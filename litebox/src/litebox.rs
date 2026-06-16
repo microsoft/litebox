@@ -9,7 +9,7 @@ use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::LocalControlChannel;
 
 use crate::{
-    broker::{self, BrokerControl, BrokerState},
+    broker::{self, BrokerState},
     fd::Descriptors,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -37,14 +37,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         Self::new_inner(platform, None)
     }
 
-    /// Create a new [`LiteBox`] instance with broker control installed.
-    pub fn new_with_broker_control(
-        platform: &'static Platform,
-        broker_control: Arc<dyn BrokerControl>,
-    ) -> Self {
-        Self::new_inner(platform, Some(broker_control))
-    }
-
     /// Create a new [`LiteBox`] instance with a negotiated broker-local control adapter installed.
     pub fn new_with_broker_local<T>(
         platform: &'static Platform,
@@ -63,7 +55,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 
     fn new_inner(
         platform: &'static Platform,
-        broker_control: Option<Arc<dyn BrokerControl>>,
+        broker_control: Option<Arc<dyn broker::BrokerControl>>,
     ) -> Self {
         // This check ensures that there is exactly one `LiteBox` instance in the process.
         //
@@ -144,7 +136,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         self.x.descriptors.write()
     }
 
-    pub(crate) fn broker_control(&self) -> Option<Arc<dyn BrokerControl>> {
+    pub(crate) fn broker_control(&self) -> Option<Arc<dyn broker::BrokerControl>> {
         self.x.broker.control()
     }
 }

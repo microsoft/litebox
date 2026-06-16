@@ -9,14 +9,14 @@ use litebox_broker_protocol::{CoreRequest, CoreResponse, LocalControlChannel};
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 pub(crate) mod error;
-pub use error::BrokerControlError;
+use error::BrokerControlError;
 
 /// Local-core access to the negotiated broker control channel.
 ///
 /// LiteBox owns broker-backed local objects and constructs broker protocol
 /// requests. Deployment code owns endpoint selection and supplies the connected
 /// transport behind this protocol-level boundary.
-pub trait BrokerControl: Send + Sync {
+pub(crate) trait BrokerControl: Send + Sync {
     /// Sends one active BrokerCore request and returns its response.
     fn request(
         &self,
