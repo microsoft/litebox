@@ -428,7 +428,7 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
         crate::arch::timer::disarm_preemption();
         if crate::arch::timer::take_user_timeout_kill() {
             crate::serial_println!(
-                "Terminiated user-mode code which exceeded its execution quantum"
+                "Terminated user-mode code which exceeded its execution quantum"
             );
         }
         vtl1_vp_exit();

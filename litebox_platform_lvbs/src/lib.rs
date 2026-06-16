@@ -1614,8 +1614,8 @@ fn run_thread_inner(
     // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
     // member variable offset calculation in assembly code).
     //
-    // Arm the preemption timer for this TA entry; disarmed at the VTL0-return
-    // boundary in `vtl_switch`.
+    // Arm the preemption timer for this user-thread execution. This function is
+    // idempotent, so `reenter` does not change the timeout.
     crate::arch::timer::arm_preemption();
     // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
     // the duration of the call, and `run_thread_arch` returns exactly once.
