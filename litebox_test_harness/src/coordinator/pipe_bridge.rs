@@ -220,7 +220,24 @@ fn wait_child(pid: i32) -> i32 {
     }
 }
 
-fn do_execv(exe: &str, args: &[&str]) -> ! {
+struct PreparedExecv {
+    c_exe: std::ffi::CString,
+    c_args: Vec<std::ffi::CString>,
+    argv_ptrs: Vec<*const libc::c_char>,
+}
+
+impl PreparedExecv {
+    fn exec(&self) -> ! {
+        // Keep the backing CString storage live while execv reads argv.
+        let _keepalive = (&self.c_exe, &self.c_args);
+        // Safety: c_exe and argv_ptrs are valid nul-terminated C strings.
+        unsafe { libc::execv(self.c_exe.as_ptr(), self.argv_ptrs.as_ptr()) };
+        // Safety: execv failed; exit without running inherited destructors.
+        unsafe { libc::_exit(127) };
+    }
+}
+
+fn prepare_execv(exe: &str, args: &[&str]) -> PreparedExecv {
     let c_exe = std::ffi::CString::new(exe).unwrap();
     let c_args: Vec<std::ffi::CString> = args
         .iter()
@@ -232,10 +249,11 @@ fn do_execv(exe: &str, args: &[&str]) -> ! {
         argv_ptrs.push(a.as_ptr());
     }
     argv_ptrs.push(core::ptr::null());
-    // Safety: c_exe and argv_ptrs are valid nul-terminated C strings.
-    unsafe { libc::execv(c_exe.as_ptr(), argv_ptrs.as_ptr()) };
-    eprintln!("[execv] failed: {}", std::io::Error::last_os_error());
-    std::process::exit(127);
+    PreparedExecv {
+        c_exe,
+        c_args,
+        argv_ptrs,
+    }
 }
 
 async fn handle_extra_pipe_multi(
@@ -516,6 +534,9 @@ fn test_extra_pipe_multi(exe: &str, count: usize) -> String {
         }
         pipes.push(fds);
     }
+    let write_fds: Vec<String> = pipes.iter().map(|fds| fds[1].to_string()).collect();
+    let fd_list = write_fds.join(",");
+    let child_exec = prepare_execv(exe, &["pipe-test", "write-on-fd", &fd_list]);
 
     // Safety: this test process is single-threaded for this fork/exec probe.
     let pid = unsafe { libc::fork() };
@@ -528,9 +549,7 @@ fn test_extra_pipe_multi(exe: &str, count: usize) -> String {
             // Safety: fds[0] is a valid fd returned by pipe.
             unsafe { libc::close(fds[0]) };
         }
-        let write_fds: Vec<String> = pipes.iter().map(|fds| fds[1].to_string()).collect();
-        let fd_list = write_fds.join(",");
-        do_execv(exe, &["pipe-test", "write-on-fd", &fd_list]);
+        child_exec.exec();
     }
 
     for fds in &pipes {
@@ -563,6 +582,8 @@ fn test_extra_socketpair(exe: &str) -> String {
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
         return format!("PB_SP_SOCKETPAIR_FAIL:{}", errno());
     }
+    let fd_str = fds[1].to_string();
+    let child_exec = prepare_execv(exe, &["pipe-test", "echo-on-fd", &fd_str]);
 
     // Safety: this test process is single-threaded for this fork/exec probe.
     let pid = unsafe { libc::fork() };
@@ -573,8 +594,7 @@ fn test_extra_socketpair(exe: &str) -> String {
     if pid == 0 {
         // Safety: fds[0] is a valid fd returned by socketpair.
         unsafe { libc::close(fds[0]) };
-        let fd_str = fds[1].to_string();
-        do_execv(exe, &["pipe-test", "echo-on-fd", &fd_str]);
+        child_exec.exec();
     }
 
     // Safety: fds[1] is a valid fd returned by socketpair.
@@ -618,6 +638,7 @@ fn test_extra_stdio_socketpair(exe: &str) -> String {
             return format!("PB_STDIO_SP_SOCKETPAIR_FAIL:{name}:{}", errno());
         }
     }
+    let child_exec = prepare_execv(exe, &["pipe-test", "stdio-echo"]);
 
     // Safety: this test process is single-threaded for this fork/exec probe.
     let pid = unsafe { libc::fork() };
@@ -643,7 +664,7 @@ fn test_extra_stdio_socketpair(exe: &str) -> String {
                 }
             }
         }
-        do_execv(exe, &["pipe-test", "stdio-echo"]);
+        child_exec.exec();
     }
 
     // Safety: parent owns the fd 0 ends after fork.
@@ -780,6 +801,9 @@ fn test_epoll_pipe_bridge(exe: &str, delay_ms: u64) -> String {
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
         return format!("EPOLL_BRIDGE_PIPE_FAIL:{}", errno());
     }
+    let wfd_str = pipe_fds[1].to_string();
+    let delay = delay_ms.to_string();
+    let child_exec = prepare_execv(exe, &["pipe-test", "delayed-write-on-fd", &wfd_str, &delay]);
 
     // Safety: this test process is single-threaded for this fork/exec probe.
     let pid = unsafe { libc::fork() };
@@ -790,9 +814,7 @@ fn test_epoll_pipe_bridge(exe: &str, delay_ms: u64) -> String {
     if pid == 0 {
         // Safety: pipe_fds[0] is a valid fd returned by pipe.
         unsafe { libc::close(pipe_fds[0]) };
-        let wfd_str = pipe_fds[1].to_string();
-        let delay = delay_ms.to_string();
-        do_execv(exe, &["pipe-test", "delayed-write-on-fd", &wfd_str, &delay]);
+        child_exec.exec();
     }
 
     // Safety: pipe_fds[1] is a valid fd returned by pipe.
@@ -875,6 +897,9 @@ fn test_epoll_socketpair_bridge(exe: &str, delay_ms: u64) -> String {
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
         return format!("EPOLL_SP_SOCKETPAIR_FAIL:{}", errno());
     }
+    let fd_str = fds[1].to_string();
+    let delay = delay_ms.to_string();
+    let child_exec = prepare_execv(exe, &["pipe-test", "delayed-write-on-fd", &fd_str, &delay]);
 
     // Safety: this test process is single-threaded for this fork/exec probe.
     let pid = unsafe { libc::fork() };
@@ -885,9 +910,7 @@ fn test_epoll_socketpair_bridge(exe: &str, delay_ms: u64) -> String {
     if pid == 0 {
         // Safety: fds[0] is a valid fd returned by socketpair.
         unsafe { libc::close(fds[0]) };
-        let fd_str = fds[1].to_string();
-        let delay = delay_ms.to_string();
-        do_execv(exe, &["pipe-test", "delayed-write-on-fd", &fd_str, &delay]);
+        child_exec.exec();
     }
 
     // Safety: fds[1] is a valid fd returned by socketpair.
@@ -1720,6 +1743,7 @@ fn subcmd_eof_exec(args: &[String]) -> i32 {
         println!("P2_PIPE_FAIL:{}", errno());
         return 1;
     }
+    let child_exec = prepare_execv(&exe, &["pipe-test", "echo-exit"]);
 
     // Safety: this argv leaf is single-threaded for the fork/exec probe.
     let pid = unsafe { libc::fork() };
@@ -1735,7 +1759,7 @@ fn subcmd_eof_exec(args: &[String]) -> i32 {
             libc::dup2(pipe_fds[1], 1);
             libc::close(pipe_fds[1]);
         }
-        do_execv(&exe, &["pipe-test", "echo-exit"]);
+        child_exec.exec();
     }
 
     // Safety: pipe_fds[1] is a valid fd returned by pipe.
@@ -1762,6 +1786,8 @@ fn subcmd_extra_pipe_c2p(args: &[String]) -> i32 {
         println!("PB_C2P_PIPE_FAIL:{}", errno());
         return 1;
     }
+    let wfd_str = pipe_fds[1].to_string();
+    let child_exec = prepare_execv(&exe, &["pipe-test", "write-on-fd", &wfd_str]);
 
     // Safety: this argv leaf is single-threaded for the fork/exec probe.
     let pid = unsafe { libc::fork() };
@@ -1773,8 +1799,7 @@ fn subcmd_extra_pipe_c2p(args: &[String]) -> i32 {
     if pid == 0 {
         // Safety: pipe_fds[0] is a valid fd returned by pipe.
         unsafe { libc::close(pipe_fds[0]) };
-        let wfd_str = pipe_fds[1].to_string();
-        do_execv(&exe, &["pipe-test", "write-on-fd", &wfd_str]);
+        child_exec.exec();
     }
 
     // Safety: pipe_fds[1] is a valid fd returned by pipe.
@@ -1806,6 +1831,8 @@ fn subcmd_extra_pipe_p2c(args: &[String]) -> i32 {
         println!("PB_P2C_PIPE_FAIL:{}", errno());
         return 1;
     }
+    let rfd_str = pipe_fds[0].to_string();
+    let child_exec = prepare_execv(&exe, &["pipe-test", "read-on-fd", &rfd_str]);
 
     // Safety: this argv leaf is single-threaded for the fork/exec probe.
     let pid = unsafe { libc::fork() };
@@ -1817,8 +1844,7 @@ fn subcmd_extra_pipe_p2c(args: &[String]) -> i32 {
     if pid == 0 {
         // Safety: pipe_fds[1] is a valid fd returned by pipe.
         unsafe { libc::close(pipe_fds[1]) };
-        let rfd_str = pipe_fds[0].to_string();
-        do_execv(&exe, &["pipe-test", "read-on-fd", &rfd_str]);
+        child_exec.exec();
     }
 
     // Safety: pipe_fds[0] is a valid fd returned by pipe.
