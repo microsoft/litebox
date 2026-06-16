@@ -23,8 +23,6 @@ pub enum BrokerError {
     WouldBlock,
     /// The operation is not implemented by this BrokerCore.
     UnsupportedOperation,
-    /// Policy returned a decision that does not match the authorized operation.
-    InvalidPolicyDecision,
 }
 
 impl fmt::Display for BrokerError {
@@ -38,7 +36,6 @@ impl fmt::Display for BrokerError {
             Self::BrokerCoreAlreadyExists => f.write_str("broker core already exists"),
             Self::WouldBlock => f.write_str("broker operation would block"),
             Self::UnsupportedOperation => f.write_str("unsupported broker operation"),
-            Self::InvalidPolicyDecision => f.write_str("invalid broker policy decision"),
         }
     }
 }

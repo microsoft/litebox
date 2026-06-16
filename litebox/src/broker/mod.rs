@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::sync::Arc;
-
 use litebox_broker_local::{BrokerLocal, BrokerLocalError};
 use litebox_broker_protocol::{CoreRequest, CoreResponse, LocalControlChannel};
 
@@ -56,23 +54,5 @@ where
                 BrokerLocalError::UnexpectedResponse(_) => BrokerControlError::UnexpectedResponse,
                 _ => BrokerControlError::Transport,
             })
-    }
-}
-
-pub(crate) struct BrokerState<Platform: RawSyncPrimitivesProvider> {
-    control: Option<Arc<dyn BrokerControl>>,
-    _marker: core::marker::PhantomData<Platform>,
-}
-
-impl<Platform: RawSyncPrimitivesProvider> BrokerState<Platform> {
-    pub(crate) fn new(control: Option<Arc<dyn BrokerControl>>) -> Self {
-        Self {
-            control,
-            _marker: core::marker::PhantomData,
-        }
-    }
-
-    pub(crate) fn control(&self) -> Option<Arc<dyn BrokerControl>> {
-        self.control.clone()
     }
 }

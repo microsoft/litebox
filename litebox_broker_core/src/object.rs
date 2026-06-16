@@ -3,7 +3,7 @@
 
 use crate::event::EventObject;
 use crate::identity::{BrokerAssociation, ProcessId};
-use crate::{BrokerCore, BrokerError, PolicyDecision, PolicyOperation, Result, allocate_id};
+use crate::{BrokerCore, BrokerError, Result, allocate_id};
 use litebox_broker_protocol::ObjectHandle;
 
 /// Broker object type known to the authority core and policy engine.
@@ -84,13 +84,8 @@ impl BrokerCore {
         association: &BrokerAssociation,
         object_type: ObjectType,
     ) -> Result<ObjectRights> {
-        match self.policy.authorize(PolicyOperation::create_object(
-            association.caller_credential(),
-            object_type,
-        ))? {
-            PolicyDecision::GrantObjectReference { rights } => Ok(rights),
-            _ => Err(BrokerError::InvalidPolicyDecision),
-        }
+        self.policy
+            .authorize_create_object(association.caller_credential(), object_type)
     }
 
     pub(crate) fn authorize_use_object(
@@ -103,17 +98,12 @@ impl BrokerCore {
         let reference = self.validate_handle(association, handle, object_type, rights)?;
         let object_id = reference.object_id;
         let reference_rights = reference.rights;
-        match self.policy.authorize(PolicyOperation::use_object(
-            association.caller_credential(),
-            object_type,
-            rights,
-        ))? {
-            PolicyDecision::Authorized => Ok(AuthorizedObject {
-                object_id,
-                rights: reference_rights,
-            }),
-            _ => Err(BrokerError::InvalidPolicyDecision),
-        }
+        self.policy
+            .authorize_use_object(association.caller_credential(), object_type, rights)?;
+        Ok(AuthorizedObject {
+            object_id,
+            rights: reference_rights,
+        })
     }
 
     pub(crate) fn object(&self, object_id: ObjectId) -> Result<&ObjectEntry> {

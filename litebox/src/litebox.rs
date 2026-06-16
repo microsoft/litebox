@@ -9,7 +9,7 @@ use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::LocalControlChannel;
 
 use crate::{
-    broker::{self, BrokerState},
+    broker,
     fd::Descriptors,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -90,9 +90,8 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         // prints, if the feature is enabled.
         #[cfg(feature = "lock_tracing")]
         crate::sync::lock_tracing::LockTracker::init(platform);
-
-        let descriptors = RwLock::new(Descriptors::new_from_litebox_creation());
-        let broker = BrokerState::new(broker_control);
+        let descriptors: RwLock<Platform, Descriptors<Platform>> =
+            RwLock::new(Descriptors::new_from_litebox_creation());
 
         litebox_util_log::trace!("LiteBox instance initialized");
 
@@ -100,7 +99,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             x: Arc::new(LiteBoxX {
                 platform,
                 descriptors,
-                broker,
+                broker: broker_control,
             }),
         }
     }
@@ -137,7 +136,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     }
 
     pub(crate) fn broker_control(&self) -> Option<Arc<dyn broker::BrokerControl>> {
-        self.x.broker.control()
+        self.x.broker.clone()
     }
 }
 
@@ -145,5 +144,5 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
-    broker: BrokerState<Platform>,
+    broker: Option<Arc<dyn broker::BrokerControl>>,
 }
