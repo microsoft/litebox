@@ -46,7 +46,7 @@ use sha2::{Digest, Sha256};
 /// When you do bump (with user approval), land the bump on the
 /// amalgamation branch promptly so other sessions pick it up on
 /// their next cargo run rather than panicking on an older meta.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Ctx {
     pub run_id: i64,
@@ -271,7 +271,7 @@ pub const SCHEMA_DDL: &str = r#"
     CREATE TABLE run_results (
         run_id                INTEGER NOT NULL REFERENCES runs(run_id),
         test_id               TEXT    NOT NULL,
-        pass                  TEXT    NOT NULL,
+        mode                  TEXT    NOT NULL,
         verdict               TEXT    NOT NULL,
         finished_ts_ms        INTEGER NOT NULL,
         suite                 TEXT    NOT NULL,
@@ -285,12 +285,12 @@ pub const SCHEMA_DDL: &str = r#"
         t_harness_dispatch_ms INTEGER,
         t_useful_ms           INTEGER NOT NULL,
         t_drain_ms            INTEGER,
-        PRIMARY KEY (run_id, test_id, pass)
+        PRIMARY KEY (run_id, test_id, mode)
     );
     CREATE INDEX run_results_test_pass_ts
-        ON run_results(test_id, pass, finished_ts_ms DESC);
+        ON run_results(test_id, mode, finished_ts_ms DESC);
     CREATE INDEX run_results_pass_verdict_ts
-        ON run_results(pass, verdict, finished_ts_ms DESC);
+        ON run_results(mode, verdict, finished_ts_ms DESC);
 
     -- Config: one row per tracked ref → dedicated CI worktree.
     CREATE TABLE tracked_refs (
@@ -298,20 +298,20 @@ pub const SCHEMA_DDL: &str = r#"
         ci_worktree TEXT NOT NULL
     );
 
-    -- "Freshest result per (test_id, pass)" — computed at query
+    -- "Freshest result per (test_id, mode)" — computed at query
     -- time. Producer just INSERTs into run_results; no UPSERT
     -- bookkeeping.
     CREATE VIEW latest_results AS
-    SELECT rr.test_id, rr.pass, rr.verdict, rr.finished_ts_ms,
+    SELECT rr.test_id, rr.mode, rr.verdict, rr.finished_ts_ms,
            rr.suite, rr."group", rr.run_id
       FROM run_results rr
       JOIN (
-          SELECT test_id, pass, MAX(finished_ts_ms) AS max_ts
+          SELECT test_id, mode, MAX(finished_ts_ms) AS max_ts
             FROM run_results
-           GROUP BY test_id, pass
+           GROUP BY test_id, mode
       ) latest
         ON latest.test_id = rr.test_id
-       AND latest.pass   = rr.pass
+       AND latest.mode   = rr.mode
        AND latest.max_ts = rr.finished_ts_ms;
 
     CREATE TABLE meta (
@@ -474,12 +474,12 @@ pub fn record_result(
     let conn = ctx.conn.lock().expect("dashboard: conn lock");
     let res = conn.execute(
         "INSERT INTO run_results (
-            run_id, test_id, pass, verdict, finished_ts_ms, suite, \"group\",
+            run_id, test_id, mode, verdict, finished_ts_ms, suite, \"group\",
             t_acquire_ms, t_docker_start_ms, t_docker_spawn_ms,
             t_litebox_init_ms, t_harness_load_ms, t_harness_args_ms,
             t_harness_dispatch_ms, t_useful_ms
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-         ON CONFLICT(run_id, test_id, pass) DO UPDATE SET
+         ON CONFLICT(run_id, test_id, mode) DO UPDATE SET
             verdict        = excluded.verdict,
             finished_ts_ms = excluded.finished_ts_ms,
             t_useful_ms    = excluded.t_useful_ms",
@@ -516,7 +516,7 @@ pub fn record_drain(test_id: &str, pass: &str, t_drain_ms: u128) {
     let conn = ctx.conn.lock().expect("dashboard: conn lock");
     let res = conn.execute(
         "UPDATE run_results SET t_drain_ms = ?1
-          WHERE run_id = ?2 AND test_id = ?3 AND pass = ?4",
+          WHERE run_id = ?2 AND test_id = ?3 AND mode = ?4",
         params![drain, ctx.run_id, test_id, pass],
     );
     if let Err(e) = res {
@@ -534,7 +534,7 @@ pub fn finalize() {
     let counts: Result<(i64, i64), rusqlite::Error> = conn.query_row(
         "SELECT
            COALESCE(SUM(CASE WHEN verdict='pass' THEN 1 ELSE 0 END), 0),
-           COALESCE(SUM(CASE WHEN verdict='FAIL' THEN 1 ELSE 0 END), 0)
+           COALESCE(SUM(CASE WHEN verdict='fail' THEN 1 ELSE 0 END), 0)
          FROM run_results WHERE run_id = ?1",
         params![ctx.run_id],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -666,7 +666,7 @@ pub fn select_fill_batch_inner(
     if !commit_sha.is_empty() {
         let mut stmt = conn
             .prepare(
-                "SELECT rr.pass, rr.test_id, rr.verdict, rr.finished_ts_ms
+                "SELECT rr.mode, rr.test_id, rr.verdict, rr.finished_ts_ms
                    FROM run_results rr
                    JOIN runs r ON r.run_id = rr.run_id
                   WHERE r.commit_sha = ?1
@@ -703,12 +703,12 @@ pub fn select_fill_batch_inner(
     {
         let mut stmt = conn
             .prepare(
-                "SELECT lr.pass, lr.test_id, lr.finished_ts_ms, lr.suite,
+                "SELECT lr.mode, lr.test_id, lr.finished_ts_ms, lr.suite,
                         rr.t_useful_ms
                    FROM latest_results lr
                    JOIN run_results rr ON rr.run_id = lr.run_id
                                        AND rr.test_id = lr.test_id
-                                       AND rr.pass    = lr.pass",
+                                       AND rr.mode    = lr.mode",
             )
             .expect("dashboard: prepare latest query");
         let rows = stmt

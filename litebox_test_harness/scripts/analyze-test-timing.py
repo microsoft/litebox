@@ -43,7 +43,7 @@ _TIMING_COLS = [
 
 def _load_sqlite(path: Path, run_id: int | None = None) -> list[dict]:
     """Query ``run_results`` from sqlite, latest run if ``run_id`` is
-    None. Returns row dicts keyed by ``test``, ``pass``, ``verdict``,
+    None. Returns row dicts keyed by ``test``, ``mode``, ``verdict``,
     each ``t_*_ms`` field, and ``jobs``.
     """
     conn = sqlite3.connect(str(path))
@@ -56,7 +56,7 @@ def _load_sqlite(path: Path, run_id: int | None = None) -> list[dict]:
             return []
     cols = ", ".join(_TIMING_COLS)
     sql_rows = conn.execute(
-        f"SELECT test_id AS test, pass, verdict, {cols},"
+        f"SELECT test_id AS test, mode, verdict, {cols},"
         f" (SELECT jobs FROM runs WHERE run_id = ?) AS jobs"
         f" FROM run_results WHERE run_id = ?",
         (run_id, run_id),
@@ -140,7 +140,7 @@ def summary(rows, label):
 
     by_pass = defaultdict(list)
     for r in rows:
-        by_pass[r["pass"]].append(r)
+        by_pass[r["mode"]].append(r)
     for p, pr in by_pass.items():
         useful_sum = sum(r.get("t_useful_ms", 0) for r in pr)
         wall_sum = sum(total(r) for r in pr)
@@ -155,8 +155,8 @@ def summary(rows, label):
 
 
 def diff(a, b):
-    a_by_test = {(r["test"], r["pass"]): r for r in a}
-    b_by_test = {(r["test"], r["pass"]): r for r in b}
+    a_by_test = {(r["test"], r["mode"]): r for r in a}
+    b_by_test = {(r["test"], r["mode"]): r for r in b}
     print(f"\n=== diff: A({len(a)}) vs B({len(b)}) ===")
     print(f"only-in-A: {len(set(a_by_test) - set(b_by_test))}")
     print(f"only-in-B: {len(set(b_by_test) - set(a_by_test))}")
