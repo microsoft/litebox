@@ -43,23 +43,23 @@ The store has two primary tables (see
                     counts (pass_count/fail_count) written
                     when the cargo process completes.
   * `run_results` — one row per **trial outcome**
-                    `(run_id, test_id, pass)`. Streamed
+                    `(run_id, test_id, mode)`. Streamed
                     continuously as each trial finishes,
                     carrying its verdict + per-stage timings.
                     THIS is the primary signal everything
                     aggregates over.
 
-`pass` (native | litebox) is a separate column from `test_id`;
-the aggregation unit throughout the renderer is `(test_id, pass)`.
+`mode` (native | litebox) is a separate column from `test_id`;
+the aggregation unit throughout the renderer is `(test_id, mode)`.
 
 **Every renderer aggregates the same way:** scope `run_results`
 by `(commit_sha, dirty_hash)` via a JOIN to `runs`, then take
-the freshest verdict per `(test_id, pass)` within that state.
+the freshest verdict per `(test_id, mode)` within that state.
 That's "state-scoped freshest" — class-2 retries (a test that
 failed then recovered at the same sha) are counted as one pass,
 not pass+fail.
 
-The `latest_results` VIEW (globally-freshest per (test_id, pass)
+The `latest_results` VIEW (globally-freshest per (test_id, mode)
 across all shas) is defined in the schema but **no longer used**
 by this renderer — it could contaminate today's view with stale
 verdicts from old commits. Left defined for now; removable in a
@@ -93,7 +93,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-SCHEMA_VERSION_EXPECTED = 3
+SCHEMA_VERSION_EXPECTED = 4
 DEFAULT_FILL_BATCH = 300
 
 # Reap timing knobs.
@@ -196,7 +196,7 @@ def _ensure_views(conn: sqlite3.Connection) -> None:
             CASE WHEN r.dirty_hash IS NULL
                  THEN NULL ELSE r.worktree_path END AS state_wt,
             rr.test_id,
-            rr.pass,
+            rr.mode,
             rr.suite,
             rr."group",
             rr.verdict,
@@ -209,28 +209,28 @@ def _ensure_views(conn: sqlite3.Connection) -> None:
         WITH ranked AS (
             SELECT
                 commit_sha, dirty_hash, state_wt,
-                test_id, pass, suite, "group",
+                test_id, mode, suite, "group",
                 verdict, finished_ts_ms,
                 ROW_NUMBER() OVER (
                     PARTITION BY commit_sha, dirty_hash, state_wt,
-                                 test_id, pass
+                                 test_id, mode
                     ORDER BY finished_ts_ms DESC
                 ) AS rn
               FROM state_rows
         )
         SELECT
             commit_sha, dirty_hash, state_wt,
-            test_id, pass,
+            test_id, mode,
             MAX(suite)   AS suite,
             MAX("group") AS "group",
             MAX(CASE WHEN rn = 1 THEN verdict END) AS freshest_verdict,
             MAX(CASE WHEN verdict != 'pass' THEN 1 ELSE 0 END) AS ever_failed,
             MAX(finished_ts_ms) AS newest_ms
           FROM ranked
-         GROUP BY commit_sha, dirty_hash, state_wt, test_id, pass;
+         GROUP BY commit_sha, dirty_hash, state_wt, test_id, mode;
 
         CREATE INDEX IF NOT EXISTS idx_state_test_pass_state
-            ON state_test_pass(commit_sha, dirty_hash, state_wt, pass);
+            ON state_test_pass(commit_sha, dirty_hash, state_wt, mode);
         """
     )
 
@@ -270,8 +270,96 @@ def check_schema(conn: sqlite3.Connection) -> None:
             f"dashboard: schema_version {actual} != expected "
             f"{SCHEMA_VERSION_EXPECTED}.\n"
             "  Producer and consumer are out of sync; update one of them. "
-            "Run a fresh integration test to recreate the store."
+            "Run a fresh integration test to recreate the store.\n"
+            "  If this store predates a column rename, migrate it in "
+            "place with `dashboard.py migrate` (lossless)."
         )
+
+
+def _schema_version(conn: sqlite3.Connection) -> Optional[int]:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='schema_version'"
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+# Canonical v4 `latest_results` view text, kept identical to the
+# fresh DDL in `tests/common/dashboard_store.rs` so a migrated store
+# and a freshly-created one are schema-identical.
+_LATEST_RESULTS_VIEW_V4 = """
+CREATE VIEW latest_results AS
+SELECT rr.test_id, rr.mode, rr.verdict, rr.finished_ts_ms,
+       rr.suite, rr."group", rr.run_id
+  FROM run_results rr
+  JOIN (
+      SELECT test_id, mode, MAX(finished_ts_ms) AS max_ts
+        FROM run_results
+       GROUP BY test_id, mode
+  ) latest
+    ON latest.test_id = rr.test_id
+   AND latest.mode   = rr.mode
+   AND latest.max_ts = rr.finished_ts_ms;
+"""
+
+
+def migrate_v3_to_v4(conn: sqlite3.Connection) -> bool:
+    """In-place, lossless v3 → v4 migration. Returns True if it
+    migrated, False if the store was already at v4 (idempotent no-op).
+
+    v4 renames `run_results.pass` → `mode` (it holds the trial pass
+    name `native`/`litebox`, which collided with the `verdict`
+    pass/fail outcome) and lower-cases the stored verdict token
+    `FAIL` → `fail` (the producer now emits lower-case end to end).
+    Both are pure renames/rewrites — every row is preserved.
+
+    SQLite's schema-aware `ALTER TABLE … RENAME COLUMN` propagates
+    the rename to the primary key and both indexes automatically
+    (index *names* are unchanged, matching the fresh DDL). The
+    `latest_results` view is dropped and recreated from the canonical
+    v4 text so a migrated store is identical to a fresh one.
+    """
+    ver = _schema_version(conn)
+    if ver == SCHEMA_VERSION_EXPECTED:
+        return False
+    if ver != 3:
+        raise SystemExit(
+            f"dashboard: cannot migrate schema_version {ver} → "
+            f"{SCHEMA_VERSION_EXPECTED}; expected a v3 store."
+        )
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(run_results)")}
+    conn.execute("BEGIN")
+    try:
+        if "pass" in cols and "mode" not in cols:
+            # Drop every persisted object that references the old
+            # column before the rename. `latest_results` is recreated
+            # below from canonical v4 text; `state_rows` /
+            # `state_test_pass` are regenerated per-connection by
+            # `_ensure_views` (older code persisted `state_test_pass`
+            # as a view — that stale copy must go too). Drop by actual
+            # type so a view-vs-table mismatch can't wedge the rename.
+            for obj in ("latest_results", "state_test_pass", "state_rows"):
+                row = conn.execute(
+                    "SELECT type FROM sqlite_master WHERE name = ?", (obj,)
+                ).fetchone()
+                if row and row[0] in ("view", "table"):
+                    conn.execute(f'DROP {row[0].upper()} IF EXISTS "{obj}"')
+            conn.execute('ALTER TABLE run_results RENAME COLUMN "pass" TO mode')
+            conn.execute(_LATEST_RESULTS_VIEW_V4)
+        conn.execute("UPDATE run_results SET verdict='fail' WHERE verdict='FAIL'")
+        conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'",
+            (str(SCHEMA_VERSION_EXPECTED),),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return True
 
 
 # ─── Time helpers ────────────────────────────────────────────────────
@@ -358,11 +446,11 @@ def state_verdicts(
     """
     where, params = _state_filter(commit_sha, dirty_hash, worktree_path)
     rows = conn.execute(
-        f"SELECT test_id, pass, freshest_verdict "
+        f"SELECT test_id, mode, freshest_verdict "
         f"  FROM state_test_pass WHERE {where}",
         params,
     )
-    return {(r["test_id"], r["pass"]): r["freshest_verdict"] for r in rows}
+    return {(r["test_id"], r["mode"]): r["freshest_verdict"] for r in rows}
 
 
 def state_delta(
@@ -479,9 +567,9 @@ def _render_velocity(conn: sqlite3.Connection) -> str:
     newly_covered = conn.execute(
         """
         SELECT COUNT(*) FROM (
-            SELECT test_id, pass, MIN(finished_ts_ms) AS first_ts
+            SELECT test_id, mode, MIN(finished_ts_ms) AS first_ts
               FROM run_results
-             GROUP BY test_id, pass
+             GROUP BY test_id, mode
         ) WHERE first_ts > ?
         """,
         (cutoff,),
@@ -493,10 +581,10 @@ def _render_velocity(conn: sqlite3.Connection) -> str:
     flips = conn.execute(
         """
         SELECT COUNT(*) FROM (
-            SELECT test_id, pass
+            SELECT test_id, mode
               FROM run_results
              WHERE finished_ts_ms > ?
-             GROUP BY test_id, pass
+             GROUP BY test_id, mode
             HAVING SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) > 0
                AND SUM(CASE WHEN verdict <> 'pass' THEN 1 ELSE 0 END) > 0
         )
@@ -551,10 +639,10 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
     # is the grand total across passes — using it as per-pass total
     # makes coverage look ~50% even at full per-pass coverage).
     per_pass_universe: dict[str, int] = {
-        r["pass"]: r["n"]
+        r["mode"]: r["n"]
         for r in conn.execute(
-            'SELECT pass, COUNT(DISTINCT test_id) AS n '
-            'FROM run_results GROUP BY pass'
+            'SELECT mode, COUNT(DISTINCT test_id) AS n '
+            'FROM run_results GROUP BY mode'
         )
     }
 
@@ -667,9 +755,9 @@ def _coverage_sparkline_for_worktree(
         n_pass = conn.execute(
             """
             WITH freshest AS (
-                SELECT rr.test_id, rr.pass, rr.verdict,
+                SELECT rr.test_id, rr.mode, rr.verdict,
                        ROW_NUMBER() OVER (
-                           PARTITION BY rr.test_id, rr.pass
+                           PARTITION BY rr.test_id, rr.mode
                            ORDER BY rr.finished_ts_ms DESC
                        ) AS rn
                   FROM run_results rr
@@ -1132,7 +1220,7 @@ def _regression_counts(
             r["test_id"]: r["freshest_verdict"]
             for r in conn.execute(
                 "SELECT test_id, freshest_verdict FROM state_test_pass "
-                " WHERE commit_sha = ? AND state_wt IS NULL AND pass = ?",
+                " WHERE commit_sha = ? AND state_wt IS NULL AND mode = ?",
                 (baseline_sha, pass_name),
             )
         }
@@ -1140,7 +1228,7 @@ def _regression_counts(
             r["test_id"]: r["freshest_verdict"]
             for r in conn.execute(
                 "SELECT test_id, freshest_verdict FROM state_test_pass "
-                " WHERE commit_sha = ? AND state_wt IS NULL AND pass = ?",
+                " WHERE commit_sha = ? AND state_wt IS NULL AND mode = ?",
                 (agent_sha, pass_name),
             )
         }
@@ -1174,14 +1262,14 @@ def _regression_test_ids(
         r["test_id"]: r["freshest_verdict"]
         for r in conn.execute(
             "SELECT test_id, freshest_verdict FROM state_test_pass "
-            " WHERE commit_sha = ? AND state_wt IS NULL AND pass = ?",
+            " WHERE commit_sha = ? AND state_wt IS NULL AND mode = ?",
             (baseline_sha, pass_name),
         )
     }
     out: list[str] = []
     for r in conn.execute(
         "SELECT test_id FROM state_test_pass "
-        " WHERE commit_sha = ? AND state_wt IS NULL AND pass = ? "
+        " WHERE commit_sha = ? AND state_wt IS NULL AND mode = ? "
         "   AND freshest_verdict <> 'pass' "
         " ORDER BY test_id",
         (agent_sha, pass_name),
@@ -1316,7 +1404,7 @@ def _coverage_pass_fail(
                SUM(CASE WHEN freshest_verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
                SUM(CASE WHEN freshest_verdict <> 'pass' THEN 1 ELSE 0 END) AS n_fail
           FROM state_test_pass
-         WHERE commit_sha = ? AND state_wt IS NULL AND pass = ?
+         WHERE commit_sha = ? AND state_wt IS NULL AND mode = ?
         """,
         (commit_sha, pass_name),
     ).fetchone()
@@ -1354,7 +1442,7 @@ def _dirty_only_coverage(
               JOIN runs r ON r.run_id = rr.run_id
              WHERE r.commit_sha = ? AND r.dirty_hash IS NOT NULL
                AND r.worktree_path = ?
-               AND rr.pass = ?
+               AND rr.mode = ?
         ),
         clean_ids AS (
             SELECT DISTINCT rr.test_id
@@ -1362,7 +1450,7 @@ def _dirty_only_coverage(
               JOIN runs r ON r.run_id = rr.run_id
              WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
                AND r.worktree_path = ?
-               AND rr.pass = ?
+               AND rr.mode = ?
         )
         SELECT COUNT(*) FROM dirty_ids
          WHERE test_id NOT IN (SELECT test_id FROM clean_ids)
@@ -1393,7 +1481,7 @@ def _flaky_test_ids(
     where, params = _state_filter(commit_sha, dirty_hash, worktree_path)
     rows = conn.execute(
         f"SELECT test_id FROM state_test_pass "
-        f" WHERE {where} AND pass = ? "
+        f" WHERE {where} AND mode = ? "
         f"   AND freshest_verdict = 'pass' AND ever_failed = 1",
         (*params, pass_name),
     )
@@ -1406,7 +1494,7 @@ def _flaky_count(
     """Clean-state flaky count for the Tracked refs table."""
     row = conn.execute(
         "SELECT COUNT(*) FROM state_test_pass "
-        " WHERE commit_sha = ? AND state_wt IS NULL AND pass = ? "
+        " WHERE commit_sha = ? AND state_wt IS NULL AND mode = ? "
         "   AND freshest_verdict = 'pass' AND ever_failed = 1",
         (commit_sha, pass_name),
     ).fetchone()
@@ -1515,10 +1603,10 @@ def _render_result_groups(conn: sqlite3.Connection,
     # look like ~50% even at full per-pass coverage. Per-pass totals
     # are stable observables: distinct test_ids per pass.
     per_pass_universe: dict[str, int] = {
-        r["pass"]: r["n"]
+        r["mode"]: r["n"]
         for r in conn.execute(
-            'SELECT pass, COUNT(DISTINCT test_id) AS n '
-            'FROM run_results GROUP BY pass'
+            'SELECT mode, COUNT(DISTINCT test_id) AS n '
+            'FROM run_results GROUP BY mode'
         )
     }
 
@@ -1793,7 +1881,7 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
                  "(test_id, pass) within this state._\n"]
     for state in states:
         out_lines.append(_format_state_header(state, now))
-        # One SQL aggregation per state — GROUP BY (suite, group, pass).
+        # One SQL aggregation per state — GROUP BY (suite, group, mode).
         # The state filter and the cov/pass/fail/flaky arithmetic all
         # come from state_test_pass; no in-Python tallying.
         where, params = _state_filter(
@@ -1802,7 +1890,7 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
         )
         bucket_rows = list(conn.execute(
             f"""
-            SELECT suite, "group", pass,
+            SELECT suite, "group", mode,
                    COUNT(*) AS cov,
                    SUM(CASE WHEN freshest_verdict = 'pass'
                             THEN 1 ELSE 0 END) AS n_pass,
@@ -1812,7 +1900,7 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
                             THEN 1 ELSE 0 END) AS n_flaky
               FROM state_test_pass
              WHERE {where}
-             GROUP BY suite, "group", pass
+             GROUP BY suite, "group", mode
             """,
             params,
         ))
@@ -1826,7 +1914,7 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
                 (r["suite"], r["group"]),
                 {"native": (0, 0, 0, 0), "litebox": (0, 0, 0, 0)},
             )
-            b[r["pass"]] = (r["cov"], r["n_pass"], r["n_fail"], r["n_flaky"])
+            b[r["mode"]] = (r["cov"], r["n_pass"], r["n_fail"], r["n_flaky"])
 
         out_lines.append(
             "\n| Suite | Group "
@@ -1911,11 +1999,11 @@ def _render_current_fails(conn: sqlite3.Connection) -> str:
         ts_for: dict[tuple[str, str], int] = {}
         if state["dirty_hash"] is None:
             ts_rows = conn.execute(
-                "SELECT rr.test_id, rr.pass, MAX(rr.finished_ts_ms) AS ts "
+                "SELECT rr.test_id, rr.mode, MAX(rr.finished_ts_ms) AS ts "
                 "  FROM run_results rr "
                 "  JOIN runs r ON r.run_id = rr.run_id "
                 " WHERE r.commit_sha = ? AND r.dirty_hash IS NULL "
-                " GROUP BY rr.test_id, rr.pass",
+                " GROUP BY rr.test_id, rr.mode",
                 (state["commit_sha"],),
             ).fetchall()
         else:
@@ -1923,17 +2011,17 @@ def _render_current_fails(conn: sqlite3.Connection) -> str:
             # state is (sha, dirty_hash, worktree_path), so the Age
             # column must read only from that worktree's dirty rows.
             ts_rows = conn.execute(
-                "SELECT rr.test_id, rr.pass, MAX(rr.finished_ts_ms) AS ts "
+                "SELECT rr.test_id, rr.mode, MAX(rr.finished_ts_ms) AS ts "
                 "  FROM run_results rr "
                 "  JOIN runs r ON r.run_id = rr.run_id "
                 " WHERE r.commit_sha = ? AND r.dirty_hash = ? "
                 "   AND r.worktree_path = ? "
-                " GROUP BY rr.test_id, rr.pass",
+                " GROUP BY rr.test_id, rr.mode",
                 (state["commit_sha"], state["dirty_hash"],
                  state["worktree_path"]),
             ).fetchall()
         for r in ts_rows:
-            ts_for[(r["test_id"], r["pass"])] = r["ts"] or 0
+            ts_for[(r["test_id"], r["mode"])] = r["ts"] or 0
 
         lines.append(
             "\n| Pass | Suite | Group | Test | Verdict | Recurrence "
@@ -1973,7 +2061,7 @@ def _verdict_history(
     """
     rows = conn.execute(
         "SELECT verdict FROM run_results"
-        " WHERE test_id = ? AND pass = ?"
+        " WHERE test_id = ? AND mode = ?"
         " ORDER BY finished_ts_ms DESC LIMIT ?",
         (test_id, pass_name, n),
     ).fetchall()
@@ -1983,7 +2071,7 @@ def _verdict_history(
         v = r["verdict"]
         if v == "pass":
             chars.append("✓")
-        elif v == "FAIL":
+        elif v == "fail":
             chars.append("✗")
         else:
             chars.append("·")
@@ -2202,6 +2290,41 @@ def write_summary(conn: sqlite3.Connection, state_dir: Path) -> Path:
 # ─── Subcommands ─────────────────────────────────────────────────────
 
 
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Lossless in-place schema migration (v3 → v4). Opens the store
+    raw (bypassing the strict version check, which would reject a v3
+    store) and applies `migrate_v3_to_v4`. Idempotent."""
+    state_dir = resolve_state_dir(args.state_dir)
+    db_path = state_dir / "results.sqlite"
+    if not db_path.exists():
+        sys.exit(f"dashboard: sqlite store not found at {db_path}")
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.row_factory = sqlite3.Row
+    try:
+        before = _schema_version(conn)
+        n_fail = 0
+        if before == 3:
+            n_fail = conn.execute(
+                "SELECT COUNT(*) FROM run_results WHERE verdict='FAIL'"
+            ).fetchone()[0]
+        migrated = migrate_v3_to_v4(conn)
+    finally:
+        conn.close()
+    if migrated:
+        print(
+            f"dashboard: migrated schema_version {before} → "
+            f"{SCHEMA_VERSION_EXPECTED} (run_results.pass → mode; "
+            f"normalized {n_fail} 'FAIL' verdicts → 'fail')"
+        )
+    else:
+        print(
+            f"dashboard: already at schema_version "
+            f"{SCHEMA_VERSION_EXPECTED}; nothing to do"
+        )
+    return 0
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     state_dir = resolve_state_dir(args.state_dir)
     conn = open_db(state_dir)
@@ -2219,21 +2342,21 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
     if args.format == "sql":
         for row in conn.execute(
-            "SELECT pass, verdict, COUNT(*) AS n FROM latest_results"
-            " GROUP BY pass, verdict ORDER BY pass, verdict"
+            "SELECT mode, verdict, COUNT(*) AS n FROM latest_results"
+            " GROUP BY mode, verdict ORDER BY mode, verdict"
         ):
-            print(f"{row['pass']}\t{row['verdict']}\t{row['n']}")
+            print(f"{row['mode']}\t{row['verdict']}\t{row['n']}")
         return 0
     for row in conn.execute(
-        "SELECT pass,"
+        "SELECT mode,"
         "  SUM(CASE WHEN verdict='pass' THEN 1 ELSE 0 END) AS n_pass,"
-        "  SUM(CASE WHEN verdict='FAIL' THEN 1 ELSE 0 END) AS n_fail,"
+        "  SUM(CASE WHEN verdict='fail' THEN 1 ELSE 0 END) AS n_fail,"
         "  COUNT(*) AS n_total"
-        "  FROM latest_results GROUP BY pass ORDER BY pass"
+        "  FROM latest_results GROUP BY mode ORDER BY mode"
     ):
         print(
-            f"{row['pass']:>8}: {row['n_pass'] or 0:5d} pass  "
-            f"{row['n_fail'] or 0:4d} FAIL  ({row['n_total'] or 0} total)"
+            f"{row['mode']:>8}: {row['n_pass'] or 0:5d} pass  "
+            f"{row['n_fail'] or 0:4d} fail  ({row['n_total'] or 0} total)"
         )
     return 0
 
@@ -3559,6 +3682,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="terminal-friendly summary")
     p_status.add_argument("--format", choices=("text", "md", "sql"), default="text")
     p_status.set_defaults(func=cmd_status)
+
+    p_migrate = sub.add_parser(
+        "migrate",
+        help="lossless in-place schema migration (v3 → v4: rename "
+             "run_results.pass → mode, lower-case 'FAIL' verdicts). "
+             "Idempotent; back up results.sqlite first.",
+    )
+    p_migrate.set_defaults(func=cmd_migrate)
 
     p_track = sub.add_parser(
         "track",

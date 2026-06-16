@@ -72,7 +72,7 @@ pub struct DispatchedContainer {
 
 /// What a `drive` closure returns.
 pub struct DriveResult {
-    /// `"pass"` | `"FAIL"` | `"no_result"` | `"other"`.
+    /// `"pass"` | `"fail"` | `"no_result"` | `"other"`.
     pub verdict: &'static str,
     /// On non-`pass`: human-readable detail for the test failure
     /// message.
