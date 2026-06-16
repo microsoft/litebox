@@ -22,8 +22,8 @@ gate in `snapshot_fd_table()` (process.rs:3693–3699).
 ### Current acceptance gate
 
 ```
-FdClass::StdioFd | FdClass::Pipe                         → accepted
-FdClass::FilesystemFd  if terminal_meta.is_some()         → accepted
+FdKind::StdioFd | FdKind::Pipe                         → accepted
+FdKind::FilesystemFd  if terminal_meta.is_some()         → accepted
 _                                                         → REJECTED
 ```
 
@@ -174,14 +174,14 @@ This mirrors `pipe_pair_id()` (pipes.rs:274–288), which uses
 
 ```rust
 match class {
-    FdClass::StdioFd | FdClass::Pipe => {}
-    FdClass::FilesystemFd if terminal_meta.is_some() => {}
+    FdKind::StdioFd | FdKind::Pipe => {}
+    FdKind::FilesystemFd if terminal_meta.is_some() => {}
     // NEW: accept connected Unix sockets on stdio slots only
-    FdClass::UnixSocket if raw_fd <= 2 && socket_pair_id.is_some() => {}
+    FdKind::UnixSocket if raw_fd <= 2 && socket_pair_id.is_some() => {}
     // NEW: accept non-terminal FilesystemFd on stdio slots only
-    FdClass::FilesystemFd if raw_fd <= 2 => {}
+    FdKind::FilesystemFd if raw_fd <= 2 => {}
     _ => {
-        reject.push(UnsupportedFdClass { fd: raw_fd, class });
+        reject.push(UnsupportedFdKind { fd: raw_fd, class });
     }
 }
 ```
@@ -222,10 +222,10 @@ struct FdReplacement {
     guest_fd: usize,
     host_fd: i32,
     direction: ExternalFdDirection,
-    subsystem: ReplacedSubsystem,  // Pipe or UnixSocket
+    subsystem: replaced subsystem,  // Pipe or UnixSocket
 }
 
-enum ReplacedSubsystem { Pipe, UnixSocket }
+enum replaced subsystem { Pipe, UnixSocket }
 ```
 
 #### Fork-time capture
@@ -403,7 +403,7 @@ the open path and store it in the snapshot's `open_file_descriptions`
 vector (currently empty / TODO):
 
 ```rust
-if class == FdClass::FilesystemFd && raw_fd <= 2 && terminal_meta.is_none() {
+if class == FdKind::FilesystemFd && raw_fd <= 2 && terminal_meta.is_none() {
     if let Some(path) = files.fd_path(&typed_fd) {
         open_file_descriptions.push(OpenFileDescriptionSnapshot {
             object_id: typed_fd.object_id(),
@@ -419,7 +419,7 @@ stdio slots, look up the `reopen_path` from `open_file_descriptions`.  If
 available, reopen.  Otherwise, open `/dev/null`:
 
 ```rust
-FdClass::FilesystemFd if entry.fd <= 2
+FdKind::FilesystemFd if entry.fd <= 2
     && entry.metadata.host_stdio_source_fd.is_none()
     && !entry.metadata.is_host_tty_alias
     && !entry.metadata.is_host_pty_device =>

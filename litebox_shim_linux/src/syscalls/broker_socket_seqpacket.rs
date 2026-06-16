@@ -38,7 +38,7 @@ use litebox_platform_multiplex::Platform;
 
 use super::{
     broker_backed::{BrokerBackedCommon, broker_err_to_errno},
-    fork_snapshot::BrokerHandleSnapshot,
+    fork_snapshot::FdKind,
     unix::UnixSocketAddr,
 };
 
@@ -112,8 +112,8 @@ where
         );
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> BrokerHandleSnapshot {
-        BrokerHandleSnapshot::SocketSeqPacket {
+    pub(crate) fn fork_snapshot_handle(&self) -> FdKind {
+        FdKind::BrokerSocketSeqPacket {
             handle_id: self.handle(),
         }
     }

@@ -280,7 +280,7 @@ struct MmappedFile {
 
 type BrokerFdBridgeParsed = (
     usize,
-    litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot,
+    litebox_shim_linux::syscalls::fork_snapshot::FdKind,
     litebox::fs::OFlags,
 );
 
@@ -305,7 +305,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
     use litebox_common_linux::broker_pty_provider::BrokerPtyRole;
     use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
-    use litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot;
+    use litebox_shim_linux::syscalls::fork_snapshot::FdKind;
     let parts: Vec<&str> = spec.split(':').collect();
     if !(parts.len() == 3 || parts.len() == 4 || parts.len() == 5) {
         anyhow::bail!("broker-fd-bridge: bad spec {spec:?}");
@@ -323,57 +323,48 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     let (snapshot, bridge_flags) = match kind_str {
         "eventfd" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
-            (
-                BrokerHandleSnapshot::Eventfd { handle_id },
-                litebox::fs::OFlags::empty(),
-            )
+            (FdKind::Eventfd { handle_id }, litebox::fs::OFlags::empty())
         }
         "pidfd" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
-            (
-                BrokerHandleSnapshot::Pidfd { handle_id },
-                litebox::fs::OFlags::empty(),
-            )
+            (FdKind::Pidfd { handle_id }, litebox::fs::OFlags::empty())
         }
         "signalfd" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
-            (
-                BrokerHandleSnapshot::Signalfd { handle_id },
-                litebox::fs::OFlags::empty(),
-            )
+            (FdKind::Signalfd { handle_id }, litebox::fs::OFlags::empty())
         }
         "tcp_conn" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::TcpConn { handle_id },
+                FdKind::BrokerTcpConn { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
         "inet_listener" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::InetListener { handle_id },
+                FdKind::BrokerInetListener { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
         "inet_dgram" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::InetDgram { handle_id },
+                FdKind::BrokerInetDgram { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
         "socket_dgram" | "dgram" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::SocketDgram { handle_id },
+                FdKind::BrokerSocketDgram { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
         "socket_seqpacket" | "seqpacket" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::SocketSeqPacket { handle_id },
+                FdKind::BrokerSocketSeqPacket { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
@@ -394,7 +385,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
                 );
             }
             (
-                BrokerHandleSnapshot::Pipe {
+                FdKind::BrokerPipe {
                     handle_id,
                     direction,
                 },
@@ -420,7 +411,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
                 ),
             };
             (
-                BrokerHandleSnapshot::UnixSocket {
+                FdKind::BrokerSocketPair {
                     handle_id,
                     endpoint,
                 },
@@ -446,7 +437,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
                 None => None,
             };
             (
-                BrokerHandleSnapshot::Pty {
+                FdKind::BrokerPty {
                     handle_id,
                     role,
                     pty_id,
@@ -2202,7 +2193,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             .entrypoints
                             .install_broker_bridge_fd(
                                 read_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: read_handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
                                 },
@@ -2239,7 +2230,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             .entrypoints
                             .install_broker_bridge_fd(
                                 read_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: read_handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
                                 },
@@ -2250,7 +2241,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             .entrypoints
                             .install_broker_bridge_fd(
                                 write_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: write_handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
                                 },
@@ -2271,7 +2262,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             let r_flags = pipe_nonblock_oflags(r_flags_bits);
                             let _ = program.entrypoints.install_broker_bridge_fd(
                                 read_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
                                 },
@@ -2291,7 +2282,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             let w_flags = pipe_nonblock_oflags(w_flags_bits);
                             let _ = program.entrypoints.install_broker_bridge_fd(
                                 write_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
                                 },
