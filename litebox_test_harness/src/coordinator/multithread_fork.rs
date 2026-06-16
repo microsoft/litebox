@@ -63,12 +63,12 @@
 //! and join cleanly. A litebox hang manifests as the handler never
 //! returning, which the per-test timeout converts to a FAIL.
 //!
-//! ## Observed litebox repro (as of authoring)
+//! ## Observed litebox repro
 //!
-//! With `N_PARK = 48`, `ITERS = 80`, the hang reproduces on exactly the
-//! node profile: **`MTF.futex_cond.{posix_spawn,posix_spawn_uds}.dng`**
-//! — i.e. `posix_spawn` (CLONE_VFORK), `NonPieGlibc` parent, siblings
-//! parked purely in `futex`. The control legs isolate every factor:
+//! The hang reproduces on exactly the node profile:
+//! **`MTF.futex_cond.{posix_spawn,posix_spawn_uds}.dng`** — i.e.
+//! `posix_spawn` (CLONE_VFORK), `NonPieGlibc` parent, siblings parked
+//! purely in `futex`. The control legs isolate every factor:
 //! `fork_exit`/`fork_exec` (plain `fork`, not vfork) pass; `dpg`/`spg`
 //! (PIE-glibc / static-PIE-glibc parents) pass; `mixed`/`epoll_eventfd`
 //! parking pass. So the trigger is precisely
@@ -76,9 +76,14 @@
 //!
 //! It is an **intermittent** deadlock (a quiesce race), faithful to the
 //! real node hang, which forked some children successfully before
-//! wedging. It fires ~deterministically under the dashboard's parallel
-//! load and ~3-of-4 in single isolation; the parked-sibling count
-//! (`N_PARK`) is the knob that widens the quiesce window. Native is the
+//! wedging. `N_PARK` (parked-sibling count) is the quiesce-pressure
+//! knob: it is deliberately kept **low** so that only the genuine,
+//! most-susceptible config deadlocks under the integration suite's
+//! normal parallel load while every control leg stays green — a clean
+//! 2-config signal rather than a flood of load-induced timeout flakes.
+//! Cranking `N_PARK` high makes the repro fire in single isolation too,
+//! but also drags the control legs past the deadline under parallel
+//! load (≈25/36 red), drowning the signal — so don't. Native is the
 //! gold standard — it must always pass; a litebox hang here is the
 //! minimal repro of the VS Code Remote-SSH reconnect loop and the
 //! target of the fork-restore / delayed-fork fix.
@@ -210,11 +215,19 @@ const fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
 /// window where the `CLONE_VFORK` + futex-parked-sibling deadlock
 /// lives, so the repro fires deterministically in isolation rather
 /// than only under parallel-sweep load.
-const N_PARK: usize = 48;
+/// Sibling threads parked at the instant of each fork. node presents
+/// ~6 (1 epoll event-loop helper + a 4-wide libuv threadpool + V8
+/// platform workers). Kept deliberately **low**: it is the
+/// quiesce-pressure knob, and a low value means only the genuine,
+/// most-susceptible config (`futex_cond × posix_spawn × dng`)
+/// deadlocks under the suite's parallel load while every control leg
+/// stays green. Raising it makes the repro fire in single isolation
+/// but drags controls past the deadline under load (flake flood).
+const N_PARK: usize = 8;
 /// Forks per test. Each fork must individually quiesce the parked
-/// siblings; looping widens the race window for an intermittent
+/// siblings; looping widens the race window for the intermittent
 /// quiesce deadlock without inflating the test count.
-const ITERS: usize = 80;
+const ITERS: usize = 40;
 
 // ─── Handler types ──────────────────────────────────────────────────
 
