@@ -65,6 +65,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
     }
     #[cfg(not(feature = "worker_local_inet"))]
     let _ = tun_device_name;
+    super::test_broker_sockets::install_test_broker_socket_providers();
     task
 }
 
