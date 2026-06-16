@@ -205,4 +205,3 @@ litebox_tool_executor/rootfs/litebox_syscall_rewriter
 # pty-marker investigation artifacts (local only, do not commit)
 /_investigation/
 /audit-out/
-/docs/copilot-pty-marker-divergence.md
