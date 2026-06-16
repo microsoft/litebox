@@ -364,27 +364,38 @@ impl InetDgramState {
         thread::Builder::new()
             .name("litebox-dns-forward".into())
             .spawn(move || {
-                let Ok(forwarder) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
-                else {
+                let forwarder = match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+                {
+                    Ok(forwarder) => forwarder,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "DNS forwarder UDP bind failed");
+                        return;
+                    }
+                };
+                if let Err(err) = forwarder.set_read_timeout(Some(DNS_FORWARD_TIMEOUT)) {
+                    tracing::warn!(error = %err, "DNS forwarder set_read_timeout failed");
                     return;
                 };
-                if forwarder
-                    .set_read_timeout(Some(DNS_FORWARD_TIMEOUT))
-                    .is_err()
-                {
-                    return;
-                }
-                if forwarder.send_to(&query, host_dns).is_err() {
+                if let Err(err) = forwarder.send_to(&query, host_dns) {
+                    tracing::warn!(error = %err, %host_dns, "DNS forwarder UDP send_to failed");
                     return;
                 }
 
                 let mut response = vec![0u8; UDP_RECV_BUF_LEN];
-                let Ok((len, _)) = forwarder.recv_from(&mut response) else {
-                    return;
+                let (len, _) = match forwarder.recv_from(&mut response) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tracing::warn!(error = %err, %host_dns, "DNS forwarder UDP recv_from failed");
+                        return;
+                    }
                 };
                 response.truncate(len);
                 if let Some(state) = state.upgrade() {
-                    let _ = state.enqueue_datagram(response, virtual_peer);
+                    if let Err(err) = state.enqueue_datagram(response, virtual_peer) {
+                        tracing::warn!(error = %err, %virtual_peer, "DNS forwarder enqueue failed");
+                    }
+                } else {
+                    tracing::warn!("DNS forwarder state dropped before response enqueue");
                 }
             })?;
         Ok(payload.len())
@@ -462,7 +473,7 @@ impl StateObject for InetDgramState {
     }
 }
 
-fn is_broker_dns_service(peer: SocketAddr) -> bool {
+pub(crate) fn is_broker_dns_service(peer: SocketAddr) -> bool {
     matches!(peer, SocketAddr::V4(addr) if *addr.ip() == BROKER_DNS_ADDR && addr.port() == DNS_PORT)
 }
 
