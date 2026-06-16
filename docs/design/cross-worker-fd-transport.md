@@ -84,9 +84,9 @@ SCM_RIGHTS data, so any test that fork-migrates a worker holding
 SCM_RIGHTS-carrying sockets fails. (Few tests hit this directly today; it
 is a correctness blocker.)
 
-`replaced subsystem` (`shim_linux/lib.rs`):
+`ReplacedSubsystem` (`shim_linux/lib.rs`):
 ```rust
-enum replaced subsystem {
+enum ReplacedSubsystem {
     Pipe,
     UnixSocket,
     Pty,
@@ -196,7 +196,7 @@ where `passed_fds` falls off the message during cross-worker delivery.
 ### Acceptance gate notes
 
 `process.rs::snapshot_fd_table` (lines 7008-7047) **already accepts**
-`FdKind::UnixSocket` unconditionally. The `expanded-fd-support-delayed-fork.md`
+`FdClass::UnixSocket` unconditionally. The `expanded-fd-support-delayed-fork.md`
 doc that said UnixSocket was rejected is stale; the wave-3-era work
 broadened the gate. The remaining gates in the existing UnixSocket
 bridge: bidirectional-conflict rejection (`process.rs:5260-5286`), and
@@ -209,7 +209,7 @@ The stdio fds (0, 1, 2) have heavily branched handling in
 
 - `host_stdio_source_fd` metadata identifies fds aliased to the original
   host stdio descriptors (e.g. `dup2(1, 2)`). The classifier prefers
-  `FdKind::StdioFd` over `FdKind::FilesystemFd` when the slot is 0/1/2
+  `FdClass::StdioFd` over `FdClass::FilesystemFd` when the slot is 0/1/2
   and `object_id` matches the host stdio OID.
 - The wave-3 fs-parent-open bridge (`process.rs:5786-5827`) explicitly
   excludes any entry with `host_stdio_source_fd.is_some()` — stdio is

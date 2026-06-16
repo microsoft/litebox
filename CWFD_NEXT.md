@@ -38,7 +38,7 @@ handle when migrating across workers:
    broker handle. Record the handle ID in `FdEntrySnapshot`
    alongside the existing fields.
 
-2. At restore time, for `FdKind::EventFd` entries with a recorded
+2. At restore time, for `FdClass::EventFd` entries with a recorded
    broker pidfd handle, construct an
    `EventFileInner::PidfdBrokerBacked { provider, handle, common }`
    using the worker-side `broker_pidfd_provider()` and the
