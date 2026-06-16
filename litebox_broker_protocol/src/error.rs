@@ -21,8 +21,6 @@ pub enum ErrorCode {
     PolicyDenied,
     /// The referenced object does not exist.
     UnknownObject,
-    /// The referenced object generation is stale.
-    StaleHandle,
     /// The referenced object type does not match the operation.
     WrongObjectType,
     /// The caller lacks the required broker rights.
@@ -42,8 +40,8 @@ impl ErrorCode {
     /// Raw error values are part of the broker wire ABI; do not renumber
     /// assigned values.
     ///
-    /// Values `0` and `1` remain unassigned so null/default-looking values never
-    /// represent concrete broker errors.
+    /// Values `0`, `1`, and `6` remain unassigned so null/default-looking values
+    /// never represent concrete broker errors and retired values are not reused.
     ///
     /// Converts a raw protocol error code to an error category.
     pub const fn from_raw(raw: u16) -> Self {
@@ -55,7 +53,6 @@ impl ErrorCode {
             12 => Self::Internal,
             4 => Self::PolicyDenied,
             5 => Self::UnknownObject,
-            6 => Self::StaleHandle,
             7 => Self::WrongObjectType,
             8 => Self::InvalidRights,
             9 => Self::ResourceExhausted,
@@ -74,7 +71,6 @@ impl ErrorCode {
             Self::Internal => 12,
             Self::PolicyDenied => 4,
             Self::UnknownObject => 5,
-            Self::StaleHandle => 6,
             Self::WrongObjectType => 7,
             Self::InvalidRights => 8,
             Self::ResourceExhausted => 9,
@@ -94,7 +90,6 @@ impl fmt::Display for ErrorCode {
             Self::Internal => f.write_str("internal broker error"),
             Self::PolicyDenied => f.write_str("broker policy denied the operation"),
             Self::UnknownObject => f.write_str("unknown broker object"),
-            Self::StaleHandle => f.write_str("stale broker handle"),
             Self::WrongObjectType => f.write_str("wrong broker object type"),
             Self::InvalidRights => f.write_str("invalid broker rights"),
             Self::ResourceExhausted => f.write_str("broker resource exhausted"),

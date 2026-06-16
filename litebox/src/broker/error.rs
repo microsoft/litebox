@@ -50,10 +50,9 @@ impl From<BrokerControlError> for BrokerObjectError {
 impl From<ErrorCode> for BrokerObjectError {
     fn from(error: ErrorCode) -> Self {
         match error {
-            ErrorCode::InvalidRights
-            | ErrorCode::UnknownObject
-            | ErrorCode::WrongObjectType
-            | ErrorCode::StaleHandle => Self::InvalidObject,
+            ErrorCode::InvalidRights | ErrorCode::UnknownObject | ErrorCode::WrongObjectType => {
+                Self::InvalidObject
+            }
             ErrorCode::WouldBlock => Self::WouldBlock,
             ErrorCode::ResourceExhausted => Self::ResourceExhausted,
             _ => Self::Internal,

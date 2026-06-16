@@ -164,8 +164,8 @@ mod tests {
     use crate::{
         AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse, CoreRequest,
         CoreResponse, CreateEventRequest, CreateEventResponse, EventConsumeMode, EventRequest,
-        EventResponse, ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId, ProtocolVersion,
-        ReadinessState, WaitEventRequest, WaitEventResponse, WaitOutcome,
+        EventResponse, ObjectHandle, ObjectReferenceId, ProtocolVersion, ReadinessState,
+        WaitEventRequest, WaitEventResponse, WaitOutcome,
     };
 
     #[test]
@@ -298,10 +298,7 @@ mod tests {
     }
 
     const fn sample_handle() -> ObjectHandle {
-        ObjectHandle::new(
-            ObjectReferenceId::new(13),
-            ObjectReferenceGeneration::new(14),
-        )
+        ObjectHandle::new(ObjectReferenceId::new(13))
     }
 
     const fn event_request(request: EventRequest) -> BrokerRequest {

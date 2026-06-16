@@ -4,7 +4,7 @@
 //! Broker authority core independent of protocol envelopes and channels.
 //!
 //! `litebox_broker_core` owns broker-side object identity, reference lifetime,
-//! rights checks, reference generation checks, and policy calls. It may use
+//! rights checks, handle validity checks, and policy calls. It may use
 //! shared semantic DTOs from `litebox_broker_protocol` for values that both the
 //! local core and broker understand, such as handles and readiness state. It
 //! deliberately has no dependency on protocol envelopes, channel traits, wire
@@ -13,7 +13,6 @@
 
 #![no_std]
 
-extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
@@ -23,13 +22,13 @@ mod identity;
 mod object;
 mod policy;
 
-use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use slotmap::SlotMap;
 
 pub use error::BrokerError;
 pub use identity::{BrokerAssociation, CallerCredential};
-use litebox_broker_protocol::ObjectReferenceId;
-use object::{ObjectEntry, ObjectId, ObjectReference};
+use object::{ObjectEntry, ObjectId, ObjectReference, ObjectReferenceKey};
 pub use object::{ObjectRights, ObjectType};
 pub use policy::{ObjectOperation, PolicyDecision, PolicyEngine, PolicyOperation, PolicyProfile};
 
@@ -68,6 +67,8 @@ impl Default for BrokerCoreLimits {
     }
 }
 
+const MAX_SLOTMAP_ENTRIES: usize = u32::MAX as usize - 1;
+
 /// Channel-independent broker authority state.
 ///
 /// A broker process may construct only one broker core for its process
@@ -77,10 +78,8 @@ pub struct BrokerCore {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     next_process_id: u64,
-    next_object_id: u64,
-    next_reference_id: u64,
-    objects: BTreeMap<ObjectId, ObjectEntry>,
-    references: BTreeMap<ObjectReferenceId, ObjectReference>,
+    objects: SlotMap<ObjectId, ObjectEntry>,
+    references: SlotMap<ObjectReferenceKey, ObjectReference>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -93,6 +92,10 @@ impl BrokerCore {
 
     /// Creates the broker core with explicit authority-state limits.
     pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Result<Self> {
+        if limits.max_objects > MAX_SLOTMAP_ENTRIES || limits.max_references > MAX_SLOTMAP_ENTRIES {
+            return Err(BrokerError::ResourceExhausted);
+        }
+
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
@@ -101,22 +104,14 @@ impl BrokerCore {
             policy,
             limits,
             next_process_id: 1,
-            next_object_id: 1,
-            next_reference_id: 1,
-            objects: BTreeMap::new(),
-            references: BTreeMap::new(),
+            objects: SlotMap::with_key(),
+            references: SlotMap::with_key(),
         })
     }
 }
 
-const EXHAUSTED_ID: u64 = 0;
-
 fn allocate_id(next_id: &mut u64) -> Result<u64> {
-    if *next_id == EXHAUSTED_ID {
-        return Err(BrokerError::ResourceExhausted);
-    }
-
     let id = *next_id;
-    *next_id = id.checked_add(1).unwrap_or(EXHAUSTED_ID);
+    *next_id = id.checked_add(1).ok_or(BrokerError::ResourceExhausted)?;
     Ok(id)
 }

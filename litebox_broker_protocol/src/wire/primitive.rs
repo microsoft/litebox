@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId, ProtocolVersion};
+use crate::{ObjectHandle, ObjectReferenceId, ProtocolVersion};
 
 use super::WireError;
 
@@ -40,7 +40,6 @@ impl Encoder {
 
     pub(super) fn handle(&mut self, handle: ObjectHandle) {
         self.u64(handle.reference_id.get());
-        self.u64(handle.reference_generation.get());
     }
 }
 
@@ -93,9 +92,7 @@ impl<'a> Decoder<'a> {
 
     pub(super) fn handle(&mut self) -> Result<ObjectHandle, WireError> {
         let reference_id = ObjectReferenceId::new(self.u64()?);
-        let reference_generation = ObjectReferenceGeneration::new(self.u64()?);
-
-        Ok(ObjectHandle::new(reference_id, reference_generation))
+        Ok(ObjectHandle::new(reference_id))
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], WireError> {

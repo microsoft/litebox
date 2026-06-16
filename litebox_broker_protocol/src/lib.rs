@@ -32,7 +32,7 @@ pub use event::{
 pub use message::{
     BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,
 };
-pub use object::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
+pub use object::{ObjectHandle, ObjectReferenceId};
 
 /// Major/minor broker protocol version.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
