@@ -3,7 +3,10 @@
 
 use alloc::collections::btree_map::BTreeMap;
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
-use core::{marker::PhantomData, mem::size_of};
+use core::{
+    marker::PhantomData,
+    mem::{align_of, size_of},
+};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox::{
@@ -23,12 +26,12 @@ use rangemap::RangeMap;
 use thiserror::Error;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
-use crate::ShimFS;
 use crate::nt_types::{
     ClientId, PebBitField, ProcessEnvironmentBlock, RtlUserProcFlags, RtlUserProcessParameters,
     ThreadEnvironmentBlock, UnicodeString, X64Context,
 };
 use crate::syscalls::mm::{MemoryType, PageProtection};
+use crate::{MutPtr, ShimFS};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
@@ -41,10 +44,12 @@ const CSR_SERVER_DLL_MAX: usize = 4;
 const BASESRV_SERVERDLL_INDEX: usize = 1;
 const WINDOWS_DIRECTORY: &str = r"C:\Windows";
 const WINDOWS_SYSTEM_DIRECTORY: &str = r"C:\Windows\System32";
-const WINDOWS_OS_MAJOR_VERSION: u32 = 10;
-const WINDOWS_OS_MINOR_VERSION: u32 = 0;
+const WINDOWS_NAMED_OBJECT_DIRECTORY: &str = r"\BaseNamedObjects";
+const WINDOWS_OS_MAJOR_VERSION: u16 = 10;
+const WINDOWS_OS_MINOR_VERSION: u16 = 0;
 const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
 const WINDOWS_OS_PLATFORM_WIN32_NT: u32 = 2;
+const WINDOWS_TIME_ZONE_ID_INVALID: u32 = u32::MAX;
 const WINDOWS_CRITICAL_SECTION_TIMEOUT_100NS: i64 = -150 * 10_000_000;
 const WINDOWS_HEAP_SEGMENT_RESERVE: u64 = 1024 * 1024;
 const WINDOWS_HEAP_SEGMENT_COMMIT: u64 = 2 * PAGE_SIZE as u64;
@@ -53,6 +58,16 @@ const WINDOWS_HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD: u64 = PAGE_SIZE as u64;
 const WINDOWS_NT_TIB_VERSION: usize = 30 << 8;
 const INITIAL_PROCESS_ID: usize = 1;
 const INITIAL_THREAD_ID: usize = 1;
+
+macro_rules! write_static_server_data_field {
+    ($platform:ty, $base:expr, $field:ident, $value:expr $(,)?) => {
+        crate::write_field_at_offset::<$platform, _, _>(
+            $base,
+            core::mem::offset_of!(BaseStaticServerData, $field),
+            $value,
+        )
+    };
+}
 
 pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
@@ -290,37 +305,55 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         process_parameters.environment = environment_ptr;
         process_parameters.environment_size =
             u64::try_from(environment_size).map_err(|_| PeImageAccessError::AddressOverflow)?;
-        let mut process_parameter_tail = process_parameters_ptr
-            .checked_add(size_of::<RtlUserProcessParameters>())
-            .ok_or(PeImageAccessError::AddressOverflow)?;
-        process_parameters.current_directory.dos_path = write_tail_utf16_string::<Platform>(
-            &mut process_parameter_tail,
+        let mut process_parameters_allocation =
+            GuestMemoryAllocator::new(process_parameters_ptr, process_parameters_length)?;
+        let guest_process_parameters =
+            process_parameters_allocation.allocate::<Platform, RtlUserProcessParameters>()?;
+        process_parameters.current_directory.dos_path = allocate_guest_unicode_string::<Platform>(
+            &mut process_parameters_allocation,
             &current_directory_path,
         )?;
-        process_parameters.dll_path =
-            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &dll_path)?;
-        process_parameters.image_path_name =
-            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &image_path_name)?;
-        process_parameters.command_line =
-            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &command_line)?;
-        process_parameters.window_title =
-            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &window_title)?;
-        process_parameters.desktop_info =
-            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &desktop_info)?;
-        process_parameters.shell_info =
-            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &shell_info)?;
-        process_parameters.runtime_data =
-            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &runtime_data)?;
-        process_parameters.redirection_dll_name = write_tail_utf16_string::<Platform>(
-            &mut process_parameter_tail,
+        process_parameters.dll_path = allocate_guest_unicode_string::<Platform>(
+            &mut process_parameters_allocation,
+            &dll_path,
+        )?;
+        process_parameters.image_path_name = allocate_guest_unicode_string::<Platform>(
+            &mut process_parameters_allocation,
+            &image_path_name,
+        )?;
+        process_parameters.command_line = allocate_guest_unicode_string::<Platform>(
+            &mut process_parameters_allocation,
+            &command_line,
+        )?;
+        process_parameters.window_title = allocate_guest_unicode_string::<Platform>(
+            &mut process_parameters_allocation,
+            &window_title,
+        )?;
+        process_parameters.desktop_info = allocate_guest_unicode_string::<Platform>(
+            &mut process_parameters_allocation,
+            &desktop_info,
+        )?;
+        process_parameters.shell_info = allocate_guest_unicode_string::<Platform>(
+            &mut process_parameters_allocation,
+            &shell_info,
+        )?;
+        process_parameters.runtime_data = allocate_guest_unicode_string::<Platform>(
+            &mut process_parameters_allocation,
+            &runtime_data,
+        )?;
+        process_parameters.redirection_dll_name = allocate_guest_unicode_string::<Platform>(
+            &mut process_parameters_allocation,
             &redirection_dll_name,
         )?;
-        crate::write_value::<Platform, _>(process_parameters_ptr, process_parameters)
+        guest_process_parameters
+            .write_at_offset(0, process_parameters)
             .ok_or(PeImageAccessError::MemoryAccess)?;
 
         let read_only_shared_memory_base = create_pages(WINDOWS_SHARED_SECTION_SIZE)?;
+        let mut shared_heap =
+            GuestMemoryAllocator::new(read_only_shared_memory_base, WINDOWS_SHARED_SECTION_SIZE)?;
         let read_only_static_server_data =
-            initialize_windows_static_server_data::<Platform>(read_only_shared_memory_base)?;
+            initialize_windows_static_server_data::<Platform>(&mut shared_heap)?;
         let mut peb = ProcessEnvironmentBlock::new_zeroed();
         peb.image_base_address = input.image_base_address;
         if input.image_base_address != input.image.image_base() || input.image.has_dynamic_base() {
@@ -348,8 +381,8 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         peb.process_heaps = process_heaps.address;
         peb.loader_lock = loader_lock;
         peb.active_process_affinity_mask = 1;
-        peb.os_major_version = WINDOWS_OS_MAJOR_VERSION;
-        peb.os_minor_version = WINDOWS_OS_MINOR_VERSION;
+        peb.os_major_version = u32::from(WINDOWS_OS_MAJOR_VERSION);
+        peb.os_minor_version = u32::from(WINDOWS_OS_MINOR_VERSION);
         peb.os_build_number = WINDOWS_OS_BUILD_NUMBER;
         peb.os_platform_id = WINDOWS_OS_PLATFORM_WIN32_NT;
         peb.image_subsystem = u32::from(input.image.subsystem());
@@ -390,68 +423,96 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
 }
 
 fn initialize_windows_static_server_data<Platform: RawPointerProvider>(
-    read_only_shared_memory_base: usize,
+    shared_heap: &mut GuestMemoryAllocator,
 ) -> Result<usize, PeImageAccessError> {
     let read_only_static_server_data =
-        SyntheticReadOnlySharedMemory::static_server_data_table_address(
-            read_only_shared_memory_base,
-        )?;
+        shared_heap.allocate_array::<Platform, usize>(CSR_SERVER_DLL_MAX)?;
     let client_base_static_server_data =
-        SyntheticReadOnlySharedMemory::base_static_server_data_address(
-            read_only_shared_memory_base,
-        )?;
-    initialize_static_server_data::<Platform>(
-        read_only_static_server_data,
-        client_base_static_server_data,
-    )?;
-    Ok(read_only_static_server_data)
+        shared_heap.allocate::<Platform, BaseStaticServerData>()?;
+    initialize_static_server_data::<Platform>(shared_heap, client_base_static_server_data)?;
+
+    read_only_static_server_data
+        .write_at_offset(
+            BASESRV_SERVERDLL_INDEX.cast_signed(),
+            client_base_static_server_data.as_usize(),
+        )
+        .ok_or(PeImageAccessError::MemoryAccess)?;
+    Ok(read_only_static_server_data.as_usize())
 }
 
 fn initialize_static_server_data<Platform: RawPointerProvider>(
-    static_server_data_table: usize,
-    base_static_server_data: usize,
+    shared_heap: &mut GuestMemoryAllocator,
+    base_static_server_data: MutPtr<Platform, BaseStaticServerData>,
 ) -> Result<(), PeImageAccessError> {
-    for server_index in [0, BASESRV_SERVERDLL_INDEX] {
-        let entry =
-            SyntheticStaticServerDataTable::entry_address(static_server_data_table, server_index)?;
-        crate::write_value::<Platform, _>(entry, base_static_server_data)
-            .ok_or(PeImageAccessError::MemoryAccess)?;
-    }
-
-    write_static_server_unicode_string::<Platform>(
-        SyntheticBaseStaticServerData::windows_directory_address(base_static_server_data)?,
-        SyntheticBaseStaticServerData::windows_directory_string_address(base_static_server_data)?,
-        WINDOWS_DIRECTORY,
+    let windows_directory =
+        allocate_guest_unicode_string_from_str::<Platform>(shared_heap, WINDOWS_DIRECTORY)?;
+    write_static_server_data_field!(
+        Platform,
+        base_static_server_data,
+        windows_directory,
+        windows_directory,
+    )
+    .ok_or(PeImageAccessError::MemoryAccess)?;
+    let windows_system_directory =
+        allocate_guest_unicode_string_from_str::<Platform>(shared_heap, WINDOWS_SYSTEM_DIRECTORY)?;
+    write_static_server_data_field!(
+        Platform,
+        base_static_server_data,
+        windows_system_directory,
+        windows_system_directory,
+    )
+    .ok_or(PeImageAccessError::MemoryAccess)?;
+    let named_object_directory = allocate_guest_unicode_string_from_str::<Platform>(
+        shared_heap,
+        WINDOWS_NAMED_OBJECT_DIRECTORY,
     )?;
-    write_static_server_unicode_string::<Platform>(
-        SyntheticBaseStaticServerData::system_directory_address(base_static_server_data)?,
-        SyntheticBaseStaticServerData::system_directory_string_address(base_static_server_data)?,
-        WINDOWS_SYSTEM_DIRECTORY,
-    )?;
+    write_static_server_data_field!(
+        Platform,
+        base_static_server_data,
+        named_object_directory,
+        named_object_directory,
+    )
+    .ok_or(PeImageAccessError::MemoryAccess)?;
+    write_static_server_data_field!(
+        Platform,
+        base_static_server_data,
+        windows_major_version,
+        WINDOWS_OS_MAJOR_VERSION,
+    )
+    .ok_or(PeImageAccessError::MemoryAccess)?;
+    write_static_server_data_field!(
+        Platform,
+        base_static_server_data,
+        windows_minor_version,
+        WINDOWS_OS_MINOR_VERSION,
+    )
+    .ok_or(PeImageAccessError::MemoryAccess)?;
+    write_static_server_data_field!(
+        Platform,
+        base_static_server_data,
+        build_number,
+        WINDOWS_OS_BUILD_NUMBER,
+    )
+    .ok_or(PeImageAccessError::MemoryAccess)?;
 
-    let rebase_anchor =
-        SyntheticBaseStaticServerData::rebase_anchor_address(base_static_server_data)?;
-    crate::write_value::<Platform, _>(rebase_anchor, base_static_server_data)
-        .ok_or(PeImageAccessError::MemoryAccess)
-}
-
-fn write_static_server_unicode_string<Platform: RawPointerProvider>(
-    string_address: usize,
-    buffer: usize,
-    value: &str,
-) -> Result<(), PeImageAccessError> {
-    let string = Utf16StringBuffer::new(value)?;
-    crate::write_slice::<Platform, _>(buffer, &string.units)
-        .ok_or(PeImageAccessError::MemoryAccess)?;
-
-    let unicode_string = UnicodeString {
-        length: string.length,
-        maximum_length: string.maximum_length,
-        padding_0: [0; 4],
-        buffer,
-    };
-    crate::write_value::<Platform, _>(string_address, unicode_string)
-        .ok_or(PeImageAccessError::MemoryAccess)
+    let ini_file_mapping = shared_heap
+        .allocate::<Platform, IniFileMapping>()?
+        .as_usize();
+    write_static_server_data_field!(
+        Platform,
+        base_static_server_data,
+        ini_file_mapping,
+        ini_file_mapping,
+    )
+    .ok_or(PeImageAccessError::MemoryAccess)?;
+    write_static_server_data_field!(
+        Platform,
+        base_static_server_data,
+        termsrv_client_time_zone_id,
+        WINDOWS_TIME_ZONE_ID_INVALID,
+    )
+    .ok_or(PeImageAccessError::MemoryAccess)?;
+    Ok(())
 }
 
 fn register_image_virtual_allocation<Platform: crate::ShimPlatform>(
@@ -533,93 +594,216 @@ impl RtlCriticalSection {
     }
 }
 
-#[repr(C)]
-struct SyntheticReadOnlySharedMemory {
-    _padding_to_static_server_data_table:
-        [u8; SyntheticReadOnlySharedMemory::STATIC_SERVER_DATA_TABLE_PADDING_BYTES],
-    static_server_data_table: SyntheticStaticServerDataTable,
-    base_static_server_data: SyntheticBaseStaticServerData,
+struct GuestMemoryAllocator {
+    cursor: usize,
+    end: usize,
 }
 
-impl SyntheticReadOnlySharedMemory {
-    const STATIC_SERVER_DATA_TABLE_PADDING_BYTES: usize = 0x750;
-    const STATIC_SERVER_DATA_TABLE_OFFSET: usize =
-        core::mem::offset_of!(Self, static_server_data_table);
-    const BASE_STATIC_SERVER_DATA_OFFSET: usize =
-        core::mem::offset_of!(Self, base_static_server_data);
-
-    fn static_server_data_table_address(base: usize) -> Result<usize, PeImageAccessError> {
-        checked_add(base, Self::STATIC_SERVER_DATA_TABLE_OFFSET)
+impl GuestMemoryAllocator {
+    fn new(base: usize, size: usize) -> Result<Self, PeImageAccessError> {
+        let cursor = base;
+        let end = checked_add(base, size)?;
+        if cursor > end {
+            return Err(PeImageAccessError::AddressOverflow);
+        }
+        Ok(Self { cursor, end })
     }
 
-    fn base_static_server_data_address(base: usize) -> Result<usize, PeImageAccessError> {
-        checked_add(base, Self::BASE_STATIC_SERVER_DATA_OFFSET)
+    fn allocate<Platform, T>(&mut self) -> Result<MutPtr<Platform, T>, PeImageAccessError>
+    where
+        Platform: RawPointerProvider,
+        T: FromBytes + IntoBytes,
+    {
+        self.allocate_array::<Platform, T>(1)
+    }
+
+    fn allocate_array<Platform, T>(
+        &mut self,
+        count: usize,
+    ) -> Result<MutPtr<Platform, T>, PeImageAccessError>
+    where
+        Platform: RawPointerProvider,
+        T: FromBytes + IntoBytes,
+    {
+        let address = self.allocate_bytes(checked_mul(size_of::<T>(), count)?, align_of::<T>())?;
+        Ok(MutPtr::<Platform, T>::from_usize(address))
+    }
+
+    fn allocate_bytes(
+        &mut self,
+        size: usize,
+        alignment: usize,
+    ) -> Result<usize, PeImageAccessError> {
+        debug_assert!(alignment.is_power_of_two());
+        let address = self.cursor.checked_next_multiple_of(alignment).ok_or(PeImageAccessError::AddressOverflow)?;
+        let cursor = checked_add(address, size)?;
+        if cursor > self.end {
+            return Err(PeImageAccessError::AddressOverflow);
+        }
+        self.cursor = cursor;
+        Ok(address)
     }
 }
 
+// Reference layout from ReactOS `sdk/include/reactos/subsys/win/base.h`.
 #[repr(C)]
-struct SyntheticStaticServerDataTable {
-    entries: [usize; CSR_SERVER_DLL_MAX],
-}
-
-impl SyntheticStaticServerDataTable {
-    fn entry_address(table: usize, server_index: usize) -> Result<usize, PeImageAccessError> {
-        checked_add(table, checked_mul(server_index, size_of::<usize>())?)
-    }
-}
-
-#[repr(C)]
-struct SyntheticBaseStaticServerData {
+#[derive(FromBytes, IntoBytes)]
+struct BaseStaticServerData {
     windows_directory: UnicodeString,
-    system_directory: UnicodeString,
-    _padding_to_rebase_anchor: [u8; SyntheticBaseStaticServerData::REBASE_ANCHOR_LAYOUT_OFFSET
-        - 2 * size_of::<UnicodeString>()],
-    rebase_anchor: usize,
-    _padding_to_windows_directory_string: [u8;
-        SyntheticBaseStaticServerData::WINDOWS_DIRECTORY_STRING_LAYOUT_OFFSET
-            - SyntheticBaseStaticServerData::REBASE_ANCHOR_LAYOUT_OFFSET
-            - size_of::<usize>()],
-    windows_directory_string: [u8;
-        SyntheticBaseStaticServerData::SYSTEM_DIRECTORY_STRING_LAYOUT_OFFSET
-            - SyntheticBaseStaticServerData::WINDOWS_DIRECTORY_STRING_LAYOUT_OFFSET],
-    system_directory_string: [u8; SyntheticBaseStaticServerData::SYSTEM_DIRECTORY_STRING_BYTES],
+    windows_system_directory: UnicodeString,
+    named_object_directory: UnicodeString,
+    windows_major_version: u16,
+    windows_minor_version: u16,
+    build_number: u16,
+    csd_number: u16,
+    rc_number: u16,
+    csd_version: [u16; 128],
+    padding_0: [u8; 6],
+    sys_info: SystemBasicInformation,
+    time_of_day: SystemTimeOfDayInformation,
+    ini_file_mapping: usize,
+    nls_user_info: NlsUserInfo,
+    default_separate_vdm: u8,
+    is_wow_task_ready: u8,
+    padding_1: [u8; 6],
+    windows_sys32_x86_directory: UnicodeString,
+    f_termsrv_app_install_mode: u8,
+    padding_2: [u8; 3],
+    tzi_termsrv_client_time_zone: TimeZoneInformation,
+    kt_termsrv_client_bias: KSystemTime,
+    termsrv_client_time_zone_id: u32,
+    luid_device_maps_enabled: u8,
+    padding_3: [u8; 3],
+    termsrv_client_time_zone_change_num: u32,
 }
 
-impl SyntheticBaseStaticServerData {
-    const REBASE_ANCHOR_LAYOUT_OFFSET: usize = 0x9e8;
-    const WINDOWS_DIRECTORY_STRING_LAYOUT_OFFSET: usize = 0xa00;
-    const SYSTEM_DIRECTORY_STRING_LAYOUT_OFFSET: usize = 0xa40;
-    const SYSTEM_DIRECTORY_STRING_BYTES: usize = 0x40;
-    const WINDOWS_DIRECTORY_OFFSET: usize = core::mem::offset_of!(Self, windows_directory);
-    const SYSTEM_DIRECTORY_OFFSET: usize = core::mem::offset_of!(Self, system_directory);
-    const REBASE_ANCHOR_OFFSET: usize = core::mem::offset_of!(Self, rebase_anchor);
-    const WINDOWS_DIRECTORY_STRING_OFFSET: usize =
-        core::mem::offset_of!(Self, windows_directory_string);
-    const SYSTEM_DIRECTORY_STRING_OFFSET: usize =
-        core::mem::offset_of!(Self, system_directory_string);
-
-    fn windows_directory_address(base: usize) -> Result<usize, PeImageAccessError> {
-        checked_add(base, Self::WINDOWS_DIRECTORY_OFFSET)
-    }
-
-    fn system_directory_address(base: usize) -> Result<usize, PeImageAccessError> {
-        checked_add(base, Self::SYSTEM_DIRECTORY_OFFSET)
-    }
-
-    fn rebase_anchor_address(base: usize) -> Result<usize, PeImageAccessError> {
-        checked_add(base, Self::REBASE_ANCHOR_OFFSET)
-    }
-
-    fn windows_directory_string_address(base: usize) -> Result<usize, PeImageAccessError> {
-        checked_add(base, Self::WINDOWS_DIRECTORY_STRING_OFFSET)
-    }
-
-    fn system_directory_string_address(base: usize) -> Result<usize, PeImageAccessError> {
-        checked_add(base, Self::SYSTEM_DIRECTORY_STRING_OFFSET)
-    }
+#[allow(clippy::struct_field_names)]
+#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+struct IniFileMapping {
+    file_names: usize,
+    default_file_name_mapping: usize,
+    win_ini_file_mapping: usize,
+    reserved: u32,
+    padding: [u8; 4],
 }
 
-const _: () = assert!(size_of::<SyntheticReadOnlySharedMemory>() <= WINDOWS_SHARED_SECTION_SIZE);
+#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+struct SystemBasicInformation {
+    reserved: u32,
+    timer_resolution: u32,
+    page_size: u32,
+    number_of_physical_pages: u32,
+    lowest_physical_page_number: u32,
+    highest_physical_page_number: u32,
+    allocation_granularity: u32,
+    padding_0: [u8; 4],
+    minimum_user_mode_address: usize,
+    maximum_user_mode_address: usize,
+    active_processors_affinity_mask: usize,
+    number_of_processors: u8,
+    padding_1: [u8; 7],
+}
+
+#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+struct SystemTimeOfDayInformation {
+    boot_time: i64,
+    current_time: i64,
+    time_zone_bias: i64,
+    time_zone_id: u32,
+    reserved: u32,
+    boot_time_bias: u64,
+    sleep_time_bias: u64,
+}
+
+#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+struct NlsUserInfo {
+    s_language: [u16; 80],
+    i_country: [u16; 80],
+    s_country: [u16; 80],
+    s_list: [u16; 80],
+    i_measure: [u16; 80],
+    i_paper_size: [u16; 80],
+    s_decimal: [u16; 80],
+    s_thousand: [u16; 80],
+    s_grouping: [u16; 80],
+    i_digits: [u16; 80],
+    i_l_zero: [u16; 80],
+    i_neg_number: [u16; 80],
+    s_native_digits: [u16; 80],
+    num_shape: [u16; 80],
+    s_currency: [u16; 80],
+    s_mon_dec_sep: [u16; 80],
+    s_mon_thou_sep: [u16; 80],
+    s_mon_grouping: [u16; 80],
+    i_curr_digits: [u16; 80],
+    i_currency: [u16; 80],
+    i_neg_curr: [u16; 80],
+    s_positive_sign: [u16; 80],
+    s_negative_sign: [u16; 80],
+    s_time_format: [u16; 80],
+    s_time: [u16; 80],
+    i_time: [u16; 80],
+    i_tl_zero: [u16; 80],
+    i_time_prefix: [u16; 80],
+    s_1159: [u16; 80],
+    s_2359: [u16; 80],
+    s_short_date: [u16; 80],
+    s_date: [u16; 80],
+    i_date: [u16; 80],
+    s_year_month: [u16; 80],
+    s_long_date: [u16; 80],
+    i_cal_type: [u16; 80],
+    i_first_day_of_week: [u16; 80],
+    i_first_week_of_year: [u16; 80],
+    locale: [u16; 80],
+    user_locale_id: u32,
+    interactive_user_luid: Luid,
+    ul_cache_update_count: u32,
+}
+
+#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+struct Luid {
+    low_part: u32,
+    high_part: i32,
+}
+
+#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+struct TimeZoneInformation {
+    bias: i32,
+    standard_name: [u16; 32],
+    standard_date: SystemTime,
+    standard_bias: i32,
+    daylight_name: [u16; 32],
+    daylight_date: SystemTime,
+    daylight_bias: i32,
+}
+
+#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+struct SystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
+#[repr(C)]
+#[derive(FromBytes, IntoBytes)]
+struct KSystemTime {
+    low_part: u32,
+    high_1_time: i32,
+    high_2_time: i32,
+}
 
 const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-core-apiquery-l1-1-0", "ntdll.dll"),
@@ -1382,19 +1566,27 @@ fn initial_process_heaps_array(peb_ptr: usize) -> Result<InitialProcessHeaps, Pe
     })
 }
 
-fn write_tail_utf16_string<Platform: RawPointerProvider>(
-    tail: &mut usize,
+fn allocate_guest_unicode_string_from_str<Platform: RawPointerProvider>(
+    shared_heap: &mut GuestMemoryAllocator,
+    value: &str,
+) -> Result<UnicodeString, PeImageAccessError> {
+    let string = Utf16StringBuffer::new(value)?;
+    allocate_guest_unicode_string::<Platform>(shared_heap, &string)
+}
+
+fn allocate_guest_unicode_string<Platform: RawPointerProvider>(
+    allocation: &mut GuestMemoryAllocator,
     string: &Utf16StringBuffer,
 ) -> Result<UnicodeString, PeImageAccessError> {
-    let buffer = *tail;
-    crate::write_slice::<Platform, _>(buffer, &string.units)
+    let buffer = allocation.allocate_array::<Platform, u16>(string.units.len())?;
+    buffer
+        .write_slice_at_offset(0, &string.units)
         .ok_or(PeImageAccessError::MemoryAccess)?;
-    *tail = checked_add(*tail, usize::from(string.maximum_length))?;
     Ok(UnicodeString {
         length: string.length,
         maximum_length: string.maximum_length,
         padding_0: [0; 4],
-        buffer,
+        buffer: buffer.as_usize(),
     })
 }
 
@@ -1990,22 +2182,8 @@ mod tests {
     fn prints_created_peb_host_diff() {
         let created = created_process_environment_snapshot();
         let host_peb = host_peb_snapshot();
-        let base_static_server_data: usize = read_guest_value(
-            created.peb.read_only_static_server_data
-                + BASESRV_SERVERDLL_INDEX * core::mem::size_of::<usize>(),
-        );
 
         assert_eq!(created.peb.image_base_address, created.image_base_address);
-        assert_eq!(
-            created.peb.read_only_static_server_data,
-            created.peb.read_only_shared_memory_base
-                + SyntheticReadOnlySharedMemory::STATIC_SERVER_DATA_TABLE_OFFSET
-        );
-        assert_eq!(
-            base_static_server_data,
-            created.peb.read_only_shared_memory_base
-                + SyntheticReadOnlySharedMemory::BASE_STATIC_SERVER_DATA_OFFSET
-        );
         assert_ne!(host_peb.image_base_address, 0);
 
         print_diff_header("synthetic PEB vs host PEB");

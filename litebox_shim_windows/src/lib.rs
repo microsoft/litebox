@@ -116,6 +116,21 @@ where
     ptr.write_at_offset(0, value)
 }
 
+fn write_field_at_offset<Platform, Struct, Field>(
+    base: MutPtr<Platform, Struct>,
+    field_offset: usize,
+    value: Field,
+) -> Option<()>
+where
+    Platform: RawPointerProvider,
+    Struct: zerocopy::FromBytes + zerocopy::IntoBytes,
+    Field: zerocopy::FromBytes + zerocopy::IntoBytes,
+{
+    let address = base.as_usize().checked_add(field_offset)?;
+    let ptr = MutPtr::<Platform, Field>::from_usize(address);
+    ptr.write_at_offset(0, value)
+}
+
 fn write_slice<Platform, T>(address: usize, values: &[T]) -> Option<()>
 where
     Platform: RawPointerProvider,
