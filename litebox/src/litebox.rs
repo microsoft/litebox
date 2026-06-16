@@ -55,7 +55,9 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     {
         Self::new_inner(
             platform,
-            Some(broker::control_from_local::<Platform, T>(broker_local)),
+            Some(Arc::new(broker::BrokerLocalControl::<Platform, T>::new(
+                broker_local,
+            ))),
         )
     }
 

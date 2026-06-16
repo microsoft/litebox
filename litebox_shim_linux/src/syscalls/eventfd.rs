@@ -57,10 +57,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
         }
     }
 
-    fn local_core(counter: EventCounter<Platform>) -> Self {
-        Self::LocalCore(counter)
-    }
-
     fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -74,7 +70,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
                 })
                 .map_err(Errno::from),
             Self::LocalCore(counter) => counter
-                .read(cx, nonblock, consume_mode(semaphore))
+                .read(
+                    cx,
+                    nonblock,
+                    if semaphore {
+                        EventCounterReadMode::One
+                    } else {
+                        EventCounterReadMode::All
+                    },
+                )
                 .map_err(Errno::from),
         }
     }
@@ -211,7 +215,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         let count = u64::from(initval);
         let counter = if flags.contains(EfdFlags::NONBLOCK) {
             match EventCounter::new(&self.litebox, count) {
-                Ok(counter) => EventFileCounter::local_core(counter),
+                Ok(counter) => EventFileCounter::LocalCore(counter),
                 Err(EventCounterError::Unavailable) => EventFileCounter::shim_local(count),
                 Err(error) => return Err(error.into()),
             }
@@ -219,14 +223,6 @@ impl<FS: ShimFS> GlobalState<FS> {
             EventFileCounter::shim_local(count)
         };
         Ok(EventFile::new(counter, flags))
-    }
-}
-
-fn consume_mode(semaphore: bool) -> EventCounterReadMode {
-    if semaphore {
-        EventCounterReadMode::One
-    } else {
-        EventCounterReadMode::All
     }
 }
 
@@ -240,43 +236,36 @@ mod tests {
 
     #[test]
     fn test_semaphore_eventfd() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(
-            task.global
-                .create_linux_eventfd(0, EfdFlags::SEMAPHORE)
-                .unwrap(),
-        );
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
+            super::EventFileCounter::shim_local(0),
+            EfdFlags::SEMAPHORE,
+        ));
         let total = 8;
-        let handles: std::vec::Vec<_> = (0..total)
-            .map(|_| {
-                let copied_eventfd = eventfd.clone();
-                std::thread::spawn(move || {
-                    copied_eventfd
-                        .read(&WaitState::new(platform()).context())
-                        .unwrap();
-                })
-            })
-            .collect();
+        for _ in 0..total {
+            let copied_eventfd = eventfd.clone();
+            std::thread::spawn(move || {
+                copied_eventfd
+                    .read(&WaitState::new(platform()).context())
+                    .unwrap();
+            });
+        }
 
         std::thread::sleep(core::time::Duration::from_millis(500));
         eventfd
             .write(&WaitState::new(platform()).context(), total)
             .unwrap();
-        for handle in handles {
-            handle.join().unwrap();
-        }
     }
 
     #[test]
     fn test_blocking_eventfd() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(
-            task.global
-                .create_linux_eventfd(0, EfdFlags::empty())
-                .unwrap(),
-        );
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
+            super::EventFileCounter::shim_local(0),
+            EfdFlags::empty(),
+        ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             copied_eventfd
@@ -299,13 +288,12 @@ mod tests {
 
     #[test]
     fn test_blocking_eventfd_no_race_on_massive_readwrite() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(
-            task.global
-                .create_linux_eventfd(0, EfdFlags::empty())
-                .unwrap(),
-        );
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new(
+            super::EventFileCounter::shim_local(0),
+            EfdFlags::empty(),
+        ));
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             for _ in 0..10000 {

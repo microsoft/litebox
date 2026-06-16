@@ -160,20 +160,32 @@ fn handle_event_request(
     match request {
         EventRequest::Create(request) => handle_core_result(
             core.create_event_with_count(association, request.initial_count),
-            |handle| event_response(EventResponse::Create(CreateEventResponse::new(handle))),
+            |handle| {
+                BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(
+                    CreateEventResponse::new(handle),
+                )))
+            },
         ),
         EventRequest::Wait(request) => {
             handle_core_result(core.wait_event(association, request.handle), |outcome| {
-                event_response(EventResponse::Wait(WaitEventResponse::new(outcome)))
+                BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
+                    WaitEventResponse::new(outcome),
+                )))
             })
         }
         EventRequest::Add(request) => handle_core_result(
             core.add_event(association, request.handle, request.value),
-            |readiness| event_response(EventResponse::Add(AddEventResponse::new(readiness))),
+            |readiness| {
+                BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(
+                    AddEventResponse::new(readiness),
+                )))
+            },
         ),
         EventRequest::Consume(request) => handle_core_result(
             core.consume_event(association, request.handle, request.mode),
-            |consumption| event_response(EventResponse::Consume(consumption)),
+            |consumption| {
+                BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(consumption)))
+            },
         ),
         _ => BrokerResponse::Error(ErrorCode::UnsupportedOperation),
     }
@@ -216,10 +228,6 @@ fn handle_core_result<T>(
         Ok(value) => into_response(value),
         Err(error) => BrokerResponse::Error(to_protocol_error(error)),
     }
-}
-
-const fn event_response(response: EventResponse) -> BrokerResponse {
-    BrokerResponse::Core(CoreResponse::Event(response))
 }
 
 fn to_protocol_error(error: BrokerError) -> ErrorCode {

@@ -47,7 +47,6 @@ pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
     pollee: Pollee<Platform>,
-    blocking_operations_supported: bool,
 }
 
 impl<Platform> EventCounter<Platform>
@@ -73,13 +72,7 @@ where
             broker,
             handle: response.handle,
             pollee: Pollee::new(),
-            blocking_operations_supported: true,
         })
-    }
-
-    /// Returns whether blocking reads and writes are supported.
-    pub fn supports_blocking_operations(&self) -> bool {
-        self.blocking_operations_supported
     }
 
     /// Reads the event counter.

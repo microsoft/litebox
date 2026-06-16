@@ -24,7 +24,7 @@ pub trait BrokerControl: Send + Sync {
     ) -> core::result::Result<CoreResponse, BrokerControlError>;
 }
 
-struct BrokerLocalControl<Platform: RawSyncPrimitivesProvider, T> {
+pub(crate) struct BrokerLocalControl<Platform: RawSyncPrimitivesProvider, T> {
     local: Mutex<Platform, BrokerLocal<T>>,
 }
 
@@ -32,7 +32,7 @@ impl<Platform, T> BrokerLocalControl<Platform, T>
 where
     Platform: RawSyncPrimitivesProvider,
 {
-    const fn new(local: BrokerLocal<T>) -> Self {
+    pub(crate) const fn new(local: BrokerLocal<T>) -> Self {
         Self {
             local: Mutex::new(local),
         }
@@ -51,24 +51,12 @@ where
         self.local
             .lock()
             .active_core_request(request)
-            .map_err(broker_control_error)
+            .map_err(|error| match error {
+                BrokerLocalError::Broker(error) => BrokerControlError::Broker(error),
+                BrokerLocalError::UnexpectedResponse(_) => BrokerControlError::UnexpectedResponse,
+                _ => BrokerControlError::Transport,
+            })
     }
-}
-
-fn broker_control_error<E>(error: BrokerLocalError<E>) -> BrokerControlError {
-    match error {
-        BrokerLocalError::Broker(error) => BrokerControlError::Broker(error),
-        BrokerLocalError::UnexpectedResponse(_) => BrokerControlError::UnexpectedResponse,
-        _ => BrokerControlError::Transport,
-    }
-}
-
-pub(crate) fn control_from_local<Platform, T>(local: BrokerLocal<T>) -> Arc<dyn BrokerControl>
-where
-    Platform: RawSyncPrimitivesProvider,
-    T: LocalControlChannel + Send + 'static,
-{
-    Arc::new(BrokerLocalControl::<Platform, T>::new(local))
 }
 
 pub(crate) struct BrokerState<Platform: RawSyncPrimitivesProvider> {
