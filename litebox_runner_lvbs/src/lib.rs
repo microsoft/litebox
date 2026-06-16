@@ -422,7 +422,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         args
     };
 
-    let Ok(mut smc_args_ptr) =
+    let Ok(smc_args_ptr) =
         NormalWorldConstPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)
     else {
         return make_error_response(OpteeSmcReturnCode::EBadAddr);

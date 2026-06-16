@@ -124,7 +124,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64) -> Result<i64, VsmError> {
         .and_then(|pa| PhysAddr::try_new(pa).ok())
         .ok_or(VsmError::InvalidPhysicalAddress)?;
 
-    let mut cpu_mask_ptr = Vtl0PhysConstPtr::<CpuMask, PAGE_SIZE>::with_usize(
+    let cpu_mask_ptr = Vtl0PhysConstPtr::<CpuMask, PAGE_SIZE>::with_usize(
         cpu_online_mask_page_addr.as_u64().trunc(),
     )
     .map_err(|_| VsmError::CpuOnlineMaskCopyFailed)?;
@@ -846,9 +846,8 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
     let heki_patch = if patch_pa_1.is_null()
         || (patch_pa_0.align_up(Size4KiB::SIZE) == patch_pa_1.align_down(Size4KiB::SIZE))
     {
-        let mut ptr =
-            Vtl0PhysConstPtr::<HekiPatch, PAGE_SIZE>::with_usize(patch_pa_0.as_u64().trunc())
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        let ptr = Vtl0PhysConstPtr::<HekiPatch, PAGE_SIZE>::with_usize(patch_pa_0.as_u64().trunc())
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
         ptr.read_at_offset(0)
             .map(|boxed| *boxed)
             .map_err(|_| VsmError::Vtl0CopyFailed)
@@ -861,7 +860,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
             PhysPageAddr::<PAGE_SIZE>::new(patch_pa_1.as_u64().trunc())
                 .ok_or(VsmError::Vtl0CopyFailed)?,
         ];
-        let mut ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::new(
+        let ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::new(
             &pages,
             (patch_pa_0 - patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
         )
@@ -961,7 +960,7 @@ fn mshv_vsm_set_platform_root_key(key_pa: u64) -> Result<i64, VsmError> {
     let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
 
     let mut keybuf = Zeroizing::new([0u8; PRK_LEN]);
-    let mut key_ptr =
+    let key_ptr =
         Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(key_pa.as_u64().trunc(), PRK_LEN)
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
     key_ptr
@@ -1391,7 +1390,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
         if visited_pages.contains(&cur_pa.as_u64()) {
             return None;
         }
-        let mut ptr =
+        let ptr =
             Vtl0PhysConstPtr::<HekiPage, PAGE_SIZE>::with_usize(cur_pa.as_u64().trunc()).ok()?;
         let heki_page = ptr.read_at_offset(0).ok()?;
         if !heki_page.is_valid() {
@@ -1669,7 +1668,7 @@ impl MemoryContainer {
             return Ok(());
         }
 
-        let mut ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+        let ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
             phys_start.as_u64().trunc(),
             bytes_to_copy,
         )

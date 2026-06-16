@@ -181,7 +181,7 @@ pub fn read_optee_msg_args_from_phys(
 
     let mut blob = alloc::vec![0u8; copy_size];
 
-    let mut blob_ptr =
+    let blob_ptr =
         NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(phys_addr, copy_size)
             .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
     blob_ptr
@@ -695,7 +695,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
         {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
-        let mut ptr = NormalWorldConstPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
+        let ptr = NormalWorldConstPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
         // Copy lands in a buffer owned by LiteBox to avoid TOCTOU issues.
         ptr.read_slice_at_offset(offset, buffer)?;
         Ok(())
@@ -787,7 +787,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
                 return Err(OpteeSmcReturnCode::EBadAddr);
             }
             visited_pages_data.insert(cur_addr);
-            let mut cur_ptr = NormalWorldConstPtr::<ShmRefPagesData, ALIGN>::with_usize(cur_addr)
+            let cur_ptr = NormalWorldConstPtr::<ShmRefPagesData, ALIGN>::with_usize(cur_addr)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
             let pages_data = cur_ptr
                 .read_at_offset(0)

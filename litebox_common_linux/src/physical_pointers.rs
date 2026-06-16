@@ -186,24 +186,15 @@ where
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let guard = unsafe {
-            self.map_and_get_ptr_guard(
-                count,
-                core::mem::size_of::<T>(),
-                PhysPageMapPermissions::READ,
-            )?
-        };
+        let guard = self.map_and_get_ptr_guard(
+            count,
+            core::mem::size_of::<T>(),
+            PhysPageMapPermissions::READ,
+        )?;
         let mut boxed = box_new_zeroed::<T>();
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                core::ptr::from_mut::<T>(boxed.as_mut()).cast::<u8>(),
-                guard.ptr.cast::<u8>(),
-                guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault reading from mapped physical page");
-        result.map_err(|_| PhysPointerError::CopyFailed)?;
+        // SAFETY: `boxed` is a freshly allocated `T` and is thus valid for writes
+        // of `size_of::<T>()` bytes, which is the guard's mapped size.
+        unsafe { guard.copy_out(core::ptr::from_mut::<T>(boxed.as_mut()).cast::<u8>())? };
         Ok(boxed)
     }
 
@@ -227,23 +218,14 @@ where
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let guard = unsafe {
-            self.map_and_get_ptr_guard(
-                count,
-                core::mem::size_of_val(values),
-                PhysPageMapPermissions::READ,
-            )?
-        };
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                values.as_mut_ptr().cast::<u8>(),
-                guard.ptr.cast::<u8>(),
-                guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault reading from mapped physical page");
-        result.map_err(|_| PhysPointerError::CopyFailed)?;
+        let guard = self.map_and_get_ptr_guard(
+            count,
+            core::mem::size_of_val(values),
+            PhysPageMapPermissions::READ,
+        )?;
+        // SAFETY: `values` is valid for writes of `size_of_val(values)` bytes, which is
+        // the guard's mapped size.
+        unsafe { guard.copy_out(values.as_mut_ptr().cast::<u8>())? };
         Ok(())
     }
 
@@ -255,23 +237,14 @@ where
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let guard = unsafe {
-            self.map_and_get_ptr_guard(
-                count,
-                core::mem::size_of::<T>(),
-                PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?
-        };
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                guard.ptr.cast::<u8>(),
-                core::ptr::from_ref(&value).cast::<u8>(),
-                guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault writing to mapped physical page");
-        result.map_err(|_| PhysPointerError::CopyFailed)?;
+        let guard = self.map_and_get_ptr_guard(
+            count,
+            core::mem::size_of::<T>(),
+            PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
+        )?;
+        // SAFETY: `value` is valid for reads of `size_of::<T>()` bytes, which is the
+        // guard's mapped size.
+        unsafe { guard.copy_in(core::ptr::from_ref(&value).cast::<u8>())? };
         Ok(())
     }
 
@@ -289,23 +262,14 @@ where
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let guard = unsafe {
-            self.map_and_get_ptr_guard(
-                count,
-                core::mem::size_of_val(values),
-                PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?
-        };
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                guard.ptr.cast::<u8>(),
-                values.as_ptr().cast::<u8>(),
-                guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault writing to mapped physical page");
-        result.map_err(|_| PhysPointerError::CopyFailed)?;
+        let guard = self.map_and_get_ptr_guard(
+            count,
+            core::mem::size_of_val(values),
+            PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
+        )?;
+        // SAFETY: `values` is valid for reads of `size_of_val(values)` bytes, which is
+        // the guard's mapped size.
+        unsafe { guard.copy_in(values.as_ptr().cast::<u8>())? };
         Ok(())
     }
 
@@ -321,11 +285,9 @@ where
     /// - `size`: Total byte size to map (must cover the data being accessed).
     /// - `perms`: Required page permissions (read, write).
     ///
-    /// # Safety
-    ///
-    /// Same as [`Self::map_range`]. The returned guard is tied to `self`'s lifetime
-    /// and releases the mapping when it goes out of scope.
-    unsafe fn map_and_get_ptr_guard(
+    /// The returned guard is tied to `self`'s lifetime and releases the mapping when it
+    /// goes out of scope.
+    fn map_and_get_ptr_guard(
         &self,
         count: usize,
         size: usize,
@@ -341,7 +303,7 @@ where
             .ok_or(PhysPointerError::Overflow)?;
         let start = skip / ALIGN;
         let end = (skip + size).div_ceil(ALIGN);
-        let map_info = unsafe { self.map_range(start, end, perms)? };
+        let map_info = self.map_range(start, end, perms)?;
         let ptr = map_info.base().wrapping_add(skip % ALIGN).cast::<T>();
         Ok(MappedGuard {
             map_info: Some(map_info),
@@ -352,12 +314,7 @@ where
     }
 
     /// Map the physical pages from `start` to `end` indexes.
-    ///
-    /// # Safety
-    ///
-    /// This function assumes that the underlying platform safely handles concurrent mapping/unmapping
-    /// requests for the same physical pages.
-    unsafe fn map_range(
+    fn map_range(
         &self,
         start: usize,
         end: usize,
@@ -371,6 +328,10 @@ where
             return Err(PhysPointerError::UnsupportedPermissions(perms.bits()));
         }
         let sub_pages = &self.pages[start..end];
+        // SAFETY: `vmap`'s only caller-side obligation is to not form Rust references into
+        // the mapped memory. This is upheld here: the function returns the opaque `MapInfo`
+        // without dereferencing the pointer, and its sole consumer (`MappedGuard`) accesses
+        // the mapping only through fault-tolerant raw copies, never as a reference.
         unsafe { V::manager().vmap(sub_pages, perms) }
     }
 }
@@ -379,11 +340,52 @@ where
 ///
 /// Created by `map_and_get_ptr_guard`. Its lifetime is tied to the parent
 /// `PhysMutPtr`, and it owns the map info for the duration of the temporary mapping.
+///
+/// # Invariant
+///
+/// `ptr` points into the live mapping owned by `map_info`, and the `size` bytes starting
+/// at `ptr` lie within that mapping. The mapping refers to foreign (non-Rust) physical
+/// memory that another core may unmap concurrently, so `ptr` must only ever be accessed
+/// through [`Self::copy_in`]/[`Self::copy_out`], which perform fault-tolerant copies.
 struct MappedGuard<'a, T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     map_info: Option<MapInfoOf<V, ALIGN>>,
     ptr: *mut T,
     size: usize,
     _owner: PhantomData<&'a PhysMutPtr<T, ALIGN, V>>,
+}
+
+impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, T, ALIGN, V> {
+    /// Copy the `self.size` mapped bytes out into `dst`.
+    ///
+    /// This is the only path through which the raw mapped pointer is dereferenced.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be valid for writes of `self.size` bytes.
+    unsafe fn copy_out(&self, dst: *mut u8) -> Result<(), PhysPointerError> {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
+            litebox::mm::exception_table::memcpy_fallible(dst, self.ptr.cast::<u8>(), self.size)
+        };
+        debug_assert!(result.is_ok(), "fault reading from mapped physical page");
+        result.map_err(|_| PhysPointerError::CopyFailed)
+    }
+
+    /// Copy `self.size` bytes from `src` into the mapped memory.
+    ///
+    /// This is the only path through which the raw mapped pointer is dereferenced.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `self.size` bytes.
+    unsafe fn copy_in(&self, src: *const u8) -> Result<(), PhysPointerError> {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
+            litebox::mm::exception_table::memcpy_fallible(self.ptr.cast::<u8>(), src, self.size)
+        };
+        debug_assert!(result.is_ok(), "fault writing to mapped physical page");
+        result.map_err(|_| PhysPointerError::CopyFailed)
+    }
 }
 
 impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
@@ -460,7 +462,7 @@ where
     /// Read the value at the given offset from the physical pointer.
     ///
     /// Returns an owned copy of the value read from physical memory.
-    pub fn read_at_offset(&mut self, count: usize) -> Result<alloc::boxed::Box<T>, PhysPointerError>
+    pub fn read_at_offset(&self, count: usize) -> Result<alloc::boxed::Box<T>, PhysPointerError>
     where
         T: FromBytes,
     {
@@ -471,7 +473,7 @@ where
     ///
     /// Copies values from physical memory into the caller-provided slice.
     pub fn read_slice_at_offset(
-        &mut self,
+        &self,
         count: usize,
         values: &mut [T],
     ) -> Result<(), PhysPointerError>
