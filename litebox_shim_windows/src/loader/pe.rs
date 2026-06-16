@@ -61,7 +61,7 @@ const INITIAL_THREAD_ID: usize = 1;
 
 macro_rules! write_static_server_data_field {
     ($platform:ty, $base:expr, $field:ident, $value:expr $(,)?) => {
-        crate::write_field_at_offset::<$platform, _, _>(
+        write_guest_field_at_offset::<$platform, _, _>(
             $base,
             core::mem::offset_of!(BaseStaticServerData, $field),
             $value,
@@ -167,8 +167,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
                 stack_top,
                 environment.peb,
             );
-            crate::write_slice::<Platform, _>(environment.context, context.as_bytes())
-                .ok_or(PeImageAccessError::MemoryAccess)?;
+            write_guest_slice::<Platform, _>(environment.context, context.as_bytes())?;
         }
 
         let virtual_allocations =
@@ -213,13 +212,11 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         };
 
         // `KI_USER_INVERTED_FUNCTION_TABLE` lives in ntdll's writable `.mrdata` section.
-        crate::write_value::<Platform, _>(table_address, header)
-            .ok_or(PeImageAccessError::MemoryAccess)?;
+        write_guest_value::<Platform, _>(table_address, header)?;
         let entries_address = table_address
             .checked_add(core::mem::size_of::<KiUserInvertedFunctionTableHeader>())
             .ok_or(PeImageAccessError::AddressOverflow)?;
-        crate::write_slice::<Platform, _>(entries_address, &entries)
-            .ok_or(PeImageAccessError::MemoryAccess)?;
+        write_guest_slice::<Platform, _>(entries_address, &entries)?;
 
         litebox_util_log::debug!(
             table:% = format_args!("{table_address:#x}");
@@ -254,8 +251,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         let api_set_map = build_api_set_namespace(API_SET_MAPPINGS)
             .map_err(|_| PeImageAccessError::AddressOverflow)?;
         let api_set_map_ptr = create_pages(api_set_map.len())?;
-        crate::write_slice::<Platform, _>(api_set_map_ptr, &api_set_map)
-            .ok_or(PeImageAccessError::MemoryAccess)?;
+        write_guest_slice::<Platform, _>(api_set_map_ptr, &api_set_map)?;
         let ctx_ptr = create_pages(size_of::<X64Context>())?;
 
         let win32_image_path = win32_image_path(input.image_path);
@@ -273,8 +269,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         let environment_block = windows_environment_block(input.envp);
         let environment_size = checked_mul(environment_block.len(), size_of::<u16>())?;
         let environment_ptr = create_pages(environment_size)?;
-        crate::write_slice::<Platform, _>(environment_ptr, &environment_block)
-            .ok_or(PeImageAccessError::MemoryAccess)?;
+        write_guest_slice::<Platform, _>(environment_ptr, &environment_block)?;
         let process_parameter_strings = [
             &current_directory_path,
             &dll_path,
@@ -361,11 +356,9 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         }
         let process_heaps = initial_process_heaps_array(peb_ptr)?;
         let fast_peb_lock = create_pages(size_of::<RtlCriticalSection>())?;
-        crate::write_value::<Platform, _>(fast_peb_lock, RtlCriticalSection::initialized(0))
-            .ok_or(PeImageAccessError::MemoryAccess)?;
+        write_guest_value::<Platform, _>(fast_peb_lock, RtlCriticalSection::initialized(0))?;
         let loader_lock = create_pages(size_of::<RtlCriticalSection>())?;
-        crate::write_value::<Platform, _>(loader_lock, RtlCriticalSection::initialized(0))
-            .ok_or(PeImageAccessError::MemoryAccess)?;
+        write_guest_value::<Platform, _>(loader_lock, RtlCriticalSection::initialized(0))?;
 
         peb.api_set_map = api_set_map_ptr;
         peb.process_parameters = process_parameters_ptr;
@@ -391,7 +384,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         peb.read_only_shared_memory_base = read_only_shared_memory_base;
         peb.read_only_static_server_data = read_only_static_server_data;
         peb.csr_server_read_only_shared_memory_base = read_only_shared_memory_base as u64;
-        crate::write_value::<Platform, _>(peb_ptr, peb).ok_or(PeImageAccessError::MemoryAccess)?;
+        write_guest_value::<Platform, _>(peb_ptr, peb)?;
 
         let mut teb = ThreadEnvironmentBlock::new_zeroed();
         teb.nt_tib.exception_list = 0;
@@ -413,7 +406,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         teb.static_unicode_string =
             initial_teb_static_unicode_string(teb_ptr, &teb.static_unicode_buffer)?;
         teb.deallocation_stack = input.stack_base;
-        crate::write_value::<Platform, _>(teb_ptr, teb).ok_or(PeImageAccessError::MemoryAccess)?;
+        write_guest_value::<Platform, _>(teb_ptr, teb)?;
         Ok(WindowsProcessEnvironment {
             peb: peb_ptr,
             teb: teb_ptr,
@@ -451,8 +444,7 @@ fn initialize_static_server_data<Platform: RawPointerProvider>(
         base_static_server_data,
         windows_directory,
         windows_directory,
-    )
-    .ok_or(PeImageAccessError::MemoryAccess)?;
+    )?;
     let windows_system_directory =
         allocate_guest_unicode_string_from_str::<Platform>(shared_heap, WINDOWS_SYSTEM_DIRECTORY)?;
     write_static_server_data_field!(
@@ -460,8 +452,7 @@ fn initialize_static_server_data<Platform: RawPointerProvider>(
         base_static_server_data,
         windows_system_directory,
         windows_system_directory,
-    )
-    .ok_or(PeImageAccessError::MemoryAccess)?;
+    )?;
     let named_object_directory = allocate_guest_unicode_string_from_str::<Platform>(
         shared_heap,
         WINDOWS_NAMED_OBJECT_DIRECTORY,
@@ -471,29 +462,25 @@ fn initialize_static_server_data<Platform: RawPointerProvider>(
         base_static_server_data,
         named_object_directory,
         named_object_directory,
-    )
-    .ok_or(PeImageAccessError::MemoryAccess)?;
+    )?;
     write_static_server_data_field!(
         Platform,
         base_static_server_data,
         windows_major_version,
         WINDOWS_OS_MAJOR_VERSION,
-    )
-    .ok_or(PeImageAccessError::MemoryAccess)?;
+    )?;
     write_static_server_data_field!(
         Platform,
         base_static_server_data,
         windows_minor_version,
         WINDOWS_OS_MINOR_VERSION,
-    )
-    .ok_or(PeImageAccessError::MemoryAccess)?;
+    )?;
     write_static_server_data_field!(
         Platform,
         base_static_server_data,
         build_number,
         WINDOWS_OS_BUILD_NUMBER,
-    )
-    .ok_or(PeImageAccessError::MemoryAccess)?;
+    )?;
 
     let ini_file_mapping = shared_heap
         .allocate::<Platform, IniFileMapping>()?
@@ -503,15 +490,13 @@ fn initialize_static_server_data<Platform: RawPointerProvider>(
         base_static_server_data,
         ini_file_mapping,
         ini_file_mapping,
-    )
-    .ok_or(PeImageAccessError::MemoryAccess)?;
+    )?;
     write_static_server_data_field!(
         Platform,
         base_static_server_data,
         termsrv_client_time_zone_id,
         WINDOWS_TIME_ZONE_ID_INVALID,
-    )
-    .ok_or(PeImageAccessError::MemoryAccess)?;
+    )?;
     Ok(())
 }
 
@@ -635,7 +620,10 @@ impl GuestMemoryAllocator {
         alignment: usize,
     ) -> Result<usize, PeImageAccessError> {
         debug_assert!(alignment.is_power_of_two());
-        let address = self.cursor.checked_next_multiple_of(alignment).ok_or(PeImageAccessError::AddressOverflow)?;
+        let address = self
+            .cursor
+            .checked_next_multiple_of(alignment)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
         let cursor = checked_add(address, size)?;
         if cursor > self.end {
             return Err(PeImageAccessError::AddressOverflow);
@@ -1011,6 +999,36 @@ fn checked_mul(left: usize, right: usize) -> Result<usize, PeImageAccessError> {
 
 fn to_u32(value: usize) -> Result<u32, PeImageAccessError> {
     u32::try_from(value).map_err(|_| PeImageAccessError::AddressOverflow)
+}
+
+fn write_guest_value<Platform, T>(address: usize, value: T) -> Result<(), PeImageAccessError>
+where
+    Platform: RawPointerProvider,
+    T: FromBytes + IntoBytes,
+{
+    crate::write_value::<Platform, T>(address, value).ok_or(PeImageAccessError::MemoryAccess)
+}
+
+fn write_guest_field_at_offset<Platform, Struct, Field>(
+    base: MutPtr<Platform, Struct>,
+    field_offset: usize,
+    value: Field,
+) -> Result<(), PeImageAccessError>
+where
+    Platform: RawPointerProvider,
+    Struct: FromBytes + IntoBytes,
+    Field: FromBytes + IntoBytes,
+{
+    crate::write_field_at_offset::<Platform, Struct, Field>(base, field_offset, value)
+        .ok_or(PeImageAccessError::MemoryAccess)
+}
+
+fn write_guest_slice<Platform, T>(address: usize, values: &[T]) -> Result<(), PeImageAccessError>
+where
+    Platform: RawPointerProvider,
+    T: Copy + FromBytes + IntoBytes,
+{
+    crate::write_slice::<Platform, T>(address, values).ok_or(PeImageAccessError::MemoryAccess)
 }
 
 struct LoadedNtDll {

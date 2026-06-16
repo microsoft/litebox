@@ -313,8 +313,6 @@ pub struct WindowsShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platf
 
 impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
     /// Loads the program at `path` as the shim's initial task.
-    ///
-    /// TODO: PEB/TEB setup and initial handle table state are not yet implemented.
     pub fn load_program(
         &self,
         fs: Arc<FS>,
