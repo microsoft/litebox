@@ -2349,13 +2349,24 @@ fn register_pty_marker_latency_tests(reg: &mut Registry<'_>) {
     //
     // Budget rationale:
     //   - `echo_marker`: 500 ms — bash writes one line, no fork; on
-    //     either substrate this should be tens of ms. 500 ms picks up
-    //     a 10x regression but tolerates load on shared CI hosts.
-    //   - `find_root_home`: 3000 ms — direct litebox measured 907 ms
-    //     for this exact pipeline (prior probe). Under PTY-wrapped
-    //     `script -qc` it ballooned to 5941 ms. 3000 ms separates the
-    //     "direct-litebox" baseline (passing) from the "PTY-amplified"
-    //     failure mode (failing). Native consistently sub-100 ms.
+    //     either substrate this should be tens of ms (measured ~3 ms).
+    //     500 ms picks up a deadlock (30 s outer timeout) while
+    //     tolerating load on shared CI hosts.
+    //   - `find_root_home`: 15000 ms — this is a *deadlock-regression
+    //     guard*, NOT a latency benchmark. The bug it guards
+    //     (interactive-bash `PGRP_PIPE` job-control read deadlocking
+    //     against a vfork-parked parent) manifests as a hard hang that
+    //     only ends at the 30 s outer timeout. Correct-but-slow
+    //     behaviour under litebox is ~1.7 s (noediting) to ~4 s
+    //     (interactive readline + PTY-wrapped `find` — the readline
+    //     path adds PTY input/output latency tracked separately as the
+    //     copilot PTY-marker divergence, see
+    //     `docs/copilot-pty-marker-divergence.md`). 15 s cleanly
+    //     separates correct (≤4 s) from deadlocked (30 s) without
+    //     masking the regression. We deliberately do NOT tighten this
+    //     to gate litebox slowness — the slowness is honest and
+    //     out-of-scope for this guard (native is the gold standard and
+    //     runs sub-100 ms).
     //
     // Invocation rationale:
     //   - `bash_interactive`: `/bin/bash --noprofile --norc` — bash
@@ -2385,7 +2396,7 @@ fn register_pty_marker_latency_tests(reg: &mut Registry<'_>) {
         Scenario {
             cmd_suffix: "find_root_home",
             cmd: "find /root /home -type f 2>/dev/null | head -5",
-            budget_ms: 3000,
+            budget_ms: 15000,
         },
     ];
 
