@@ -44,15 +44,6 @@ use super::{
 
 static BROKER_SOCKET_DGRAM_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerSocketDgramProvider>> =
     once_cell::race::OnceBox::new();
-static EAGER_BROKER_SOCKET_DGRAM_ENABLED: AtomicBool = AtomicBool::new(false);
-
-pub fn set_eager_broker_socket_dgram_enabled(enabled: bool) {
-    EAGER_BROKER_SOCKET_DGRAM_ENABLED.store(enabled, Ordering::Release);
-}
-
-pub fn eager_broker_socket_dgram_enabled() -> bool {
-    EAGER_BROKER_SOCKET_DGRAM_ENABLED.load(Ordering::Acquire)
-}
 
 pub fn set_broker_socket_dgram_provider(
     provider: Arc<dyn BrokerSocketDgramProvider>,

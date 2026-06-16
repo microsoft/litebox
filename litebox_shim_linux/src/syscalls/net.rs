@@ -1765,50 +1765,91 @@ impl<FS: ShimFS> Task<FS> {
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
-                if ty == SockType::Datagram
-                    && crate::syscalls::broker_socket_dgram::eager_broker_socket_dgram_enabled()
-                    && let Some(provider) =
-                        crate::syscalls::broker_socket_dgram::broker_socket_dgram_provider()
-                {
-                    let mut status = OFlags::empty();
-                    status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
-                    let handle = provider
-                        .create()
-                        .map_err(super::broker_backed::broker_err_to_errno)?;
-                    let dgram =
-                        crate::syscalls::broker_socket_dgram::BrokerSocketDgramFd::<Platform>::new(
-                            provider, handle, status,
-                        );
-                    let mut dt = self.global.litebox.descriptor_table_mut();
-                    let typed = dt
-                        .insert::<crate::syscalls::broker_socket_dgram::BrokerSocketDgramSubsystem>(
-                            dgram,
-                        );
-                    if flags.contains(SockFlags::CLOEXEC) {
-                        let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
-                        assert!(old.is_none());
+                match ty {
+                    SockType::Datagram => {
+                        let provider =
+                            crate::syscalls::broker_socket_dgram::broker_socket_dgram_provider()
+                                .ok_or(Errno::ENODEV)?;
+                        let mut status = OFlags::empty();
+                        status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                        let handle = provider
+                            .create()
+                            .map_err(super::broker_backed::broker_err_to_errno)?;
+                        let dgram = crate::syscalls::broker_socket_dgram::BrokerSocketDgramFd::<
+                            Platform,
+                        >::new(provider, handle, status);
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt.insert::<
+                            crate::syscalls::broker_socket_dgram::BrokerSocketDgramSubsystem,
+                        >(dgram);
+                        if flags.contains(SockFlags::CLOEXEC) {
+                            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                            assert!(old.is_none());
+                        }
+                        drop(dt);
+                        #[cfg(feature = "trace_syscalls")]
+                        let object_id = typed.object_id().as_u64();
+                        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                            let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                            Errno::EMFILE
+                        })?;
+                        #[cfg(feature = "trace_syscalls")]
+                        if raw_fd <= 20 {
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[FD-TRACE] pid={} socket raw_fd={} object_id={} domain={:?} type={:?} flags={:?}",
+                                self.pid,
+                                raw_fd,
+                                object_id,
+                                domain,
+                                ty,
+                                flags,
+                            );
+                        }
+                        return Ok(u32::try_from(raw_fd).unwrap());
                     }
-                    drop(dt);
-                    #[cfg(feature = "trace_syscalls")]
-                    let object_id = typed.object_id().as_u64();
-                    let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-                        let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                        Errno::EMFILE
-                    })?;
-                    #[cfg(feature = "trace_syscalls")]
-                    if raw_fd <= 20 {
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[FD-TRACE] pid={} socket raw_fd={} object_id={} domain={:?} type={:?} flags={:?}",
-                            self.pid,
-                            raw_fd,
-                            object_id,
-                            domain,
-                            ty,
-                            flags,
-                        );
+                    SockType::SeqPacket => {
+                        let provider = crate::syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider()
+                            .ok_or(Errno::ENODEV)?;
+                        let mut status = OFlags::empty();
+                        status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                        let handle = provider
+                            .create()
+                            .map_err(super::broker_backed::broker_err_to_errno)?;
+                        let seqpacket =
+                            crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<
+                                Platform,
+                            >::new(provider, handle, status);
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt.insert::<crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(seqpacket);
+                        if flags.contains(SockFlags::CLOEXEC) {
+                            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                            assert!(old.is_none());
+                        }
+                        drop(dt);
+                        #[cfg(feature = "trace_syscalls")]
+                        let object_id = typed.object_id().as_u64();
+                        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                            let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                            Errno::EMFILE
+                        })?;
+                        #[cfg(feature = "trace_syscalls")]
+                        if raw_fd <= 20 {
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[FD-TRACE] pid={} socket raw_fd={} object_id={} domain={:?} type={:?} flags={:?}",
+                                self.pid,
+                                raw_fd,
+                                object_id,
+                                domain,
+                                ty,
+                                flags,
+                            );
+                        }
+                        return Ok(u32::try_from(raw_fd).unwrap());
                     }
-                    return Ok(u32::try_from(raw_fd).unwrap());
+                    SockType::Stream => {}
+                    _ => return Err(Errno::ESOCKTNOSUPPORT),
                 }
                 let socket = UnixSocket::new(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
                 let typed = self
@@ -2040,162 +2081,107 @@ impl<FS: ShimFS> Task<FS> {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
 
-                // Phase F: eager broker-backed AF_UNIX SOCK_STREAM
-                // socketpair. Gated by LITEBOX_EAGER_BROKER_SOCKETPAIR
-                // (off by default). Only SOCK_STREAM is supported by
-                // the broker StateObject — datagram / seqpacket /
-                // SCM_RIGHTS-bearing variants fall through to the
-                // in-shim UnixSocket path until those are modeled.
-                if ty == SockType::Stream
-                    && crate::syscalls::broker_socketpair::eager_broker_socketpair_enabled()
-                    && let Some(provider) =
-                        crate::syscalls::broker_socketpair::broker_socketpair_provider()
-                {
-                    use litebox::fs::OFlags;
-                    use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
-                    // Default capacity / atomic-write-size mirror the
-                    // pipe defaults (PIPE_BUF=4096, capacity=64KB).
-                    const SP_CAPACITY: u64 = 64 * 1024;
-                    const SP_ATOMIC: u64 = 4096;
-                    let (handle_a, handle_b) = provider
-                        .create_socketpair(SP_CAPACITY, SP_ATOMIC)
-                        .map_err(|_| Errno::EIO)?;
-                    let nonblock = if flags.contains(SockFlags::NONBLOCK) {
-                        OFlags::NONBLOCK
-                    } else {
-                        OFlags::empty()
-                    };
-                    let sp_a = crate::syscalls::broker_socketpair::BrokerSocketPairFd::<
-                        crate::Platform,
-                    >::new(
-                        alloc::sync::Arc::clone(&provider),
-                        handle_a,
-                        BrokerSocketPairEndpoint::A,
-                        nonblock,
-                    );
-                    let sp_b = crate::syscalls::broker_socketpair::BrokerSocketPairFd::<
-                        crate::Platform,
-                    >::new(
-                        provider, handle_b, BrokerSocketPairEndpoint::B, nonblock
-                    );
-                    let files = self.files.borrow();
-                    let mut dt = self.global.litebox.descriptor_table_mut();
-                    let typed1 = dt
-                        .insert::<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
-                            sp_a,
-                        );
-                    let typed2 = dt
-                        .insert::<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
-                            sp_b,
-                        );
-                    if flags.contains(SockFlags::CLOEXEC) {
-                        let old = dt.set_fd_metadata(&typed1, FileDescriptorFlags::FD_CLOEXEC);
-                        assert!(old.is_none());
-                        let old = dt.set_fd_metadata(&typed2, FileDescriptorFlags::FD_CLOEXEC);
-                        assert!(old.is_none());
-                    }
-                    drop(dt);
-                    let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
-                        let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                        Errno::EMFILE
-                    })?;
-                    let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
-                        self.do_close(raw_fd1).unwrap();
-                        let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                        Errno::EMFILE
-                    })?;
-                    return Ok((
-                        u32::try_from(raw_fd1).unwrap(),
-                        u32::try_from(raw_fd2).unwrap(),
-                    ));
-                }
+                match ty {
+                    SockType::Stream => {
+                        use litebox::fs::OFlags;
+                        use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
 
-                if ty == SockType::SeqPacket
-                    && crate::syscalls::broker_socket_seqpacket::eager_broker_socket_seqpacket_enabled()
-                    && let Some(provider) = crate::syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider()
-                {
-                    use litebox::fs::OFlags;
-                    let (handle_a, handle_b) = provider
-                        .create_socketpair()
-                        .map_err(super::broker_backed::broker_err_to_errno)?;
-                    let mut status = OFlags::empty();
-                    status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
-                    let sp_a = crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<crate::Platform>::new(
-                        alloc::sync::Arc::clone(&provider),
-                        handle_a,
-                        status,
-                    );
-                    let sp_b = crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<crate::Platform>::new(
-                        provider,
-                        handle_b,
-                        status,
-                    );
-                    let files = self.files.borrow();
-                    let mut dt = self.global.litebox.descriptor_table_mut();
-                    let typed1 = dt.insert::<crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(sp_a);
-                    let typed2 = dt.insert::<crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(sp_b);
-                    if flags.contains(SockFlags::CLOEXEC) {
-                        let old = dt.set_fd_metadata(&typed1, FileDescriptorFlags::FD_CLOEXEC);
-                        assert!(old.is_none());
-                        let old = dt.set_fd_metadata(&typed2, FileDescriptorFlags::FD_CLOEXEC);
-                        assert!(old.is_none());
+                        let provider =
+                            crate::syscalls::broker_socketpair::broker_socketpair_provider()
+                                .ok_or(Errno::ENODEV)?;
+                        const SP_CAPACITY: u64 = 64 * 1024;
+                        const SP_ATOMIC: u64 = 4096;
+                        let (handle_a, handle_b) = provider
+                            .create_socketpair(SP_CAPACITY, SP_ATOMIC)
+                            .map_err(|_| Errno::EIO)?;
+                        let nonblock = if flags.contains(SockFlags::NONBLOCK) {
+                            OFlags::NONBLOCK
+                        } else {
+                            OFlags::empty()
+                        };
+                        let sp_a = crate::syscalls::broker_socketpair::BrokerSocketPairFd::<
+                            crate::Platform,
+                        >::new(
+                            alloc::sync::Arc::clone(&provider),
+                            handle_a,
+                            BrokerSocketPairEndpoint::A,
+                            nonblock,
+                        );
+                        let sp_b = crate::syscalls::broker_socketpair::BrokerSocketPairFd::<
+                            crate::Platform,
+                        >::new(
+                            provider, handle_b, BrokerSocketPairEndpoint::B, nonblock
+                        );
+                        let files = self.files.borrow();
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed1 = dt.insert::<
+                            crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem,
+                        >(sp_a);
+                        let typed2 = dt.insert::<
+                            crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem,
+                        >(sp_b);
+                        if flags.contains(SockFlags::CLOEXEC) {
+                            let old = dt.set_fd_metadata(&typed1, FileDescriptorFlags::FD_CLOEXEC);
+                            assert!(old.is_none());
+                            let old = dt.set_fd_metadata(&typed2, FileDescriptorFlags::FD_CLOEXEC);
+                            assert!(old.is_none());
+                        }
+                        drop(dt);
+                        let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
+                            let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                            Errno::EMFILE
+                        })?;
+                        let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
+                            self.do_close(raw_fd1).unwrap();
+                            let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                            Errno::EMFILE
+                        })?;
+                        (raw_fd1, raw_fd2)
                     }
-                    drop(dt);
-                    let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
-                        let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                        Errno::EMFILE
-                    })?;
-                    let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
-                        self.do_close(raw_fd1).unwrap();
-                        let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                        Errno::EMFILE
-                    })?;
-                    return Ok((u32::try_from(raw_fd1).unwrap(), u32::try_from(raw_fd2).unwrap()));
-                }
+                    SockType::SeqPacket => {
+                        use litebox::fs::OFlags;
 
-                let (sock1, sock2) =
-                    UnixSocket::new_connected_pair(ty, flags, self.current_ucred())
-                        .ok_or(Errno::ESOCKTNOSUPPORT)?;
-                let files = self.files.borrow();
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let typed1 = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(sock1);
-                let typed2 = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(sock2);
-                if flags.contains(SockFlags::CLOEXEC) {
-                    let old = dt.set_fd_metadata(&typed1, FileDescriptorFlags::FD_CLOEXEC);
-                    assert!(old.is_none());
-                    let old = dt.set_fd_metadata(&typed2, FileDescriptorFlags::FD_CLOEXEC);
-                    assert!(old.is_none());
+                        let provider = crate::syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider()
+                            .ok_or(Errno::ENODEV)?;
+                        let (handle_a, handle_b) = provider
+                            .create_socketpair()
+                            .map_err(super::broker_backed::broker_err_to_errno)?;
+                        let mut status = OFlags::empty();
+                        status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                        let sp_a =
+                            crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<
+                                crate::Platform,
+                            >::new(
+                                alloc::sync::Arc::clone(&provider), handle_a, status
+                            );
+                        let sp_b =
+                            crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<
+                                crate::Platform,
+                            >::new(provider, handle_b, status);
+                        let files = self.files.borrow();
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed1 = dt.insert::<crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(sp_a);
+                        let typed2 = dt.insert::<crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(sp_b);
+                        if flags.contains(SockFlags::CLOEXEC) {
+                            let old = dt.set_fd_metadata(&typed1, FileDescriptorFlags::FD_CLOEXEC);
+                            assert!(old.is_none());
+                            let old = dt.set_fd_metadata(&typed2, FileDescriptorFlags::FD_CLOEXEC);
+                            assert!(old.is_none());
+                        }
+                        drop(dt);
+                        let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
+                            let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                            Errno::EMFILE
+                        })?;
+                        let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
+                            self.do_close(raw_fd1).unwrap();
+                            let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                            Errno::EMFILE
+                        })?;
+                        (raw_fd1, raw_fd2)
+                    }
+                    _ => return Err(Errno::ESOCKTNOSUPPORT),
                 }
-                drop(dt);
-                #[cfg(feature = "trace_syscalls")]
-                let object_id1 = typed1.object_id().as_u64();
-                let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                    Errno::EMFILE
-                })?;
-                #[cfg(feature = "trace_syscalls")]
-                let object_id2 = typed2.object_id().as_u64();
-                let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
-                    self.do_close(raw_fd1).unwrap();
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                    Errno::EMFILE
-                })?;
-                #[cfg(feature = "trace_syscalls")]
-                if raw_fd1 <= 20 || raw_fd2 <= 20 {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[FD-TRACE] pid={} socketpair fd1={} object_id1={} fd2={} object_id2={} domain={:?} type={:?} flags={:?}",
-                        self.pid,
-                        raw_fd1,
-                        object_id1,
-                        raw_fd2,
-                        object_id2,
-                        domain,
-                        ty,
-                        flags,
-                    );
-                }
-                (raw_fd1, raw_fd2)
             }
             AddressFamily::INET | AddressFamily::INET6 | AddressFamily::NETLINK => {
                 return Err(Errno::EOPNOTSUPP);

@@ -946,56 +946,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     }
 
-    // Broker AF_UNIX SOCK_DGRAM remains opt-in while broader external-fd
-    // fallback coverage is completed. Set LITEBOX_EAGER_BROKER_SOCKETDGRAM=1
-    // to force the broker path.
-    {
-        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETDGRAM")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        litebox_shim_linux::syscalls::set_eager_broker_socket_dgram_enabled(enabled);
-    }
-
-    // Phase U.3: eager broker-backed AF_UNIX SOCK_SEQPACKET is default-on
-    // for consistency with U.1 (SOCK_STREAM). Required for the
-    // UDS_SEQPACKET.* harness suite to exercise BrokerSocketSeqPacket
-    // rather than falling back to in-shim UnixSocket (which lacks
-    // message-boundary semantics).
-    //
-    // Set `LITEBOX_EAGER_BROKER_SOCKETSEQPACKET=0` to opt out.
-    {
-        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETSEQPACKET")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(true);
-        litebox_shim_linux::syscalls::set_eager_broker_socket_seqpacket_enabled(enabled);
-    }
-
-    // Phase U.1: eager broker-backed AF_UNIX SOCK_STREAM socketpair
-    // is default-on so fork+exec inheritance uses broker-held pairs
-    // instead of in-shim UnixSocket state. Required for cross-worker
-    // fork+exec inheritance of socketpair fds.
-    //
-    // **F.8 flip retry (2026-05-17, PE.10 done)**: setting default
-    // ON. The earlier F.8 attempt regressed PB.c2p 20/20 → 11/20.
-    // Root caused: PE.5's fork-emit caller_pid scope wrap was
-    // unconditionally stamping child_pid on dup_handles, while
-    // releases at exec ran with caller_pid=0 (gate off). Ambient
-    // fallback mis-attributed releases → ReleaseAllForPid(child)
-    // double-released. Fixed by gating PE.5's scope wrap on
-    // per_pid_ownership_enabled(). Empirically: 5/5 isolation
-    // passes on PB.c2p.pie-glibc.dpg1 with eager-socketpair on.
-    //
-    // Set `LITEBOX_EAGER_BROKER_SOCKETPAIR=0` to opt out.
-    {
-        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETPAIR")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(true);
-        litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
-    }
-
     if let Ok(s) = std::env::var("LITEBOX_BROKER_INET_DELAY_NS")
         && let Ok(ns) = s.parse::<u64>()
     {

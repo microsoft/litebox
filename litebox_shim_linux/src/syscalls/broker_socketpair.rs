@@ -39,24 +39,6 @@ use super::fork_snapshot::BrokerHandleSnapshot;
 static BROKER_SOCKETPAIR_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerSocketPairProvider>> =
     once_cell::race::OnceBox::new();
 
-/// Phase F: dynamic gate for the eager-broker `sys_socketpair`
-/// codepath. The runner sets this from the env var
-/// `LITEBOX_EAGER_BROKER_SOCKETPAIR=1` at startup, before any guest
-/// `socketpair` can run. Default is `false` (legacy in-shim
-/// `UnixSocket` fallback) so the committed baseline is unchanged
-/// while broker-backed socketpair is iterated on.
-static EAGER_BROKER_SOCKETPAIR_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-pub fn set_eager_broker_socketpair_enabled(enabled: bool) {
-    EAGER_BROKER_SOCKETPAIR_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
-}
-
-#[inline]
-pub fn eager_broker_socketpair_enabled() -> bool {
-    EAGER_BROKER_SOCKETPAIR_ENABLED.load(core::sync::atomic::Ordering::Acquire)
-}
-
 pub fn set_broker_socketpair_provider(
     provider: Arc<dyn BrokerSocketPairProvider>,
 ) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerSocketPairProvider>>> {
