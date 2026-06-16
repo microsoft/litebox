@@ -20,19 +20,19 @@ Three independent concepts that show up at different layers:
 2. **`HostStdioSourceFd` metadata** on a `DescriptorObjectId` — records
    that this descriptor was originally one of the host's stdio
    descriptors (so dup2 alias detection works).
-3. **`FdClass::StdioFd`** — a classification used by `snapshot_fd_table`
+3. **`FdKind::StdioFd`** — a classification used by `snapshot_fd_table`
    that promotes a descriptor to "stdio" only when **both** (a) it sits
    at slot 0/1/2 *and* (b) its `object_id` matches one of the original
    host stdio object IDs.
 
 The third concept is what gates fork acceptance. The classifier prefers
-`FdClass::StdioFd` over the raw subsystem class (FilesystemFd, Pipe,
+`FdKind::StdioFd` over the raw subsystem class (FilesystemFd, Pipe,
 UnixSocket) when the slot is stdio AND the object matches.
 
 ## Code references
 
 - `shim_linux/syscalls/process.rs:7008-7026` — classifier promoting fd
-  to `FdClass::StdioFd`.
+  to `FdKind::StdioFd`.
 - `shim_linux/syscalls/process.rs:5786-5827` — wave-3 fs-parent-open
   bridge explicitly excludes `host_stdio_source_fd.is_some()`.
 - `shim_linux/syscalls/process.rs:5235-5244` — UnixSocket bridge stdio-
@@ -50,7 +50,7 @@ UnixSocket) when the slot is stdio AND the object matches.
 
 ## The invariants
 
-### I-1. Stdio fds at slots 0/1/2 must be classified as `FdClass::StdioFd` when they are aliases of the original host stdio.
+### I-1. Stdio fds at slots 0/1/2 must be classified as `FdKind::StdioFd` when they are aliases of the original host stdio.
 
 Concretely: if the slot is 0/1/2 AND the descriptor's `object_id` matches
 the host's recorded stdio OIDs, classification is `StdioFd`, not

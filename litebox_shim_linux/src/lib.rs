@@ -616,7 +616,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
     ///
     /// The snapshot variant determines which broker provider to consult
     /// and how to build the per-fd shim entry. Match is exhaustive; new
-    /// `BrokerHandleSnapshot` variants fail to compile here.
+    /// `FdKind` variants fail to compile here.
     ///
     /// `pipe_flags` is the open-flags bits (NONBLOCK in particular) the
     /// caller wants applied to the constructed fd. For PTYs it is
@@ -626,13 +626,13 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
     pub fn install_broker_bridge_fd(
         &self,
         guest_fd: usize,
-        snapshot: syscalls::fork_snapshot::BrokerHandleSnapshot,
+        snapshot: syscalls::fork_snapshot::FdKind,
         pipe_flags: litebox::fs::OFlags,
     ) -> Result<(), ()> {
-        use syscalls::fork_snapshot::BrokerHandleSnapshot;
+        use syscalls::fork_snapshot::FdKind;
         let files = self.task.files.borrow();
         match snapshot {
-            BrokerHandleSnapshot::Eventfd { handle_id } => {
+            FdKind::Eventfd { handle_id } => {
                 let provider = syscalls::eventfd::broker_eventfd_provider().ok_or(())?;
                 let event_file = syscalls::eventfd::EventFile::new_broker_backed(
                     provider,
@@ -642,7 +642,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 self.install_eventfd_at_slot(event_file, guest_fd, &files);
                 Ok(())
             }
-            BrokerHandleSnapshot::Pidfd { handle_id } => {
+            FdKind::Pidfd { handle_id } => {
                 let target_pid =
                     litebox::process::ProcessId(u32::try_from(handle_id).map_err(|_| ())?);
                 let subscription =
@@ -656,7 +656,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 self.install_eventfd_at_slot(event_file, guest_fd, &files);
                 Ok(())
             }
-            BrokerHandleSnapshot::Pipe {
+            FdKind::BrokerPipe {
                 handle_id,
                 direction,
             } => {
@@ -677,7 +677,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(bp_fd);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "pipe")
             }
-            BrokerHandleSnapshot::UnixSocket {
+            FdKind::BrokerSocketPair {
                 handle_id,
                 endpoint,
             } => {
@@ -704,7 +704,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(sp_fd);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "unix_socket")
             }
-            BrokerHandleSnapshot::SocketDgram { handle_id } => {
+            FdKind::BrokerSocketDgram { handle_id } => {
                 let provider =
                     syscalls::broker_socket_dgram::broker_socket_dgram_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -726,7 +726,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(dgram);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "socket_dgram")
             }
-            BrokerHandleSnapshot::SocketSeqPacket { handle_id } => {
+            FdKind::BrokerSocketSeqPacket { handle_id } => {
                 let provider =
                     syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider()
                         .ok_or(())?;
@@ -754,7 +754,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     "socket_seqpacket",
                 )
             }
-            BrokerHandleSnapshot::TcpConn { handle_id } => {
+            FdKind::BrokerTcpConn { handle_id } => {
                 let provider = syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
                 let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
@@ -773,7 +773,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                         .insert(tcp_fd);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "tcp_conn")
             }
-            BrokerHandleSnapshot::InetDgram { handle_id } => {
+            FdKind::BrokerInetDgram { handle_id } => {
                 let provider =
                     syscalls::broker_inet_dgram::broker_inet_dgram_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -795,7 +795,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(dgram);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "inet_dgram")
             }
-            BrokerHandleSnapshot::InetListener { handle_id } => {
+            FdKind::BrokerInetListener { handle_id } => {
                 let provider =
                     syscalls::broker_inet_listener::broker_inet_listener_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -831,11 +831,11 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             // runner level but no early panic). Make it a hard
             // failure so a snapshot carrying this kind crashes loudly
             // instead of leaking broker refs and stalling readers.
-            BrokerHandleSnapshot::Signalfd { handle_id } => todo!(
-                "install_broker_bridge_fd for BrokerHandleSnapshot::Signalfd \
+            FdKind::Signalfd { handle_id } => todo!(
+                "install_broker_bridge_fd for FdKind::Signalfd \
                  not implemented yet (guest_fd={guest_fd}, handle_id={handle_id})"
             ),
-            BrokerHandleSnapshot::Pty {
+            FdKind::BrokerPty {
                 handle_id,
                 role,
                 pty_id,
@@ -847,6 +847,15 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .map_err(|_| ())?;
                 self.install_broker_pty_at_slot(pty_fd, guest_fd, &files)
             }
+            FdKind::Timerfd { .. }
+            | FdKind::BrokerInetRaw { .. }
+            | FdKind::FilesystemFd
+            | FdKind::UnixSocket
+            | FdKind::Epoll
+            | FdKind::Inotify
+            | FdKind::HostPassthrough { .. } => Err(()),
+            #[cfg(feature = "worker_local_inet")]
+            FdKind::Net => Err(()),
         }
     }
 
@@ -2107,7 +2116,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         direction,
                     } => {
                         // C.5l: Phase C.3 follow-up — restore BrokerPipeFd entries for
-                        // FdClass::Pipe slots whose snapshot carries a broker_handle.
+                        // FdKind::Pipe slots whose snapshot carries a broker_handle.
                         // Previously these fell through to the local-pipe restore branch
                         // (line 1414 mapped `BrokerHandleKind::Pipe => None`), which
                         // meant fork-restore created no BrokerPipeFd in the child
@@ -2117,7 +2126,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         // when the original writer process exited — readers in other
                         // workers stalled forever waiting for EOF.
                         //
-                        // Now: per FdClass::Pipe entry with broker_handle, create a
+                        // Now: per FdKind::Pipe entry with broker_handle, create a
                         // fresh BrokerPipeFd that adopts the parent's emit-side
                         // `dup_handle` ref (no additional bump on this side).
                         // BrokerPipeFd's on_close in the child worker will release on
@@ -5256,14 +5265,6 @@ pub(crate) struct VforkParking {
     pub deferred_lie_count: core::sync::atomic::AtomicU32,
 }
 
-/// Which virtual subsystem the replaced fd belonged to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplacedSubsystem {
-    UnixSocket,
-    Pty,
-    Filesystem,
-}
-
 /// Describes a single fd endpoint that should be replaced with a host OS
 /// pipe after the delayed-fork child has been migrated.
 ///
@@ -5276,9 +5277,6 @@ struct FdReplacement {
     host_fd: i32,
     /// Whether this endpoint is a read or write end.
     direction: syscalls::host_passthrough_fd::HostPassthroughFdDirection,
-    /// The virtual subsystem that owned the original fd.
-    #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
-    subsystem: ReplacedSubsystem,
 }
 
 #[derive(Debug, Clone)]
@@ -5664,22 +5662,6 @@ mod tests {
 
     const DUP_FAIL_HANDLE: u64 = 0xd0_fa_11;
 
-    #[test]
-    fn replaced_subsystem_has_no_pipe_kind() {
-        for subsystem in [
-            ReplacedSubsystem::UnixSocket,
-            ReplacedSubsystem::Pty,
-            ReplacedSubsystem::Filesystem,
-        ] {
-            let kind = match subsystem {
-                ReplacedSubsystem::UnixSocket => "unix_socket",
-                ReplacedSubsystem::Pty => "pty",
-                ReplacedSubsystem::Filesystem => "filesystem",
-            };
-            assert_ne!(kind, "pipe");
-        }
-    }
-
     struct TestBrokerPipeProvider;
 
     impl BrokerSubscribable for TestBrokerPipeProvider {
@@ -5821,7 +5803,7 @@ mod tests {
         assert_eq!(
             entrypoints.install_broker_bridge_fd(
                 guest_fd,
-                syscalls::fork_snapshot::BrokerHandleSnapshot::UnixSocket {
+                syscalls::fork_snapshot::FdKind::BrokerSocketPair {
                     handle_id: 1234,
                     endpoint: BrokerSocketPairEndpoint::A,
                 },
@@ -5855,7 +5837,7 @@ mod tests {
         assert_eq!(
             entrypoints.install_broker_bridge_fd(
                 guest_fd,
-                syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                syscalls::fork_snapshot::FdKind::BrokerPipe {
                     handle_id: DUP_FAIL_HANDLE,
                     direction: BrokerPipeEnd::Read,
                 },
@@ -5951,7 +5933,7 @@ mod tests {
         entrypoints
             .install_broker_bridge_fd(
                 usize::try_from(inherited_fd).expect("inherited fd should fit usize"),
-                syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                syscalls::fork_snapshot::FdKind::BrokerPipe {
                     handle_id: 1234,
                     direction: BrokerPipeEnd::Read,
                 },

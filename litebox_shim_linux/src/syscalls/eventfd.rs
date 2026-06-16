@@ -362,7 +362,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     ///   fork-snapshot broker-handle path still cannot preserve the
     ///   exact kernel timer object or accumulated expiration count.
     ///   In the cross-binary fork-snapshot path, the fd itself migrates
-    ///   classified as `FdClass::EventFd` (see `RawFdRef::Eventfd`
+    ///   classified as `FdKind::EventFd` (see `RawFdRef::Eventfd`
     ///   classification in `process.rs::snapshot_fd_table`); the fd
     ///   handoff works but the kernel timer's *arm state* (interval,
     ///   next expiration, accumulated unread expirations) is lost. The
@@ -376,20 +376,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         &self,
         _eventfd_provider: Option<&Arc<dyn BrokerEventfdProvider>>,
         _pidfd_provider: Option<&Arc<dyn BrokerPidfdProvider>>,
-    ) -> Result<Option<super::fork_snapshot::BrokerHandleSnapshot>, BrokerOpError> {
-        use super::fork_snapshot::BrokerHandleSnapshot;
+    ) -> Result<Option<super::fork_snapshot::FdKind>, BrokerOpError> {
+        use super::fork_snapshot::FdKind;
         let guard = self.inner.lock();
         match &*guard {
-            EventFileInner::BrokerBacked { common, .. } => {
-                Ok(Some(BrokerHandleSnapshot::Eventfd {
-                    handle_id: common.handle(),
-                }))
-            }
-            EventFileInner::PidfdBrokerBacked { common, .. } => {
-                Ok(Some(BrokerHandleSnapshot::Pidfd {
-                    handle_id: common.handle(),
-                }))
-            }
+            EventFileInner::BrokerBacked { common, .. } => Ok(Some(FdKind::Eventfd {
+                handle_id: common.handle(),
+            })),
+            EventFileInner::PidfdBrokerBacked { common, .. } => Ok(Some(FdKind::Pidfd {
+                handle_id: common.handle(),
+            })),
             EventFileInner::Timerfd(_) => Ok(None),
             EventFileInner::Pidfd {
                 target_pid,
@@ -397,7 +393,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 ..
             } => {
                 if broker_subscription.is_some() {
-                    Ok(Some(BrokerHandleSnapshot::Pidfd {
+                    Ok(Some(FdKind::Pidfd {
                         handle_id: u64::from(target_pid.0),
                     }))
                 } else {

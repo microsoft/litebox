@@ -50,41 +50,41 @@ use crate::register_handler;
 // ─── Parent fd classes ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
-enum ParentFdClass {
+enum ParentFdKind {
     /// No extra fd opened — only stdio inherited.
     StdioOnly,
-    /// `pipe2(O_CLOEXEC)` — accept-list (`FdClass::Pipe`).
+    /// `pipe2(O_CLOEXEC)` — accept-list (`FdKind::Pipe`).
     Pipe,
-    /// `eventfd(0, EFD_CLOEXEC)` — accept-list (`FdClass::EventFd`).
+    /// `eventfd(0, EFD_CLOEXEC)` — accept-list (`FdKind::EventFd`).
     EventFd,
     /// `socketpair(AF_UNIX, SOCK_STREAM, 0)` — accept-list
-    /// (`FdClass::UnixSocket`).
+    /// (`FdKind::UnixSocket`).
     UnixSocket,
     /// `signalfd(-1, &set, SFD_CLOEXEC)` — accept-list
-    /// (`FdClass::Signalfd`).
+    /// (`FdKind::Signalfd`).
     Signalfd,
     /// `socket(AF_INET, SOCK_STREAM, 0)` bound to 127.0.0.1:0 +
-    /// `listen` — accept-list (`FdClass::InetListener`).
+    /// `listen` — accept-list (`FdKind::InetListener`).
     InetListener,
     /// `open("/etc/hostname", O_RDONLY|O_CLOEXEC)` — accept-list
-    /// (`FdClass::FilesystemFd`). `/etc/hostname` is a regular file
+    /// (`FdKind::FilesystemFd`). `/etc/hostname` is a regular file
     /// in both the docker rootfs and the WSL2 chroot used for
     /// native baseline.
     FilesystemFd,
     /// `timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC)` — reject-list
-    /// (`FdClass::TimerFd`).
+    /// (`FdKind::TimerFd`).
     TimerFd,
-    /// `epoll_create1(EPOLL_CLOEXEC)` — reject-list (`FdClass::Epoll`).
+    /// `epoll_create1(EPOLL_CLOEXEC)` — reject-list (`FdKind::Epoll`).
     Epoll,
-    /// `inotify_init1(IN_CLOEXEC)` — reject-list (`FdClass::Inotify`).
+    /// `inotify_init1(IN_CLOEXEC)` — reject-list (`FdKind::Inotify`).
     Inotify,
     /// `pidfd_open(getpid(), 0)` on self — reject-list
-    /// (`FdClass::PidFd`).
+    /// (`FdKind::PidFd`).
     PidFd,
 }
 
-impl ParentFdClass {
-    const ALL: &'static [ParentFdClass] = &[
+impl ParentFdKind {
+    const ALL: &'static [ParentFdKind] = &[
         Self::StdioOnly,
         Self::Pipe,
         Self::EventFd,
@@ -154,7 +154,7 @@ const fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct DfParentTriggerArgs {
-    /// Wire form of [`ParentFdClass`].
+    /// Wire form of [`ParentFdKind`].
     fd_class: String,
     /// Path to the child binary to fork+exec.
     child_cmd: String,
@@ -175,11 +175,11 @@ const DF_PARENT_TRIGGER: HandlerToken<DfParentTriggerArgs, DfParentTriggerOut> =
 /// Open one or more fds of the requested class. All returned fds are
 /// closed by the caller on the success path; on the failure path the
 /// caller still closes any partial set.
-fn open_parent_fds(class: ParentFdClass) -> Result<Vec<libc::c_int>, String> {
+fn open_parent_fds(class: ParentFdKind) -> Result<Vec<libc::c_int>, String> {
     let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
     match class {
-        ParentFdClass::StdioOnly => Ok(Vec::new()),
-        ParentFdClass::Pipe => {
+        ParentFdKind::StdioOnly => Ok(Vec::new()),
+        ParentFdKind::Pipe => {
             let mut fds = [0i32; 2];
             let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
             if rc != 0 {
@@ -187,14 +187,14 @@ fn open_parent_fds(class: ParentFdClass) -> Result<Vec<libc::c_int>, String> {
             }
             Ok(vec![fds[0], fds[1]])
         }
-        ParentFdClass::EventFd => {
+        ParentFdKind::EventFd => {
             let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
             if fd < 0 {
                 return Err(format!("eventfd: errno={}", errno()));
             }
             Ok(vec![fd])
         }
-        ParentFdClass::UnixSocket => {
+        ParentFdKind::UnixSocket => {
             let mut fds = [0i32; 2];
             let rc = unsafe {
                 libc::socketpair(
@@ -209,7 +209,7 @@ fn open_parent_fds(class: ParentFdClass) -> Result<Vec<libc::c_int>, String> {
             }
             Ok(vec![fds[0], fds[1]])
         }
-        ParentFdClass::Signalfd => {
+        ParentFdKind::Signalfd => {
             let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
             unsafe {
                 libc::sigemptyset(&raw mut set);
@@ -221,7 +221,7 @@ fn open_parent_fds(class: ParentFdClass) -> Result<Vec<libc::c_int>, String> {
             }
             Ok(vec![fd])
         }
-        ParentFdClass::InetListener => {
+        ParentFdKind::InetListener => {
             let fd =
                 unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
             if fd < 0 {
@@ -257,7 +257,7 @@ fn open_parent_fds(class: ParentFdClass) -> Result<Vec<libc::c_int>, String> {
             }
             Ok(vec![fd])
         }
-        ParentFdClass::FilesystemFd => {
+        ParentFdKind::FilesystemFd => {
             let path = b"/etc/hostname\0";
             let fd = unsafe {
                 libc::open(
@@ -270,28 +270,28 @@ fn open_parent_fds(class: ParentFdClass) -> Result<Vec<libc::c_int>, String> {
             }
             Ok(vec![fd])
         }
-        ParentFdClass::TimerFd => {
+        ParentFdKind::TimerFd => {
             let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
             if fd < 0 {
                 return Err(format!("timerfd_create: errno={}", errno()));
             }
             Ok(vec![fd])
         }
-        ParentFdClass::Epoll => {
+        ParentFdKind::Epoll => {
             let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
             if fd < 0 {
                 return Err(format!("epoll_create1: errno={}", errno()));
             }
             Ok(vec![fd])
         }
-        ParentFdClass::Inotify => {
+        ParentFdKind::Inotify => {
             let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
             if fd < 0 {
                 return Err(format!("inotify_init1: errno={}", errno()));
             }
             Ok(vec![fd])
         }
-        ParentFdClass::PidFd => {
+        ParentFdKind::PidFd => {
             // pidfd_open is not in libc directly on all targets; use
             // the raw syscall number. SYS_pidfd_open = 434 on x86_64,
             // aarch64, and other Linux ABIs we care about.
@@ -324,7 +324,7 @@ async fn handle_df_parent_trigger(
     args: DfParentTriggerArgs,
     _ctx: &mut HandlerCtx<'_>,
 ) -> Result<DfParentTriggerOut, HandlerError> {
-    let class = ParentFdClass::from_wire(&args.fd_class)
+    let class = ParentFdKind::from_wire(&args.fd_class)
         .ok_or_else(|| HandlerError::from(format!("unknown fd_class: {}", args.fd_class)))?;
 
     let fds = open_parent_fds(class).map_err(HandlerError::from)?;
@@ -377,7 +377,7 @@ async fn handle_df_parent_trigger(
 pub(crate) fn register_df_parent_trigger(reg: &mut Registry<'_>) {
     register_handler!(DF_PARENT_TRIGGER, handle_df_parent_trigger);
 
-    for &fd_class in ParentFdClass::ALL {
+    for &fd_class in ParentFdKind::ALL {
         for &parent_bt in DF_PT_BINARIES {
             for &child_bt in DF_PT_BINARIES {
                 let id = format!(
