@@ -5656,7 +5656,7 @@ mod tests {
     use litebox_common_linux::{
         FcntlArg, FileDescriptorFlags, SockFlags, SockType,
         broker_pipe_provider::{BrokerOpError, BrokerPipeEnd, BrokerPipeProvider},
-        broker_socketpair_provider::{BrokerSocketPairEndpoint, BrokerSocketPairProvider},
+        broker_socketpair_provider::BrokerSocketPairEndpoint,
         cwfd::broker_subscribable::{BrokerEventCallback, BrokerSubscribable},
     };
 
@@ -5713,61 +5713,9 @@ mod tests {
         }
     }
 
-    struct TestBrokerSocketPairProvider;
-
-    impl BrokerSubscribable for TestBrokerSocketPairProvider {
-        fn subscribe(
-            &self,
-            _handle: u64,
-            _events_mask: u32,
-            _callback: Arc<dyn BrokerEventCallback>,
-        ) -> Result<u64, BrokerOpError> {
-            Ok(1)
-        }
-
-        fn unsubscribe(&self, _handle: u64, _subscription_id: u64) {}
-
-        fn release(&self, _handle: u64) {}
-
-        fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
-            Ok(())
-        }
-
-        fn query_events(&self, _handle: u64) -> Result<u32, BrokerOpError> {
-            Ok(0)
-        }
-    }
-
-    impl BrokerSocketPairProvider for TestBrokerSocketPairProvider {
-        fn create_socketpair(
-            &self,
-            _capacity: u64,
-            _atomic_write_size: u64,
-        ) -> Result<(u64, u64), BrokerOpError> {
-            Ok((20, 21))
-        }
-
-        fn read_socketpair(
-            &self,
-            _handle: u64,
-            _max_len: u64,
-        ) -> Result<alloc::vec::Vec<u8>, BrokerOpError> {
-            Ok(alloc::vec::Vec::new())
-        }
-
-        fn write_socketpair(&self, _handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError> {
-            Ok(bytes.len())
-        }
-
-        fn shutdown_socketpair_write(&self, _handle: u64) -> Result<(), BrokerOpError> {
-            Ok(())
-        }
-    }
-
     fn install_test_broker_providers() {
         let _ = crate::syscalls::set_broker_pipe_provider(Arc::new(TestBrokerPipeProvider));
-        let _ =
-            crate::syscalls::set_broker_socketpair_provider(Arc::new(TestBrokerSocketPairProvider));
+        crate::syscalls::test_broker_sockets::install_test_broker_socket_providers();
     }
 
     fn test_entrypoints() -> LinuxShimEntrypoints<DefaultFS> {

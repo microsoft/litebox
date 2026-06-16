@@ -71,6 +71,8 @@ pub(crate) mod unix;
 
 pub(crate) mod signal;
 #[cfg(test)]
+pub(crate) mod test_broker_sockets;
+#[cfg(test)]
 pub(crate) mod tests;
 
 static BROKER_INET_DELAY_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
