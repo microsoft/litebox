@@ -982,7 +982,10 @@ def _discover_agent_worktrees(
     conn: sqlite3.Connection, canonical: Path,
 ) -> list[dict]:
     """Return list of agent-worktree dicts (subset of `_list_worktrees`)
-    excluding tracked-ref CI worktrees and detached / missing HEADs."""
+    excluding tracked-ref CI worktrees, detached / missing HEADs, and
+    worktrees that haven't diverged from a tracked ref yet (their HEAD
+    is an ancestor of a tracked-ref HEAD — see
+    `_drop_covered_by_tracked`)."""
     tracked = _tracked_ci_worktree_paths(conn)
     out: list[dict] = []
     for wt in _list_worktrees(canonical):
@@ -999,7 +1002,9 @@ def _discover_agent_worktrees(
             continue
         # Skip canonical clone itself if it's checked out to the
         # amalgamation (or any tracked_ref branch). It's covered by
-        # the tracked_ref drive already.
+        # the tracked_ref drive already. (Kept as a name-based check
+        # in addition to the ancestry filter below, since a canonical
+        # checkout can sit *ahead* of a tracked `origin/<ref>`.)
         if resolved == str(canonical) and _branch_is_tracked(
             conn, wt["branch"]
         ):
@@ -1007,7 +1012,13 @@ def _discover_agent_worktrees(
         if not Path(path).is_dir():
             continue
         out.append({**wt, "path": resolved})
-    return out
+    # Drop worktrees whose HEAD is already contained in a tracked ref:
+    # driving a shadow at the merge-base only re-tests the upstream
+    # baseline under the agent's branch and splits its history.
+    tracked_heads = _tracked_ref_heads(conn, canonical)
+    return _drop_covered_by_tracked(
+        out, tracked_heads, lambda a, b: _is_ancestor(canonical, a, b),
+    )
 
 
 def _branch_is_tracked(conn: sqlite3.Connection, branch: str) -> bool:
@@ -1105,6 +1116,41 @@ def _compute_tip_set(
     return out
 
 
+def _drop_covered_by_tracked(
+    worktrees: list[dict],
+    tracked_ref_heads: list[str],
+    is_ancestor: Callable[[str, str], bool],
+) -> list[dict]:
+    """Drop agent worktrees whose committed HEAD is already an
+    ancestor of a tracked ref's HEAD.
+
+    Such a worktree has no commits of its own beyond the upstream it
+    forked from — its HEAD *is* the merge-base. A clean shadow
+    checkout there reproduces the tracked-ref baseline (already
+    covered by the tracked-ref drive), not the agent's work, and would
+    record that coverage under the agent's branch at the merge-base
+    sha — splitting the branch's apparent history across the
+    merge-base and (once it commits) its real tip. The agent's own
+    in-worktree runs cover its uncommitted work; the worktree
+    reappears as a coverage target the moment it has a divergent
+    commit.
+
+    Pure-functional with an injected `is_ancestor` predicate so it can
+    be unit-tested with a fake graph (mirrors `_compute_tip_set`).
+    Order-preserving. Empty `tracked_ref_heads` (or unresolved heads)
+    is fail-open: nothing is dropped.
+    """
+    if not tracked_ref_heads:
+        return list(worktrees)
+    out: list[dict] = []
+    for wt in worktrees:
+        head = wt.get("head")
+        if head and any(is_ancestor(head, rh) for rh in tracked_ref_heads):
+            continue
+        out.append(wt)
+    return out
+
+
 def _agent_tip_worktrees(
     conn: sqlite3.Connection, canonical: Path,
 ) -> tuple[list[dict], list[dict]]:
@@ -1162,6 +1208,21 @@ def _resolve_ref_head(canonical: Path, ref: str) -> Optional[str]:
         return None
     s = r.stdout.strip()
     return s if len(s) >= 7 else None
+
+
+def _tracked_ref_heads(conn: sqlite3.Connection, canonical: Path) -> list[str]:
+    """Resolved HEAD SHAs of all tracked refs (local name first, then
+    `origin/<ref>`). Skips refs that don't resolve. Used by
+    `_discover_agent_worktrees` to suppress opportunistic coverage of
+    agent worktrees that haven't diverged from a tracked ref yet."""
+    heads: list[str] = []
+    for r in conn.execute("SELECT ref FROM tracked_refs"):
+        ref = r["ref"]
+        rh = (_resolve_ref_head(canonical, ref)
+              or _resolve_ref_head(canonical, f"origin/{ref}"))
+        if rh:
+            heads.append(rh)
+    return heads
 
 
 def _pick_baseline_ref(

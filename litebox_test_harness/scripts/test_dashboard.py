@@ -262,6 +262,79 @@ class TipSetTests(unittest.TestCase):
         self.assertEqual([w["head"] for w in out], ["Z", "A"])
 
 
+class CoveredByTrackedTests(unittest.TestCase):
+    """`_drop_covered_by_tracked`: drop agent worktrees whose HEAD is
+    an ancestor of a tracked ref's HEAD (no divergent commits → it's
+    the merge-base, already covered by the tracked-ref drive). Uses a
+    fake reflexive ancestor predicate so the test is hermetic."""
+
+    @staticmethod
+    def _ancestor_pred(graph):
+        """graph: {descendant_sha: {ancestor_shas...}}. Reflexive, like
+        the real `_is_ancestor`."""
+        def pred(a: str, b: str) -> bool:
+            return a == b or a in graph.get(b, set())
+        return pred
+
+    @staticmethod
+    def _wts(*shas):
+        return [{"path": f"/wt/{s}", "head": s, "branch": s} for s in shas]
+
+    def test_drops_worktree_at_merge_base(self):
+        # Agent worktree HEAD MB is an ancestor of tracked tip TIP
+        # (the mt-fork-repro pre-commit case): drop it.
+        graph = {"TIP": {"MB"}}
+        out = dashboard._drop_covered_by_tracked(
+            self._wts("MB"), ["TIP"], self._ancestor_pred(graph))
+        self.assertEqual(out, [])
+
+    def test_keeps_divergent_worktree(self):
+        # Agent HEAD has its own commit (not an ancestor of the tracked
+        # tip): keep it.
+        out = dashboard._drop_covered_by_tracked(
+            self._wts("AGENT_TIP"), ["BASE"], self._ancestor_pred({}))
+        self.assertEqual([w["head"] for w in out], ["AGENT_TIP"])
+
+    def test_drops_reflexive_equal_to_tracked_head(self):
+        # Fresh worktree sitting exactly at the tracked tip.
+        out = dashboard._drop_covered_by_tracked(
+            self._wts("TIP"), ["TIP"], self._ancestor_pred({}))
+        self.assertEqual(out, [])
+
+    def test_empty_tracked_heads_is_fail_open(self):
+        wts = self._wts("A", "B")
+        out = dashboard._drop_covered_by_tracked(
+            wts, [], self._ancestor_pred({"X": {"A"}}))
+        self.assertEqual([w["head"] for w in out], ["A", "B"])
+
+    def test_drops_if_ancestor_of_any_tracked_ref(self):
+        graph = {"TIP2": {"MB"}}
+        out = dashboard._drop_covered_by_tracked(
+            self._wts("MB"), ["TIP1", "TIP2"], self._ancestor_pred(graph))
+        self.assertEqual(out, [])
+
+    def test_mixed_keeps_divergent_drops_mergebase(self):
+        # MB at merge-base (dropped), DIV with own commit (kept).
+        graph = {"TIP": {"MB"}}
+        wts = self._wts("MB", "DIV")
+        out = dashboard._drop_covered_by_tracked(
+            wts, ["TIP"], self._ancestor_pred(graph))
+        self.assertEqual([w["head"] for w in out], ["DIV"])
+
+    def test_missing_head_kept(self):
+        wts = [{"path": "/wt/x", "branch": "weird"}]
+        out = dashboard._drop_covered_by_tracked(
+            wts, ["TIP"], self._ancestor_pred({}))
+        self.assertEqual(out, wts)
+
+    def test_preserves_input_order(self):
+        graph = {"TIP": {"MB"}}
+        wts = self._wts("Z", "MB", "A")
+        out = dashboard._drop_covered_by_tracked(
+            wts, ["TIP"], self._ancestor_pred(graph))
+        self.assertEqual([w["head"] for w in out], ["Z", "A"])
+
+
 class ShadowPathTests(unittest.TestCase):
     """Per-branch shadow path encoding + GC selection rules.
     Hermetic: only exercises pure-functional path helpers and the
