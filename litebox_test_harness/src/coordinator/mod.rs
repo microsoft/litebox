@@ -264,10 +264,10 @@ pub struct TestResult {
 }
 
 impl TestResult {
-    /// Effective outcome: `"pass"` or `"FAIL"`.
+    /// Effective outcome: `"pass"` or `"fail"`.
     #[must_use]
     pub fn outcome(&self) -> &'static str {
-        if self.actual_pass { "pass" } else { "FAIL" }
+        if self.actual_pass { "pass" } else { "fail" }
     }
 }
 

@@ -45,7 +45,7 @@ def _init_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_DDL)
-    conn.execute("INSERT INTO meta(key, value) VALUES('schema_version','3')")
+    conn.execute("INSERT INTO meta(key, value) VALUES('schema_version','4')")
     return conn
 
 
@@ -62,7 +62,7 @@ def _add_run(conn, *, worktree="/wt", commit="sha1", dirty_hash=None,
 def _add_result(conn, *, run_id, test_id, pass_, verdict, ts_ms,
                 suite="vscode", group="pidfd"):
     conn.execute(
-        "INSERT INTO run_results(run_id, test_id, pass, verdict,"
+        "INSERT INTO run_results(run_id, test_id, mode, verdict,"
         " finished_ts_ms, suite, \"group\","
         " t_acquire_ms, t_docker_start_ms, t_useful_ms)"
         " VALUES (?,?,?,?,?,?,?, 0, 0, 100)",
@@ -72,7 +72,7 @@ def _add_result(conn, *, run_id, test_id, pass_, verdict, ts_ms,
 
 class LatestResultsViewTests(unittest.TestCase):
     """The latest_results VIEW replaces the prior UPSERT-maintained
-    table. Verify it returns the freshest row per (test_id, pass).
+    table. Verify it returns the freshest row per (test_id, mode).
     """
 
     def setUp(self) -> None:
@@ -89,12 +89,12 @@ class LatestResultsViewTests(unittest.TestCase):
         r1 = _add_run(self.conn, started_ts_ms=1000)
         r2 = _add_run(self.conn, started_ts_ms=2000)
         _add_result(self.conn, run_id=r1, test_id="A", pass_="native",
-                    verdict="FAIL", ts_ms=1500)
+                    verdict="fail", ts_ms=1500)
         _add_result(self.conn, run_id=r2, test_id="A", pass_="native",
                     verdict="pass", ts_ms=2500)
         row = self.conn.execute(
             "SELECT verdict, finished_ts_ms FROM latest_results"
-            " WHERE test_id='A' AND pass='native'"
+            " WHERE test_id='A' AND mode='native'"
         ).fetchone()
         self.assertEqual(row["verdict"], "pass")
         self.assertEqual(row["finished_ts_ms"], 2500)
@@ -104,15 +104,15 @@ class LatestResultsViewTests(unittest.TestCase):
         _add_result(self.conn, run_id=r, test_id="A", pass_="native",
                     verdict="pass", ts_ms=1000)
         _add_result(self.conn, run_id=r, test_id="A", pass_="litebox",
-                    verdict="FAIL", ts_ms=1000)
+                    verdict="fail", ts_ms=1000)
         rows = self.conn.execute(
-            "SELECT pass, verdict FROM latest_results WHERE test_id='A'"
-            " ORDER BY pass"
+            "SELECT mode, verdict FROM latest_results WHERE test_id='A'"
+            " ORDER BY mode"
         ).fetchall()
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["pass"], "litebox")
-        self.assertEqual(rows[0]["verdict"], "FAIL")
-        self.assertEqual(rows[1]["pass"], "native")
+        self.assertEqual(rows[0]["mode"], "litebox")
+        self.assertEqual(rows[0]["verdict"], "fail")
+        self.assertEqual(rows[1]["mode"], "native")
         self.assertEqual(rows[1]["verdict"], "pass")
 
 
@@ -142,6 +142,9 @@ class CoverageFiltersDirtyTests(unittest.TestCase):
                          dirty_hash="deadbeef", started_ts_ms=2000)
         _add_result(self.conn, run_id=dirty, test_id="B", pass_="native",
                     verdict="pass", ts_ms=2500)
+        # Materialize the per-connection state views (open_db does this
+        # in production) so state_test_pass reflects the rows above.
+        dashboard._ensure_views(self.conn)
         # _coverage_pass_fail filters dirty; only A counts.
         covered, n_pass, n_fail = dashboard._coverage_pass_fail(
             self.conn, "abc", "native"
@@ -256,6 +259,79 @@ class TipSetTests(unittest.TestCase):
         wts = self._wts("Z", "A")
         out = dashboard._compute_tip_set(
             wts, self._ancestor_pred({}))
+        self.assertEqual([w["head"] for w in out], ["Z", "A"])
+
+
+class CoveredByTrackedTests(unittest.TestCase):
+    """`_drop_covered_by_tracked`: drop agent worktrees whose HEAD is
+    an ancestor of a tracked ref's HEAD (no divergent commits → it's
+    the merge-base, already covered by the tracked-ref drive). Uses a
+    fake reflexive ancestor predicate so the test is hermetic."""
+
+    @staticmethod
+    def _ancestor_pred(graph):
+        """graph: {descendant_sha: {ancestor_shas...}}. Reflexive, like
+        the real `_is_ancestor`."""
+        def pred(a: str, b: str) -> bool:
+            return a == b or a in graph.get(b, set())
+        return pred
+
+    @staticmethod
+    def _wts(*shas):
+        return [{"path": f"/wt/{s}", "head": s, "branch": s} for s in shas]
+
+    def test_drops_worktree_at_merge_base(self):
+        # Agent worktree HEAD MB is an ancestor of tracked tip TIP
+        # (the mt-fork-repro pre-commit case): drop it.
+        graph = {"TIP": {"MB"}}
+        out = dashboard._drop_covered_by_tracked(
+            self._wts("MB"), ["TIP"], self._ancestor_pred(graph))
+        self.assertEqual(out, [])
+
+    def test_keeps_divergent_worktree(self):
+        # Agent HEAD has its own commit (not an ancestor of the tracked
+        # tip): keep it.
+        out = dashboard._drop_covered_by_tracked(
+            self._wts("AGENT_TIP"), ["BASE"], self._ancestor_pred({}))
+        self.assertEqual([w["head"] for w in out], ["AGENT_TIP"])
+
+    def test_drops_reflexive_equal_to_tracked_head(self):
+        # Fresh worktree sitting exactly at the tracked tip.
+        out = dashboard._drop_covered_by_tracked(
+            self._wts("TIP"), ["TIP"], self._ancestor_pred({}))
+        self.assertEqual(out, [])
+
+    def test_empty_tracked_heads_is_fail_open(self):
+        wts = self._wts("A", "B")
+        out = dashboard._drop_covered_by_tracked(
+            wts, [], self._ancestor_pred({"X": {"A"}}))
+        self.assertEqual([w["head"] for w in out], ["A", "B"])
+
+    def test_drops_if_ancestor_of_any_tracked_ref(self):
+        graph = {"TIP2": {"MB"}}
+        out = dashboard._drop_covered_by_tracked(
+            self._wts("MB"), ["TIP1", "TIP2"], self._ancestor_pred(graph))
+        self.assertEqual(out, [])
+
+    def test_mixed_keeps_divergent_drops_mergebase(self):
+        # MB at merge-base (dropped), DIV with own commit (kept).
+        graph = {"TIP": {"MB"}}
+        wts = self._wts("MB", "DIV")
+        out = dashboard._drop_covered_by_tracked(
+            wts, ["TIP"], self._ancestor_pred(graph))
+        self.assertEqual([w["head"] for w in out], ["DIV"])
+
+    def test_missing_head_kept(self):
+        wts = [{"path": "/wt/x", "branch": "weird"}]
+        out = dashboard._drop_covered_by_tracked(
+            wts, ["TIP"], self._ancestor_pred({}))
+        self.assertEqual(out, wts)
+
+    def test_preserves_input_order(self):
+        graph = {"TIP": {"MB"}}
+        wts = self._wts("Z", "MB", "A")
+        out = dashboard._drop_covered_by_tracked(
+            wts, ["TIP"], self._ancestor_pred(graph))
         self.assertEqual([w["head"] for w in out], ["Z", "A"])
 
 
@@ -455,6 +531,132 @@ class PickTopNTests(unittest.TestCase):
         topn = dashboard._pick_opportunistic_worktrees_topn(conn, cands, 1)
         self.assertEqual(len(topn), 1)
         self.assertEqual(topn[0]["path"], single["path"])
+
+
+_V3_DDL = """
+CREATE TABLE runs (
+    run_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_ts_ms  INTEGER NOT NULL,
+    hostname       TEXT    NOT NULL,
+    worktree_path  TEXT    NOT NULL,
+    commit_sha     TEXT    NOT NULL,
+    branch         TEXT,
+    dirty_hash     TEXT
+);
+CREATE TABLE run_results (
+    run_id            INTEGER NOT NULL REFERENCES runs(run_id),
+    test_id           TEXT    NOT NULL,
+    pass              TEXT    NOT NULL,
+    verdict           TEXT    NOT NULL,
+    finished_ts_ms    INTEGER NOT NULL,
+    suite             TEXT    NOT NULL,
+    "group"           TEXT    NOT NULL,
+    t_acquire_ms      INTEGER NOT NULL,
+    t_docker_start_ms INTEGER NOT NULL,
+    t_useful_ms       INTEGER NOT NULL,
+    PRIMARY KEY (run_id, test_id, pass)
+);
+CREATE INDEX run_results_test_pass_ts
+    ON run_results(test_id, pass, finished_ts_ms DESC);
+CREATE INDEX run_results_pass_verdict_ts
+    ON run_results(pass, verdict, finished_ts_ms DESC);
+CREATE VIEW latest_results AS
+SELECT rr.test_id, rr.pass, rr.verdict, rr.finished_ts_ms,
+       rr.suite, rr."group", rr.run_id
+  FROM run_results rr
+  JOIN (SELECT test_id, pass, MAX(finished_ts_ms) AS max_ts
+          FROM run_results GROUP BY test_id, pass) latest
+    ON latest.test_id = rr.test_id AND latest.pass = rr.pass
+   AND latest.max_ts = rr.finished_ts_ms;
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO meta(key, value) VALUES('schema_version','3');
+"""
+
+
+class MigrationV3ToV4Tests(unittest.TestCase):
+    """The lossless in-place v3 → v4 migration: rename
+    `run_results.pass` → `mode`, lower-case `FAIL` → `fail`, bump the
+    schema version. Every row must survive."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-mig-")
+        self.db = Path(self.tmp) / "results.sqlite"
+        self.conn = sqlite3.connect(str(self.db), isolation_level=None)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(_V3_DDL)
+        self.conn.execute(
+            "INSERT INTO runs(started_ts_ms, hostname, worktree_path,"
+            " commit_sha, branch, dirty_hash)"
+            " VALUES (1000,'h','/wt','sha1','main',NULL)"
+        )
+        rid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for tid, p, v in [("A", "native", "FAIL"),
+                          ("A", "litebox", "pass"),
+                          ("B", "native", "pass")]:
+            self.conn.execute(
+                "INSERT INTO run_results(run_id, test_id, pass, verdict,"
+                " finished_ts_ms, suite, \"group\","
+                " t_acquire_ms, t_docker_start_ms, t_useful_ms)"
+                " VALUES (?,?,?,?,1500,'s','g',0,0,100)",
+                (rid, tid, p, v),
+            )
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_migrate_renames_column_and_normalizes_verdict(self):
+        before = self.conn.execute(
+            "SELECT COUNT(*) FROM run_results"
+        ).fetchone()[0]
+        self.assertTrue(dashboard.migrate_v3_to_v4(self.conn))
+        self.assertEqual(
+            dashboard._schema_version(self.conn),
+            dashboard.SCHEMA_VERSION_EXPECTED,
+        )
+        cols = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(run_results)")}
+        self.assertIn("mode", cols)
+        self.assertNotIn("pass", cols)
+        # No row lost.
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM run_results").fetchone()[0],
+            before,
+        )
+        # Verdict normalized in place.
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM run_results WHERE verdict='FAIL'"
+        ).fetchone()[0], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM run_results WHERE verdict='fail'"
+        ).fetchone()[0], 1)
+        # Mode values intact.
+        self.assertEqual(
+            {r["mode"] for r in self.conn.execute(
+                "SELECT DISTINCT mode FROM run_results")},
+            {"native", "litebox"},
+        )
+        # latest_results view now exposes `mode`.
+        row = self.conn.execute(
+            "SELECT mode, verdict FROM latest_results"
+            " WHERE test_id='A' AND mode='native'"
+        ).fetchone()
+        self.assertEqual(row["verdict"], "fail")
+        # Indexes kept their names (so migrated == fresh schema).
+        idx = {r[0] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master"
+            " WHERE type='index' AND tbl_name='run_results'")}
+        self.assertIn("run_results_test_pass_ts", idx)
+        self.assertIn("run_results_pass_verdict_ts", idx)
+
+    def test_migrate_is_idempotent(self):
+        self.assertTrue(dashboard.migrate_v3_to_v4(self.conn))
+        self.assertFalse(dashboard.migrate_v3_to_v4(self.conn))
+        self.assertEqual(
+            dashboard._schema_version(self.conn),
+            dashboard.SCHEMA_VERSION_EXPECTED,
+        )
 
 
 if __name__ == "__main__":

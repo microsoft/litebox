@@ -145,9 +145,9 @@ code remains:
 | Object | Role |
 |---|---|
 | `runs` | One row per `cargo test --test integration` invocation. `commit_sha`, `dirty_hash` (NULL ⇔ clean), `cargo_argv`, `universe_size`, pass/fail counts. |
-| `run_results` | Immutable per-trial timing + verdict. Primary key `(run_id, test_id, pass)`. |
+| `run_results` | Immutable per-trial timing + verdict. Primary key `(run_id, test_id, mode)`. `mode` is the trial **pass** — `'native'` or `'litebox'` — *not* a pass/fail flag; the outcome is `verdict` (`'pass'` / `'fail'` / `'no_result'`). |
 | `tracked_refs` | Config: `(ref, ci_worktree)` pairs the autonomous driver tracks. |
-| `latest_results` | **VIEW** over `run_results` returning the freshest row per `(test_id, pass)`. No UPSERT path in the producer — pure SQL. |
+| `latest_results` | **VIEW** over `run_results` returning the freshest row per `(test_id, mode)`. No UPSERT path in the producer — pure SQL. |
 | `meta` | One key/value row: `schema_version`. |
 | `harness_leases` | Cross-session concurrency coordination — one row per live `cargo test --test integration` invocation (`pid`, `heartbeat_at_ms`). Additive (no SCHEMA_VERSION bump). |
 
@@ -155,6 +155,18 @@ There is no `universe`, `worktree_coverage`, `ci_cycles`, or
 `latest_results`-as-table. The runner enumerates the universe
 in-process; coverage is computed at query time from `run_results
 JOIN runs ON commit_sha = ? WHERE dirty_hash IS NULL`.
+
+**Query gotchas** (the two that trip up ad-hoc consumers):
+
+- `run_results.mode` is the trial pass (`'native'` / `'litebox'`),
+  **not** pass/fail. The outcome is `verdict`
+  (`'pass'` / `'fail'` / `'no_result'`, all lower-case). So
+  "did it pass?" is `verdict = 'pass'`, and "which pass?" is
+  `mode = 'litebox'`. (Historically `mode` was named `pass`, which
+  collided with the verdict; renamed in schema v4.)
+- `runs.commit_sha` is the **full 40-char** SHA. A short-SHA
+  equality match silently returns nothing — use
+  `commit_sha LIKE 'abc1234%'` or `substr(commit_sha, 1, 12)`.
 
 Schema-version compatibility: bumped on breaking changes. On
 mismatch the Rust producer panics with a remediation pointer;
@@ -466,11 +478,11 @@ cat <main-worktree>/.dashboard/summary.md
 
 sqlite3 <main-worktree>/.dashboard/results.sqlite <<'SQL'
 .headers on
-SELECT lr.test_id, lr.pass, lr.verdict,
+SELECT lr.test_id, lr.mode, lr.verdict,
        r.commit_sha, r.dirty_hash, r.worktree_path
   FROM latest_results lr
   JOIN runs r ON r.run_id = lr.run_id
- WHERE lr.pass = 'litebox' AND lr.verdict = 'FAIL'
+ WHERE lr.mode = 'litebox' AND lr.verdict = 'fail'
  ORDER BY lr.finished_ts_ms DESC;
 SQL
 

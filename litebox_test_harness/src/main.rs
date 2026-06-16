@@ -153,7 +153,7 @@ fn main() {
             // We just compute the summary counts here.
             let results = coordinator::run_filtered(self_exe, filter);
             let pass_count = results.iter().filter(|r| r.outcome() == "pass").count();
-            let fail_count = results.iter().filter(|r| r.outcome() == "FAIL").count();
+            let fail_count = results.iter().filter(|r| r.outcome() == "fail").count();
             eprintln!(
                 "\n=== SUMMARY: {} total, {} passed, {} failed ===",
                 results.len(),
