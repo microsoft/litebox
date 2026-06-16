@@ -38,6 +38,18 @@ pub struct TimerfdState {
     subscriptions: SubscriptionList,
 }
 
+impl Drop for TimerfdState {
+    fn drop(&mut self) {
+        assert!(
+            self.subscriptions.is_empty(),
+            "TimerfdState dropped with {} live subscription(s) — \
+             eager per-conn unsubscribe is not running, or a Release \
+             bypassed ConnRefTracker.drain_tracked_subscriptions",
+            self.subscriptions.len()
+        );
+    }
+}
+
 #[derive(Debug)]
 struct TimerfdInner {
     clockid: i32,
@@ -154,6 +166,10 @@ impl TimerfdState {
 
     pub fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         self.subscriptions.remove(subscription_id)
+    }
+
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.len()
     }
 }
 
@@ -277,6 +293,7 @@ impl StateObject for TimerfdState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cwfd::state_registry::BrokerStateRegistry;
     use litebox_common_linux::notification_ring::NotificationReceiver;
     use litebox_common_linux::shmem_ring::ShmemRingPair;
 
@@ -290,42 +307,235 @@ mod tests {
         )
     }
 
+    fn spec(value: Duration, interval: Duration) -> BrokerTimerfdSpec {
+        BrokerTimerfdSpec {
+            interval_sec: interval.as_secs(),
+            interval_nsec: u64::from(interval.subsec_nanos()),
+            value_sec: value.as_secs(),
+            value_nsec: u64::from(value.subsec_nanos()),
+        }
+    }
+
+    fn arm_relative(timer: &TimerfdState, value: Duration, interval: Duration) -> Instant {
+        timer.settime(spec(value, interval), 0).unwrap();
+        timer.next_deadline().expect("armed timer deadline")
+    }
+
     #[test]
-    fn relative_oneshot_accumulates_on_read() {
+    fn create_timerfd_initializes_disarmed_and_validates_inputs() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC as u32).unwrap();
+
+        assert_eq!(timer.gettime(), BrokerTimerfdSpec::default());
+        assert_eq!(timer.current_events(), 0);
+        assert!(matches!(timer.read(), Err(TimerfdError::WouldBlock)));
+        assert_eq!(
+            TimerfdState::new(libc::CLOCK_PROCESS_CPUTIME_ID, 0).unwrap_err(),
+            TimerfdError::InvalidValue
+        );
+        assert_eq!(
+            TimerfdState::new(libc::CLOCK_MONOTONIC, 0x8000_0000).unwrap_err(),
+            TimerfdError::InvalidValue
+        );
+    }
+
+    #[test]
+    fn settime_gettime_relative_oneshot_and_disarm() {
         let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+
+        arm_relative(&timer, Duration::from_secs(60), Duration::ZERO);
+
+        let got = timer.gettime();
+        assert_eq!(got.interval_sec, 0);
+        assert_eq!(got.interval_nsec, 0);
+        assert!(got.value_sec <= 60);
+        assert!(got.value_sec > 0 || got.value_nsec > 0);
+
         timer
-            .settime(
+            .settime(BrokerTimerfdSpec::default(), 0)
+            .expect("disarm timer");
+        assert_eq!(timer.gettime(), BrokerTimerfdSpec::default());
+        assert_eq!(timer.next_deadline(), None);
+    }
+
+    #[test]
+    fn settime_gettime_interval_preserves_interval() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+
+        arm_relative(
+            &timer,
+            Duration::from_secs(60),
+            Duration::from_secs(5) + Duration::from_nanos(7),
+        );
+
+        let got = timer.gettime();
+        assert_eq!(got.interval_sec, 5);
+        assert_eq!(got.interval_nsec, 7);
+        assert!(got.value_sec <= 60);
+        assert!(got.value_sec > 0 || got.value_nsec > 0);
+    }
+
+    #[test]
+    fn settime_rejects_invalid_nsec_and_unsupported_flags() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+
+        assert_eq!(
+            timer.settime(
                 BrokerTimerfdSpec {
-                    value_nsec: 1,
+                    value_nsec: NSEC_PER_SEC,
                     ..BrokerTimerfdSpec::default()
                 },
-                0,
-            )
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(1));
+                0
+            ),
+            Err(TimerfdError::InvalidValue)
+        );
+        assert_eq!(
+            timer.settime(
+                BrokerTimerfdSpec {
+                    value_sec: 1,
+                    ..BrokerTimerfdSpec::default()
+                },
+                libc::TFD_TIMER_CANCEL_ON_SET as u32
+            ),
+            Err(TimerfdError::InvalidValue)
+        );
+        assert_eq!(
+            timer.settime(
+                BrokerTimerfdSpec {
+                    value_sec: 1,
+                    ..BrokerTimerfdSpec::default()
+                },
+                0x8000_0000
+            ),
+            Err(TimerfdError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn read_returns_expiration_count_and_resets_readiness() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let due = arm_relative(&timer, Duration::from_secs(60), Duration::ZERO);
+
+        assert!(matches!(timer.read(), Err(TimerfdError::WouldBlock)));
+        assert!(timer.fire_due(due));
+
+        assert_eq!(timer.current_events(), NOTIFY_EVENT_IN);
         assert_eq!(timer.read().unwrap(), 1);
+        assert_eq!(timer.current_events(), 0);
         assert!(matches!(timer.read(), Err(TimerfdError::WouldBlock)));
     }
 
     #[test]
-    fn fire_due_notifies_subscriber() {
+    fn fire_due_accrues_interval_expirations_without_wall_clock() {
         let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
-        timer
-            .settime(
-                BrokerTimerfdSpec {
-                    value_sec: 60,
-                    ..BrokerTimerfdSpec::default()
-                },
-                0,
-            )
-            .unwrap();
+        let due = arm_relative(&timer, Duration::from_secs(60), Duration::from_secs(10));
+
+        assert!(timer.fire_due(due + Duration::from_secs(25)));
+        assert_eq!(timer.read().unwrap(), 3);
+
+        let next_due = timer.next_deadline().expect("rearmed interval timer");
+        assert!(!timer.fire_due(next_due - Duration::from_nanos(1)));
+        assert!(timer.fire_due(next_due));
+        assert_eq!(timer.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn subscribe_priming_delivers_initial_ready_events() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let due = arm_relative(&timer, Duration::from_secs(60), Duration::ZERO);
+        assert!(timer.fire_due(due));
+
+        let (sender, mut receiver) = make_pair();
+        timer.subscribe(1, NOTIFY_EVENT_IN, sender).unwrap();
+        let frame = receiver.recv().unwrap();
+        assert_eq!(frame.subscription_id(), 1);
+        assert_eq!(frame.events(), NOTIFY_EVENT_IN);
+        timer.unsubscribe(1).unwrap();
+    }
+
+    #[test]
+    fn subscribe_no_priming_when_not_ready_then_fire_notifies() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let due = arm_relative(&timer, Duration::from_secs(60), Duration::ZERO);
         let (sender, mut receiver) = make_pair();
         timer.subscribe(7, NOTIFY_EVENT_IN, sender).unwrap();
-        let due = timer.next_deadline().unwrap();
+
         assert!(timer.fire_due(due));
         let frame = receiver.recv().unwrap();
         assert_eq!(frame.subscription_id(), 7);
         assert_eq!(frame.events(), NOTIFY_EVENT_IN);
         timer.unsubscribe(7).unwrap();
+    }
+
+    #[test]
+    fn multiple_subscribers_each_get_fire_notification() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let due = arm_relative(&timer, Duration::from_secs(60), Duration::ZERO);
+        let (sender1, mut receiver1) = make_pair();
+        let (sender2, mut receiver2) = make_pair();
+
+        timer.subscribe(10, NOTIFY_EVENT_IN, sender1).unwrap();
+        timer.subscribe(20, NOTIFY_EVENT_IN, sender2).unwrap();
+        assert!(timer.fire_due(due));
+
+        assert_eq!(receiver1.recv().unwrap().subscription_id(), 10);
+        assert_eq!(receiver2.recv().unwrap().subscription_id(), 20);
+        timer.unsubscribe(10).unwrap();
+        timer.unsubscribe(20).unwrap();
+    }
+
+    #[test]
+    fn unsubscribe_stops_notifications() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let due = arm_relative(&timer, Duration::from_secs(60), Duration::ZERO);
+        let (sender, mut receiver) = make_pair();
+
+        timer.subscribe(1, NOTIFY_EVENT_IN, sender).unwrap();
+        timer.unsubscribe(1).unwrap();
+        assert_eq!(timer.subscription_count(), 0);
+        assert!(timer.fire_due(due));
+
+        drop(timer);
+        match receiver.recv() {
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            other => panic!("expected EOF, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn state_object_tag_is_timerfd() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let dyn_ref: &dyn StateObject = &*timer;
+        assert_eq!(dyn_ref.subsystem_tag(), SubsystemTag::Timerfd);
+    }
+
+    #[test]
+    fn state_object_enum_carries_concrete_type() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let object = crate::cwfd::state_registry::StateObjectEnum::from(timer);
+        let crate::cwfd::state_registry::StateObjectEnum::Timerfd(concrete) = object else {
+            panic!("expected Timerfd variant");
+        };
+        assert_eq!(concrete.gettime(), BrokerTimerfdSpec::default());
+    }
+
+    #[test]
+    fn registry_release_refcount_and_cleanup_for_timerfd() {
+        let registry = BrokerStateRegistry::new();
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let handle = registry.register(timer);
+
+        assert_eq!(registry.refcount(handle), 1);
+        let duplicate = registry.dup(handle).unwrap();
+        assert_eq!(duplicate, handle);
+        assert_eq!(registry.refcount(handle), 2);
+        assert_eq!(registry.release(handle).unwrap(), 1);
+        assert_eq!(registry.refcount(handle), 1);
+        assert_eq!(registry.release(handle).unwrap(), 0);
+        assert_eq!(registry.refcount(handle), 0);
+        assert!(registry.is_empty());
+        assert!(matches!(
+            registry.release(handle),
+            Err(crate::cwfd::state_registry::StateRegistryError::UnknownHandle(_))
+        ));
     }
 }

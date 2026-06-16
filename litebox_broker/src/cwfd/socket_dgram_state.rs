@@ -346,17 +346,27 @@ mod tests {
         let b = SocketDgramState::new();
         a.bind(SocketDgramAddr::Abstract(b"a".to_vec())).unwrap();
         b.bind(SocketDgramAddr::Abstract(b"b".to_vec())).unwrap();
-        a.sendto(Some(SocketDgramAddr::Abstract(b"b".to_vec())), b"hello")
-            .unwrap();
-        a.sendto(Some(SocketDgramAddr::Abstract(b"b".to_vec())), b"world")
-            .unwrap();
-        let (src, payload, flags) = b.recvfrom(3).unwrap();
+        a.sendto(
+            Some(SocketDgramAddr::Abstract(b"b".to_vec())),
+            b"hello",
+            &[],
+        )
+        .unwrap();
+        a.sendto(
+            Some(SocketDgramAddr::Abstract(b"b".to_vec())),
+            b"world",
+            &[],
+        )
+        .unwrap();
+        let (src, payload, flags, tokens) = b.recvfrom(3).unwrap();
         assert_eq!(src, SocketDgramAddr::Abstract(b"a".to_vec()));
         assert_eq!(payload, b"hel");
         assert_ne!(flags & INET_DGRAM_RECV_FLAG_TRUNC, 0);
-        let (_, payload, flags) = b.recvfrom(16).unwrap();
+        assert!(tokens.is_empty());
+        let (_, payload, flags, tokens) = b.recvfrom(16).unwrap();
         assert_eq!(payload, b"world");
         assert_eq!(flags, 0);
+        assert!(tokens.is_empty());
     }
 
     #[test]
@@ -366,9 +376,10 @@ mod tests {
         a.bind(SocketDgramAddr::Abstract(b"c".to_vec())).unwrap();
         b.bind(SocketDgramAddr::Abstract(b"d".to_vec())).unwrap();
         a.connect(SocketDgramAddr::Abstract(b"d".to_vec())).unwrap();
-        a.sendto(None, b"ping").unwrap();
-        let (src, payload, _) = b.recvfrom(16).unwrap();
+        a.sendto(None, b"ping", &[]).unwrap();
+        let (src, payload, _, tokens) = b.recvfrom(16).unwrap();
         assert_eq!(src, SocketDgramAddr::Abstract(b"c".to_vec()));
         assert_eq!(payload, b"ping");
+        assert!(tokens.is_empty());
     }
 }
