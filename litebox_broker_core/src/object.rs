@@ -4,7 +4,7 @@
 use crate::event::EventObject;
 use crate::identity::{BrokerAssociation, ProcessId};
 use crate::{BrokerCore, BrokerError, PolicyDecision, PolicyOperation, Result};
-use litebox_broker_protocol::{ObjectHandle, ObjectReferenceId};
+use litebox_broker_protocol::ObjectHandle;
 use slotmap::{Key, KeyData};
 
 /// Broker object type known to the authority core and policy engine.
@@ -36,22 +36,21 @@ slotmap::new_key_type! {
 pub(crate) struct ObjectReference {
     pub(crate) object_id: ObjectId,
     pub(crate) owner: ProcessId,
-    pub(crate) object_type: ObjectType,
     pub(crate) rights: ObjectRights,
 }
 
-impl From<ObjectReferenceKey> for ObjectReferenceId {
+impl From<ObjectReferenceKey> for ObjectHandle {
     fn from(key: ObjectReferenceKey) -> Self {
-        Self::new(key.data().as_ffi())
+        Self(key.data().as_ffi())
     }
 }
 
-impl TryFrom<ObjectReferenceId> for ObjectReferenceKey {
+impl TryFrom<ObjectHandle> for ObjectReferenceKey {
     type Error = BrokerError;
 
-    fn try_from(id: ObjectReferenceId) -> Result<Self> {
-        let key: Self = KeyData::from_ffi(id.get()).into();
-        if ObjectReferenceId::from(key) == id {
+    fn try_from(handle: ObjectHandle) -> Result<Self> {
+        let key: Self = KeyData::from_ffi(handle.0).into();
+        if ObjectHandle::from(key) == handle {
             Ok(key)
         } else {
             Err(BrokerError::UnknownObject)
@@ -60,16 +59,11 @@ impl TryFrom<ObjectReferenceId> for ObjectReferenceKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ObjectEntry {
-    pub(crate) kind: ObjectKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ObjectKind {
+pub(crate) enum ObjectEntry {
     Event(EventObject),
 }
 
-impl ObjectKind {
+impl ObjectEntry {
     pub(crate) const fn object_type(self) -> ObjectType {
         match self {
             Self::Event(_) => ObjectType::Event,
@@ -82,8 +76,7 @@ impl BrokerCore {
     pub(crate) fn insert_object_with_reference(
         &mut self,
         association: &BrokerAssociation,
-        kind: ObjectKind,
-        object_type: ObjectType,
+        object: ObjectEntry,
         rights: ObjectRights,
     ) -> Result<ObjectHandle> {
         if self.objects.len() >= self.limits.max_objects
@@ -92,15 +85,14 @@ impl BrokerCore {
             return Err(BrokerError::ResourceExhausted);
         }
 
-        let object_id = self.objects.insert(ObjectEntry { kind });
+        let object_id = self.objects.insert(object);
         let reference_key = self.references.insert(ObjectReference {
             object_id,
             owner: association.process_id(),
-            object_type,
             rights,
         });
 
-        Ok(ObjectHandle::new(reference_key.into()))
+        Ok(reference_key.into())
     }
 
     pub(crate) fn authorize_create_object(
@@ -160,9 +152,6 @@ impl BrokerCore {
         required_rights: ObjectRights,
     ) -> Result<ObjectReference> {
         let reference = self.reference_for_handle(association, handle)?;
-        if reference.object_type != expected_type {
-            return Err(BrokerError::WrongObjectType);
-        }
         if !reference.rights.contains(required_rights) {
             return Err(BrokerError::InvalidRights);
         }
@@ -171,7 +160,7 @@ impl BrokerCore {
             .objects
             .get(reference.object_id)
             .ok_or(BrokerError::UnknownObject)?;
-        if object.kind.object_type() != expected_type {
+        if object.object_type() != expected_type {
             return Err(BrokerError::WrongObjectType);
         }
 
@@ -193,7 +182,7 @@ impl BrokerCore {
             return Err(BrokerError::UnknownObject);
         }
 
-        self.references.remove(handle.reference_id.try_into()?);
+        self.references.remove(handle.try_into()?);
         self.drop_object_if_unreferenced(object_id);
         Ok(())
     }
@@ -218,7 +207,7 @@ impl BrokerCore {
     ) -> Result<&ObjectReference> {
         let reference = self
             .references
-            .get(handle.reference_id.try_into()?)
+            .get(handle.try_into()?)
             .ok_or(BrokerError::UnknownObject)?;
         if reference.owner != association.process_id() {
             return Err(BrokerError::UnknownObject);
@@ -247,7 +236,7 @@ pub(crate) struct AuthorizedObject {
 mod tests {
     use super::*;
     use crate::{BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, allocate_id};
-    use litebox_broker_protocol::{ObjectHandle, ObjectReferenceId, WaitOutcome};
+    use litebox_broker_protocol::{ObjectHandle, WaitOutcome};
 
     #[test]
     fn allocator_exhausts_before_id_overflow() {
@@ -293,9 +282,7 @@ mod tests {
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = core.create_event(&owner).unwrap();
-        let noncanonical = ObjectHandle::new(ObjectReferenceId::new(
-            handle.reference_id.get() & u64::from(u32::MAX),
-        ));
+        let noncanonical = ObjectHandle(handle.0 & u64::from(u32::MAX));
 
         assert_ne!(noncanonical, handle);
         assert_eq!(

@@ -220,11 +220,11 @@ mod tests {
     #[test]
     fn active_core_request_wraps_request_and_unwraps_response() {
         use litebox_broker_protocol::{
-            CoreRequest, CoreResponse, EventRequest, EventResponse, ObjectHandle,
-            ObjectReferenceId, ReadinessState, WaitEventRequest, WaitEventResponse, WaitOutcome,
+            CoreRequest, CoreResponse, EventRequest, EventResponse, ObjectHandle, ReadinessState,
+            WaitEventRequest, WaitEventResponse, WaitOutcome,
         };
 
-        let handle = ObjectHandle::new(ObjectReferenceId::new(7));
+        let handle = ObjectHandle(7);
         let request = CoreRequest::Event(EventRequest::Wait(WaitEventRequest::new(handle)));
         let response = CoreResponse::Event(EventResponse::Wait(WaitEventResponse::new(
             WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0)),

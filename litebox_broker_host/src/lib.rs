@@ -351,7 +351,7 @@ mod tests {
             }
             response => panic!("unexpected response: {response:?}"),
         };
-        assert_ne!(handle.reference_id.get(), 0);
+        assert_ne!(handle.0, 0);
     }
 
     fn serve_connection_closes_after_protocol_violation(core: &mut BrokerCore) {

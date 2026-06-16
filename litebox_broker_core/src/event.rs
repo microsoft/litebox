@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::object::{ObjectId, ObjectKind};
+use crate::object::{ObjectEntry, ObjectId};
 use crate::{BrokerAssociation, BrokerCore, BrokerError, ObjectRights, ObjectType, Result};
 use litebox_broker_protocol::{
     EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState, WaitOutcome,
@@ -28,8 +28,7 @@ impl BrokerCore {
 
         self.insert_object_with_reference(
             association,
-            ObjectKind::Event(EventObject::new(initial_count)),
-            ObjectType::Event,
+            ObjectEntry::Event(EventObject::new(initial_count)),
             rights,
         )
     }
@@ -66,8 +65,8 @@ impl BrokerCore {
     ) -> Result<ReadinessState> {
         let authorized =
             self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WRITE)?;
-        match &mut self.object_mut(authorized.object_id)?.kind {
-            ObjectKind::Event(event) => event
+        match self.object_mut(authorized.object_id)? {
+            ObjectEntry::Event(event) => event
                 .add(value)
                 .map(|state| Self::filter_readiness_for_rights(state, authorized.rights)),
         }
@@ -82,8 +81,8 @@ impl BrokerCore {
     ) -> Result<EventConsumption> {
         let authorized =
             self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
-        match &mut self.object_mut(authorized.object_id)?.kind {
-            ObjectKind::Event(event) => event.consume(mode).map(|response| {
+        match self.object_mut(authorized.object_id)? {
+            ObjectEntry::Event(event) => event.consume(mode).map(|response| {
                 EventConsumption::new(
                     response.value,
                     Self::filter_readiness_for_rights(response.readiness, authorized.rights),
@@ -101,8 +100,8 @@ impl BrokerCore {
     }
 
     fn event_state(&self, object_id: ObjectId) -> Result<ReadinessState> {
-        match &self.object(object_id)?.kind {
-            ObjectKind::Event(event) => Ok(event.readiness_state()),
+        match self.object(object_id)? {
+            ObjectEntry::Event(event) => Ok(event.readiness_state()),
         }
     }
 }
