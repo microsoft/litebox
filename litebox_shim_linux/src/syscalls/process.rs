@@ -6828,9 +6828,19 @@ impl<FS: ShimFS> Task<FS> {
             metadata.broker_handle = broker_handle_meta;
             metadata.broker_fd_token = broker_fd_token_meta;
 
+            // wsD: the canonical kind, derived from the (class, broker_handle,
+            // broker_fd_token) the extraction above already produced. Becomes
+            // the sole stored discriminant once restore + wire move off `class`.
+            let kind = super::fork_snapshot::FdKind::from_legacy(
+                class,
+                metadata.broker_handle,
+                metadata.broker_fd_token,
+            );
+
             entries.push(FdEntrySnapshot {
                 fd: raw_fd,
                 class,
+                kind,
                 fd_flags: fd_flags.bits(),
                 status_flags: fs_status_flags,
                 object_id: object_id.map_or(0, litebox::fd::DescriptorObjectId::as_u64),

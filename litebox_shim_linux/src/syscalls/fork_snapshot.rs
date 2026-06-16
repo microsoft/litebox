@@ -197,7 +197,17 @@ pub struct FdEntrySnapshot {
     /// The raw fd number.
     pub fd: usize,
     /// The descriptor class, used to decide import strategy.
+    ///
+    /// Transitional: being superseded by [`FdEntrySnapshot::kind`]. Still the
+    /// wire-serialized discriminant and still drives emit-side accept/reject;
+    /// removed once restore + wire are fully on `kind`.
     pub class: FdClass,
+    /// The canonical fd kind (wsD). Derived from `class` + broker metadata via
+    /// [`FdKind::from_legacy`]; becomes the sole stored discriminant once
+    /// `class` / `broker_handle` / `broker_fd_token` are removed. Consumed by
+    /// the single-match restore path (wsF).
+    #[allow(dead_code)]
+    pub kind: FdKind,
     /// FD-level flags (e.g., `FD_CLOEXEC`).
     pub fd_flags: u32,
     /// Open-file-description status flags (e.g., `O_NONBLOCK`, `O_APPEND`).
@@ -1684,13 +1694,21 @@ impl FdEntrySnapshot {
     }
 
     fn read(r: &mut SnapshotReader<'_>) -> Result<Self, SnapshotDeserializeError> {
+        let fd = r.read_usize()?;
+        let class = FdClass::from_wire(r.read_u8()?)?;
+        let fd_flags = r.read_u32()?;
+        let status_flags = r.read_u32()?;
+        let object_id = r.read_u64()?;
+        let metadata = FdMetadataSnapshot::read(r)?;
+        let kind = FdKind::from_legacy(class, metadata.broker_handle, metadata.broker_fd_token);
         Ok(Self {
-            fd: r.read_usize()?,
-            class: FdClass::from_wire(r.read_u8()?)?,
-            fd_flags: r.read_u32()?,
-            status_flags: r.read_u32()?,
-            object_id: r.read_u64()?,
-            metadata: FdMetadataSnapshot::read(r)?,
+            fd,
+            class,
+            kind,
+            fd_flags,
+            status_flags,
+            object_id,
+            metadata,
         })
     }
 }
@@ -2264,6 +2282,7 @@ mod tests {
                     FdEntrySnapshot {
                         fd: 0,
                         class: FdClass::StdioFd,
+                        kind: FdKind::FilesystemFd,
                         fd_flags: 0,
                         status_flags: 0,
                         object_id: 100,
@@ -2280,6 +2299,7 @@ mod tests {
                     FdEntrySnapshot {
                         fd: 1,
                         class: FdClass::StdioFd,
+                        kind: FdKind::FilesystemFd,
                         fd_flags: 0,
                         status_flags: 0,
                         object_id: 101,
@@ -2296,6 +2316,7 @@ mod tests {
                     FdEntrySnapshot {
                         fd: 3,
                         class: FdClass::FilesystemFd,
+                        kind: FdKind::FilesystemFd,
                         fd_flags: 1,         // FD_CLOEXEC
                         status_flags: 0x800, // O_NONBLOCK
                         object_id: 200,
@@ -2313,6 +2334,7 @@ mod tests {
                     FdEntrySnapshot {
                         fd: 4,
                         class: FdClass::FilesystemFd,
+                        kind: FdKind::FilesystemFd,
                         fd_flags: 0,
                         status_flags: 0x800,
                         object_id: 200, // same OFD as fd 3
