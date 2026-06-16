@@ -2,18 +2,19 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::ErrorCode;
+use thiserror::Error;
 
 use crate::event::{counter::EventCounterError, polling::TryOpError};
 
 /// Error returned by the deployment-provided broker control path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum BrokerControlError {
-    /// The broker control transport failed.
+    #[error("broker control transport failed")]
     Transport,
-    /// The broker returned an operation error.
-    Broker(ErrorCode),
-    /// The broker returned a response shape that does not match the request.
+    #[error("broker returned operation error: {0}")]
+    Broker(#[source] ErrorCode),
+    #[error("broker returned unexpected response")]
     UnexpectedResponse,
 }
 
@@ -21,19 +22,19 @@ pub(crate) enum BrokerControlError {
 ///
 /// This keeps protocol/control-channel failures separate from the public
 /// object-specific API error exposed by each local-core facade.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub(crate) enum BrokerObjectError {
-    /// The deployment-provided broker control path failed.
+    #[error("broker control failed")]
     Control,
-    /// The broker rejected the cached object handle, type, or rights.
+    #[error("invalid broker object")]
     InvalidObject,
-    /// The object operation would block in its current broker-side state.
+    #[error("broker object operation would block")]
     WouldBlock,
-    /// The object or broker-side state cannot grow further.
+    #[error("broker object resource exhausted")]
     ResourceExhausted,
-    /// The broker returned a response shape that does not match the request.
+    #[error("broker returned unexpected response")]
     UnexpectedResponse,
-    /// The broker reported a non-recoverable or unsupported object error.
+    #[error("internal broker object error")]
     Internal,
 }
 

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+thiserror = { version = "2.0.6", default-features = false }
 
 [lints]
 workspace = true

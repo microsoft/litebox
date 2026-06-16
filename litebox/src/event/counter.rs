@@ -9,6 +9,7 @@ use litebox_broker_protocol::{
     CreateEventRequest, EventRequest, EventResponse, ObjectHandle, ReadinessState,
     WaitEventRequest, WaitOutcome,
 };
+use thiserror::Error;
 
 use crate::{
     LiteBox,
@@ -25,20 +26,20 @@ use crate::{
 };
 
 /// Errors returned by local-core event counters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EventCounterError {
-    /// The requested operation is invalid for this event counter.
+    #[error("invalid event counter input")]
     InvalidInput,
-    /// The operation would block.
+    #[error("event counter operation would block")]
     WouldBlock,
-    /// The event counter cannot accept more state.
+    #[error("event counter resource exhausted")]
     ResourceExhausted,
-    /// The backing authority or transport failed.
+    #[error("event counter I/O failed")]
     Io,
-    /// The backing authority returned a response shape that does not match the request.
+    #[error("event counter received unexpected response")]
     UnexpectedResponse,
-    /// No backing authority is available for this event counter.
+    #[error("event counter backing authority unavailable")]
     Unavailable,
 }
 

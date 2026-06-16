@@ -1483,6 +1483,7 @@ dependencies = [
  "bitflags 2.11.0",
  "litebox_broker_protocol",
  "slotmap",
+ "thiserror",
 ]
 
 [[package]]
@@ -1491,6 +1492,7 @@ version = "0.1.0"
 dependencies = [
  "litebox_broker_core",
  "litebox_broker_protocol",
+ "thiserror",
 ]
 
 [[package]]
@@ -1498,11 +1500,15 @@ name = "litebox_broker_local"
 version = "0.1.0"
 dependencies = [
  "litebox_broker_protocol",
+ "thiserror",
 ]
 
 [[package]]
 name = "litebox_broker_protocol"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "litebox_broker_transport"

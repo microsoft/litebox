@@ -1,36 +1,37 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use core::fmt;
+use thiserror::Error;
 
 /// ABI-neutral broker error category.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorCode {
-    /// The requested protocol version is unsupported.
+    #[error("unsupported broker protocol version")]
     UnsupportedVersion,
-    /// The request is structurally invalid.
+    #[error("malformed broker request")]
     MalformedRequest,
-    /// The request is validly encoded but violates the connection state machine.
+    #[error("broker protocol state violation")]
     ProtocolState,
-    /// The request is unsupported by this broker protocol implementation.
+    #[error("unsupported broker operation")]
     UnsupportedOperation,
-    /// Broker hit an internal condition or an error category this protocol cannot represent.
+    #[error("internal broker error")]
     Internal,
-    /// Policy denied the operation.
+    #[error("broker policy denied the operation")]
     PolicyDenied,
-    /// The referenced object does not exist.
+    #[error("unknown broker object")]
     UnknownObject,
-    /// The caller lacks the required broker rights.
+    #[error("invalid broker rights")]
     InvalidRights,
-    /// Broker-side resource exhaustion.
+    #[error("broker resource exhausted")]
     ResourceExhausted,
-    /// The operation would block in the current event state.
+    #[error("broker operation would block")]
     WouldBlock,
     /// Error code emitted by a newer broker and not understood by this local peer.
     ///
     /// This variant is reserved for raw codes not assigned by this protocol
     /// version.
+    #[error("unknown broker error code {0}")]
     Unknown(u16),
 }
 
@@ -75,23 +76,3 @@ impl ErrorCode {
         }
     }
 }
-
-impl fmt::Display for ErrorCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedVersion => f.write_str("unsupported broker protocol version"),
-            Self::MalformedRequest => f.write_str("malformed broker request"),
-            Self::ProtocolState => f.write_str("broker protocol state violation"),
-            Self::UnsupportedOperation => f.write_str("unsupported broker operation"),
-            Self::Internal => f.write_str("internal broker error"),
-            Self::PolicyDenied => f.write_str("broker policy denied the operation"),
-            Self::UnknownObject => f.write_str("unknown broker object"),
-            Self::InvalidRights => f.write_str("invalid broker rights"),
-            Self::ResourceExhausted => f.write_str("broker resource exhausted"),
-            Self::WouldBlock => f.write_str("broker operation would block"),
-            Self::Unknown(raw) => write!(f, "unknown broker error code {raw}"),
-        }
-    }
-}
-
-impl core::error::Error for ErrorCode {}

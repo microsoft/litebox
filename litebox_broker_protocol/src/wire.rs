@@ -16,9 +16,8 @@
 //! changing fields is an ABI change, so prefer a new operation tag or explicit
 //! negotiated-version gate for payload evolution.
 
-use core::fmt;
-
 use alloc::vec::Vec;
+use thiserror::Error;
 
 use crate::{
     BrokerRequest, BrokerResponse, ErrorCode, ReceivedBrokerRequest, ReceivedBrokerResponse,
@@ -39,31 +38,18 @@ const RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
 
 /// Error produced while encoding or decoding a broker wire message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WireError {
-    /// The frame ended before a complete field could be decoded.
+    #[error("truncated broker wire frame")]
     TruncatedFrame,
-    /// The frame contained bytes after the decoded message.
+    #[error("trailing broker wire bytes")]
     TrailingBytes,
-    /// A boolean field was not encoded as 0 or 1.
+    #[error("invalid broker wire boolean")]
     InvalidBoolean,
-    /// A decoder offset overflowed.
+    #[error("broker wire offset overflow")]
     OffsetOverflow,
 }
-
-impl fmt::Display for WireError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TruncatedFrame => f.write_str("truncated broker wire frame"),
-            Self::TrailingBytes => f.write_str("trailing broker wire bytes"),
-            Self::InvalidBoolean => f.write_str("invalid broker wire boolean"),
-            Self::OffsetOverflow => f.write_str("broker wire offset overflow"),
-        }
-    }
-}
-
-impl core::error::Error for WireError {}
 
 /// Encodes a broker request body.
 ///

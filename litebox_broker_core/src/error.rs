@@ -1,40 +1,24 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use core::fmt;
+use thiserror::Error;
 
 /// Broker authority error category.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BrokerError {
-    /// Policy denied the operation.
+    #[error("broker policy denied the operation")]
     PolicyDenied,
-    /// The referenced object does not exist.
+    #[error("unknown broker object")]
     UnknownObject,
-    /// The caller lacks the required broker rights.
+    #[error("invalid broker rights")]
     InvalidRights,
-    /// Broker-side resource exhaustion.
+    #[error("broker resource exhausted")]
     ResourceExhausted,
-    /// A broker core has already been created in this process.
+    #[error("broker core already exists")]
     BrokerCoreAlreadyExists,
-    /// The operation would block in the current object state.
+    #[error("broker operation would block")]
     WouldBlock,
-    /// The operation is not implemented by this BrokerCore.
+    #[error("unsupported broker operation")]
     UnsupportedOperation,
 }
-
-impl fmt::Display for BrokerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PolicyDenied => f.write_str("broker policy denied the operation"),
-            Self::UnknownObject => f.write_str("unknown broker object"),
-            Self::InvalidRights => f.write_str("invalid broker rights"),
-            Self::ResourceExhausted => f.write_str("broker resource exhausted"),
-            Self::BrokerCoreAlreadyExists => f.write_str("broker core already exists"),
-            Self::WouldBlock => f.write_str("broker operation would block"),
-            Self::UnsupportedOperation => f.write_str("unsupported broker operation"),
-        }
-    }
-}
-
-impl core::error::Error for BrokerError {}

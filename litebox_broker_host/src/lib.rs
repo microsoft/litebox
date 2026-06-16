@@ -382,10 +382,10 @@ mod tests {
                 protocol_version: HOST_PROTOCOL_VERSION,
             }),
         ))]));
-        channel.send_error = Some(FakeChannelError::Send);
+        channel.send_error = true;
 
         match serve_connection(core, &mut channel) {
-            Err(BrokerHostError::Channel(FakeChannelError::Send)) => {}
+            Err(BrokerHostError::Channel(())) => {}
             result => panic!("unexpected serve result: {result:?}"),
         }
         assert!(channel.responses.is_empty());
@@ -399,44 +399,26 @@ mod tests {
         event_request(EventRequest::Create(CreateEventRequest::new(initial_count)))
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum FakeChannelError {
-        Send,
-    }
-
-    impl fmt::Display for FakeChannelError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Self::Send => f.write_str("fake send error"),
-            }
-        }
-    }
-
-    impl core::error::Error for FakeChannelError {}
-
     struct FakeHostControlChannel {
-        requests:
-            std::vec::Vec<core::result::Result<Option<ReceivedBrokerRequest>, FakeChannelError>>,
+        requests: std::vec::Vec<core::result::Result<Option<ReceivedBrokerRequest>, ()>>,
         responses: std::vec::Vec<BrokerResponse>,
-        send_error: Option<FakeChannelError>,
+        send_error: bool,
     }
 
     impl FakeHostControlChannel {
         fn new(
-            requests: std::vec::Vec<
-                core::result::Result<Option<ReceivedBrokerRequest>, FakeChannelError>,
-            >,
+            requests: std::vec::Vec<core::result::Result<Option<ReceivedBrokerRequest>, ()>>,
         ) -> Self {
             Self {
                 requests,
                 responses: std::vec::Vec::new(),
-                send_error: None,
+                send_error: false,
             }
         }
     }
 
     impl HostControlChannel for FakeHostControlChannel {
-        type Error = FakeChannelError;
+        type Error = ();
 
         fn peer_credential(&self) -> core::result::Result<PeerCredential, Self::Error> {
             Ok(PeerCredential::Unauthenticated)
@@ -456,8 +438,8 @@ mod tests {
             &mut self,
             response: &BrokerResponse,
         ) -> core::result::Result<(), Self::Error> {
-            if let Some(error) = self.send_error {
-                return Err(error);
+            if self.send_error {
+                return Err(());
             }
             self.responses.push(response.clone());
             Ok(())
