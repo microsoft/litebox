@@ -2,13 +2,10 @@
 // Licensed under the MIT license.
 
 #include <errno.h>
-#include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
-#include <string.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
-#include <sys/uio.h>
 #include <unistd.h>
 
 static int expect_eagain_read(int fd) {
@@ -48,66 +45,12 @@ static int expect_poll_events(int fd, short expected) {
     return 0;
 }
 
-static int writev_values(int fd, uint64_t first, uint64_t second) {
-    struct iovec iov[2] = {
-        {&first, sizeof(first)},
-        {&second, sizeof(second)},
-    };
-    return writev(fd, iov, 2) == (ssize_t)(sizeof(first) + sizeof(second)) ? 0 : 1;
-}
-
-static int readv_split_value(int fd, uint64_t expected) {
-    uint8_t bytes[sizeof(expected)] = {0};
-    struct iovec iov[2] = {
-        {bytes, 4},
-        {bytes + 4, 4},
-    };
-    uint64_t value = 0;
-    if (readv(fd, iov, 2) != (ssize_t)sizeof(value)) {
-        return 1;
-    }
-    memcpy(&value, bytes, sizeof(value));
-    return value == expected ? 0 : 2;
-}
-
-static int expect_einval_short_readv(int fd) {
-    uint32_t value = 0;
-    struct iovec iov = {&value, sizeof(value)};
-    errno = 0;
-    if (readv(fd, &iov, 1) != -1) {
-        return 1;
-    }
-    return errno == EINVAL ? 0 : 2;
-}
-
-static int expect_einval_split_writev(int fd) {
-    uint32_t low = 1;
-    uint32_t high = 0;
-    struct iovec iov[2] = {
-        {&low, sizeof(low)},
-        {&high, sizeof(high)},
-    };
-    errno = 0;
-    if (writev(fd, iov, 2) != -1) {
-        return 1;
-    }
-    return errno == EINVAL ? 0 : 2;
-}
-
 static int expect_eagain_write(int fd, uint64_t value) {
     errno = 0;
     if (write(fd, &value, sizeof(value)) != -1) {
         return 1;
     }
     return errno == EAGAIN ? 0 : 2;
-}
-
-static int clear_nonblock_with_fcntl(int fd) {
-    int flags = fcntl(fd, F_GETFL);
-    if (flags < 0) {
-        return 1;
-    }
-    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0 ? 0 : 2;
 }
 
 static int clear_nonblock_with_ioctl(int fd) {
@@ -138,76 +81,61 @@ int main(void) {
     if (expect_poll_events(fd, POLLOUT) != 0) {
         return 16;
     }
-    if (writev_values(fd, 2, 5) != 0) {
+    if (write_value(fd, 2) != 0) {
         return 17;
     }
-    if (read_value(fd, 7) != 0) {
+    if (write_value(fd, 5) != 0) {
         return 18;
     }
-    if (write_value(fd, 9) != 0) {
+    if (read_value(fd, 7) != 0) {
         return 19;
     }
-    if (readv_split_value(fd, 9) != 0) {
+    if (write_value(fd, 9) != 0) {
         return 20;
     }
-    if (expect_einval_split_writev(fd) != 0) {
+    if (read_value(fd, 9) != 0) {
         return 21;
     }
     if (write_value(fd, 11) != 0) {
         return 22;
     }
-    if (expect_einval_short_readv(fd) != 0) {
+    if (read_value(fd, 11) != 0) {
         return 23;
     }
-    if (read_value(fd, 11) != 0) {
-        return 24;
-    }
     if (expect_eagain_read(fd) != 0) {
-        return 25;
+        return 24;
     }
     uint64_t invalid = UINT64_MAX;
     errno = 0;
     if (write(fd, &invalid, sizeof(invalid)) != -1 || errno != EINVAL) {
-        return 26;
+        return 25;
     }
     if (write_value(fd, UINT64_MAX - 1) != 0) {
-        return 27;
+        return 26;
     }
     if (expect_poll_events(fd, POLLIN) != 0) {
-        return 28;
+        return 27;
     }
     if (expect_eagain_write(fd, 1) != 0) {
-        return 29;
+        return 28;
     }
     if (read_value(fd, UINT64_MAX - 1) != 0) {
-        return 30;
+        return 29;
     }
     if (expect_poll_events(fd, POLLOUT) != 0) {
-        return 31;
+        return 30;
     }
     close(fd);
 
-    int fcntl_toggle_fd = eventfd(1, EFD_NONBLOCK);
-    if (fcntl_toggle_fd < 0) {
-        return 32;
-    }
-    if (clear_nonblock_with_fcntl(fcntl_toggle_fd) != 0) {
-        return 33;
-    }
-    if (read_value(fcntl_toggle_fd, 1) != 0) {
-        return 34;
-    }
-    close(fcntl_toggle_fd);
-
     int ioctl_toggle_fd = eventfd(1, EFD_NONBLOCK);
     if (ioctl_toggle_fd < 0) {
-        return 35;
+        return 31;
     }
     if (clear_nonblock_with_ioctl(ioctl_toggle_fd) != 0) {
-        return 36;
+        return 32;
     }
     if (read_value(ioctl_toggle_fd, 1) != 0) {
-        return 37;
+        return 33;
     }
     close(ioctl_toggle_fd);
 

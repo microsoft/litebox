@@ -61,13 +61,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
         Self::LocalCore(counter)
     }
 
-    fn supports_blocking_operations(&self) -> bool {
-        match self {
-            Self::ShimLocal { .. } => true,
-            Self::LocalCore(counter) => counter.supports_blocking_operations(),
-        }
-    }
-
     fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -188,16 +181,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
 
     super::common_functions_for_file_status!();
 
-    pub(crate) fn set_status_flags(&self, requested: OFlags, mask: OFlags) -> Result<(), Errno> {
-        let new_status = (self.get_status() & mask.complement()) | (requested & mask);
-        if !new_status.contains(OFlags::NONBLOCK) && !self.counter.supports_blocking_operations() {
-            return Err(Errno::EINVAL);
-        }
-        self.set_status(requested & mask, true);
-        self.set_status(requested.complement() & mask, false);
-        Ok(())
-    }
-
     fn is_nonblocking(&self) -> bool {
         self.get_status().contains(OFlags::NONBLOCK)
     }
@@ -249,7 +232,7 @@ fn consume_mode(semaphore: bool) -> EventCounterReadMode {
 
 #[cfg(test)]
 mod tests {
-    use litebox::{event::wait::WaitState, fs::OFlags};
+    use litebox::event::wait::WaitState;
     use litebox_common_linux::{EfdFlags, errno::Errno};
     use litebox_platform_multiplex::platform;
 
@@ -355,23 +338,5 @@ mod tests {
             Ok(8)
         );
         assert_eq!(eventfd.read(&WaitState::new(platform()).context()), Ok(1));
-    }
-
-    #[test]
-    fn test_shim_local_eventfd_can_be_made_nonblocking() {
-        let task = crate::syscalls::tests::init_platform(None);
-
-        let eventfd = task
-            .global
-            .create_linux_eventfd(0, EfdFlags::empty())
-            .unwrap();
-
-        eventfd
-            .set_status_flags(OFlags::NONBLOCK, OFlags::NONBLOCK)
-            .unwrap();
-        assert_eq!(
-            eventfd.read(&WaitState::new(platform()).context()),
-            Err(Errno::EAGAIN)
-        );
     }
 }
