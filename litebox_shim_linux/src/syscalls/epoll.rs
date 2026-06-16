@@ -1496,10 +1496,17 @@ mod test {
         (task, epoll, fs)
     }
 
+    fn new_mock_eventfd(
+        count: u64,
+        flags: EfdFlags,
+    ) -> crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform> {
+        crate::syscalls::eventfd::test_support::new_mock_broker_eventfd(count, flags).2
+    }
+
     #[test]
     fn test_epoll_with_eventfd() {
         let (task, epoll, fs) = setup_epoll();
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = new_mock_eventfd(0, EfdFlags::CLOEXEC);
         let typed = task
             .global
             .litebox
@@ -1778,7 +1785,7 @@ mod test {
     fn test_epoll_with_eventfd_and_timerfd() {
         let (task, epoll, fs) = setup_epoll();
 
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = new_mock_eventfd(0, EfdFlags::CLOEXEC);
         let eventfd = task
             .global
             .litebox
@@ -1876,7 +1883,7 @@ mod test {
     fn test_epoll_with_host_poll_and_spurious_wakes() {
         let (task, epoll, fs) = setup_epoll();
 
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = new_mock_eventfd(0, EfdFlags::CLOEXEC);
         let eventfd = task
             .global
             .litebox
@@ -1991,6 +1998,11 @@ mod test {
 
     #[test]
     fn test_sys_epoll_pwait_with_eventfd_and_timerfd() {
+        let provider: Arc<
+            dyn litebox_common_linux::broker_eventfd_provider::BrokerEventfdProvider,
+        > = Arc::new(crate::syscalls::eventfd::test_support::TestBrokerEventfdProvider::new());
+        let _ = crate::syscalls::eventfd::set_broker_eventfd_provider(provider);
+
         let task = crate::syscalls::tests::init_platform(None);
 
         let epfd = task
@@ -2065,7 +2077,7 @@ mod test {
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::empty());
+        let eventfd = new_mock_eventfd(0, EfdFlags::empty());
 
         let typed = task
             .global
