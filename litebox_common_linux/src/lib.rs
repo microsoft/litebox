@@ -3221,6 +3221,22 @@ pub mod arch {
         | EFLAGS_ID;
 }
 
+#[cfg(target_arch = "aarch64")]
+pub mod arch {
+    // User returns must not target the null-guard region.
+    pub const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
+    // Exclusive upper bound; keep the final low-userspace page reserved as a guard page.
+    pub const USER_ADDR_END: usize = 0x0000_ffff_ffff_f000;
+    /// PSTATE condition flags (N, Z, C, V) — guest-controllable arithmetic state.
+    pub const PSR_NZCV_MASK: u64 = 0b1111 << 28;
+    /// Speculative Store Bypass Safe bit — a benign, user-settable mitigation bit.
+    pub const PSR_SSBS_BIT: u64 = 1 << 12;
+    /// Data Independent Timing bit — a benign, user-settable mitigation bit.
+    pub const PSR_DIT_BIT: u64 = 1 << 24;
+    /// PSTATE bits a guest may keep when returning to EL0.
+    pub const SAFE_USER_PSTATE: u64 = PSR_NZCV_MASK | PSR_SSBS_BIT | PSR_DIT_BIT;
+}
+
 impl PtRegs {
     /// Returns whether `rip` and `rsp` are in the x86_64 Linux user address range.
     #[cfg(target_arch = "x86_64")]
@@ -3245,6 +3261,31 @@ impl PtRegs {
         self.eflags = (self.eflags & arch::SAFE_USER_EFLAGS) | arch::EFLAGS_FIXED | arch::EFLAGS_IF;
         self.cs = arch::USER_CS;
         self.ss = arch::USER_DS;
+        true
+    }
+
+    /// Returns whether `pc` and `sp` are in the aarch64 Linux user address range.
+    #[cfg(target_arch = "aarch64")]
+    #[must_use]
+    pub fn has_user_return_addresses(&self) -> bool {
+        (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.pc)
+            && (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.sp)
+    }
+
+    /// Sanitizes CPU state and normalizes the context to the aarch64 Linux user ABI.
+    ///
+    /// Returns `false` if `pc` or `sp` are outside the aarch64 Linux user address
+    /// range. On success, `pstate` is coerced to a clean AArch64 EL0t state: the
+    /// guest keeps only the condition flags and benign mitigation bits. Every
+    /// other bit is cleared, forcing EL0t, AArch64 execution state, unmasked
+    /// exceptions, and no illegal-state or single-step.
+    #[cfg(target_arch = "aarch64")]
+    #[must_use]
+    pub fn sanitize_for_user_return(&mut self) -> bool {
+        if !self.has_user_return_addresses() {
+            return false;
+        }
+        self.pstate &= arch::SAFE_USER_PSTATE;
         true
     }
 

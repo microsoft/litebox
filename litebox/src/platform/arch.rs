@@ -3,13 +3,12 @@
 
 //! Architecture-specific platform interfaces.
 //!
-//! As it currently stands, the interfaces here are only considered for x86-64, in the future other
+//! As it currently stands, the interfaces here are mostly considered for x86-64, in the future other
 //! architectures might be supported.
 
 use thiserror::Error;
 
 /// A provider of architecture-specific functionality.
-#[cfg(target_arch = "x86_64")]
 pub trait ArchSpecificProvider {
     /// Get the architecture-specific `reg`, for the current guest context.
     ///
@@ -44,6 +43,11 @@ pub enum ArchSpecificRegister {
     FsBase,
     GsBase,
 }
+
+/// Architecture-specific registers for AArch64.
+#[cfg(target_arch = "aarch64")]
+#[non_exhaustive]
+pub enum ArchSpecificRegister {}
 
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.
 #[non_exhaustive]
