@@ -19,7 +19,7 @@
 //! its ring once via `RegisterNotificationRing`; subsequent
 //! `SubscribeEventfd` calls use that sender.
 
-use crate::cwfd::inet_dgram_state::{InetDgramError, InetDgramState};
+use crate::cwfd::inet_dgram_state::{InetDgramError, InetDgramState, is_broker_dns_service};
 use crate::cwfd::inet_listener_state::{
     AddressFamily, InetListenerError, InetListenerState, decode_sockaddr, encode_sockaddr,
     family_from_u8,
@@ -1783,10 +1783,16 @@ fn handle_inet_tcp_conn_connect(
         Some(parts) => parts,
         None => return protocol_err(response_opcode),
     };
-    let target = match decode_sockaddr(&sockaddr) {
+    let mut target = match decode_sockaddr(&sockaddr) {
         Ok(target) => target,
         Err(_) => return status_err(response_opcode, StatusCode::InvalidValue),
     };
+    if is_broker_dns_service(target) {
+        target = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            crate::net_proxy::host_dns::discover_host_dns(),
+            target.port(),
+        ));
+    }
     let state = match resolve_tcp_conn(registry, handle_id) {
         Ok(state) => state,
         Err(status) => return status_err(response_opcode, status),

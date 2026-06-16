@@ -447,6 +447,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "/usr/bin/grep",
                         "/usr/bin/tr",
                         "/usr/bin/true",
+                        // findutils/coreutils binaries the PTYM.* PTY
+                        // marker-completion tests exec (`find ... | head`
+                        // and `stty` for interactive-readline echo
+                        // disable), plus libselinux which `find` links.
+                        "/usr/bin/find",
+                        "/usr/bin/head",
+                        "/usr/bin/stty",
+                        "/usr/lib/x86_64-linux-gnu/libselinux.so.1",
                         "/usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.11.2",
                         "/usr/lib/x86_64-linux-gnu/libtinfo.so.6.4",
                         // Node.js (bundled with the litebox-test image

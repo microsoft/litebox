@@ -1159,14 +1159,14 @@ fn parse_standard_verdict(
         );
         found = Some(serde_json::json!({
             "test": test_id,
-            "result": "FAIL",
+            "result": "fail",
             "detail": detail,
         }));
     }
     let verdict: &'static str = match &found {
         Some(v) => match v.get("result").and_then(|r| r.as_str()) {
             Some("pass") => "pass",
-            Some("FAIL") => "FAIL",
+            Some("fail") => "fail",
             _ => "other",
         },
         None => "no_result",
@@ -1174,7 +1174,7 @@ fn parse_standard_verdict(
     let sub_phases = SubPhaseMs::compute(&markers);
     let detail = match (verdict, &found) {
         ("pass", _) => None,
-        ("FAIL", Some(v)) => Some(format!(
+        ("fail", Some(v)) => Some(format!(
             "{pass}::{test_id}: {} (logs: {} {})",
             v.get("detail").and_then(|d| d.as_str()).unwrap_or(""),
             stdout_log.display(),
@@ -3181,7 +3181,7 @@ mod copilot {
                 let t_dispatch = Instant::now();
                 let Some(&port) = container.published_ports.get(&22) else {
                     return super::framework::DriveResult {
-                        verdict: "FAIL",
+                        verdict: "fail",
                         detail: Some(format!(
                             "container {} did not publish port 22",
                             container.name
@@ -3196,7 +3196,7 @@ mod copilot {
                 };
                 if let Err(e) = wait_for_sshd(port, Duration::from_secs(30)) {
                     return super::framework::DriveResult {
-                        verdict: "FAIL",
+                        verdict: "fail",
                         detail: Some(format!("wait_for_sshd port {port}: {e}")),
                         t_docker_start_ms: t_dispatch.elapsed().as_millis(),
                         t_useful_ms: 0,
@@ -3213,7 +3213,7 @@ mod copilot {
                     Ok(r) => r,
                     Err(e) => {
                         return super::framework::DriveResult {
-                            verdict: "FAIL",
+                            verdict: "fail",
                             detail: Some(format!("drive: {e}")),
                             t_docker_start_ms,
                             t_useful_ms: t_useful_start.elapsed().as_millis(),
@@ -3244,7 +3244,7 @@ mod copilot {
                 if !ok {
                     let preview: String = stripped.chars().take(800).collect();
                     return super::framework::DriveResult {
-                        verdict: "FAIL",
+                        verdict: "fail",
                         detail: Some(format!(
                             "copilot::tui.{scenario_id_owned} startup check failed.\n\
                              transcript: {}\n\
@@ -3463,7 +3463,7 @@ mod copilot {
                 let t_dispatch = Instant::now();
                 let Some(&port) = container.published_ports.get(&22) else {
                     return super::framework::DriveResult {
-                        verdict: "FAIL",
+                        verdict: "fail",
                         detail: Some(format!(
                             "container {} did not publish port 22",
                             container.name
@@ -3478,7 +3478,7 @@ mod copilot {
                 };
                 if let Err(e) = wait_for_sshd(port, Duration::from_secs(30)) {
                     return super::framework::DriveResult {
-                        verdict: "FAIL",
+                        verdict: "fail",
                         detail: Some(format!("wait_for_sshd port {port}: {e}")),
                         t_docker_start_ms: t_dispatch.elapsed().as_millis(),
                         t_useful_ms: 0,
@@ -3499,7 +3499,7 @@ mod copilot {
                     Ok(r) => r,
                     Err(e) => {
                         return super::framework::DriveResult {
-                            verdict: "FAIL",
+                            verdict: "fail",
                             detail: Some(format!("drive: {e}")),
                             t_docker_start_ms,
                             t_useful_ms: t_useful_start.elapsed().as_millis(),
@@ -3529,7 +3529,7 @@ mod copilot {
                 if !ok {
                     let preview: String = strip_ansi(&response).chars().take(800).collect();
                     return super::framework::DriveResult {
-                        verdict: "FAIL",
+                        verdict: "fail",
                         detail: Some(format!(
                             "copilot::{mode_label}.{driver_label}.{scenario_id_owned} check failed.\n\
                              canary={canary_owned}\n\
@@ -5254,7 +5254,7 @@ mod vscode {
         t_useful_ms: u128,
     ) -> super::framework::DriveResult {
         super::framework::DriveResult {
-            verdict: "FAIL",
+            verdict: "fail",
             detail: Some(detail),
             t_docker_start_ms,
             t_useful_ms,
@@ -6319,7 +6319,7 @@ process.exit(0);\n",
                 let t_dispatch = Instant::now();
                 let Some(&port) = container.published_ports.get(&22) else {
                     return super::framework::DriveResult {
-                        verdict: "FAIL",
+                        verdict: "fail",
                         detail: Some(format!(
                             "container {} did not publish port 22 (ports={:?})",
                             container.name, container.published_ports,
@@ -6334,7 +6334,7 @@ process.exit(0);\n",
                 };
                 if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
                     return super::framework::DriveResult {
-                        verdict: "FAIL",
+                        verdict: "fail",
                         detail: Some(format!("wait_for_sshd port {port}: {e}")),
                         t_docker_start_ms: t_dispatch.elapsed().as_millis(),
                         t_useful_ms: 0,
@@ -6351,7 +6351,7 @@ process.exit(0);\n",
                     Ok(r) => r,
                     Err(e) => {
                         return super::framework::DriveResult {
-                            verdict: "FAIL",
+                            verdict: "fail",
                             detail: Some(format!("drive_bash: {e}")),
                             t_docker_start_ms,
                             t_useful_ms: t_useful_start.elapsed().as_millis(),
@@ -6377,7 +6377,7 @@ process.exit(0);\n",
                         "dropbear_bash-{pass_owned}-{scenario_id_owned}.stripped.log"
                     ));
                     return super::framework::DriveResult {
-                        verdict: "FAIL",
+                        verdict: "fail",
                         detail: Some(format!(
                             "dropbear_bash.{scenario_id_owned} missing expected output {:?}.\n\
                              transcript: {}\n\
