@@ -50,6 +50,7 @@ use crate::state_registry::{
 };
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use crate::tcp_conn_state::{TcpConnError, TcpConnState};
+use crate::timerfd_state::{TimerfdError, TimerfdState};
 use litebox_common_linux::fd_token_protocol as proto;
 use litebox_common_linux::fd_token_protocol::PtyEndpoint;
 
@@ -57,30 +58,32 @@ use litebox_common_linux::fd_token_protocol::{
     Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
     build_create_pidfd_response_ok, build_create_pipe_response_ok, build_create_pty_response_ok,
     build_create_signalfd_response_ok, build_create_socketpair_response_ok,
-    build_deliver_signal_inbox_response_ok, build_error_response,
-    build_inet_listener_accept_response_ok, build_inet_listener_bind_response_ok,
-    build_inet_listener_create_response_ok, build_inet_listener_getsockname_response_ok,
-    build_inet_listener_getsockopt_response_ok, build_inet_listener_listen_response_ok,
-    build_inet_listener_query_events_response_ok, build_inet_raw_query_events_response_ok,
-    build_inet_raw_recvfrom_response_ok, build_inet_raw_sendto_response_ok,
-    build_inet_tcp_conn_getsockopt_response_ok, build_inet_tcp_conn_setsockopt_response_ok,
-    build_inotify_add_watch_response_ok, build_inotify_init1_response_ok,
-    build_inotify_read_response_ok, build_inotify_rm_watch_response_ok,
-    build_mark_process_exited_response_ok, build_open_pty_slave_response_ok,
-    build_pidfd_exited_response_ok, build_poll_tcp_conn_events_response_ok,
-    build_pty_ioctl_response_ok, build_pty_read_response_ok, build_pty_write_response_ok,
-    build_push_siginfo_response_ok, build_read_eventfd_response_ok, build_read_pipe_response_ok,
-    build_read_siginfo_response_ok, build_read_socketpair_response_ok,
-    build_read_tcp_conn_response_ok, build_register_notification_ring_response_ok,
+    build_create_timerfd_response_ok, build_deliver_signal_inbox_response_ok, build_error_response,
+    build_get_timerfd_response_ok, build_inet_listener_accept_response_ok,
+    build_inet_listener_bind_response_ok, build_inet_listener_create_response_ok,
+    build_inet_listener_getsockname_response_ok, build_inet_listener_getsockopt_response_ok,
+    build_inet_listener_listen_response_ok, build_inet_listener_query_events_response_ok,
+    build_inet_raw_query_events_response_ok, build_inet_raw_recvfrom_response_ok,
+    build_inet_raw_sendto_response_ok, build_inet_tcp_conn_getsockopt_response_ok,
+    build_inet_tcp_conn_setsockopt_response_ok, build_inotify_add_watch_response_ok,
+    build_inotify_init1_response_ok, build_inotify_read_response_ok,
+    build_inotify_rm_watch_response_ok, build_mark_process_exited_response_ok,
+    build_open_pty_slave_response_ok, build_pidfd_exited_response_ok,
+    build_poll_tcp_conn_events_response_ok, build_pty_ioctl_response_ok,
+    build_pty_read_response_ok, build_pty_write_response_ok, build_push_siginfo_response_ok,
+    build_read_eventfd_response_ok, build_read_pipe_response_ok, build_read_siginfo_response_ok,
+    build_read_socketpair_response_ok, build_read_tcp_conn_response_ok,
+    build_read_timerfd_response_ok, build_register_notification_ring_response_ok,
     build_register_process_response_ok, build_release_response_ok, build_set_pgid_response_ok,
-    build_set_sid_response_ok, build_shutdown_socketpair_write_response_ok,
-    build_shutdown_tcp_conn_response_ok, build_subscribe_eventfd_response_ok,
-    build_subscribe_process_exit_response_ok, build_subscribe_pty_response_ok,
-    build_subscribe_signal_inbox_response_ok, build_unsubscribe_response_ok,
-    build_unsubscribe_signal_inbox_response_ok, build_write_eventfd_response_ok,
-    build_write_pipe_response_ok, build_write_socketpair_response_ok,
-    build_write_tcp_conn_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
-    parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
+    build_set_sid_response_ok, build_set_timerfd_response_ok,
+    build_shutdown_socketpair_write_response_ok, build_shutdown_tcp_conn_response_ok,
+    build_subscribe_eventfd_response_ok, build_subscribe_process_exit_response_ok,
+    build_subscribe_pty_response_ok, build_subscribe_signal_inbox_response_ok,
+    build_unsubscribe_response_ok, build_unsubscribe_signal_inbox_response_ok,
+    build_write_eventfd_response_ok, build_write_pipe_response_ok,
+    build_write_socketpair_response_ok, build_write_tcp_conn_response_ok,
+    parse_create_eventfd_body, parse_create_pidfd_body, parse_create_pipe_body,
+    parse_create_signalfd_body, parse_create_socketpair_body, parse_create_timerfd_body,
     parse_deliver_signal_inbox_body, parse_handle_body, parse_inet_listener_accept_body,
     parse_inet_listener_bind_body, parse_inet_listener_create_body,
     parse_inet_listener_getsockname_body, parse_inet_listener_getsockopt_body,
@@ -92,11 +95,12 @@ use litebox_common_linux::fd_token_protocol::{
     parse_open_pty_slave_body, parse_pidfd_exited_request, parse_poll_tcp_conn_events_body,
     parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body,
     parse_read_pipe_body, parse_read_socketpair_body, parse_read_tcp_conn_body,
-    parse_set_pgid_body, parse_set_sid_body, parse_shutdown_socketpair_write_body,
-    parse_shutdown_tcp_conn_body, parse_subscribe_eventfd_body, parse_subscribe_process_exit_body,
-    parse_subscribe_pty_body, parse_subscribe_signal_inbox_body, parse_unsubscribe_body,
-    parse_unsubscribe_signal_inbox_body, parse_write_eventfd_body, parse_write_pipe_body,
-    parse_write_socketpair_body, parse_write_tcp_conn_body,
+    parse_set_pgid_body, parse_set_sid_body, parse_set_timerfd_body,
+    parse_shutdown_socketpair_write_body, parse_shutdown_tcp_conn_body,
+    parse_subscribe_eventfd_body, parse_subscribe_process_exit_body, parse_subscribe_pty_body,
+    parse_subscribe_signal_inbox_body, parse_unsubscribe_body, parse_unsubscribe_signal_inbox_body,
+    parse_write_eventfd_body, parse_write_pipe_body, parse_write_socketpair_body,
+    parse_write_tcp_conn_body,
 };
 
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -268,6 +272,10 @@ fn dispatch_request(
             handle_register_notification_ring(conn, request, in_fds)
         }
         Opcode::CreateEventfd => handle_create_eventfd(registry, request, in_fds),
+        Opcode::CreateTimerfd => handle_create_timerfd(registry, request, in_fds),
+        Opcode::ReadTimerfd => handle_read_timerfd(registry, request, in_fds),
+        Opcode::SetTimerfd => handle_set_timerfd(registry, request, in_fds),
+        Opcode::GetTimerfd => handle_get_timerfd(registry, request, in_fds),
         Opcode::CreatePidfd => handle_create_pidfd(registry, request, in_fds),
         Opcode::PidfdExited => handle_pidfd_exited(registry, request, in_fds),
         Opcode::ReadEventfd => handle_read_eventfd(registry, request, in_fds),
@@ -905,6 +913,154 @@ fn handle_write_eventfd(
     }
 }
 
+fn handle_create_timerfd(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::CreateTimerfdResponse);
+    }
+    let (clockid, flags) = match parse_create_timerfd_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::CreateTimerfdResponse),
+    };
+    let state = match TimerfdState::new(clockid, flags) {
+        Ok(state) => state,
+        Err(TimerfdError::InvalidValue) => {
+            return status_err(Opcode::CreateTimerfdResponse, StatusCode::InvalidValue);
+        }
+        Err(TimerfdError::WouldBlock) => {
+            return status_err(Opcode::CreateTimerfdResponse, StatusCode::Internal);
+        }
+    };
+    let handle = registry.register(state);
+    HandlerResult {
+        frame: build_create_timerfd_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn resolve_timerfd(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+    response: Opcode,
+) -> Result<Arc<TimerfdState>, HandlerResult> {
+    let state = match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Timerfd) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return Err(status_err(response, StatusCode::UnknownHandle));
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return Err(status_err(response, StatusCode::SubsystemMismatch));
+        }
+        Err(_) => return Err(status_err(response, StatusCode::Internal)),
+    };
+    match state.as_ref() {
+        StateObjectEnum::Timerfd(timerfd) => Ok(Arc::clone(timerfd)),
+        StateObjectEnum::Eventfd(_)
+        | StateObjectEnum::PipeReadEnd(_)
+        | StateObjectEnum::PipeWriteEnd(_)
+        | StateObjectEnum::SocketPairEnd(_)
+        | StateObjectEnum::SocketDgram(_)
+        | StateObjectEnum::SocketSeqPacket(_)
+        | StateObjectEnum::TcpConn(_)
+        | StateObjectEnum::InetListener(_)
+        | StateObjectEnum::InetDgram(_)
+        | StateObjectEnum::InetRaw(_)
+        | StateObjectEnum::Signalfd(_)
+        | StateObjectEnum::Inotify(_)
+        | StateObjectEnum::Pty(_)
+        | StateObjectEnum::Pidfd(_)
+        | StateObjectEnum::Process(_)
+        | StateObjectEnum::HostFdAttached(_) => {
+            unreachable!("registry returned wrong state variant for Timerfd tag")
+        }
+    }
+}
+
+fn handle_read_timerfd(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::ReadTimerfdResponse);
+    }
+    let handle_id = match parse_handle_body(request.body, request.opcode) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::ReadTimerfdResponse),
+    };
+    let state = match resolve_timerfd(registry, handle_id, Opcode::ReadTimerfdResponse) {
+        Ok(state) => state,
+        Err(result) => return result,
+    };
+    match state.read() {
+        Ok(v) => HandlerResult {
+            frame: build_read_timerfd_response_ok(v),
+            out_fd: None,
+        },
+        Err(TimerfdError::WouldBlock) => {
+            status_err(Opcode::ReadTimerfdResponse, StatusCode::WouldBlock)
+        }
+        Err(TimerfdError::InvalidValue) => {
+            status_err(Opcode::ReadTimerfdResponse, StatusCode::Internal)
+        }
+    }
+}
+
+fn handle_set_timerfd(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SetTimerfdResponse);
+    }
+    let (handle_id, new_value, flags) = match parse_set_timerfd_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SetTimerfdResponse),
+    };
+    let state = match resolve_timerfd(registry, handle_id, Opcode::SetTimerfdResponse) {
+        Ok(state) => state,
+        Err(result) => return result,
+    };
+    match state.settime(new_value, flags) {
+        Ok(()) => HandlerResult {
+            frame: build_set_timerfd_response_ok(),
+            out_fd: None,
+        },
+        Err(TimerfdError::InvalidValue) => {
+            status_err(Opcode::SetTimerfdResponse, StatusCode::InvalidValue)
+        }
+        Err(TimerfdError::WouldBlock) => {
+            status_err(Opcode::SetTimerfdResponse, StatusCode::Internal)
+        }
+    }
+}
+
+fn handle_get_timerfd(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::GetTimerfdResponse);
+    }
+    let handle_id = match parse_handle_body(request.body, request.opcode) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::GetTimerfdResponse),
+    };
+    let state = match resolve_timerfd(registry, handle_id, Opcode::GetTimerfdResponse) {
+        Ok(state) => state,
+        Err(result) => return result,
+    };
+    HandlerResult {
+        frame: build_get_timerfd_response_ok(state.gettime()),
+        out_fd: None,
+    }
+}
+
 fn handle_create_pipe(
     registry: &BrokerStateRegistry,
     request: &Frame<'_>,
@@ -1155,7 +1311,8 @@ fn resolve_pipe_read(
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
-            | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
+            | StateObjectEnum::Process(_)
+            | StateObjectEnum::Timerfd(_) => Err(StatusCode::SubsystemMismatch),
         },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
@@ -1190,7 +1347,8 @@ fn resolve_pipe_write(
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
-            | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
+            | StateObjectEnum::Process(_)
+            | StateObjectEnum::Timerfd(_) => Err(StatusCode::SubsystemMismatch),
         },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
@@ -1363,7 +1521,8 @@ fn resolve_socket_dgram(
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::Process(_)
-            | StateObjectEnum::HostFdAttached(_) => Err(StatusCode::SubsystemMismatch),
+            | StateObjectEnum::HostFdAttached(_)
+            | StateObjectEnum::Timerfd(_) => Err(StatusCode::SubsystemMismatch),
         },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
@@ -1653,7 +1812,8 @@ fn resolve_socketpair_end(
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::Process(_)
-            | StateObjectEnum::HostFdAttached(_) => Err(StatusCode::SubsystemMismatch),
+            | StateObjectEnum::HostFdAttached(_)
+            | StateObjectEnum::Timerfd(_) => Err(StatusCode::SubsystemMismatch),
         },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
@@ -1999,7 +2159,8 @@ fn resolve_tcp_conn(
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_)
-            | StateObjectEnum::HostFdAttached(_) => Err(StatusCode::SubsystemMismatch),
+            | StateObjectEnum::HostFdAttached(_)
+            | StateObjectEnum::Timerfd(_) => Err(StatusCode::SubsystemMismatch),
         },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
@@ -2351,7 +2512,8 @@ fn resolve_inet_dgram(
         | StateObjectEnum::Pty(_)
         | StateObjectEnum::Pidfd(_)
         | StateObjectEnum::Process(_)
-        | StateObjectEnum::HostFdAttached(_) => {
+        | StateObjectEnum::HostFdAttached(_)
+        | StateObjectEnum::Timerfd(_) => {
             unreachable!("registry returned wrong state variant for InetDgram tag")
         }
     }
@@ -3320,7 +3482,8 @@ fn resolve_pty(
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_)
-            | StateObjectEnum::HostFdAttached(_) => {
+            | StateObjectEnum::HostFdAttached(_)
+            | StateObjectEnum::Timerfd(_) => {
                 Err(status_err(response, StatusCode::SubsystemMismatch))
             }
         },
@@ -4469,7 +4632,8 @@ fn resolve_socket_seqpacket(
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_)
-            | StateObjectEnum::HostFdAttached(_) => Err(status_err(
+            | StateObjectEnum::HostFdAttached(_)
+            | StateObjectEnum::Timerfd(_) => Err(status_err(
                 Opcode::ReleaseResponse,
                 StatusCode::SubsystemMismatch,
             )),

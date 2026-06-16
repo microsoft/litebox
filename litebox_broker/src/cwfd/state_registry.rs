@@ -84,6 +84,7 @@ use crate::cwfd::socket_seqpacket_state::SocketSeqPacketState;
 use crate::cwfd::socketpair_state::SocketPairEnd;
 use crate::cwfd::subscription_list::{SubscribeError, UnsubscribeError};
 use crate::cwfd::tcp_conn_state::TcpConnState;
+use crate::cwfd::timerfd_state::TimerfdState;
 
 /// An opaque, broker-global handle to a [`StateObject`] held by the
 /// broker on behalf of one or more workers.
@@ -206,6 +207,7 @@ pub enum StateKind {
     Pidfd,
     Process,
     HostFdAttached,
+    Timerfd,
 }
 
 /// A tagged broker-hosted state object.
@@ -227,6 +229,7 @@ pub enum StateObjectEnum {
     Pidfd(Arc<PidfdState>),
     Process(Arc<ProcessState>),
     HostFdAttached(Arc<HostFdState>),
+    Timerfd(Arc<TimerfdState>),
 }
 
 impl StateObjectEnum {
@@ -248,6 +251,7 @@ impl StateObjectEnum {
             StateObjectEnum::Pidfd(_) => StateKind::Pidfd,
             StateObjectEnum::Process(_) => StateKind::Process,
             StateObjectEnum::HostFdAttached(_) => StateKind::HostFdAttached,
+            StateObjectEnum::Timerfd(_) => StateKind::Timerfd,
         }
     }
 
@@ -269,6 +273,7 @@ impl StateObjectEnum {
             StateObjectEnum::Pidfd(state) => state.subsystem_tag(),
             StateObjectEnum::Process(state) => state.subsystem_tag(),
             StateObjectEnum::HostFdAttached(state) => state.subsystem_tag(),
+            StateObjectEnum::Timerfd(state) => state.subsystem_tag(),
         }
     }
 
@@ -323,6 +328,9 @@ impl StateObjectEnum {
             StateObjectEnum::HostFdAttached(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
+            StateObjectEnum::Timerfd(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
         }
     }
 
@@ -344,6 +352,7 @@ impl StateObjectEnum {
             StateObjectEnum::Pidfd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Process(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::HostFdAttached(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::Timerfd(state) => state.unsubscribe(subscription_id),
         }
     }
 
@@ -365,6 +374,7 @@ impl StateObjectEnum {
             StateObjectEnum::Pidfd(state) => state.current_events(),
             StateObjectEnum::Process(state) => state.current_events(),
             StateObjectEnum::HostFdAttached(state) => state.current_events(),
+            StateObjectEnum::Timerfd(state) => state.current_events(),
         }
     }
 
@@ -386,6 +396,7 @@ impl StateObjectEnum {
             StateObjectEnum::Pidfd(state) => state.try_flush_subscriptions(),
             StateObjectEnum::Process(state) => state.try_flush_subscriptions(),
             StateObjectEnum::HostFdAttached(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::Timerfd(state) => state.try_flush_subscriptions(),
         }
     }
 
@@ -408,6 +419,7 @@ impl StateObjectEnum {
             StateObjectEnum::Pidfd(state) => state.debug_repr(),
             StateObjectEnum::Process(state) => state.debug_repr(),
             StateObjectEnum::HostFdAttached(state) => state.debug_repr(),
+            StateObjectEnum::Timerfd(state) => state.debug_repr(),
         }
     }
 }
@@ -541,6 +553,12 @@ impl From<Arc<PidfdState>> for StateObjectEnum {
 impl From<Arc<ProcessState>> for StateObjectEnum {
     fn from(state: Arc<ProcessState>) -> Self {
         StateObjectEnum::Process(state)
+    }
+}
+
+impl From<Arc<TimerfdState>> for StateObjectEnum {
+    fn from(state: Arc<TimerfdState>) -> Self {
+        StateObjectEnum::Timerfd(state)
     }
 }
 
@@ -816,7 +834,8 @@ impl BrokerStateRegistry {
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_)
-            | StateObjectEnum::HostFdAttached(_) => {
+            | StateObjectEnum::HostFdAttached(_)
+            | StateObjectEnum::Timerfd(_) => {
                 return Err(StateRegistryError::TagMismatch {
                     handle,
                     expected: SubsystemTag::InetListener,
@@ -880,7 +899,8 @@ impl BrokerStateRegistry {
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_)
-            | StateObjectEnum::HostFdAttached(_) => {
+            | StateObjectEnum::HostFdAttached(_)
+            | StateObjectEnum::Timerfd(_) => {
                 panic!(
                     "broker-held inet listener route for port {port} family {family:?} points at non-listener handle {handle}"
                 );

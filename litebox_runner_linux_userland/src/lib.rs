@@ -26,6 +26,7 @@ pub mod broker_socket_dgram_provider;
 pub mod broker_socket_seqpacket_provider;
 pub mod broker_socketpair_provider;
 pub mod broker_tcp_conn_provider;
+pub mod broker_timerfd_provider;
 pub mod guest_pid_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
