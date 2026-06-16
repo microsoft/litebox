@@ -622,6 +622,110 @@ impl FdKind {
         }
     }
 
+    /// Map a (pre-v3) [`BrokerHandleSnapshot`] to its broker-held [`FdKind`].
+    /// This is the kind-disambiguation the old dual taxonomy split across the
+    /// `(FdClass, broker_handle)` product — here it is a single total function.
+    //
+    // Transitional bridge used by the emit side and wire-read while the legacy
+    // `class` + `broker_handle` fields still exist; removed once `FdKind` is the
+    // sole stored discriminant (wsD final step).
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn from_broker_handle(bh: BrokerHandleSnapshot) -> Self {
+        match bh {
+            BrokerHandleSnapshot::Pidfd { handle_id } => Self::Pidfd { handle_id },
+            BrokerHandleSnapshot::Eventfd { handle_id } => Self::Eventfd { handle_id },
+            BrokerHandleSnapshot::Signalfd { handle_id } => Self::Signalfd { handle_id },
+            BrokerHandleSnapshot::Pty {
+                handle_id,
+                role,
+                pty_id,
+            } => Self::BrokerPty {
+                handle_id,
+                role,
+                pty_id,
+            },
+            BrokerHandleSnapshot::Pipe {
+                handle_id,
+                direction,
+            } => Self::BrokerPipe {
+                handle_id,
+                direction,
+            },
+            BrokerHandleSnapshot::UnixSocket {
+                handle_id,
+                endpoint,
+            } => Self::BrokerSocketPair {
+                handle_id,
+                endpoint,
+            },
+            BrokerHandleSnapshot::TcpConn { handle_id } => Self::BrokerTcpConn { handle_id },
+            BrokerHandleSnapshot::InetListener { handle_id } => {
+                Self::BrokerInetListener { handle_id }
+            }
+            BrokerHandleSnapshot::InetDgram { handle_id } => Self::BrokerInetDgram { handle_id },
+            BrokerHandleSnapshot::SocketDgram { handle_id } => {
+                Self::BrokerSocketDgram { handle_id }
+            }
+            BrokerHandleSnapshot::SocketSeqPacket { handle_id } => {
+                Self::BrokerSocketSeqPacket { handle_id }
+            }
+        }
+    }
+
+    /// Derive the canonical [`FdKind`] from the legacy
+    /// `(FdClass, broker_handle, broker_fd_token)` triple. The broker-handle and
+    /// host-token presence disambiguate the formerly-overloaded buckets
+    /// (`FdClass::Pipe` = BrokerPipe vs HostPassthrough; `FdClass::EventFd` =
+    /// eventfd vs pidfd vs timerfd). The `class`-only arms are the local /
+    /// extraction-failed cases; their `handle_id: 0` placeholders are inert
+    /// because the matching restore arms no-op when re-attach fails.
+    //
+    // Transitional bridge; removed once `FdKind` is the sole stored
+    // discriminant (wsD final step).
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn from_legacy(
+        class: FdClass,
+        broker_handle: Option<BrokerHandleSnapshot>,
+        broker_fd_token: Option<BrokerFdTokenSnapshot>,
+    ) -> Self {
+        if let Some(bh) = broker_handle {
+            return Self::from_broker_handle(bh);
+        }
+        if let Some(token) = broker_fd_token {
+            return Self::HostPassthrough {
+                token_id: token.token_id,
+                direction: token.host_passthrough_fd_direction.unwrap_or(
+                    crate::syscalls::host_passthrough_fd::HostPassthroughFdDirection::ReadWrite,
+                ),
+            };
+        }
+        match class {
+            // stdio is recovered from metadata / stdio_object_ids, not a kind.
+            FdClass::FilesystemFd | FdClass::StdioFd => Self::FilesystemFd,
+            // A `Pipe` with neither a broker handle nor a host token is an
+            // extraction-failed HostPassthrough/BrokerPipe — unrestorable; the
+            // inert host-token form keeps a single representation.
+            FdClass::Pipe => Self::HostPassthrough {
+                token_id: 0,
+                direction:
+                    crate::syscalls::host_passthrough_fd::HostPassthroughFdDirection::ReadWrite,
+            },
+            #[cfg(feature = "worker_local_inet")]
+            FdClass::NetworkSocket => Self::Net,
+            FdClass::UnixSocket => Self::UnixSocket,
+            FdClass::Epoll => Self::Epoll,
+            // eventfd/pidfd always carry a broker handle; only timerfd reaches
+            // here (no broker timer state yet — WS-T).
+            FdClass::EventFd => Self::Timerfd { handle_id: 0 },
+            FdClass::Signalfd => Self::Signalfd { handle_id: 0 },
+            FdClass::Inotify => Self::Inotify,
+            FdClass::InetListener => Self::BrokerInetListener { handle_id: 0 },
+            FdClass::BrokerInetRaw => Self::BrokerInetRaw { handle_id: 0 },
+        }
+    }
+
     /// Serialize as one variant-tagged blob: `variant_byte` then exactly the
     /// extra fields the variant carries (no `Option<...>` headers). This is the
     /// v3 replacement for the separate `FdClass` byte + `broker_handle` /
@@ -2980,6 +3084,101 @@ mod tests {
                 "SnapshotReader has unread bytes after round-trip for {original:?}"
             );
         }
+    }
+
+    #[test]
+    fn fd_kind_from_broker_handle_preserves_handle_and_is_broker_held() {
+        use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
+        use litebox_common_linux::broker_pty_provider::BrokerPtyRole;
+        use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
+
+        let id = 0x1234_5678_9ABC_DEF0u64;
+        let all: alloc::vec::Vec<BrokerHandleSnapshot> = alloc::vec![
+            BrokerHandleSnapshot::Pidfd { handle_id: id },
+            BrokerHandleSnapshot::Eventfd { handle_id: id },
+            BrokerHandleSnapshot::Signalfd { handle_id: id },
+            BrokerHandleSnapshot::Pty {
+                handle_id: id,
+                role: BrokerPtyRole::Master,
+                pty_id: Some(7),
+            },
+            BrokerHandleSnapshot::Pipe {
+                handle_id: id,
+                direction: BrokerPipeEnd::Read,
+            },
+            BrokerHandleSnapshot::UnixSocket {
+                handle_id: id,
+                endpoint: BrokerSocketPairEndpoint::A,
+            },
+            BrokerHandleSnapshot::TcpConn { handle_id: id },
+            BrokerHandleSnapshot::InetListener { handle_id: id },
+            BrokerHandleSnapshot::InetDgram { handle_id: id },
+            BrokerHandleSnapshot::SocketDgram { handle_id: id },
+            BrokerHandleSnapshot::SocketSeqPacket { handle_id: id },
+        ];
+        // Compile-time exhaustiveness: adding a BrokerHandleSnapshot variant
+        // fails to compile here, forcing it into the list (and the mapping).
+        match all[0] {
+            BrokerHandleSnapshot::Pidfd { .. }
+            | BrokerHandleSnapshot::Eventfd { .. }
+            | BrokerHandleSnapshot::Signalfd { .. }
+            | BrokerHandleSnapshot::Pty { .. }
+            | BrokerHandleSnapshot::Pipe { .. }
+            | BrokerHandleSnapshot::UnixSocket { .. }
+            | BrokerHandleSnapshot::TcpConn { .. }
+            | BrokerHandleSnapshot::InetListener { .. }
+            | BrokerHandleSnapshot::InetDgram { .. }
+            | BrokerHandleSnapshot::SocketDgram { .. }
+            | BrokerHandleSnapshot::SocketSeqPacket { .. } => {}
+        }
+        for bh in all {
+            let kind = FdKind::from_broker_handle(bh);
+            assert_eq!(
+                kind.broker_handle_id(),
+                Some(id),
+                "from_broker_handle({bh:?}) must be broker-held with the same handle_id"
+            );
+            assert_eq!(
+                kind.spec_token(),
+                bh.spec_token(),
+                "from_broker_handle({bh:?}) must keep the same spec token"
+            );
+        }
+    }
+
+    #[test]
+    fn fd_kind_from_legacy_local_classes_have_no_handle() {
+        // No broker handle + no token: local/extraction-failed classes map to a
+        // representation whose restore is inert.
+        assert_eq!(
+            FdKind::from_legacy(FdClass::FilesystemFd, None, None),
+            FdKind::FilesystemFd
+        );
+        assert_eq!(
+            FdKind::from_legacy(FdClass::StdioFd, None, None),
+            FdKind::FilesystemFd
+        );
+        assert_eq!(
+            FdKind::from_legacy(FdClass::UnixSocket, None, None),
+            FdKind::UnixSocket
+        );
+        assert_eq!(
+            FdKind::from_legacy(FdClass::Epoll, None, None),
+            FdKind::Epoll
+        );
+        assert_eq!(
+            FdKind::from_legacy(FdClass::Inotify, None, None),
+            FdKind::Inotify
+        );
+        // A broker handle always wins over the class bucket.
+        assert_eq!(
+            FdKind::from_legacy(
+                FdClass::UnixSocket,
+                Some(BrokerHandleSnapshot::TcpConn { handle_id: 9 }),
+                None
+            ),
+            FdKind::BrokerTcpConn { handle_id: 9 }
+        );
     }
 
     #[test]
