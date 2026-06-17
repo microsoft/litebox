@@ -840,7 +840,7 @@ fn append_decoded_instructions(
     chunk_end_ip: u64,
     instructions: &mut Vec<iced_x86::Instruction>,
 ) -> Result<()> {
-    if bytes_until_next_4g_boundary(window.as_ptr()) >= window.len() {
+    if bytes_until_next_4g_boundary(window.as_ptr()) > window.len() {
         return append_decoded_non_crossing_window(
             bitness,
             window,
@@ -859,7 +859,7 @@ fn append_decoded_instructions(
         .ok_or_else(|| Error::DisassemblyFailure("decode window too large".into()))?;
     let mut scratch = vec![0; scratch_len];
     let scratch_boundary_dist = bytes_until_next_4g_boundary(scratch.as_ptr());
-    let scratch_offset = if scratch_boundary_dist >= window.len() {
+    let scratch_offset = if scratch_boundary_dist > window.len() {
         0
     } else {
         scratch_boundary_dist
@@ -871,7 +871,7 @@ fn append_decoded_instructions(
     scratch[scratch_offset..scratch_end].copy_from_slice(window);
 
     let scratch_window = &scratch[scratch_offset..scratch_end];
-    assert!(bytes_until_next_4g_boundary(scratch_window.as_ptr()) >= scratch_window.len());
+    assert!(bytes_until_next_4g_boundary(scratch_window.as_ptr()) > scratch_window.len());
     append_decoded_non_crossing_window(
         bitness,
         scratch_window,
