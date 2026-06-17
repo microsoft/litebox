@@ -1365,7 +1365,6 @@ fn handle_control_connection_inner(
                     | Opcode::GetTimerfd
                     | Opcode::CreatePidfd
                     | Opcode::PidfdExited
-                    | Opcode::DebugQueryStateObject
                     | Opcode::CreateSignalfd
                     | Opcode::ReadSiginfo
                     | Opcode::PushSiginfo
@@ -1444,6 +1443,23 @@ fn handle_control_connection_inner(
                     | Opcode::RegisterOfd
                     | Opcode::CloneOfd => {
                         // State-object opcodes: route to state_service on the fd-state registry.
+                        let state_result = state_handle_request(
+                            state_registry,
+                            inotify_dispatcher,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
+                        SocketHandlerResult {
+                            frame: state_result.frame,
+                            out_fd: state_result.out_fd,
+                        }
+                    }
+                    // Debug-only diagnostic opcode (the variant does not exist in
+                    // release builds); route it to the state registry like the
+                    // other state-object opcodes above.
+                    #[cfg(debug_assertions)]
+                    Opcode::DebugQueryStateObject => {
                         let state_result = state_handle_request(
                             state_registry,
                             inotify_dispatcher,
@@ -1691,8 +1707,13 @@ fn handle_control_connection_inner(
                     | Opcode::ShutdownTcpConnResponse
                     | Opcode::PollTcpConnEventsResponse
                     | Opcode::InetTcpConnSetSockOptResponse
-                    | Opcode::InetTcpConnGetSockOptResponse
-                    | Opcode::DebugQueryStateObjectResponse => {
+                    | Opcode::InetTcpConnGetSockOptResponse => {
+                        warn!(opcode = ?frame.opcode, "fd-token control: response opcode received as request; closing");
+                        return;
+                    }
+                    // Debug-only response variant (absent in release builds).
+                    #[cfg(debug_assertions)]
+                    Opcode::DebugQueryStateObjectResponse => {
                         warn!(opcode = ?frame.opcode, "fd-token control: response opcode received as request; closing");
                         return;
                     }
