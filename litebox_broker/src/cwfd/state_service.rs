@@ -266,7 +266,6 @@ fn dispatch_request(
     in_fds: Vec<OwnedFd>,
 ) -> HandlerResult {
     // reason: unsupported variants intentionally share this fallback path.
-    #[allow(clippy::wildcard_enum_match_arm)]
     match request.opcode {
         Opcode::RegisterNotificationRing => {
             handle_register_notification_ring(conn, request, in_fds)
@@ -411,9 +410,133 @@ fn dispatch_request(
             handle_subscribe_process_exit(registry, conn, request, in_fds)
         }
         Opcode::MarkProcessExited => handle_mark_process_exited(registry, request, in_fds),
-        other => HandlerResult {
+        // DebugQueryStateObjectResponse only exists in debug builds; reject it
+        // there. (The request variant is handled above in debug and does not
+        // exist in release, so it needs no arm here.)
+        #[cfg(debug_assertions)]
+        Opcode::DebugQueryStateObjectResponse => HandlerResult {
+            frame: build_error_response(Opcode::ReleaseResponse, StatusCode::Protocol),
+            out_fd: None,
+        },
+        // Opcodes the fd-state registry does not service: host-fd ops,
+        // process-group/session control, signal-inbox, and ReleaseAllForPid
+        // are dispatched at the socket layer, and every *Response opcode is
+        // never a valid inbound request. Reject all with a Protocol error.
+        // Listed explicitly (no wildcard) so a newly-added state request
+        // opcode trips E0004 here instead of silently erroring at runtime.
+        op @ (Opcode::Register
+        | Opcode::Materialize
+        | Opcode::ReleaseAllForPid
+        | Opcode::SubscribeSignalInbox
+        | Opcode::UnsubscribeSignalInbox
+        | Opcode::DeliverSignalInbox
+        | Opcode::SetPgid
+        | Opcode::SetSid
+        | Opcode::RegisterResponse
+        | Opcode::MaterializeResponse
+        | Opcode::ReleaseResponse
+        | Opcode::RegisterNotificationRingResponse
+        | Opcode::CreateEventfdResponse
+        | Opcode::ReadEventfdResponse
+        | Opcode::WriteEventfdResponse
+        | Opcode::SubscribeEventfdResponse
+        | Opcode::CreateTimerfdResponse
+        | Opcode::ReadTimerfdResponse
+        | Opcode::SetTimerfdResponse
+        | Opcode::GetTimerfdResponse
+        | Opcode::CreateSignalfdResponse
+        | Opcode::ReadSiginfoResponse
+        | Opcode::PushSiginfoResponse
+        | Opcode::InotifyInit1Response
+        | Opcode::InotifyAddWatchResponse
+        | Opcode::InotifyRmWatchResponse
+        | Opcode::InotifyReadResponse
+        | Opcode::InotifyQueryEventsResponse
+        | Opcode::InetListenerCreateResponse
+        | Opcode::InetListenerBindResponse
+        | Opcode::InetListenerListenResponse
+        | Opcode::InetListenerAcceptResponse
+        | Opcode::InetListenerQueryEventsResponse
+        | Opcode::InetListenerSetSockOptResponse
+        | Opcode::InetListenerGetSockNameResponse
+        | Opcode::InetListenerGetSockOptResponse
+        | Opcode::CreatePipeResponse
+        | Opcode::ReadPipeResponse
+        | Opcode::WritePipeResponse
+        | Opcode::AttachHostFdResponse
+        | Opcode::RegisterOfdResponse
+        | Opcode::CloneOfdResponse
+        | Opcode::BindNinePSessionResponse
+        | Opcode::CreateSocketDgramResponse
+        | Opcode::SocketDgramBindResponse
+        | Opcode::SocketDgramConnectResponse
+        | Opcode::SocketDgramSendToResponse
+        | Opcode::SocketDgramRecvFromResponse
+        | Opcode::SocketDgramShutdownResponse
+        | Opcode::SocketDgramGetSockNameResponse
+        | Opcode::SocketDgramGetPeerNameResponse
+        | Opcode::CreateSocketPairResponse
+        | Opcode::ReadSocketPairResponse
+        | Opcode::WriteSocketPairResponse
+        | Opcode::ShutdownSocketPairWriteResponse
+        | Opcode::InetRawCreateResponse
+        | Opcode::InetRawSendToResponse
+        | Opcode::InetRawRecvFromResponse
+        | Opcode::InetRawQueryEventsResponse
+        | Opcode::InetTcpConnCreateResponse
+        | Opcode::InetTcpConnConnectResponse
+        | Opcode::InetTcpConnQueryEventsResponse
+        | Opcode::InetTcpConnGetSockNameResponse
+        | Opcode::InetTcpConnGetPeerNameResponse
+        | Opcode::CreatePtyResponse
+        | Opcode::OpenPtySlaveResponse
+        | Opcode::CreateSocketSeqPacketResponse
+        | Opcode::SocketSeqPacketBindResponse
+        | Opcode::SocketSeqPacketListenResponse
+        | Opcode::SocketSeqPacketAcceptResponse
+        | Opcode::SocketSeqPacketConnectResponse
+        | Opcode::SocketSeqPacketSendResponse
+        | Opcode::SocketSeqPacketRecvResponse
+        | Opcode::SocketSeqPacketShutdownResponse
+        | Opcode::SocketSeqPacketGetSockNameResponse
+        | Opcode::SocketSeqPacketGetPeerNameResponse
+        | Opcode::PtyReadResponse
+        | Opcode::PtyWriteResponse
+        | Opcode::SubscribePtyResponse
+        | Opcode::PtyIoctlResponse
+        | Opcode::UnsubscribeResponse
+        | Opcode::DupHandleResponse
+        | Opcode::QueryEventsResponse
+        | Opcode::CreatePidfdResponse
+        | Opcode::PidfdExitedResponse
+        | Opcode::InetDgramCreateResponse
+        | Opcode::InetDgramBindResponse
+        | Opcode::InetDgramConnectResponse
+        | Opcode::InetDgramSendToResponse
+        | Opcode::InetDgramRecvFromResponse
+        | Opcode::InetDgramShutdownResponse
+        | Opcode::InetDgramGetSockNameResponse
+        | Opcode::InetDgramGetPeerNameResponse
+        | Opcode::InetDgramSetSockOptResponse
+        | Opcode::InetDgramGetSockOptResponse
+        | Opcode::InetDgramQueryEventsResponse
+        | Opcode::RegisterProcessResponse
+        | Opcode::SubscribeProcessExitResponse
+        | Opcode::MarkProcessExitedResponse
+        | Opcode::ReleaseAllForPidResponse
+        | Opcode::SubscribeSignalInboxResponse
+        | Opcode::UnsubscribeSignalInboxResponse
+        | Opcode::DeliverSignalInboxResponse
+        | Opcode::SetPgidResponse
+        | Opcode::SetSidResponse
+        | Opcode::ReadTcpConnResponse
+        | Opcode::WriteTcpConnResponse
+        | Opcode::ShutdownTcpConnResponse
+        | Opcode::PollTcpConnEventsResponse
+        | Opcode::InetTcpConnSetSockOptResponse
+        | Opcode::InetTcpConnGetSockOptResponse) => HandlerResult {
             frame: build_error_response(
-                other.response_for().unwrap_or(Opcode::ReleaseResponse),
+                op.response_for().unwrap_or(Opcode::ReleaseResponse),
                 StatusCode::Protocol,
             ),
             out_fd: None,
