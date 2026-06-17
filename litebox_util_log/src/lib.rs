@@ -93,6 +93,8 @@ pub enum Level {
 
 #[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
 pub use backend_log::SpanGuard;
+#[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
+pub use backend_log::format_record;
 
 #[cfg(feature = "backend_tracing")]
 pub use backend_tracing::SpanGuard;
