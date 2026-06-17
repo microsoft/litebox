@@ -50,15 +50,11 @@ const WINDOWS_OS_MAJOR_VERSION: u16 = 10;
 const WINDOWS_OS_MINOR_VERSION: u16 = 0;
 const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
 const WINDOWS_OS_PLATFORM_WIN32_NT: u32 = 2;
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "windows"))]
 const WINDOWS_USER_SHARED_DATA_BASE: usize = 0x7FFE_0000;
-#[cfg(target_os = "linux")]
-const WINDOWS_USER_SHARED_DATA_SIZE: usize = PAGE_SIZE;
-#[cfg(target_os = "linux")]
-const WINDOWS_KUSER_SHARED_DATA_SIZE: usize = 0x738;
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "windows"))]
 const WINDOWS_KUSER_SHARED_DATA_XSTATE_CONFIGURATION_SIZE: usize = 0x348;
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "windows"))]
 const WINDOWS_NT_PRODUCT_WORKSTATION: u32 = 1;
 const WINDOWS_TIME_ZONE_ID_INVALID: u32 = u32::MAX;
 const WINDOWS_CRITICAL_SECTION_TIMEOUT_100NS: i64 = -150 * 10_000_000;
@@ -78,7 +74,8 @@ macro_rules! write_static_server_data_field {
     };
 }
 
-#[cfg(target_os = "linux")]
+/// Layout from Wine `include/ddk/wdm.h` and ReactOS `sdk/include/wine/ddk/wdm.h`.
+#[cfg(not(target_os = "windows"))]
 #[repr(C)]
 #[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
 struct KUserSharedData {
@@ -165,35 +162,6 @@ struct KUserSharedData {
     user_pointer_auth_mask: u64,
 }
 
-#[cfg(target_os = "linux")]
-#[repr(C)]
-#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
-struct KUserSharedDataPage {
-    shared_data: KUserSharedData,
-    page_tail: [u8; WINDOWS_USER_SHARED_DATA_SIZE - WINDOWS_KUSER_SHARED_DATA_SIZE],
-}
-
-// Layout anchors are from Wine `include/ddk/wdm.h` and ReactOS
-// `sdk/include/wine/ddk/wdm.h`, which both publish KUSER_SHARED_DATA offsets.
-#[cfg(target_os = "linux")]
-const _: () = {
-    assert!(size_of::<KSystemTime>() == 0x0c);
-    assert!(size_of::<KUserSharedData>() == WINDOWS_KUSER_SHARED_DATA_SIZE);
-    assert!(size_of::<KUserSharedDataPage>() == WINDOWS_USER_SHARED_DATA_SIZE);
-    assert!(core::mem::offset_of!(KUserSharedData, nt_system_root) == 0x030);
-    assert!(core::mem::offset_of!(KUserSharedData, nt_build_number) == 0x260);
-    assert!(core::mem::offset_of!(KUserSharedData, nt_product_type) == 0x264);
-    assert!(core::mem::offset_of!(KUserSharedData, product_type_is_valid) == 0x268);
-    assert!(core::mem::offset_of!(KUserSharedData, native_processor_architecture) == 0x26a);
-    assert!(core::mem::offset_of!(KUserSharedData, nt_major_version) == 0x26c);
-    assert!(core::mem::offset_of!(KUserSharedData, nt_minor_version) == 0x270);
-    assert!(core::mem::offset_of!(KUserSharedData, time_zone_bias_effective_start) == 0x3c8);
-    assert!(core::mem::offset_of!(KUserSharedData, time_zone_bias_effective_end) == 0x3d0);
-    assert!(core::mem::offset_of!(KUserSharedData, x_state) == 0x3d8);
-    assert!(core::mem::offset_of!(KUserSharedData, feature_configuration_change_stamp) == 0x720);
-    assert!(core::mem::offset_of!(KUserSharedData, user_pointer_auth_mask) == 0x730);
-};
-
 pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
     pub(crate) teb: usize,
@@ -243,6 +211,9 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         argv: &[CString],
         envp: &[CString],
     ) -> Result<PeLoadInfo<Platform>, WindowsLoadError> {
+        #[cfg(not(target_os = "windows"))]
+        map_windows_user_shared_data::<Platform>(self.page_manager)?;
+
         let image = load_image(self.platform, self.fs.clone(), path, self.page_manager)?;
         let application_entry_point = image.mapping.entry_point;
         let ntdll = load_ntdll(self.platform, self.fs.clone(), self.page_manager)?;
@@ -371,8 +342,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             }?;
             Ok(ptr.as_usize())
         };
-        #[cfg(target_os = "linux")]
-        map_windows_user_shared_data::<Platform>(self.page_manager)?;
         let teb_ptr = create_pages(size_of::<ThreadEnvironmentBlock>())?;
         let peb_ptr = create_pages(size_of::<ProcessEnvironmentBlock>())?;
         let api_set_map = build_api_set_namespace(API_SET_MAPPINGS)
@@ -1158,22 +1127,22 @@ where
     crate::write_slice::<Platform, T>(address, values).ok_or(PeImageAccessError::MemoryAccess)
 }
 
-#[cfg(target_os = "linux")]
+/// Wine and ReactOS model KUSER_SHARED_DATA as a fixed user page at
+/// 0x7FFE0000. Native Windows hosts already provide that page; Non-Windows hosts
+/// need LiteBox to create it before guest ntdll reads it during startup.
+#[cfg(not(target_os = "windows"))]
 fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<(), PeImageAccessError> {
     let address = NonZeroAddress::new(WINDOWS_USER_SHARED_DATA_BASE)
         .ok_or(PeImageAccessError::AddressOverflow)?;
-    let length = NonZeroPageSize::new(WINDOWS_USER_SHARED_DATA_SIZE)
+    let length = NonZeroPageSize::new(size_of::<KUserSharedData>().next_multiple_of(PAGE_SIZE))
         .ok_or(PeImageAccessError::AddressOverflow)?;
-    let shared_data = windows_user_shared_data_page();
+    let shared_data = windows_user_shared_data();
     let shared_data_bytes = shared_data.as_bytes();
-    // Wine and ReactOS model KUSER_SHARED_DATA as a fixed user page at
-    // 0x7FFE0000. Native Windows hosts already provide that page; Linux hosts
-    // need LiteBox to create it before guest ntdll reads it during startup.
     // SAFETY: `NOREPLACE` makes the fixed mapping fail instead of replacing any
     // existing host or guest mapping at the shared-data address.
-    let result = unsafe {
+    unsafe {
         page_manager.create_readable_pages(
             Some(address),
             length,
@@ -1184,89 +1153,24 @@ fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
                 Ok(0)
             },
         )
-    };
-    match result {
-        Ok(_) => Ok(()),
-        Err(MappingError::MapError(
-            litebox::platform::page_mgmt::AllocationError::AddressInUse,
-        )) if windows_user_shared_data_mapping_matches::<Platform>(
-            page_manager,
-            address,
-            length,
-            shared_data_bytes,
-        ) =>
-        {
-            Ok(())
-        }
-        Err(err) => Err(err.into()),
     }
+    .map_err(PeImageAccessError::from)
+    .map(|_| ())
 }
 
-#[cfg(target_os = "linux")]
-fn windows_user_shared_data_mapping_matches<Platform: crate::ShimPlatform>(
-    page_manager: &crate::WindowsPageManager<Platform>,
-    address: NonZeroAddress<PAGE_SIZE>,
-    length: NonZeroPageSize<PAGE_SIZE>,
-    expected: &[u8],
-) -> bool {
-    if page_manager.get_memory_permissions(address, length)
-        != Some(litebox::platform::page_mgmt::MemoryRegionPermissions::READ)
-    {
-        return false;
-    }
-    let ptr =
-        <Platform as RawPointerProvider>::RawConstPointer::<u8>::from_usize(address.as_usize());
-    ptr.to_owned_slice(expected.len())
-        .is_some_and(|actual| actual.as_ref() == expected)
-}
-
-#[cfg(target_os = "linux")]
-fn windows_user_shared_data_page() -> KUserSharedDataPage {
-    let mut page = KUserSharedDataPage::new_zeroed();
-    page.shared_data.nt_build_number = u32::from(WINDOWS_OS_BUILD_NUMBER);
-    page.shared_data.nt_product_type = WINDOWS_NT_PRODUCT_WORKSTATION;
-    page.shared_data.product_type_is_valid = 1;
-    page.shared_data.nt_major_version = u32::from(WINDOWS_OS_MAJOR_VERSION);
-    page.shared_data.nt_minor_version = u32::from(WINDOWS_OS_MINOR_VERSION);
+#[cfg(not(target_os = "windows"))]
+fn windows_user_shared_data() -> KUserSharedData {
+    let mut shared_data = KUserSharedData::new_zeroed();
+    shared_data.nt_build_number = u32::from(WINDOWS_OS_BUILD_NUMBER);
+    shared_data.nt_product_type = WINDOWS_NT_PRODUCT_WORKSTATION;
+    shared_data.product_type_is_valid = 1;
+    shared_data.nt_major_version = u32::from(WINDOWS_OS_MAJOR_VERSION);
+    shared_data.nt_minor_version = u32::from(WINDOWS_OS_MINOR_VERSION);
     for (index, code_unit) in WINDOWS_DIRECTORY.encode_utf16().enumerate() {
-        page.shared_data.nt_system_root[index] = code_unit;
+        shared_data.nt_system_root[index] = code_unit;
     }
 
-    page
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod linux_tests {
-    use super::*;
-
-    #[test]
-    fn windows_user_shared_data_page_contains_loader_version_fields() {
-        let page = windows_user_shared_data_page();
-
-        assert_eq!(
-            page.shared_data.nt_build_number,
-            u32::from(WINDOWS_OS_BUILD_NUMBER)
-        );
-        assert_eq!(
-            page.shared_data.nt_product_type,
-            WINDOWS_NT_PRODUCT_WORKSTATION
-        );
-        assert_eq!(page.shared_data.product_type_is_valid, 1);
-        assert_eq!(
-            page.shared_data.nt_major_version,
-            u32::from(WINDOWS_OS_MAJOR_VERSION)
-        );
-        assert_eq!(
-            page.shared_data.nt_minor_version,
-            u32::from(WINDOWS_OS_MINOR_VERSION)
-        );
-
-        let root_units = WINDOWS_DIRECTORY.encode_utf16().count();
-        for (index, expected) in WINDOWS_DIRECTORY.encode_utf16().enumerate() {
-            assert_eq!(page.shared_data.nt_system_root[index], expected);
-        }
-        assert_eq!(page.shared_data.nt_system_root[root_units], 0);
-    }
+    shared_data
 }
 
 struct LoadedNtDll {
