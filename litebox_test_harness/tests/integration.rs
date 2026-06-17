@@ -4170,6 +4170,12 @@ mod copilot {
 //   vscode::connect_cross_ssh  — second independent SSH session
 //                                does the same connect (Remote-SSH
 //                                SOCKS-proxy pattern).
+//   vscode::extension_host_steady
+//                             — start production `code-server
+//                                --start-server --socket-path`, open
+//                                a Remote-SSH-shaped WebSocket to the
+//                                Unix socket, and assert it stays
+//                                alive for 60 s.
 //
 // Image flexibility: `LITEBOX_VSCODE_IMAGE_STAGE` env var picks
 // `litebox-vscode` (default — runtime-rewritten) or
@@ -4402,6 +4408,8 @@ mod vscode {
         "server_listen",
         "connect_loopback",
         "connect_cross_ssh",
+        "extension_host_steady",
+        "extension_host_spawn",
     ];
 
     /// Register every `vscode::<scenario>` Trial pair. Called
@@ -4430,6 +4438,8 @@ mod vscode {
             "server_listen" => run_server_listen(pass),
             "connect_loopback" => run_connect_loopback(pass),
             "connect_cross_ssh" => run_connect_cross_ssh(pass),
+            "extension_host_steady" => run_extension_host_steady(pass),
+            "extension_host_spawn" => run_extension_host_spawn(pass),
             other => Err(Failed::from(format!("unknown vscode scenario: {other}"))),
         }
     }
@@ -4946,6 +4956,471 @@ mod vscode {
         )
     }
 
+    fn run_extension_host_steady(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "extension_host_steady").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        let template =
+            include_str!("../../litebox_tool_executor/scripts/vscode/vscode-bootstrap-captured.sh");
+        let script_path = fixture_dir.join("bootstrap-extension-host-steady.sh");
+
+        let test_id = "vscode::extension_host_steady".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "extension_host_steady",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let token = format!("litebox-vscode-extension-host-steady-{pass}");
+                let patched = template
+                    .replace(
+                        "COMMIT_ID=\"41dd792b5e652393e7787322889ed5fdc58bd75b\"",
+                        &format!("COMMIT_ID=\"{commit}\""),
+                    )
+                    .replace(
+                        "TOKEN=\"83883a34-4381-4753-91e1-1567ebecf203\"",
+                        &format!("TOKEN=\"{token}\""),
+                    )
+                    .replace(
+                        "\nstart_server\n",
+                        "\n# extension_host_steady only needs bootstrap install/token setup.\nSERVER_START_TIME=0\n",
+                    )
+                    .replace("while true; do sleep 180; printf ' '; done", "exit 0");
+                if patched == template {
+                    return drive_fail(
+                        "bootstrap script patch produced no changes — the captured script \
+                         no longer contains the expected commit-id/token/keepalive lines"
+                            .to_string(),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+                if let Err(e) = std::fs::write(&script_path, patched.as_bytes()) {
+                    return drive_fail(
+                        format!("write patched script {}: {e}", script_path.display()),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-extension_host_steady");
+
+                let bootstrap_out = match run_remote_command_retry(
+                    port,
+                    "sh -s < /workspace/bootstrap-extension-host-steady.sh",
+                    120,
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("bootstrap via `ssh sh -s`: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.bootstrap.raw.log")),
+                    &bootstrap_out,
+                );
+                let stripped_bootstrap = copilot::strip_ansi(&bootstrap_out);
+                if !stripped_bootstrap.contains("execServerToken==")
+                    || !stripped_bootstrap.contains(": end")
+                {
+                    let preview: String = stripped_bootstrap.chars().take(1500).collect();
+                    return drive_fail(
+                        format!(
+                            "bootstrap did not complete/tokenize cleanly. bootstrap log: {}\n\
+                             first 1500 chars (ANSI-stripped):\n{preview}",
+                            log_dir.join(format!("{safe}.bootstrap.raw.log")).display(),
+                        ),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+
+                let cli_path = format!(
+                    "/root/.vscode-server/cli/servers/Stable-{commit}/server/bin/code-server"
+                );
+                let node_path =
+                    format!("/root/.vscode-server/cli/servers/Stable-{commit}/server/node");
+                let server_main = format!(
+                    "/root/.vscode-server/cli/servers/Stable-{commit}/server/out/server-main.js"
+                );
+                let socket_path = format!("/tmp/code-litebox-eh-steady-{pass}.sock");
+                let server_log = format!("/tmp/vscode-extension-host-steady-{pass}.log");
+
+                let server_cmd = build_extension_host_server_cmd(
+                    &cli_path,
+                    &node_path,
+                    &server_main,
+                    &token,
+                    &socket_path,
+                    &server_log,
+                );
+                let server_pty = match Pty::open() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("open server-session pty: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let mut server_argv = copilot::ssh_argv_base(port);
+                server_argv.push(server_cmd);
+                let server_pid =
+                    match server_pty.fork_exec(&server_argv, /* ctrl_tty = */ true) {
+                        Ok(pid) => pid,
+                        Err(e) => {
+                            return drive_fail(
+                                format!("fork_exec server SSH session: {e}"),
+                                t_docker_start_ms,
+                                t_useful_start.elapsed().as_millis(),
+                            );
+                        }
+                    };
+                let _server_guard = HeldSshSessionGuard {
+                    pty: &server_pty,
+                    pid: server_pid,
+                };
+                let server_start_out = match read_pty_until_contains(
+                    &server_pty,
+                    "VSEH_READY",
+                    Duration::from_secs(45),
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("server session did not reach VSEH_READY: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.server-session-start.log")),
+                    &server_start_out,
+                );
+
+                let client_cmd =
+                    build_extension_host_client_cmd(&node_path, &socket_path, &token, 60, 10);
+                let client_out = match run_remote_command_retry(port, &client_cmd, 75) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("extension-host WebSocket client SSH session: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(log_dir.join(format!("{safe}.client.log")), &client_out);
+                let stripped_client = copilot::strip_ansi(&client_out);
+
+                let management_out = match read_pty_until_contains(
+                    &server_pty,
+                    "VSEH_MANAGEMENT_READY",
+                    Duration::from_secs(15),
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("server session did not print VSEH_MANAGEMENT_READY: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.management.log")),
+                    &management_out,
+                );
+                let stripped_management = copilot::strip_ansi(&management_out);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+                let hold_ok = stripped_client
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("VSEH_HOLD_OK "));
+                let management_ok = stripped_management
+                    .lines()
+                    .any(|l| l.trim() == "VSEH_MANAGEMENT_READY");
+
+                if hold_ok && management_ok {
+                    return super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+
+                let client_preview: String = stripped_client.chars().take(2000).collect();
+                let management_preview: String = stripped_management.chars().take(2000).collect();
+                drive_fail(
+                    format!(
+                        "extension_host_steady failed: hold_ok={hold_ok} \
+                         management_ok={management_ok} (commit={commit}, socket={socket_path}). \
+                         client log: {} management log: {}\n\
+                         client first 2000 chars:\n{client_preview}\n\
+                         management first 2000 chars:\n{management_preview}",
+                        log_dir.join(format!("{safe}.client.log")).display(),
+                        log_dir.join(format!("{safe}.management.log")).display(),
+                    ),
+                    t_docker_start_ms,
+                    t_useful_ms,
+                )
+            },
+        )
+    }
+
+    /// `vscode::extension_host_spawn` — drives the **real bundled VS Code
+    /// Server node** through a `child_process` spawn-storm with a warmed,
+    /// futex-parked libuv threadpool. This is the integration-layer
+    /// companion to the self-contained `MTF.futex_cond.posix_spawn.dng`
+    /// trial: it exercises the exact capability behind the VS Code
+    /// Remote-SSH "Extension Host disconnect / reconnect loop" — node
+    /// (`NonPieGlibc`) doing `posix_spawn` (`clone(CLONE_VM|CLONE_VFORK)`)
+    /// while its libuv threadpool siblings are parked in `futex`.
+    ///
+    /// Unlike `extension_host_steady` (which only *idles* a held
+    /// management connection and therefore never forks anything), this
+    /// scenario makes the production node binary fork repeatedly. Before
+    /// the vfork-quiesce fix (`fix: shim — re-arm vfork quiesce
+    /// interrupts`) this wedged on litebox — the forking thread spun in
+    /// `clone()` forever because a futex-parked sibling never reached its
+    /// park checkpoint — so the spawn-storm never completed and the trial
+    /// timed out. After the fix it completes and prints `SPAWN_OK`.
+    ///
+    /// It only needs the bundled node (installed by the captured
+    /// bootstrap), not a running `code-server`; this keeps the signal
+    /// crisp and avoids coupling to VS Code's management protocol. The
+    /// deeper, protocol-driven variant (request a terminal so the real
+    /// `code-server` forks its ptyHost) is tracked as follow-up — it is
+    /// the most faithful reproduction but brittle against upstream
+    /// protocol changes.
+    fn run_extension_host_spawn(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "extension_host_spawn").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        let template =
+            include_str!("../../litebox_tool_executor/scripts/vscode/vscode-bootstrap-captured.sh");
+        let script_path = fixture_dir.join("bootstrap-extension-host-spawn.sh");
+
+        let test_id = "vscode::extension_host_spawn".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        // Spawn-storm parameters. `N_SPAWNS` is large enough that a
+        // pre-fix wedge (which strikes within the first handful of forks
+        // once the threadpool is parked) is reliably hit, and small
+        // enough that a post-fix run completes inside the timeout even at
+        // debug-build fork-restore latency under host load.
+        const N_SPAWNS: u32 = 60;
+        const THREADPOOL_SIZE: u32 = 96;
+        const SPAWN_TIMEOUT_SECS: u64 = 180;
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "extension_host_spawn",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let token = format!("litebox-vscode-extension-host-spawn-{pass}");
+                let patched = template
+                    .replace(
+                        "COMMIT_ID=\"41dd792b5e652393e7787322889ed5fdc58bd75b\"",
+                        &format!("COMMIT_ID=\"{commit}\""),
+                    )
+                    .replace(
+                        "TOKEN=\"83883a34-4381-4753-91e1-1567ebecf203\"",
+                        &format!("TOKEN=\"{token}\""),
+                    )
+                    .replace(
+                        "\nstart_server\n",
+                        "\n# extension_host_spawn only needs the bundled node from install.\nSERVER_START_TIME=0\n",
+                    )
+                    .replace("while true; do sleep 180; printf ' '; done", "exit 0");
+                if patched == template {
+                    return drive_fail(
+                        "bootstrap script patch produced no changes — the captured script \
+                         no longer contains the expected commit-id/token/keepalive lines"
+                            .to_string(),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+                if let Err(e) = std::fs::write(&script_path, patched.as_bytes()) {
+                    return drive_fail(
+                        format!("write patched script {}: {e}", script_path.display()),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-extension_host_spawn");
+
+                let bootstrap_out = match run_remote_command_retry(
+                    port,
+                    "sh -s < /workspace/bootstrap-extension-host-spawn.sh",
+                    120,
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("bootstrap via `ssh sh -s`: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.bootstrap.raw.log")),
+                    &bootstrap_out,
+                );
+                let stripped_bootstrap = copilot::strip_ansi(&bootstrap_out);
+                if !stripped_bootstrap.contains("execServerToken==")
+                    || !stripped_bootstrap.contains(": end")
+                {
+                    let preview: String = stripped_bootstrap.chars().take(1500).collect();
+                    return drive_fail(
+                        format!(
+                            "bootstrap did not complete/tokenize cleanly. bootstrap log: {}\n\
+                             first 1500 chars (ANSI-stripped):\n{preview}",
+                            log_dir.join(format!("{safe}.bootstrap.raw.log")).display(),
+                        ),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+
+                let node_path =
+                    format!("/root/.vscode-server/cli/servers/Stable-{commit}/server/node");
+
+                // Drive the bundled node through the spawn-storm. A
+                // pre-fix litebox wedge never returns, so the SSH read
+                // hits SPAWN_TIMEOUT_SECS and we report a (correct) FAIL.
+                let spawn_cmd = build_node_spawn_storm_cmd(&node_path, N_SPAWNS, THREADPOOL_SIZE);
+                let spawn_out = match run_remote_command_retry(port, &spawn_cmd, SPAWN_TIMEOUT_SECS)
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!(
+                                "node spawn-storm did not complete within {SPAWN_TIMEOUT_SECS}s \
+                                 (vfork-quiesce deadlock symptom): {e}"
+                            ),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(log_dir.join(format!("{safe}.spawn.log")), &spawn_out);
+                let stripped = copilot::strip_ansi(&spawn_out);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+                let expected = format!("SPAWN_OK {N_SPAWNS}");
+                if stripped
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&expected))
+                {
+                    return super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+
+                let preview: String = stripped.chars().take(2000).collect();
+                drive_fail(
+                    format!(
+                        "node spawn-storm completed but did not print `{expected}` \
+                         (commit={commit}, node={node_path}). spawn log: {}\n\
+                         first 2000 chars:\n{preview}",
+                        log_dir.join(format!("{safe}.spawn.log")).display(),
+                    ),
+                    t_docker_start_ms,
+                    t_useful_ms,
+                )
+            },
+        )
+    }
+
     // ───────────────────────────────────────────────────────────────
     // Shared helpers (kept ready for scenario bodies)
     // ───────────────────────────────────────────────────────────────
@@ -5298,6 +5773,343 @@ mod vscode {
                 echo VSL_CONN_FAIL exit=$?; \
                 exit 1; \
              fi"
+        )
+    }
+
+    fn read_pty_until_contains(
+        pty: &Pty,
+        needle: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let start = Instant::now();
+        let mut out = String::new();
+        while start.elapsed() < timeout {
+            match pty.try_read_now(4096) {
+                Ok(Some(chunk)) if chunk.is_empty() => {
+                    return Err(format!("EOF before seeing {needle:?}; output:\n{out}"));
+                }
+                Ok(Some(chunk)) => {
+                    out.push_str(&String::from_utf8_lossy(&chunk));
+                    if out.contains(needle) {
+                        return Ok(out);
+                    }
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(format!(
+            "timeout after {timeout:?} before seeing {needle:?}; output:\n{out}"
+        ))
+    }
+
+    struct HeldSshSessionGuard<'a> {
+        pty: &'a Pty,
+        pid: libc::pid_t,
+    }
+
+    impl Drop for HeldSshSessionGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.pty.write_all(b"\x03");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let mut status: libc::c_int = 0;
+                // SAFETY: `pid` is the child returned by `fork_exec`; `status`
+                // points at valid writable memory for this waitpid call.
+                let r = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+                if r == self.pid
+                    || (r < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// Production Remote-SSH server invocation: unlike
+    /// `server_listen`, this starts the installed `code-server`
+    /// with `--start-server --socket-path` and keeps the SSH session
+    /// open while the process lives.
+    fn build_extension_host_server_cmd(
+        cli_path: &str,
+        node_path: &str,
+        server_main: &str,
+        token: &str,
+        socket_path: &str,
+        log_path: &str,
+    ) -> String {
+        let cli_q = copilot::shell_quote(cli_path);
+        let node_q = copilot::shell_quote(node_path);
+        let server_main_q = copilot::shell_quote(server_main);
+        let token_q = copilot::shell_quote(token);
+        let socket_q = copilot::shell_quote(socket_path);
+        let log_q = copilot::shell_quote(log_path);
+        format!(
+            "set -e; \
+             CLI={cli_q}; NODE_BIN={node_q}; SERVER_MAIN={server_main_q}; \
+             TOKEN={token_q}; SOCK={socket_q}; LOG={log_q}; \
+             rm -f \"$SOCK\" \"$LOG\"; \
+             if [ ! -x \"$CLI\" ]; then echo VSEH_NO_CODE_SERVER=$CLI; exit 1; fi; \
+             if [ ! -x \"$NODE_BIN\" ]; then echo VSEH_NO_NODE=$NODE_BIN; exit 1; fi; \
+             if [ ! -f \"$SERVER_MAIN\" ]; then echo VSEH_NO_SERVER_MAIN=$SERVER_MAIN; exit 1; fi; \
+             export VSCODE_AGENT_FOLDER=/root/.vscode-server; \
+             \"$NODE_BIN\" \"$SERVER_MAIN\" \
+               --connection-token=\"$TOKEN\" \
+               --accept-server-license-terms \
+               --start-server \
+               --enable-remote-auto-shutdown \
+               --socket-path=\"$SOCK\" \
+               > \"$LOG\" 2>&1 & \
+             CLI_PID=$!; \
+             echo VSEH_CLI_PID=$CLI_PID; \
+             READY=; \
+             for _ in $(seq 1 30); do \
+               LISTEN=$(grep -aF \"Extension host agent listening on $SOCK\" \"$LOG\" 2>/dev/null || true); \
+               STARTED=$(grep -aF 'Extension host agent started.' \"$LOG\" 2>/dev/null || true); \
+               if [ -n \"$LISTEN\" ] && [ -n \"$STARTED\" ]; then \
+                 echo VSEH_READY; READY=1; break; \
+               fi; \
+               if ! kill -0 $CLI_PID 2>/dev/null; then \
+                 echo VSEH_CLI_DIED_BEFORE_READY; cat \"$LOG\" 2>/dev/null || true; exit 1; \
+               fi; \
+               sleep 1; \
+             done; \
+             if [ -z \"$READY\" ]; then echo VSEH_NOT_READY; cat \"$LOG\" 2>/dev/null || true; exit 1; fi; \
+             (for _ in $(seq 1 120); do \
+                MGMT=$(grep -aF '[ManagementConnection] New connection established' \"$LOG\" 2>/dev/null || true); \
+                if [ -n \"$MGMT\" ]; then echo VSEH_MANAGEMENT_READY; exit 0; fi; \
+                sleep 1; \
+              done) & \
+             while kill -0 $CLI_PID 2>/dev/null; do sleep 1; done; \
+             STATUS=$?; \
+             echo VSEH_CLI_EXITED pid=$CLI_PID status=$STATUS; \
+             cat \"$LOG\" 2>/dev/null || true; \
+             exit 1"
+        )
+    }
+
+    /// Build the remote shell command that runs the bundled VS Code node
+    /// through a `child_process` spawn-storm with a warmed, futex-parked
+    /// libuv threadpool — the production-binary reproduction of the
+    /// Extension Host fork path the vfork-quiesce fix repairs.
+    ///
+    /// The node program: (1) sets `UV_THREADPOOL_SIZE` and kicks off that
+    /// many async `crypto.randomBytes` jobs so the libuv threadpool
+    /// threads are spawned and then **park in `futex`** once their work
+    /// drains; (2) once they have parked, runs `N` synchronous
+    /// `execFileSync('/bin/true')` calls — each a `posix_spawn`
+    /// (`clone(CLONE_VM|CLONE_VFORK)`) from the now-multithreaded process;
+    /// (3) prints `SPAWN_OK <N>` on completion. A pre-fix litebox wedge
+    /// never reaches step 3.
+    fn build_node_spawn_storm_cmd(node_path: &str, n_spawns: u32, threadpool_size: u32) -> String {
+        let node_q = copilot::shell_quote(node_path);
+        // Single-quoted node program; contains no single quotes itself.
+        let script = "const cp=require(\"child_process\"),crypto=require(\"crypto\");\
+const N=Number(process.argv[1]||0),pool=Number(process.env.UV_THREADPOOL_SIZE||4);\
+const t0=Date.now();let pending=pool;\
+function run(){for(let i=0;i<N;i++){cp.execFileSync(\"/bin/true\");}\
+console.log(\"SPAWN_OK\",N,\"in\",(Date.now()-t0)+\"ms\");}\
+for(let i=0;i<pool;i++){crypto.randomBytes(32,()=>{if(--pending===0)run();});}";
+        format!("UV_THREADPOOL_SIZE={threadpool_size} {node_q} -e '{script}' {n_spawns}")
+    }
+
+    fn build_extension_host_client_cmd(
+        node_path: &str,
+        socket_path: &str,
+        token: &str,
+        hold_secs: u32,
+        idle_timeout_secs: u32,
+    ) -> String {
+        let node_q = copilot::shell_quote(node_path);
+        let socket_q = copilot::shell_quote(socket_path);
+        let token_q = copilot::shell_quote(token);
+        let script = r#"const net = require('net');
+const crypto = require('crypto');
+
+const sockPath = process.argv[2];
+const token = process.argv[3];
+const holdMs = Number(process.argv[4]) * 1000;
+const idleMs = Number(process.argv[5]) * 1000;
+let total = 0;
+let done = false;
+let upgraded = false;
+let lastData = Date.now();
+let tail = Buffer.alloc(0);
+let frameBuf = Buffer.alloc(0);
+let headerBuf = Buffer.alloc(0);
+let protoBuf = Buffer.alloc(0);
+let sentConnectionType = false;
+
+function remember(buf) {
+  total += buf.length;
+  lastData = Date.now();
+  tail = Buffer.concat([tail, buf]);
+  if (tail.length > 96) tail = tail.subarray(tail.length - 96);
+}
+
+function finishFail(kind) {
+  if (done) return;
+  done = true;
+  console.log(`VSEH_DISCONNECT kind=${kind} bytes=${total} last_hex=${tail.toString('hex')}`);
+  process.exit(2);
+}
+
+function maskFrame(opcode, payload) {
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | len;
+  } else {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(len, 2);
+  }
+  const mask = crypto.randomBytes(4);
+  const masked = Buffer.alloc(len);
+  for (let i = 0; i < len; i++) masked[i] = payload[i] ^ mask[i % 4];
+  return Buffer.concat([header, mask, masked]);
+}
+
+function protocolFrame(type, id, ack, payload) {
+  const head = Buffer.alloc(13);
+  head.writeUInt8(type, 0);
+  head.writeUInt32BE(id, 1);
+  head.writeUInt32BE(ack, 5);
+  head.writeUInt32BE(payload.length, 9);
+  return Buffer.concat([head, payload]);
+}
+
+function sendProtocol(sock, type, id, ack, payload) {
+  sock.write(maskFrame(0x2, protocolFrame(type, id, ack, payload)));
+}
+
+function sendControl(sock, obj) {
+  sendProtocol(sock, 2, 0, 0, Buffer.from(JSON.stringify(obj)));
+}
+
+function acceptProtocolPayload(sock, payload) {
+  protoBuf = Buffer.concat([protoBuf, payload]);
+  while (protoBuf.length >= 13) {
+    const len = protoBuf.readUInt32BE(9);
+    if (protoBuf.length < 13 + len) return;
+    const type = protoBuf.readUInt8(0);
+    const body = protoBuf.subarray(13, 13 + len);
+    protoBuf = protoBuf.subarray(13 + len);
+    if (type === 2) {
+      const msg = JSON.parse(body.toString('utf8'));
+      console.log(`VSEH_CONTROL=${msg.type || 'unknown'}`);
+      if (msg.type === 'sign' && !sentConnectionType) {
+        sentConnectionType = true;
+        sendControl(sock, {
+          type: 'connectionType',
+          desiredConnectionType: 1,
+          signedData: token,
+          args: {}
+        });
+      }
+    } else if (type === 5) {
+      finishFail('PROTOCOL_DISCONNECT');
+    } else if (type === 9) {
+      sendProtocol(sock, 9, 0, 0, Buffer.alloc(0));
+    }
+  }
+}
+
+function drainFrames(sock) {
+  while (frameBuf.length >= 2) {
+    const b0 = frameBuf[0];
+    const b1 = frameBuf[1];
+    let len = b1 & 0x7f;
+    let off = 2;
+    if (len === 126) {
+      if (frameBuf.length < 4) return;
+      len = frameBuf.readUInt16BE(2);
+      off = 4;
+    } else if (len === 127) {
+      if (frameBuf.length < 10) return;
+      const high = frameBuf.readUInt32BE(2);
+      const low = frameBuf.readUInt32BE(6);
+      if (high !== 0) finishFail('FRAME_TOO_LARGE');
+      len = low;
+      off = 10;
+    }
+    if (frameBuf.length < off + len) return;
+    const opcode = b0 & 0x0f;
+    const payload = frameBuf.subarray(off, off + len);
+    frameBuf = frameBuf.subarray(off + len);
+    if (opcode === 0x8) finishFail('WS_CLOSE_FRAME');
+    if (opcode === 0x9) sock.write(maskFrame(0xA, payload));
+    if (opcode === 0x1 || opcode === 0x2) acceptProtocolPayload(sock, payload);
+  }
+}
+
+const sock = net.createConnection({ path: sockPath });
+sock.on('connect', () => {
+  console.log('VSEH_CLIENT_CONNECTED');
+  const req = [
+    'GET / HTTP/1.1',
+    'Host: localhost',
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+    'Sec-WebSocket-Version: 13',
+    `Authorization: Bearer ${token}`,
+    '',
+    ''
+  ].join('\r\n');
+  sock.write(req);
+});
+sock.on('data', (buf) => {
+  remember(buf);
+  if (!upgraded) {
+    headerBuf = Buffer.concat([headerBuf, buf]);
+    const s = headerBuf.toString('latin1');
+    if (s.includes('\r\n\r\n')) {
+      if (!s.includes('101')) finishFail('HTTP_UPGRADE_REJECTED');
+      upgraded = true;
+      console.log(`VSEH_UPGRADED bytes=${total}`);
+      sendControl(sock, { type: 'auth', auth: token, data: '' });
+      const bodyStart = s.indexOf('\r\n\r\n') + 4;
+      const bufferedBody = Buffer.from(s.slice(bodyStart), 'latin1');
+      headerBuf = Buffer.alloc(0);
+      if (bufferedBody.length > 0) {
+        frameBuf = Buffer.concat([frameBuf, bufferedBody]);
+        drainFrames(sock);
+      }
+    }
+    return;
+  }
+  frameBuf = Buffer.concat([frameBuf, buf]);
+  drainFrames(sock);
+});
+sock.on('end', () => finishFail('EOF'));
+sock.on('error', (err) => finishFail(`ERROR_${err.code || err.message}`));
+sock.on('close', (hadError) => {
+  if (!done) finishFail(`CLOSE_hadError_${hadError}`);
+});
+
+const tick = setInterval(() => {
+  console.log(`VSEH_BYTES=${total}`);
+  if (Date.now() - lastData > idleMs) finishFail('IDLE_TIMEOUT');
+}, 1000);
+
+setTimeout(() => {
+  done = true;
+  clearInterval(tick);
+  console.log(`VSEH_HOLD_OK bytes=${total}`);
+  sock.end();
+  process.exit(0);
+}, holdMs);
+"#;
+        format!(
+            "NODE_BIN={node_q}; SOCK={socket_q}; TOKEN={token_q}; HOLD_SECS={hold_secs}; \
+             IDLE_SECS={idle_timeout_secs}; \
+             \"$NODE_BIN\" - \"$SOCK\" \"$TOKEN\" \"$HOLD_SECS\" \"$IDLE_SECS\" <<'NODE'\n{script}\nNODE"
         )
     }
 }
