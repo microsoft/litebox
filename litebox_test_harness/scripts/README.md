@@ -542,10 +542,14 @@ it separately), and a real `fail` is never masked by a later
 merge-base baseline *and* a definitive `fail` on the branch.
 
 `confidence` is `high` / `medium` / `low` (or `n/a`): `high` needs the
-branch to fail repeatedly *and* the upstream to be well-observed-stable;
-`low` flags thin evidence — the explicit "not enough data to judge yet"
-signal. Almost everything is a live derivation: `test_flake_stats` (the
-upstream recent-flake tally) is itself a view, kept cheap by an index on
+branch to fail the **full retry budget** (`LITEBOX_FILL_FAIL_RETRIES`,
+default 3, all definitive fails) *and* the upstream to be
+well-observed-stable — so a 2-of-3 (which a timing/load-sensitive test
+can hit under the shadow's build load while upstream passes it) stays
+`medium`, not high. `low` flags thin evidence — the explicit "not enough
+data to judge yet" signal. Almost everything is a live derivation:
+`test_flake_stats` (the upstream recent-flake tally) is itself a view,
+kept cheap by an index on
 `runs(worktree_path)`. The *only* materialized table is `branch_baseline`
 — the git `merge-base(branch_HEAD, tracked_tip)` map, which SQLite has no
 way to compute — refreshed each cycle by the `dashboard.py auto`

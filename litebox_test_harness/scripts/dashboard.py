@@ -272,10 +272,19 @@ def _ensure_views(conn: sqlite3.Connection) -> None:
 # meta-keyed definition version) — no SCHEMA_VERSION bump, no producer
 # change, no data migration.
 
-_CLASSIFICATION_SCHEMA_VERSION = 4
+_CLASSIFICATION_SCHEMA_VERSION = 5
 
 # "Recently flaky" lookback for the soft-regression discount.
 _RECENT_FLAKE_WINDOW_MS = 7 * 24 * 3600 * 1000
+
+# A hard_regression is `high` confidence only when the branch failed at
+# least this many *definitive* times at the sha — i.e. it exhausted the
+# fill selector's retry budget (LITEBOX_FILL_FAIL_RETRIES, default 3)
+# with all fails. A 2-of-3 (e.g. 2 fails + a no_result, or still
+# retrying) stays `medium`, since a timing/load-sensitive test can fail
+# a couple of times under the agent-coverage shadow's build load while
+# upstream CI passes it — that should read as provisional, not high.
+_HIGH_CONF_MIN_FAILS = 3
 
 _CLASSIFICATION_DDL = f"""
 -- (regression_class + test_flake_stats are dropped by actual type in
@@ -399,7 +408,7 @@ SELECT
       WHEN b.freshest_def = 'fail'                           THEN 'n/a'
       WHEN COALESCE(f.recent_flaky, 0) = 1
         OR b.flaky_atsha = 1                                 THEN 'low'
-      WHEN a.n_fail >= 2 AND a.n_pass = 0
+      WHEN a.n_fail >= {_HIGH_CONF_MIN_FAILS} AND a.n_pass = 0
        AND COALESCE(f.n_pass, 0) >= 3                        THEN 'high'
       WHEN COALESCE(f.n_pass, 0) >= 1                        THEN 'medium'
       ELSE 'low'
