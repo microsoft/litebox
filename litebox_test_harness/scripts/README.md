@@ -490,6 +490,48 @@ sqlite3 <main-worktree>/.dashboard/results.sqlite \
   "SELECT value FROM meta WHERE key='schema_version'"
 ```
 
+### Standardized regression classification (`regression_class` view)
+
+Instead of hand-rolling "is this test regressing on my branch?"
+queries, read the **`regression_class`** view — a pure-SQL,
+flaky-aware, confidence-tiered classifier. It's consumable from plain
+`sqlite3` (no Python), and every consumer gets the identical verdict.
+
+```sh
+# CLI:
+sqlite3 <main-worktree>/.dashboard/results.sqlite \
+  "SELECT test_id, classification, confidence FROM regression_class
+    WHERE branch='wportnoy/my-branch' AND mode='litebox'
+      AND classification='hard_regression'"
+
+# or the wrapper (refreshes caches first, then prints grouped):
+dashboard.py regressions wportnoy/my-branch
+dashboard.py regressions <sha-prefix> --format sql
+```
+
+Each failing `(test_id, mode)` on a branch is classified by comparing
+its state at the branch HEAD against its `merge-base` baseline, plus
+the test's recent flakiness **on the upstream lineage** (tracked-ref CI
+runs only — so a genuine branch regression isn't mistaken for a flake):
+
+| `classification` | Meaning |
+|---|---|
+| `hard_regression` | Stable pass upstream → fails on branch. **Really bad.** |
+| `soft_regression` | Fails on branch, but was already flaky upstream / at baseline. Discount. |
+| `new_fail` | Fails on branch, no baseline coverage to compare. |
+| `preexisting_fail` | Failed at baseline too — not a regression. |
+| `flaky_pass` | Passes on branch but flaked (retry-recovered) at the sha. |
+| `ok` | Pass, no regression. |
+
+`confidence` is `high` / `medium` / `low` (or `n/a`): `high` needs the
+branch to fail repeatedly *and* the upstream to be well-observed-stable;
+`low` flags thin evidence — the explicit "not enough data to judge yet"
+signal. The view's two inputs that SQL can't derive — the git
+`merge-base` map (`branch_baseline`) and the upstream recent-flake tally
+(`test_flake_stats`) — are small tables the `dashboard.py auto`
+supervisor refreshes each cycle. `(hard + soft)` reconciles exactly with
+the old binary regression count; it just splits it by severity.
+
 ## `analyze-test-timing.py` — per-test timing summaries
 
 Reads `run_results` from

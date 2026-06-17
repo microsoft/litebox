@@ -123,7 +123,8 @@ def resolve_state_dir(arg: Optional[str]) -> Path:
     return Path(out.stdout.strip()).parent / ".dashboard"
 
 
-def open_db(state_dir: Path, *, bootstrap: bool = False) -> sqlite3.Connection:
+def open_db(state_dir: Path, *, bootstrap: bool = False,
+            with_state_views: bool = True) -> sqlite3.Connection:
     """Open the dashboard sqlite store.
 
     `bootstrap=True` initializes an empty store + schema if the file
@@ -131,6 +132,13 @@ def open_db(state_dir: Path, *, bootstrap: bool = False) -> sqlite3.Connection:
     tracked ref before the producer has ever run. Other subcommands
     pass `bootstrap=False` (the default) and exit with a helpful
     message instead of silently creating an empty store.
+
+    `with_state_views=False` skips materializing the render-only
+    `state_test_pass` TEMP TABLE (an expensive window over all of
+    `run_results`). Callers that only need `regression_class` / the
+    cache tables / raw `run_results` (e.g. `regressions`, the
+    supervisor's per-cycle ref read + classification refresh) pass it
+    to avoid a multi-second cost they'd never use.
     """
     db_path = state_dir / "results.sqlite"
     if not db_path.exists():
@@ -149,7 +157,10 @@ def open_db(state_dir: Path, *, bootstrap: bool = False) -> sqlite3.Connection:
     if bootstrap:
         _ensure_schema(conn)
     check_schema(conn)
-    _ensure_views(conn)
+    if with_state_views:
+        _ensure_views(conn)
+    _ensure_classification_schema(conn)
+    _ensure_classification_schema(conn)
     return conn
 
 
@@ -233,6 +244,230 @@ def _ensure_views(conn: sqlite3.Connection) -> None:
             ON state_test_pass(commit_sha, dirty_hash, state_wt, mode);
         """
     )
+
+
+# ─── Regression classification (CLI-consumable, pure-SQL) ────────────
+#
+# Sessions repeatedly re-derive "is this test regressing on my branch?"
+# with ad-hoc queries. This standardizes it as a VIEW so every consumer
+# — `sqlite3 results.sqlite`, the Python renderer, any session — gets
+# the identical, flaky-aware, confidence-tiered verdict with no Python
+# and no drift.
+#
+# The classification *logic* lives entirely in SQL (the `regression_class`
+# view's CASE). The only two inputs SQL can't cheaply derive are
+# materialized into small tables the supervisor refreshes each cycle:
+#   * `branch_baseline` — git `merge-base(branch_HEAD, tracked_tip)`,
+#     which SQLite has no way to know (no git ancestry).
+#   * `test_flake_stats` — a recent cross-sha pass/fail tally per test,
+#     so the "was it flaky beforehand?" softening doesn't require a
+#     full-history window on every query.
+# Both are pure caches; the view is always live for the per-sha state.
+#
+# Additive (new table + view, created via IF NOT EXISTS / a meta-keyed
+# definition version) — no SCHEMA_VERSION bump, no producer change.
+
+_CLASSIFICATION_SCHEMA_VERSION = 1
+
+# "Recently flaky" lookback for the soft-regression discount.
+_RECENT_FLAKE_WINDOW_MS = 7 * 24 * 3600 * 1000
+
+_CLASSIFICATION_VIEW_DDL = """
+DROP VIEW IF EXISTS regression_class;
+CREATE VIEW regression_class AS
+WITH relevant(sha) AS (
+    SELECT branch_sha   FROM branch_baseline
+    UNION
+    SELECT baseline_sha FROM branch_baseline
+),
+ranked AS (
+    SELECT r.commit_sha AS sha, rr.mode, rr.test_id, rr.verdict,
+           rr.finished_ts_ms,
+           ROW_NUMBER() OVER (
+               PARTITION BY r.commit_sha, rr.mode, rr.test_id
+               ORDER BY rr.finished_ts_ms DESC) AS rn
+      FROM run_results rr
+      JOIN runs r ON r.run_id = rr.run_id
+     WHERE r.dirty_hash IS NULL
+       AND r.commit_sha IN (SELECT sha FROM relevant)
+),
+sha_state AS (
+    SELECT sha, mode, test_id,
+           COUNT(*) AS n,
+           SUM(CASE WHEN verdict =  'pass' THEN 1 ELSE 0 END) AS n_pass,
+           SUM(CASE WHEN verdict <> 'pass' THEN 1 ELSE 0 END) AS n_fail,
+           MAX(CASE WHEN rn = 1 THEN verdict END) AS freshest,
+           MAX(CASE WHEN verdict <> 'pass' THEN 1 ELSE 0 END) AS ever_failed
+      FROM ranked
+     GROUP BY sha, mode, test_id
+)
+SELECT
+    bb.branch, bb.ref, bb.branch_sha, bb.baseline_sha,
+    a.mode, a.test_id,
+    b.freshest    AS baseline_verdict,
+    b.n           AS baseline_n,
+    b.ever_failed AS baseline_atsha_flaky,
+    a.freshest    AS branch_verdict,
+    a.n           AS branch_n,
+    a.n_fail      AS branch_n_fail,
+    a.ever_failed AS branch_atsha_flaky,
+    COALESCE(f.recent_flaky, 0) AS recent_flaky,
+    COALESCE(f.n_pass, 0)       AS recent_pass,
+    COALESCE(f.n_fail, 0)       AS recent_fail,
+    CASE
+      WHEN a.freshest =  'pass' AND a.ever_failed = 0 THEN 'ok'
+      WHEN a.freshest =  'pass' AND a.ever_failed = 1 THEN 'flaky_pass'
+      WHEN b.freshest IS NULL                         THEN 'new_fail'
+      WHEN b.freshest <> 'pass'                       THEN 'preexisting_fail'
+      WHEN COALESCE(f.recent_flaky, 0) = 1
+        OR b.ever_failed = 1                          THEN 'soft_regression'
+      ELSE 'hard_regression'
+    END AS classification,
+    CASE
+      WHEN a.freshest = 'pass'                            THEN 'n/a'
+      WHEN b.freshest IS NULL                            THEN 'low'
+      WHEN b.freshest <> 'pass'                          THEN 'n/a'
+      WHEN COALESCE(f.recent_flaky, 0) = 1
+        OR b.ever_failed = 1                             THEN 'low'
+      WHEN a.n >= 2 AND a.n_pass = 0
+       AND COALESCE(f.n_pass, 0) >= 3                    THEN 'high'
+      WHEN COALESCE(f.n_pass, 0) >= 1                    THEN 'medium'
+      ELSE 'low'
+    END AS confidence
+  FROM branch_baseline bb
+  JOIN sha_state a ON a.sha = bb.branch_sha
+  LEFT JOIN sha_state b
+         ON b.sha = bb.baseline_sha AND b.mode = a.mode
+        AND b.test_id = a.test_id
+  LEFT JOIN test_flake_stats f
+         ON f.mode = a.mode AND f.test_id = a.test_id;
+"""
+
+
+def _ensure_classification_schema(conn: sqlite3.Connection) -> None:
+    """Create the persistent, CLI-consumable regression-classification
+    schema: the supervisor-refreshed `branch_baseline` /
+    `test_flake_stats` cache tables and the `regression_class` VIEW.
+
+    Idempotent. The view is (re)defined only when its meta-keyed
+    definition version changes, so steady-state connections do no
+    schema writes (no churn / schema-cookie bumps)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS branch_baseline (
+            branch_sha     TEXT NOT NULL PRIMARY KEY,
+            baseline_sha   TEXT NOT NULL,
+            ref            TEXT,
+            branch         TEXT,
+            computed_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS test_flake_stats (
+            mode           TEXT    NOT NULL,
+            test_id        TEXT    NOT NULL,
+            n_recent       INTEGER NOT NULL,
+            n_pass         INTEGER NOT NULL,
+            n_fail         INTEGER NOT NULL,
+            recent_flaky   INTEGER NOT NULL,
+            computed_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (mode, test_id)
+        );
+        """
+    )
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = 'classification_schema_version'"
+    ).fetchone()
+    if row is not None and int(row[0]) == _CLASSIFICATION_SCHEMA_VERSION:
+        return
+    conn.executescript(_CLASSIFICATION_VIEW_DDL)
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) "
+        "VALUES('classification_schema_version', ?)",
+        (str(_CLASSIFICATION_SCHEMA_VERSION),),
+    )
+
+
+def _refresh_test_flake_stats(conn: sqlite3.Connection,
+                              window_ms: int = _RECENT_FLAKE_WINDOW_MS) -> None:
+    """Recompute the recent pass/fail tally per (mode, test_id) over the
+    last `window_ms` of clean **upstream** runs (the tracked-ref CI
+    worktrees only). Restricting to upstream is essential: it measures
+    whether a test was flaky on the gold-standard lineage *beforehand*,
+    not whether it merely failed on some in-flight branch — otherwise a
+    genuine branch regression (pass upstream, fail on branch) would look
+    "flaky" and be wrongly softened. Cheap snapshot the supervisor
+    refreshes each cycle so `regression_class` need not window over
+    full history per query."""
+    now = now_ms()
+    cutoff = now - window_ms
+    conn.execute("DELETE FROM test_flake_stats")
+    conn.execute(
+        """
+        INSERT INTO test_flake_stats
+            (mode, test_id, n_recent, n_pass, n_fail, recent_flaky, computed_at_ms)
+        SELECT rr.mode, rr.test_id, COUNT(*),
+               SUM(CASE WHEN rr.verdict =  'pass' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN rr.verdict <> 'pass' THEN 1 ELSE 0 END),
+               CASE WHEN SUM(CASE WHEN rr.verdict =  'pass' THEN 1 ELSE 0 END) > 0
+                     AND SUM(CASE WHEN rr.verdict <> 'pass' THEN 1 ELSE 0 END) > 0
+                    THEN 1 ELSE 0 END,
+               ?
+          FROM run_results rr
+          JOIN runs r ON r.run_id = rr.run_id
+         WHERE r.dirty_hash IS NULL
+           AND rr.finished_ts_ms > ?
+           AND r.worktree_path IN (SELECT ci_worktree FROM tracked_refs)
+         GROUP BY rr.mode, rr.test_id
+        """,
+        (now, cutoff),
+    )
+
+
+def _refresh_branch_baseline(conn: sqlite3.Connection, canonical: Path) -> int:
+    """Recompute `branch_baseline` for every live branch (agent
+    worktrees + tracked refs): map each branch HEAD to its
+    `merge-base` with the most-recent tracked upstream. Returns the
+    number of rows written. Best-effort; git failures skip a row."""
+    now = now_ms()
+    candidates: list[tuple[str, str]] = []
+    for wt in _list_worktrees(canonical):
+        if wt.get("branch") and wt.get("head"):
+            candidates.append((wt["head"], wt["branch"]))
+    for r in conn.execute("SELECT ref FROM tracked_refs"):
+        ref = r["ref"]
+        rh = (_resolve_ref_head(canonical, ref)
+              or _resolve_ref_head(canonical, f"origin/{ref}"))
+        if rh:
+            candidates.append((rh, ref))
+    rows: list[tuple] = []
+    seen: set[str] = set()
+    for head, label in candidates:
+        if head in seen:
+            continue
+        seen.add(head)
+        base = _pick_baseline_ref(conn, canonical, head)
+        if base is None:
+            continue
+        rows.append((head, base["merge_base"], base["ref"], label, now))
+    conn.execute("DELETE FROM branch_baseline")
+    conn.executemany(
+        "INSERT OR REPLACE INTO branch_baseline"
+        "(branch_sha, baseline_sha, ref, branch, computed_at_ms) "
+        "VALUES (?,?,?,?,?)",
+        rows,
+    )
+    return len(rows)
+
+
+def _refresh_classification_inputs(conn: sqlite3.Connection,
+                                   canonical: Path) -> None:
+    """Refresh both classification cache tables. Called once per
+    supervisor cycle. Best-effort — never aborts the cycle."""
+    try:
+        _refresh_branch_baseline(conn, canonical)
+        _refresh_test_flake_stats(conn)
+    except sqlite3.Error as e:
+        print(f"[auto] classification refresh failed: {e}", file=sys.stderr)
+
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -2351,6 +2586,91 @@ def write_summary(conn: sqlite3.Connection, state_dir: Path) -> Path:
 # ─── Subcommands ─────────────────────────────────────────────────────
 
 
+def cmd_regressions(args: argparse.Namespace) -> int:
+    """Standardized regression classification for a branch, read from
+    the `regression_class` view. Buckets each failing (test, mode) as
+    hard_regression (clean upstream → fail), soft_regression (was flaky
+    upstream), new_fail (no baseline), preexisting_fail, or flaky_pass,
+    each with a confidence tier — so sessions don't hand-roll triage
+    queries."""
+    state_dir = resolve_state_dir(args.state_dir)
+    conn = open_db(state_dir, with_state_views=False)
+    if not args.no_refresh:
+        try:
+            _refresh_classification_inputs(
+                conn, _canonical_worktree(args, state_dir))
+        except Exception as e:
+            print(f"warning: classification refresh failed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+    sel = args.branch
+    row = conn.execute(
+        "SELECT branch, branch_sha, baseline_sha FROM branch_baseline "
+        " WHERE branch = ? OR branch_sha = ? OR branch_sha LIKE ? "
+        " LIMIT 1",
+        (sel, sel, sel + "%"),
+    ).fetchone()
+    if row is None:
+        print(f"no branch_baseline entry for '{sel}'. Known branches:",
+              file=sys.stderr)
+        for r in conn.execute(
+            "SELECT branch, substr(branch_sha,1,10) s FROM branch_baseline "
+            "ORDER BY branch"
+        ):
+            print(f"  {r['branch']}  {r['s']}", file=sys.stderr)
+        conn.close()
+        return 1
+    branch_sha = row["branch_sha"]
+    if args.format == "sql":
+        for r in conn.execute(
+            "SELECT mode, test_id, classification, confidence "
+            "  FROM regression_class WHERE branch_sha = ? "
+            "   AND classification NOT IN ('ok','flaky_pass') "
+            " ORDER BY mode, classification, confidence DESC, test_id",
+            (branch_sha,),
+        ):
+            print(f"{r['mode']}\t{r['classification']}\t{r['confidence']}"
+                  f"\t{r['test_id']}")
+        conn.close()
+        return 0
+    print(f"# Regressions — {row['branch']} @ {short_sha(branch_sha)} "
+          f"(baseline {short_sha(row['baseline_sha'])})\n")
+    for mode in ("native", "litebox"):
+        counts = conn.execute(
+            "SELECT classification, confidence, COUNT(*) n "
+            "  FROM regression_class WHERE branch_sha = ? AND mode = ? "
+            "   AND classification NOT IN ('ok','flaky_pass') "
+            " GROUP BY classification, confidence "
+            " ORDER BY classification, confidence",
+            (branch_sha, mode),
+        ).fetchall()
+        summary = "  ".join(
+            f"{c['classification']}/{c['confidence']}={c['n']}" for c in counts
+        ) or "clean"
+        print(f"_{mode}_: {summary}")
+    print()
+    # List the actionable buckets, hardest first.
+    for mode in ("native", "litebox"):
+        for cls in ("hard_regression", "new_fail", "soft_regression"):
+            ids = conn.execute(
+                "SELECT test_id, confidence FROM regression_class "
+                " WHERE branch_sha = ? AND mode = ? AND classification = ? "
+                " ORDER BY CASE confidence WHEN 'high' THEN 0 "
+                "          WHEN 'medium' THEN 1 ELSE 2 END, test_id",
+                (branch_sha, mode, cls),
+            ).fetchall()
+            if not ids:
+                continue
+            print(f"## {cls} ({mode}) — {len(ids)}")
+            for r in ids[: args.limit]:
+                print(f"- `{r['test_id']}`  [{r['confidence']}]")
+            if len(ids) > args.limit:
+                print(f"  … and {len(ids) - args.limit} more "
+                      f"(use --limit or --format sql)")
+            print()
+    conn.close()
+    return 0
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     """Lossless in-place schema migration (v3 → v4). Opens the store
     raw (bypassing the strict version check, which would reject a v3
@@ -2623,7 +2943,16 @@ def cmd_auto(args: argparse.Namespace) -> int:
 
     try:
         while True:
-            conn = open_db(state_dir)
+            conn = open_db(state_dir, with_state_views=False)
+            # Refresh the regression-classification caches (branch→
+            # merge-base map + recent-flake tally) once per cycle so
+            # `regression_class` stays current for any consumer.
+            try:
+                _refresh_classification_inputs(
+                    conn, _canonical_worktree(args, state_dir))
+            except Exception as e:
+                print(f"[auto] classification refresh crashed: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
             refs = conn.execute(
                 "SELECT ref, ci_worktree FROM tracked_refs ORDER BY ref"
             ).fetchall()
@@ -3751,6 +4080,25 @@ def build_parser() -> argparse.ArgumentParser:
              "Idempotent; back up results.sqlite first.",
     )
     p_migrate.set_defaults(func=cmd_migrate)
+
+    p_regr = sub.add_parser(
+        "regressions",
+        help="classify a branch's failing tests as hard/soft "
+             "regression, new_fail, etc. with a confidence tier "
+             "(reads the regression_class view).",
+    )
+    p_regr.add_argument("branch",
+                        help="branch name or commit sha (prefix ok)")
+    p_regr.add_argument("--format", choices=("text", "sql"), default="text")
+    p_regr.add_argument("--limit", type=int, default=30,
+                        help="max test_ids listed per bucket (text mode)")
+    p_regr.add_argument("--no-refresh", action="store_true",
+                        help="skip recomputing branch_baseline / "
+                             "test_flake_stats before reading the view")
+    p_regr.add_argument("--canonical-worktree", default=None,
+                        help="canonical clone root for git queries "
+                             "(default: state-dir's parent)")
+    p_regr.set_defaults(func=cmd_regressions)
 
     p_track = sub.add_parser(
         "track",
