@@ -522,7 +522,17 @@ runs only — so a genuine branch regression isn't mistaken for a flake):
 | `preexisting_fail` | Failed at baseline too — not a regression. |
 | `flaky_pass` | Passes on branch but flaked (retry-recovered) at the sha. |
 | `no_result` | Branch produced only `no_result` (infra non-outcome, ~1% background) — **not** a regression. |
+| `not_run` | In the comparable universe (has a baseline verdict) but **not yet run at the branch sha** — an explicit coverage gap, *not* a pass. |
 | `ok` | Pass, no regression. |
+
+The view drives off the **comparable universe** (every test with a
+definitive verdict at the merge-base baseline, plus everything covered
+at the branch) via a LEFT JOIN, so a test that simply hasn't run on the
+branch surfaces as `not_run` instead of vanishing. This is the guard
+against a *partial* run reading as "clean": `dashboard.py regressions`
+prints a coverage line per pass — e.g. `litebox: hard_regression/high=80
+… [covered 1543/5677, 4134 not_run]` — so a thin sample is obviously
+provisional, never silently mistaken for green.
 
 Classification keys off the **freshest *definitive* verdict** (most
 recent `pass`/`fail`, ignoring `no_result`): a `no_result` never reads

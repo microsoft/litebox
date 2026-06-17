@@ -801,6 +801,23 @@ class RegressionClassTests(unittest.TestCase):
         self._branch("BRANCH", "T", "fail")
         self.assertEqual(self._classify()["T"][0], "hard_regression")
 
+    def test_not_run_surfaces_coverage_gap(self):
+        # Passed at baseline but never run at the branch sha → 'not_run'
+        # (explicit coverage gap), NOT silently absent and NOT 'ok'.
+        self._upstream("BASE", "T", "pass")
+        # (no branch run for T)
+        self.assertEqual(self._classify()["T"], ("not_run", "n/a"))
+
+    def test_not_run_distinct_from_no_result(self):
+        # not_run = no branch row at all; no_result = ran but only infra
+        # non-outcomes. They must not be conflated.
+        self._upstream("BASE", "GAP", "pass")        # not run on branch
+        self._upstream("BASE", "NR", "pass")
+        self._branch("BRANCH", "NR", "no_result")    # ran, infra-only
+        res = self._classify()
+        self.assertEqual(res["GAP"][0], "not_run")
+        self.assertEqual(res["NR"][0], "no_result")
+
 
 if __name__ == "__main__":
     unittest.main()
