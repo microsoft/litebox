@@ -5,6 +5,7 @@ pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod mm;
 pub(crate) mod nls;
+pub(crate) mod process;
 pub(crate) mod registry;
 mod sysinfo;
 
@@ -206,6 +207,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         system_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtQueryInformationProcess {
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: Platform::RawMutPointer<u8>,
+        process_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
     NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
         flag: u32,
         source: Platform::RawConstPointer<u64>,
@@ -398,6 +406,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 input_buffer_length,
                 system_information:*,
                 system_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQueryInformationProcess => Some(sys_req!(NtQueryInformationProcess {
+                process_handle: { ProcessHandle::from_raw },
+                process_information_class,
+                process_information:*,
+                process_information_length,
                 return_length:*,
             })),
             NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(

@@ -332,6 +332,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
+            default_hard_error_mode: AtomicU32::new(0),
+            cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
         });
         Ok(LoadedProgram {
@@ -373,6 +375,8 @@ pub struct Process<Platform: ShimPlatform> {
     system_lcid: AtomicU32,
     user_lcid: AtomicU32,
     user_ui_language: AtomicU32,
+    default_hard_error_mode: AtomicU32,
+    cookie: u32,
     exit_code: AtomicI32,
 }
 
@@ -684,6 +688,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     input_buffer_length,
                     system_information,
                     system_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryInformationProcess {
+                process_handle,
+                process_information_class,
+                process_information,
+                process_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_information_process(
+                    process_handle,
+                    process_information_class,
+                    process_information,
+                    process_information_length,
                     return_length,
                 );
                 (status, ContinueOperation::Resume)

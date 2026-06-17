@@ -31,6 +31,7 @@ use crate::nt_types::{
     ThreadEnvironmentBlock, UnicodeString, X64Context,
 };
 use crate::syscalls::mm::{MemoryType, PageProtection};
+use crate::syscalls::process::{INITIAL_PROCESS_ID, INITIAL_THREAD_ID};
 use crate::{MutPtr, ShimFS};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
@@ -56,8 +57,6 @@ const WINDOWS_HEAP_SEGMENT_COMMIT: u64 = 2 * PAGE_SIZE as u64;
 const WINDOWS_HEAP_DECOMMIT_TOTAL_FREE_THRESHOLD: u64 = 64 * 1024;
 const WINDOWS_HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD: u64 = PAGE_SIZE as u64;
 const WINDOWS_NT_TIB_VERSION: usize = 30 << 8;
-const INITIAL_PROCESS_ID: usize = 1;
-const INITIAL_THREAD_ID: usize = 1;
 
 macro_rules! write_static_server_data_field {
     ($platform:ty, $base:expr, $field:ident, $value:expr $(,)?) => {
