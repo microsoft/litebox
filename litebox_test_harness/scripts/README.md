@@ -516,12 +516,20 @@ runs only — so a genuine branch regression isn't mistaken for a flake):
 
 | `classification` | Meaning |
 |---|---|
-| `hard_regression` | Stable pass upstream → fails on branch. **Really bad.** |
+| `hard_regression` | Stable pass upstream → **fails** on branch. **Really bad.** |
 | `soft_regression` | Fails on branch, but was already flaky upstream / at baseline. Discount. |
-| `new_fail` | Fails on branch, no baseline coverage to compare. |
+| `new_fail` | Fails on branch, no definitive baseline pass to compare. |
 | `preexisting_fail` | Failed at baseline too — not a regression. |
 | `flaky_pass` | Passes on branch but flaked (retry-recovered) at the sha. |
+| `no_result` | Branch produced only `no_result` (infra non-outcome, ~1% background) — **not** a regression. |
 | `ok` | Pass, no regression. |
+
+Classification keys off the **freshest *definitive* verdict** (most
+recent `pass`/`fail`, ignoring `no_result`): a `no_result` never reads
+as a failure (it's infra noise, and `dashboard.py regressions` reports
+it separately), and a real `fail` is never masked by a later
+`no_result` hiccup. A regression requires a definitive `pass` at the
+merge-base baseline *and* a definitive `fail` on the branch.
 
 `confidence` is `high` / `medium` / `low` (or `n/a`): `high` needs the
 branch to fail repeatedly *and* the upstream to be well-observed-stable;

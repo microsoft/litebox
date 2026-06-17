@@ -770,6 +770,37 @@ class RegressionClassTests(unittest.TestCase):
         cls, _ = self._classify()["T"]
         self.assertEqual(cls, "hard_regression")
 
+    def test_no_result_is_not_a_regression(self):
+        # Branch's only result is an infra no_result (~1% background),
+        # baseline passed. Must be 'no_result', NOT hard_regression.
+        self._upstream("BASE", "T", "pass")
+        self._branch("BRANCH", "T", "no_result")
+        self.assertEqual(self._classify()["T"], ("no_result", "n/a"))
+
+    def test_no_result_does_not_mask_a_real_fail(self):
+        # Branch failed, then a later no_result hiccup. Freshest
+        # *definitive* verdict is the fail → still a hard_regression.
+        self._upstream("BASE", "T", "pass")
+        self._upstream("UP", "T", "pass", dt=2000)
+        self._branch("BRANCH", "T", "fail", dt=10)
+        self._branch("BRANCH", "T", "no_result", dt=5)  # later infra blip
+        self.assertEqual(self._classify()["T"][0], "hard_regression")
+
+    def test_baseline_only_no_result_is_new_fail(self):
+        # No definitive baseline pass (baseline only produced no_result)
+        # → can't confirm a regression → new_fail, not hard_regression.
+        self._upstream("BASE", "T", "no_result")
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"], ("new_fail", "low"))
+
+    def test_upstream_no_result_does_not_flag_flaky(self):
+        # Upstream pass + upstream no_result must NOT read as flaky
+        # (no_result is not a fail). A branch fail is hard, not soft.
+        self._upstream("BASE", "T", "pass")
+        self._upstream("UP", "T", "no_result", dt=1000)
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"][0], "hard_regression")
+
 
 if __name__ == "__main__":
     unittest.main()

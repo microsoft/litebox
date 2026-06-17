@@ -272,30 +272,31 @@ def _ensure_views(conn: sqlite3.Connection) -> None:
 # meta-keyed definition version) — no SCHEMA_VERSION bump, no producer
 # change, no data migration.
 
-_CLASSIFICATION_SCHEMA_VERSION = 2
+_CLASSIFICATION_SCHEMA_VERSION = 3
 
 # "Recently flaky" lookback for the soft-regression discount.
 _RECENT_FLAKE_WINDOW_MS = 7 * 24 * 3600 * 1000
 
 _CLASSIFICATION_DDL = f"""
-DROP VIEW  IF EXISTS regression_class;
-DROP TABLE IF EXISTS test_flake_stats;   -- retire the v1 materialized cache
-DROP VIEW  IF EXISTS test_flake_stats;   -- idempotent on re-run
+-- (regression_class + test_flake_stats are dropped by actual type in
+-- Python before this runs — DROP TABLE/VIEW can't be mixed safely here.)
 
 -- Recent pass/fail tally per (mode, test_id) over clean **upstream**
 -- runs (the tracked-ref CI worktrees only). Restricting to upstream is
 -- essential: it measures whether a test was flaky on the gold-standard
 -- lineage *beforehand*, not whether it merely failed on some in-flight
 -- branch — otherwise a genuine branch regression (pass upstream, fail
--- on branch) would look "flaky" and be wrongly softened. A pure live
--- derivation; kept cheap by `idx_runs_worktree`.
+-- on branch) would look "flaky" and be wrongly softened. `no_result`
+-- (an infra non-outcome, ~1% background rate) is NOT counted as a fail,
+-- so it never inflates the flake signal. A pure live derivation; kept
+-- cheap by `idx_runs_worktree`.
 CREATE VIEW test_flake_stats AS
 SELECT rr.mode, rr.test_id,
        COUNT(*) AS n_recent,
-       SUM(CASE WHEN rr.verdict =  'pass' THEN 1 ELSE 0 END) AS n_pass,
-       SUM(CASE WHEN rr.verdict <> 'pass' THEN 1 ELSE 0 END) AS n_fail,
-       CASE WHEN SUM(CASE WHEN rr.verdict =  'pass' THEN 1 ELSE 0 END) > 0
-             AND SUM(CASE WHEN rr.verdict <> 'pass' THEN 1 ELSE 0 END) > 0
+       SUM(CASE WHEN rr.verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
+       SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END) AS n_fail,
+       CASE WHEN SUM(CASE WHEN rr.verdict = 'pass' THEN 1 ELSE 0 END) > 0
+             AND SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END) > 0
             THEN 1 ELSE 0 END AS recent_flaky
   FROM run_results rr
   JOIN runs r ON r.run_id = rr.run_id
@@ -305,6 +306,13 @@ SELECT rr.mode, rr.test_id,
    AND r.worktree_path IN (SELECT ci_worktree FROM tracked_refs)
  GROUP BY rr.mode, rr.test_id;
 
+-- Per-(branch, test, mode) regression classification. Keys off the
+-- freshest *definitive* verdict (most recent pass/fail, IGNORING
+-- `no_result`): a test whose only branch result is an infra `no_result`
+-- is classified `no_result`, never a regression; and a real `fail`
+-- isn't masked by a later `no_result` hiccup. A regression requires a
+-- definitive `pass` at the merge-base baseline and a definitive `fail`
+-- on the branch.
 CREATE VIEW regression_class AS
 WITH relevant(sha) AS (
     SELECT branch_sha   FROM branch_baseline
@@ -312,11 +320,15 @@ WITH relevant(sha) AS (
     SELECT baseline_sha FROM branch_baseline
 ),
 ranked AS (
+    -- Definitive verdicts (pass/fail) sorted ahead of no_result, then
+    -- newest-first, so rn_def=1 is the freshest *definitive* verdict
+    -- (or a no_result row iff the test produced nothing but no_result).
     SELECT r.commit_sha AS sha, rr.mode, rr.test_id, rr.verdict,
-           rr.finished_ts_ms,
            ROW_NUMBER() OVER (
                PARTITION BY r.commit_sha, rr.mode, rr.test_id
-               ORDER BY rr.finished_ts_ms DESC) AS rn
+               ORDER BY CASE WHEN rr.verdict IN ('pass','fail')
+                             THEN 0 ELSE 1 END,
+                        rr.finished_ts_ms DESC) AS rn_def
       FROM run_results rr
       JOIN runs r ON r.run_id = rr.run_id
      WHERE r.dirty_hash IS NULL
@@ -325,44 +337,51 @@ ranked AS (
 sha_state AS (
     SELECT sha, mode, test_id,
            COUNT(*) AS n,
-           SUM(CASE WHEN verdict =  'pass' THEN 1 ELSE 0 END) AS n_pass,
-           SUM(CASE WHEN verdict <> 'pass' THEN 1 ELSE 0 END) AS n_fail,
-           MAX(CASE WHEN rn = 1 THEN verdict END) AS freshest,
-           MAX(CASE WHEN verdict <> 'pass' THEN 1 ELSE 0 END) AS ever_failed
+           SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
+           SUM(CASE WHEN verdict = 'fail' THEN 1 ELSE 0 END) AS n_fail,
+           SUM(CASE WHEN verdict NOT IN ('pass','fail')
+                    THEN 1 ELSE 0 END) AS n_other,
+           CASE WHEN SUM(CASE WHEN verdict='pass' THEN 1 ELSE 0 END) > 0
+                 AND SUM(CASE WHEN verdict='fail' THEN 1 ELSE 0 END) > 0
+                THEN 1 ELSE 0 END AS flaky_atsha,
+           MAX(CASE WHEN rn_def = 1 AND verdict IN ('pass','fail')
+                    THEN verdict END) AS freshest_def
       FROM ranked
      GROUP BY sha, mode, test_id
 )
 SELECT
     bb.branch, bb.ref, bb.branch_sha, bb.baseline_sha,
     a.mode, a.test_id,
-    b.freshest    AS baseline_verdict,
-    b.n           AS baseline_n,
-    b.ever_failed AS baseline_atsha_flaky,
-    a.freshest    AS branch_verdict,
-    a.n           AS branch_n,
-    a.n_fail      AS branch_n_fail,
-    a.ever_failed AS branch_atsha_flaky,
+    b.freshest_def AS baseline_verdict,
+    b.n            AS baseline_n,
+    b.flaky_atsha  AS baseline_atsha_flaky,
+    a.freshest_def AS branch_verdict,
+    a.n            AS branch_n,
+    a.n_fail       AS branch_n_fail,
+    a.n_other      AS branch_n_noresult,
+    a.flaky_atsha  AS branch_atsha_flaky,
     COALESCE(f.recent_flaky, 0) AS recent_flaky,
     COALESCE(f.n_pass, 0)       AS recent_pass,
     COALESCE(f.n_fail, 0)       AS recent_fail,
     CASE
-      WHEN a.freshest =  'pass' AND a.ever_failed = 0 THEN 'ok'
-      WHEN a.freshest =  'pass' AND a.ever_failed = 1 THEN 'flaky_pass'
-      WHEN b.freshest IS NULL                         THEN 'new_fail'
-      WHEN b.freshest <> 'pass'                       THEN 'preexisting_fail'
+      WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 0 THEN 'ok'
+      WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 1 THEN 'flaky_pass'
+      WHEN a.freshest_def IS NULL                        THEN 'no_result'
+      WHEN b.freshest_def IS NULL                        THEN 'new_fail'
+      WHEN b.freshest_def = 'fail'                       THEN 'preexisting_fail'
       WHEN COALESCE(f.recent_flaky, 0) = 1
-        OR b.ever_failed = 1                          THEN 'soft_regression'
+        OR b.flaky_atsha = 1                             THEN 'soft_regression'
       ELSE 'hard_regression'
     END AS classification,
     CASE
-      WHEN a.freshest = 'pass'                            THEN 'n/a'
-      WHEN b.freshest IS NULL                            THEN 'low'
-      WHEN b.freshest <> 'pass'                          THEN 'n/a'
+      WHEN a.freshest_def = 'pass' OR a.freshest_def IS NULL THEN 'n/a'
+      WHEN b.freshest_def IS NULL                            THEN 'low'
+      WHEN b.freshest_def = 'fail'                           THEN 'n/a'
       WHEN COALESCE(f.recent_flaky, 0) = 1
-        OR b.ever_failed = 1                             THEN 'low'
-      WHEN a.n >= 2 AND a.n_pass = 0
-       AND COALESCE(f.n_pass, 0) >= 3                    THEN 'high'
-      WHEN COALESCE(f.n_pass, 0) >= 1                    THEN 'medium'
+        OR b.flaky_atsha = 1                                 THEN 'low'
+      WHEN a.n_fail >= 2 AND a.n_pass = 0
+       AND COALESCE(f.n_pass, 0) >= 3                        THEN 'high'
+      WHEN COALESCE(f.n_pass, 0) >= 1                        THEN 'medium'
       ELSE 'low'
     END AS confidence
   FROM branch_baseline bb
@@ -407,6 +426,16 @@ def _ensure_classification_schema(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if row is not None and int(row[0]) == _CLASSIFICATION_SCHEMA_VERSION:
         return
+    # Drop dependent objects by their ACTUAL type before recreating.
+    # `test_flake_stats` may be a v1 materialized TABLE or a v2+ VIEW;
+    # `DROP TABLE/VIEW IF EXISTS` raises on a type mismatch (IF EXISTS
+    # only suppresses "doesn't exist"), so detect the type first.
+    conn.execute("DROP VIEW IF EXISTS regression_class")
+    tfs = conn.execute(
+        "SELECT type FROM sqlite_master WHERE name = 'test_flake_stats'"
+    ).fetchone()
+    if tfs is not None and tfs[0] in ("table", "view"):
+        conn.execute(f'DROP {tfs[0].upper()} IF EXISTS test_flake_stats')
     conn.executescript(_CLASSIFICATION_DDL)
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) "
@@ -2618,7 +2647,7 @@ def cmd_regressions(args: argparse.Namespace) -> int:
         for r in conn.execute(
             "SELECT mode, test_id, classification, confidence "
             "  FROM regression_class WHERE branch_sha = ? "
-            "   AND classification NOT IN ('ok','flaky_pass') "
+            "   AND classification NOT IN ('ok','flaky_pass','no_result') "
             " ORDER BY mode, classification, confidence DESC, test_id",
             (branch_sha,),
         ):
@@ -2632,7 +2661,7 @@ def cmd_regressions(args: argparse.Namespace) -> int:
         counts = conn.execute(
             "SELECT classification, confidence, COUNT(*) n "
             "  FROM regression_class WHERE branch_sha = ? AND mode = ? "
-            "   AND classification NOT IN ('ok','flaky_pass') "
+            "   AND classification NOT IN ('ok','flaky_pass','no_result') "
             " GROUP BY classification, confidence "
             " ORDER BY classification, confidence",
             (branch_sha, mode),
@@ -2640,7 +2669,15 @@ def cmd_regressions(args: argparse.Namespace) -> int:
         summary = "  ".join(
             f"{c['classification']}/{c['confidence']}={c['n']}" for c in counts
         ) or "clean"
-        print(f"_{mode}_: {summary}")
+        # no_result is an infra non-outcome (~1% background), not a
+        # regression — report it separately so it never reads as a fail.
+        n_nr = conn.execute(
+            "SELECT COUNT(*) FROM regression_class "
+            " WHERE branch_sha = ? AND mode = ? AND classification = 'no_result'",
+            (branch_sha, mode),
+        ).fetchone()[0]
+        nr = f"   (+{n_nr} no_result infra)" if n_nr else ""
+        print(f"_{mode}_: {summary}{nr}")
     print()
     # List the actionable buckets, hardest first.
     for mode in ("native", "litebox"):
