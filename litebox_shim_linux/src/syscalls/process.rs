@@ -1985,28 +1985,18 @@ impl<FS: ShimFS> Task<FS> {
         let subscription =
             crate::syscalls::guest_pid::try_subscribe_broker_process_exit(process_id)
                 .ok_or(Errno::ESRCH)?;
-        let state = self
-            .global
-            .litebox
-            .process_registry()
-            .exit_state(process_id);
-        let pidfd = if let Some(state) = state {
-            crate::syscalls::eventfd::EventFile::new_pidfd(
-                process_id,
-                state.exited,
-                state.subject,
-                flags & PIDFD_NONBLOCK != 0,
-                host_pid_opt,
-                Some(subscription),
-            )
-        } else {
-            crate::syscalls::eventfd::EventFile::new_broker_process_pidfd(
-                process_id,
-                subscription,
-                flags & PIDFD_NONBLOCK != 0,
-                host_pid_opt,
-            )
-        };
+        // Eager-broker model: a pidfd is always backed by the broker
+        // process-exit subscription, never a local exit-state fast path.
+        // The subscription fires for locally-tracked children too (every
+        // local-child exit path stamps `try_mark_broker_process_exited`),
+        // so a single broker-backed wake source is both sufficient and
+        // free of the dual-subject divergence the local fast path had.
+        let pidfd = crate::syscalls::eventfd::EventFile::new_broker_process_pidfd(
+            process_id,
+            subscription,
+            flags & PIDFD_NONBLOCK != 0,
+            host_pid_opt,
+        );
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<crate::syscalls::eventfd::EventfdSubsystem>(pidfd);
         let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
