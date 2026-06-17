@@ -32,18 +32,11 @@ pub use broker_inet_listener::{broker_inet_listener_provider, set_broker_inet_li
 pub use broker_inet_raw::{broker_inet_raw_provider, set_broker_inet_raw_provider};
 pub use broker_pipe::{broker_pipe_provider, set_broker_pipe_provider};
 pub use broker_pty::{broker_pty_provider, set_broker_pty_provider};
-pub use broker_socket_dgram::{
-    broker_socket_dgram_provider, eager_broker_socket_dgram_enabled,
-    set_broker_socket_dgram_provider, set_eager_broker_socket_dgram_enabled,
-};
+pub use broker_socket_dgram::{broker_socket_dgram_provider, set_broker_socket_dgram_provider};
 pub use broker_socket_seqpacket::{
-    broker_socket_seqpacket_provider, eager_broker_socket_seqpacket_enabled,
-    set_broker_socket_seqpacket_provider, set_eager_broker_socket_seqpacket_enabled,
+    broker_socket_seqpacket_provider, set_broker_socket_seqpacket_provider,
 };
-pub use broker_socketpair::{
-    broker_socketpair_provider, eager_broker_socketpair_enabled, set_broker_socketpair_provider,
-    set_eager_broker_socketpair_enabled,
-};
+pub use broker_socketpair::{broker_socketpair_provider, set_broker_socketpair_provider};
 pub use broker_tcp_conn::{
     broker_inet_tcp_conn_provider_outbound_enabled, broker_tcp_conn_provider,
     set_broker_inet_tcp_conn_provider_outbound_enabled, set_broker_tcp_conn_accept_enabled,
@@ -77,6 +70,8 @@ pub(crate) mod signalfd;
 pub(crate) mod unix;
 
 pub(crate) mod signal;
+#[cfg(test)]
+pub(crate) mod test_broker_sockets;
 #[cfg(test)]
 pub(crate) mod tests;
 

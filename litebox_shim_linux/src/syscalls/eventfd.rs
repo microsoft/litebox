@@ -115,14 +115,6 @@ pub fn broker_pty_provider() -> Option<Arc<dyn BrokerPtyProvider>> {
 }
 
 enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    /// Local in-memory eventfd. Constructed only by the test-only
-    /// [`EventFile::new`]; production `sys_eventfd2` always creates
-    /// the broker-backed variant below.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Eventfd {
-        counter: u64,
-        semaphore: bool,
-    },
     Pidfd {
         target_pid: litebox::process::ProcessId,
         exited: Arc<AtomicBool>,
@@ -179,37 +171,14 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     /// and fire local observer wake-ups when a broker→worker
     /// notification arrives.
     ///
-    /// Shared by all variants: Eventfd / Timerfd use it directly
-    /// for in-worker observer registration; BrokerBacked uses it
-    /// AND passes it to `BrokerBackedCommon::ensure_subscribed` so
-    /// the broker subscription's callback wakes the same pollee.
+    /// Shared by all variants: Timerfd uses it directly for
+    /// in-worker observer registration; BrokerBacked uses it AND
+    /// passes it to `BrokerBackedCommon::ensure_subscribed` so the
+    /// broker subscription's callback wakes the same pollee.
     pollee: Arc<Pollee<Platform>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
-    /// Test-only constructor for the local in-memory eventfd variant.
-    ///
-    /// In production, `sys_eventfd2` always routes through the broker
-    /// (see [`EventFile::new_broker_backed`]) so that every guest-visible
-    /// eventfd is broker-backed from birth. This local constructor is
-    /// retained only for in-process unit tests of read/write/poll
-    /// semantics that don't need cross-worker visibility or a real
-    /// broker connection.
-    #[cfg(test)]
-    pub(crate) fn new(count: u64, flags: EfdFlags) -> Self {
-        let mut status = OFlags::RDWR;
-        status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
-
-        Self {
-            inner: litebox::sync::Mutex::new(EventFileInner::Eventfd {
-                counter: count,
-                semaphore: flags.contains(EfdFlags::SEMAPHORE),
-            }),
-            status: AtomicU32::new(status.bits()),
-            pollee: Arc::new(Pollee::new()),
-        }
-    }
-
     /// Creates a broker-backed eventfd. The caller (`sys_eventfd2`) has
     /// already obtained `handle` from `provider.create_eventfd(...)`.
     /// All subsequent read/write ops route through the provider.
@@ -393,19 +362,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     ///   fork-snapshot broker-handle path still cannot preserve the
     ///   exact kernel timer object or accumulated expiration count.
     ///   In the cross-binary fork-snapshot path, the fd itself migrates
-    ///   classified as `FdClass::EventFd` (see `RawFdRef::Eventfd`
+    ///   classified as `FdKind::EventFd` (see `RawFdRef::Eventfd`
     ///   classification in `process.rs::snapshot_fd_table`); the fd
     ///   handoff works but the kernel timer's *arm state* (interval,
     ///   next expiration, accumulated unread expirations) is lost. The
     ///   child observes a fresh, disarmed timerfd. Known limitation,
     ///   not a bug — callers that rely on inherited arm state across
     ///   a delayed-fork commit must re-arm explicitly.
-    /// - local `Eventfd`: unreachable in production. `sys_eventfd2`
-    ///   creates eventfds as broker-backed eagerly (post eager-creation
-    ///   refactor), so any guest-visible eventfd reaches fork as
-    ///   `BrokerBacked`. The local variant exists only for in-process
-    ///   unit tests that never reach this fork bridge.
-    ///
     /// For handle-backed kinds, the caller MUST `dup_handle` the returned
     /// handle and arrange rollback `release`. For Phase B.2 pidfds, the
     /// returned value is a broker process token and needs no fd-handle dup.
@@ -413,34 +376,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         &self,
         _eventfd_provider: Option<&Arc<dyn BrokerEventfdProvider>>,
         _pidfd_provider: Option<&Arc<dyn BrokerPidfdProvider>>,
-    ) -> Result<Option<super::fork_snapshot::BrokerHandleSnapshot>, BrokerOpError> {
-        use super::fork_snapshot::BrokerHandleSnapshot;
+    ) -> Result<Option<super::fork_snapshot::FdKind>, BrokerOpError> {
+        use super::fork_snapshot::FdKind;
         let guard = self.inner.lock();
         match &*guard {
-            EventFileInner::BrokerBacked { common, .. } => {
-                Ok(Some(BrokerHandleSnapshot::Eventfd {
-                    handle_id: common.handle(),
-                }))
-            }
-            EventFileInner::PidfdBrokerBacked { common, .. } => {
-                Ok(Some(BrokerHandleSnapshot::Pidfd {
-                    handle_id: common.handle(),
-                }))
-            }
+            EventFileInner::BrokerBacked { common, .. } => Ok(Some(FdKind::Eventfd {
+                handle_id: common.handle(),
+            })),
+            EventFileInner::PidfdBrokerBacked { common, .. } => Ok(Some(FdKind::Pidfd {
+                handle_id: common.handle(),
+            })),
             EventFileInner::Timerfd(_) => Ok(None),
-            EventFileInner::Eventfd { .. } => {
-                unreachable!(
-                    "local Eventfd variant must not reach fork-snapshot in production: \
-                     sys_eventfd2 creates eventfds as broker-backed eagerly"
-                );
-            }
             EventFileInner::Pidfd {
                 target_pid,
                 broker_subscription,
                 ..
             } => {
                 if broker_subscription.is_some() {
-                    Ok(Some(BrokerHandleSnapshot::Pidfd {
+                    Ok(Some(FdKind::Pidfd {
                         handle_id: u64::from(target_pid.0),
                     }))
                 } else {
@@ -453,7 +406,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     #[cfg(feature = "trace_syscalls")]
     pub(crate) fn kind_name(&self) -> &'static str {
         match &*self.inner.lock() {
-            EventFileInner::Eventfd { .. } => "eventfd",
             EventFileInner::Pidfd { .. } => "pidfd",
             EventFileInner::Timerfd(_) => "timerfd",
             EventFileInner::BrokerBacked { .. } => "broker_eventfd",
@@ -471,16 +423,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     fn try_read_eventfd(&self) -> Result<u64, TryOpError<Errno>> {
         let mut inner = self.inner.lock();
         match &mut *inner {
-            EventFileInner::Eventfd { counter, semaphore } => {
-                if *counter == 0 {
-                    return Err(TryOpError::TryAgain);
-                }
-                let res = if *semaphore { 1 } else { *counter };
-                *counter -= res;
-                drop(inner);
-                self.pollee.notify_observers(Events::OUT);
-                Ok(res)
-            }
             EventFileInner::BrokerBacked {
                 provider,
                 common,
@@ -531,7 +473,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     fn try_read(&self) -> Result<u64, TryOpError<Errno>> {
         let inner = self.inner.lock();
         match &*inner {
-            EventFileInner::Eventfd { .. } | EventFileInner::BrokerBacked { .. } => {
+            EventFileInner::BrokerBacked { .. } => {
                 drop(inner);
                 self.try_read_eventfd()
             }
@@ -586,19 +528,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     fn try_write_eventfd(&self, value: u64) -> Result<usize, TryOpError<Errno>> {
         let mut inner = self.inner.lock();
         match &mut *inner {
-            EventFileInner::Eventfd { counter, .. } => {
-                if let Some(new_value) = (*counter).checked_add(value)
-                    // The maximum value that may be stored in the counter is the largest unsigned
-                    // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
-                    && new_value != u64::MAX
-                {
-                    *counter = new_value;
-                    drop(inner);
-                    self.pollee.notify_observers(Events::IN);
-                    return Ok(8);
-                }
-                Err(TryOpError::TryAgain)
-            }
             EventFileInner::BrokerBacked {
                 provider, common, ..
             } => {
@@ -634,10 +563,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
-        let writable = matches!(
-            *self.inner.lock(),
-            EventFileInner::Eventfd { .. } | EventFileInner::BrokerBacked { .. }
-        );
+        let writable = matches!(*self.inner.lock(), EventFileInner::BrokerBacked { .. });
         if !writable {
             let _ = (cx, value);
             return Err(Errno::EINVAL);
@@ -736,16 +662,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
         let mut inner = self.inner.lock();
         let mut events = Events::empty();
         match &mut *inner {
-            EventFileInner::Eventfd { counter, .. } => {
-                if *counter != 0 {
-                    events |= Events::IN;
-                }
-                // if it is possible to write a value of at least "1"
-                // without blocking, the file is writable
-                if *counter < u64::MAX - 1 {
-                    events |= Events::OUT;
-                }
-            }
             EventFileInner::Timerfd(timer) => {
                 timer.update();
                 if timer.pending_expirations != 0 {
@@ -833,7 +749,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                         .register_observer(observer, observer_mask);
                 }
             }
-            EventFileInner::Eventfd { .. } | EventFileInner::Timerfd(_) => {
+            EventFileInner::Timerfd(_) => {
                 drop(inner);
                 self.pollee.register_observer(observer, mask);
             }
@@ -878,7 +794,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
             | EventFileInner::PidfdBrokerBacked { common, .. } => {
                 common.ensure_subscribed(&self.pollee);
             }
-            _ => {}
+            EventFileInner::Pidfd { .. } | EventFileInner::Timerfd(_) => {}
         }
     }
 }
@@ -1017,6 +933,254 @@ fn nanos_to_duration(nanos: u128) -> Option<Duration> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    extern crate std;
+
+    use alloc::{sync::Arc, vec::Vec};
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    use litebox_common_linux::{
+        EfdFlags,
+        broker_eventfd_provider::{BrokerEventCallback, BrokerEventfdProvider, BrokerOpError},
+        cwfd::{
+            broker_subscribable::BrokerSubscribable,
+            notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT},
+        },
+    };
+
+    use super::EventFile;
+
+    #[derive(Default)]
+    struct EventfdState {
+        counter: u64,
+        semaphore: bool,
+        subscriptions: BTreeMap<u64, Subscription>,
+    }
+
+    struct Subscription {
+        events_mask: u32,
+        callback: Arc<dyn BrokerEventCallback>,
+    }
+
+    #[derive(Default)]
+    struct ProviderState {
+        next_handle: u64,
+        next_subscription: u64,
+        eventfds: BTreeMap<u64, EventfdState>,
+    }
+
+    pub(crate) struct TestBrokerEventfdProvider {
+        state: Mutex<ProviderState>,
+        reads: AtomicU64,
+        writes: AtomicU64,
+        releases: AtomicU64,
+    }
+
+    impl TestBrokerEventfdProvider {
+        pub(crate) fn new() -> Self {
+            Self {
+                state: Mutex::new(ProviderState {
+                    next_handle: 1,
+                    next_subscription: 1,
+                    eventfds: BTreeMap::new(),
+                }),
+                reads: AtomicU64::new(0),
+                writes: AtomicU64::new(0),
+                releases: AtomicU64::new(0),
+            }
+        }
+
+        pub(crate) fn counter(&self, handle: u64) -> Option<u64> {
+            self.state
+                .lock()
+                .unwrap()
+                .eventfds
+                .get(&handle)
+                .map(|eventfd| eventfd.counter)
+        }
+
+        pub(crate) fn reads(&self) -> u64 {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn writes(&self) -> u64 {
+            self.writes.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn releases(&self) -> u64 {
+            self.releases.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BrokerSubscribable for TestBrokerEventfdProvider {
+        fn subscribe(
+            &self,
+            handle: u64,
+            events_mask: u32,
+            callback: Arc<dyn BrokerEventCallback>,
+        ) -> Result<u64, BrokerOpError> {
+            let mut state = self.state.lock().unwrap();
+            let subscription_id = state.next_subscription;
+            state.next_subscription += 1;
+            let eventfd = state
+                .eventfds
+                .get_mut(&handle)
+                .ok_or(BrokerOpError::UnknownHandle)?;
+            eventfd.subscriptions.insert(
+                subscription_id,
+                Subscription {
+                    events_mask,
+                    callback,
+                },
+            );
+            Ok(subscription_id)
+        }
+
+        fn unsubscribe(&self, handle: u64, subscription_id: u64) {
+            if let Some(eventfd) = self.state.lock().unwrap().eventfds.get_mut(&handle) {
+                eventfd.subscriptions.remove(&subscription_id);
+            }
+        }
+
+        fn release(&self, _handle: u64) {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+            if self.state.lock().unwrap().eventfds.contains_key(&handle) {
+                Ok(())
+            } else {
+                Err(BrokerOpError::UnknownHandle)
+            }
+        }
+
+        fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
+            let state = self.state.lock().unwrap();
+            let eventfd = state
+                .eventfds
+                .get(&handle)
+                .ok_or(BrokerOpError::UnknownHandle)?;
+            Ok(readiness_bits(eventfd.counter))
+        }
+    }
+
+    impl BrokerEventfdProvider for TestBrokerEventfdProvider {
+        fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
+            if initial == u64::MAX {
+                return Err(BrokerOpError::InvalidValue);
+            }
+            let mut state = self.state.lock().unwrap();
+            let handle = state.next_handle;
+            state.next_handle += 1;
+            state.eventfds.insert(
+                handle,
+                EventfdState {
+                    counter: initial,
+                    semaphore,
+                    subscriptions: BTreeMap::new(),
+                },
+            );
+            Ok(handle)
+        }
+
+        fn read_eventfd(&self, handle: u64) -> Result<u64, BrokerOpError> {
+            let callbacks = {
+                let mut state = self.state.lock().unwrap();
+                let eventfd = state
+                    .eventfds
+                    .get_mut(&handle)
+                    .ok_or(BrokerOpError::UnknownHandle)?;
+                if eventfd.counter == 0 {
+                    return Err(BrokerOpError::WouldBlock);
+                }
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                let value = if eventfd.semaphore {
+                    eventfd.counter -= 1;
+                    1
+                } else {
+                    core::mem::take(&mut eventfd.counter)
+                };
+                let callbacks = matching_callbacks(eventfd, NOTIFY_EVENT_OUT);
+                (value, callbacks)
+            };
+            notify(callbacks.1, NOTIFY_EVENT_OUT);
+            Ok(callbacks.0)
+        }
+
+        fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {
+            if value == u64::MAX {
+                return Err(BrokerOpError::InvalidValue);
+            }
+            let callbacks = {
+                let mut state = self.state.lock().unwrap();
+                let eventfd = state
+                    .eventfds
+                    .get_mut(&handle)
+                    .ok_or(BrokerOpError::UnknownHandle)?;
+                let Some(new_value) = eventfd.counter.checked_add(value) else {
+                    return Err(BrokerOpError::WouldBlock);
+                };
+                if new_value == u64::MAX {
+                    return Err(BrokerOpError::WouldBlock);
+                }
+                eventfd.counter = new_value;
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                matching_callbacks(eventfd, NOTIFY_EVENT_IN)
+            };
+            notify(callbacks, NOTIFY_EVENT_IN);
+            Ok(())
+        }
+    }
+
+    fn readiness_bits(counter: u64) -> u32 {
+        let mut events = 0;
+        if counter != 0 {
+            events |= NOTIFY_EVENT_IN;
+        }
+        if counter < u64::MAX - 1 {
+            events |= NOTIFY_EVENT_OUT;
+        }
+        events
+    }
+
+    fn matching_callbacks(
+        eventfd: &EventfdState,
+        events: u32,
+    ) -> Vec<Arc<dyn BrokerEventCallback>> {
+        eventfd
+            .subscriptions
+            .values()
+            .filter(|subscription| subscription.events_mask & events != 0)
+            .map(|subscription| Arc::clone(&subscription.callback))
+            .collect()
+    }
+
+    fn notify(callbacks: Vec<Arc<dyn BrokerEventCallback>>, events: u32) {
+        for callback in callbacks {
+            callback.on_events(events);
+        }
+    }
+
+    pub(crate) fn new_mock_broker_eventfd(
+        count: u64,
+        flags: EfdFlags,
+    ) -> (
+        Arc<TestBrokerEventfdProvider>,
+        u64,
+        EventFile<litebox_platform_multiplex::Platform>,
+    ) {
+        let provider = Arc::new(TestBrokerEventfdProvider::new());
+        let handle = provider
+            .create_eventfd(count, flags.contains(EfdFlags::SEMAPHORE))
+            .expect("mock eventfd creation failed");
+        let provider_dyn: Arc<dyn BrokerEventfdProvider> = provider.clone();
+        let eventfd = EventFile::new_broker_backed(provider_dyn, handle, flags);
+        (provider, handle, eventfd)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use core::time::Duration;
 
@@ -1033,7 +1197,8 @@ mod tests {
     fn test_semaphore_eventfd() {
         let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::SEMAPHORE));
+        let (_, _, eventfd) = super::test_support::new_mock_broker_eventfd(0, EfdFlags::SEMAPHORE);
+        let eventfd = alloc::sync::Arc::new(eventfd);
         let total = 8;
         for _ in 0..total {
             let copied_eventfd = eventfd.clone();
@@ -1054,7 +1219,8 @@ mod tests {
     fn test_blocking_eventfd() {
         let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::empty()));
+        let (_, _, eventfd) = super::test_support::new_mock_broker_eventfd(0, EfdFlags::empty());
+        let eventfd = alloc::sync::Arc::new(eventfd);
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             copied_eventfd
@@ -1079,7 +1245,8 @@ mod tests {
     fn test_blocking_eventfd_no_race_on_massive_readwrite() {
         let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::empty()));
+        let (_, _, eventfd) = super::test_support::new_mock_broker_eventfd(0, EfdFlags::empty());
+        let eventfd = alloc::sync::Arc::new(eventfd);
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             for _ in 0..10000 {
@@ -1099,7 +1266,8 @@ mod tests {
     fn test_nonblocking_eventfd() {
         let _task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::NONBLOCK));
+        let (_, _, eventfd) = super::test_support::new_mock_broker_eventfd(0, EfdFlags::NONBLOCK);
+        let eventfd = alloc::sync::Arc::new(eventfd);
         let copied_eventfd = eventfd.clone();
         std::thread::spawn(move || {
             // first write should succeed immediately
@@ -1176,92 +1344,24 @@ mod tests {
     #[test]
     fn test_broker_backed_eventfd_routes_read_write() {
         use alloc::sync::Arc;
-        use core::sync::atomic::{AtomicU64, Ordering};
-        use litebox_common_linux::broker_eventfd_provider::{
-            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
-        };
-
-        /// Mock provider: in-process counter modelling the broker.
-        struct MockProvider {
-            counter: AtomicU64,
-            reads: AtomicU64,
-            writes: AtomicU64,
-        }
-
-        impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable for MockProvider {
-            fn subscribe(
-                &self,
-                _handle: u64,
-                _events_mask: u32,
-                _cb: Arc<dyn BrokerEventCallback>,
-            ) -> Result<u64, BrokerOpError> {
-                Ok(1)
-            }
-            fn unsubscribe(&self, _handle: u64, _subscription_id: u64) {}
-            fn release(&self, _handle: u64) {}
-            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
-                Ok(())
-            }
-            fn query_events(&self, _handle: u64) -> Result<u32, BrokerOpError> {
-                Ok(0)
-            }
-        }
-
-        impl BrokerEventfdProvider for MockProvider {
-            fn create_eventfd(
-                &self,
-                _initial: u64,
-                _semaphore: bool,
-            ) -> Result<u64, BrokerOpError> {
-                Ok(7) // arbitrary fixed handle id
-            }
-            fn read_eventfd(&self, _handle: u64) -> Result<u64, BrokerOpError> {
-                self.reads.fetch_add(1, Ordering::SeqCst);
-                let v = self.counter.swap(0, Ordering::SeqCst);
-                if v == 0 {
-                    Err(BrokerOpError::WouldBlock)
-                } else {
-                    Ok(v)
-                }
-            }
-            fn write_eventfd(&self, _handle: u64, value: u64) -> Result<(), BrokerOpError> {
-                if value == u64::MAX {
-                    return Err(BrokerOpError::InvalidValue);
-                }
-                self.writes.fetch_add(1, Ordering::SeqCst);
-                self.counter.fetch_add(value, Ordering::SeqCst);
-                Ok(())
-            }
-        }
 
         let _task = crate::syscalls::tests::init_platform(None);
 
-        let provider = Arc::new(MockProvider {
-            counter: AtomicU64::new(0),
-            reads: AtomicU64::new(0),
-            writes: AtomicU64::new(0),
-        });
-        let provider_dyn: Arc<dyn BrokerEventfdProvider> = provider.clone();
+        let (provider, handle, eventfd) =
+            super::test_support::new_mock_broker_eventfd(0, EfdFlags::NONBLOCK);
+        let eventfd = Arc::new(eventfd);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new_broker_backed(
-            provider_dyn,
-            7,
-            EfdFlags::NONBLOCK,
-        ));
-
-        // Write 5 → provider.counter goes to 5.
         let n = eventfd
             .write(&WaitState::new(platform()).context(), 5)
             .unwrap();
         assert_eq!(n, 8);
-        assert_eq!(provider.counter.load(Ordering::SeqCst), 5);
-        assert_eq!(provider.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.counter(handle), Some(5));
+        assert_eq!(provider.writes(), 1);
 
-        // Read → returns 5, provider.counter back to 0.
         let v = eventfd.read(&WaitState::new(platform()).context()).unwrap();
         assert_eq!(v, 5);
-        assert_eq!(provider.counter.load(Ordering::SeqCst), 0);
-        assert_eq!(provider.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.counter(handle), Some(0));
+        assert_eq!(provider.reads(), 1);
 
         // Second read → WouldBlock, surfaces as EAGAIN because NONBLOCK is set.
         match eventfd.read(&WaitState::new(platform()).context()) {
@@ -1281,70 +1381,16 @@ mod tests {
     /// refcount that sys_eventfd2 set up at create.
     #[test]
     fn test_broker_backed_eventfd_drop_releases_handle() {
-        use alloc::sync::Arc;
-        use core::sync::atomic::{AtomicU32, Ordering};
-        use litebox_common_linux::broker_eventfd_provider::{
-            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
-        };
-
-        struct ReleaseCountingProvider {
-            releases: AtomicU32,
-        }
-
-        impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable
-            for ReleaseCountingProvider
-        {
-            fn subscribe(
-                &self,
-                _handle: u64,
-                _events_mask: u32,
-                _cb: Arc<dyn BrokerEventCallback>,
-            ) -> Result<u64, BrokerOpError> {
-                Ok(1)
-            }
-            fn unsubscribe(&self, _handle: u64, _subscription_id: u64) {}
-            fn release(&self, _handle: u64) {
-                self.releases.fetch_add(1, Ordering::SeqCst);
-            }
-            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
-                Ok(())
-            }
-            fn query_events(&self, _handle: u64) -> Result<u32, BrokerOpError> {
-                Ok(0)
-            }
-        }
-
-        impl BrokerEventfdProvider for ReleaseCountingProvider {
-            fn create_eventfd(
-                &self,
-                _initial: u64,
-                _semaphore: bool,
-            ) -> Result<u64, BrokerOpError> {
-                Ok(99)
-            }
-            fn read_eventfd(&self, _handle: u64) -> Result<u64, BrokerOpError> {
-                Err(BrokerOpError::WouldBlock)
-            }
-            fn write_eventfd(&self, _handle: u64, _value: u64) -> Result<(), BrokerOpError> {
-                Ok(())
-            }
-        }
-
         let _task = crate::syscalls::tests::init_platform(None);
 
-        let provider = Arc::new(ReleaseCountingProvider {
-            releases: AtomicU32::new(0),
-        });
-        let provider_dyn: Arc<dyn BrokerEventfdProvider> = provider.clone();
-
-        // Construct then drop.
+        let (provider, _, eventfd) =
+            super::test_support::new_mock_broker_eventfd(0, EfdFlags::empty());
         {
-            let _ef: super::EventFile<litebox_platform_multiplex::Platform> =
-                super::EventFile::new_broker_backed(provider_dyn, 99, EfdFlags::empty());
+            let _ef = eventfd;
         }
 
         assert_eq!(
-            provider.releases.load(Ordering::SeqCst),
+            provider.releases(),
             1,
             "EventFile::drop must call release_eventfd exactly once for the BrokerBacked variant",
         );

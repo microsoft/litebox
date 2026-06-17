@@ -1,11 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! AF_UNIX SOCK_STREAM socketpair probes for broker-backed vs local pairs.
+//! AF_UNIX SOCK_STREAM socketpair probes for broker-backed pairs.
 //!
-//! Native Linux is the gold standard. The `eager_off` legs intentionally keep
-//! running under Litebox and report any divergence in the test detail so the
-//! default-on flip keeps its historical motivation visible.
+//! Native Linux is the gold standard.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,23 +23,6 @@ const RUN: HandlerToken<ProbeArgs, ProbeOut> = HandlerToken::new("uds_stream.run
 const PAYLOAD_PARENT: &[u8] = b"uds-stream-parent-to-child";
 const PAYLOAD_CHILD: &[u8] = b"uds-stream-child-to-parent";
 const POLL_TIMEOUT_MS: i32 = 5_000;
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-enum BrokerMode {
-    EagerOn,
-    EagerOff,
-}
-
-impl BrokerMode {
-    const ALL: [Self; 2] = [Self::EagerOn, Self::EagerOff];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::EagerOn => "eager_on",
-            Self::EagerOff => "eager_off",
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 enum Scenario {
@@ -102,7 +83,6 @@ impl InheritVariant {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProbeArgs {
-    mode: BrokerMode,
     scenario: Scenario,
     inherit: InheritVariant,
     child_binary: Option<String>,
@@ -118,42 +98,32 @@ pub(crate) fn register_uds_stream_tests(reg: &mut Registry<'_>) {
     register_handler!(RUN, handle_run);
     register_leaf_subcommand!("uds-stream-child", leaf_child::run);
 
-    for mode in BrokerMode::ALL {
-        for scenario in Scenario::NONFORK {
-            register_case(reg, mode, scenario, InheritVariant::Inline, None);
-        }
-        for scenario in Scenario::FORK {
-            register_case(
-                reg,
-                mode,
-                scenario,
-                InheritVariant::ForkExecPie,
-                Some(BinaryType::PieGlibc),
-            );
-            register_case(
-                reg,
-                mode,
-                scenario,
-                InheritVariant::ForkExecNonPie,
-                Some(BinaryType::NonPieGlibc),
-            );
-        }
+    for scenario in Scenario::NONFORK {
+        register_case(reg, scenario, InheritVariant::Inline, None);
+    }
+    for scenario in Scenario::FORK {
+        register_case(
+            reg,
+            scenario,
+            InheritVariant::ForkExecPie,
+            Some(BinaryType::PieGlibc),
+        );
+        register_case(
+            reg,
+            scenario,
+            InheritVariant::ForkExecNonPie,
+            Some(BinaryType::NonPieGlibc),
+        );
     }
 }
 
 fn register_case(
     reg: &mut Registry<'_>,
-    mode: BrokerMode,
     scenario: Scenario,
     inherit: InheritVariant,
     child_binary_type: Option<BinaryType>,
 ) {
-    let id = format!(
-        "UDS_STREAM.{}.{}.{}",
-        mode.label(),
-        scenario.label(),
-        inherit.label()
-    );
+    let id = format!("UDS_STREAM.{}.{}", scenario.label(), inherit.label());
     reg.test("vscode", "uds_stream", id)
         .timeout(30)
         .build(move |cx| {
@@ -165,7 +135,6 @@ fn register_case(
                         crate::binary_path(bt, &self_exe)
                     });
                     let args = ProbeArgs {
-                        mode,
                         scenario,
                         inherit,
                         child_binary,
@@ -183,14 +152,6 @@ async fn handle_run(args: ProbeArgs, _ctx: &mut HandlerCtx<'_>) -> Result<ProbeO
     let result = run_probe(&args);
     match result {
         Ok(detail) => Ok(ProbeOut { ok: true, detail }),
-        Err(e) if args.mode == BrokerMode::EagerOff => Ok(ProbeOut {
-            ok: true,
-            detail: format!(
-                "documented eager_off divergence: scenario={} inherit={} error={e}",
-                args.scenario.label(),
-                args.inherit.label()
-            ),
-        }),
         Err(e) => Ok(ProbeOut {
             ok: false,
             detail: e,

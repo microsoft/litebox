@@ -34,28 +34,10 @@ use litebox_common_linux::{
 use litebox_platform_multiplex::Platform;
 
 use super::broker_backed::{BrokerBackedCommon, broker_err_to_errno};
-use super::fork_snapshot::BrokerHandleSnapshot;
+use super::fork_snapshot::FdKind;
 
 static BROKER_SOCKETPAIR_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerSocketPairProvider>> =
     once_cell::race::OnceBox::new();
-
-/// Phase F: dynamic gate for the eager-broker `sys_socketpair`
-/// codepath. The runner sets this from the env var
-/// `LITEBOX_EAGER_BROKER_SOCKETPAIR=1` at startup, before any guest
-/// `socketpair` can run. Default is `false` (legacy in-shim
-/// `UnixSocket` fallback) so the committed baseline is unchanged
-/// while broker-backed socketpair is iterated on.
-static EAGER_BROKER_SOCKETPAIR_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-pub fn set_eager_broker_socketpair_enabled(enabled: bool) {
-    EAGER_BROKER_SOCKETPAIR_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
-}
-
-#[inline]
-pub fn eager_broker_socketpair_enabled() -> bool {
-    EAGER_BROKER_SOCKETPAIR_ENABLED.load(core::sync::atomic::Ordering::Acquire)
-}
 
 pub fn set_broker_socketpair_provider(
     provider: Arc<dyn BrokerSocketPairProvider>,
@@ -165,8 +147,8 @@ where
         );
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> BrokerHandleSnapshot {
-        BrokerHandleSnapshot::UnixSocket {
+    pub(crate) fn fork_snapshot_handle(&self) -> FdKind {
+        FdKind::BrokerSocketPair {
             handle_id: self.handle(),
             endpoint: self.endpoint,
         }

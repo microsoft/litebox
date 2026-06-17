@@ -616,7 +616,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
     ///
     /// The snapshot variant determines which broker provider to consult
     /// and how to build the per-fd shim entry. Match is exhaustive; new
-    /// `BrokerHandleSnapshot` variants fail to compile here.
+    /// `FdKind` variants fail to compile here.
     ///
     /// `pipe_flags` is the open-flags bits (NONBLOCK in particular) the
     /// caller wants applied to the constructed fd. For PTYs it is
@@ -626,13 +626,13 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
     pub fn install_broker_bridge_fd(
         &self,
         guest_fd: usize,
-        snapshot: syscalls::fork_snapshot::BrokerHandleSnapshot,
+        snapshot: syscalls::fork_snapshot::FdKind,
         pipe_flags: litebox::fs::OFlags,
     ) -> Result<(), ()> {
-        use syscalls::fork_snapshot::BrokerHandleSnapshot;
+        use syscalls::fork_snapshot::FdKind;
         let files = self.task.files.borrow();
         match snapshot {
-            BrokerHandleSnapshot::Eventfd { handle_id } => {
+            FdKind::Eventfd { handle_id } => {
                 let provider = syscalls::eventfd::broker_eventfd_provider().ok_or(())?;
                 let event_file = syscalls::eventfd::EventFile::new_broker_backed(
                     provider,
@@ -642,7 +642,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 self.install_eventfd_at_slot(event_file, guest_fd, &files);
                 Ok(())
             }
-            BrokerHandleSnapshot::Pidfd { handle_id } => {
+            FdKind::Pidfd { handle_id } => {
                 let target_pid =
                     litebox::process::ProcessId(u32::try_from(handle_id).map_err(|_| ())?);
                 let subscription =
@@ -656,7 +656,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 self.install_eventfd_at_slot(event_file, guest_fd, &files);
                 Ok(())
             }
-            BrokerHandleSnapshot::Pipe {
+            FdKind::BrokerPipe {
                 handle_id,
                 direction,
             } => {
@@ -677,7 +677,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(bp_fd);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "pipe")
             }
-            BrokerHandleSnapshot::UnixSocket {
+            FdKind::BrokerSocketPair {
                 handle_id,
                 endpoint,
             } => {
@@ -704,7 +704,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(sp_fd);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "unix_socket")
             }
-            BrokerHandleSnapshot::SocketDgram { handle_id } => {
+            FdKind::BrokerSocketDgram { handle_id } => {
                 let provider =
                     syscalls::broker_socket_dgram::broker_socket_dgram_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -726,7 +726,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(dgram);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "socket_dgram")
             }
-            BrokerHandleSnapshot::SocketSeqPacket { handle_id } => {
+            FdKind::BrokerSocketSeqPacket { handle_id } => {
                 let provider =
                     syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider()
                         .ok_or(())?;
@@ -754,7 +754,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     "socket_seqpacket",
                 )
             }
-            BrokerHandleSnapshot::TcpConn { handle_id } => {
+            FdKind::BrokerTcpConn { handle_id } => {
                 let provider = syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
                 let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
@@ -773,7 +773,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                         .insert(tcp_fd);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "tcp_conn")
             }
-            BrokerHandleSnapshot::InetDgram { handle_id } => {
+            FdKind::BrokerInetDgram { handle_id } => {
                 let provider =
                     syscalls::broker_inet_dgram::broker_inet_dgram_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -795,7 +795,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(dgram);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "inet_dgram")
             }
-            BrokerHandleSnapshot::InetListener { handle_id } => {
+            FdKind::BrokerInetListener { handle_id } => {
                 let provider =
                     syscalls::broker_inet_listener::broker_inet_listener_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -831,11 +831,11 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             // runner level but no early panic). Make it a hard
             // failure so a snapshot carrying this kind crashes loudly
             // instead of leaking broker refs and stalling readers.
-            BrokerHandleSnapshot::Signalfd { handle_id } => todo!(
-                "install_broker_bridge_fd for BrokerHandleSnapshot::Signalfd \
+            FdKind::Signalfd { handle_id } => todo!(
+                "install_broker_bridge_fd for FdKind::Signalfd \
                  not implemented yet (guest_fd={guest_fd}, handle_id={handle_id})"
             ),
-            BrokerHandleSnapshot::Pty {
+            FdKind::BrokerPty {
                 handle_id,
                 role,
                 pty_id,
@@ -847,6 +847,15 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .map_err(|_| ())?;
                 self.install_broker_pty_at_slot(pty_fd, guest_fd, &files)
             }
+            FdKind::Timerfd { .. }
+            | FdKind::BrokerInetRaw { .. }
+            | FdKind::FilesystemFd
+            | FdKind::UnixSocket
+            | FdKind::Epoll
+            | FdKind::Inotify
+            | FdKind::HostPassthrough { .. } => Err(()),
+            #[cfg(feature = "worker_local_inet")]
+            FdKind::Net => Err(()),
         }
     }
 
@@ -1827,465 +1836,222 @@ impl<FS: ShimFS> LinuxShim<FS> {
         );
         child_files.initialize_stdio_in_shared_descriptors_table(&self.global);
 
-        // Restore terminal fds beyond stdio.  Fds 0/1/2 are already
-        // populated by initialize_stdio; skip them to avoid slot collisions.
-        // Terminal filesystem fds (tty/pty metadata) are reconnected via
-        // /dev/tty; tty-backed stdio aliases use their original /dev/std* path.
+        // Restore snapshot fd entries from the canonical fd-kind taxonomy.
         {
             use litebox::fs::{Mode, OFlags};
-            use syscalls::fork_snapshot::{BrokerHandleSnapshot, FdClass};
-
-            for entry in &fd_table.entries {
-                // Skip stdio slots (already initialized above) and non-FS fds.
-                if entry.fd <= 2 || entry.class != FdClass::FilesystemFd {
-                    continue;
-                }
-                let meta = &entry.metadata;
-                if !meta.is_host_tty_alias
-                    && !meta.is_host_pty_device
-                    && meta.host_stdio_source_fd.is_none()
-                {
-                    continue;
-                }
-
-                // Choose the right device path based on the fd's origin.
-                let (path, flags) = if meta.is_host_tty_alias || meta.is_host_pty_device {
-                    ("/dev/tty", OFlags::RDWR)
-                } else if let Some(source_fd) = meta.host_stdio_source_fd {
-                    match source_fd {
-                        0 => ("/dev/stdin", OFlags::RDONLY),
-                        1 => ("/dev/stdout", OFlags::WRONLY),
-                        _ => ("/dev/stderr", OFlags::WRONLY),
-                    }
-                } else {
-                    continue;
-                };
-
-                let Ok(fd_handle) = child_files.fs.open(path, flags, Mode::empty()) else {
-                    continue;
-                };
-
-                // Attach metadata markers matching the snapshot.
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let mut rds = child_files.raw_descriptor_store.write();
-                let status_flags = OFlags::APPEND | flags;
-                dt.set_entry_metadata(&fd_handle, StdioStatusFlags(status_flags));
-                if meta.is_host_tty_alias {
-                    dt.set_entry_metadata(&fd_handle, HostTtyAlias);
-                }
-                if meta.is_host_pty_device {
-                    dt.set_entry_metadata(&fd_handle, syscalls::file::HostPtyDeviceFd);
-                }
-                if let Some(source_fd) = meta.host_stdio_source_fd {
-                    dt.set_entry_metadata(&fd_handle, HostStdioSourceFd(source_fd));
-                }
-                let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
-                debug_assert!(success, "fd slot {} already occupied", entry.fd);
-                drop(rds);
-                drop(dt);
-            }
-
-            // Restore broker-backed PTY fds by re-attaching to the broker handle.
-            for entry in &fd_table.entries {
-                if entry.class != FdClass::FilesystemFd {
-                    continue;
-                }
-                let Some(broker_handle) = entry.metadata.broker_handle else {
-                    continue;
-                };
-                let BrokerHandleSnapshot::Pty {
-                    handle_id,
-                    role,
-                    pty_id,
-                } = broker_handle
-                else {
-                    // Non-Pty broker_handle on a FilesystemFd entry:
-                    // handled by other restore branches (or not
-                    // installed if no provider). FdClass::FilesystemFd
-                    // is the only `FdClass` arm that accepts
-                    // `BrokerHandleSnapshot::Pty` per snapshot_fd_table.
-                    continue;
-                };
-                let Some(provider) = syscalls::broker_pty::broker_pty_provider() else {
-                    continue;
-                };
-                let Ok(pty_fd) = syscalls::broker_pty::BrokerPtyProviderReacquireExt::reacquire(
-                    &provider, handle_id, role, pty_id,
-                ) else {
-                    continue;
-                };
-                let typed: litebox::fd::TypedFd<syscalls::broker_pty::BrokerPtySubsystem> =
-                    self.global.litebox.descriptor_table_mut().insert(pty_fd);
-                let mut rds = child_files.raw_descriptor_store.write();
-                if entry.fd <= 2 {
-                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                }
-                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
-                debug_assert!(
-                    success,
-                    "broker pty fd slot {} occupied during restore",
-                    entry.fd
-                );
-            }
-
-            // Restore non-terminal FilesystemFd entries.  Reopen by path
-            // if available, fall back to /dev/null.  For stdio slots (0-2),
-            // consume the pre-populated entry first.
-            for entry in &fd_table.entries {
-                if entry.class != FdClass::FilesystemFd {
-                    continue;
-                }
-                let meta = &entry.metadata;
-                // Skip terminal fds, host stdio, and broker-backed PTYs (already handled above).
-                if meta.is_host_tty_alias
-                    || meta.is_host_pty_device
-                    || meta.host_stdio_source_fd.is_some()
-                    || matches!(meta.broker_handle, Some(BrokerHandleSnapshot::Pty { .. }))
-                {
-                    continue;
-                }
-
-                let path = fd_table
-                    .open_file_descriptions
-                    .iter()
-                    .find(|ofd| ofd.object_id == entry.object_id)
-                    .and_then(|ofd| ofd.reopen_path.as_deref())
-                    .unwrap_or("/dev/null");
-                // Use captured access mode, falling back to RDONLY.
-                let access_bits = entry.status_flags & 0x3; // O_ACCMODE
-                let flags = match access_bits {
-                    1 => OFlags::WRONLY,
-                    2 => OFlags::RDWR,
-                    _ => OFlags::RDONLY,
-                };
-                let Ok(fd_handle) = child_files
-                    .fs
-                    .open(path, flags, Mode::empty())
-                    .or_else(|_| {
-                        // Try RDONLY if the original mode failed.
-                        child_files.fs.open(path, OFlags::RDONLY, Mode::empty())
-                    })
-                    .or_else(|_| {
-                        child_files
-                            .fs
-                            .open("/dev/null", OFlags::RDWR, Mode::empty())
-                    })
-                else {
-                    continue;
-                };
-
-                // For stdio slots, consume the pre-populated entry.
-                // For higher fds, the slot is empty.
-                let mut rds = child_files.raw_descriptor_store.write();
-                if entry.fd <= 2 {
-                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                }
-                let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
-                debug_assert!(success, "fd slot {} occupied during restore", entry.fd);
-                drop(rds);
-            }
-        }
-
-        // Recreate unconnected Unix sockets. Connected/socketpair descriptors
-        // are also seeded here so any bridge fd installation below has an fd
-        // table entry to replace with the cross-process host passthrough fd.
-        {
             use litebox_common_linux::{SockFlags, SockType};
-            use syscalls::fork_snapshot::{BrokerHandleSnapshot, FdClass};
+            use syscalls::fork_snapshot::FdKind;
 
             for entry in &fd_table.entries {
-                if entry.class != FdClass::UnixSocket {
-                    continue;
-                }
+                match entry.kind {
+                    FdKind::FilesystemFd => {
+                        if entry.fd <= 2
+                            && fd_table.stdio_object_ids.contains(&Some(entry.object_id))
+                        {
+                            continue;
+                        }
 
-                // Phase F: if the snapshot carries a broker UnixSocket
-                // handle for this slot, install a BrokerSocketPairFd. Bump
-                // the handle on this connection so its on_close release is
-                // tracked locally; the parent's transit ref is drained later.
-                if let Some(broker_handle) = entry.metadata.broker_handle {
-                    // Exhaustive match (no wildcards: see AGENTS.md "Match
-                    // exhaustiveness, no catch-alls, loud failure for logic
-                    // errors"). Adding a new `BrokerHandleSnapshot` variant
-                    // fails to compile here, forcing an explicit
-                    // accept/reject decision for the UnixSocket restore path.
-                    match broker_handle {
-                        BrokerHandleSnapshot::UnixSocket {
-                            handle_id,
-                            endpoint,
-                        } => {
-                            let Some(provider) =
-                                syscalls::broker_socketpair::broker_socketpair_provider()
+                        let meta = &entry.metadata;
+                        if meta.is_host_tty_alias
+                            || meta.is_host_pty_device
+                            || meta.host_stdio_source_fd.is_some()
+                        {
+                            // Restore terminal fds beyond stdio.  Fds 0/1/2 are already
+                            // populated by initialize_stdio; skip them to avoid slot collisions.
+                            // Terminal filesystem fds (tty/pty metadata) are reconnected via
+                            // /dev/tty; tty-backed stdio aliases use their original /dev/std* path.
+                            if entry.fd <= 2 {
+                                continue;
+                            }
+
+                            // Choose the right device path based on the fd's origin.
+                            let (path, flags) = if meta.is_host_tty_alias || meta.is_host_pty_device
+                            {
+                                ("/dev/tty", OFlags::RDWR)
+                            } else if let Some(source_fd) = meta.host_stdio_source_fd {
+                                match source_fd {
+                                    0 => ("/dev/stdin", OFlags::RDONLY),
+                                    1 => ("/dev/stdout", OFlags::WRONLY),
+                                    _ => ("/dev/stderr", OFlags::WRONLY),
+                                }
+                            } else {
+                                continue;
+                            };
+
+                            let Ok(fd_handle) = child_files.fs.open(path, flags, Mode::empty())
                             else {
                                 continue;
                             };
-                            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
-                            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
-                                alloc::sync::Arc::clone(&provider) as _;
-                            let _ = releaser.dup_handle(handle_id);
-                            let sp_fd =
-                                syscalls::broker_socketpair::BrokerSocketPairFd::<Platform>::new(
-                                    provider,
-                                    handle_id,
-                                    endpoint,
-                                    litebox::fs::OFlags::empty(),
-                                );
-                            let typed = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .insert::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
-                                sp_fd,
-                            );
+
+                            // Attach metadata markers matching the snapshot.
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let mut rds = child_files.raw_descriptor_store.write();
+                            let status_flags = OFlags::APPEND | flags;
+                            dt.set_entry_metadata(&fd_handle, StdioStatusFlags(status_flags));
+                            if meta.is_host_tty_alias {
+                                dt.set_entry_metadata(&fd_handle, HostTtyAlias);
+                            }
+                            if meta.is_host_pty_device {
+                                dt.set_entry_metadata(&fd_handle, syscalls::file::HostPtyDeviceFd);
+                            }
+                            if let Some(source_fd) = meta.host_stdio_source_fd {
+                                dt.set_entry_metadata(&fd_handle, HostStdioSourceFd(source_fd));
+                            }
+                            let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
+                            debug_assert!(success, "fd slot {} already occupied", entry.fd);
+                            drop(rds);
+                            drop(dt);
+                        } else {
+                            // Restore non-terminal FilesystemFd entries.  Reopen by path
+                            // if available, fall back to /dev/null.  For stdio slots (0-2),
+                            // consume the pre-populated entry first.
+                            let path = fd_table
+                                .open_file_descriptions
+                                .iter()
+                                .find(|ofd| ofd.object_id == entry.object_id)
+                                .and_then(|ofd| ofd.reopen_path.as_deref())
+                                .unwrap_or("/dev/null");
+                            // Use captured access mode, falling back to RDONLY.
+                            let access_bits = entry.status_flags & 0x3; // O_ACCMODE
+                            let flags = match access_bits {
+                                1 => OFlags::WRONLY,
+                                2 => OFlags::RDWR,
+                                _ => OFlags::RDONLY,
+                            };
+                            let Ok(fd_handle) = child_files
+                                .fs
+                                .open(path, flags, Mode::empty())
+                                .or_else(|_| {
+                                    // Try RDONLY if the original mode failed.
+                                    child_files.fs.open(path, OFlags::RDONLY, Mode::empty())
+                                })
+                                .or_else(|_| {
+                                    child_files
+                                        .fs
+                                        .open("/dev/null", OFlags::RDWR, Mode::empty())
+                                })
+                            else {
+                                continue;
+                            };
+
+                            // For stdio slots, consume the pre-populated entry.
+                            // For higher fds, the slot is empty.
                             let mut rds = child_files.raw_descriptor_store.write();
                             if entry.fd <= 2 {
                                 let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
                             }
-                            let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
-                            debug_assert!(
-                                success,
-                                "broker_socketpair fd slot {} occupied during restore",
-                                entry.fd
-                            );
-                            continue;
+                            let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
+                            debug_assert!(success, "fd slot {} occupied during restore", entry.fd);
+                            drop(rds);
                         }
-                        BrokerHandleSnapshot::TcpConn { handle_id } => {
-                            let Some(provider) =
-                                syscalls::broker_tcp_conn::broker_tcp_conn_provider()
-                            else {
-                                continue;
-                            };
-                            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
-                            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
-                                alloc::sync::Arc::clone(&provider) as _;
-                            let _ = releaser.dup_handle(handle_id);
-                            let tcp_fd =
-                                syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
-                                    provider,
-                                    handle_id,
-                                    litebox::fs::OFlags::from_bits_retain(entry.status_flags),
-                                );
-                            let typed = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .insert::<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(
-                                tcp_fd,
-                            );
-                            let mut rds = child_files.raw_descriptor_store.write();
-                            if entry.fd <= 2 {
-                                let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                            }
-                            let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
-                            debug_assert!(
-                                success,
-                                "broker_tcp_conn fd slot {} occupied during restore",
-                                entry.fd
-                            );
-                            continue;
-                        }
-                        // AF_UNIX SOCK_DGRAM: re-attach by broker handle.
-                        // Without this arm a fork restore silently fell
-                        // through to creating a fresh disconnected local
-                        // stream socket, making any queued datagram
-                        // unreachable from the child. The UDS_DGRAM gap
-                        // was silent (no test exercised SOCK_DGRAM
-                        // peer-read-after-fork until this fix).
-                        BrokerHandleSnapshot::SocketDgram { handle_id } => {
-                            let Some(provider) =
-                                syscalls::broker_socket_dgram::broker_socket_dgram_provider()
-                            else {
-                                continue;
-                            };
-                            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
-                            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
-                                alloc::sync::Arc::clone(&provider) as _;
-                            let _ = releaser.dup_handle(handle_id);
-                            let dgram_fd = syscalls::broker_socket_dgram::BrokerSocketDgramFd::<
-                                Platform,
-                            >::new(
-                                provider,
-                                handle_id,
-                                litebox::fs::OFlags::from_bits_retain(entry.status_flags),
-                            );
-                            let typed = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .insert::<syscalls::broker_socket_dgram::BrokerSocketDgramSubsystem>(
-                                    dgram_fd,
-                                );
-                            let mut rds = child_files.raw_descriptor_store.write();
-                            if entry.fd <= 2 {
-                                let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                            }
-                            let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
-                            debug_assert!(
-                                success,
-                                "broker_socket_dgram fd slot {} occupied during restore",
-                                entry.fd
-                            );
-                            continue;
-                        }
-                        // AF_UNIX SOCK_SEQPACKET: re-attach by broker
-                        // handle. Without this arm `UDS_SEQPACKET.
-                        // fork_restore_inherit` failed because the child
-                        // got a fresh disconnected stream socket instead
-                        // of a re-attached SEQPACKET endpoint.
-                        BrokerHandleSnapshot::SocketSeqPacket { handle_id } => {
-                            let Some(provider) =
-                                syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider(
-                                )
-                            else {
-                                continue;
-                            };
-                            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
-                            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
-                                alloc::sync::Arc::clone(&provider) as _;
-                            let _ = releaser.dup_handle(handle_id);
-                            let seq_fd = syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<
-                                Platform,
-                            >::new(
-                                provider,
-                                handle_id,
-                                litebox::fs::OFlags::from_bits_retain(entry.status_flags),
-                            );
-                            let typed = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .insert::<syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(
-                                    seq_fd,
-                                );
-                            let mut rds = child_files.raw_descriptor_store.write();
-                            if entry.fd <= 2 {
-                                let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                            }
-                            let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
-                            debug_assert!(
-                                success,
-                                "broker_socket_seqpacket fd slot {} occupied during restore",
-                                entry.fd
-                            );
-                            continue;
-                        }
-                        // Variants that cannot legitimately appear under
-                        // `FdClass::UnixSocket` per the snapshot wire
-                        // format invariant (snapshot_fd_table classifies
-                        // these into other FdClass values). Panic loudly
-                        // per AGENTS.md "loud failure for logic errors".
-                        BrokerHandleSnapshot::Eventfd { .. }
-                        | BrokerHandleSnapshot::Pidfd { .. }
-                        | BrokerHandleSnapshot::Signalfd { .. }
-                        | BrokerHandleSnapshot::Pty { .. }
-                        | BrokerHandleSnapshot::Pipe { .. }
-                        | BrokerHandleSnapshot::InetListener { .. }
-                        | BrokerHandleSnapshot::InetDgram { .. } => unreachable!(
-                            "{broker_handle:?} cannot appear in a FdClass::UnixSocket entry",
-                        ),
                     }
-                }
-
-                // Non-broker-backed UnixSocket entry: fall through to a
-                // fresh local stream socket. This is the legitimate
-                // restore for entries with `metadata.broker_handle.is_none()`
-                // (unconnected sockets recorded in the snapshot).
-                if let Some(socket) =
-                    syscalls::unix::UnixSocket::<FS>::new(SockType::Stream, SockFlags::empty())
-                {
-                    let file = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .insert::<syscalls::unix::UnixSocketSubsystem<FS>>(socket);
-                    let mut rds = child_files.raw_descriptor_store.write();
-                    if entry.fd <= 2 {
-                        let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                    FdKind::UnixSocket => {
+                        // Local (non-broker) AF_UNIX socket: create a fresh
+                        // stream socket. Broker-backed AF_UNIX sockets are
+                        // distinct FdKind variants (BrokerSocketPair / Dgram /
+                        // SeqPacket) restored by their own arms; FdKind::UnixSocket
+                        // is only the local unconnected case recorded in the snapshot.
+                        if let Some(socket) = syscalls::unix::UnixSocket::<FS>::new(
+                            SockType::Stream,
+                            SockFlags::empty(),
+                        ) {
+                            let file = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .insert::<syscalls::unix::UnixSocketSubsystem<FS>>(socket);
+                            let mut rds = child_files.raw_descriptor_store.write();
+                            if entry.fd <= 2 {
+                                let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                            }
+                            let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                            debug_assert!(
+                                success,
+                                "unix fd slot {} occupied during restore",
+                                entry.fd
+                            );
+                        }
                     }
-                    let success = rds.fd_into_specific_raw_integer(file, entry.fd);
-                    debug_assert!(success, "unix fd slot {} occupied during restore", entry.fd);
-                }
-            }
-        }
-
-        // Restore broker-backed inet listener fds by re-attaching to the broker handle.
-        {
-            use syscalls::fork_snapshot::{BrokerHandleSnapshot, FdClass};
-            for entry in &fd_table.entries {
-                if entry.class != FdClass::InetListener {
-                    continue;
-                }
-                let Some(broker_handle) = entry.metadata.broker_handle else {
-                    continue;
-                };
-                let BrokerHandleSnapshot::InetListener { handle_id } = broker_handle else {
-                    continue;
-                };
-                let Some(provider) =
-                    syscalls::broker_inet_listener::broker_inet_listener_provider()
-                else {
-                    continue;
-                };
-                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
-                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
-                    alloc::sync::Arc::clone(&provider) as _;
-                let _ = releaser.dup_handle(handle_id);
-                let listener =
-                    syscalls::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
-                        provider,
-                        handle_id,
-                        0,
-                        litebox::fs::OFlags::from_bits_retain(entry.status_flags),
-                    );
-                let typed = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
-                    .insert::<syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
-                    listener,
-                );
-                let mut rds = child_files.raw_descriptor_store.write();
-                if entry.fd <= 2 {
-                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                }
-                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
-                debug_assert!(
-                    success,
-                    "broker inet listener fd slot {} occupied during restore",
-                    entry.fd
-                );
-            }
-        }
-
-        // Phase 2.F.3: Recreate EventFd entries that carry a broker_handle
-        // reference. Re-attach to the same broker handle via the local
-        // provider's `dup_handle` semantics — the parent already dup'd
-        // the handle at snapshot capture, so adopting the existing ref
-        // requires no additional refcount changes.
-        //
-        // Entries without `broker_handle` (e.g. Eventfd with no provider
-        // available at snapshot time, or Timerfd) fall through to a
-        // fresh local fd at the next branch.
-        {
-            use syscalls::fork_snapshot::{BrokerHandleSnapshot, FdClass};
-            for entry in &fd_table.entries {
-                if entry.class != FdClass::EventFd {
-                    continue;
-                }
-                let Some(broker_handle) = entry.metadata.broker_handle else {
-                    continue;
-                };
-                let event_file: Option<syscalls::eventfd::EventFile<Platform>> =
-                    match broker_handle {
-                        BrokerHandleSnapshot::Eventfd { handle_id } => {
+                    FdKind::Epoll | FdKind::Inotify => {
+                        // Not snapshot-restored; migrated via `--broker-fd-bridge` specs installed later.
+                    }
+                    FdKind::HostPassthrough {
+                        token_id,
+                        direction,
+                    } => {
+                        // Restore host-fd tokens for HostPassthroughFdEntry entries.
+                        // INVARIANT: the aliased resource is a raw host fd that was already
+                        // registered with the fd-token broker during snapshot, not a broker-held
+                        // descriptor with durable per-fd state. The token is the explicit
+                        // cross-binary-type fork handoff; without it, HostPassthroughFd entries
+                        // must be treated as non-migratable across another worker hop.
+                        let Some(client) = litebox_common_linux::fd_token_client::global_client()
+                        else {
+                            continue;
+                        };
+                        let Ok(raw_fd) = client.materialize_raw_fd(token_id) else {
+                            let _ = client.release(token_id);
+                            continue;
+                        };
+                        let _ = client.release(token_id);
+                        let host_entry = syscalls::host_passthrough_fd::HostPassthroughFdEntry::new(
+                            raw_fd, direction,
+                        );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::host_passthrough_fd::HostPassthroughFd>(
+                            host_entry,
+                        );
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "host-token fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    #[cfg(feature = "worker_local_inet")]
+                    FdKind::Net => {
+                        // Local-worker inet sockets are not snapshot-restored by this path.
+                    }
+                    FdKind::Eventfd { handle_id } => {
+                        let event_file: Option<syscalls::eventfd::EventFile<Platform>> =
                             syscalls::eventfd::broker_eventfd_provider().map(|provider| {
                                 syscalls::eventfd::EventFile::new_broker_backed(
                                     provider,
                                     handle_id,
                                     litebox_common_linux::EfdFlags::empty(),
                                 )
-                            })
+                            });
+                        let Some(event_file) = event_file else {
+                            continue;
+                        };
+                        let file = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::eventfd::EventfdSubsystem>(event_file);
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
                         }
-                        BrokerHandleSnapshot::Pidfd { handle_id } => {
+                        let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                        debug_assert!(
+                            success,
+                            "eventfd fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::Timerfd { .. } => {
+                        // TODO(wsT): reattach broker timerfd once broker timer hosting lands; today timerfds are not snapshot-restored (no broker_handle was emitted), matching prior behavior.
+                    }
+                    FdKind::Pidfd { handle_id } => {
+                        let event_file: Option<syscalls::eventfd::EventFile<Platform>> =
                             u32::try_from(handle_id).ok().and_then(|pid| {
                                 let target_pid = litebox::process::ProcessId(pid);
                                 syscalls::guest_pid::try_subscribe_broker_process_exit(target_pid)
@@ -2297,213 +2063,341 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                             None,
                                         )
                                     })
-                            })
+                            });
+                        let Some(event_file) = event_file else {
+                            continue;
+                        };
+                        let file = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::eventfd::EventfdSubsystem>(event_file);
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
                         }
-                        // `Pipe` is handled by the FdClass::Pipe restore branch
-                        // below (C.5l). It's intentionally NOT an EventFile.
-                        BrokerHandleSnapshot::Pipe { .. } => None,
-                        // Phase F: `UnixSocket` is handled by the
-                        // FdClass::UnixSocket restore branch above.
-                        BrokerHandleSnapshot::UnixSocket { .. } => None,
-                        BrokerHandleSnapshot::TcpConn { .. } => None,
-                        BrokerHandleSnapshot::InetListener { .. } => None,
-                        BrokerHandleSnapshot::InetDgram { .. } => None,
-                        BrokerHandleSnapshot::SocketDgram { .. } => None,
-                        BrokerHandleSnapshot::SocketSeqPacket { .. } => None,
-                        // `Signalfd` is restored by its dedicated FdClass branch below.
-                        BrokerHandleSnapshot::Signalfd { handle_id } => todo!(
-                            "fork-snapshot restore for BrokerHandleSnapshot::Signalfd \
-                             not implemented yet (handle_id={handle_id})"
-                        ),
-                        // PTYs are restored by the broker-backed PTY FilesystemFd branch above.
-                        BrokerHandleSnapshot::Pty { .. } => None,
-                    };
-                let Some(event_file) = event_file else {
-                    continue;
-                };
-                let file = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
-                    .insert::<syscalls::eventfd::EventfdSubsystem>(event_file);
-                let mut rds = child_files.raw_descriptor_store.write();
-                if entry.fd <= 2 {
-                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                        debug_assert!(
+                            success,
+                            "eventfd fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::Signalfd { handle_id } => {
+                        // Recreate broker-backed signalfd entries inherited across fork/exec.
+                        let Some(provider) = syscalls::signalfd::broker_signalfd_provider() else {
+                            continue;
+                        };
+                        let nonblock = litebox::fs::OFlags::from_bits_retain(entry.status_flags)
+                            .contains(litebox::fs::OFlags::NONBLOCK);
+                        let file = syscalls::signalfd::SignalfdFile::new_broker_backed(
+                            provider,
+                            handle_id,
+                            nonblock,
+                            litebox_common_linux::signal::SigSet::from_u64(u64::MAX),
+                        );
+                        let file = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::signalfd::SignalfdSubsystem>(file);
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                        debug_assert!(
+                            success,
+                            "signalfd fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::BrokerPipe {
+                        handle_id,
+                        direction,
+                    } => {
+                        // C.5l: Phase C.3 follow-up — restore BrokerPipeFd entries for
+                        // FdKind::Pipe slots whose snapshot carries a broker_handle.
+                        // Previously these fell through to the local-pipe restore branch
+                        // (line 1414 mapped `BrokerHandleKind::Pipe => None`), which
+                        // meant fork-restore created no BrokerPipeFd in the child
+                        // worker. The emit-side `dup_handle` in
+                        // `syscalls/process.rs:7283` then leaked the broker refcount,
+                        // and the writer-side pipe's `PipeWriteEnd::Drop` never fired
+                        // when the original writer process exited — readers in other
+                        // workers stalled forever waiting for EOF.
+                        //
+                        // Now: per FdKind::Pipe entry with broker_handle, create a
+                        // fresh BrokerPipeFd that adopts the parent's emit-side
+                        // `dup_handle` ref (no additional bump on this side).
+                        // BrokerPipeFd's on_close in the child worker will release on
+                        // drop; the broker per-connection cleanup handles SIGKILL'd
+                        // workers.
+                        let Some(provider) = syscalls::broker_pipe::broker_pipe_provider() else {
+                            continue;
+                        };
+                        // PE.13 fix (2026-05-18): bump broker rc and record
+                        // on this conn's tracker so the BrokerPipeFd's on_close
+                        // release later finds a matching tracker entry. Without
+                        // this, PE.9's strict ownership check fires a PROTOCOL
+                        // VIOLATION on the implicit release at close-time
+                        // (the original "adopts the parent's emit-side dup_handle
+                        // ref" design predated PE.9's per-conn tracking).
+                        //
+                        // The corresponding release of the parent's emit-side
+                        // dup happens in process.rs's commit_delayed_fork
+                        // success path via `fork_snapshot_broker_transit`
+                        // drain — see process.rs:4519. Net broker rc change
+                        // across the fork: +1 (our dup) -1 (parent's transit
+                        // release) = 0. Matches the pre-PE.9 design intent
+                        // while satisfying strict ownership checking.
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(handle_id);
+                        let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
+                            provider,
+                            handle_id,
+                            direction,
+                            litebox::fs::OFlags::empty(),
+                            2, // creation_site: fork_snapshot_restore
+                        );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::broker_pipe::BrokerPipeSubsystem>(bp_fd);
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker-pipe fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::BrokerPty {
+                        handle_id,
+                        role,
+                        pty_id,
+                    } => {
+                        // Restore broker-backed PTY fds by re-attaching to the broker handle.
+                        let Some(provider) = syscalls::broker_pty::broker_pty_provider() else {
+                            continue;
+                        };
+                        let Ok(pty_fd) =
+                            syscalls::broker_pty::BrokerPtyProviderReacquireExt::reacquire(
+                                &provider, handle_id, role, pty_id,
+                            )
+                        else {
+                            continue;
+                        };
+                        let typed: litebox::fd::TypedFd<syscalls::broker_pty::BrokerPtySubsystem> =
+                            self.global.litebox.descriptor_table_mut().insert(pty_fd);
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker pty fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::BrokerSocketPair {
+                        handle_id,
+                        endpoint,
+                    } => {
+                        let Some(provider) =
+                            syscalls::broker_socketpair::broker_socketpair_provider()
+                        else {
+                            continue;
+                        };
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(handle_id);
+                        let sp_fd =
+                            syscalls::broker_socketpair::BrokerSocketPairFd::<Platform>::new(
+                                provider,
+                                handle_id,
+                                endpoint,
+                                litebox::fs::OFlags::empty(),
+                            );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                            sp_fd,
+                        );
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker_socketpair fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::BrokerSocketDgram { handle_id } => {
+                        // AF_UNIX SOCK_DGRAM: re-attach by broker handle.
+                        // Without this arm a fork restore silently fell
+                        // through to creating a fresh disconnected local
+                        // stream socket, making any queued datagram
+                        // unreachable from the child. The UDS_DGRAM gap
+                        // was silent (no test exercised SOCK_DGRAM
+                        // peer-read-after-fork until this fix).
+                        let Some(provider) =
+                            syscalls::broker_socket_dgram::broker_socket_dgram_provider()
+                        else {
+                            continue;
+                        };
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(handle_id);
+                        let dgram_fd =
+                            syscalls::broker_socket_dgram::BrokerSocketDgramFd::<Platform>::new(
+                                provider,
+                                handle_id,
+                                litebox::fs::OFlags::from_bits_retain(entry.status_flags),
+                            );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::broker_socket_dgram::BrokerSocketDgramSubsystem>(
+                            dgram_fd,
+                        );
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker_socket_dgram fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::BrokerSocketSeqPacket { handle_id } => {
+                        // AF_UNIX SOCK_SEQPACKET: re-attach by broker
+                        // handle. Without this arm `UDS_SEQPACKET.
+                        // fork_restore_inherit` failed because the child
+                        // got a fresh disconnected stream socket instead
+                        // of a re-attached SEQPACKET endpoint.
+                        let Some(provider) =
+                            syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider()
+                        else {
+                            continue;
+                        };
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(handle_id);
+                        let seq_fd = syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<
+                            Platform,
+                        >::new(
+                            provider,
+                            handle_id,
+                            litebox::fs::OFlags::from_bits_retain(entry.status_flags),
+                        );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(
+                                seq_fd,
+                            );
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker_socket_seqpacket fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::BrokerTcpConn { handle_id } => {
+                        let Some(provider) = syscalls::broker_tcp_conn::broker_tcp_conn_provider()
+                        else {
+                            continue;
+                        };
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(handle_id);
+                        let tcp_fd = syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+                            provider,
+                            handle_id,
+                            litebox::fs::OFlags::from_bits_retain(entry.status_flags),
+                        );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                            tcp_fd,
+                        );
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker_tcp_conn fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::BrokerInetListener { handle_id } => {
+                        // Restore broker-backed inet listener fds by re-attaching to the broker handle.
+                        let Some(provider) =
+                            syscalls::broker_inet_listener::broker_inet_listener_provider()
+                        else {
+                            continue;
+                        };
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(handle_id);
+                        let listener =
+                            syscalls::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
+                                provider,
+                                handle_id,
+                                0,
+                                litebox::fs::OFlags::from_bits_retain(entry.status_flags),
+                            );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
+                            listener,
+                        );
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker inet listener fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
+                    FdKind::BrokerInetDgram { .. } | FdKind::BrokerInetRaw { .. } => {
+                        // Broker-backed inet datagram/raw fds are not migrated by this restore path today.
+                    }
                 }
-                let success = rds.fd_into_specific_raw_integer(file, entry.fd);
-                debug_assert!(
-                    success,
-                    "eventfd fd slot {} occupied during restore",
-                    entry.fd
-                );
-            }
-        }
-
-        // Restore host-fd tokens for HostPassthroughFdEntry entries.
-        // INVARIANT: the aliased resource is a raw host fd that was already
-        // registered with the fd-token broker during snapshot, not a broker-held
-        // descriptor with durable per-fd state. The token is the explicit
-        // cross-binary-type fork handoff; without it, HostPassthroughFd entries
-        // must be treated as non-migratable across another worker hop.
-        {
-            use syscalls::fork_snapshot::FdClass;
-            for entry in &fd_table.entries {
-                if entry.class != FdClass::Pipe {
-                    continue;
-                }
-                let Some(token) = entry.metadata.broker_fd_token else {
-                    continue;
-                };
-                let Some(direction) = token.host_passthrough_fd_direction else {
-                    continue;
-                };
-                let Some(client) = litebox_common_linux::fd_token_client::global_client() else {
-                    continue;
-                };
-                let Ok(raw_fd) = client.materialize_raw_fd(token.token_id) else {
-                    let _ = client.release(token.token_id);
-                    continue;
-                };
-                let _ = client.release(token.token_id);
-                let host_entry =
-                    syscalls::host_passthrough_fd::HostPassthroughFdEntry::new(raw_fd, direction);
-                let typed = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
-                    .insert::<syscalls::host_passthrough_fd::HostPassthroughFd>(host_entry);
-                let mut rds = child_files.raw_descriptor_store.write();
-                if entry.fd <= 2 {
-                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                }
-                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
-                debug_assert!(
-                    success,
-                    "host-token fd slot {} occupied during restore",
-                    entry.fd
-                );
-            }
-        }
-
-        // Recreate broker-backed signalfd entries inherited across fork/exec.
-        {
-            use syscalls::fork_snapshot::{BrokerHandleSnapshot, FdClass};
-            for entry in &fd_table.entries {
-                if entry.class != FdClass::Signalfd {
-                    continue;
-                }
-                let Some(broker_handle) = entry.metadata.broker_handle else {
-                    continue;
-                };
-                let BrokerHandleSnapshot::Signalfd { handle_id } = broker_handle else {
-                    continue;
-                };
-                let Some(provider) = syscalls::signalfd::broker_signalfd_provider() else {
-                    continue;
-                };
-                let nonblock = litebox::fs::OFlags::from_bits_retain(entry.status_flags)
-                    .contains(litebox::fs::OFlags::NONBLOCK);
-                let file = syscalls::signalfd::SignalfdFile::new_broker_backed(
-                    provider,
-                    handle_id,
-                    nonblock,
-                    litebox_common_linux::signal::SigSet::from_u64(u64::MAX),
-                );
-                let file = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
-                    .insert::<syscalls::signalfd::SignalfdSubsystem>(file);
-                let mut rds = child_files.raw_descriptor_store.write();
-                if entry.fd <= 2 {
-                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                }
-                let success = rds.fd_into_specific_raw_integer(file, entry.fd);
-                debug_assert!(
-                    success,
-                    "signalfd fd slot {} occupied during restore",
-                    entry.fd
-                );
-            }
-        }
-
-        // C.5l: Phase C.3 follow-up — restore BrokerPipeFd entries for
-        // FdClass::Pipe slots whose snapshot carries a broker_handle.
-        // Previously these fell through to the local-pipe restore branch
-        // (line 1414 mapped `BrokerHandleKind::Pipe => None`), which
-        // meant fork-restore created no BrokerPipeFd in the child
-        // worker. The emit-side `dup_handle` in
-        // `syscalls/process.rs:7283` then leaked the broker refcount,
-        // and the writer-side pipe's `PipeWriteEnd::Drop` never fired
-        // when the original writer process exited — readers in other
-        // workers stalled forever waiting for EOF.
-        //
-        // Now: per FdClass::Pipe entry with broker_handle, create a
-        // fresh BrokerPipeFd that adopts the parent's emit-side
-        // `dup_handle` ref (no additional bump on this side).
-        // BrokerPipeFd's on_close in the child worker will release on
-        // drop; the broker per-connection cleanup handles SIGKILL'd
-        // workers.
-        {
-            use syscalls::fork_snapshot::{BrokerHandleSnapshot, FdClass};
-            for entry in &fd_table.entries {
-                if entry.class != FdClass::Pipe {
-                    continue;
-                }
-                let Some(broker_handle) = entry.metadata.broker_handle else {
-                    continue;
-                };
-                let BrokerHandleSnapshot::Pipe {
-                    handle_id,
-                    direction,
-                } = broker_handle
-                else {
-                    continue;
-                };
-                let Some(provider) = syscalls::broker_pipe::broker_pipe_provider() else {
-                    continue;
-                };
-                // PE.13 fix (2026-05-18): bump broker rc and record
-                // on this conn's tracker so the BrokerPipeFd's on_close
-                // release later finds a matching tracker entry. Without
-                // this, PE.9's strict ownership check fires a PROTOCOL
-                // VIOLATION on the implicit release at close-time
-                // (the original "adopts the parent's emit-side dup_handle
-                // ref" design predated PE.9's per-conn tracking).
-                //
-                // The corresponding release of the parent's emit-side
-                // dup happens in process.rs's commit_delayed_fork
-                // success path via `fork_snapshot_broker_transit`
-                // drain — see process.rs:4519. Net broker rc change
-                // across the fork: +1 (our dup) -1 (parent's transit
-                // release) = 0. Matches the pre-PE.9 design intent
-                // while satisfying strict ownership checking.
-                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
-                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
-                    alloc::sync::Arc::clone(&provider) as _;
-                let _ = releaser.dup_handle(handle_id);
-                let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
-                    provider,
-                    handle_id,
-                    direction,
-                    litebox::fs::OFlags::empty(),
-                    2, // creation_site: fork_snapshot_restore
-                );
-                let typed = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
-                    .insert::<syscalls::broker_pipe::BrokerPipeSubsystem>(bp_fd);
-                let mut rds = child_files.raw_descriptor_store.write();
-                if entry.fd <= 2 {
-                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
-                }
-                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
-                debug_assert!(
-                    success,
-                    "broker-pipe fd slot {} occupied during restore",
-                    entry.fd
-                );
             }
         }
 
@@ -5372,14 +5266,6 @@ pub(crate) struct VforkParking {
     pub deferred_lie_count: core::sync::atomic::AtomicU32,
 }
 
-/// Which virtual subsystem the replaced fd belonged to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplacedSubsystem {
-    UnixSocket,
-    Pty,
-    Filesystem,
-}
-
 /// Describes a single fd endpoint that should be replaced with a host OS
 /// pipe after the delayed-fork child has been migrated.
 ///
@@ -5392,9 +5278,6 @@ struct FdReplacement {
     host_fd: i32,
     /// Whether this endpoint is a read or write end.
     direction: syscalls::host_passthrough_fd::HostPassthroughFdDirection,
-    /// The virtual subsystem that owned the original fd.
-    #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
-    subsystem: ReplacedSubsystem,
 }
 
 #[derive(Debug, Clone)]
@@ -5774,27 +5657,11 @@ mod tests {
     use litebox_common_linux::{
         FcntlArg, FileDescriptorFlags, SockFlags, SockType,
         broker_pipe_provider::{BrokerOpError, BrokerPipeEnd, BrokerPipeProvider},
-        broker_socketpair_provider::{BrokerSocketPairEndpoint, BrokerSocketPairProvider},
+        broker_socketpair_provider::BrokerSocketPairEndpoint,
         cwfd::broker_subscribable::{BrokerEventCallback, BrokerSubscribable},
     };
 
     const DUP_FAIL_HANDLE: u64 = 0xd0_fa_11;
-
-    #[test]
-    fn replaced_subsystem_has_no_pipe_kind() {
-        for subsystem in [
-            ReplacedSubsystem::UnixSocket,
-            ReplacedSubsystem::Pty,
-            ReplacedSubsystem::Filesystem,
-        ] {
-            let kind = match subsystem {
-                ReplacedSubsystem::UnixSocket => "unix_socket",
-                ReplacedSubsystem::Pty => "pty",
-                ReplacedSubsystem::Filesystem => "filesystem",
-            };
-            assert_ne!(kind, "pipe");
-        }
-    }
 
     struct TestBrokerPipeProvider;
 
@@ -5847,61 +5714,9 @@ mod tests {
         }
     }
 
-    struct TestBrokerSocketPairProvider;
-
-    impl BrokerSubscribable for TestBrokerSocketPairProvider {
-        fn subscribe(
-            &self,
-            _handle: u64,
-            _events_mask: u32,
-            _callback: Arc<dyn BrokerEventCallback>,
-        ) -> Result<u64, BrokerOpError> {
-            Ok(1)
-        }
-
-        fn unsubscribe(&self, _handle: u64, _subscription_id: u64) {}
-
-        fn release(&self, _handle: u64) {}
-
-        fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
-            Ok(())
-        }
-
-        fn query_events(&self, _handle: u64) -> Result<u32, BrokerOpError> {
-            Ok(0)
-        }
-    }
-
-    impl BrokerSocketPairProvider for TestBrokerSocketPairProvider {
-        fn create_socketpair(
-            &self,
-            _capacity: u64,
-            _atomic_write_size: u64,
-        ) -> Result<(u64, u64), BrokerOpError> {
-            Ok((20, 21))
-        }
-
-        fn read_socketpair(
-            &self,
-            _handle: u64,
-            _max_len: u64,
-        ) -> Result<alloc::vec::Vec<u8>, BrokerOpError> {
-            Ok(alloc::vec::Vec::new())
-        }
-
-        fn write_socketpair(&self, _handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError> {
-            Ok(bytes.len())
-        }
-
-        fn shutdown_socketpair_write(&self, _handle: u64) -> Result<(), BrokerOpError> {
-            Ok(())
-        }
-    }
-
     fn install_test_broker_providers() {
         let _ = crate::syscalls::set_broker_pipe_provider(Arc::new(TestBrokerPipeProvider));
-        let _ =
-            crate::syscalls::set_broker_socketpair_provider(Arc::new(TestBrokerSocketPairProvider));
+        crate::syscalls::test_broker_sockets::install_test_broker_socket_providers();
     }
 
     fn test_entrypoints() -> LinuxShimEntrypoints<DefaultFS> {
@@ -5937,7 +5752,7 @@ mod tests {
         assert_eq!(
             entrypoints.install_broker_bridge_fd(
                 guest_fd,
-                syscalls::fork_snapshot::BrokerHandleSnapshot::UnixSocket {
+                syscalls::fork_snapshot::FdKind::BrokerSocketPair {
                     handle_id: 1234,
                     endpoint: BrokerSocketPairEndpoint::A,
                 },
@@ -5971,7 +5786,7 @@ mod tests {
         assert_eq!(
             entrypoints.install_broker_bridge_fd(
                 guest_fd,
-                syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                syscalls::fork_snapshot::FdKind::BrokerPipe {
                     handle_id: DUP_FAIL_HANDLE,
                     direction: BrokerPipeEnd::Read,
                 },
@@ -6067,7 +5882,7 @@ mod tests {
         entrypoints
             .install_broker_bridge_fd(
                 usize::try_from(inherited_fd).expect("inherited fd should fit usize"),
-                syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                syscalls::fork_snapshot::FdKind::BrokerPipe {
                     handle_id: 1234,
                     direction: BrokerPipeEnd::Read,
                 },
