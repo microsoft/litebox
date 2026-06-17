@@ -9,6 +9,7 @@
 use thiserror::Error;
 
 /// A provider of architecture-specific functionality.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub trait ArchSpecificProvider {
     /// Get the architecture-specific `reg`, for the current guest context.
     ///
@@ -47,7 +48,9 @@ pub enum ArchSpecificRegister {
 /// Architecture-specific registers for AArch64.
 #[cfg(target_arch = "aarch64")]
 #[non_exhaustive]
-pub enum ArchSpecificRegister {}
+pub enum ArchSpecificRegister {
+    TpidrEl0,
+}
 
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.
 #[non_exhaustive]
