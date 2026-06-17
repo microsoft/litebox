@@ -50,6 +50,16 @@ const WINDOWS_OS_MAJOR_VERSION: u16 = 10;
 const WINDOWS_OS_MINOR_VERSION: u16 = 0;
 const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
 const WINDOWS_OS_PLATFORM_WIN32_NT: u32 = 2;
+#[cfg(target_os = "linux")]
+const WINDOWS_USER_SHARED_DATA_BASE: usize = 0x7FFE_0000;
+#[cfg(target_os = "linux")]
+const WINDOWS_USER_SHARED_DATA_SIZE: usize = PAGE_SIZE;
+#[cfg(target_os = "linux")]
+const WINDOWS_KUSER_SHARED_DATA_SIZE: usize = 0x738;
+#[cfg(target_os = "linux")]
+const WINDOWS_KUSER_SHARED_DATA_XSTATE_CONFIGURATION_SIZE: usize = 0x348;
+#[cfg(target_os = "linux")]
+const WINDOWS_NT_PRODUCT_WORKSTATION: u32 = 1;
 const WINDOWS_TIME_ZONE_ID_INVALID: u32 = u32::MAX;
 const WINDOWS_CRITICAL_SECTION_TIMEOUT_100NS: i64 = -150 * 10_000_000;
 const WINDOWS_HEAP_SEGMENT_RESERVE: u64 = 1024 * 1024;
@@ -67,6 +77,122 @@ macro_rules! write_static_server_data_field {
         )
     };
 }
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct KUserSharedData {
+    tick_count_low_deprecated: u32,
+    tick_count_multiplier: u32,
+    interrupt_time: KSystemTime,
+    system_time: KSystemTime,
+    time_zone_bias: KSystemTime,
+    image_number_low: u16,
+    image_number_high: u16,
+    nt_system_root: [u16; 260],
+    max_stack_trace_depth: u32,
+    crypto_exponent: u32,
+    time_zone_id: u32,
+    large_page_minimum: u32,
+    ait_sampling_value: u32,
+    app_compat_flag: u32,
+    rng_seed_version: u64,
+    global_validation_run_level: u32,
+    time_zone_bias_stamp: u32,
+    nt_build_number: u32,
+    nt_product_type: u32,
+    product_type_is_valid: u8,
+    reserved_0: u8,
+    native_processor_architecture: u16,
+    nt_major_version: u32,
+    nt_minor_version: u32,
+    processor_features: [u8; 64],
+    reserved_1: u32,
+    reserved_3: u32,
+    time_slip: u32,
+    alternative_architecture: u32,
+    boot_id: u32,
+    system_expiration_date: i64,
+    suite_mask: u32,
+    kd_debugger_enabled: u8,
+    nx_support_policy: u8,
+    cycles_per_yield: u16,
+    active_console_id: u32,
+    dismount_count: u32,
+    com_plus_package: u32,
+    last_system_rit_event_tick_count: u32,
+    number_of_physical_pages: u32,
+    safe_boot_mode: u8,
+    virtualization_flags: u8,
+    padding_2ee: [u8; 2],
+    shared_data_flags: u32,
+    data_flags_pad: [u32; 1],
+    test_ret_instruction: u64,
+    qpc_frequency: i64,
+    system_call: u32,
+    user_cet_available_environments: u32,
+    system_call_pad: [u64; 2],
+    tick_count: [u8; 0x10],
+    cookie: u32,
+    cookie_pad: [u32; 1],
+    console_session_foreground_process_id: i64,
+    time_update_lock: u64,
+    baseline_system_time_qpc: u64,
+    baseline_interrupt_time_qpc: u64,
+    qpc_system_time_increment: u64,
+    qpc_interrupt_time_increment: u64,
+    qpc_system_time_increment_shift: u8,
+    qpc_interrupt_time_increment_shift: u8,
+    unparked_processor_count: u16,
+    enclave_feature_mask: [u32; 4],
+    telemetry_coverage_round: u32,
+    user_mode_global_logger: [u16; 16],
+    image_file_execution_options: u32,
+    lang_generation_count: u32,
+    active_processor_affinity: u32,
+    padding_3ac: u32,
+    interrupt_time_bias: u64,
+    qpc_bias: u64,
+    active_processor_count: u32,
+    active_group_count: u8,
+    padding_3c5: u8,
+    qpc_data: u16,
+    time_zone_bias_effective_start: i64,
+    time_zone_bias_effective_end: i64,
+    x_state: [u8; WINDOWS_KUSER_SHARED_DATA_XSTATE_CONFIGURATION_SIZE],
+    feature_configuration_change_stamp: KSystemTime,
+    spare: u32,
+    user_pointer_auth_mask: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct KUserSharedDataPage {
+    shared_data: KUserSharedData,
+    page_tail: [u8; WINDOWS_USER_SHARED_DATA_SIZE - WINDOWS_KUSER_SHARED_DATA_SIZE],
+}
+
+// Layout anchors are from Wine `include/ddk/wdm.h` and ReactOS
+// `sdk/include/wine/ddk/wdm.h`, which both publish KUSER_SHARED_DATA offsets.
+#[cfg(target_os = "linux")]
+const _: () = {
+    assert!(size_of::<KSystemTime>() == 0x0c);
+    assert!(size_of::<KUserSharedData>() == WINDOWS_KUSER_SHARED_DATA_SIZE);
+    assert!(size_of::<KUserSharedDataPage>() == WINDOWS_USER_SHARED_DATA_SIZE);
+    assert!(core::mem::offset_of!(KUserSharedData, nt_system_root) == 0x030);
+    assert!(core::mem::offset_of!(KUserSharedData, nt_build_number) == 0x260);
+    assert!(core::mem::offset_of!(KUserSharedData, nt_product_type) == 0x264);
+    assert!(core::mem::offset_of!(KUserSharedData, product_type_is_valid) == 0x268);
+    assert!(core::mem::offset_of!(KUserSharedData, native_processor_architecture) == 0x26a);
+    assert!(core::mem::offset_of!(KUserSharedData, nt_major_version) == 0x26c);
+    assert!(core::mem::offset_of!(KUserSharedData, nt_minor_version) == 0x270);
+    assert!(core::mem::offset_of!(KUserSharedData, time_zone_bias_effective_start) == 0x3c8);
+    assert!(core::mem::offset_of!(KUserSharedData, time_zone_bias_effective_end) == 0x3d0);
+    assert!(core::mem::offset_of!(KUserSharedData, x_state) == 0x3d8);
+    assert!(core::mem::offset_of!(KUserSharedData, feature_configuration_change_stamp) == 0x720);
+    assert!(core::mem::offset_of!(KUserSharedData, user_pointer_auth_mask) == 0x730);
+};
 
 pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
@@ -245,6 +371,8 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             }?;
             Ok(ptr.as_usize())
         };
+        #[cfg(target_os = "linux")]
+        map_windows_user_shared_data::<Platform>(self.page_manager)?;
         let teb_ptr = create_pages(size_of::<ThreadEnvironmentBlock>())?;
         let peb_ptr = create_pages(size_of::<ProcessEnvironmentBlock>())?;
         let api_set_map = build_api_set_namespace(API_SET_MAPPINGS)
@@ -785,7 +913,7 @@ struct SystemTime {
 }
 
 #[repr(C)]
-#[derive(FromBytes, IntoBytes)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
 struct KSystemTime {
     low_part: u32,
     high_1_time: i32,
@@ -1028,6 +1156,117 @@ where
     T: Copy + FromBytes + IntoBytes,
 {
     crate::write_slice::<Platform, T>(address, values).ok_or(PeImageAccessError::MemoryAccess)
+}
+
+#[cfg(target_os = "linux")]
+fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
+    page_manager: &crate::WindowsPageManager<Platform>,
+) -> Result<(), PeImageAccessError> {
+    let address = NonZeroAddress::new(WINDOWS_USER_SHARED_DATA_BASE)
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let length = NonZeroPageSize::new(WINDOWS_USER_SHARED_DATA_SIZE)
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let shared_data = windows_user_shared_data_page();
+    let shared_data_bytes = shared_data.as_bytes();
+    // Wine and ReactOS model KUSER_SHARED_DATA as a fixed user page at
+    // 0x7FFE0000. Native Windows hosts already provide that page; Linux hosts
+    // need LiteBox to create it before guest ntdll reads it during startup.
+    // SAFETY: `NOREPLACE` makes the fixed mapping fail instead of replacing any
+    // existing host or guest mapping at the shared-data address.
+    let result = unsafe {
+        page_manager.create_readable_pages(
+            Some(address),
+            length,
+            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+            |ptr| {
+                ptr.copy_from_slice(0, shared_data_bytes)
+                    .ok_or(MappingError::OutOfMemory)?;
+                Ok(0)
+            },
+        )
+    };
+    match result {
+        Ok(_) => Ok(()),
+        Err(MappingError::MapError(
+            litebox::platform::page_mgmt::AllocationError::AddressInUse,
+        )) if windows_user_shared_data_mapping_matches::<Platform>(
+            page_manager,
+            address,
+            length,
+            shared_data_bytes,
+        ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn windows_user_shared_data_mapping_matches<Platform: crate::ShimPlatform>(
+    page_manager: &crate::WindowsPageManager<Platform>,
+    address: NonZeroAddress<PAGE_SIZE>,
+    length: NonZeroPageSize<PAGE_SIZE>,
+    expected: &[u8],
+) -> bool {
+    if page_manager.get_memory_permissions(address, length)
+        != Some(litebox::platform::page_mgmt::MemoryRegionPermissions::READ)
+    {
+        return false;
+    }
+    let ptr =
+        <Platform as RawPointerProvider>::RawConstPointer::<u8>::from_usize(address.as_usize());
+    ptr.to_owned_slice(expected.len())
+        .is_some_and(|actual| actual.as_ref() == expected)
+}
+
+#[cfg(target_os = "linux")]
+fn windows_user_shared_data_page() -> KUserSharedDataPage {
+    let mut page = KUserSharedDataPage::new_zeroed();
+    page.shared_data.nt_build_number = u32::from(WINDOWS_OS_BUILD_NUMBER);
+    page.shared_data.nt_product_type = WINDOWS_NT_PRODUCT_WORKSTATION;
+    page.shared_data.product_type_is_valid = 1;
+    page.shared_data.nt_major_version = u32::from(WINDOWS_OS_MAJOR_VERSION);
+    page.shared_data.nt_minor_version = u32::from(WINDOWS_OS_MINOR_VERSION);
+    for (index, code_unit) in WINDOWS_DIRECTORY.encode_utf16().enumerate() {
+        page.shared_data.nt_system_root[index] = code_unit;
+    }
+
+    page
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn windows_user_shared_data_page_contains_loader_version_fields() {
+        let page = windows_user_shared_data_page();
+
+        assert_eq!(
+            page.shared_data.nt_build_number,
+            u32::from(WINDOWS_OS_BUILD_NUMBER)
+        );
+        assert_eq!(
+            page.shared_data.nt_product_type,
+            WINDOWS_NT_PRODUCT_WORKSTATION
+        );
+        assert_eq!(page.shared_data.product_type_is_valid, 1);
+        assert_eq!(
+            page.shared_data.nt_major_version,
+            u32::from(WINDOWS_OS_MAJOR_VERSION)
+        );
+        assert_eq!(
+            page.shared_data.nt_minor_version,
+            u32::from(WINDOWS_OS_MINOR_VERSION)
+        );
+
+        let root_units = WINDOWS_DIRECTORY.encode_utf16().count();
+        for (index, expected) in WINDOWS_DIRECTORY.encode_utf16().enumerate() {
+            assert_eq!(page.shared_data.nt_system_root[index], expected);
+        }
+        assert_eq!(page.shared_data.nt_system_root[root_units], 0);
+    }
 }
 
 struct LoadedNtDll {
