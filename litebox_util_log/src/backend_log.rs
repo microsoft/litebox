@@ -27,32 +27,6 @@ impl crate::Level {
     }
 }
 
-struct FieldVisitor<'a, W>(&'a mut W);
-
-impl<W: core::fmt::Write> log::kv::VisitSource<'_> for FieldVisitor<'_, W> {
-    fn visit_pair(
-        &mut self,
-        key: log::kv::Key<'_>,
-        value: log::kv::Value<'_>,
-    ) -> Result<(), log::kv::Error> {
-        write!(self.0, " {key}={value}")?;
-        Ok(())
-    }
-}
-
-/// Converts a [`log::Record`] into the compact host-console format.
-pub fn format_record<W: core::fmt::Write>(
-    writer: &mut W,
-    record: &log::Record<'_>,
-) -> core::fmt::Result {
-    write!(writer, "[{}] {}", record.level(), record.args())?;
-    record
-        .key_values()
-        .visit(&mut FieldVisitor(writer))
-        .map_err(|_| core::fmt::Error)?;
-    writeln!(writer)
-}
-
 /// RAII guard that logs span exit when dropped.
 ///
 /// This type is returned by span macros (e.g., [`info_span!`](crate::info_span)) when

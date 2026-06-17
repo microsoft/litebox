@@ -194,7 +194,7 @@ fn test_instrument() {
     TestStruct { value: 7 }.instrumented_method();
 }
 
-#[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
+#[cfg(feature = "backend_log")]
 #[test]
 fn test_format_record_includes_key_values() {
     let key_values = [("count", 42), ("name", 7)];
