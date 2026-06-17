@@ -744,11 +744,27 @@ impl<
         let mut tombstone_removal = false;
         // If we already have an entry saying it is a tombstone, then we need to quit out early;
         // otherwise, we'll check the levels.
-        let cached_entry = {
+        // Snapshot the cached entry AND its lower access mode together under a
+        // single read lock, then release before running the body. Two reasons:
+        //  - The read must NOT be held across `lower_fd_is_shareable` (a 9P
+        //    fstat): the writer-preferring RwLock deadlocks at high thread
+        //    count when a writer queues while readers are parked in the fstat.
+        //  - Reading `entry` and `lower_access_modes` under the *same* guard
+        //    keeps the (entry, access-mode) pair consistent. Reading the access
+        //    mode separately (a second `self.root.read()` later) races a
+        //    concurrent reopen and can pair a fresh access mode with a stale
+        //    entry, yielding a wrong compatibility decision — a stale fid gets
+        //    reused for an incompatible mode and the open hangs (observed as a
+        //    `vscode::bootstrap` regression).
+        // The cloned `entry` Arc keeps the lower fd alive across the body.
+        let cache_hit = {
             let root = self.root.read();
-            root.entries.get(&path).cloned()
+            root.entries.get(&path).cloned().map(|entry| {
+                let access = root.lower_access_modes.get(&path).copied().unwrap_or(0);
+                (entry, access)
+            })
         };
-        if let Some(entry) = cached_entry {
+        if let Some((entry, cached_access)) = cache_hit {
             #[cfg(feature = "trace_fs")]
             if matches!(
                 self.layering_semantics,
@@ -789,13 +805,10 @@ impl<
                             // writes.  On mismatch, fall through to open a
                             // new fid with the correct mode.
                             let requested_access = flags.bits() & 0x3; // O_ACCMODE
-                            let cached_access = self
-                                .root
-                                .read()
-                                .lower_access_modes
-                                .get(&path)
-                                .copied()
-                                .unwrap_or(0);
+                            // `cached_access` was snapshotted with `entry`
+                            // above, under one read lock, to keep the pair
+                            // consistent and avoid holding the lock across the
+                            // 9P fstat in `lower_fd_is_shareable`.
                             let needs_read = requested_access == 0 || requested_access == 2; // RDONLY or RDWR
                             let needs_write = requested_access == 1 || requested_access == 2; // WRONLY or RDWR
                             let cached_can_read = cached_access == 0 || cached_access == 2; // RDONLY or RDWR
