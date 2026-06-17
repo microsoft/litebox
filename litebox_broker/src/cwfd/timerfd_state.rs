@@ -3,12 +3,13 @@
 
 //! Broker-hosted timerfd state.
 //!
-//! The broker has no central timed wait/dispatch loop today. This state
-//! therefore exposes [`TimerfdState::fire_due`] as the precise hook that
-//! future broker polling code must call when its next deadline is reached.
+//! Each broker-hosted timerfd owns a small firing thread that sleeps until
+//! the next armed deadline, advances the timer state, and fans out readiness
+//! notifications to subscribers.
 
 use core::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use litebox_common_linux::broker_timerfd_provider::BrokerTimerfdSpec;
@@ -34,18 +35,33 @@ pub enum TimerfdError {
 
 #[derive(Debug)]
 pub struct TimerfdState {
+    shared: Arc<Shared>,
+    fire_thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct Shared {
     inner: Mutex<TimerfdInner>,
+    cv: Condvar,
     subscriptions: SubscriptionList,
 }
 
 impl Drop for TimerfdState {
     fn drop(&mut self) {
+        {
+            let mut inner = self.shared.inner.lock().expect("TimerfdState poisoned");
+            inner.stop = true;
+        }
+        self.shared.cv.notify_all();
+        if let Some(fire_thread) = self.fire_thread.take() {
+            fire_thread.join().expect("timerfd fire thread panicked");
+        }
         assert!(
-            self.subscriptions.is_empty(),
+            self.shared.subscriptions.is_empty(),
             "TimerfdState dropped with {} live subscription(s) — \
              eager per-conn unsubscribe is not running, or a Release \
              bypassed ConnRefTracker.drain_tracked_subscriptions",
-            self.subscriptions.len()
+            self.shared.subscriptions.len()
         );
     }
 }
@@ -56,8 +72,10 @@ struct TimerfdInner {
     interval: Duration,
     next_deadline: Option<Instant>,
     accumulated: u64,
+    stop: bool,
 }
 
+#[allow(clippy::missing_panics_doc)]
 impl TimerfdState {
     pub fn new(clockid: i32, flags: u32) -> Result<Arc<Self>, TimerfdError> {
         if !matches!(clockid, libc::CLOCK_MONOTONIC | libc::CLOCK_REALTIME)
@@ -65,14 +83,21 @@ impl TimerfdState {
         {
             return Err(TimerfdError::InvalidValue);
         }
-        Ok(Arc::new(Self {
+        let shared = Arc::new(Shared {
             inner: Mutex::new(TimerfdInner {
                 clockid,
                 interval: Duration::ZERO,
                 next_deadline: None,
                 accumulated: 0,
+                stop: false,
             }),
+            cv: Condvar::new(),
             subscriptions: SubscriptionList::new(),
+        });
+        let fire_thread = spawn_fire_thread(Arc::clone(&shared));
+        Ok(Arc::new(Self {
+            shared,
+            fire_thread: Some(fire_thread),
         }))
     }
 
@@ -83,27 +108,27 @@ impl TimerfdState {
         }
         let interval = duration_from_parts(new_value.interval_sec, new_value.interval_nsec)?;
         let value = duration_from_parts(new_value.value_sec, new_value.value_nsec)?;
-        let mut inner = self.inner.lock().expect("TimerfdState poisoned");
+        let mut inner = self.shared.inner.lock().expect("TimerfdState poisoned");
         refresh_locked(&mut inner, Instant::now());
         inner.interval = interval;
         inner.accumulated = 0;
         inner.next_deadline = compute_deadline(inner.clockid, value, flags)?;
+        self.shared.cv.notify_all();
         Ok(())
     }
 
     pub fn gettime(&self) -> BrokerTimerfdSpec {
         let now = Instant::now();
-        let mut inner = self.inner.lock().expect("TimerfdState poisoned");
+        let mut inner = self.shared.inner.lock().expect("TimerfdState poisoned");
         refresh_locked(&mut inner, now);
-        let remaining = inner
-            .next_deadline
-            .map(|deadline| deadline.saturating_duration_since(now))
-            .unwrap_or(Duration::ZERO);
+        let remaining = inner.next_deadline.map_or(Duration::ZERO, |deadline| {
+            deadline.saturating_duration_since(now)
+        });
         spec_from_durations(inner.interval, remaining)
     }
 
     pub fn read(&self) -> Result<u64, TimerfdError> {
-        let mut inner = self.inner.lock().expect("TimerfdState poisoned");
+        let mut inner = self.shared.inner.lock().expect("TimerfdState poisoned");
         refresh_locked(&mut inner, Instant::now());
         if inner.accumulated == 0 {
             return Err(TimerfdError::WouldBlock);
@@ -114,7 +139,7 @@ impl TimerfdState {
     }
 
     pub fn current_events(&self) -> u32 {
-        let mut inner = self.inner.lock().expect("TimerfdState poisoned");
+        let mut inner = self.shared.inner.lock().expect("TimerfdState poisoned");
         refresh_locked(&mut inner, Instant::now());
         if inner.accumulated > 0 {
             NOTIFY_EVENT_IN
@@ -124,25 +149,18 @@ impl TimerfdState {
     }
 
     pub fn fire_due(&self, now: Instant) -> bool {
-        let mut inner = self.inner.lock().expect("TimerfdState poisoned");
-        let before = inner.accumulated;
-        refresh_locked(&mut inner, now);
-        let became_readable = before == 0 && inner.accumulated > 0;
+        let mut inner = self.shared.inner.lock().expect("TimerfdState poisoned");
+        let became_readable = advance_locked(&mut inner, now);
         drop(inner);
         if became_readable {
-            self.subscriptions.notify(NOTIFY_EVENT_IN);
+            self.shared.subscriptions.notify(NOTIFY_EVENT_IN);
         }
         became_readable
     }
 
-    // TODO(broker-timerfd): call `fire_due(Instant::now())` from the broker's
-    // future timed dispatch loop whenever this state's `next_deadline` is due,
-    // and arrange for the loop to sleep until the earliest live timerfd
-    // deadline. Without that hook, expirations are accumulated lazily by RPCs
-    // (`read`, `gettime`, `query_events`) but subscribers are not woken exactly
-    // at the deadline.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .expect("TimerfdState poisoned")
             .next_deadline
@@ -155,21 +173,22 @@ impl TimerfdState {
         sender: Arc<Mutex<NotificationSender>>,
     ) -> Result<(), SubscribeError> {
         let now_events = self.current_events();
-        self.subscriptions
+        self.shared
+            .subscriptions
             .add(subscription_id, events_mask, sender)?;
         let initial = now_events & events_mask;
         if initial != 0 {
-            self.subscriptions.notify(initial);
+            self.shared.subscriptions.notify(initial);
         }
         Ok(())
     }
 
     pub fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
-        self.subscriptions.remove(subscription_id)
+        self.shared.subscriptions.remove(subscription_id)
     }
 
     pub fn subscription_count(&self) -> usize {
-        self.subscriptions.len()
+        self.shared.subscriptions.len()
     }
 }
 
@@ -221,6 +240,48 @@ fn refresh_locked(inner: &mut TimerfdInner, now: Instant) {
         .or(Some(now));
 }
 
+fn advance_locked(inner: &mut TimerfdInner, now: Instant) -> bool {
+    let before = inner.accumulated;
+    refresh_locked(inner, now);
+    before == 0 && inner.accumulated > 0
+}
+
+fn spawn_fire_thread(shared: Arc<Shared>) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("timerfd-fire".to_owned())
+        .spawn(move || {
+            let mut inner = shared.inner.lock().expect("TimerfdState poisoned");
+            loop {
+                if inner.stop {
+                    break;
+                }
+                match inner.next_deadline {
+                    None => {
+                        inner = shared.cv.wait(inner).expect("TimerfdState poisoned");
+                    }
+                    Some(deadline) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            let fired = advance_locked(&mut inner, now);
+                            drop(inner);
+                            if fired {
+                                shared.subscriptions.notify(NOTIFY_EVENT_IN);
+                            }
+                            inner = shared.inner.lock().expect("TimerfdState poisoned");
+                        } else {
+                            let (guard, _) = shared
+                                .cv
+                                .wait_timeout(inner, deadline - now)
+                                .expect("TimerfdState poisoned");
+                            inner = guard;
+                        }
+                    }
+                }
+            }
+        })
+        .expect("timerfd fire thread spawn")
+}
+
 fn duration_from_parts(sec: u64, nsec: u64) -> Result<Duration, TimerfdError> {
     if nsec >= NSEC_PER_SEC {
         return Err(TimerfdError::InvalidValue);
@@ -233,7 +294,7 @@ fn clock_now_duration(clockid: i32) -> Result<Duration, TimerfdError> {
     // mutable pointer to `clock_gettime`; `clockid` is validated by the caller.
     let mut ts = unsafe { core::mem::zeroed::<libc::timespec>() };
     // SAFETY: `ts` is a valid, writable `timespec` pointer.
-    if unsafe { libc::clock_gettime(clockid, &mut ts) } != 0 {
+    if unsafe { libc::clock_gettime(clockid, &raw mut ts) } != 0 {
         return Err(TimerfdError::InvalidValue);
     }
     let secs = u64::try_from(ts.tv_sec).map_err(|_| TimerfdError::InvalidValue)?;
@@ -286,7 +347,7 @@ impl StateObject for TimerfdState {
     }
 
     fn try_flush_subscriptions(&self) {
-        self.subscriptions.try_flush();
+        self.shared.subscriptions.try_flush();
     }
 }
 
@@ -296,6 +357,8 @@ mod tests {
     use crate::cwfd::state_registry::BrokerStateRegistry;
     use litebox_common_linux::notification_ring::NotificationReceiver;
     use litebox_common_linux::shmem_ring::ShmemRingPair;
+    use std::sync::mpsc;
+    use std::thread;
 
     fn make_pair() -> (Arc<Mutex<NotificationSender>>, NotificationReceiver) {
         let (pair, tx_fd, rx_fd) = ShmemRingPair::create().expect("ring create");
@@ -319,6 +382,30 @@ mod tests {
     fn arm_relative(timer: &TimerfdState, value: Duration, interval: Duration) -> Instant {
         timer.settime(spec(value, interval), 0).unwrap();
         timer.next_deadline().expect("armed timer deadline")
+    }
+
+    fn spawn_notification_collector(
+        mut receiver: NotificationReceiver,
+    ) -> (mpsc::Receiver<(u64, u32)>, thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            while let Ok(frame) = receiver.recv() {
+                if tx.send((frame.subscription_id(), frame.events())).is_err() {
+                    break;
+                }
+            }
+        });
+        (rx, handle)
+    }
+
+    fn expect_notification(
+        rx: &mpsc::Receiver<(u64, u32)>,
+        timeout: Duration,
+        subscription_id: u64,
+    ) {
+        let (id, events) = rx.recv_timeout(timeout).expect("timerfd notification");
+        assert_eq!(id, subscription_id);
+        assert_eq!(events, NOTIFY_EVENT_IN);
     }
 
     #[test]
@@ -499,6 +586,96 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
             other => panic!("expected EOF, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn firing_thread_notifies_relative_oneshot() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let (sender, receiver) = make_pair();
+        let (rx, handle) = spawn_notification_collector(receiver);
+        timer.subscribe(100, NOTIFY_EVENT_IN, sender).unwrap();
+
+        arm_relative(&timer, Duration::from_millis(40), Duration::ZERO);
+
+        expect_notification(&rx, Duration::from_secs(1), 100);
+        assert!(timer.read().unwrap() >= 1);
+        timer.unsubscribe(100).unwrap();
+        drop(timer);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn firing_thread_notifies_interval_repeatedly_after_reads() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let (sender, receiver) = make_pair();
+        let (rx, handle) = spawn_notification_collector(receiver);
+        timer.subscribe(101, NOTIFY_EVENT_IN, sender).unwrap();
+
+        arm_relative(&timer, Duration::from_millis(30), Duration::from_millis(30));
+
+        expect_notification(&rx, Duration::from_secs(1), 101);
+        assert!(timer.read().unwrap() >= 1);
+        expect_notification(&rx, Duration::from_secs(1), 101);
+        assert!(timer.read().unwrap() >= 1);
+        timer.unsubscribe(101).unwrap();
+        drop(timer);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn settime_rearm_to_sooner_deadline_wakes_firing_thread() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let (sender, receiver) = make_pair();
+        let (rx, handle) = spawn_notification_collector(receiver);
+        timer.subscribe(102, NOTIFY_EVENT_IN, sender).unwrap();
+
+        arm_relative(&timer, Duration::from_millis(500), Duration::ZERO);
+        let rearm_at = Instant::now();
+        arm_relative(&timer, Duration::from_millis(40), Duration::ZERO);
+
+        expect_notification(&rx, Duration::from_millis(300), 102);
+        assert!(
+            rearm_at.elapsed() < Duration::from_millis(450),
+            "timer fired at the original late deadline"
+        );
+        assert!(timer.read().unwrap() >= 1);
+        timer.unsubscribe(102).unwrap();
+        drop(timer);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn disarm_stops_firing_thread_notifications() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let (sender, receiver) = make_pair();
+        let (rx, handle) = spawn_notification_collector(receiver);
+        timer.subscribe(103, NOTIFY_EVENT_IN, sender).unwrap();
+
+        arm_relative(&timer, Duration::from_millis(200), Duration::ZERO);
+        timer
+            .settime(BrokerTimerfdSpec::default(), 0)
+            .expect("disarm timer");
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(300)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        timer.unsubscribe(103).unwrap();
+        drop(timer);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn drop_joins_firing_thread_cleanly() {
+        let timer = TimerfdState::new(libc::CLOCK_MONOTONIC, 0).unwrap();
+        let (sender, receiver) = make_pair();
+        let (_rx, handle) = spawn_notification_collector(receiver);
+        timer.subscribe(104, NOTIFY_EVENT_IN, sender).unwrap();
+        arm_relative(&timer, Duration::from_secs(1), Duration::ZERO);
+        timer.unsubscribe(104).unwrap();
+
+        drop(timer);
+        handle.join().unwrap();
     }
 
     #[test]
