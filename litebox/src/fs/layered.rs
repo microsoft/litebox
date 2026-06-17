@@ -744,7 +744,11 @@ impl<
         let mut tombstone_removal = false;
         // If we already have an entry saying it is a tombstone, then we need to quit out early;
         // otherwise, we'll check the levels.
-        if let Some(entry) = self.root.read().entries.get(&path).cloned() {
+        let cached_entry = {
+            let root = self.root.read();
+            root.entries.get(&path).cloned()
+        };
+        if let Some(entry) = cached_entry {
             #[cfg(feature = "trace_fs")]
             if matches!(
                 self.layering_semantics,
