@@ -30,9 +30,8 @@ impl log::Log for HostLogger {
     }
 
     fn log(&self, record: &log::Record) {
-        use core::fmt::Write;
         let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
-        let _ = writeln!(buf, "[{}] {}", record.level(), record.args());
+        let _ = litebox_util_log::format_record(&mut buf, record);
         litebox_platform_lvbs::arch::ioport::serial_print_string(&buf);
     }
 

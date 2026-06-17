@@ -97,6 +97,35 @@ pub use backend_log::SpanGuard;
 #[cfg(feature = "backend_tracing")]
 pub use backend_tracing::SpanGuard;
 
+/// Converts a [`log::Record`] into the compact host-console format.
+///
+/// Formats the record as `[LEVEL] message key=value ...\n` into `writer`.
+#[cfg(feature = "backend_log")]
+pub fn format_record<W: core::fmt::Write>(
+    writer: &mut W,
+    record: &log::Record<'_>,
+) -> core::fmt::Result {
+    struct FieldVisitor<'a, W>(&'a mut W);
+
+    impl<W: core::fmt::Write> log::kv::VisitSource<'_> for FieldVisitor<'_, W> {
+        fn visit_pair(
+            &mut self,
+            key: log::kv::Key<'_>,
+            value: log::kv::Value<'_>,
+        ) -> Result<(), log::kv::Error> {
+            write!(self.0, " {key}={value}")?;
+            Ok(())
+        }
+    }
+
+    write!(writer, "[{}] {}", record.level(), record.args())?;
+    record
+        .key_values()
+        .visit(&mut FieldVisitor(writer))
+        .map_err(|_| core::fmt::Error)?;
+    writeln!(writer)
+}
+
 /// Internal module exposing backend types for use by exported macros.
 ///
 /// This module is public only because macros need access to backend types at the

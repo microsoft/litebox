@@ -193,3 +193,19 @@ fn test_instrument() {
     nested();
     TestStruct { value: 7 }.instrumented_method();
 }
+
+#[cfg(feature = "backend_log")]
+#[test]
+fn test_format_record_includes_key_values() {
+    let key_values = [("count", 42), ("name", 7)];
+    let record = log::Record::builder()
+        .level(log::Level::Info)
+        .args(format_args!("hello"))
+        .key_values(&key_values)
+        .build();
+    let mut output = String::new();
+
+    litebox_util_log::format_record(&mut output, &record).unwrap();
+
+    assert_eq!(output, "[INFO] hello count=42 name=7\n");
+}
