@@ -243,19 +243,24 @@ mod tests {
             EfdFlags::SEMAPHORE,
         ));
         let total = 8;
-        for _ in 0..total {
-            let copied_eventfd = eventfd.clone();
-            std::thread::spawn(move || {
-                copied_eventfd
-                    .read(&WaitState::new(platform()).context())
-                    .unwrap();
-            });
-        }
+        let handles: std::vec::Vec<_> = (0..total)
+            .map(|_| {
+                let copied_eventfd = eventfd.clone();
+                std::thread::spawn(move || {
+                    copied_eventfd
+                        .read(&WaitState::new(platform()).context())
+                        .unwrap();
+                })
+            })
+            .collect();
 
         std::thread::sleep(core::time::Duration::from_millis(500));
         eventfd
             .write(&WaitState::new(platform()).context(), total)
             .unwrap();
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     #[test]
