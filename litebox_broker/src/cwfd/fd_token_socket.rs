@@ -541,6 +541,7 @@ fn update_tracker_from_response(
         // State-registry creators: response body is one or two handle ids.
         Opcode::CreateEventfd
         | Opcode::CreatePidfd
+        | Opcode::CreateTimerfd
         | Opcode::CreateSignalfd
         | Opcode::InotifyInit1
         | Opcode::InetListenerCreate
@@ -1355,6 +1356,10 @@ fn handle_control_connection_inner(
                     | Opcode::CreateEventfd
                     | Opcode::ReadEventfd
                     | Opcode::WriteEventfd
+                    | Opcode::CreateTimerfd
+                    | Opcode::ReadTimerfd
+                    | Opcode::SetTimerfd
+                    | Opcode::GetTimerfd
                     | Opcode::CreateSignalfd
                     | Opcode::ReadSiginfo
                     | Opcode::PushSiginfo

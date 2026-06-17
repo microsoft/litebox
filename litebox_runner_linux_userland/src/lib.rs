@@ -326,6 +326,10 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (FdKind::Eventfd { handle_id }, litebox::fs::OFlags::empty())
         }
+        "timerfd" => {
+            ensure_no_subkind(spec, kind_str, &parts)?;
+            (FdKind::Timerfd { handle_id }, litebox::fs::OFlags::empty())
+        }
         "pidfd" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (FdKind::Pidfd { handle_id }, litebox::fs::OFlags::empty())
