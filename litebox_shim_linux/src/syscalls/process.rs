@@ -6401,7 +6401,7 @@ impl<FS: ShimFS> Task<FS> {
                                 ),
                                 #[cfg(feature = "worker_local_inet")]
                                 FdKind::Net => unreachable!(
-                                    "ensure_broker_backed_for_fork must only return Eventfd or Pidfd, got {snapshot:?}",
+                                    "ensure_broker_backed_for_fork must only return Eventfd, Pidfd, or Timerfd, got {snapshot:?}",
                                 ),
                             };
                             if matches!(snapshot, FdKind::Pidfd { .. }) {
