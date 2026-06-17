@@ -1483,6 +1483,7 @@ dependencies = [
  "bitflags 2.11.0",
  "litebox_broker_protocol",
  "slotmap",
+ "spin 0.9.8",
  "thiserror",
 ]
 

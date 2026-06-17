@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (stream, _) = listener.accept()?;
     let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
     channel.set_io_deadline(Some(Instant::now() + SESSION_TIMEOUT))?;
-    let mut broker = BrokerCore::new(PolicyEngine::event_only())?;
-    serve_connection(&mut broker, &mut channel)?;
+    let broker = BrokerCore::new(PolicyEngine::event_only())?;
+    serve_connection(&broker, &mut channel)?;
     Ok(())
 }

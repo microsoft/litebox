@@ -19,19 +19,21 @@ extern crate alloc;
 extern crate std;
 
 mod error;
-mod event;
+pub mod event;
 mod identity;
 mod object;
 mod policy;
 
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use alloc::collections::BTreeMap;
+use litebox_broker_protocol::ObjectHandle;
 use slotmap::SlotMap;
+use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
-pub use identity::{BrokerAssociation, CallerCredential};
-use litebox_broker_protocol::ObjectHandle;
+pub use identity::{BrokerSession, CallerCredential};
 pub use object::ObjectRights;
 use object::{ObjectEntry, ObjectId, ObjectReference};
 pub use policy::{PolicyEngine, PolicyProfile};
@@ -40,6 +42,8 @@ pub use policy::{PolicyEngine, PolicyProfile};
 pub type Result<T> = core::result::Result<T, BrokerError>;
 
 /// Resource limits for broker-owned authority state.
+///
+/// These limits are global to the broker core, not per session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BrokerCoreLimits {
@@ -73,18 +77,22 @@ impl Default for BrokerCoreLimits {
 
 const MAX_OBJECTS: usize = u32::MAX as usize - 1;
 
-/// Channel-independent broker authority state.
+/// Channel-independent broker authority handle.
 ///
 /// A broker process may construct only one broker core for its process
 /// lifetime. Constructors return [`BrokerError::BrokerCoreAlreadyExists`] if a
 /// core has already been constructed.
 pub struct BrokerCore {
-    policy: PolicyEngine,
-    limits: BrokerCoreLimits,
-    next_process_id: u64,
-    next_reference_handle: u64,
-    objects: SlotMap<ObjectId, ObjectEntry>,
-    references: BTreeMap<ObjectHandle, ObjectReference>,
+    pub(crate) state: Arc<RwLock<BrokerCoreState>>,
+}
+
+pub(crate) struct BrokerCoreState {
+    pub(crate) policy: PolicyEngine,
+    pub(crate) limits: BrokerCoreLimits,
+    pub(crate) next_session_id: u64,
+    pub(crate) next_reference_handle: u64,
+    pub(crate) objects: SlotMap<ObjectId, Arc<RwLock<ObjectEntry>>>,
+    pub(crate) references: BTreeMap<ObjectHandle, ObjectReference>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -106,14 +114,37 @@ impl BrokerCore {
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
 
         Ok(Self {
-            policy,
-            limits,
-            next_process_id: 1,
-            next_reference_handle: 1,
-            objects: SlotMap::with_key(),
-            references: BTreeMap::new(),
+            state: Arc::new(RwLock::new(BrokerCoreState {
+                policy,
+                limits,
+                next_session_id: 1,
+                next_reference_handle: 1,
+                objects: SlotMap::with_key(),
+                references: BTreeMap::new(),
+            })),
         })
     }
+
+    pub(crate) fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Allocates broker authority state for one authenticated caller session.
+    pub fn create_session(&self, caller_credential: CallerCredential) -> Result<BrokerSession> {
+        let mut state = self.state.write();
+        let session_id = allocate_id(&mut state.next_session_id)?;
+        Ok(BrokerSession::new(
+            self.clone(),
+            identity::SessionId::new(session_id),
+            caller_credential,
+        ))
+    }
+}
+
+fn close_session(core: &BrokerCore, session_id: identity::SessionId) {
+    object::drop_references_for_session(core, session_id);
 }
 
 fn allocate_id(next_id: &mut u64) -> Result<u64> {

@@ -14,7 +14,7 @@ extern crate std;
 
 use core::fmt;
 
-use litebox_broker_core::{BrokerAssociation, BrokerCore, BrokerError, CallerCredential};
+use litebox_broker_core::{BrokerCore, BrokerError, BrokerSession, CallerCredential, event};
 use litebox_broker_protocol::{
     AddEventResponse, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse,
     CreateEventResponse, ErrorCode, EventRequest, EventResponse, HostControlChannel,
@@ -31,7 +31,7 @@ pub const HOST_PROTOCOL_VERSION: ProtocolVersion = INITIAL_PROTOCOL_VERSION;
 
 /// Serves one broker connection over the provided connected control channel.
 pub fn serve_connection<T>(
-    core: &mut BrokerCore,
+    core: &BrokerCore,
     channel: &mut T,
 ) -> Result<ConnectionTermination, T::Error>
 where
@@ -42,19 +42,16 @@ where
         .map_err(BrokerHostError::Channel)?;
     let caller_credential = caller_credential_from_peer(peer_credential)
         .map_err(|()| BrokerHostError::AssociationSetup)?;
-    let association = core
-        .create_association(caller_credential)
+    let session = core
+        .create_session(caller_credential)
         .map_err(|_error| BrokerHostError::AssociationSetup)?;
 
-    let result = serve_request_loop(core, channel, &association);
-    core.close_association(association);
-    result
+    serve_request_loop(channel, &session)
 }
 
 fn serve_request_loop<T>(
-    core: &mut BrokerCore,
     channel: &mut T,
-    association: &BrokerAssociation,
+    session: &BrokerSession,
 ) -> Result<ConnectionTermination, T::Error>
 where
     T: HostControlChannel,
@@ -65,7 +62,7 @@ where
             break;
         };
 
-        let dispatch = handle_received_request(core, association, &mut state, received);
+        let dispatch = handle_received_request(session, &mut state, received);
         channel
             .send_response(&dispatch.response)
             .map_err(BrokerHostError::Channel)?;
@@ -88,22 +85,18 @@ fn caller_credential_from_peer(
 }
 
 fn handle_received_request(
-    core: &mut BrokerCore,
-    association: &BrokerAssociation,
+    session: &BrokerSession,
     state: &mut ConnectionState,
     received: ReceivedBrokerRequest,
 ) -> BrokerDispatch {
     match received {
-        ReceivedBrokerRequest::Request(request) => {
-            handle_request(core, association, state, request)
-        }
+        ReceivedBrokerRequest::Request(request) => handle_request(session, state, request),
         _ => handle_unknown_request(*state),
     }
 }
 
 fn handle_request(
-    core: &mut BrokerCore,
-    association: &BrokerAssociation,
+    session: &BrokerSession,
     state: &mut ConnectionState,
     request: BrokerRequest,
 ) -> BrokerDispatch {
@@ -119,13 +112,12 @@ fn handle_request(
         },
         ConnectionState::Active {
             negotiated_protocol_version,
-        } => handle_active_request(core, association, negotiated_protocol_version, request),
+        } => handle_active_request(session, negotiated_protocol_version, request),
     }
 }
 
 fn handle_active_request(
-    core: &mut BrokerCore,
-    association: &BrokerAssociation,
+    session: &BrokerSession,
     _negotiated_protocol_version: ProtocolVersion,
     request: BrokerRequest,
 ) -> BrokerDispatch {
@@ -135,46 +127,37 @@ fn handle_active_request(
             CloseReason::ProtocolViolation,
         ),
         BrokerRequest::Core(request) => {
-            BrokerDispatch::continue_after(handle_core_request(core, association, request))
+            BrokerDispatch::continue_after(handle_core_request(session, request))
         }
         _ => BrokerDispatch::continue_after(BrokerResponse::Error(ErrorCode::UnsupportedOperation)),
     }
 }
 
-fn handle_core_request(
-    core: &mut BrokerCore,
-    association: &BrokerAssociation,
-    request: CoreRequest,
-) -> BrokerResponse {
+fn handle_core_request(session: &BrokerSession, request: CoreRequest) -> BrokerResponse {
     match request {
-        CoreRequest::Event(request) => handle_event_request(core, association, request),
+        CoreRequest::Event(request) => handle_event_request(session, request),
         _ => BrokerResponse::Error(ErrorCode::UnsupportedOperation),
     }
 }
 
-fn handle_event_request(
-    core: &mut BrokerCore,
-    association: &BrokerAssociation,
-    request: EventRequest,
-) -> BrokerResponse {
+fn handle_event_request(session: &BrokerSession, request: EventRequest) -> BrokerResponse {
     match request {
-        EventRequest::Create(request) => handle_core_result(
-            core.create_event_with_count(association, request.initial_count),
-            |handle| {
+        EventRequest::Create(request) => {
+            handle_core_result(event::create(session, request.initial_count), |handle| {
                 BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(
                     CreateEventResponse::new(handle),
                 )))
-            },
-        ),
+            })
+        }
         EventRequest::Wait(request) => {
-            handle_core_result(core.wait_event(association, request.handle), |outcome| {
+            handle_core_result(event::wait(session, request.handle), |outcome| {
                 BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
                     WaitEventResponse::new(outcome),
                 )))
             })
         }
         EventRequest::Add(request) => handle_core_result(
-            core.add_event(association, request.handle, request.value),
+            event::add(session, request.handle, request.value),
             |readiness| {
                 BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(
                     AddEventResponse::new(readiness),
@@ -182,7 +165,7 @@ fn handle_event_request(
             },
         ),
         EventRequest::Consume(request) => handle_core_result(
-            core.consume_event(association, request.handle, request.mode),
+            event::consume(session, request.handle, request.mode),
             |consumption| {
                 BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(consumption)))
             },
@@ -312,16 +295,14 @@ mod tests {
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
-        let mut core = BrokerCore::new(PolicyEngine::event_only()).unwrap();
+        let core = BrokerCore::new(PolicyEngine::event_only()).unwrap();
 
-        serve_connection_negotiates_routes_one_request_and_returns_peer_closed(&mut core);
-        serve_connection_closes_after_protocol_violation(&mut core);
-        serve_connection_returns_channel_error_when_response_send_fails(&mut core);
+        serve_connection_negotiates_routes_one_request_and_returns_peer_closed(&core);
+        serve_connection_closes_after_protocol_violation(&core);
+        serve_connection_returns_channel_error_when_response_send_fails(&core);
     }
 
-    fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(
-        core: &mut BrokerCore,
-    ) {
+    fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(core: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([
             Ok(Some(ReceivedBrokerRequest::Request(
                 BrokerRequest::Negotiate {
@@ -353,7 +334,7 @@ mod tests {
         assert_ne!(handle.0, 0);
     }
 
-    fn serve_connection_closes_after_protocol_violation(core: &mut BrokerCore) {
+    fn serve_connection_closes_after_protocol_violation(core: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([
             Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
                 0,
@@ -376,7 +357,7 @@ mod tests {
         assert_eq!(channel.requests.len(), 1);
     }
 
-    fn serve_connection_returns_channel_error_when_response_send_fails(core: &mut BrokerCore) {
+    fn serve_connection_returns_channel_error_when_response_send_fails(core: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([Ok(Some(
             ReceivedBrokerRequest::Request(BrokerRequest::Negotiate {
                 protocol_version: HOST_PROTOCOL_VERSION,

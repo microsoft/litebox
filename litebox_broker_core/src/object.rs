@@ -1,10 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::sync::Arc;
+
 use crate::event::EventObject;
-use crate::identity::{BrokerAssociation, ProcessId};
-use crate::{BrokerCore, BrokerError, Result, allocate_id};
+use crate::identity::{BrokerSession, CallerCredential, SessionId};
+use crate::{BrokerCore, BrokerCoreState, BrokerError, Result, allocate_id};
 use litebox_broker_protocol::ObjectHandle;
+use spin::rwlock::RwLock;
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
@@ -25,7 +28,7 @@ slotmap::new_key_type! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ObjectReference {
     pub(crate) object_id: ObjectId,
-    pub(crate) owner: ProcessId,
+    pub(crate) session_id: SessionId,
     pub(crate) rights: ObjectRights,
 }
 
@@ -34,148 +37,188 @@ pub(crate) enum ObjectEntry {
     Event(EventObject),
 }
 
-impl BrokerCore {
-    /// Inserts a broker object and mints its first owned reference.
-    pub(crate) fn insert_object_with_reference(
-        &mut self,
-        association: &BrokerAssociation,
-        object: ObjectEntry,
-        rights: ObjectRights,
-    ) -> Result<ObjectHandle> {
-        if self.objects.len() >= self.limits.max_objects
-            || self.references.len() >= self.limits.max_references
-        {
-            return Err(BrokerError::ResourceExhausted);
-        }
+pub(super) fn create_object_with_reference(
+    session: &BrokerSession,
+    object: ObjectEntry,
+) -> Result<ObjectHandle> {
+    let mut state = session.core.state.write();
+    let rights = match &object {
+        ObjectEntry::Event(_) => state
+            .policy
+            .authorize_create_event(session.caller_credential)?,
+    };
 
-        let handle = ObjectHandle(allocate_id(&mut self.next_reference_handle)?);
-        let object_id = self.objects.insert(object);
-        let old_reference = self.references.insert(
+    if state.objects.len() >= state.limits.max_objects
+        || state.references.len() >= state.limits.max_references
+    {
+        return Err(BrokerError::ResourceExhausted);
+    }
+    if state.objects.len() == state.objects.capacity() {
+        state
+            .objects
+            .try_reserve(1)
+            .map_err(|_| BrokerError::ResourceExhausted)?;
+    }
+
+    let handle = ObjectHandle(allocate_id(&mut state.next_reference_handle)?);
+    let object_id = state.objects.insert(Arc::new(RwLock::new(object)));
+    let old_reference = state.references.insert(
+        handle,
+        ObjectReference {
+            object_id,
+            session_id: session.session_id,
+            rights,
+        },
+    );
+    debug_assert!(old_reference.is_none());
+
+    Ok(handle)
+}
+
+pub(super) fn with_authorized_object<T>(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    rights: ObjectRights,
+    f: impl FnOnce(&ObjectEntry, ObjectRights) -> Result<T>,
+) -> Result<T> {
+    let authorized = {
+        let state = session.core.state.read();
+        authorize_use_object(
+            &state,
+            session.session_id,
+            session.caller_credential,
             handle,
-            ObjectReference {
-                object_id,
-                owner: association.process_id(),
-                rights,
-            },
-        );
-        debug_assert!(old_reference.is_none());
+            rights,
+        )?
+    };
+    let object = authorized.object.read();
+    f(&object, authorized.rights)
+}
 
-        Ok(handle)
+pub(super) fn with_authorized_object_mut<T>(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    rights: ObjectRights,
+    f: impl FnOnce(&mut ObjectEntry, ObjectRights) -> Result<T>,
+) -> Result<T> {
+    let authorized = {
+        let state = session.core.state.read();
+        authorize_use_object(
+            &state,
+            session.session_id,
+            session.caller_credential,
+            handle,
+            rights,
+        )?
+    };
+    let mut object = authorized.object.write();
+    f(&mut object, authorized.rights)
+}
+
+fn authorize_use_object(
+    state: &BrokerCoreState,
+    session_id: SessionId,
+    caller_credential: CallerCredential,
+    handle: ObjectHandle,
+    rights: ObjectRights,
+) -> Result<AuthorizedObject> {
+    let reference = validate_handle(state, session_id, handle, rights)?;
+    let reference_rights = reference.rights;
+    let object = state
+        .objects
+        .get(reference.object_id)
+        .ok_or(BrokerError::UnknownObject)?;
+    state
+        .policy
+        .authorize_use_event(caller_credential, rights)?;
+    Ok(AuthorizedObject {
+        object: Arc::clone(object),
+        rights: reference_rights,
+    })
+}
+
+pub(super) fn close_object_reference(session: &BrokerSession, handle: ObjectHandle) -> Result<()> {
+    let mut state = session.core.state.write();
+    let object_id = reference_for_handle(&state, session.session_id, handle)?.object_id;
+    if !state.objects.contains_key(object_id) {
+        return Err(BrokerError::UnknownObject);
     }
 
-    pub(crate) fn authorize_create_event(
-        &self,
-        association: &BrokerAssociation,
-    ) -> Result<ObjectRights> {
-        self.policy
-            .authorize_create_event(association.caller_credential())
+    state.references.remove(&handle);
+    drop_object_if_unreferenced(&mut state, object_id);
+    Ok(())
+}
+
+pub(super) fn drop_references_for_session(core: &BrokerCore, session_id: SessionId) {
+    let mut state = core.state.write();
+    let BrokerCoreState {
+        objects,
+        references,
+        ..
+    } = &mut *state;
+    references.retain(|_, reference| reference.session_id != session_id);
+    objects.retain(|object_id, _| {
+        references
+            .values()
+            .any(|reference| reference.object_id == object_id)
+    });
+}
+
+fn validate_handle(
+    state: &BrokerCoreState,
+    session_id: SessionId,
+    handle: ObjectHandle,
+    required_rights: ObjectRights,
+) -> Result<ObjectReference> {
+    let reference = reference_for_handle(state, session_id, handle)?;
+    if !reference.rights.contains(required_rights) {
+        return Err(BrokerError::InvalidRights);
     }
 
-    pub(crate) fn authorize_use_event(
-        &self,
-        association: &BrokerAssociation,
-        handle: ObjectHandle,
-        rights: ObjectRights,
-    ) -> Result<ObjectReference> {
-        let reference = self.validate_handle(association, handle, rights)?;
-        self.policy
-            .authorize_use_event(association.caller_credential(), rights)?;
-        Ok(reference)
+    state
+        .objects
+        .get(reference.object_id)
+        .ok_or(BrokerError::UnknownObject)?;
+
+    Ok(*reference)
+}
+
+fn reference_for_handle(
+    state: &BrokerCoreState,
+    session_id: SessionId,
+    handle: ObjectHandle,
+) -> Result<&ObjectReference> {
+    let reference = state
+        .references
+        .get(&handle)
+        .ok_or(BrokerError::UnknownObject)?;
+    if reference.session_id != session_id {
+        return Err(BrokerError::UnknownObject);
     }
+    Ok(reference)
+}
 
-    pub(crate) fn object(&self, object_id: ObjectId) -> Result<&ObjectEntry> {
-        self.objects
-            .get(object_id)
-            .ok_or(BrokerError::UnknownObject)
-    }
-
-    pub(crate) fn object_mut(&mut self, object_id: ObjectId) -> Result<&mut ObjectEntry> {
-        self.objects
-            .get_mut(object_id)
-            .ok_or(BrokerError::UnknownObject)
-    }
-
-    fn validate_handle(
-        &self,
-        association: &BrokerAssociation,
-        handle: ObjectHandle,
-        required_rights: ObjectRights,
-    ) -> Result<ObjectReference> {
-        let reference = self.reference_for_handle(association, handle)?;
-        if !reference.rights.contains(required_rights) {
-            return Err(BrokerError::InvalidRights);
-        }
-
-        self.objects
-            .get(reference.object_id)
-            .ok_or(BrokerError::UnknownObject)?;
-
-        Ok(*reference)
+fn drop_object_if_unreferenced(state: &mut BrokerCoreState, object_id: ObjectId) {
+    if !state
+        .references
+        .values()
+        .any(|reference| reference.object_id == object_id)
+    {
+        state.objects.remove(object_id);
     }
 }
 
-impl BrokerCore {
-    /// Closes one object reference owned by an association.
-    ///
-    /// The underlying object is released when this was the last live reference.
-    pub fn close_object_reference(
-        &mut self,
-        association: &BrokerAssociation,
-        handle: ObjectHandle,
-    ) -> Result<()> {
-        let object_id = self.reference_for_handle(association, handle)?.object_id;
-        if !self.objects.contains_key(object_id) {
-            return Err(BrokerError::UnknownObject);
-        }
-
-        self.references.remove(&handle);
-        self.drop_object_if_unreferenced(object_id);
-        Ok(())
-    }
-
-    /// Closes a broker association and releases references owned by it.
-    pub fn close_association(&mut self, association: BrokerAssociation) {
-        let process_id = association.process_id();
-        self.references
-            .retain(|_, reference| reference.owner != process_id);
-        let references = &self.references;
-        self.objects.retain(|object_id, _| {
-            references
-                .values()
-                .any(|reference| reference.object_id == object_id)
-        });
-    }
-
-    fn reference_for_handle(
-        &self,
-        association: &BrokerAssociation,
-        handle: ObjectHandle,
-    ) -> Result<&ObjectReference> {
-        let reference = self
-            .references
-            .get(&handle)
-            .ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != association.process_id() {
-            return Err(BrokerError::UnknownObject);
-        }
-        Ok(reference)
-    }
-
-    fn drop_object_if_unreferenced(&mut self, object_id: ObjectId) {
-        if !self
-            .references
-            .values()
-            .any(|reference| reference.object_id == object_id)
-        {
-            self.objects.remove(object_id);
-        }
-    }
+struct AuthorizedObject {
+    object: Arc<RwLock<ObjectEntry>>,
+    rights: ObjectRights,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, allocate_id};
+    use crate::{
+        BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, allocate_id,
+        event,
+    };
     use litebox_broker_protocol::{ObjectHandle, WaitOutcome};
 
     #[test]
@@ -207,61 +250,74 @@ mod tests {
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
-        let mut core = BrokerCore::new(PolicyEngine::event_only()).unwrap();
-        let owner = core
-            .create_association(CallerCredential::Unauthenticated)
+        let core = BrokerCore::new(PolicyEngine::event_only()).unwrap();
+        let session = core
+            .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let other = core
-            .create_association(CallerCredential::Unauthenticated)
+            .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let handle = core.create_event(&owner).unwrap();
+        let handle = event::create(&session, 0).unwrap();
         let unknown_handle = ObjectHandle(handle.0 + 1);
 
         assert_ne!(unknown_handle, handle);
         assert_eq!(
-            core.wait_event(&owner, unknown_handle),
+            event::wait(&session, unknown_handle),
             Err(BrokerError::UnknownObject)
         );
 
         assert_eq!(
-            core.close_object_reference(&other, handle),
+            other.close_object_reference(handle),
             Err(BrokerError::UnknownObject)
         );
 
         assert!(matches!(
-            core.wait_event(&owner, handle),
+            event::wait(&session, handle),
             Ok(WaitOutcome::WouldBlock(_))
         ));
 
-        assert_eq!(core.close_object_reference(&owner, handle), Ok(()));
-        assert!(core.references.is_empty());
-        assert!(core.objects.is_empty());
+        assert_eq!(session.close_object_reference(handle), Ok(()));
+        {
+            let state = core.state.read();
+            assert!(state.references.is_empty());
+            assert!(state.objects.is_empty());
+        }
         assert_eq!(
-            core.close_object_reference(&owner, handle),
+            session.close_object_reference(handle),
             Err(BrokerError::UnknownObject)
         );
 
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
+        let session = core
+            .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let _handle = core.create_event(&association).unwrap();
-        assert_eq!(core.references.len(), 1);
-        assert_eq!(core.objects.len(), 1);
+        let _handle = event::create(&session, 0).unwrap();
+        {
+            let state = core.state.read();
+            assert_eq!(state.references.len(), 1);
+            assert_eq!(state.objects.len(), 1);
+        }
 
-        core.close_association(association);
+        drop(session);
 
-        assert!(core.references.is_empty());
-        assert!(core.objects.is_empty());
+        {
+            let state = core.state.read();
+            assert!(state.references.is_empty());
+            assert!(state.objects.is_empty());
+        }
 
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
+        let session = core
+            .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        core.next_reference_handle = u64::MAX;
+        {
+            let mut state = core.state.write();
+            state.next_reference_handle = u64::MAX;
+        }
         assert_eq!(
-            core.create_event(&association),
+            event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
         );
-        assert!(core.references.is_empty());
-        assert!(core.objects.is_empty());
+        let state = core.state.read();
+        assert!(state.references.is_empty());
+        assert!(state.objects.is_empty());
     }
 }
