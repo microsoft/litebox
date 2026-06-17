@@ -659,5 +659,117 @@ class MigrationV3ToV4Tests(unittest.TestCase):
         )
 
 
+class RegressionClassTests(unittest.TestCase):
+    """The `regression_class` view: flaky-aware, confidence-tiered
+    classification, computed purely in SQL over run_results + the
+    supervisor-refreshed branch_baseline / test_flake_stats caches.
+    Hermetic — branch_baseline is inserted directly (no git)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-regr-")
+        self.db = Path(self.tmp) / "results.sqlite"
+        self.conn = _init_db(self.db)
+        dashboard._ensure_classification_schema(self.conn)
+        # Upstream lineage lives in the tracked-ref CI worktree.
+        self.conn.execute(
+            "INSERT INTO tracked_refs(ref, ci_worktree) VALUES('up','/ci')"
+        )
+        self.now = dashboard.now_ms()
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _upstream(self, commit, test_id, verdict, *, dt=0):
+        # A clean run on the tracked-ref CI worktree (/ci).
+        rid = _add_run(self.conn, worktree="/ci", commit=commit,
+                       dirty_hash=None, started_ts_ms=self.now - dt)
+        _add_result(self.conn, run_id=rid, test_id=test_id, pass_="litebox",
+                    verdict=verdict, ts_ms=self.now - dt)
+
+    def _branch(self, commit, test_id, verdict, *, dt=0):
+        rid = _add_run(self.conn, worktree="/wt", commit=commit,
+                       dirty_hash=None, started_ts_ms=self.now - dt)
+        _add_result(self.conn, run_id=rid, test_id=test_id, pass_="litebox",
+                    verdict=verdict, ts_ms=self.now - dt)
+
+    def _classify(self):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO branch_baseline"
+            "(branch_sha, baseline_sha, ref, branch, computed_at_ms) "
+            "VALUES('BRANCH','BASE','up','wt/x',?)",
+            (self.now,),
+        )
+        dashboard._refresh_test_flake_stats(self.conn)
+        return {
+            r["test_id"]: (r["classification"], r["confidence"])
+            for r in self.conn.execute(
+                "SELECT test_id, classification, confidence "
+                "FROM regression_class WHERE mode='litebox'"
+            )
+        }
+
+    def test_hard_regression_high_confidence(self):
+        # Rock-solid upstream (3 passes), passed at baseline, fails
+        # twice on branch → hard_regression, high confidence.
+        for i in range(3):
+            self._upstream("UP", "T", "pass", dt=i * 1000)
+        self._upstream("BASE", "T", "pass")
+        self._branch("BRANCH", "T", "fail", dt=10)
+        self._branch("BRANCH", "T", "fail", dt=5)
+        self.assertEqual(self._classify()["T"], ("hard_regression", "high"))
+
+    def test_hard_regression_medium_when_single_branch_run(self):
+        self._upstream("BASE", "T", "pass")
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"], ("hard_regression", "medium"))
+
+    def test_soft_regression_when_upstream_flaky(self):
+        # Upstream flipped pass/fail recently → discount the branch fail.
+        self._upstream("UP", "T", "pass", dt=2000)
+        self._upstream("UP", "T", "fail", dt=1000)
+        self._upstream("BASE", "T", "pass")
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"][0], "soft_regression")
+
+    def test_soft_regression_when_baseline_sha_flaky(self):
+        # Baseline sha itself was flaky (fail then pass) → soft.
+        self._upstream("BASE", "T", "fail", dt=2000)
+        self._upstream("BASE", "T", "pass", dt=1000)
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"][0], "soft_regression")
+
+    def test_preexisting_fail(self):
+        self._upstream("BASE", "T", "fail")
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"], ("preexisting_fail", "n/a"))
+
+    def test_new_fail_when_no_baseline(self):
+        # Only branch coverage, no baseline row.
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"], ("new_fail", "low"))
+
+    def test_ok_and_flaky_pass(self):
+        self._upstream("BASE", "T_ok", "pass")
+        self._branch("BRANCH", "T_ok", "pass")
+        self._upstream("BASE", "T_fp", "pass")
+        self._branch("BRANCH", "T_fp", "fail", dt=10)
+        self._branch("BRANCH", "T_fp", "pass", dt=5)  # recovered on retry
+        res = self._classify()
+        self.assertEqual(res["T_ok"], ("ok", "n/a"))
+        self.assertEqual(res["T_fp"], ("flaky_pass", "n/a"))
+
+    def test_branch_fail_not_softened_by_branch_side_pass(self):
+        # A genuine regression: upstream stable pass, fails on branch.
+        # The branch's own fail must NOT count as upstream flakiness
+        # (regression-as-flake bug guard).
+        self._upstream("BASE", "T", "pass")
+        self._upstream("UP", "T", "pass", dt=1000)
+        self._branch("BRANCH", "T", "fail")
+        cls, _ = self._classify()["T"]
+        self.assertEqual(cls, "hard_regression")
+
+
 if __name__ == "__main__":
     unittest.main()
