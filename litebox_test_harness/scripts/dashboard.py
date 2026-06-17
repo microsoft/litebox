@@ -272,7 +272,7 @@ def _ensure_views(conn: sqlite3.Connection) -> None:
 # meta-keyed definition version) — no SCHEMA_VERSION bump, no producer
 # change, no data migration.
 
-_CLASSIFICATION_SCHEMA_VERSION = 3
+_CLASSIFICATION_SCHEMA_VERSION = 4
 
 # "Recently flaky" lookback for the soft-regression discount.
 _RECENT_FLAKE_WINDOW_MS = 7 * 24 * 3600 * 1000
@@ -334,7 +334,7 @@ ranked AS (
      WHERE r.dirty_hash IS NULL
        AND r.commit_sha IN (SELECT sha FROM relevant)
 ),
-sha_state AS (
+sha_state AS MATERIALIZED (
     SELECT sha, mode, test_id,
            COUNT(*) AS n,
            SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
@@ -348,10 +348,28 @@ sha_state AS (
                     THEN verdict END) AS freshest_def
       FROM ranked
      GROUP BY sha, mode, test_id
+),
+universe AS (
+    -- Every (branch, mode, test_id) worth a verdict: covered at the
+    -- branch sha OR at its baseline. Driving from this UNION (rather
+    -- than an inner join on the branch sha) is what lets a test that
+    -- exists in the comparable universe but simply hasn't run at the
+    -- branch yet surface as `not_run` instead of vanishing — so a
+    -- thin/partial run can't be mistaken for "clean". UNION of two
+    -- equality joins (deduped) is cheaper than one OR-join.
+    SELECT bb.branch, bb.ref, bb.branch_sha, bb.baseline_sha,
+           s.mode, s.test_id
+      FROM branch_baseline bb
+      JOIN sha_state s ON s.sha = bb.branch_sha
+    UNION
+    SELECT bb.branch, bb.ref, bb.branch_sha, bb.baseline_sha,
+           s.mode, s.test_id
+      FROM branch_baseline bb
+      JOIN sha_state s ON s.sha = bb.baseline_sha
 )
 SELECT
-    bb.branch, bb.ref, bb.branch_sha, bb.baseline_sha,
-    a.mode, a.test_id,
+    u.branch, u.ref, u.branch_sha, u.baseline_sha,
+    u.mode, u.test_id,
     b.freshest_def AS baseline_verdict,
     b.n            AS baseline_n,
     b.flaky_atsha  AS baseline_atsha_flaky,
@@ -364,6 +382,7 @@ SELECT
     COALESCE(f.n_pass, 0)       AS recent_pass,
     COALESCE(f.n_fail, 0)       AS recent_fail,
     CASE
+      WHEN a.n IS NULL                                   THEN 'not_run'
       WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 0 THEN 'ok'
       WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 1 THEN 'flaky_pass'
       WHEN a.freshest_def IS NULL                        THEN 'no_result'
@@ -374,6 +393,7 @@ SELECT
       ELSE 'hard_regression'
     END AS classification,
     CASE
+      WHEN a.n IS NULL                                       THEN 'n/a'
       WHEN a.freshest_def = 'pass' OR a.freshest_def IS NULL THEN 'n/a'
       WHEN b.freshest_def IS NULL                            THEN 'low'
       WHEN b.freshest_def = 'fail'                           THEN 'n/a'
@@ -384,13 +404,13 @@ SELECT
       WHEN COALESCE(f.n_pass, 0) >= 1                        THEN 'medium'
       ELSE 'low'
     END AS confidence
-  FROM branch_baseline bb
-  JOIN sha_state a ON a.sha = bb.branch_sha
+  FROM universe u
+  LEFT JOIN sha_state a
+         ON a.sha = u.branch_sha AND a.mode = u.mode AND a.test_id = u.test_id
   LEFT JOIN sha_state b
-         ON b.sha = bb.baseline_sha AND b.mode = a.mode
-        AND b.test_id = a.test_id
+         ON b.sha = u.baseline_sha AND b.mode = u.mode AND b.test_id = u.test_id
   LEFT JOIN test_flake_stats f
-         ON f.mode = a.mode AND f.test_id = a.test_id;
+         ON f.mode = u.mode AND f.test_id = u.test_id;
 """
 
 
@@ -2643,13 +2663,23 @@ def cmd_regressions(args: argparse.Namespace) -> int:
         conn.close()
         return 1
     branch_sha = row["branch_sha"]
+    # `regression_class` is expensive to evaluate (it classifies the whole
+    # comparable universe). Materialize this branch's slice once so the
+    # summary / coverage / per-bucket queries below don't each re-run it.
+    conn.execute("DROP TABLE IF EXISTS temp._rc")
+    conn.execute(
+        "CREATE TEMP TABLE _rc AS "
+        "SELECT mode, test_id, classification, confidence "
+        "  FROM regression_class WHERE branch_sha = ?",
+        (branch_sha,),
+    )
     if args.format == "sql":
         for r in conn.execute(
             "SELECT mode, test_id, classification, confidence "
-            "  FROM regression_class WHERE branch_sha = ? "
-            "   AND classification NOT IN ('ok','flaky_pass','no_result') "
+            "  FROM _rc "
+            "   WHERE classification NOT IN "
+            "       ('ok','flaky_pass','no_result','not_run') "
             " ORDER BY mode, classification, confidence DESC, test_id",
-            (branch_sha,),
         ):
             print(f"{r['mode']}\t{r['classification']}\t{r['confidence']}"
                   f"\t{r['test_id']}")
@@ -2660,34 +2690,45 @@ def cmd_regressions(args: argparse.Namespace) -> int:
     for mode in ("native", "litebox"):
         counts = conn.execute(
             "SELECT classification, confidence, COUNT(*) n "
-            "  FROM regression_class WHERE branch_sha = ? AND mode = ? "
-            "   AND classification NOT IN ('ok','flaky_pass','no_result') "
+            "  FROM _rc WHERE mode = ? "
+            "   AND classification NOT IN "
+            "       ('ok','flaky_pass','no_result','not_run') "
             " GROUP BY classification, confidence "
             " ORDER BY classification, confidence",
-            (branch_sha, mode),
+            (mode,),
         ).fetchall()
         summary = "  ".join(
             f"{c['classification']}/{c['confidence']}={c['n']}" for c in counts
         ) or "clean"
-        # no_result is an infra non-outcome (~1% background), not a
-        # regression — report it separately so it never reads as a fail.
-        n_nr = conn.execute(
-            "SELECT COUNT(*) FROM regression_class "
-            " WHERE branch_sha = ? AND mode = ? AND classification = 'no_result'",
-            (branch_sha, mode),
-        ).fetchone()[0]
-        nr = f"   (+{n_nr} no_result infra)" if n_nr else ""
-        print(f"_{mode}_: {summary}{nr}")
+        # Coverage of the comparable universe: how much of it has actually
+        # run at the branch sha. A high `not_run` means the verdict is
+        # provisional — a partial run must not read as "clean".
+        cov = conn.execute(
+            "SELECT "
+            "  SUM(CASE WHEN classification = 'not_run' THEN 0 ELSE 1 END) covered,"
+            "  COUNT(*) total,"
+            "  SUM(CASE WHEN classification = 'no_result' THEN 1 ELSE 0 END) nr "
+            "  FROM _rc WHERE mode = ?",
+            (mode,),
+        ).fetchone()
+        covered, total, n_nr = cov["covered"] or 0, cov["total"] or 0, cov["nr"] or 0
+        not_run = total - covered
+        cov_str = f"covered {covered}/{total}"
+        if not_run:
+            cov_str += f", {not_run} not_run"
+        if n_nr:
+            cov_str += f", {n_nr} no_result infra"
+        print(f"_{mode}_: {summary}   [{cov_str}]")
     print()
     # List the actionable buckets, hardest first.
     for mode in ("native", "litebox"):
         for cls in ("hard_regression", "new_fail", "soft_regression"):
             ids = conn.execute(
-                "SELECT test_id, confidence FROM regression_class "
-                " WHERE branch_sha = ? AND mode = ? AND classification = ? "
+                "SELECT test_id, confidence FROM _rc "
+                " WHERE mode = ? AND classification = ? "
                 " ORDER BY CASE confidence WHEN 'high' THEN 0 "
                 "          WHEN 'medium' THEN 1 ELSE 2 END, test_id",
-                (branch_sha, mode, cls),
+                (mode, cls),
             ).fetchall()
             if not ids:
                 continue
