@@ -642,6 +642,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 self.install_eventfd_at_slot(event_file, guest_fd, &files);
                 Ok(())
             }
+            FdKind::Timerfd { handle_id } => {
+                let provider = syscalls::eventfd::broker_timerfd_provider().ok_or(())?;
+                provider.dup_handle(handle_id).map_err(|_| ())?;
+                let timer_file = syscalls::eventfd::EventFile::new_timer_broker_backed(
+                    provider,
+                    handle_id,
+                    litebox_common_linux::TimerfdFlags::empty(),
+                );
+                self.install_eventfd_at_slot(timer_file, guest_fd, &files);
+                Ok(())
+            }
             FdKind::Pidfd { handle_id } => {
                 let target_pid =
                     litebox::process::ProcessId(u32::try_from(handle_id).map_err(|_| ())?);
@@ -847,8 +858,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .map_err(|_| ())?;
                 self.install_broker_pty_at_slot(pty_fd, guest_fd, &files)
             }
-            FdKind::Timerfd { .. }
-            | FdKind::BrokerInetRaw { .. }
+            FdKind::BrokerInetRaw { .. }
             | FdKind::FilesystemFd
             | FdKind::UnixSocket
             | FdKind::Epoll
@@ -2047,8 +2057,33 @@ impl<FS: ShimFS> LinuxShim<FS> {
                             entry.fd
                         );
                     }
-                    FdKind::Timerfd { .. } => {
-                        // TODO(wsT): reattach broker timerfd once broker timer hosting lands; today timerfds are not snapshot-restored (no broker_handle was emitted), matching prior behavior.
+                    FdKind::Timerfd { handle_id } => {
+                        let Some(provider) = syscalls::eventfd::broker_timerfd_provider() else {
+                            continue;
+                        };
+                        if provider.dup_handle(handle_id).is_err() {
+                            continue;
+                        }
+                        let timer_file = syscalls::eventfd::EventFile::new_timer_broker_backed(
+                            provider,
+                            handle_id,
+                            litebox_common_linux::TimerfdFlags::empty(),
+                        );
+                        let file = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::eventfd::EventfdSubsystem>(timer_file);
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                        debug_assert!(
+                            success,
+                            "timerfd fd slot {} occupied during restore",
+                            entry.fd
+                        );
                     }
                     FdKind::Pidfd { handle_id } => {
                         let event_file: Option<syscalls::eventfd::EventFile<Platform>> =

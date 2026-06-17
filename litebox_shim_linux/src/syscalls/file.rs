@@ -6618,12 +6618,11 @@ impl<FS: ShimFS> Task<FS> {
             _ => return Err(Errno::EINVAL),
         }
 
-        let timerfd = super::eventfd::EventFile::new_timer(
-            self.global.platform,
-            self.global.boot_time,
-            clockid,
-            flags,
-        );
+        let provider = super::eventfd::broker_timerfd_provider().ok_or(Errno::ENODEV)?;
+        let handle = provider
+            .create_timerfd(super::eventfd::timerfd_clockid_raw(clockid)?, flags.bits())
+            .map_err(super::broker_backed::broker_err_to_errno)?;
+        let timerfd = super::eventfd::EventFile::new_timer_broker_backed(provider, handle, flags);
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<super::eventfd::EventfdSubsystem>(timerfd);
         if flags.contains(TimerfdFlags::CLOEXEC) {
