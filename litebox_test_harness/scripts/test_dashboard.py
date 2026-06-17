@@ -711,14 +711,26 @@ class RegressionClassTests(unittest.TestCase):
         }
 
     def test_hard_regression_high_confidence(self):
-        # Rock-solid upstream (3 passes), passed at baseline, fails
-        # twice on branch → hard_regression, high confidence.
+        # Rock-solid upstream (3 passes), passed at baseline, fails the
+        # full retry budget (3×) on the branch → hard_regression, high.
+        for i in range(3):
+            self._upstream("UP", "T", "pass", dt=i * 1000)
+        self._upstream("BASE", "T", "pass")
+        self._branch("BRANCH", "T", "fail", dt=15)
+        self._branch("BRANCH", "T", "fail", dt=10)
+        self._branch("BRANCH", "T", "fail", dt=5)
+        self.assertEqual(self._classify()["T"], ("hard_regression", "high"))
+
+    def test_hard_regression_medium_when_two_fails(self):
+        # Only 2 definitive fails (retry budget not exhausted) — could be
+        # a load flake under the shadow's build pressure → medium, not
+        # high, even with rock-solid upstream.
         for i in range(3):
             self._upstream("UP", "T", "pass", dt=i * 1000)
         self._upstream("BASE", "T", "pass")
         self._branch("BRANCH", "T", "fail", dt=10)
         self._branch("BRANCH", "T", "fail", dt=5)
-        self.assertEqual(self._classify()["T"], ("hard_regression", "high"))
+        self.assertEqual(self._classify()["T"], ("hard_regression", "medium"))
 
     def test_hard_regression_medium_when_single_branch_run(self):
         self._upstream("BASE", "T", "pass")
