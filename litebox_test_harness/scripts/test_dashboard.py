@@ -662,7 +662,7 @@ class MigrationV3ToV4Tests(unittest.TestCase):
 class RegressionClassTests(unittest.TestCase):
     """The `regression_class` view: flaky-aware, confidence-tiered
     classification, computed purely in SQL over run_results + the
-    supervisor-refreshed branch_baseline / test_flake_stats caches.
+    supervisor-refreshed branch_baseline + the test_flake_stats view.
     Hermetic — branch_baseline is inserted directly (no git)."""
 
     def setUp(self) -> None:
@@ -701,7 +701,7 @@ class RegressionClassTests(unittest.TestCase):
             "VALUES('BRANCH','BASE','up','wt/x',?)",
             (self.now,),
         )
-        dashboard._refresh_test_flake_stats(self.conn)
+        # test_flake_stats is a live view now — no refresh needed.
         return {
             r["test_id"]: (r["classification"], r["confidence"])
             for r in self.conn.execute(

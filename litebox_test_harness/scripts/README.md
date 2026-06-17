@@ -526,11 +526,13 @@ runs only — so a genuine branch regression isn't mistaken for a flake):
 `confidence` is `high` / `medium` / `low` (or `n/a`): `high` needs the
 branch to fail repeatedly *and* the upstream to be well-observed-stable;
 `low` flags thin evidence — the explicit "not enough data to judge yet"
-signal. The view's two inputs that SQL can't derive — the git
-`merge-base` map (`branch_baseline`) and the upstream recent-flake tally
-(`test_flake_stats`) — are small tables the `dashboard.py auto`
-supervisor refreshes each cycle. `(hard + soft)` reconciles exactly with
-the old binary regression count; it just splits it by severity.
+signal. Almost everything is a live derivation: `test_flake_stats` (the
+upstream recent-flake tally) is itself a view, kept cheap by an index on
+`runs(worktree_path)`. The *only* materialized table is `branch_baseline`
+— the git `merge-base(branch_HEAD, tracked_tip)` map, which SQLite has no
+way to compute — refreshed each cycle by the `dashboard.py auto`
+supervisor. `(hard + soft)` reconciles exactly with the old binary
+regression count; it just splits it by severity.
 
 ## `analyze-test-timing.py` — per-test timing summaries
 

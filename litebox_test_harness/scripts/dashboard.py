@@ -255,25 +255,56 @@ def _ensure_views(conn: sqlite3.Connection) -> None:
 # and no drift.
 #
 # The classification *logic* lives entirely in SQL (the `regression_class`
-# view's CASE). The only two inputs SQL can't cheaply derive are
-# materialized into small tables the supervisor refreshes each cycle:
-#   * `branch_baseline` — git `merge-base(branch_HEAD, tracked_tip)`,
-#     which SQLite has no way to know (no git ancestry).
-#   * `test_flake_stats` — a recent cross-sha pass/fail tally per test,
-#     so the "was it flaky beforehand?" softening doesn't require a
-#     full-history window on every query.
-# Both are pure caches; the view is always live for the per-sha state.
+# view's CASE), and so does every *derivable* input — including
+# `test_flake_stats` (the recent upstream pass/fail tally for the
+# "was it flaky beforehand?" softening), which is a VIEW. The view's
+# aggregate is kept cheap by an index on `runs(worktree_path)` (SQLite
+# can't index a view itself — views aren't materialized — so the index
+# goes on the base table the view filters by).
 #
-# Additive (new table + view, created via IF NOT EXISTS / a meta-keyed
-# definition version) — no SCHEMA_VERSION bump, no producer change.
+# Exactly ONE input genuinely can't live in SQL and is materialized:
+#   * `branch_baseline` — git `merge-base(branch_HEAD, tracked_tip)`,
+#     which SQLite has no way to compute (no git ancestry). The
+#     supervisor refreshes it each cycle. It is the only derived-state
+#     table; everything else is a pure live derivation.
+#
+# Additive (a table + views + an index, created via IF NOT EXISTS / a
+# meta-keyed definition version) — no SCHEMA_VERSION bump, no producer
+# change, no data migration.
 
-_CLASSIFICATION_SCHEMA_VERSION = 1
+_CLASSIFICATION_SCHEMA_VERSION = 2
 
 # "Recently flaky" lookback for the soft-regression discount.
 _RECENT_FLAKE_WINDOW_MS = 7 * 24 * 3600 * 1000
 
-_CLASSIFICATION_VIEW_DDL = """
-DROP VIEW IF EXISTS regression_class;
+_CLASSIFICATION_DDL = f"""
+DROP VIEW  IF EXISTS regression_class;
+DROP TABLE IF EXISTS test_flake_stats;   -- retire the v1 materialized cache
+DROP VIEW  IF EXISTS test_flake_stats;   -- idempotent on re-run
+
+-- Recent pass/fail tally per (mode, test_id) over clean **upstream**
+-- runs (the tracked-ref CI worktrees only). Restricting to upstream is
+-- essential: it measures whether a test was flaky on the gold-standard
+-- lineage *beforehand*, not whether it merely failed on some in-flight
+-- branch — otherwise a genuine branch regression (pass upstream, fail
+-- on branch) would look "flaky" and be wrongly softened. A pure live
+-- derivation; kept cheap by `idx_runs_worktree`.
+CREATE VIEW test_flake_stats AS
+SELECT rr.mode, rr.test_id,
+       COUNT(*) AS n_recent,
+       SUM(CASE WHEN rr.verdict =  'pass' THEN 1 ELSE 0 END) AS n_pass,
+       SUM(CASE WHEN rr.verdict <> 'pass' THEN 1 ELSE 0 END) AS n_fail,
+       CASE WHEN SUM(CASE WHEN rr.verdict =  'pass' THEN 1 ELSE 0 END) > 0
+             AND SUM(CASE WHEN rr.verdict <> 'pass' THEN 1 ELSE 0 END) > 0
+            THEN 1 ELSE 0 END AS recent_flaky
+  FROM run_results rr
+  JOIN runs r ON r.run_id = rr.run_id
+ WHERE r.dirty_hash IS NULL
+   AND rr.finished_ts_ms >
+       (CAST(strftime('%s','now') AS INTEGER) * 1000 - {_RECENT_FLAKE_WINDOW_MS})
+   AND r.worktree_path IN (SELECT ci_worktree FROM tracked_refs)
+ GROUP BY rr.mode, rr.test_id;
+
 CREATE VIEW regression_class AS
 WITH relevant(sha) AS (
     SELECT branch_sha   FROM branch_baseline
@@ -345,13 +376,17 @@ SELECT
 
 
 def _ensure_classification_schema(conn: sqlite3.Connection) -> None:
-    """Create the persistent, CLI-consumable regression-classification
-    schema: the supervisor-refreshed `branch_baseline` /
-    `test_flake_stats` cache tables and the `regression_class` VIEW.
+    """Create the regression-classification schema: the one materialized
+    table SQL can't derive (`branch_baseline`, git merge-bases), the
+    index that keeps the `test_flake_stats` view cheap, and the
+    `test_flake_stats` / `regression_class` VIEWs.
 
-    Idempotent. The view is (re)defined only when its meta-keyed
-    definition version changes, so steady-state connections do no
-    schema writes (no churn / schema-cookie bumps)."""
+    Idempotent. The views are (re)defined only when their meta-keyed
+    definition version changes, so steady-state connections do no schema
+    writes (no churn / schema-cookie bumps). The version bump also
+    retires the v1 materialized `test_flake_stats` table in place — a
+    derived cache, so dropping it loses no data and needs no
+    SCHEMA_VERSION bump."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS branch_baseline (
@@ -361,16 +396,10 @@ def _ensure_classification_schema(conn: sqlite3.Connection) -> None:
             branch         TEXT,
             computed_at_ms INTEGER NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS test_flake_stats (
-            mode           TEXT    NOT NULL,
-            test_id        TEXT    NOT NULL,
-            n_recent       INTEGER NOT NULL,
-            n_pass         INTEGER NOT NULL,
-            n_fail         INTEGER NOT NULL,
-            recent_flaky   INTEGER NOT NULL,
-            computed_at_ms INTEGER NOT NULL,
-            PRIMARY KEY (mode, test_id)
-        );
+        -- Lets the test_flake_stats view seek the upstream (tracked-ref
+        -- CI worktree) runs instead of scanning all of `runs`.
+        CREATE INDEX IF NOT EXISTS idx_runs_worktree
+            ON runs(worktree_path);
         """
     )
     row = conn.execute(
@@ -378,47 +407,11 @@ def _ensure_classification_schema(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if row is not None and int(row[0]) == _CLASSIFICATION_SCHEMA_VERSION:
         return
-    conn.executescript(_CLASSIFICATION_VIEW_DDL)
+    conn.executescript(_CLASSIFICATION_DDL)
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) "
         "VALUES('classification_schema_version', ?)",
         (str(_CLASSIFICATION_SCHEMA_VERSION),),
-    )
-
-
-def _refresh_test_flake_stats(conn: sqlite3.Connection,
-                              window_ms: int = _RECENT_FLAKE_WINDOW_MS) -> None:
-    """Recompute the recent pass/fail tally per (mode, test_id) over the
-    last `window_ms` of clean **upstream** runs (the tracked-ref CI
-    worktrees only). Restricting to upstream is essential: it measures
-    whether a test was flaky on the gold-standard lineage *beforehand*,
-    not whether it merely failed on some in-flight branch — otherwise a
-    genuine branch regression (pass upstream, fail on branch) would look
-    "flaky" and be wrongly softened. Cheap snapshot the supervisor
-    refreshes each cycle so `regression_class` need not window over
-    full history per query."""
-    now = now_ms()
-    cutoff = now - window_ms
-    conn.execute("DELETE FROM test_flake_stats")
-    conn.execute(
-        """
-        INSERT INTO test_flake_stats
-            (mode, test_id, n_recent, n_pass, n_fail, recent_flaky, computed_at_ms)
-        SELECT rr.mode, rr.test_id, COUNT(*),
-               SUM(CASE WHEN rr.verdict =  'pass' THEN 1 ELSE 0 END),
-               SUM(CASE WHEN rr.verdict <> 'pass' THEN 1 ELSE 0 END),
-               CASE WHEN SUM(CASE WHEN rr.verdict =  'pass' THEN 1 ELSE 0 END) > 0
-                     AND SUM(CASE WHEN rr.verdict <> 'pass' THEN 1 ELSE 0 END) > 0
-                    THEN 1 ELSE 0 END,
-               ?
-          FROM run_results rr
-          JOIN runs r ON r.run_id = rr.run_id
-         WHERE r.dirty_hash IS NULL
-           AND rr.finished_ts_ms > ?
-           AND r.worktree_path IN (SELECT ci_worktree FROM tracked_refs)
-         GROUP BY rr.mode, rr.test_id
-        """,
-        (now, cutoff),
     )
 
 
@@ -460,11 +453,12 @@ def _refresh_branch_baseline(conn: sqlite3.Connection, canonical: Path) -> int:
 
 def _refresh_classification_inputs(conn: sqlite3.Connection,
                                    canonical: Path) -> None:
-    """Refresh both classification cache tables. Called once per
-    supervisor cycle. Best-effort — never aborts the cycle."""
+    """Refresh the one materialized classification input,
+    `branch_baseline` (git merge-bases). Called once per supervisor
+    cycle. `test_flake_stats` is a live view and needs no refresh.
+    Best-effort — never aborts the cycle."""
     try:
         _refresh_branch_baseline(conn, canonical)
-        _refresh_test_flake_stats(conn)
     except sqlite3.Error as e:
         print(f"[auto] classification refresh failed: {e}", file=sys.stderr)
 
@@ -4093,8 +4087,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_regr.add_argument("--limit", type=int, default=30,
                         help="max test_ids listed per bucket (text mode)")
     p_regr.add_argument("--no-refresh", action="store_true",
-                        help="skip recomputing branch_baseline / "
-                             "test_flake_stats before reading the view")
+                        help="skip recomputing branch_baseline "
+                             "(git merge-bases) before reading the view")
     p_regr.add_argument("--canonical-worktree", default=None,
                         help="canonical clone root for git queries "
                              "(default: state-dir's parent)")
