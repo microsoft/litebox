@@ -1946,10 +1946,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         }
                     }
                     FdKind::UnixSocket => {
-                        // Non-broker-backed UnixSocket entry: fall through to a
-                        // fresh local stream socket. This is the legitimate
-                        // restore for entries with `metadata.broker_handle.is_none()`
-                        // (unconnected sockets recorded in the snapshot).
+                        // Local (non-broker) AF_UNIX socket: create a fresh
+                        // stream socket. Broker-backed AF_UNIX sockets are
+                        // distinct FdKind variants (BrokerSocketPair / Dgram /
+                        // SeqPacket) restored by their own arms; FdKind::UnixSocket
+                        // is only the local unconnected case recorded in the snapshot.
                         if let Some(socket) = syscalls::unix::UnixSocket::<FS>::new(
                             SockType::Stream,
                             SockFlags::empty(),
