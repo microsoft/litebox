@@ -3277,6 +3277,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     litebox_shim_linux::syscalls::set_broker_eventfd_provider(eventfd_provider)
         .map_err(|_| anyhow!("eventfd provider already set"))?;
 
+    let timerfd_provider = Arc::new(
+        crate::broker_timerfd_provider::RunnerBrokerTimerfdProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_timerfd_provider(timerfd_provider)
+        .map_err(|_| anyhow!("timerfd provider already set"))?;
+
     let pidfd_provider = Arc::new(
         crate::broker_pidfd_provider::RunnerBrokerPidfdProvider::new(
             Arc::clone(&client),
