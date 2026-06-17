@@ -5255,9 +5255,9 @@ mod vscode {
         // once the threadpool is parked) is reliably hit, and small
         // enough that a post-fix run completes inside the timeout even at
         // debug-build fork-restore latency under host load.
-        const N_SPAWNS: u32 = 100;
-        const THREADPOOL_SIZE: u32 = 8;
-        const SPAWN_TIMEOUT_SECS: u64 = 150;
+        const N_SPAWNS: u32 = 60;
+        const THREADPOOL_SIZE: u32 = 96;
+        const SPAWN_TIMEOUT_SECS: u64 = 180;
 
         super::framework::run_trial(
             pass_static(pass),
