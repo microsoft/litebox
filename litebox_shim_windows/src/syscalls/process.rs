@@ -192,55 +192,9 @@ mod tests {
 
     type TestPlatform = crate::tests::TestPlatform;
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    unsafe extern "system" {
-        fn NtQueryInformationProcess(
-            process_handle: *mut core::ffi::c_void,
-            process_information_class: u32,
-            process_information: *mut core::ffi::c_void,
-            process_information_length: u32,
-            return_length: *mut u32,
-        ) -> i32;
-    }
-
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
         let _ = crate::tests::test_platform();
         <TestPlatform as ThreadProvider>::run_test_thread(f)
-    }
-
-    fn empty_basic_information() -> ProcessBasicInformation {
-        ProcessBasicInformation {
-            exit_status: 0,
-            _padding0: 0,
-            peb_base_address: 0,
-            affinity_mask: 0,
-            base_priority: 0,
-            _padding1: 0,
-            unique_process_id: 0,
-            inherited_from_unique_process_id: usize::MAX,
-        }
-    }
-
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    fn host_nt_query_information_process(
-        process_information_class: ProcessInformationClass,
-        process_information: *mut core::ffi::c_void,
-        process_information_length: u32,
-        return_length: *mut u32,
-    ) -> NtStatus {
-        // SAFETY: The host ntdll call treats these as user-mode output pointers, probes them,
-        // and does not retain them. Tests pass either valid locals or null to observe NTSTATUS
-        // and output side effects.
-        let status = unsafe {
-            NtQueryInformationProcess(
-                usize::MAX as *mut core::ffi::c_void,
-                process_information_class as u32,
-                process_information,
-                process_information_length,
-                return_length,
-            )
-        };
-        NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
     }
 
     #[test]
@@ -318,62 +272,112 @@ mod tests {
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    #[test]
-    fn nt_query_information_process_basic_length_mismatch_matches_host() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let mut host_info = empty_basic_information();
-            let mut shim_info = empty_basic_information();
-            let mut host_return_length = RETURN_LENGTH_SENTINEL;
-            let mut shim_return_length = RETURN_LENGTH_SENTINEL;
-            let basic_information_len: u32 = size_of::<ProcessBasicInformation>().trunc();
-            let short_length = basic_information_len - 1;
+    mod host_fidelity {
+        use core::ffi::c_void;
 
-            let host = host_nt_query_information_process(
-                ProcessInformationClass::BasicInformation,
-                core::ptr::addr_of_mut!(host_info).cast::<core::ffi::c_void>(),
-                short_length,
-                core::ptr::addr_of_mut!(host_return_length),
-            );
-            let shim = task.sys_nt_query_information_process(
-                ProcessHandle::CURRENT,
-                ProcessInformationClass::BasicInformation as u32,
-                mut_byte_ptr(&mut shim_info),
-                short_length,
-                Some(mut_ptr(&mut shim_return_length)),
-            );
+        use super::*;
 
-            assert_eq!(shim, host);
-            assert_eq!(shim_return_length, host_return_length);
-            assert_eq!(shim_info.peb_base_address, 0);
-        });
-    }
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryInformationProcess(
+                process_handle: *mut c_void,
+                process_information_class: u32,
+                process_information: *mut c_void,
+                process_information_length: u32,
+                return_length: *mut u32,
+            ) -> i32;
+        }
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    #[test]
-    fn nt_query_information_process_invalid_output_leaves_return_length_unchanged() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let mut host_return_length = RETURN_LENGTH_SENTINEL;
-            let mut shim_return_length = RETURN_LENGTH_SENTINEL;
-            let basic_information_len: u32 = size_of::<ProcessBasicInformation>().trunc();
+        fn empty_basic_information() -> ProcessBasicInformation {
+            ProcessBasicInformation {
+                exit_status: 0,
+                _padding0: 0,
+                peb_base_address: 0,
+                affinity_mask: 0,
+                base_priority: 0,
+                _padding1: 0,
+                unique_process_id: 0,
+                inherited_from_unique_process_id: usize::MAX,
+            }
+        }
 
-            let host = host_nt_query_information_process(
-                ProcessInformationClass::BasicInformation,
-                core::ptr::null_mut(),
-                basic_information_len,
-                core::ptr::addr_of_mut!(host_return_length),
-            );
-            let shim = task.sys_nt_query_information_process(
-                ProcessHandle::CURRENT,
-                ProcessInformationClass::BasicInformation as u32,
-                null_mut_ptr::<u8>(),
-                basic_information_len,
-                Some(mut_ptr(&mut shim_return_length)),
-            );
+        fn host_nt_query_information_process(
+            process_information_class: ProcessInformationClass,
+            process_information: *mut c_void,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> NtStatus {
+            // SAFETY: The host ntdll call treats these as user-mode output pointers, probes them,
+            // and does not retain them. Tests pass either valid locals or null to observe NTSTATUS
+            // and output side effects.
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    usize::MAX as *mut c_void,
+                    process_information_class as u32,
+                    process_information,
+                    process_information_length,
+                    return_length,
+                )
+            };
+            NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
+        }
 
-            assert_eq!(shim, host);
-            assert_eq!(shim_return_length, host_return_length);
-        });
+        #[test]
+        fn nt_query_information_process_basic_length_mismatch_matches_host() {
+            run_with_test_platform_pointers(|| {
+                let task = crate::tests::test_task();
+                let mut host_info = empty_basic_information();
+                let mut shim_info = empty_basic_information();
+                let mut host_return_length = RETURN_LENGTH_SENTINEL;
+                let mut shim_return_length = RETURN_LENGTH_SENTINEL;
+                let basic_information_len: u32 = size_of::<ProcessBasicInformation>().trunc();
+                let short_length = basic_information_len - 1;
+
+                let host = host_nt_query_information_process(
+                    ProcessInformationClass::BasicInformation,
+                    core::ptr::addr_of_mut!(host_info).cast::<c_void>(),
+                    short_length,
+                    core::ptr::addr_of_mut!(host_return_length),
+                );
+                let shim = task.sys_nt_query_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::BasicInformation as u32,
+                    mut_byte_ptr(&mut shim_info),
+                    short_length,
+                    Some(mut_ptr(&mut shim_return_length)),
+                );
+
+                assert_eq!(shim, host);
+                assert_eq!(shim_return_length, host_return_length);
+                assert_eq!(shim_info.peb_base_address, 0);
+            });
+        }
+
+        #[test]
+        fn nt_query_information_process_invalid_output_leaves_return_length_unchanged() {
+            run_with_test_platform_pointers(|| {
+                let task = crate::tests::test_task();
+                let mut host_return_length = RETURN_LENGTH_SENTINEL;
+                let mut shim_return_length = RETURN_LENGTH_SENTINEL;
+                let basic_information_len: u32 = size_of::<ProcessBasicInformation>().trunc();
+
+                let host = host_nt_query_information_process(
+                    ProcessInformationClass::BasicInformation,
+                    core::ptr::null_mut(),
+                    basic_information_len,
+                    core::ptr::addr_of_mut!(host_return_length),
+                );
+                let shim = task.sys_nt_query_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::BasicInformation as u32,
+                    null_mut_ptr::<u8>(),
+                    basic_information_len,
+                    Some(mut_ptr(&mut shim_return_length)),
+                );
+
+                assert_eq!(shim, host);
+                assert_eq!(shim_return_length, host_return_length);
+            });
+        }
     }
 }
