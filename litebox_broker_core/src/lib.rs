@@ -34,7 +34,7 @@ use spin::rwlock::RwLock;
 pub use error::BrokerError;
 pub use policy::{PolicyEngine, PolicyProfile};
 pub use session::{BrokerSession, CallerCredential, ObjectRights};
-use session::{ObjectEntry, ObjectId, ObjectReference};
+use session::{ObjectId, ObjectRecord, ObjectReference};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -86,7 +86,7 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
-    pub(crate) objects: Arc<RwLock<SlotMap<ObjectId, Arc<RwLock<ObjectEntry>>>>>,
+    pub(crate) objects: Arc<RwLock<SlotMap<ObjectId, Arc<ObjectRecord>>>>,
     pub(crate) references: Arc<RwLock<BTreeMap<ObjectHandle, ObjectReference>>>,
 }
 
