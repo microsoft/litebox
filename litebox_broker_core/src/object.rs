@@ -74,41 +74,41 @@ pub(super) fn create_object_reference(
 pub(super) fn with_authorized_object<T>(
     session: &BrokerSession,
     handle: ObjectHandle,
-    rights: ObjectRights,
-    f: impl FnOnce(&ObjectEntry, ObjectRights) -> Result<T>,
+    required_rights: ObjectRights,
+    f: impl FnOnce(&ObjectEntry) -> Result<T>,
 ) -> Result<T> {
-    let authorized = {
+    let object = {
         let state = session.core.state.read();
         authorize_use_object(
             &state,
             session.session_id,
             session.caller_credential,
             handle,
-            rights,
+            required_rights,
         )?
     };
-    let object = authorized.object.read();
-    f(&object, authorized.rights)
+    let object = object.read();
+    f(&object)
 }
 
 pub(super) fn with_authorized_object_mut<T>(
     session: &BrokerSession,
     handle: ObjectHandle,
-    rights: ObjectRights,
-    f: impl FnOnce(&mut ObjectEntry, ObjectRights) -> Result<T>,
+    required_rights: ObjectRights,
+    f: impl FnOnce(&mut ObjectEntry) -> Result<T>,
 ) -> Result<T> {
-    let authorized = {
+    let object = {
         let state = session.core.state.read();
         authorize_use_object(
             &state,
             session.session_id,
             session.caller_credential,
             handle,
-            rights,
+            required_rights,
         )?
     };
-    let mut object = authorized.object.write();
-    f(&mut object, authorized.rights)
+    let mut object = object.write();
+    f(&mut object)
 }
 
 fn authorize_use_object(
@@ -116,21 +116,17 @@ fn authorize_use_object(
     session_id: SessionId,
     caller_credential: CallerCredential,
     handle: ObjectHandle,
-    rights: ObjectRights,
-) -> Result<AuthorizedObject> {
-    let reference = validate_handle(state, session_id, handle, rights)?;
-    let reference_rights = reference.rights;
+    required_rights: ObjectRights,
+) -> Result<Arc<RwLock<ObjectEntry>>> {
+    let reference = validate_handle(state, session_id, handle, required_rights)?;
     let object = state
         .objects
         .get(reference.object_id)
         .ok_or(BrokerError::UnknownObject)?;
     state
         .policy
-        .authorize_use_event(caller_credential, rights)?;
-    Ok(AuthorizedObject {
-        object: Arc::clone(object),
-        rights: reference_rights,
-    })
+        .authorize_use_event(caller_credential, required_rights)?;
+    Ok(Arc::clone(object))
 }
 
 pub(super) fn close_object_reference(session: &BrokerSession, handle: ObjectHandle) -> Result<()> {
@@ -211,11 +207,6 @@ fn drop_object_if_unreferenced(state: &mut BrokerCoreState, object_id: ObjectId)
     {
         state.objects.remove(object_id);
     }
-}
-
-struct AuthorizedObject {
-    object: Arc<RwLock<ObjectEntry>>,
-    rights: ObjectRights,
 }
 
 #[cfg(test)]

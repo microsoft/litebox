@@ -36,28 +36,26 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
 /// concept. Userland or kernel deployments can block on deployment-specific
 /// wait primitives after BrokerCore authorizes and reports readiness state.
 pub fn wait(session: &BrokerSession, handle: ObjectHandle) -> Result<WaitOutcome> {
-    object::with_authorized_object(session, handle, ObjectRights::WAIT, |object, rights| {
-        match object {
-            ObjectEntry::Event(event) => {
-                let readiness = filter_readiness_for_rights(event.readiness_state(), rights);
-                Ok(if readiness.read_ready {
-                    WaitOutcome::Ready(readiness)
-                } else {
-                    WaitOutcome::WouldBlock(readiness)
-                })
-            }
+    let required_rights = ObjectRights::WAIT;
+    object::with_authorized_object(session, handle, required_rights, |object| match object {
+        ObjectEntry::Event(event) => {
+            let readiness = filter_readiness_for_rights(event.readiness_state(), required_rights);
+            Ok(if readiness.read_ready {
+                WaitOutcome::Ready(readiness)
+            } else {
+                WaitOutcome::WouldBlock(readiness)
+            })
         }
     })
 }
 
 /// Adds readiness credits to a broker-owned event object.
 pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<ReadinessState> {
-    object::with_authorized_object_mut(session, handle, ObjectRights::WRITE, |object, rights| {
-        match object {
-            ObjectEntry::Event(event) => event
-                .add(value)
-                .map(|state| filter_readiness_for_rights(state, rights)),
-        }
+    let required_rights = ObjectRights::WRITE;
+    object::with_authorized_object_mut(session, handle, required_rights, |object| match object {
+        ObjectEntry::Event(event) => event
+            .add(value)
+            .map(|state| filter_readiness_for_rights(state, required_rights)),
     })
 }
 
@@ -67,15 +65,14 @@ pub fn consume(
     handle: ObjectHandle,
     mode: EventConsumeMode,
 ) -> Result<EventConsumption> {
-    object::with_authorized_object_mut(session, handle, ObjectRights::WAIT, |object, rights| {
-        match object {
-            ObjectEntry::Event(event) => event.consume(mode).map(|response| {
-                EventConsumption::new(
-                    response.value,
-                    filter_readiness_for_rights(response.readiness, rights),
-                )
-            }),
-        }
+    let required_rights = ObjectRights::WAIT;
+    object::with_authorized_object_mut(session, handle, required_rights, |object| match object {
+        ObjectEntry::Event(event) => event.consume(mode).map(|response| {
+            EventConsumption::new(
+                response.value,
+                filter_readiness_for_rights(response.readiness, required_rights),
+            )
+        }),
     })
 }
 
