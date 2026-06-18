@@ -82,6 +82,7 @@ const MAX_OBJECTS: usize = u32::MAX as usize - 1;
 /// A broker process may construct only one broker core for its process
 /// lifetime. Constructors return [`BrokerError::BrokerCoreAlreadyExists`] if a
 /// core has already been constructed.
+#[derive(Clone)]
 pub struct BrokerCore {
     pub(crate) state: Arc<RwLock<BrokerCoreState>>,
 }
@@ -123,12 +124,6 @@ impl BrokerCore {
                 references: BTreeMap::new(),
             })),
         })
-    }
-
-    pub(crate) fn clone(&self) -> Self {
-        Self {
-            state: Arc::clone(&self.state),
-        }
     }
 
     /// Allocates broker authority state for one authenticated caller session.
