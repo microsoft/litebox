@@ -13,6 +13,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 
@@ -24,11 +26,13 @@ mod policy;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use alloc::collections::BTreeMap;
 use slotmap::SlotMap;
 
 pub use error::BrokerError;
 pub use identity::{BrokerAssociation, CallerCredential};
-use object::{ObjectEntry, ObjectId, ObjectReference, ObjectReferenceKey};
+use litebox_broker_protocol::ObjectHandle;
+use object::{ObjectEntry, ObjectId, ObjectReference};
 pub use object::{ObjectRights, ObjectType};
 pub use policy::{ObjectOperation, PolicyDecision, PolicyEngine, PolicyOperation, PolicyProfile};
 
@@ -67,7 +71,7 @@ impl Default for BrokerCoreLimits {
     }
 }
 
-const MAX_SLOTMAP_ENTRIES: usize = u32::MAX as usize - 1;
+const MAX_OBJECTS: usize = u32::MAX as usize - 1;
 
 /// Channel-independent broker authority state.
 ///
@@ -78,8 +82,9 @@ pub struct BrokerCore {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     next_process_id: u64,
+    next_reference_handle: u64,
     objects: SlotMap<ObjectId, ObjectEntry>,
-    references: SlotMap<ObjectReferenceKey, ObjectReference>,
+    references: BTreeMap<ObjectHandle, ObjectReference>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -92,7 +97,7 @@ impl BrokerCore {
 
     /// Creates the broker core with explicit authority-state limits.
     pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Result<Self> {
-        if limits.max_objects > MAX_SLOTMAP_ENTRIES || limits.max_references > MAX_SLOTMAP_ENTRIES {
+        if limits.max_objects > MAX_OBJECTS {
             return Err(BrokerError::ResourceExhausted);
         }
 
@@ -104,8 +109,9 @@ impl BrokerCore {
             policy,
             limits,
             next_process_id: 1,
+            next_reference_handle: 1,
             objects: SlotMap::with_key(),
-            references: SlotMap::with_key(),
+            references: BTreeMap::new(),
         })
     }
 }

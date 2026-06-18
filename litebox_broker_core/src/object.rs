@@ -3,9 +3,8 @@
 
 use crate::event::EventObject;
 use crate::identity::{BrokerAssociation, ProcessId};
-use crate::{BrokerCore, BrokerError, PolicyDecision, PolicyOperation, Result};
+use crate::{BrokerCore, BrokerError, PolicyDecision, PolicyOperation, Result, allocate_id};
 use litebox_broker_protocol::ObjectHandle;
-use slotmap::{Key, KeyData};
 
 /// Broker object type known to the authority core and policy engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -29,7 +28,6 @@ bitflags::bitflags! {
 slotmap::new_key_type! {
     /// Broker-owned object identifier.
     pub(crate) struct ObjectId;
-    pub(crate) struct ObjectReferenceKey;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,25 +35,6 @@ pub(crate) struct ObjectReference {
     pub(crate) object_id: ObjectId,
     pub(crate) owner: ProcessId,
     pub(crate) rights: ObjectRights,
-}
-
-impl From<ObjectReferenceKey> for ObjectHandle {
-    fn from(key: ObjectReferenceKey) -> Self {
-        Self(key.data().as_ffi())
-    }
-}
-
-impl TryFrom<ObjectHandle> for ObjectReferenceKey {
-    type Error = BrokerError;
-
-    fn try_from(handle: ObjectHandle) -> Result<Self> {
-        let key: Self = KeyData::from_ffi(handle.0).into();
-        if ObjectHandle::from(key) == handle {
-            Ok(key)
-        } else {
-            Err(BrokerError::UnknownObject)
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,14 +64,19 @@ impl BrokerCore {
             return Err(BrokerError::ResourceExhausted);
         }
 
+        let handle = ObjectHandle(allocate_id(&mut self.next_reference_handle)?);
         let object_id = self.objects.insert(object);
-        let reference_key = self.references.insert(ObjectReference {
-            object_id,
-            owner: association.process_id(),
-            rights,
-        });
+        let old_reference = self.references.insert(
+            handle,
+            ObjectReference {
+                object_id,
+                owner: association.process_id(),
+                rights,
+            },
+        );
+        debug_assert!(old_reference.is_none());
 
-        Ok(reference_key.into())
+        Ok(handle)
     }
 
     pub(crate) fn authorize_create_object(
@@ -182,7 +166,7 @@ impl BrokerCore {
             return Err(BrokerError::UnknownObject);
         }
 
-        self.references.remove(handle.try_into()?);
+        self.references.remove(&handle);
         self.drop_object_if_unreferenced(object_id);
         Ok(())
     }
@@ -207,7 +191,7 @@ impl BrokerCore {
     ) -> Result<&ObjectReference> {
         let reference = self
             .references
-            .get(handle.try_into()?)
+            .get(&handle)
             .ok_or(BrokerError::UnknownObject)?;
         if reference.owner != association.process_id() {
             return Err(BrokerError::UnknownObject);
@@ -253,20 +237,13 @@ mod tests {
     }
 
     #[test]
-    fn oversized_slotmap_limits_are_rejected_before_core_construction() {
+    fn oversized_object_slotmap_limits_are_rejected_before_core_construction() {
         let too_many_entries = u32::MAX as usize;
 
         assert!(matches!(
             BrokerCore::new_with_limits(
                 PolicyEngine::event_only(),
                 BrokerCoreLimits::new(too_many_entries, 1)
-            ),
-            Err(BrokerError::ResourceExhausted)
-        ));
-        assert!(matches!(
-            BrokerCore::new_with_limits(
-                PolicyEngine::event_only(),
-                BrokerCoreLimits::new(1, too_many_entries)
             ),
             Err(BrokerError::ResourceExhausted)
         ));
@@ -282,11 +259,11 @@ mod tests {
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = core.create_event(&owner).unwrap();
-        let noncanonical = ObjectHandle(handle.0 & u64::from(u32::MAX));
+        let unknown_handle = ObjectHandle(handle.0 + 1);
 
-        assert_ne!(noncanonical, handle);
+        assert_ne!(unknown_handle, handle);
         assert_eq!(
-            core.wait_event(&owner, noncanonical),
+            core.wait_event(&owner, unknown_handle),
             Err(BrokerError::UnknownObject)
         );
 
@@ -317,6 +294,17 @@ mod tests {
 
         core.close_association(association);
 
+        assert!(core.references.is_empty());
+        assert!(core.objects.is_empty());
+
+        let association = core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        core.next_reference_handle = u64::MAX;
+        assert_eq!(
+            core.create_event(&association),
+            Err(BrokerError::ResourceExhausted)
+        );
         assert!(core.references.is_empty());
         assert!(core.objects.is_empty());
     }
