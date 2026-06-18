@@ -26,6 +26,7 @@ pub mod broker_socket_dgram_provider;
 pub mod broker_socket_seqpacket_provider;
 pub mod broker_socketpair_provider;
 pub mod broker_tcp_conn_provider;
+pub mod broker_timerfd_provider;
 pub mod guest_pid_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -324,6 +325,10 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "eventfd" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (FdKind::Eventfd { handle_id }, litebox::fs::OFlags::empty())
+        }
+        "timerfd" => {
+            ensure_no_subkind(spec, kind_str, &parts)?;
+            (FdKind::Timerfd { handle_id }, litebox::fs::OFlags::empty())
         }
         "pidfd" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
@@ -3275,6 +3280,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_eventfd_provider(eventfd_provider)
         .map_err(|_| anyhow!("eventfd provider already set"))?;
+
+    let timerfd_provider = Arc::new(
+        crate::broker_timerfd_provider::RunnerBrokerTimerfdProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_timerfd_provider(timerfd_provider)
+        .map_err(|_| anyhow!("timerfd provider already set"))?;
 
     let pidfd_provider = Arc::new(
         crate::broker_pidfd_provider::RunnerBrokerPidfdProvider::new(

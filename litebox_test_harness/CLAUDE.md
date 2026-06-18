@@ -1385,7 +1385,7 @@ node already flipped to ✅.
 
 **Trial namespace:** `vscode::<scenario>`. Each registers as
 `native::vscode::<scenario>` and `litebox::vscode::<scenario>`.
-4 scenarios × 2 passes = 8 trials.
+5 scenarios × 2 passes = 10 trials.
 
 | Scenario              | What it exercises                                                                                            |
 |-----------------------|--------------------------------------------------------------------------------------------------------------|
@@ -1393,6 +1393,7 @@ node already flipped to ✅.
 | `server_listen`       | Invokes `code command-shell --on-host=127.0.0.1 --on-port=0 --parent-process-id 1` directly (no bootstrap-script wrapping). Polls its log for `Listening on N.N.N.N:PORT`, emits `VSL_PORT=` marker. Narrower diagnostic surface than `bootstrap` — points at the CLI startup path itself. |
 | `connect_loopback`    | Same SSH session as `server_listen`, plus a TCP 3-way handshake to the captured port via bash's `/dev/tcp/127.0.0.1/$PORT`. Validates loopback TCP delivery inside the sandbox. |
 | `connect_cross_ssh`   | Two independent SSH sessions: session A starts the CLI and emits the captured port; session B (separate dropbear → bash worker tree) does the connect. Mirrors the VS Code Remote-SSH SOCKS-proxy pattern; under litebox exercises broker cross-worker loopback TCP. |
+| `extension_host_steady` | Replays the captured bootstrap, starts the production `code-server --start-server --socket-path=/tmp/code-*.sock` invocation, opens a Remote-SSH-shaped WebSocket to the Unix socket from a fresh SSH session, and asserts the connection stays alive for 60 s. |
 
 **No token required** — VS Code's `--connection-token` is
 locally-generated and never validated externally. (Unlike
@@ -1480,7 +1481,8 @@ contracted by their respective native trials).
 - `litebox_tool_executor/scripts/vscode/vscode-bootstrap-captured.sh`
   — the exact payload VS Code Remote-SSH pipes through `sh`;
   `vscode::bootstrap` `include_str!`s it and patches two
-  lines at runtime.
+  lines at runtime. `vscode::extension_host_steady` reuses it
+  to install/prime the CLI before starting `code-server`.
 - `litebox_test_harness/tests/integration.rs` — `mod vscode`
   and unconditional registration in `main()`.
 
@@ -1493,5 +1495,4 @@ contracted by their respective native trials).
   which is sufficient to validate the listener + broker TCP
   loopback; speaking the protocol would couple to a moving
   upstream binary format.
-
 

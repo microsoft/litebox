@@ -6333,6 +6333,7 @@ impl<FS: ShimFS> Task<FS> {
                 {
                     let eventfd_provider = super::eventfd::broker_eventfd_provider();
                     let pidfd_provider = super::eventfd::broker_pidfd_provider();
+                    let timerfd_provider = super::eventfd::broker_timerfd_provider();
                     let result =
                         dt.with_entry(&typed, |ef: &super::eventfd::EventFile<crate::Platform>| {
                             ef.ensure_broker_backed_for_fork(
@@ -6363,13 +6364,15 @@ impl<FS: ShimFS> Task<FS> {
                                 FdKind::Pidfd { .. } => pidfd_provider
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
+                                FdKind::Timerfd { .. } => timerfd_provider
+                                    .as_ref()
+                                    .map(|p| alloc::sync::Arc::clone(p) as _),
                                 // `ensure_broker_backed_for_fork` only
-                                // produces `Eventfd` or `Pidfd` (see
+                                // produces broker-backed Eventfd, Pidfd, or Timerfd (see
                                 // `eventfd.rs`); other variants here
                                 // would be a logic error. Per AGENTS.md
                                 // "loud failure for logic errors".
-                                FdKind::Timerfd { .. }
-                                | FdKind::Signalfd { .. }
+                                FdKind::Signalfd { .. }
                                 | FdKind::BrokerPty { .. }
                                 | FdKind::BrokerPipe { .. }
                                 | FdKind::BrokerSocketPair { .. }
@@ -6384,11 +6387,11 @@ impl<FS: ShimFS> Task<FS> {
                                 | FdKind::Epoll
                                 | FdKind::Inotify
                                 | FdKind::HostPassthrough { .. } => unreachable!(
-                                    "ensure_broker_backed_for_fork must only return Eventfd or Pidfd, got {snapshot:?}",
+                                    "ensure_broker_backed_for_fork must only return Eventfd, Pidfd, or Timerfd, got {snapshot:?}",
                                 ),
                                 #[cfg(feature = "worker_local_inet")]
                                 FdKind::Net => unreachable!(
-                                    "ensure_broker_backed_for_fork must only return Eventfd or Pidfd, got {snapshot:?}",
+                                    "ensure_broker_backed_for_fork must only return Eventfd, Pidfd, or Timerfd, got {snapshot:?}",
                                 ),
                             };
                             if matches!(snapshot, FdKind::Pidfd { .. }) {
@@ -7173,16 +7176,28 @@ impl<FS: ShimFS> Task<FS> {
                 .parked_count
                 .underlying_atomic()
                 .load(Ordering::Acquire);
-            let expected_now = {
+            let (expected_now, threads_to_interrupt) = {
                 let inner = self.thread.process.inner.lock();
-                u32::try_from(
+                let expected_now = u32::try_from(
                     inner
                         .threads
                         .len()
                         .checked_sub(1)
                         .expect("calling thread must be in the map"),
                 )
-                .expect("thread count must fit in u32")
+                .expect("thread count must fit in u32");
+                let threads_to_interrupt = inner
+                    .threads
+                    .iter()
+                    .filter_map(|(&tid, thread)| {
+                        if tid == self.tid || !thread.is_suspended.load(Ordering::Relaxed) {
+                            None
+                        } else {
+                            Some(thread.clone())
+                        }
+                    })
+                    .collect::<alloc::vec::Vec<_>>();
+                (expected_now, threads_to_interrupt)
             };
             if n >= expected_now {
                 break;
@@ -7194,7 +7209,17 @@ impl<FS: ShimFS> Task<FS> {
                 .process_registry()
                 .notify_waiters(self.process_id);
             self.thread.process.nr_threads.wake_all();
-            let _ = ps.vfork_parking.parked_count.block(n);
+            // ThreadHandle::interrupt is edge-triggered while the target is
+            // running in host/shim code. Re-arm it on a conservative timeout
+            // so a sibling that enters a guest futex wait after the initial
+            // interrupt still breaks out and reaches the park checkpoint.
+            for thread in threads_to_interrupt {
+                thread.interrupt();
+            }
+            let _ = ps
+                .vfork_parking
+                .parked_count
+                .block_or_timeout(n, core::time::Duration::from_millis(50));
         }
         Ok(true)
     }
@@ -9978,6 +10003,7 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
         }
         let eventfd_provider = super::eventfd::broker_eventfd_provider();
         let pidfd_provider = super::eventfd::broker_pidfd_provider();
+        let timerfd_provider = super::eventfd::broker_timerfd_provider();
         let dt_local = task.global.litebox.descriptor_table();
         let result =
             dt_local.with_entry(typed, |ef: &super::eventfd::EventFile<crate::Platform>| {
@@ -9988,8 +10014,8 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
             use super::fork_snapshot::FdKind;
             let handle_id = snapshot.handle_id();
             let kind_str = snapshot.spec_token();
-            // `ensure_broker_backed_for_fork` only produces `Eventfd`
-            // or `Pidfd`; any other variant here is a logic error.
+            // `ensure_broker_backed_for_fork` only produces broker-backed
+            // Eventfd, Pidfd, or Timerfd; any other variant here is a logic error.
             let releaser: Option<
                 alloc::sync::Arc<
                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
@@ -10001,8 +10027,10 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
                 FdKind::Pidfd { .. } => pidfd_provider
                     .as_ref()
                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                FdKind::Timerfd { .. }
-                | FdKind::Signalfd { .. }
+                FdKind::Timerfd { .. } => timerfd_provider
+                    .as_ref()
+                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                FdKind::Signalfd { .. }
                 | FdKind::BrokerPty { .. }
                 | FdKind::BrokerPipe { .. }
                 | FdKind::BrokerSocketPair { .. }
@@ -10017,11 +10045,11 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
                 | FdKind::Epoll
                 | FdKind::Inotify
                 | FdKind::HostPassthrough { .. } => unreachable!(
-                    "ensure_broker_backed_for_fork must only return Eventfd or Pidfd, got {snapshot:?}",
+                    "ensure_broker_backed_for_fork must only return Eventfd, Pidfd, or Timerfd, got {snapshot:?}",
                 ),
                 #[cfg(feature = "worker_local_inet")]
                 FdKind::Net => unreachable!(
-                    "ensure_broker_backed_for_fork must only return Eventfd or Pidfd, got {snapshot:?}",
+                    "ensure_broker_backed_for_fork must only return Eventfd, Pidfd, or Timerfd, got {snapshot:?}",
                 ),
             };
             if matches!(snapshot, FdKind::Pidfd { .. }) {

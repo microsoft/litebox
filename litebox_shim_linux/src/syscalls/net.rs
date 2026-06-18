@@ -302,7 +302,10 @@ fn passthrough_sockopt_value(level: u32, optname: u32) -> Option<u32> {
     match SocketOptionName::try_from(level, optname)? {
         SocketOptionName::Socket(SocketOption::SNDBUF | SocketOption::RCVBUF) => Some(64u32 * 1024),
         SocketOptionName::TCP(TcpOption::NODELAY) => Some(1),
-        _ => None,
+        SocketOptionName::IP(_)
+        | SocketOptionName::IPv6(_)
+        | SocketOptionName::Socket(_)
+        | SocketOptionName::TCP(_) => None,
     }
 }
 
@@ -1390,7 +1393,69 @@ fn socket_option_name_to_raw(optname: SocketOptionName) -> (i32, i32) {
     }
 }
 
+/// Socket-I/O dispatch class for a raw fd. The shared, exhaustive gate that
+/// every socket syscall handler routes through (via [`FilesState::run_on_raw_fd`]),
+/// mirroring [`crate::syscalls::migration_policy::migration_policies_for`].
+///
+/// This replaces the per-handler `try_with_broker_*` probe chains — where each
+/// handler independently enumerated a *different* subset of socket subsystems,
+/// so a type handled in one syscall could be silently missing in a sibling (the
+/// `do_sendmsg` vs `do_sendto` `tcp_conn` gap) — and the runtime
+/// [`assert_no_unhandled_socket_subsystem`] safety net, with a *compile-time*
+/// gate: adding a `RawFdRef` variant trips E0004 in [`socket_io_class`], and a
+/// new `SocketIoClass` variant trips E0004 in every handler that matches on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SocketIoClass {
+    BrokerSocketPair,
+    BrokerSocketDgram,
+    BrokerSocketSeqPacket,
+    BrokerTcpConn,
+    BrokerInetListener,
+    BrokerInetDgram,
+    BrokerInetRaw,
+    /// Shim-local AF_UNIX socket, or (under `worker_local_inet`) the legacy
+    /// smoltcp inet socket — both dispatched through [`FilesState::with_socket`].
+    WithSocket,
+    /// Not a socket at all (regular file, eventfd/timerfd/pidfd, epoll, broker
+    /// pipe, broker pty, signalfd, inotify, host-passthrough fd) — `ENOTSOCK`.
+    NotASocket,
+}
+
+/// Exhaustive classifier over `RawFdRef`; no wildcard arm (the workspace denies
+/// `clippy::wildcard_enum_match_arm`). See [`SocketIoClass`].
+pub(super) fn socket_io_class<FS: ShimFS>(r: &crate::RawFdRef<'_, FS>) -> SocketIoClass {
+    use crate::RawFdRef;
+    match r {
+        RawFdRef::BrokerSocketPair(_) => SocketIoClass::BrokerSocketPair,
+        RawFdRef::BrokerSocketDgram(_) => SocketIoClass::BrokerSocketDgram,
+        RawFdRef::BrokerSocketSeqPacket(_) => SocketIoClass::BrokerSocketSeqPacket,
+        RawFdRef::BrokerTcpConn(_) => SocketIoClass::BrokerTcpConn,
+        RawFdRef::BrokerInetListener(_) => SocketIoClass::BrokerInetListener,
+        RawFdRef::BrokerInetDgram(_) => SocketIoClass::BrokerInetDgram,
+        RawFdRef::BrokerInetRaw(_) => SocketIoClass::BrokerInetRaw,
+        RawFdRef::Unix(_) => SocketIoClass::WithSocket,
+        #[cfg(feature = "worker_local_inet")]
+        RawFdRef::Net(_) => SocketIoClass::WithSocket,
+        RawFdRef::Fs(_)
+        | RawFdRef::Eventfd(_)
+        | RawFdRef::Epoll(_)
+        | RawFdRef::HostPassthroughFd(_)
+        | RawFdRef::BrokerPipe(_)
+        | RawFdRef::BrokerPty(_)
+        | RawFdRef::Signalfd(_)
+        | RawFdRef::Inotify(_) => SocketIoClass::NotASocket,
+    }
+}
+
 impl<FS: ShimFS> Task<FS> {
+    /// Classify `sockfd` for socket-I/O dispatch via the exhaustive
+    /// [`socket_io_class`] gate, or `EBADF` if the fd is unknown.
+    pub(super) fn socket_io_class_of(&self, sockfd: u32) -> Result<SocketIoClass, Errno> {
+        self.files
+            .borrow()
+            .run_on_raw_fd(sockfd as usize, |r| socket_io_class(&r))
+    }
+
     /// Returns `Some(result)` if `sockfd` is a broker socketpair fd; returns
     /// `None` so callers can fall through to the legacy `with_socket` dispatch
     /// otherwise.
@@ -1849,7 +1914,11 @@ impl<FS: ShimFS> Task<FS> {
                         return Ok(u32::try_from(raw_fd).unwrap());
                     }
                     SockType::Stream => {}
-                    _ => return Err(Errno::ESOCKTNOSUPPORT),
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "SockType is non_exhaustive; unknown socket types are unsupported"
+                    )]
+                    SockType::Raw | _ => return Err(Errno::ESOCKTNOSUPPORT),
                 }
                 let socket = UnixSocket::new(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
                 let typed = self
@@ -2599,147 +2668,160 @@ impl<FS: ShimFS> Task<FS> {
         peer: Option<&mut SocketAddress>,
         flags: SockFlags,
     ) -> Result<u32, Errno> {
-        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
-            let handle = self.broker_inet_listener_handle(typed)?;
-            let (conn_handle, peer_raw) =
-                handle.with_entry(|entry| entry.accept(&self.wait_cx()))?;
-            let tcp_provider =
-                crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(Errno::EIO)?;
-            let mut status = OFlags::empty();
-            status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
-            let tcp_fd = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
-                tcp_provider,
-                conn_handle,
-                status,
-            );
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let typed_tcp =
-                dt.insert::<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(tcp_fd);
-            if flags.contains(SockFlags::CLOEXEC) {
-                let old = dt.set_fd_metadata(&typed_tcp, FileDescriptorFlags::FD_CLOEXEC);
-                assert!(old.is_none());
-            }
-            drop(dt);
-            let files = self.files.borrow();
-            let raw_fd = files.insert_raw_fd(typed_tcp).map_err(|typed_tcp| {
-                let _ = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
-                    .remove(&typed_tcp);
-                Errno::EMFILE
-            })?;
-            Ok((
-                u32::try_from(raw_fd).unwrap(),
-                Some(inet_listener_wire_to_socket_address(peer_raw)?),
-            ))
-        }) {
-            let (fd, peer_addr) = result?;
-            if let (Some(peer), Some(addr)) = (peer, peer_addr) {
-                *peer = addr;
-            }
-            return Ok(fd);
-        }
-        if let Some(result) = self.try_with_broker_socket_seqpacket(sockfd, |typed| {
-            let handle = self.broker_socket_seqpacket_handle(typed)?;
-            let accepted_handle = handle.with_entry(|entry| entry.accept(&self.wait_cx()))?;
-            let provider =
-                crate::syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider()
-                    .ok_or(Errno::EIO)?;
-            let mut status = OFlags::empty();
-            status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
-            let seqpacket = crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<
-                Platform,
-            >::new(provider, accepted_handle, status);
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let typed_seq = dt
-                .insert::<crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(
-                    seqpacket,
-                );
-            if flags.contains(SockFlags::CLOEXEC) {
-                let old = dt.set_fd_metadata(&typed_seq, FileDescriptorFlags::FD_CLOEXEC);
-                assert!(old.is_none());
-            }
-            drop(dt);
-            let files = self.files.borrow();
-            let raw_fd = files.insert_raw_fd(typed_seq).map_err(|typed_seq| {
-                let _ = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
-                    .remove(&typed_seq);
-                Errno::EMFILE
-            })?;
-            Ok(u32::try_from(raw_fd).unwrap())
-        }) {
-            return result;
-        }
-        let files = self.files.borrow();
-        let want_peer = peer.is_some();
-        let (file, peer_addr) = files.with_socket(
-            &self.global,
-            sockfd,
-            |fd| {
-                #[cfg(feature = "worker_local_inet")]
-                {
-                    let sock_type = self.global.get_socket_type(fd)?;
-                    let mut socket_addr = want_peer
-                        .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
-                    let accepted_file =
-                        self.global
-                            .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
-                    let peer_addr = socket_addr.map(SocketAddress::Inet);
-
-                    if let Some(raw_fd) = self.try_install_broker_tcp_accept(
-                        &accepted_file,
-                        peer_addr.as_ref(),
-                        flags,
-                        files.as_ref(),
-                    )? {
-                        return Ok((raw_fd, peer_addr));
+        let class = self.socket_io_class_of(sockfd)?;
+        let (fd, peer_addr) = match class {
+            SocketIoClass::BrokerInetListener => self
+                .try_with_broker_inet_listener(sockfd, |typed| {
+                    let handle = self.broker_inet_listener_handle(typed)?;
+                    let (conn_handle, peer_raw) =
+                        handle.with_entry(|entry| entry.accept(&self.wait_cx()))?;
+                    let tcp_provider = crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider()
+                        .ok_or(Errno::EIO)?;
+                    let mut status = OFlags::empty();
+                    status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                    let tcp_fd = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+                        tcp_provider,
+                        conn_handle,
+                        status,
+                    );
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let typed_tcp = dt
+                        .insert::<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(tcp_fd);
+                    if flags.contains(SockFlags::CLOEXEC) {
+                        let old = dt.set_fd_metadata(&typed_tcp, FileDescriptorFlags::FD_CLOEXEC);
+                        assert!(old.is_none());
                     }
+                    drop(dt);
+                    let files = self.files.borrow();
+                    let raw_fd = files.insert_raw_fd(typed_tcp).map_err(|typed_tcp| {
+                        let _ = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .remove(&typed_tcp);
+                        Errno::EMFILE
+                    })?;
+                    Ok((
+                        u32::try_from(raw_fd).unwrap(),
+                        Some(inet_listener_wire_to_socket_address(peer_raw)?),
+                    ))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketSeqPacket => self
+                .try_with_broker_socket_seqpacket(sockfd, |typed| {
+                    let handle = self.broker_socket_seqpacket_handle(typed)?;
+                    let accepted_handle =
+                        handle.with_entry(|entry| entry.accept(&self.wait_cx()))?;
+                    let provider =
+                        crate::syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider(
+                        )
+                        .ok_or(Errno::EIO)?;
+                    let mut status = OFlags::empty();
+                    status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                    let seqpacket =
+                        crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<
+                            Platform,
+                        >::new(provider, accepted_handle, status);
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let typed_seq = dt.insert::<
+                        crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem,
+                    >(seqpacket);
+                    if flags.contains(SockFlags::CLOEXEC) {
+                        let old = dt.set_fd_metadata(&typed_seq, FileDescriptorFlags::FD_CLOEXEC);
+                        assert!(old.is_none());
+                    }
+                    drop(dt);
+                    let files = self.files.borrow();
+                    let raw_fd = files.insert_raw_fd(typed_seq).map_err(|typed_seq| {
+                        let _ = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .remove(&typed_seq);
+                        Errno::EMFILE
+                    })?;
+                    Ok(u32::try_from(raw_fd).unwrap())
+                })
+                .unwrap_or(Err(Errno::EBADF))
+                .map(|fd| (fd, None)),
+            SocketIoClass::BrokerSocketPair
+            | SocketIoClass::BrokerSocketDgram
+            | SocketIoClass::BrokerTcpConn
+            | SocketIoClass::BrokerInetDgram
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => {
+                let files = self.files.borrow();
+                let want_peer = peer.is_some();
+                let (file, peer_addr) = files.with_socket(
+                    &self.global,
+                    sockfd,
+                    |fd| {
+                        #[cfg(feature = "worker_local_inet")]
+                        {
+                            let sock_type = self.global.get_socket_type(fd)?;
+                            let mut socket_addr = want_peer.then(|| {
+                                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+                            });
+                            let accepted_file =
+                                self.global
+                                    .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
+                            let peer_addr = socket_addr.map(SocketAddress::Inet);
 
-                    let proxy = self
-                        .global
-                        .initialize_socket(&accepted_file, sock_type, flags);
-                    proxy.set_state(SocketState::Connected);
-                    let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
-                        unimplemented!()
-                    };
-                    Ok((raw_fd, peer_addr))
-                }
-                #[cfg(not(feature = "worker_local_inet"))]
-                {
-                    let _ = fd;
-                    Err(Errno::ENOTSOCK)
-                }
-            },
-            |file| {
-                let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
-                let accepted_file =
-                    file.accept(Some(self), &self.wait_cx(), flags, socket_addr.as_mut())?;
-                let peer_addr = socket_addr.map(SocketAddress::Unix);
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let typed =
-                    dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(accepted_file);
-                if flags.contains(SockFlags::CLOEXEC) {
-                    let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
-                    assert!(old.is_none());
-                }
-                drop(dt);
-                let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                    Errno::EMFILE
-                })?;
-                Ok((raw_fd, peer_addr))
-            },
-        )?;
+                            if let Some(raw_fd) = self.try_install_broker_tcp_accept(
+                                &accepted_file,
+                                peer_addr.as_ref(),
+                                flags,
+                                files.as_ref(),
+                            )? {
+                                return Ok((raw_fd, peer_addr));
+                            }
+
+                            let proxy =
+                                self.global
+                                    .initialize_socket(&accepted_file, sock_type, flags);
+                            proxy.set_state(SocketState::Connected);
+                            let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
+                                unimplemented!()
+                            };
+                            Ok((raw_fd, peer_addr))
+                        }
+                        #[cfg(not(feature = "worker_local_inet"))]
+                        {
+                            let _ = fd;
+                            Err(Errno::ENOTSOCK)
+                        }
+                    },
+                    |file| {
+                        let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
+                        let accepted_file =
+                            file.accept(Some(self), &self.wait_cx(), flags, socket_addr.as_mut())?;
+                        let peer_addr = socket_addr.map(SocketAddress::Unix);
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(
+                            accepted_file,
+                        );
+                        if flags.contains(SockFlags::CLOEXEC) {
+                            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                            assert!(old.is_none());
+                        }
+                        drop(dt);
+                        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                            let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                            Errno::EMFILE
+                        })?;
+                        Ok((raw_fd, peer_addr))
+                    },
+                )?;
+                Ok((u32::try_from(file).unwrap(), peer_addr))
+            }
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
+        }?;
 
         if let (Some(peer), Some(addr)) = (peer, peer_addr) {
             *peer = addr;
         }
 
-        Ok(u32::try_from(file).unwrap())
+        Ok(fd)
     }
 
     /// Handle syscall `connect`
@@ -2777,117 +2859,126 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             sockaddr
         };
-        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
-            let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
-            let handle = self.broker_tcp_conn_handle(typed)?;
-            handle.with_entry(|entry| entry.connect(&self.wait_cx(), &raw))
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
-            let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-            let SocketAddr::V4(addr) = addr else {
-                return Err(Errno::EAFNOSUPPORT);
-            };
-            let raw_fd = usize::try_from(sockfd).map_err(|_| Errno::EBADF)?;
-            if crate::syscalls::broker_tcp_conn::broker_inet_tcp_conn_provider_outbound_enabled()
-                && let Some(tcp_provider) =
-                    crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider()
-            {
-                let fd_flags = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
-                    .unwrap_or_else(|_| FileDescriptorFlags::empty());
-                let listener_handle = self.broker_inet_listener_handle(typed)?;
-                let (status, family) =
-                    listener_handle.with_entry(|entry| (entry.get_status(), entry.family()));
-                let tcp_handle = tcp_provider
-                    .create(family)
-                    .map_err(super::broker_backed::broker_err_to_errno)?;
-                let tcp_fd = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
-                    tcp_provider,
-                    tcp_handle,
-                    status,
-                );
-                let typed_tcp = {
-                    let mut dt = self.global.litebox.descriptor_table_mut();
-                    let typed_tcp = dt
-                        .insert::<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(tcp_fd);
-                    if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
-                        let old = dt.set_fd_metadata(&typed_tcp, FileDescriptorFlags::FD_CLOEXEC);
-                        assert!(old.is_none());
-                    }
-                    typed_tcp
-                };
-                let tcp_handle = self.broker_tcp_conn_handle(&typed_tcp)?;
-                {
-                    let files = self.files.borrow();
-                    let mut rds = files.raw_descriptor_store.write();
-                    let _old_fd = rds
-                        .fd_consume_raw_integer::<
-                            super::broker_inet_listener::BrokerInetListenerSubsystem,
-                        >(raw_fd)
-                        .map_err(|_| Errno::EBADF)?;
-                    assert!(rds.fd_into_specific_raw_integer(typed_tcp, raw_fd));
-                }
-                let _ = self.global.litebox.descriptor_table_mut().remove(typed);
-                let raw = socket_address_to_inet_listener_wire(SocketAddress::Inet(
-                    SocketAddr::V4(addr),
-                ))?;
-                return tcp_handle.with_entry(|entry| entry.connect(&self.wait_cx(), &raw));
-            }
-            // Broker-held outbound TCP is mandatory in the linux_userland runner
-            // (`broker_inet_tcp_enabled()` is always true), so do not resurrect
-            // the old raw host-socket passthrough fallback. A host socket here
-            // would have no broker state to duplicate across cross-binary-type
-            // fork; missing provider setup is a runner configuration error.
-            Err(Errno::ENODEV)
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_inet_dgram(sockfd, |typed| {
-            let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
-            let handle = self.broker_inet_dgram_handle(typed)?;
-            handle.with_entry(|entry| entry.connect(&raw))
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_socket_dgram(sockfd, |typed| {
-            let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
-            let handle = self.broker_socket_dgram_handle(typed)?;
-            handle.with_entry(|entry| entry.connect(addr))
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_socket_seqpacket(sockfd, |typed| {
-            let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
-            let handle = self.broker_socket_seqpacket_handle(typed)?;
-            handle.with_entry(|entry| entry.connect(addr))
-        }) {
-            return result;
-        }
-        self.files.borrow().with_socket(
-            &self.global,
-            sockfd,
-            |fd| {
-                #[cfg(feature = "worker_local_inet")]
-                {
+        let class = self.socket_io_class_of(sockfd)?;
+        match class {
+            SocketIoClass::BrokerTcpConn => self
+                .try_with_broker_tcp_conn(sockfd, |typed| {
+                    let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
+                    let handle = self.broker_tcp_conn_handle(typed)?;
+                    handle.with_entry(|entry| entry.connect(&self.wait_cx(), &raw))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetListener => self
+                .try_with_broker_inet_listener(sockfd, |typed| {
                     let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-                    self.global.connect(&self.wait_cx(), fd, addr)
-                }
-                #[cfg(not(feature = "worker_local_inet"))]
-                {
-                    let _ = fd;
-                    Err(Errno::ENOTSOCK)
-                }
-            },
-            |file| {
-                let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
-                file.connect(self, addr)
-            },
-        )
+                    let SocketAddr::V4(addr) = addr else {
+                        return Err(Errno::EAFNOSUPPORT);
+                    };
+                    let raw_fd = usize::try_from(sockfd).map_err(|_| Errno::EBADF)?;
+                    if crate::syscalls::broker_tcp_conn::broker_inet_tcp_conn_provider_outbound_enabled()
+                        && let Some(tcp_provider) =
+                            crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider()
+                    {
+                        let fd_flags = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
+                            .unwrap_or_else(|_| FileDescriptorFlags::empty());
+                        let listener_handle = self.broker_inet_listener_handle(typed)?;
+                        let (status, family) =
+                            listener_handle.with_entry(|entry| (entry.get_status(), entry.family()));
+                        let tcp_handle = tcp_provider
+                            .create(family)
+                            .map_err(super::broker_backed::broker_err_to_errno)?;
+                        let tcp_fd =
+                            crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+                                tcp_provider,
+                                tcp_handle,
+                                status,
+                            );
+                        let typed_tcp = {
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let typed_tcp = dt.insert::<
+                                crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem,
+                            >(tcp_fd);
+                            if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
+                                let old =
+                                    dt.set_fd_metadata(&typed_tcp, FileDescriptorFlags::FD_CLOEXEC);
+                                assert!(old.is_none());
+                            }
+                            typed_tcp
+                        };
+                        let tcp_handle = self.broker_tcp_conn_handle(&typed_tcp)?;
+                        {
+                            let files = self.files.borrow();
+                            let mut rds = files.raw_descriptor_store.write();
+                            let _old_fd = rds
+                                .fd_consume_raw_integer::<
+                                    super::broker_inet_listener::BrokerInetListenerSubsystem,
+                                >(raw_fd)
+                                .map_err(|_| Errno::EBADF)?;
+                            assert!(rds.fd_into_specific_raw_integer(typed_tcp, raw_fd));
+                        }
+                        let _ = self.global.litebox.descriptor_table_mut().remove(typed);
+                        let raw = socket_address_to_inet_listener_wire(SocketAddress::Inet(
+                            SocketAddr::V4(addr),
+                        ))?;
+                        return tcp_handle.with_entry(|entry| entry.connect(&self.wait_cx(), &raw));
+                    }
+                    // Broker-held outbound TCP is mandatory in the linux_userland runner
+                    // (`broker_inet_tcp_enabled()` is always true), so do not resurrect
+                    // the old raw host-socket passthrough fallback. A host socket here
+                    // would have no broker state to duplicate across cross-binary-type
+                    // fork; missing provider setup is a runner configuration error.
+                    Err(Errno::ENODEV)
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetDgram => self
+                .try_with_broker_inet_dgram(sockfd, |typed| {
+                    let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
+                    let handle = self.broker_inet_dgram_handle(typed)?;
+                    handle.with_entry(|entry| entry.connect(&raw))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketDgram => self
+                .try_with_broker_socket_dgram(sockfd, |typed| {
+                    let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
+                    let handle = self.broker_socket_dgram_handle(typed)?;
+                    handle.with_entry(|entry| entry.connect(addr))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketSeqPacket => self
+                .try_with_broker_socket_seqpacket(sockfd, |typed| {
+                    let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
+                    let handle = self.broker_socket_seqpacket_handle(typed)?;
+                    handle.with_entry(|entry| entry.connect(addr))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketPair
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => self.files.borrow().with_socket(
+                &self.global,
+                sockfd,
+                |fd| {
+                    #[cfg(feature = "worker_local_inet")]
+                    {
+                        let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
+                        self.global.connect(&self.wait_cx(), fd, addr)
+                    }
+                    #[cfg(not(feature = "worker_local_inet"))]
+                    {
+                        let _ = fd;
+                        Err(Errno::ENOTSOCK)
+                    }
+                },
+                |file| {
+                    let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
+                    file.connect(self, addr)
+                },
+            ),
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
+        }
     }
 
     /// Handle syscall `bind`
@@ -2913,111 +3004,115 @@ impl<FS: ShimFS> Task<FS> {
                 .bind();
             return Ok(());
         }
-        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
-            let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
-            let listener_provider =
-                crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
-                    .ok_or(Errno::EINVAL)?;
-            let raw_fd = usize::try_from(sockfd).map_err(|_| Errno::EBADF)?;
-            let tcp_handle = self.broker_tcp_conn_handle(typed)?;
-            let status = tcp_handle.with_entry(|entry| entry.get_status());
-            let fd_flags = self
-                .global
-                .litebox
-                .descriptor_table()
-                .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
-                .unwrap_or_else(|_| FileDescriptorFlags::empty());
-            let listener_family = match sockaddr {
-                SocketAddress::Inet(SocketAddr::V4(_)) => 0,
-                SocketAddress::Inet(SocketAddr::V6(_)) => 1,
-                SocketAddress::Unix(_) => return Err(Errno::EAFNOSUPPORT),
-            };
-            let listener_handle = listener_provider
-                .create(listener_family)
-                .map_err(super::broker_backed::broker_err_to_errno)?;
-            let listener =
-                crate::syscalls::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
-                    listener_provider,
-                    listener_handle,
-                    listener_family,
-                    status,
-                );
-            listener.bind(&raw)?;
-            let typed_listener = {
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let typed_listener = dt
-                    .insert::<crate::syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
-                        listener,
+        let class = self.socket_io_class_of(sockfd)?;
+        match class {
+            SocketIoClass::BrokerTcpConn => self
+                .try_with_broker_tcp_conn(sockfd, |typed| {
+                    let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
+                    let listener_provider =
+                        crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
+                            .ok_or(Errno::EINVAL)?;
+                    let raw_fd = usize::try_from(sockfd).map_err(|_| Errno::EBADF)?;
+                    let tcp_handle = self.broker_tcp_conn_handle(typed)?;
+                    let status = tcp_handle.with_entry(|entry| entry.get_status());
+                    let fd_flags = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
+                        .unwrap_or_else(|_| FileDescriptorFlags::empty());
+                    let listener_family = match sockaddr {
+                        SocketAddress::Inet(SocketAddr::V4(_)) => 0,
+                        SocketAddress::Inet(SocketAddr::V6(_)) => 1,
+                        SocketAddress::Unix(_) => return Err(Errno::EAFNOSUPPORT),
+                    };
+                    let listener_handle = listener_provider
+                        .create(listener_family)
+                        .map_err(super::broker_backed::broker_err_to_errno)?;
+                    let listener = crate::syscalls::broker_inet_listener::BrokerInetListenerFd::<
+                        Platform,
+                    >::new(
+                        listener_provider, listener_handle, listener_family, status
                     );
-                if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
-                    let old = dt.set_fd_metadata(&typed_listener, FileDescriptorFlags::FD_CLOEXEC);
-                    assert!(old.is_none());
-                }
-                typed_listener
-            };
-            {
-                let files = self.files.borrow();
-                let mut rds = files.raw_descriptor_store.write();
-                let _old_fd = rds
-                    .fd_consume_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(
-                        raw_fd,
-                    )
-                    .map_err(|_| Errno::EBADF)?;
-                assert!(rds.fd_into_specific_raw_integer(typed_listener, raw_fd));
-            }
-            let _ = self.global.litebox.descriptor_table_mut().remove(typed);
-            Ok(())
-        }) {
-            return result;
+                    listener.bind(&raw)?;
+                    let typed_listener = {
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed_listener = dt.insert::<
+                            crate::syscalls::broker_inet_listener::BrokerInetListenerSubsystem,
+                        >(listener);
+                        if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
+                            let old = dt
+                                .set_fd_metadata(&typed_listener, FileDescriptorFlags::FD_CLOEXEC);
+                            assert!(old.is_none());
+                        }
+                        typed_listener
+                    };
+                    {
+                        let files = self.files.borrow();
+                        let mut rds = files.raw_descriptor_store.write();
+                        let _old_fd = rds
+                            .fd_consume_raw_integer::<
+                                super::broker_tcp_conn::BrokerTcpConnSubsystem,
+                            >(raw_fd)
+                            .map_err(|_| Errno::EBADF)?;
+                        assert!(rds.fd_into_specific_raw_integer(typed_listener, raw_fd));
+                    }
+                    let _ = self.global.litebox.descriptor_table_mut().remove(typed);
+                    Ok(())
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetListener => self
+                .try_with_broker_inet_listener(sockfd, |typed| {
+                    let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
+                    let handle = self.broker_inet_listener_handle(typed)?;
+                    handle.with_entry(|entry| entry.bind(&raw)).map(|_| ())
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetDgram => self
+                .try_with_broker_inet_dgram(sockfd, |typed| {
+                    let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
+                    let handle = self.broker_inet_dgram_handle(typed)?;
+                    handle.with_entry(|entry| entry.bind(&raw)).map(|_| ())
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketDgram => self
+                .try_with_broker_socket_dgram(sockfd, |typed| {
+                    let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
+                    let handle = self.broker_socket_dgram_handle(typed)?;
+                    handle.with_entry(|entry| entry.bind(addr)).map(|_| ())
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketSeqPacket => self
+                .try_with_broker_socket_seqpacket(sockfd, |typed| {
+                    let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
+                    let handle = self.broker_socket_seqpacket_handle(typed)?;
+                    handle.with_entry(|entry| entry.bind(addr)).map(|_| ())
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketPair
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => self.files.borrow().with_socket(
+                &self.global,
+                sockfd,
+                |fd| {
+                    #[cfg(feature = "worker_local_inet")]
+                    {
+                        let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
+                        self.global.bind(fd, addr)
+                    }
+                    #[cfg(not(feature = "worker_local_inet"))]
+                    {
+                        let _ = fd;
+                        Err(Errno::ENOTSOCK)
+                    }
+                },
+                |file| {
+                    let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
+                    file.bind(self, addr)
+                },
+            ),
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
         }
-        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
-            let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
-            let handle = self.broker_inet_listener_handle(typed)?;
-            handle.with_entry(|entry| entry.bind(&raw)).map(|_| ())
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_inet_dgram(sockfd, |typed| {
-            let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
-            let handle = self.broker_inet_dgram_handle(typed)?;
-            handle.with_entry(|entry| entry.bind(&raw)).map(|_| ())
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_socket_dgram(sockfd, |typed| {
-            let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
-            let handle = self.broker_socket_dgram_handle(typed)?;
-            handle.with_entry(|entry| entry.bind(addr)).map(|_| ())
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_socket_seqpacket(sockfd, |typed| {
-            let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
-            let handle = self.broker_socket_seqpacket_handle(typed)?;
-            handle.with_entry(|entry| entry.bind(addr)).map(|_| ())
-        }) {
-            return result;
-        }
-        self.files.borrow().with_socket(
-            &self.global,
-            sockfd,
-            |fd| {
-                #[cfg(feature = "worker_local_inet")]
-                {
-                    let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-                    self.global.bind(fd, addr)
-                }
-                #[cfg(not(feature = "worker_local_inet"))]
-                {
-                    let _ = fd;
-                    Err(Errno::ENOTSOCK)
-                }
-            },
-            |file| {
-                let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
-                file.bind(self, addr)
-            },
-        )
     }
 
     /// Handle syscall `listen`
@@ -3028,34 +3123,43 @@ impl<FS: ShimFS> Task<FS> {
         self.do_listen(sockfd, backlog)
     }
     pub(super) fn do_listen(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
-        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
-            let handle = self.broker_inet_listener_handle(typed)?;
-            handle.with_entry(|entry| entry.listen(u32::from(backlog)))
-        }) {
-            return result;
+        let class = self.socket_io_class_of(sockfd)?;
+        match class {
+            SocketIoClass::BrokerInetListener => self
+                .try_with_broker_inet_listener(sockfd, |typed| {
+                    let handle = self.broker_inet_listener_handle(typed)?;
+                    handle.with_entry(|entry| entry.listen(u32::from(backlog)))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketSeqPacket => self
+                .try_with_broker_socket_seqpacket(sockfd, |typed| {
+                    let handle = self.broker_socket_seqpacket_handle(typed)?;
+                    handle.with_entry(|entry| entry.listen(u32::from(backlog)))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketPair
+            | SocketIoClass::BrokerSocketDgram
+            | SocketIoClass::BrokerTcpConn
+            | SocketIoClass::BrokerInetDgram
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => self.files.borrow().with_socket(
+                &self.global,
+                sockfd,
+                |fd| {
+                    #[cfg(feature = "worker_local_inet")]
+                    {
+                        self.global.listen(fd, backlog)
+                    }
+                    #[cfg(not(feature = "worker_local_inet"))]
+                    {
+                        let _ = fd;
+                        Err(Errno::ENOTSOCK)
+                    }
+                },
+                |file| file.listen(self, backlog, &self.global),
+            ),
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
         }
-        if let Some(result) = self.try_with_broker_socket_seqpacket(sockfd, |typed| {
-            let handle = self.broker_socket_seqpacket_handle(typed)?;
-            handle.with_entry(|entry| entry.listen(u32::from(backlog)))
-        }) {
-            return result;
-        }
-        self.files.borrow().with_socket(
-            &self.global,
-            sockfd,
-            |fd| {
-                #[cfg(feature = "worker_local_inet")]
-                {
-                    self.global.listen(fd, backlog)
-                }
-                #[cfg(not(feature = "worker_local_inet"))]
-                {
-                    let _ = fd;
-                    Err(Errno::ENOTSOCK)
-                }
-            },
-            |file| file.listen(self, backlog, &self.global),
-        )
     }
 
     #[cfg(feature = "worker_local_inet")]
@@ -3309,104 +3413,109 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(nl) = self.netlink_sockets.borrow_mut().get_mut(&sockfd) {
             return nl.sendto(buf).map_err(|_| Errno::EINVAL);
         }
-        if let Some(ret) = self.try_with_broker_sp(sockfd, |typed| {
-            if sockaddr.is_some() {
-                Err(Errno::EISCONN)
-            } else {
-                let handle = self.broker_sp_handle(typed)?;
-                handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
-            }
-        }) {
-            if let Err(Errno::EPIPE) = ret
-                && !flags.contains(SendFlags::NOSIGNAL)
-            {
-                self.send_signal(
-                    litebox_common_linux::signal::Signal::SIGPIPE,
-                    super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
-                );
-            }
-            return ret;
-        }
-        if let Some(ret) = self.try_with_broker_tcp_conn(sockfd, |typed| {
-            if sockaddr.is_some() {
-                Err(Errno::EISCONN)
-            } else {
-                let handle = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(typed)
-                    .ok_or(Errno::EBADF)?;
-                handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
-            }
-        }) {
-            if let Err(Errno::EPIPE) = ret
-                && !flags.contains(SendFlags::NOSIGNAL)
-            {
-                self.send_signal(
-                    litebox_common_linux::signal::Signal::SIGPIPE,
-                    super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
-                );
-            }
-            return ret;
-        }
-        if let Some(ret) = self.try_with_broker_inet_dgram(sockfd, |typed| {
-            let raw = match sockaddr.clone() {
-                Some(addr) => socket_address_to_inet_listener_wire(addr)?.to_vec(),
-                None => Vec::new(),
-            };
-            let handle = self.broker_inet_dgram_handle(typed)?;
-            handle.with_entry(|entry| entry.sendto(&self.wait_cx(), &raw, buf))
-        }) {
-            return ret;
-        }
-        if let Some(ret) = self.try_with_broker_socket_dgram(sockfd, |typed| {
-            let addr = sockaddr
-                .clone()
-                .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
-                .transpose()?;
-            let handle = self.broker_socket_dgram_handle(typed)?;
-            handle.with_entry(|entry| entry.sendto(&self.wait_cx(), addr, buf, &[]))
-        }) {
-            return ret;
-        }
-        if let Some(ret) = self.try_with_broker_socket_seqpacket(sockfd, |typed| {
-            if sockaddr.is_some() {
-                return Err(Errno::EISCONN);
-            }
-            let handle = self.broker_socket_seqpacket_handle(typed)?;
-            handle.with_entry(|entry| entry.send(&self.wait_cx(), buf))
-        }) {
-            return ret;
-        }
-        let ret = self.files.borrow().with_socket(
-            &self.global,
-            sockfd,
-            |fd| {
-                #[cfg(feature = "worker_local_inet")]
-                {
-                    let sockaddr = sockaddr
+        let class = self.socket_io_class_of(sockfd)?;
+        let ret = match class {
+            SocketIoClass::BrokerSocketPair => self
+                .try_with_broker_sp(sockfd, |typed| {
+                    if sockaddr.is_some() {
+                        Err(Errno::EISCONN)
+                    } else {
+                        let handle = self.broker_sp_handle(typed)?;
+                        handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
+                    }
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerTcpConn => self
+                .try_with_broker_tcp_conn(sockfd, |typed| {
+                    if sockaddr.is_some() {
+                        Err(Errno::EISCONN)
+                    } else {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(typed)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
+                    }
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetDgram => self
+                .try_with_broker_inet_dgram(sockfd, |typed| {
+                    let raw = match sockaddr.clone() {
+                        Some(addr) => socket_address_to_inet_listener_wire(addr)?.to_vec(),
+                        None => Vec::new(),
+                    };
+                    let handle = self.broker_inet_dgram_handle(typed)?;
+                    handle.with_entry(|entry| entry.sendto(&self.wait_cx(), &raw, buf))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketDgram => self
+                .try_with_broker_socket_dgram(sockfd, |typed| {
+                    let addr = sockaddr
                         .clone()
-                        .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                        .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                         .transpose()?;
-                    self.global
-                        .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
-                }
-                #[cfg(not(feature = "worker_local_inet"))]
-                {
-                    let _ = fd;
-                    Err(Errno::ENOTSOCK)
-                }
-            },
-            |file| {
-                let addr = sockaddr
-                    .clone()
-                    .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
-                file.sendto(self, buf, flags, addr, Vec::new(), Vec::new())
-            },
+                    let handle = self.broker_socket_dgram_handle(typed)?;
+                    handle.with_entry(|entry| entry.sendto(&self.wait_cx(), addr, buf, &[]))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketSeqPacket => self
+                .try_with_broker_socket_seqpacket(sockfd, |typed| {
+                    if sockaddr.is_some() {
+                        return Err(Errno::EISCONN);
+                    }
+                    let handle = self.broker_socket_seqpacket_handle(typed)?;
+                    handle.with_entry(|entry| entry.send(&self.wait_cx(), buf))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            // inet-listener / inet-raw have no sendto fast path; preserve the
+            // historical fall-through to `with_socket` (which rejects them).
+            // AF_UNIX / worker-local inet are dispatched by `with_socket`.
+            SocketIoClass::BrokerInetListener
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => self.files.borrow().with_socket(
+                &self.global,
+                sockfd,
+                |fd| {
+                    #[cfg(feature = "worker_local_inet")]
+                    {
+                        let sockaddr = sockaddr
+                            .clone()
+                            .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                            .transpose()?;
+                        self.global
+                            .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
+                    }
+                    #[cfg(not(feature = "worker_local_inet"))]
+                    {
+                        let _ = fd;
+                        Err(Errno::ENOTSOCK)
+                    }
+                },
+                |file| {
+                    let addr = sockaddr
+                        .clone()
+                        .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
+                        .transpose()?;
+                    file.sendto(self, buf, flags, addr, Vec::new(), Vec::new())
+                },
+            ),
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
+        };
+        // SIGPIPE on EPIPE for the stream-like sends that previously applied it
+        // (socketpair, tcp_conn, and the `with_socket` path); never for the
+        // datagram/seqpacket broker fast paths, matching prior behavior.
+        let sigpipe_eligible = matches!(
+            class,
+            SocketIoClass::BrokerSocketPair
+                | SocketIoClass::BrokerTcpConn
+                | SocketIoClass::BrokerInetListener
+                | SocketIoClass::BrokerInetRaw
+                | SocketIoClass::WithSocket
         );
-        if let Err(Errno::EPIPE) = ret
+        if sigpipe_eligible
+            && let Err(Errno::EPIPE) = ret
             && !flags.contains(SendFlags::NOSIGNAL)
         {
             self.send_signal(
@@ -3930,162 +4039,208 @@ impl<FS: ShimFS> Task<FS> {
             .iter()
             .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
             .ok_or(Errno::EINVAL)?;
-        if let Some(ret) = self.try_with_broker_sp(sockfd, |typed| {
-            if sock_addr.is_some() {
-                Err(Errno::EISCONN)
-            } else {
-                let handle = self.broker_sp_handle(typed)?;
-                if msg.msg_controllen != 0 {
+        let class = self.socket_io_class_of(sockfd)?;
+        let ret = match class {
+            SocketIoClass::BrokerSocketPair => self
+                .try_with_broker_sp(sockfd, |typed| {
+                    if sock_addr.is_some() {
+                        Err(Errno::EISCONN)
+                    } else {
+                        let handle = self.broker_sp_handle(typed)?;
+                        if msg.msg_controllen != 0 {
+                            let (passed_fds, passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
+                            if !passed_fds.is_empty() {
+                                return Err(Errno::EOPNOTSUPP);
+                            }
+                            let data = Self::copy_sendmsg_iovs(&iovs)?;
+                            let mut frame = Vec::new();
+                            FdTransferFrame {
+                                tokens: &passed_tokens,
+                                data: &data,
+                            }
+                            .encode(&mut frame)
+                            .map_err(|_| Errno::EMSGSIZE)?;
+                            handle.with_entry(|entry| entry.write(&self.wait_cx(), &frame))?;
+                            Ok(total_len)
+                        } else if total_len == 0 {
+                            handle.with_entry(|entry| entry.write(&self.wait_cx(), &[]))
+                        } else {
+                            Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                                handle.with_entry(|entry| entry.write(&self.wait_cx(), chunk))
+                            })
+                        }
+                    }
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerTcpConn => self
+                .try_with_broker_tcp_conn(sockfd, |typed| {
+                    // Broker-held inet TCP connection. `do_sendto`/`write` already
+                    // handle this; `sendmsg` must too, otherwise musl's resolver —
+                    // which sends its DNS-over-TCP fallback query via `sendmsg`
+                    // rather than `send`/`write` like glibc — gets ENOTSOCK and
+                    // fails to resolve CNAME-heavy names (the truncated-UDP→TCP
+                    // fallback path). See `BL.dns_resolve_cname_heavy.*musl*`.
+                    if sock_addr.is_some() {
+                        return Err(Errno::EISCONN);
+                    }
+                    if msg.msg_controllen != 0 {
+                        let (passed_fds, _passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
+                        if !passed_fds.is_empty() {
+                            // SCM_RIGHTS fd passing is not meaningful on a TCP stream.
+                            return Err(Errno::EOPNOTSUPP);
+                        }
+                    }
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(typed)
+                        .ok_or(Errno::EBADF)?;
+                    if total_len == 0 {
+                        handle.with_entry(|entry| entry.write(&self.wait_cx(), &[]))
+                    } else {
+                        Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                            handle.with_entry(|entry| entry.write(&self.wait_cx(), chunk))
+                        })
+                    }
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetDgram => self
+                .try_with_broker_inet_dgram(sockfd, |typed| {
+                    if msg.msg_controllen != 0 {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
+                    let raw = match sock_addr.clone() {
+                        Some(addr) => socket_address_to_inet_listener_wire(addr)?.to_vec(),
+                        None => Vec::new(),
+                    };
+                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
+                    let handle = self.broker_inet_dgram_handle(typed)?;
+                    handle.with_entry(|entry| entry.sendto(&self.wait_cx(), &raw, &buf))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketDgram => self
+                .try_with_broker_socket_dgram(sockfd, |typed| {
                     let (passed_fds, passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
                     if !passed_fds.is_empty() {
                         return Err(Errno::EOPNOTSUPP);
                     }
-                    let data = Self::copy_sendmsg_iovs(&iovs)?;
-                    let mut frame = Vec::new();
-                    FdTransferFrame {
-                        tokens: &passed_tokens,
-                        data: &data,
-                    }
-                    .encode(&mut frame)
-                    .map_err(|_| Errno::EMSGSIZE)?;
-                    handle.with_entry(|entry| entry.write(&self.wait_cx(), &frame))?;
-                    Ok(total_len)
-                } else if total_len == 0 {
-                    handle.with_entry(|entry| entry.write(&self.wait_cx(), &[]))
-                } else {
-                    Self::sendmsg_stream_iovs(&iovs, |chunk| {
-                        handle.with_entry(|entry| entry.write(&self.wait_cx(), chunk))
+                    let addr = sock_addr
+                        .clone()
+                        .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
+                        .transpose()?;
+                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
+                    let handle = self.broker_socket_dgram_handle(typed)?;
+                    handle.with_entry(|entry| {
+                        entry.sendto(&self.wait_cx(), addr, &buf, &passed_tokens)
                     })
-                }
-            }
-        }) {
-            if let Err(Errno::EPIPE) = ret
-                && !flags.contains(SendFlags::NOSIGNAL)
-            {
-                self.send_signal(
-                    litebox_common_linux::signal::Signal::SIGPIPE,
-                    super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
-                );
-            }
-            return ret;
-        }
-        if let Some(ret) = self.try_with_broker_inet_dgram(sockfd, |typed| {
-            if msg.msg_controllen != 0 {
-                return Err(Errno::EOPNOTSUPP);
-            }
-            let raw = match sock_addr.clone() {
-                Some(addr) => socket_address_to_inet_listener_wire(addr)?.to_vec(),
-                None => Vec::new(),
-            };
-            let buf = Self::copy_sendmsg_iovs(&iovs)?;
-            let handle = self.broker_inet_dgram_handle(typed)?;
-            handle.with_entry(|entry| entry.sendto(&self.wait_cx(), &raw, &buf))
-        }) {
-            return ret;
-        }
-        if let Some(ret) = self.try_with_broker_socket_dgram(sockfd, |typed| {
-            let (passed_fds, passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
-            if !passed_fds.is_empty() {
-                return Err(Errno::EOPNOTSUPP);
-            }
-            let addr = sock_addr
-                .clone()
-                .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
-                .transpose()?;
-            let buf = Self::copy_sendmsg_iovs(&iovs)?;
-            let handle = self.broker_socket_dgram_handle(typed)?;
-            handle.with_entry(|entry| entry.sendto(&self.wait_cx(), addr, &buf, &passed_tokens))
-        }) {
-            return ret;
-        }
-        if let Some(ret) = self.try_with_broker_socket_seqpacket(sockfd, |typed| {
-            if msg.msg_controllen != 0 {
-                return Err(Errno::EOPNOTSUPP);
-            }
-            if sock_addr.is_some() {
-                return Err(Errno::EISCONN);
-            }
-            let buf = Self::copy_sendmsg_iovs(&iovs)?;
-            let handle = self.broker_socket_seqpacket_handle(typed)?;
-            handle.with_entry(|entry| entry.send(&self.wait_cx(), &buf))
-        }) {
-            return ret;
-        }
-        let ret = self.files.borrow().with_socket(
-            &self.global,
-            sockfd,
-            |fd| {
-                #[cfg(feature = "worker_local_inet")]
-                {
-                    // Inet sockets do not support ancillary data.
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketSeqPacket => self
+                .try_with_broker_socket_seqpacket(sockfd, |typed| {
                     if msg.msg_controllen != 0 {
                         return Err(Errno::EOPNOTSUPP);
                     }
+                    if sock_addr.is_some() {
+                        return Err(Errno::EISCONN);
+                    }
+                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
+                    let handle = self.broker_socket_seqpacket_handle(typed)?;
+                    handle.with_entry(|entry| entry.send(&self.wait_cx(), &buf))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetListener
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => self.files.borrow().with_socket(
+                &self.global,
+                sockfd,
+                |fd| {
+                    #[cfg(feature = "worker_local_inet")]
+                    {
+                        // Inet sockets do not support ancillary data.
+                        if msg.msg_controllen != 0 {
+                            return Err(Errno::EOPNOTSUPP);
+                        }
+                        let sock_addr = sock_addr
+                            .clone()
+                            .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                            .transpose()?;
+                        if self.global.get_socket_type(fd)? == SockType::Stream {
+                            if total_len == 0 {
+                                return self.global.sendto(
+                                    &self.wait_cx(),
+                                    fd,
+                                    &[],
+                                    flags,
+                                    sock_addr,
+                                );
+                            }
+                            Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                                self.global
+                                    .sendto(&self.wait_cx(), fd, chunk, flags, sock_addr)
+                            })
+                        } else {
+                            let buf = Self::copy_sendmsg_iovs(&iovs)?;
+                            self.global
+                                .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)
+                        }
+                    }
+                    #[cfg(not(feature = "worker_local_inet"))]
+                    {
+                        let _ = fd;
+                        Err(Errno::ENOTSOCK)
+                    }
+                },
+                |file| {
+                    // Parse SCM_RIGHTS ancillary data for unix sockets.
+                    let (passed_fds, passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
                     let sock_addr = sock_addr
                         .clone()
-                        .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                        .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                         .transpose()?;
-                    if self.global.get_socket_type(fd)? == SockType::Stream {
+                    if file.sock_type() == SockType::Stream {
                         if total_len == 0 {
-                            return self
-                                .global
-                                .sendto(&self.wait_cx(), fd, &[], flags, sock_addr);
+                            return file.sendto(
+                                self,
+                                &[],
+                                flags,
+                                sock_addr.clone(),
+                                passed_fds,
+                                passed_tokens,
+                            );
                         }
+                        // For stream sockets with ancillary data, attach fds to
+                        // the first chunk only (matching Linux semantics).
+                        let mut fds = Some(passed_fds);
+                        let mut tokens = Some(passed_tokens);
                         Self::sendmsg_stream_iovs(&iovs, |chunk| {
-                            self.global
-                                .sendto(&self.wait_cx(), fd, chunk, flags, sock_addr)
+                            file.sendto(
+                                self,
+                                chunk,
+                                flags,
+                                sock_addr.clone(),
+                                fds.take().unwrap_or_default(),
+                                tokens.take().unwrap_or_default(),
+                            )
                         })
                     } else {
                         let buf = Self::copy_sendmsg_iovs(&iovs)?;
-                        self.global
-                            .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)
+                        file.sendto(self, &buf, flags, sock_addr, passed_fds, passed_tokens)
                     }
-                }
-                #[cfg(not(feature = "worker_local_inet"))]
-                {
-                    let _ = fd;
-                    Err(Errno::ENOTSOCK)
-                }
-            },
-            |file| {
-                // Parse SCM_RIGHTS ancillary data for unix sockets.
-                let (passed_fds, passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
-                let sock_addr = sock_addr
-                    .clone()
-                    .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
-                if file.sock_type() == SockType::Stream {
-                    if total_len == 0 {
-                        return file.sendto(
-                            self,
-                            &[],
-                            flags,
-                            sock_addr.clone(),
-                            passed_fds,
-                            passed_tokens,
-                        );
-                    }
-                    // For stream sockets with ancillary data, attach fds to
-                    // the first chunk only (matching Linux semantics).
-                    let mut fds = Some(passed_fds);
-                    let mut tokens = Some(passed_tokens);
-                    Self::sendmsg_stream_iovs(&iovs, |chunk| {
-                        file.sendto(
-                            self,
-                            chunk,
-                            flags,
-                            sock_addr.clone(),
-                            fds.take().unwrap_or_default(),
-                            tokens.take().unwrap_or_default(),
-                        )
-                    })
-                } else {
-                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
-                    file.sendto(self, &buf, flags, sock_addr, passed_fds, passed_tokens)
-                }
-            },
+                },
+            ),
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
+        };
+        let sigpipe_eligible = matches!(
+            class,
+            SocketIoClass::BrokerSocketPair
+                | SocketIoClass::BrokerTcpConn
+                | SocketIoClass::BrokerInetListener
+                | SocketIoClass::BrokerInetRaw
+                | SocketIoClass::WithSocket
         );
-        if let Err(Errno::EPIPE) = ret
+        if sigpipe_eligible
+            && let Err(Errno::EPIPE) = ret
             && !flags.contains(SendFlags::NOSIGNAL)
         {
             self.send_signal(
@@ -4808,204 +4963,189 @@ impl<FS: ShimFS> Task<FS> {
         received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
-        let files = self.files.borrow();
-        let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
+        // Exhaustive socket-I/O dispatch over the shared `socket_io_class` gate
+        // (mirrors `do_sendto`); a new socket subsystem is an E0004 here instead
+        // of silently falling through to `with_socket`/ENOTSOCK or — for the
+        // broker stream types — tripping the `with_socket` panic net.
+        match self.socket_io_class_of(sockfd)? {
+            // F.8: broker-backed AF_UNIX SOCK_STREAM socketpair. recv() on a
+            // connected stream socketpair degenerates to read(); SCM_RIGHTS
+            // arrive in-band as broker tokens (FdTransferReader). A connected
+            // socketpair has no peer address, so `source_addr` is left unset
+            // (caller writes msg_namelen 0). The pre-gate code limited this to
+            // `!want_source` and let the `want_source` case fall through to the
+            // `with_socket` panic net; the gate handles both here.
+            SocketIoClass::BrokerSocketPair => self
+                .try_with_broker_sp(sockfd, |typed| {
+                    if buf.is_empty() {
+                        return Ok(0);
+                    }
+                    let handle = self.broker_sp_handle(typed)?;
+                    let mut staging = alloc::vec![0u8; buf.len()];
+                    let size =
+                        handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut staging))?;
+                    staging.truncate(size);
+                    let mut reader = FdTransferReader::new();
+                    reader.push(&staging);
+                    match reader.take_frame() {
+                        Ok(Some(frame)) => {
+                            received_tokens.extend(frame.tokens);
+                            let n = buf.len().min(frame.data.len());
+                            buf[..n].copy_from_slice(&frame.data[..n]);
+                            Ok(n)
+                        }
+                        Ok(None) | Err(FrameError::BadMagic { .. }) => {
+                            let n = buf.len().min(staging.len());
+                            buf[..n].copy_from_slice(&staging[..n]);
+                            Ok(n)
+                        }
+                        Err(_) => Err(Errno::EPROTO),
+                    }
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            // Connected broker TCP stream: recv() degenerates to read(); a
+            // connected socket has no source address, so `source_addr` is left
+            // unset for both the `want_source` and `!want_source` callers.
+            SocketIoClass::BrokerTcpConn => self
+                .try_with_broker_tcp_conn(sockfd, |typed| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(typed)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetDgram => self
+                .try_with_broker_inet_dgram(sockfd, |typed| {
+                    let handle = self.broker_inet_dgram_handle(typed)?;
+                    let (peer_raw, payload, dgram_flags) = handle
+                        .with_entry(|entry| entry.recvfrom(&self.wait_cx(), buf.len() as u32))?;
+                    let copied = buf.len().min(payload.len());
+                    buf[..copied].copy_from_slice(&payload[..copied]);
+                    if let Some(source_addr) = source_addr {
+                        *source_addr = Some(inet_listener_wire_to_socket_address(peer_raw)?);
+                    }
+                    let truncated = (dgram_flags
+                        & litebox_common_linux::cwfd::fd_token_protocol::INET_DGRAM_RECV_FLAG_TRUNC)
+                        != 0;
+                    Ok(if truncated {
+                        copied.saturating_add(1)
+                    } else {
+                        copied
+                    })
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketSeqPacket => self
+                .try_with_broker_socket_seqpacket(sockfd, |typed| {
+                    let handle = self.broker_socket_seqpacket_handle(typed)?;
+                    let recv_len = if flags.contains(ReceiveFlags::TRUNC) {
+                        u32::MAX
+                    } else {
+                        buf.len() as u32
+                    };
+                    let (payload, packet_flags) =
+                        handle.with_entry(|entry| entry.recv(&self.wait_cx(), recv_len))?;
+                    let copied = buf.len().min(payload.len());
+                    buf[..copied].copy_from_slice(&payload[..copied]);
+                    if flags.contains(ReceiveFlags::TRUNC) {
+                        return Ok(payload.len());
+                    }
+                    Ok(
+                        if super::broker_socket_seqpacket::recv_truncated(packet_flags) {
+                            copied.saturating_add(1)
+                        } else {
+                            copied
+                        },
+                    )
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketDgram => self
+                .try_with_broker_socket_dgram(sockfd, |typed| {
+                    let handle = self.broker_socket_dgram_handle(typed)?;
+                    let recv_len = if flags.contains(ReceiveFlags::TRUNC) {
+                        u32::MAX
+                    } else {
+                        buf.len() as u32
+                    };
+                    let (src, payload, dgram_flags, tokens) =
+                        handle.with_entry(|entry| entry.recvfrom(&self.wait_cx(), recv_len))?;
+                    received_tokens.extend(tokens);
+                    let copied = buf.len().min(payload.len());
+                    buf[..copied].copy_from_slice(&payload[..copied]);
+                    if let Some(source_addr) = source_addr {
+                        *source_addr = Some(SocketAddress::Unix(src));
+                    }
+                    if flags.contains(ReceiveFlags::TRUNC) {
+                        return Ok(payload.len());
+                    }
+                    Ok(if super::broker_socket_dgram::recv_truncated(dgram_flags) {
+                        copied.saturating_add(1)
+                    } else {
+                        copied
+                    })
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            // inet-listener / inet-raw have no recv fast path; preserve the
+            // historical fall-through to `with_socket`. AF_UNIX / worker-local
+            // inet are dispatched by `with_socket`.
+            SocketIoClass::BrokerInetListener
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => {
+                let (size, addr) = {
+                    let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+                    self.files.borrow().with_socket(
+                        &self.global,
+                        sockfd,
+                        |fd| {
+                            #[cfg(feature = "worker_local_inet")]
+                            {
+                                let mut addr = None;
+                                let size = self.global.receive(
+                                    &self.wait_cx(),
+                                    fd,
+                                    &mut buf.borrow_mut(),
+                                    flags,
+                                    if want_source { Some(&mut addr) } else { None },
+                                )?;
+                                let src_addr = addr.map(SocketAddress::Inet);
+                                Ok((size, src_addr))
+                            }
+                            #[cfg(not(feature = "worker_local_inet"))]
+                            {
+                                let _ = fd;
+                                Err(Errno::ENOTSOCK)
+                            }
+                        },
+                        |entry| {
+                            let mut addr = None;
+                            let size = entry.recvfrom(
+                                &self.wait_cx(),
+                                &mut buf.borrow_mut(),
+                                flags,
+                                if want_source { Some(&mut addr) } else { None },
+                                received_fds,
+                                received_tokens,
+                            )?;
+                            let src_addr = addr.map(SocketAddress::Unix);
+                            Ok((size, src_addr))
+                        },
+                    )?
+                };
 
-        // F.8 prep: broker-backed AF_UNIX SOCK_STREAM socketpair fast
-        // path. with_socket's two-arm dispatch (INET / shim-UnixSocket)
-        // doesn't know about BrokerSocketPair, so without this branch
-        // any recv() on a broker-backed socketpair would fall through
-        // to ENOTSOCK. tokio's signal self-pipe is the prominent
-        // caller hitting this under eager-broker-socketpair.
-        //
-        // recv() on a connected stream socketpair degenerates to
-        // read() when caller doesn't ask for addr/fds — exactly
-        // tokio's use. Limit this fast path to that case; richer
-        // recvmsg semantics (SCM_RIGHTS, peer addr) are deferred
-        // until BrokerSocketPair is plumbed through with_socket
-        // properly.
-        if !want_source {
-            let broker_sp = files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
-                .ok();
-            if let Some(typed) = broker_sp {
-                if buf.is_empty() {
-                    return Ok(0);
+                if !flags.contains(ReceiveFlags::TRUNC) {
+                    let len = buf.len();
+                    assert!(size <= len, "{size} should be smaller than {len}");
                 }
-                let handle = self.broker_sp_handle(typed.as_ref())?;
-                let mut staging = alloc::vec![0u8; buf.len()];
-                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut staging))?;
-                staging.truncate(size);
-                let mut reader = FdTransferReader::new();
-                reader.push(&staging);
-                match reader.take_frame() {
-                    Ok(Some(frame)) => {
-                        received_tokens.extend(frame.tokens);
-                        let n = buf.len().min(frame.data.len());
-                        buf[..n].copy_from_slice(&frame.data[..n]);
-                        return Ok(n);
-                    }
-                    Ok(None) | Err(FrameError::BadMagic { .. }) => {
-                        let n = buf.len().min(staging.len());
-                        buf[..n].copy_from_slice(&staging[..n]);
-                        return Ok(n);
-                    }
-                    Err(_) => return Err(Errno::EPROTO),
+
+                if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
+                    *source_addr = Some(addr);
                 }
+                Ok(size)
             }
-            let broker_tcp_conn = files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
-                .ok();
-            if let Some(typed) = broker_tcp_conn {
-                let handle = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(&typed)
-                    .ok_or(Errno::EBADF)?;
-                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
-                return Ok(size);
-            }
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
         }
-
-        let broker_dgram = files
-            .raw_descriptor_store
-            .read()
-            .fd_from_raw_integer::<super::broker_inet_dgram::BrokerInetDgramSubsystem>(raw_fd)
-            .ok();
-        if let Some(typed) = broker_dgram {
-            let handle = self.broker_inet_dgram_handle(typed.as_ref())?;
-            let (peer_raw, payload, dgram_flags) =
-                handle.with_entry(|entry| entry.recvfrom(&self.wait_cx(), buf.len() as u32))?;
-            let copied = buf.len().min(payload.len());
-            buf[..copied].copy_from_slice(&payload[..copied]);
-            if let Some(source_addr) = source_addr {
-                *source_addr = Some(inet_listener_wire_to_socket_address(peer_raw)?);
-            }
-            let truncated = (dgram_flags
-                & litebox_common_linux::cwfd::fd_token_protocol::INET_DGRAM_RECV_FLAG_TRUNC)
-                != 0;
-            return Ok(if truncated {
-                copied.saturating_add(1)
-            } else {
-                copied
-            });
-        }
-
-        let broker_unix_seqpacket = files
-            .raw_descriptor_store
-            .read()
-            .fd_from_raw_integer::<super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(
-                raw_fd,
-            )
-            .ok();
-        if let Some(typed) = broker_unix_seqpacket {
-            let handle = self.broker_socket_seqpacket_handle(typed.as_ref())?;
-            let recv_len = if flags.contains(ReceiveFlags::TRUNC) {
-                u32::MAX
-            } else {
-                buf.len() as u32
-            };
-            let (payload, packet_flags) =
-                handle.with_entry(|entry| entry.recv(&self.wait_cx(), recv_len))?;
-            let copied = buf.len().min(payload.len());
-            buf[..copied].copy_from_slice(&payload[..copied]);
-            if flags.contains(ReceiveFlags::TRUNC) {
-                return Ok(payload.len());
-            }
-            return Ok(
-                if super::broker_socket_seqpacket::recv_truncated(packet_flags) {
-                    copied.saturating_add(1)
-                } else {
-                    copied
-                },
-            );
-        }
-
-        let broker_unix_dgram = files
-            .raw_descriptor_store
-            .read()
-            .fd_from_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(raw_fd)
-            .ok();
-        if let Some(typed) = broker_unix_dgram {
-            let handle = self.broker_socket_dgram_handle(typed.as_ref())?;
-            let recv_len = if flags.contains(ReceiveFlags::TRUNC) {
-                u32::MAX
-            } else {
-                buf.len() as u32
-            };
-            let (src, payload, dgram_flags, tokens) =
-                handle.with_entry(|entry| entry.recvfrom(&self.wait_cx(), recv_len))?;
-            received_tokens.extend(tokens);
-            let copied = buf.len().min(payload.len());
-            buf[..copied].copy_from_slice(&payload[..copied]);
-            if let Some(source_addr) = source_addr {
-                *source_addr = Some(SocketAddress::Unix(src));
-            }
-            if flags.contains(ReceiveFlags::TRUNC) {
-                return Ok(payload.len());
-            }
-            return Ok(if super::broker_socket_dgram::recv_truncated(dgram_flags) {
-                copied.saturating_add(1)
-            } else {
-                copied
-            });
-        }
-
-        let (size, addr) = {
-            let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-            files.with_socket(
-                &self.global,
-                raw_fd.truncate(),
-                |fd| {
-                    #[cfg(feature = "worker_local_inet")]
-                    {
-                        let mut addr = None;
-                        let size = self.global.receive(
-                            &self.wait_cx(),
-                            fd,
-                            &mut buf.borrow_mut(),
-                            flags,
-                            if want_source { Some(&mut addr) } else { None },
-                        )?;
-                        let src_addr = addr.map(SocketAddress::Inet);
-                        Ok((size, src_addr))
-                    }
-                    #[cfg(not(feature = "worker_local_inet"))]
-                    {
-                        let _ = fd;
-                        Err(Errno::ENOTSOCK)
-                    }
-                },
-                |entry| {
-                    let mut addr = None;
-                    let size = entry.recvfrom(
-                        &self.wait_cx(),
-                        &mut buf.borrow_mut(),
-                        flags,
-                        if want_source { Some(&mut addr) } else { None },
-                        received_fds,
-                        received_tokens,
-                    )?;
-                    let src_addr = addr.map(SocketAddress::Unix);
-                    Ok((size, src_addr))
-                },
-            )?
-        };
-
-        if !flags.contains(ReceiveFlags::TRUNC) {
-            let len = buf.len();
-            assert!(size <= len, "{size} should be smaller than {len}");
-        }
-
-        if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
-            *source_addr = Some(addr);
-        }
-        Ok(size)
     }
 
     pub(crate) fn sys_setsockopt(
@@ -5047,14 +5187,6 @@ impl<FS: ShimFS> Task<FS> {
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
             return Ok(());
         }
-        if let Some(result) = self.try_with_broker_inet_dgram(sockfd, |typed| {
-            let value = optval.to_owned_slice(optlen).ok_or(Errno::EFAULT)?;
-            let (level, name) = socket_option_name_to_raw(optname);
-            let handle = self.broker_inet_dgram_handle(typed)?;
-            handle.with_entry(|entry| entry.setsockopt(level, name, &value))
-        }) {
-            return result;
-        }
         // reason: unsupported variants intentionally share this fallback path.
         #[allow(clippy::wildcard_enum_match_arm)]
         let broker_sockopt = |optname| match optname {
@@ -5076,55 +5208,70 @@ impl<FS: ShimFS> Task<FS> {
             }
             _ => Err(Errno::ENOPROTOOPT),
         };
-        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| broker_sockopt(optname)) {
-            return result;
+        let class = self.socket_io_class_of(sockfd)?;
+        match class {
+            SocketIoClass::BrokerInetDgram => self
+                .try_with_broker_inet_dgram(sockfd, |typed| {
+                    let value = optval.to_owned_slice(optlen).ok_or(Errno::EFAULT)?;
+                    let (level, name) = socket_option_name_to_raw(optname);
+                    let handle = self.broker_inet_dgram_handle(typed)?;
+                    handle.with_entry(|entry| entry.setsockopt(level, name, &value))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketPair => self
+                .try_with_broker_sp(sockfd, |_typed| broker_sockopt(optname))
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerTcpConn => self
+                .try_with_broker_tcp_conn(sockfd, |typed| {
+                    if matches!(
+                        optname,
+                        SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF)
+                    ) {
+                        let _val: u32 = super::read_from_user(optval, optlen)?;
+                        return Ok(());
+                    }
+                    let (level, raw_optname) = socket_option_raw(optname);
+                    let value = optval.to_owned_slice(optlen).ok_or(Errno::EFAULT)?;
+                    let handle = self.broker_tcp_conn_handle(typed)?;
+                    handle.with_entry(|entry| entry.setsockopt(level, raw_optname, &value))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetListener => self
+                .try_with_broker_inet_listener(sockfd, |typed| {
+                    if matches!(
+                        optname,
+                        SocketOptionName::IPv6(litebox_common_linux::Ipv6Option::V6ONLY)
+                    ) {
+                        let _val: u32 = super::read_from_user(optval, optlen)?;
+                        return Ok(());
+                    }
+                    let value = optval.to_owned_slice(optlen).ok_or(Errno::EFAULT)?;
+                    let (level, raw_optname) = socket_option_raw(optname);
+                    let handle = self.broker_inet_listener_handle(typed)?;
+                    handle.with_entry(|entry| entry.setsockopt(level, raw_optname, &value))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketDgram
+            | SocketIoClass::BrokerSocketSeqPacket
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => self.files.borrow().with_socket(
+                &self.global,
+                sockfd,
+                |fd| {
+                    #[cfg(feature = "worker_local_inet")]
+                    {
+                        self.global.setsockopt(fd, optname, optval, optlen)
+                    }
+                    #[cfg(not(feature = "worker_local_inet"))]
+                    {
+                        let _ = fd;
+                        Err(Errno::ENOTSOCK)
+                    }
+                },
+                |file| file.setsockopt(&self.global, optname, optval, optlen),
+            ),
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
         }
-        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
-            if matches!(
-                optname,
-                SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF)
-            ) {
-                let _val: u32 = super::read_from_user(optval, optlen)?;
-                return Ok(());
-            }
-            let (level, raw_optname) = socket_option_raw(optname);
-            let value = optval.to_owned_slice(optlen).ok_or(Errno::EFAULT)?;
-            let handle = self.broker_tcp_conn_handle(typed)?;
-            handle.with_entry(|entry| entry.setsockopt(level, raw_optname, &value))
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
-            if matches!(
-                optname,
-                SocketOptionName::IPv6(litebox_common_linux::Ipv6Option::V6ONLY)
-            ) {
-                let _val: u32 = super::read_from_user(optval, optlen)?;
-                return Ok(());
-            }
-            let value = optval.to_owned_slice(optlen).ok_or(Errno::EFAULT)?;
-            let (level, raw_optname) = socket_option_raw(optname);
-            let handle = self.broker_inet_listener_handle(typed)?;
-            handle.with_entry(|entry| entry.setsockopt(level, raw_optname, &value))
-        }) {
-            return result;
-        }
-        self.files.borrow().with_socket(
-            &self.global,
-            sockfd,
-            |fd| {
-                #[cfg(feature = "worker_local_inet")]
-                {
-                    self.global.setsockopt(fd, optname, optval, optlen)
-                }
-                #[cfg(not(feature = "worker_local_inet"))]
-                {
-                    let _ = fd;
-                    Err(Errno::ENOTSOCK)
-                }
-            },
-            |file| file.setsockopt(&self.global, optname, optval, optlen),
-        )
     }
 
     /// Handle syscall `getsockopt`
@@ -5191,18 +5338,6 @@ impl<FS: ShimFS> Task<FS> {
             }
             return Ok(0);
         }
-        if let Some(result) = self.try_with_broker_inet_dgram(sockfd, |typed| {
-            let (level, name) = socket_option_name_to_raw(optname);
-            let handle = self.broker_inet_dgram_handle(typed)?;
-            let value = handle.with_entry(|entry| entry.getsockopt(level, name, len))?;
-            let copy_len = value.len().min(len as usize);
-            optval
-                .copy_from_slice(0, &value[..copy_len])
-                .ok_or(Errno::EFAULT)?;
-            Ok(copy_len)
-        }) {
-            return result;
-        }
         // reason: unsupported variants intentionally share this fallback path.
         #[allow(clippy::wildcard_enum_match_arm)]
         let broker_getsockopt = |optname| match optname {
@@ -5235,55 +5370,76 @@ impl<FS: ShimFS> Task<FS> {
             }
             _ => Err(Errno::ENOPROTOOPT),
         };
-        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| broker_getsockopt(optname)) {
-            return result;
+        let class = self.socket_io_class_of(sockfd)?;
+        match class {
+            SocketIoClass::BrokerInetDgram => self
+                .try_with_broker_inet_dgram(sockfd, |typed| {
+                    let (level, name) = socket_option_name_to_raw(optname);
+                    let handle = self.broker_inet_dgram_handle(typed)?;
+                    let value = handle.with_entry(|entry| entry.getsockopt(level, name, len))?;
+                    let copy_len = value.len().min(len as usize);
+                    optval
+                        .copy_from_slice(0, &value[..copy_len])
+                        .ok_or(Errno::EFAULT)?;
+                    Ok(copy_len)
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketPair => self
+                .try_with_broker_sp(sockfd, |_typed| broker_getsockopt(optname))
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerTcpConn => self
+                .try_with_broker_tcp_conn(sockfd, |typed| {
+                    if matches!(
+                        optname,
+                        SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF)
+                    ) {
+                        return super::write_to_user(64u32 * 1024, optval, len);
+                    }
+                    let (level, raw_optname) = socket_option_raw(optname);
+                    let handle = self.broker_tcp_conn_handle(typed)?;
+                    let value =
+                        handle.with_entry(|entry| entry.getsockopt(level, raw_optname, len))?;
+                    let write_len = value.len().min(len as usize);
+                    optval
+                        .write_slice_at_offset(0, &value[..write_len])
+                        .ok_or(Errno::EFAULT)?;
+                    Ok(write_len)
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetListener => self
+                .try_with_broker_inet_listener(sockfd, |typed| {
+                    let (level, raw_optname) = socket_option_raw(optname);
+                    let handle = self.broker_inet_listener_handle(typed)?;
+                    let value =
+                        handle.with_entry(|entry| entry.getsockopt(level, raw_optname, len))?;
+                    let write_len = value.len().min(len as usize);
+                    optval
+                        .write_slice_at_offset(0, &value[..write_len])
+                        .ok_or(Errno::EFAULT)?;
+                    Ok(write_len)
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketDgram
+            | SocketIoClass::BrokerSocketSeqPacket
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => self.files.borrow().with_socket(
+                &self.global,
+                sockfd,
+                |fd| {
+                    #[cfg(feature = "worker_local_inet")]
+                    {
+                        self.global.getsockopt(fd, optname, optval, len)
+                    }
+                    #[cfg(not(feature = "worker_local_inet"))]
+                    {
+                        let _ = fd;
+                        Err(Errno::ENOTSOCK)
+                    }
+                },
+                |file| file.getsockopt(&self.global, optname, optval, len),
+            ),
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
         }
-        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
-            if matches!(
-                optname,
-                SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF)
-            ) {
-                return super::write_to_user(64u32 * 1024, optval, len);
-            }
-            let (level, raw_optname) = socket_option_raw(optname);
-            let handle = self.broker_tcp_conn_handle(typed)?;
-            let value = handle.with_entry(|entry| entry.getsockopt(level, raw_optname, len))?;
-            let write_len = value.len().min(len as usize);
-            optval
-                .write_slice_at_offset(0, &value[..write_len])
-                .ok_or(Errno::EFAULT)?;
-            Ok(write_len)
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
-            let (level, raw_optname) = socket_option_raw(optname);
-            let handle = self.broker_inet_listener_handle(typed)?;
-            let value = handle.with_entry(|entry| entry.getsockopt(level, raw_optname, len))?;
-            let write_len = value.len().min(len as usize);
-            optval
-                .write_slice_at_offset(0, &value[..write_len])
-                .ok_or(Errno::EFAULT)?;
-            Ok(write_len)
-        }) {
-            return result;
-        }
-        self.files.borrow().with_socket(
-            &self.global,
-            sockfd,
-            |fd| {
-                #[cfg(feature = "worker_local_inet")]
-                {
-                    self.global.getsockopt(fd, optname, optval, len)
-                }
-                #[cfg(not(feature = "worker_local_inet"))]
-                {
-                    let _ = fd;
-                    Err(Errno::ENOTSOCK)
-                }
-            },
-            |file| file.getsockopt(&self.global, optname, optval, len),
-        )
     }
 
     /// Handle syscall `getsockname`

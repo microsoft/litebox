@@ -29,6 +29,7 @@ use litebox_common_linux::{
     broker_pgrp_signal_provider::BrokerPgrpSignalProvider,
     broker_pidfd_provider::BrokerPidfdProvider,
     broker_pty_provider::BrokerPtyProvider,
+    cwfd::broker_timerfd_provider::{BrokerTimerfdProvider, BrokerTimerfdSpec},
     errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
@@ -55,6 +56,8 @@ static BROKER_PIDFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPidfdProvid
 static BROKER_PGRP_SIGNAL_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPgrpSignalProvider>> =
     once_cell::race::OnceBox::new();
 static BROKER_PTY_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPtyProvider>> =
+    once_cell::race::OnceBox::new();
+static BROKER_TIMERFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerTimerfdProvider>> =
     once_cell::race::OnceBox::new();
 
 /// Sets the process-global broker eventfd provider. Called by the
@@ -114,6 +117,19 @@ pub fn broker_pty_provider() -> Option<Arc<dyn BrokerPtyProvider>> {
     BROKER_PTY_PROVIDER.get().cloned()
 }
 
+/// Sets the process-global broker timerfd provider.
+#[allow(dead_code)]
+pub fn set_broker_timerfd_provider(
+    provider: Arc<dyn BrokerTimerfdProvider>,
+) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerTimerfdProvider>>> {
+    BROKER_TIMERFD_PROVIDER.set(alloc::boxed::Box::new(provider))
+}
+
+/// Returns the broker timerfd provider if one has been set.
+pub fn broker_timerfd_provider() -> Option<Arc<dyn BrokerTimerfdProvider>> {
+    BROKER_TIMERFD_PROVIDER.get().cloned()
+}
+
 enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Pidfd {
         target_pid: litebox::process::ProcessId,
@@ -130,6 +146,7 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
         /// on it because Phase B.2 exports the broker process token instead.
         host_pid: Option<u32>,
     },
+    #[allow(dead_code)]
     Timerfd(TimerFileState<Platform>),
     /// Broker-hosted eventfd (Phase B-Step7b + P2.0 refactor). State
     /// lives in the broker; this worker holds only the canonical
@@ -148,6 +165,10 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     },
     PidfdBrokerBacked {
         provider: Arc<dyn BrokerPidfdProvider>,
+        common: super::broker_backed::BrokerBackedCommon<Platform>,
+    },
+    TimerfdBrokerBacked {
+        provider: Arc<dyn BrokerTimerfdProvider>,
         common: super::broker_backed::BrokerBackedCommon<Platform>,
     },
 }
@@ -245,6 +266,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new_timer(
         platform: &'static Platform,
         boot_time: Platform::Instant,
@@ -263,6 +285,29 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 next_deadline: None,
                 pending_expirations: 0,
             })),
+            status: AtomicU32::new(status.bits()),
+            pollee: Arc::new(Pollee::new()),
+        }
+    }
+
+    pub(crate) fn new_timer_broker_backed(
+        provider: Arc<dyn BrokerTimerfdProvider>,
+        handle: u64,
+        flags: TimerfdFlags,
+    ) -> Self {
+        use litebox_common_linux::cwfd::notification_frame::NOTIFY_EVENT_IN;
+        let mut status = OFlags::RDWR;
+        status.set(OFlags::NONBLOCK, flags.contains(TimerfdFlags::NONBLOCK));
+        let subscribable: Arc<
+            dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+        > = Arc::clone(&provider) as _;
+        let common =
+            super::broker_backed::BrokerBackedCommon::new(subscribable, handle, NOTIFY_EVENT_IN);
+        Self {
+            inner: litebox::sync::Mutex::new(EventFileInner::TimerfdBrokerBacked {
+                provider,
+                common,
+            }),
             status: AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
         }
@@ -292,6 +337,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     pub(crate) fn is_timerfd(&self) -> bool {
+        matches!(
+            *self.inner.lock(),
+            EventFileInner::Timerfd(_) | EventFileInner::TimerfdBrokerBacked { .. }
+        )
+    }
+
+    fn is_local_timerfd(&self) -> bool {
         matches!(*self.inner.lock(), EventFileInner::Timerfd(_))
     }
 
@@ -304,7 +356,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         #[allow(clippy::wildcard_enum_match_arm)]
         match &*self.inner.lock() {
             EventFileInner::BrokerBacked { common, .. }
-            | EventFileInner::PidfdBrokerBacked { common, .. } => Some(common.handle()),
+            | EventFileInner::PidfdBrokerBacked { common, .. }
+            | EventFileInner::TimerfdBrokerBacked { common, .. } => Some(common.handle()),
             _ => None,
         }
     }
@@ -351,24 +404,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     /// the cross-binary-type fork boundary.
     ///
     /// Behavior by variant:
-    /// - `BrokerBacked` / `PidfdBrokerBacked`: returns the existing handle.
+    /// - `BrokerBacked` / `PidfdBrokerBacked` / `TimerfdBrokerBacked`: returns the existing handle.
     /// - `Pidfd { broker_subscription: Some(_), .. }`: Phase B.2 pidfds are
     ///   already broker-backed by process-exit subscription, so this is a
     ///   no-op that exports the target ProcessId as the child restore token.
     /// - legacy `Pidfd` without a broker subscription: returns `Ok(None)`.
-    /// - `Timerfd`: returns `Ok(None)` — timerfd state is not
-    ///   currently broker-backed. The non-PIE worker-exec bridge has
-    ///   a best-effort timerfd reconstruction path, but the true
-    ///   fork-snapshot broker-handle path still cannot preserve the
-    ///   exact kernel timer object or accumulated expiration count.
-    ///   In the cross-binary fork-snapshot path, the fd itself migrates
-    ///   classified as `FdKind::EventFd` (see `RawFdRef::Eventfd`
-    ///   classification in `process.rs::snapshot_fd_table`); the fd
-    ///   handoff works but the kernel timer's *arm state* (interval,
-    ///   next expiration, accumulated unread expirations) is lost. The
-    ///   child observes a fresh, disarmed timerfd. Known limitation,
-    ///   not a bug — callers that rely on inherited arm state across
-    ///   a delayed-fork commit must re-arm explicitly.
+    /// - legacy local `Timerfd`: returns `Ok(None)`.
     /// For handle-backed kinds, the caller MUST `dup_handle` the returned
     /// handle and arrange rollback `release`. For Phase B.2 pidfds, the
     /// returned value is a broker process token and needs no fd-handle dup.
@@ -384,6 +425,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 handle_id: common.handle(),
             })),
             EventFileInner::PidfdBrokerBacked { common, .. } => Ok(Some(FdKind::Pidfd {
+                handle_id: common.handle(),
+            })),
+            EventFileInner::TimerfdBrokerBacked { common, .. } => Ok(Some(FdKind::Timerfd {
                 handle_id: common.handle(),
             })),
             EventFileInner::Timerfd(_) => Ok(None),
@@ -410,6 +454,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             EventFileInner::Timerfd(_) => "timerfd",
             EventFileInner::BrokerBacked { .. } => "broker_eventfd",
             EventFileInner::PidfdBrokerBacked { .. } => "broker_pidfd",
+            EventFileInner::TimerfdBrokerBacked { .. } => "broker_timerfd",
         }
     }
 
@@ -454,20 +499,33 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             }
             EventFileInner::Pidfd { .. }
             | EventFileInner::Timerfd(_)
-            | EventFileInner::PidfdBrokerBacked { .. } => Err(TryOpError::Other(Errno::EINVAL)),
+            | EventFileInner::PidfdBrokerBacked { .. }
+            | EventFileInner::TimerfdBrokerBacked { .. } => Err(TryOpError::Other(Errno::EINVAL)),
         }
     }
 
     fn try_read_timerfd(&self) -> Result<u64, Errno> {
         let mut inner = self.inner.lock();
-        let EventFileInner::Timerfd(timer) = &mut *inner else {
-            return Err(Errno::EINVAL);
-        };
-        timer.update();
-        if timer.pending_expirations == 0 {
-            return Err(Errno::EAGAIN);
+        match &mut *inner {
+            EventFileInner::Timerfd(timer) => {
+                timer.update();
+                if timer.pending_expirations == 0 {
+                    return Err(Errno::EAGAIN);
+                }
+                Ok(core::mem::take(&mut timer.pending_expirations))
+            }
+            EventFileInner::TimerfdBrokerBacked { provider, common } => {
+                let provider = Arc::clone(provider);
+                let handle = common.handle();
+                drop(inner);
+                provider
+                    .read_timerfd(handle)
+                    .map_err(super::broker_backed::broker_err_to_errno)
+            }
+            EventFileInner::Pidfd { .. }
+            | EventFileInner::BrokerBacked { .. }
+            | EventFileInner::PidfdBrokerBacked { .. } => Err(Errno::EINVAL),
         }
-        Ok(core::mem::take(&mut timer.pending_expirations))
     }
 
     fn try_read(&self) -> Result<u64, TryOpError<Errno>> {
@@ -477,6 +535,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 drop(inner);
                 self.try_read_eventfd()
             }
+            EventFileInner::TimerfdBrokerBacked { .. } => {
+                drop(inner);
+                self.try_read_timerfd().map_err(|err| {
+                    if err == Errno::EAGAIN {
+                        TryOpError::TryAgain
+                    } else {
+                        TryOpError::Other(err)
+                    }
+                })
+            }
             EventFileInner::Pidfd { .. }
             | EventFileInner::PidfdBrokerBacked { .. }
             | EventFileInner::Timerfd(_) => Err(TryOpError::Other(Errno::EINVAL)),
@@ -484,7 +552,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
-        if self.is_timerfd() {
+        if self.is_local_timerfd() {
             if self.get_status().contains(OFlags::NONBLOCK) {
                 return self.try_read_timerfd();
             }
@@ -558,7 +626,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             }
             EventFileInner::Pidfd { .. }
             | EventFileInner::Timerfd(_)
-            | EventFileInner::PidfdBrokerBacked { .. } => Err(TryOpError::Other(Errno::EINVAL)),
+            | EventFileInner::PidfdBrokerBacked { .. }
+            | EventFileInner::TimerfdBrokerBacked { .. } => Err(TryOpError::Other(Errno::EINVAL)),
         }
     }
 
@@ -584,22 +653,52 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         new_value: ItimerSpec,
     ) -> Result<ItimerSpec, Errno> {
         let mut inner = self.inner.lock();
-        let EventFileInner::Timerfd(timer) = &mut *inner else {
-            return Err(Errno::EINVAL);
-        };
-        let old_value = timer.current_spec();
-        timer.set_time(flags, new_value)?;
-        drop(inner);
-        self.pollee.notify_observers(Events::IN);
-        Ok(old_value)
+        match &mut *inner {
+            EventFileInner::Timerfd(timer) => {
+                let old_value = timer.current_spec();
+                timer.set_time(flags, new_value)?;
+                drop(inner);
+                self.pollee.notify_observers(Events::IN);
+                Ok(old_value)
+            }
+            EventFileInner::TimerfdBrokerBacked { provider, common } => {
+                let provider = Arc::clone(provider);
+                let handle = common.handle();
+                drop(inner);
+                let old_value = broker_spec_to_itimer(
+                    provider
+                        .gettime_timerfd(handle)
+                        .map_err(super::broker_backed::broker_err_to_errno)?,
+                )?;
+                provider
+                    .settime_timerfd(handle, itimer_spec_to_broker(new_value)?, flags.bits())
+                    .map_err(super::broker_backed::broker_err_to_errno)?;
+                Ok(old_value)
+            }
+            EventFileInner::Pidfd { .. }
+            | EventFileInner::BrokerBacked { .. }
+            | EventFileInner::PidfdBrokerBacked { .. } => Err(Errno::EINVAL),
+        }
     }
 
     pub(crate) fn get_timer(&self) -> Result<ItimerSpec, Errno> {
         let mut inner = self.inner.lock();
-        let EventFileInner::Timerfd(timer) = &mut *inner else {
-            return Err(Errno::EINVAL);
-        };
-        Ok(timer.current_spec())
+        match &mut *inner {
+            EventFileInner::Timerfd(timer) => Ok(timer.current_spec()),
+            EventFileInner::TimerfdBrokerBacked { provider, common } => {
+                let provider = Arc::clone(provider);
+                let handle = common.handle();
+                drop(inner);
+                broker_spec_to_itimer(
+                    provider
+                        .gettime_timerfd(handle)
+                        .map_err(super::broker_backed::broker_err_to_errno)?,
+                )
+            }
+            EventFileInner::Pidfd { .. }
+            | EventFileInner::BrokerBacked { .. }
+            | EventFileInner::PidfdBrokerBacked { .. } => Err(Errno::EINVAL),
+        }
     }
 
     /// Snapshot the timerfd state for the non-PIE worker-exec bridge.
@@ -667,6 +766,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 if timer.pending_expirations != 0 {
                     events |= Events::IN;
                 }
+            }
+            EventFileInner::TimerfdBrokerBacked { common, .. } => {
+                events |= common.check_io_events();
             }
             EventFileInner::Pidfd {
                 target_pid,
@@ -753,6 +855,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 drop(inner);
                 self.pollee.register_observer(observer, mask);
             }
+            EventFileInner::TimerfdBrokerBacked { common, .. } => {
+                common.ensure_subscribed(&self.pollee);
+                drop(inner);
+                self.pollee.register_observer(observer, mask);
+            }
             EventFileInner::BrokerBacked { common, .. } => {
                 // Ensure we have an active broker subscription so that
                 // cross-worker writes get pushed to our pollee via the
@@ -791,12 +898,56 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
         #[allow(clippy::wildcard_enum_match_arm)]
         match &*inner {
             EventFileInner::BrokerBacked { common, .. }
-            | EventFileInner::PidfdBrokerBacked { common, .. } => {
+            | EventFileInner::PidfdBrokerBacked { common, .. }
+            | EventFileInner::TimerfdBrokerBacked { common, .. } => {
                 common.ensure_subscribed(&self.pollee);
             }
             EventFileInner::Pidfd { .. } | EventFileInner::Timerfd(_) => {}
         }
     }
+}
+
+pub(crate) fn timerfd_clockid_raw(clockid: ClockId) -> Result<i32, Errno> {
+    // reason: unsupported clock ids intentionally share the EINVAL path.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match clockid {
+        ClockId::RealTime => Ok(0),
+        ClockId::Monotonic => Ok(1),
+        ClockId::ProcessCputimeId => Ok(2),
+        ClockId::ThreadCputimeId => Ok(3),
+        ClockId::MonotonicRaw => Ok(4),
+        ClockId::RealtimeCoarse => Ok(5),
+        ClockId::MonotonicCoarse => Ok(6),
+        ClockId::Boottime => Ok(7),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn itimer_spec_to_broker(spec: ItimerSpec) -> Result<BrokerTimerfdSpec, Errno> {
+    let _ = Duration::try_from(spec.interval)?;
+    let _ = Duration::try_from(spec.value)?;
+    Ok(BrokerTimerfdSpec {
+        interval_sec: u64::try_from(spec.interval.tv_sec).map_err(|_| Errno::EINVAL)?,
+        interval_nsec: spec.interval.tv_nsec,
+        value_sec: u64::try_from(spec.value.tv_sec).map_err(|_| Errno::EINVAL)?,
+        value_nsec: spec.value.tv_nsec,
+    })
+}
+
+fn broker_spec_to_itimer(spec: BrokerTimerfdSpec) -> Result<ItimerSpec, Errno> {
+    let itimer = ItimerSpec {
+        interval: litebox_common_linux::Timespec {
+            tv_sec: i64::try_from(spec.interval_sec).map_err(|_| Errno::EINVAL)?,
+            tv_nsec: spec.interval_nsec,
+        },
+        value: litebox_common_linux::Timespec {
+            tv_sec: i64::try_from(spec.value_sec).map_err(|_| Errno::EINVAL)?,
+            tv_nsec: spec.value_nsec,
+        },
+    };
+    let _ = Duration::try_from(itimer.interval)?;
+    let _ = Duration::try_from(itimer.value)?;
+    Ok(itimer)
 }
 
 impl EventFile<Platform> {
@@ -941,10 +1092,13 @@ pub(crate) mod test_support {
     use std::{collections::BTreeMap, sync::Mutex};
 
     use litebox_common_linux::{
-        EfdFlags,
+        EfdFlags, TimerfdFlags,
         broker_eventfd_provider::{BrokerEventCallback, BrokerEventfdProvider, BrokerOpError},
         cwfd::{
             broker_subscribable::BrokerSubscribable,
+            broker_timerfd_provider::{
+                BrokerTimerfdProvider, test_util::TestBrokerTimerfdProvider,
+            },
             notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT},
         },
     };
@@ -1178,6 +1332,22 @@ pub(crate) mod test_support {
         let eventfd = EventFile::new_broker_backed(provider_dyn, handle, flags);
         (provider, handle, eventfd)
     }
+
+    pub(crate) fn new_mock_broker_timerfd(
+        flags: TimerfdFlags,
+    ) -> (
+        Arc<TestBrokerTimerfdProvider>,
+        u64,
+        EventFile<litebox_platform_multiplex::Platform>,
+    ) {
+        let provider = Arc::new(TestBrokerTimerfdProvider::new());
+        let handle = provider
+            .create_timerfd(1, flags.bits())
+            .expect("mock timerfd creation failed");
+        let provider_dyn: Arc<dyn BrokerTimerfdProvider> = provider.clone();
+        let timerfd = EventFile::new_timer_broker_backed(provider_dyn, handle, flags);
+        (provider, handle, timerfd)
+    }
 }
 
 #[cfg(test)]
@@ -1311,12 +1481,8 @@ mod tests {
     fn test_timerfd_one_shot() {
         let _task = crate::syscalls::tests::init_platform(None);
 
-        let timerfd = super::EventFile::new_timer(
-            platform(),
-            platform().now(),
-            ClockId::Monotonic,
-            TimerfdFlags::empty(),
-        );
+        let (provider, handle, timerfd) =
+            super::test_support::new_mock_broker_timerfd(TimerfdFlags::empty());
         let old = timerfd
             .set_timer(
                 TimerfdTimerFlags::empty(),
@@ -1328,11 +1494,14 @@ mod tests {
             .unwrap();
         assert_eq!(Duration::try_from(old.value).unwrap(), Duration::ZERO);
 
+        provider
+            .fire_timerfd(handle, 1)
+            .expect("mock timerfd fire failed");
         let expirations = timerfd.read(&WaitState::new(platform()).context()).unwrap();
         assert_eq!(expirations, 1);
         assert_eq!(
             Duration::try_from(timerfd.get_timer().unwrap().value).unwrap(),
-            Duration::ZERO
+            Duration::from_millis(1)
         );
     }
 
