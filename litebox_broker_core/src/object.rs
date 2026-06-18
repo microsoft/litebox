@@ -44,20 +44,9 @@ pub(super) fn create_object(
     object: ObjectEntry,
     rights: ObjectRights,
 ) -> Result<ObjectHandle> {
-    let object_id = {
-        let mut objects = session.core.objects.write();
-        if objects.len() >= session.core.limits.max_objects {
-            return Err(BrokerError::ResourceExhausted);
-        }
-        if objects.len() == objects.capacity() {
-            objects
-                .try_reserve(1)
-                .map_err(|_| BrokerError::ResourceExhausted)?;
-        }
-        objects.insert(Arc::new(RwLock::new(object)))
-    };
+    let object_id = insert_object_entry(&session.core, object)?;
 
-    match create_object_reference(session, object_id, rights) {
+    match insert_object_reference(session, object_id, rights) {
         Ok(handle) => Ok(handle),
         Err(error) => {
             let removed_object = session.core.objects.write().remove(object_id);
@@ -67,7 +56,21 @@ pub(super) fn create_object(
     }
 }
 
-fn create_object_reference(
+fn insert_object_entry(broker: &BrokerCore, object: ObjectEntry) -> Result<ObjectId> {
+    let mut objects = broker.objects.write();
+    if objects.len() >= broker.limits.max_objects {
+        return Err(BrokerError::ResourceExhausted);
+    }
+    if objects.len() == objects.capacity() {
+        objects
+            .try_reserve(1)
+            .map_err(|_| BrokerError::ResourceExhausted)?;
+    }
+
+    Ok(objects.insert(Arc::new(RwLock::new(object))))
+}
+
+fn insert_object_reference(
     session: &BrokerSession,
     object_id: ObjectId,
     rights: ObjectRights,
