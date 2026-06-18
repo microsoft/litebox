@@ -216,6 +216,17 @@ pub enum Opcode {
     SocketSeqPacketShutdown = 0x6D,
     SocketSeqPacketGetSockName = 0x6E,
     SocketSeqPacketGetPeerName = 0x6F,
+    // UnixStream (AF_UNIX SOCK_STREAM, named) — scattered free request slots.
+    CreateUnixStream = 0x0D,
+    UnixStreamBind = 0x0E,
+    UnixStreamListen = 0x0F,
+    UnixStreamAccept = 0x1B,
+    UnixStreamConnect = 0x1C,
+    UnixStreamSend = 0x1D,
+    UnixStreamRecv = 0x1E,
+    UnixStreamShutdown = 0x1F,
+    UnixStreamGetSockName = 0x2D,
+    UnixStreamGetPeerName = 0x2E,
     PtyRead = 0x61,
     PtyWrite = 0x62,
     SubscribePty = 0x63,
@@ -352,6 +363,17 @@ pub enum Opcode {
     SocketSeqPacketShutdownResponse = 0xED,
     SocketSeqPacketGetSockNameResponse = 0xEE,
     SocketSeqPacketGetPeerNameResponse = 0xEF,
+    // UnixStream responses (= request opcode + 0x80).
+    CreateUnixStreamResponse = 0x8D,
+    UnixStreamBindResponse = 0x8E,
+    UnixStreamListenResponse = 0x8F,
+    UnixStreamAcceptResponse = 0x9B,
+    UnixStreamConnectResponse = 0x9C,
+    UnixStreamSendResponse = 0x9D,
+    UnixStreamRecvResponse = 0x9E,
+    UnixStreamShutdownResponse = 0x9F,
+    UnixStreamGetSockNameResponse = 0xAD,
+    UnixStreamGetPeerNameResponse = 0xAE,
     PtyReadResponse = 0xE1,
     PtyWriteResponse = 0xE2,
     SubscribePtyResponse = 0xE3,
@@ -571,6 +593,16 @@ impl Opcode {
             Opcode::SocketSeqPacketShutdown => Some(Opcode::SocketSeqPacketShutdownResponse),
             Opcode::SocketSeqPacketGetSockName => Some(Opcode::SocketSeqPacketGetSockNameResponse),
             Opcode::SocketSeqPacketGetPeerName => Some(Opcode::SocketSeqPacketGetPeerNameResponse),
+            Opcode::CreateUnixStream => Some(Opcode::CreateUnixStreamResponse),
+            Opcode::UnixStreamBind => Some(Opcode::UnixStreamBindResponse),
+            Opcode::UnixStreamListen => Some(Opcode::UnixStreamListenResponse),
+            Opcode::UnixStreamAccept => Some(Opcode::UnixStreamAcceptResponse),
+            Opcode::UnixStreamConnect => Some(Opcode::UnixStreamConnectResponse),
+            Opcode::UnixStreamSend => Some(Opcode::UnixStreamSendResponse),
+            Opcode::UnixStreamRecv => Some(Opcode::UnixStreamRecvResponse),
+            Opcode::UnixStreamShutdown => Some(Opcode::UnixStreamShutdownResponse),
+            Opcode::UnixStreamGetSockName => Some(Opcode::UnixStreamGetSockNameResponse),
+            Opcode::UnixStreamGetPeerName => Some(Opcode::UnixStreamGetPeerNameResponse),
             Opcode::PtyRead => Some(Opcode::PtyReadResponse),
             Opcode::PtyWrite => Some(Opcode::PtyWriteResponse),
             Opcode::SubscribePty => Some(Opcode::SubscribePtyResponse),
@@ -7052,6 +7084,316 @@ pub fn parse_socket_seqpacket_getpeername_response_ok(
     if off != body.len() {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::SocketSeqPacketGetPeerNameResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(addr)
+}
+
+// UnixStream (AF_UNIX SOCK_STREAM, named) wire format. Connection-oriented like
+// seqpacket but with byte-stream data semantics (send/recv carry bytes, no
+// packet boundary / TRUNC). `SCM_RIGHTS` is framed inline in the byte stream by
+// the shim; the broker carries the framed bytes opaquely.
+pub fn build_create_unix_stream_request() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreateUnixStream,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+pub fn build_create_unix_stream_response_ok(handle_id: u64) -> OwnedFrame {
+    build_handle_response(Opcode::CreateUnixStreamResponse, handle_id)
+}
+pub fn parse_create_unix_stream_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::CreateUnixStreamResponse)
+}
+
+fn build_unix_stream_addr_request(opcode: Opcode, handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + addr.len());
+    put_u64(&mut body, handle_id);
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+fn parse_unix_stream_addr_body(
+    body: &[u8],
+    opcode: Opcode,
+) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    let handle_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut off = 8;
+    let addr = parse_len_bytes(body, &mut off, opcode)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok((handle_id, addr))
+}
+
+pub fn build_unix_stream_bind_request(handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    build_unix_stream_addr_request(Opcode::UnixStreamBind, handle_id, addr)
+}
+pub fn parse_unix_stream_bind_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    parse_unix_stream_addr_body(body, Opcode::UnixStreamBind)
+}
+pub fn build_unix_stream_bind_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::new();
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamBindResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_bind_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::UnixStreamBindResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamBindResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(addr)
+}
+
+pub fn build_unix_stream_listen_request(handle_id: u64, backlog: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12);
+    put_u64(&mut body, handle_id);
+    body.extend_from_slice(&backlog.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::UnixStreamListen,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_listen_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamListen,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+pub fn build_unix_stream_listen_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::UnixStreamListenResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_unix_stream_accept_request(handle_id: u64) -> OwnedFrame {
+    build_handle_request(Opcode::UnixStreamAccept, handle_id)
+}
+pub fn parse_unix_stream_accept_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::UnixStreamAccept)
+}
+pub fn build_unix_stream_accept_response_ok(handle_id: u64) -> OwnedFrame {
+    build_handle_response(Opcode::UnixStreamAcceptResponse, handle_id)
+}
+pub fn parse_unix_stream_accept_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::UnixStreamAcceptResponse)
+}
+
+pub fn build_unix_stream_connect_request(handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    build_unix_stream_addr_request(Opcode::UnixStreamConnect, handle_id, addr)
+}
+pub fn parse_unix_stream_connect_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    parse_unix_stream_addr_body(body, Opcode::UnixStreamConnect)
+}
+pub fn build_unix_stream_connect_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::UnixStreamConnectResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_unix_stream_send_request(handle_id: u64, payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + payload.len());
+    put_u64(&mut body, handle_id);
+    push_len_bytes(&mut body, payload);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamSend,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_send_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamSend,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    let handle_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut off = 8;
+    let payload = parse_len_bytes(body, &mut off, Opcode::UnixStreamSend)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamSend,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok((handle_id, payload))
+}
+pub fn build_unix_stream_send_response_ok(written: u64) -> OwnedFrame {
+    build_handle_response(Opcode::UnixStreamSendResponse, written)
+}
+pub fn parse_unix_stream_send_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::UnixStreamSendResponse)
+}
+
+pub fn build_unix_stream_recv_request(handle_id: u64, max_len: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12);
+    put_u64(&mut body, handle_id);
+    body.extend_from_slice(&max_len.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::UnixStreamRecv,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_recv_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamRecv,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+pub fn build_unix_stream_recv_response_ok(payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(4 + payload.len());
+    push_len_bytes(&mut body, payload);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamRecvResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_recv_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let payload = parse_len_bytes(body, &mut off, Opcode::UnixStreamRecvResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamRecvResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(payload)
+}
+
+pub fn build_unix_stream_shutdown_request(handle_id: u64, how: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(9);
+    put_u64(&mut body, handle_id);
+    body.push(how);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamShutdown,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_shutdown_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    if body.len() != 9 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamShutdown,
+            want: 9,
+            got: body.len(),
+        });
+    }
+    Ok((u64::from_le_bytes(body[0..8].try_into().unwrap()), body[8]))
+}
+pub fn build_unix_stream_shutdown_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::UnixStreamShutdownResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_unix_stream_getsockname_request(handle_id: u64) -> OwnedFrame {
+    build_handle_request(Opcode::UnixStreamGetSockName, handle_id)
+}
+pub fn build_unix_stream_getpeername_request(handle_id: u64) -> OwnedFrame {
+    build_handle_request(Opcode::UnixStreamGetPeerName, handle_id)
+}
+pub fn build_unix_stream_getsockname_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::new();
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamGetSockNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn build_unix_stream_getpeername_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::new();
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamGetPeerNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_getsockname_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::UnixStreamGetSockNameResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamGetSockNameResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(addr)
+}
+pub fn parse_unix_stream_getpeername_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::UnixStreamGetPeerNameResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamGetPeerNameResponse,
             want: off,
             got: body.len(),
         });
