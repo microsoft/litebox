@@ -21,11 +21,11 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
+use litebox_common_linux::errno::Errno;
 use litebox_common_linux::vmap::{
     GlobalVmapManager, PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions,
     PhysPointerError, VmapManager,
 };
-use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use x86_64::{
     VirtAddr,
     structures::paging::{
