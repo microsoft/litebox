@@ -67,9 +67,10 @@
 //! # Bounds
 //!
 //! [`BODY_MAX`] caps the body size. The largest defined body in v1
-//! is 24 bytes (Subscribe), so this is comfortably generous; the
+//! is 48 bytes (TimerfdSettime), so this is comfortably generous; the
 //! cap exists primarily to bound memory on a malformed peer.
 
+use crate::cwfd::broker_timerfd_provider::BrokerTimerfdSpec;
 use crate::cwfd::fd_transfer_frame::PassedToken;
 #[cfg(debug_assertions)]
 use alloc::string::String;
@@ -130,6 +131,10 @@ pub enum Opcode {
     ReadEventfd = 0x11,
     WriteEventfd = 0x12,
     SubscribeEventfd = 0x13,
+    CreateTimerfd = 0x17,
+    ReadTimerfd = 0x18,
+    SetTimerfd = 0x19,
+    GetTimerfd = 0x1A,
     CreateSignalfd = 0x40,
     ReadSiginfo = 0x41,
     PushSiginfo = 0x42,
@@ -281,6 +286,10 @@ pub enum Opcode {
     ReadEventfdResponse = 0x91,
     WriteEventfdResponse = 0x92,
     SubscribeEventfdResponse = 0x93,
+    CreateTimerfdResponse = 0x97,
+    ReadTimerfdResponse = 0x98,
+    SetTimerfdResponse = 0x99,
+    GetTimerfdResponse = 0x9A,
     CreateSignalfdResponse = 0xC0,
     ReadSiginfoResponse = 0xC1,
     PushSiginfoResponse = 0xC2,
@@ -502,6 +511,10 @@ impl Opcode {
             Opcode::ReadEventfd => Some(Opcode::ReadEventfdResponse),
             Opcode::WriteEventfd => Some(Opcode::WriteEventfdResponse),
             Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
+            Opcode::CreateTimerfd => Some(Opcode::CreateTimerfdResponse),
+            Opcode::ReadTimerfd => Some(Opcode::ReadTimerfdResponse),
+            Opcode::SetTimerfd => Some(Opcode::SetTimerfdResponse),
+            Opcode::GetTimerfd => Some(Opcode::GetTimerfdResponse),
             Opcode::CreateSignalfd => Some(Opcode::CreateSignalfdResponse),
             Opcode::ReadSiginfo => Some(Opcode::ReadSiginfoResponse),
             Opcode::PushSiginfo => Some(Opcode::PushSiginfoResponse),
@@ -615,6 +628,10 @@ impl Opcode {
                 | Opcode::ReadEventfd
                 | Opcode::WriteEventfd
                 | Opcode::SubscribeEventfd
+                | Opcode::CreateTimerfd
+                | Opcode::ReadTimerfd
+                | Opcode::SetTimerfd
+                | Opcode::GetTimerfd
                 | Opcode::CreateSignalfd
                 | Opcode::ReadSiginfo
                 | Opcode::PushSiginfo
@@ -729,6 +746,10 @@ impl TryFrom<u8> for Opcode {
             0x11 => Ok(Opcode::ReadEventfd),
             0x12 => Ok(Opcode::WriteEventfd),
             0x13 => Ok(Opcode::SubscribeEventfd),
+            0x17 => Ok(Opcode::CreateTimerfd),
+            0x18 => Ok(Opcode::ReadTimerfd),
+            0x19 => Ok(Opcode::SetTimerfd),
+            0x1A => Ok(Opcode::GetTimerfd),
             0x40 => Ok(Opcode::CreateSignalfd),
             0x41 => Ok(Opcode::ReadSiginfo),
             0x42 => Ok(Opcode::PushSiginfo),
@@ -830,6 +851,10 @@ impl TryFrom<u8> for Opcode {
             0x91 => Ok(Opcode::ReadEventfdResponse),
             0x92 => Ok(Opcode::WriteEventfdResponse),
             0x93 => Ok(Opcode::SubscribeEventfdResponse),
+            0x97 => Ok(Opcode::CreateTimerfdResponse),
+            0x98 => Ok(Opcode::ReadTimerfdResponse),
+            0x99 => Ok(Opcode::SetTimerfdResponse),
+            0x9A => Ok(Opcode::GetTimerfdResponse),
             0xC0 => Ok(Opcode::CreateSignalfdResponse),
             0xC1 => Ok(Opcode::ReadSiginfoResponse),
             0xC2 => Ok(Opcode::PushSiginfoResponse),
@@ -1929,6 +1954,176 @@ pub fn build_subscribe_eventfd_response_ok() -> OwnedFrame {
         caller_pid: 0,
         body: Vec::new(),
     }
+}
+
+/// Body for [`Opcode::CreateTimerfd`]: (clockid: i32, flags: u32).
+pub fn build_create_timerfd_request(clockid: i32, flags: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&clockid.to_le_bytes());
+    body.extend_from_slice(&flags.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::CreateTimerfd,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+/// Decodes the body of a CreateTimerfd request frame.
+pub fn parse_create_timerfd_body(body: &[u8]) -> Result<(i32, u32), ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreateTimerfd,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let clockid = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let flags = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    Ok((clockid, flags))
+}
+
+/// Body for [`Opcode::CreateTimerfdResponse`]: handle id.
+pub fn build_create_timerfd_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreateTimerfdResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::ReadTimerfd`]: handle id.
+pub fn build_read_timerfd_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::ReadTimerfd,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::ReadTimerfdResponse`]: expiration count.
+pub fn build_read_timerfd_response_ok(expirations: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::ReadTimerfdResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: expirations.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::SetTimerfd`]: (handle: u64, flags: u32, pad: u32, itimerspec).
+pub fn build_set_timerfd_request(
+    handle_id: u64,
+    new_value: BrokerTimerfdSpec,
+    flags: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(48);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&flags.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    encode_timerfd_spec(&mut body, new_value);
+    OwnedFrame {
+        opcode: Opcode::SetTimerfd,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+/// Decodes the body of a SetTimerfd request frame.
+pub fn parse_set_timerfd_body(body: &[u8]) -> Result<(u64, BrokerTimerfdSpec, u32), ProtocolError> {
+    if body.len() != 48 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SetTimerfd,
+            got: body.len(),
+            want: 48,
+        });
+    }
+    let handle = u64::from_le_bytes([
+        body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+    ]);
+    let flags = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+    if body[12..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((handle, decode_timerfd_spec(&body[16..48])?, flags))
+}
+
+/// Body for [`Opcode::SetTimerfdResponse`]: empty.
+pub fn build_set_timerfd_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SetTimerfdResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::GetTimerfd`]: handle id.
+pub fn build_get_timerfd_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::GetTimerfd,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::GetTimerfdResponse`]: itimerspec.
+pub fn build_get_timerfd_response_ok(value: BrokerTimerfdSpec) -> OwnedFrame {
+    let mut body = Vec::with_capacity(32);
+    encode_timerfd_spec(&mut body, value);
+    OwnedFrame {
+        opcode: Opcode::GetTimerfdResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+/// Decodes the body of a GetTimerfdResponse success frame.
+pub fn parse_get_timerfd_response_ok(body: &[u8]) -> Result<BrokerTimerfdSpec, ProtocolError> {
+    decode_timerfd_spec_with_opcode(body, Opcode::GetTimerfdResponse)
+}
+
+fn encode_timerfd_spec(body: &mut Vec<u8>, spec: BrokerTimerfdSpec) {
+    body.extend_from_slice(&spec.interval_sec.to_le_bytes());
+    body.extend_from_slice(&spec.interval_nsec.to_le_bytes());
+    body.extend_from_slice(&spec.value_sec.to_le_bytes());
+    body.extend_from_slice(&spec.value_nsec.to_le_bytes());
+}
+
+fn decode_timerfd_spec(body: &[u8]) -> Result<BrokerTimerfdSpec, ProtocolError> {
+    decode_timerfd_spec_with_opcode(body, Opcode::SetTimerfd)
+}
+
+fn decode_timerfd_spec_with_opcode(
+    body: &[u8],
+    opcode: Opcode,
+) -> Result<BrokerTimerfdSpec, ProtocolError> {
+    if body.len() != 32 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            got: body.len(),
+            want: 32,
+        });
+    }
+    Ok(BrokerTimerfdSpec {
+        interval_sec: u64::from_le_bytes([
+            body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+        ]),
+        interval_nsec: u64::from_le_bytes([
+            body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
+        ]),
+        value_sec: u64::from_le_bytes([
+            body[16], body[17], body[18], body[19], body[20], body[21], body[22], body[23],
+        ]),
+        value_nsec: u64::from_le_bytes([
+            body[24], body[25], body[26], body[27], body[28], body[29], body[30], body[31],
+        ]),
+    })
 }
 
 /// Body for [`Opcode::CreateSignalfd`]: (sigmask_lo: u64, sigmask_hi: u64).

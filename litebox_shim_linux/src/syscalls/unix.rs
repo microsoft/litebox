@@ -520,7 +520,7 @@ impl<FS: ShimFS> UnixListenStream<FS> {
         #[cfg(feature = "worker_local_inet")]
         if let Some(proxy) = global.get_proxy_by_raw_fd(raw_fd, &task.files) {
             use litebox::event::IOPollable;
-            proxy.register_observer(bridge_weak, Events::IN);
+            proxy.register_observer(bridge_weak.clone(), Events::IN);
             tcp_proxy = Some(proxy);
         }
         {

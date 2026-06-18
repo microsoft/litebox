@@ -541,6 +541,7 @@ fn update_tracker_from_response(
         // State-registry creators: response body is one or two handle ids.
         Opcode::CreateEventfd
         | Opcode::CreatePidfd
+        | Opcode::CreateTimerfd
         | Opcode::CreateSignalfd
         | Opcode::InotifyInit1
         | Opcode::InetListenerCreate
@@ -1048,8 +1049,11 @@ fn handle_control_connection_inner(
                         );
                     }
                 }
-                // reason: unsupported protocol opcodes intentionally close the control connection.
-                #[allow(clippy::wildcard_enum_match_arm)]
+                // Exhaustive over Opcode (no wildcard): request opcodes are
+                // routed below; every response opcode is rejected explicitly.
+                // Adding a new request opcode then trips E0004 here, which is
+                // what would have caught the CreateTimerfd routing gap that
+                // silently closed the connection.
                 let result = match frame.opcode {
                     Opcode::Register | Opcode::Materialize => {
                         // Host-fd opcodes: route to fd_token_service.
@@ -1355,6 +1359,12 @@ fn handle_control_connection_inner(
                     | Opcode::CreateEventfd
                     | Opcode::ReadEventfd
                     | Opcode::WriteEventfd
+                    | Opcode::CreateTimerfd
+                    | Opcode::ReadTimerfd
+                    | Opcode::SetTimerfd
+                    | Opcode::GetTimerfd
+                    | Opcode::CreatePidfd
+                    | Opcode::PidfdExited
                     | Opcode::CreateSignalfd
                     | Opcode::ReadSiginfo
                     | Opcode::PushSiginfo
@@ -1433,6 +1443,23 @@ fn handle_control_connection_inner(
                     | Opcode::RegisterOfd
                     | Opcode::CloneOfd => {
                         // State-object opcodes: route to state_service on the fd-state registry.
+                        let state_result = state_handle_request(
+                            state_registry,
+                            inotify_dispatcher,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
+                        SocketHandlerResult {
+                            frame: state_result.frame,
+                            out_fd: state_result.out_fd,
+                        }
+                    }
+                    // Debug-only diagnostic opcode (the variant does not exist in
+                    // release builds); route it to the state registry like the
+                    // other state-object opcodes above.
+                    #[cfg(debug_assertions)]
+                    Opcode::DebugQueryStateObject => {
                         let state_result = state_handle_request(
                             state_registry,
                             inotify_dispatcher,
@@ -1574,8 +1601,120 @@ fn handle_control_connection_inner(
                             out_fd: proc_result.out_fd,
                         }
                     }
-                    other => {
-                        warn!(opcode = ?other, "fd-token control: response opcode received as request; closing");
+                    // Response opcodes are never valid as inbound requests on
+                    // the control channel: reject and close. Listed explicitly
+                    // (rather than a wildcard) so a newly-added *request* opcode
+                    // cannot silently land here.
+                    Opcode::RegisterResponse
+                    | Opcode::MaterializeResponse
+                    | Opcode::ReleaseResponse
+                    | Opcode::RegisterNotificationRingResponse
+                    | Opcode::CreateEventfdResponse
+                    | Opcode::ReadEventfdResponse
+                    | Opcode::WriteEventfdResponse
+                    | Opcode::SubscribeEventfdResponse
+                    | Opcode::CreateTimerfdResponse
+                    | Opcode::ReadTimerfdResponse
+                    | Opcode::SetTimerfdResponse
+                    | Opcode::GetTimerfdResponse
+                    | Opcode::CreateSignalfdResponse
+                    | Opcode::ReadSiginfoResponse
+                    | Opcode::PushSiginfoResponse
+                    | Opcode::InotifyInit1Response
+                    | Opcode::InotifyAddWatchResponse
+                    | Opcode::InotifyRmWatchResponse
+                    | Opcode::InotifyReadResponse
+                    | Opcode::InotifyQueryEventsResponse
+                    | Opcode::InetListenerCreateResponse
+                    | Opcode::InetListenerBindResponse
+                    | Opcode::InetListenerListenResponse
+                    | Opcode::InetListenerAcceptResponse
+                    | Opcode::InetListenerQueryEventsResponse
+                    | Opcode::InetListenerSetSockOptResponse
+                    | Opcode::InetListenerGetSockNameResponse
+                    | Opcode::InetListenerGetSockOptResponse
+                    | Opcode::CreatePipeResponse
+                    | Opcode::ReadPipeResponse
+                    | Opcode::WritePipeResponse
+                    | Opcode::AttachHostFdResponse
+                    | Opcode::RegisterOfdResponse
+                    | Opcode::CloneOfdResponse
+                    | Opcode::BindNinePSessionResponse
+                    | Opcode::CreateSocketDgramResponse
+                    | Opcode::SocketDgramBindResponse
+                    | Opcode::SocketDgramConnectResponse
+                    | Opcode::SocketDgramSendToResponse
+                    | Opcode::SocketDgramRecvFromResponse
+                    | Opcode::SocketDgramShutdownResponse
+                    | Opcode::SocketDgramGetSockNameResponse
+                    | Opcode::SocketDgramGetPeerNameResponse
+                    | Opcode::CreateSocketPairResponse
+                    | Opcode::ReadSocketPairResponse
+                    | Opcode::WriteSocketPairResponse
+                    | Opcode::ShutdownSocketPairWriteResponse
+                    | Opcode::InetRawCreateResponse
+                    | Opcode::InetRawSendToResponse
+                    | Opcode::InetRawRecvFromResponse
+                    | Opcode::InetRawQueryEventsResponse
+                    | Opcode::InetTcpConnCreateResponse
+                    | Opcode::InetTcpConnConnectResponse
+                    | Opcode::InetTcpConnQueryEventsResponse
+                    | Opcode::InetTcpConnGetSockNameResponse
+                    | Opcode::InetTcpConnGetPeerNameResponse
+                    | Opcode::CreatePtyResponse
+                    | Opcode::OpenPtySlaveResponse
+                    | Opcode::CreateSocketSeqPacketResponse
+                    | Opcode::SocketSeqPacketBindResponse
+                    | Opcode::SocketSeqPacketListenResponse
+                    | Opcode::SocketSeqPacketAcceptResponse
+                    | Opcode::SocketSeqPacketConnectResponse
+                    | Opcode::SocketSeqPacketSendResponse
+                    | Opcode::SocketSeqPacketRecvResponse
+                    | Opcode::SocketSeqPacketShutdownResponse
+                    | Opcode::SocketSeqPacketGetSockNameResponse
+                    | Opcode::SocketSeqPacketGetPeerNameResponse
+                    | Opcode::PtyReadResponse
+                    | Opcode::PtyWriteResponse
+                    | Opcode::SubscribePtyResponse
+                    | Opcode::PtyIoctlResponse
+                    | Opcode::UnsubscribeResponse
+                    | Opcode::DupHandleResponse
+                    | Opcode::QueryEventsResponse
+                    | Opcode::CreatePidfdResponse
+                    | Opcode::PidfdExitedResponse
+                    | Opcode::InetDgramCreateResponse
+                    | Opcode::InetDgramBindResponse
+                    | Opcode::InetDgramConnectResponse
+                    | Opcode::InetDgramSendToResponse
+                    | Opcode::InetDgramRecvFromResponse
+                    | Opcode::InetDgramShutdownResponse
+                    | Opcode::InetDgramGetSockNameResponse
+                    | Opcode::InetDgramGetPeerNameResponse
+                    | Opcode::InetDgramSetSockOptResponse
+                    | Opcode::InetDgramGetSockOptResponse
+                    | Opcode::InetDgramQueryEventsResponse
+                    | Opcode::RegisterProcessResponse
+                    | Opcode::SubscribeProcessExitResponse
+                    | Opcode::MarkProcessExitedResponse
+                    | Opcode::ReleaseAllForPidResponse
+                    | Opcode::SubscribeSignalInboxResponse
+                    | Opcode::UnsubscribeSignalInboxResponse
+                    | Opcode::DeliverSignalInboxResponse
+                    | Opcode::SetPgidResponse
+                    | Opcode::SetSidResponse
+                    | Opcode::ReadTcpConnResponse
+                    | Opcode::WriteTcpConnResponse
+                    | Opcode::ShutdownTcpConnResponse
+                    | Opcode::PollTcpConnEventsResponse
+                    | Opcode::InetTcpConnSetSockOptResponse
+                    | Opcode::InetTcpConnGetSockOptResponse => {
+                        warn!(opcode = ?frame.opcode, "fd-token control: response opcode received as request; closing");
+                        return;
+                    }
+                    // Debug-only response variant (absent in release builds).
+                    #[cfg(debug_assertions)]
+                    Opcode::DebugQueryStateObjectResponse => {
+                        warn!(opcode = ?frame.opcode, "fd-token control: response opcode received as request; closing");
                         return;
                     }
                 };

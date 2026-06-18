@@ -25,39 +25,42 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 // StatusCode pass-through arms deliberately preserve broker statuses; converting every RPC remains incremental.
 
+use crate::cwfd::broker_timerfd_provider::BrokerTimerfdSpec;
 use crate::cwfd::fd_transfer_frame::PassedToken;
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
     build_attach_host_fd_request, build_bind_nine_p_session_request, build_clone_ofd_request,
     build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
     build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
-    build_deliver_signal_inbox_request, build_inet_listener_accept_request,
-    build_inet_listener_bind_request, build_inet_listener_create_request,
-    build_inet_listener_getsockname_request, build_inet_listener_getsockopt_request,
-    build_inet_listener_listen_request, build_inet_listener_query_events_request,
-    build_inet_listener_setsockopt_request, build_inet_raw_create_request,
-    build_inet_raw_query_events_request, build_inet_raw_recvfrom_request,
-    build_inet_raw_sendto_request, build_inet_tcp_conn_connect_request,
-    build_inet_tcp_conn_create_request, build_inet_tcp_conn_getpeername_request,
-    build_inet_tcp_conn_getsockname_request, build_inet_tcp_conn_getsockopt_request,
-    build_inet_tcp_conn_query_events_request, build_inet_tcp_conn_setsockopt_request,
-    build_inotify_add_watch_request, build_inotify_init1_request, build_inotify_read_request,
-    build_inotify_rm_watch_request, build_mark_process_exited_request, build_materialize_request,
-    build_open_pty_slave_request, build_pidfd_exited_request, build_poll_tcp_conn_events_request,
-    build_pty_ioctl_request, build_pty_read_request, build_pty_write_request,
-    build_push_siginfo_request, build_read_eventfd_request, build_read_pipe_request,
-    build_read_siginfo_request, build_read_socketpair_request, build_read_tcp_conn_request,
+    build_create_timerfd_request, build_deliver_signal_inbox_request, build_get_timerfd_request,
+    build_inet_listener_accept_request, build_inet_listener_bind_request,
+    build_inet_listener_create_request, build_inet_listener_getsockname_request,
+    build_inet_listener_getsockopt_request, build_inet_listener_listen_request,
+    build_inet_listener_query_events_request, build_inet_listener_setsockopt_request,
+    build_inet_raw_create_request, build_inet_raw_query_events_request,
+    build_inet_raw_recvfrom_request, build_inet_raw_sendto_request,
+    build_inet_tcp_conn_connect_request, build_inet_tcp_conn_create_request,
+    build_inet_tcp_conn_getpeername_request, build_inet_tcp_conn_getsockname_request,
+    build_inet_tcp_conn_getsockopt_request, build_inet_tcp_conn_query_events_request,
+    build_inet_tcp_conn_setsockopt_request, build_inotify_add_watch_request,
+    build_inotify_init1_request, build_inotify_read_request, build_inotify_rm_watch_request,
+    build_mark_process_exited_request, build_materialize_request, build_open_pty_slave_request,
+    build_pidfd_exited_request, build_poll_tcp_conn_events_request, build_pty_ioctl_request,
+    build_pty_read_request, build_pty_write_request, build_push_siginfo_request,
+    build_read_eventfd_request, build_read_pipe_request, build_read_siginfo_request,
+    build_read_socketpair_request, build_read_tcp_conn_request, build_read_timerfd_request,
     build_register_notification_ring_request, build_register_ofd_request,
     build_register_process_request, build_register_request, build_release_request,
-    build_set_pgid_request, build_set_sid_request, build_shutdown_socketpair_write_request,
-    build_shutdown_tcp_conn_request, build_socket_dgram_sendto_request_with_tokens,
-    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
-    build_subscribe_pty_request, build_subscribe_signal_inbox_request, build_unsubscribe_request,
+    build_set_pgid_request, build_set_sid_request, build_set_timerfd_request,
+    build_shutdown_socketpair_write_request, build_shutdown_tcp_conn_request,
+    build_socket_dgram_sendto_request_with_tokens, build_subscribe_eventfd_request,
+    build_subscribe_process_exit_request, build_subscribe_pty_request,
+    build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, build_write_tcp_conn_request, decode,
     parse_attach_host_fd_response_body, parse_bind_nine_p_session_response_body,
     parse_clone_ofd_response_body, parse_create_pidfd_response_ok, parse_create_pty_response_ok,
-    parse_create_socketpair_response_body, parse_handle_body,
+    parse_create_socketpair_response_body, parse_get_timerfd_response_ok, parse_handle_body,
     parse_inet_listener_accept_response_ok, parse_inet_listener_bind_response_ok,
     parse_inet_listener_create_response_ok, parse_inet_listener_getsockname_response_ok,
     parse_inet_listener_getsockopt_response_ok, parse_inet_listener_query_events_response_ok,
@@ -639,6 +642,78 @@ impl FdTokenClient {
             StatusCode::Ok => Ok(()),
             StatusCode::WouldBlock => Err(ClientError::WouldBlock),
             StatusCode::InvalidValue => Err(ClientError::InvalidValue { value }),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    /// Asks the broker to create a `TimerfdState` with the given clock and flags.
+    pub fn create_timerfd(&self, clockid: i32, flags: u32) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_create_timerfd_request(clockid, flags), None)?;
+        let (resp_bytes, _attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::CreateTimerfdResponse)?;
+        match resp.status {
+            StatusCode::Ok => {
+                parse_handle_body(resp.body, resp.opcode).map_err(ClientError::Protocol)
+            }
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    /// Performs the timerfd `read` op on the named handle.
+    pub fn read_timerfd(&self, handle_id: u64) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_read_timerfd_request(handle_id), None)?;
+        let (resp_bytes, _) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::ReadTimerfdResponse)?;
+        match resp.status {
+            StatusCode::Ok => {
+                parse_handle_body(resp.body, resp.opcode).map_err(ClientError::Protocol)
+            }
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    /// Performs the timerfd `settime` op on the named handle.
+    pub fn set_timerfd(
+        &self,
+        handle_id: u64,
+        new_value: BrokerTimerfdSpec,
+        flags: u32,
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_set_timerfd_request(handle_id, new_value, flags),
+            None,
+        )?;
+        let (resp_bytes, _) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::SetTimerfdResponse)?;
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: 0 }),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    /// Performs the timerfd `gettime` op on the named handle.
+    pub fn get_timerfd(&self, handle_id: u64) -> Result<BrokerTimerfdSpec, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_get_timerfd_request(handle_id), None)?;
+        let (resp_bytes, _) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::GetTimerfdResponse)?;
+        match resp.status {
+            StatusCode::Ok => {
+                parse_get_timerfd_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }
@@ -2850,8 +2925,11 @@ fn map_status_no_handle(opcode: Opcode, status: StatusCode) -> ClientError {
         StatusCode::Protocol => ClientError::BrokerRejectedProtocol,
         StatusCode::Internal => ClientError::BrokerInternal { opcode },
         StatusCode::Io => ClientError::OperationIo { opcode },
+        StatusCode::UnknownHandle => ClientError::UnknownHandle { handle_id: 0 },
+        StatusCode::InvalidValue => ClientError::InvalidValue { value: 0 },
         StatusCode::PermissionDenied => ClientError::PermissionDenied,
         StatusCode::ProtocolNotSupported => ClientError::ProtocolNotSupported,
+        StatusCode::SubsystemMismatch => ClientError::SubsystemMismatch,
         s => ClientError::OtherStatus { opcode, status: s },
     }
 }

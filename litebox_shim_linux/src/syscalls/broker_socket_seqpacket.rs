@@ -38,22 +38,13 @@ use litebox_platform_multiplex::Platform;
 
 use super::{
     broker_backed::{BrokerBackedCommon, broker_err_to_errno},
-    fork_snapshot::BrokerHandleSnapshot,
+    fork_snapshot::FdKind,
     unix::UnixSocketAddr,
 };
 
 static BROKER_SOCKET_SEQPACKET_PROVIDER: once_cell::race::OnceBox<
     Arc<dyn BrokerSocketSeqPacketProvider>,
 > = once_cell::race::OnceBox::new();
-static EAGER_BROKER_SOCKET_SEQPACKET_ENABLED: AtomicBool = AtomicBool::new(false);
-
-pub fn set_eager_broker_socket_seqpacket_enabled(enabled: bool) {
-    EAGER_BROKER_SOCKET_SEQPACKET_ENABLED.store(enabled, Ordering::Release);
-}
-
-pub fn eager_broker_socket_seqpacket_enabled() -> bool {
-    EAGER_BROKER_SOCKET_SEQPACKET_ENABLED.load(Ordering::Acquire)
-}
 
 pub fn set_broker_socket_seqpacket_provider(
     provider: Arc<dyn BrokerSocketSeqPacketProvider>,
@@ -121,8 +112,8 @@ where
         );
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> BrokerHandleSnapshot {
-        BrokerHandleSnapshot::SocketSeqPacket {
+    pub(crate) fn fork_snapshot_handle(&self) -> FdKind {
+        FdKind::BrokerSocketSeqPacket {
             handle_id: self.handle(),
         }
     }

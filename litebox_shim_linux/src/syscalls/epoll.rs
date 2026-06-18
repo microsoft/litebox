@@ -1473,11 +1473,8 @@ mod test {
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
     use litebox::platform::RawConstPointer as _;
-    use litebox::platform::TimeProvider as _;
     use litebox::utils::TruncateExt as _;
-    use litebox_common_linux::{
-        ClockId, EfdFlags, EpollEvent, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
-    };
+    use litebox_common_linux::{ClockId, EfdFlags, EpollEvent, TimerfdFlags};
     use litebox_platform_multiplex::platform;
 
     use super::EpollFile;
@@ -1496,10 +1493,29 @@ mod test {
         (task, epoll, fs)
     }
 
+    fn new_mock_eventfd(
+        count: u64,
+        flags: EfdFlags,
+    ) -> crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform> {
+        crate::syscalls::eventfd::test_support::new_mock_broker_eventfd(count, flags).2
+    }
+
+    fn new_mock_timerfd(
+        flags: TimerfdFlags,
+    ) -> (
+        Arc<
+            litebox_common_linux::cwfd::broker_timerfd_provider::test_util::TestBrokerTimerfdProvider,
+        >,
+        u64,
+        crate::syscalls::eventfd::EventFile<litebox_platform_multiplex::Platform>,
+    ){
+        crate::syscalls::eventfd::test_support::new_mock_broker_timerfd(flags)
+    }
+
     #[test]
     fn test_epoll_with_eventfd() {
         let (task, epoll, fs) = setup_epoll();
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = new_mock_eventfd(0, EfdFlags::CLOEXEC);
         let typed = task
             .global
             .litebox
@@ -1554,12 +1570,7 @@ mod test {
     #[test]
     fn test_epoll_with_timerfd() {
         let (task, epoll, fs) = setup_epoll();
-        let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
-            platform(),
-            platform().now(),
-            ClockId::Monotonic,
-            TimerfdFlags::empty(),
-        );
+        let (timer_provider, timer_handle, timerfd) = new_mock_timerfd(TimerfdFlags::empty());
         let typed = task
             .global
             .litebox
@@ -1582,27 +1593,9 @@ mod test {
                 },
             )
             .unwrap();
-        task.global
-            .litebox
-            .descriptor_table()
-            .with_entry(
-                &files
-                    .raw_descriptor_store
-                    .read()
-                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
-                    .unwrap(),
-                |entry| {
-                    entry.set_timer(
-                        TimerfdTimerFlags::empty(),
-                        ItimerSpec {
-                            interval: Duration::ZERO.into(),
-                            value: Duration::from_millis(1).into(),
-                        },
-                    )
-                },
-            )
-            .unwrap()
-            .unwrap();
+        timer_provider
+            .fire_timerfd(timer_handle, 1)
+            .expect("failed to fire mock timerfd");
 
         let events = epoll
             .wait(
@@ -1710,17 +1703,15 @@ mod test {
             let inner_handle = inner_handle.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(20));
-                let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
-                    platform(),
-                    platform().now(),
-                    ClockId::Monotonic,
-                    TimerfdFlags::empty(),
-                );
+                let (timer_provider, timer_broker_handle, timerfd) =
+                    crate::syscalls::eventfd::test_support::new_mock_broker_timerfd(
+                        TimerfdFlags::empty(),
+                    );
                 let typed = global
                     .litebox
                     .descriptor_table_mut()
                     .insert::<crate::syscalls::eventfd::EventfdSubsystem>(timerfd);
-                let timer_handle = global
+                let timer_entry_handle = global
                     .litebox
                     .descriptor_table()
                     .entry_handle(&typed)
@@ -1744,17 +1735,10 @@ mod test {
                         )
                     })
                     .unwrap();
-                timer_handle
-                    .with_entry(|entry| {
-                        entry.set_timer(
-                            TimerfdTimerFlags::empty(),
-                            ItimerSpec {
-                                interval: Duration::ZERO.into(),
-                                value: Duration::from_millis(1).into(),
-                            },
-                        )
-                    })
-                    .unwrap();
+                let _ = timer_entry_handle;
+                timer_provider
+                    .fire_timerfd(timer_broker_handle, 1)
+                    .expect("failed to fire mock timerfd");
             });
         }
 
@@ -1778,19 +1762,14 @@ mod test {
     fn test_epoll_with_eventfd_and_timerfd() {
         let (task, epoll, fs) = setup_epoll();
 
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = new_mock_eventfd(0, EfdFlags::CLOEXEC);
         let eventfd = task
             .global
             .litebox
             .descriptor_table_mut()
             .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
 
-        let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
-            platform(),
-            platform().now(),
-            ClockId::Monotonic,
-            TimerfdFlags::empty(),
-        );
+        let (_, _, timerfd) = new_mock_timerfd(TimerfdFlags::empty());
         let timerfd = task
             .global
             .litebox
@@ -1876,19 +1855,14 @@ mod test {
     fn test_epoll_with_host_poll_and_spurious_wakes() {
         let (task, epoll, fs) = setup_epoll();
 
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = new_mock_eventfd(0, EfdFlags::CLOEXEC);
         let eventfd = task
             .global
             .litebox
             .descriptor_table_mut()
             .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
 
-        let timerfd = crate::syscalls::eventfd::EventFile::new_timer(
-            platform(),
-            platform().now(),
-            ClockId::Monotonic,
-            TimerfdFlags::empty(),
-        );
+        let (_, _, timerfd) = new_mock_timerfd(TimerfdFlags::empty());
         let timerfd = task
             .global
             .litebox
@@ -1991,6 +1965,17 @@ mod test {
 
     #[test]
     fn test_sys_epoll_pwait_with_eventfd_and_timerfd() {
+        let provider: Arc<
+            dyn litebox_common_linux::broker_eventfd_provider::BrokerEventfdProvider,
+        > = Arc::new(crate::syscalls::eventfd::test_support::TestBrokerEventfdProvider::new());
+        let _ = crate::syscalls::eventfd::set_broker_eventfd_provider(provider);
+        let timer_provider: Arc<
+            dyn litebox_common_linux::cwfd::broker_timerfd_provider::BrokerTimerfdProvider,
+        > = Arc::new(
+            litebox_common_linux::cwfd::broker_timerfd_provider::test_util::TestBrokerTimerfdProvider::new(),
+        );
+        let _ = crate::syscalls::eventfd::set_broker_timerfd_provider(timer_provider);
+
         let task = crate::syscalls::tests::init_platform(None);
 
         let epfd = task
@@ -2065,7 +2050,7 @@ mod test {
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::empty());
+        let eventfd = new_mock_eventfd(0, EfdFlags::empty());
 
         let typed = task
             .global

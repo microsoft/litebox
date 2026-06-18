@@ -26,6 +26,7 @@ pub mod broker_socket_dgram_provider;
 pub mod broker_socket_seqpacket_provider;
 pub mod broker_socketpair_provider;
 pub mod broker_tcp_conn_provider;
+pub mod broker_timerfd_provider;
 pub mod guest_pid_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -280,7 +281,7 @@ struct MmappedFile {
 
 type BrokerFdBridgeParsed = (
     usize,
-    litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot,
+    litebox_shim_linux::syscalls::fork_snapshot::FdKind,
     litebox::fs::OFlags,
 );
 
@@ -305,7 +306,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
     use litebox_common_linux::broker_pty_provider::BrokerPtyRole;
     use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
-    use litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot;
+    use litebox_shim_linux::syscalls::fork_snapshot::FdKind;
     let parts: Vec<&str> = spec.split(':').collect();
     if !(parts.len() == 3 || parts.len() == 4 || parts.len() == 5) {
         anyhow::bail!("broker-fd-bridge: bad spec {spec:?}");
@@ -323,57 +324,52 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     let (snapshot, bridge_flags) = match kind_str {
         "eventfd" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
-            (
-                BrokerHandleSnapshot::Eventfd { handle_id },
-                litebox::fs::OFlags::empty(),
-            )
+            (FdKind::Eventfd { handle_id }, litebox::fs::OFlags::empty())
+        }
+        "timerfd" => {
+            ensure_no_subkind(spec, kind_str, &parts)?;
+            (FdKind::Timerfd { handle_id }, litebox::fs::OFlags::empty())
         }
         "pidfd" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
-            (
-                BrokerHandleSnapshot::Pidfd { handle_id },
-                litebox::fs::OFlags::empty(),
-            )
+            (FdKind::Pidfd { handle_id }, litebox::fs::OFlags::empty())
         }
         "signalfd" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
-            (
-                BrokerHandleSnapshot::Signalfd { handle_id },
-                litebox::fs::OFlags::empty(),
-            )
+            (FdKind::Signalfd { handle_id }, litebox::fs::OFlags::empty())
         }
         "tcp_conn" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::TcpConn { handle_id },
+                FdKind::BrokerTcpConn { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
         "inet_listener" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::InetListener { handle_id },
+                FdKind::BrokerInetListener { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
         "inet_dgram" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::InetDgram { handle_id },
+                FdKind::BrokerInetDgram { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
         "socket_dgram" | "dgram" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::SocketDgram { handle_id },
+                FdKind::BrokerSocketDgram { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
         "socket_seqpacket" | "seqpacket" => {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
-                BrokerHandleSnapshot::SocketSeqPacket { handle_id },
+                FdKind::BrokerSocketSeqPacket { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
@@ -394,7 +390,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
                 );
             }
             (
-                BrokerHandleSnapshot::Pipe {
+                FdKind::BrokerPipe {
                     handle_id,
                     direction,
                 },
@@ -420,7 +416,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
                 ),
             };
             (
-                BrokerHandleSnapshot::UnixSocket {
+                FdKind::BrokerSocketPair {
                     handle_id,
                     endpoint,
                 },
@@ -446,7 +442,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
                 None => None,
             };
             (
-                BrokerHandleSnapshot::Pty {
+                FdKind::BrokerPty {
                     handle_id,
                     role,
                     pty_id,
@@ -946,56 +942,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     }
 
-    // Broker AF_UNIX SOCK_DGRAM remains opt-in while broader external-fd
-    // fallback coverage is completed. Set LITEBOX_EAGER_BROKER_SOCKETDGRAM=1
-    // to force the broker path.
-    {
-        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETDGRAM")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        litebox_shim_linux::syscalls::set_eager_broker_socket_dgram_enabled(enabled);
-    }
-
-    // Phase U.3: eager broker-backed AF_UNIX SOCK_SEQPACKET is default-on
-    // for consistency with U.1 (SOCK_STREAM). Required for the
-    // UDS_SEQPACKET.* harness suite to exercise BrokerSocketSeqPacket
-    // rather than falling back to in-shim UnixSocket (which lacks
-    // message-boundary semantics).
-    //
-    // Set `LITEBOX_EAGER_BROKER_SOCKETSEQPACKET=0` to opt out.
-    {
-        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETSEQPACKET")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(true);
-        litebox_shim_linux::syscalls::set_eager_broker_socket_seqpacket_enabled(enabled);
-    }
-
-    // Phase U.1: eager broker-backed AF_UNIX SOCK_STREAM socketpair
-    // is default-on so fork+exec inheritance uses broker-held pairs
-    // instead of in-shim UnixSocket state. Required for cross-worker
-    // fork+exec inheritance of socketpair fds.
-    //
-    // **F.8 flip retry (2026-05-17, PE.10 done)**: setting default
-    // ON. The earlier F.8 attempt regressed PB.c2p 20/20 → 11/20.
-    // Root caused: PE.5's fork-emit caller_pid scope wrap was
-    // unconditionally stamping child_pid on dup_handles, while
-    // releases at exec ran with caller_pid=0 (gate off). Ambient
-    // fallback mis-attributed releases → ReleaseAllForPid(child)
-    // double-released. Fixed by gating PE.5's scope wrap on
-    // per_pid_ownership_enabled(). Empirically: 5/5 isolation
-    // passes on PB.c2p.pie-glibc.dpg1 with eager-socketpair on.
-    //
-    // Set `LITEBOX_EAGER_BROKER_SOCKETPAIR=0` to opt out.
-    {
-        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETPAIR")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(true);
-        litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
-    }
-
     if let Ok(s) = std::env::var("LITEBOX_BROKER_INET_DELAY_NS")
         && let Ok(ns) = s.parse::<u64>()
     {
@@ -1447,7 +1393,6 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // Open a dedicated 9P channel using shared-memory ring buffers.
     if !is_tcp {
         let (ring_writer, ring_reader, nine_p_conn_id) = connect_nine_p_channel(broker_addr)?;
-        bind_nine_p_session_for_broker(nine_p_conn_id);
         litebox_timing::emit("runner_broker_connected_ns");
 
         let shim = shim_builder.build();
@@ -1461,6 +1406,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         let (nine_p_fs, mut reader) =
             litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
                 .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+        bind_nine_p_session_for_broker(nine_p_conn_id);
         litebox_timing::emit("runner_rootfs_ready_ns");
 
         // Spawn the 9P response worker thread.
@@ -2023,7 +1969,6 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         }
 
         let (ring_writer, ring_reader, nine_p_conn_id) = connect_nine_p_channel(broker_addr)?;
-        bind_nine_p_session_for_broker(nine_p_conn_id);
 
         let shim = shim_builder.build();
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -2036,6 +1981,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         let (nine_p_fs, mut reader) =
             litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
                 .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+        bind_nine_p_session_for_broker(nine_p_conn_id);
 
         // Spawn the 9P response worker thread.
         let worker_handle = nine_p_fs.worker_handle();
@@ -2252,7 +2198,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             .entrypoints
                             .install_broker_bridge_fd(
                                 read_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: read_handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
                                 },
@@ -2289,7 +2235,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             .entrypoints
                             .install_broker_bridge_fd(
                                 read_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: read_handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
                                 },
@@ -2300,7 +2246,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             .entrypoints
                             .install_broker_bridge_fd(
                                 write_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: write_handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
                                 },
@@ -2321,7 +2267,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             let r_flags = pipe_nonblock_oflags(r_flags_bits);
                             let _ = program.entrypoints.install_broker_bridge_fd(
                                 read_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
                                 },
@@ -2341,7 +2287,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             let w_flags = pipe_nonblock_oflags(w_flags_bits);
                             let _ = program.entrypoints.install_broker_bridge_fd(
                                 write_fd,
-                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleSnapshot::Pipe {
+                                litebox_shim_linux::syscalls::fork_snapshot::FdKind::BrokerPipe {
                                     handle_id: handle,
                                     direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
                                 },
@@ -3334,6 +3280,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_eventfd_provider(eventfd_provider)
         .map_err(|_| anyhow!("eventfd provider already set"))?;
+
+    let timerfd_provider = Arc::new(
+        crate::broker_timerfd_provider::RunnerBrokerTimerfdProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_timerfd_provider(timerfd_provider)
+        .map_err(|_| anyhow!("timerfd provider already set"))?;
 
     let pidfd_provider = Arc::new(
         crate::broker_pidfd_provider::RunnerBrokerPidfdProvider::new(

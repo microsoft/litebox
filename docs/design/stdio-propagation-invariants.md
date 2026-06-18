@@ -20,19 +20,22 @@ Three independent concepts that show up at different layers:
 2. **`HostStdioSourceFd` metadata** on a `DescriptorObjectId` — records
    that this descriptor was originally one of the host's stdio
    descriptors (so dup2 alias detection works).
-3. **`FdClass::StdioFd`** — a classification used by `snapshot_fd_table`
-   that promotes a descriptor to "stdio" only when **both** (a) it sits
-   at slot 0/1/2 *and* (b) its `object_id` matches one of the original
-   host stdio object IDs.
+3. **Snapshot stdio identity metadata** — `FdTableSnapshot::stdio_object_ids`
+   records the original host stdio object IDs. `snapshot_fd_table` keeps the
+   descriptor's real `FdKind`; stdio is identified only when **both** (a) the
+   entry sits at slot 0/1/2 *and* (b) its `object_id` matches one of those
+   recorded IDs.
 
-The third concept is what gates fork acceptance. The classifier prefers
-`FdClass::StdioFd` over the raw subsystem class (FilesystemFd, Pipe,
-UnixSocket) when the slot is stdio AND the object matches.
+The third concept is what protects fork/restore stdio routing. There is no
+stdio fd-kind variant: the snapshot keeps the raw subsystem kind
+(`FdKind::FilesystemFd`, `FdKind::BrokerPipe`, `FdKind::BrokerSocketPair`,
+etc.) and carries stdio identity as metadata.
 
 ## Code references
 
-- `shim_linux/syscalls/process.rs:7008-7026` — classifier promoting fd
-  to `FdClass::StdioFd`.
+- `shim_linux/syscalls/process.rs:snapshot_fd_table` — emits each entry's
+  real `FdKind` and records `FdTableSnapshot::stdio_object_ids` for stdio
+  identity matching during restore.
 - `shim_linux/syscalls/process.rs:5786-5827` — wave-3 fs-parent-open
   bridge explicitly excludes `host_stdio_source_fd.is_some()`.
 - `shim_linux/syscalls/process.rs:5235-5244` — UnixSocket bridge stdio-
@@ -50,18 +53,18 @@ UnixSocket) when the slot is stdio AND the object matches.
 
 ## The invariants
 
-### I-1. Stdio fds at slots 0/1/2 must be classified as `FdClass::StdioFd` when they are aliases of the original host stdio.
+### I-1. Stdio fds at slots 0/1/2 must retain stdio identity metadata when they alias the original host stdio.
 
 Concretely: if the slot is 0/1/2 AND the descriptor's `object_id` matches
-the host's recorded stdio OIDs, classification is `StdioFd`, not
-`FilesystemFd` or `Pipe` even if the underlying subsystem would say
-otherwise.
+the host's recorded stdio OIDs, the snapshot must preserve that identity in
+`FdTableSnapshot::stdio_object_ids` and per-fd stdio metadata. The entry's
+`FdKind` remains its actual subsystem kind; stdio is metadata, not a kind.
 
-**Why it matters:** the bridges in `commit_delayed_fork` route stdio
-classes via mux/direct-stdio (the well-trodden path) instead of through
-the per-subsystem bridges (newer, narrower paths). If a stdio fd ends up
-classified as FilesystemFd, the wave-3 fs-parent-open bridge would catch
-it, set up a writable-fs bridge, and break stdio routing.
+**Why it matters:** restore pre-initializes stdio and skips reopening
+matching entries as ordinary per-subsystem fds. If the stdio identity is
+lost, a restored child can treat fd 0/1/2 as a normal filesystem, pipe, or
+socket entry and route it through newer per-subsystem bridges instead of the
+well-trodden mux/direct-stdio path.
 
 ### I-2. Bridges added for non-stdio purposes must explicitly skip stdio entries.
 

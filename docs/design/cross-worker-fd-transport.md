@@ -84,15 +84,11 @@ SCM_RIGHTS data, so any test that fork-migrates a worker holding
 SCM_RIGHTS-carrying sockets fails. (Few tests hit this directly today; it
 is a correctness blocker.)
 
-`ReplacedSubsystem` (`shim_linux/lib.rs`):
-```rust
-enum ReplacedSubsystem {
-    Pipe,
-    UnixSocket,
-    Pty,
-    Filesystem,    // wave-3 fs-parent-open
-}
-```
+Historical note: an earlier replacement-subsystem mini-enum lived in
+`shim_linux/lib.rs`; it was dead code and has been removed. Replacement
+plumbing now carries the concrete replacement data it needs directly, and
+fork snapshot/restore dispatches on the canonical `FdKind` taxonomy (see
+`docs/fd-taxonomy-survey.md`).
 
 #### Path B — broker TCP via smoltcp (independent worker connect/accept)
 
@@ -195,12 +191,13 @@ where `passed_fds` falls off the message during cross-worker delivery.
 
 ### Acceptance gate notes
 
-`process.rs::snapshot_fd_table` (lines 7008-7047) **already accepts**
-`FdClass::UnixSocket` unconditionally. The `expanded-fd-support-delayed-fork.md`
-doc that said UnixSocket was rejected is stale; the wave-3-era work
-broadened the gate. The remaining gates in the existing UnixSocket
-bridge: bidirectional-conflict rejection (`process.rs:5260-5286`), and
-the SCM_RIGHTS-message rejection (`process.rs:5391-5400`).
+`process.rs::snapshot_fd_table` now dispatches on `FdKind` with an
+exhaustive accept/reject `match`. `FdKind::UnixSocket` is accepted by the
+snapshot gate; the `expanded-fd-support-delayed-fork.md` text that said
+UnixSocket was rejected was stale even before the taxonomy collapse. The
+remaining gates in the existing UnixSocket bridge are the
+bidirectional-conflict rejection (`process.rs:5260-5286`) and the
+SCM_RIGHTS-message rejection (`process.rs:5391-5400`).
 
 ### Stdio is special-cased throughout
 
@@ -208,9 +205,11 @@ The stdio fds (0, 1, 2) have heavily branched handling in
 `snapshot_fd_table` and `commit_delayed_fork`:
 
 - `host_stdio_source_fd` metadata identifies fds aliased to the original
-  host stdio descriptors (e.g. `dup2(1, 2)`). The classifier prefers
-  `FdClass::StdioFd` over `FdClass::FilesystemFd` when the slot is 0/1/2
-  and `object_id` matches the host stdio OID.
+  host stdio descriptors (e.g. `dup2(1, 2)`). Stdio is no longer a fd kind:
+  `FdTableSnapshot::stdio_object_ids` records the original stdio object IDs,
+  and restore treats entries at slots 0/1/2 whose `object_id` matches those
+  IDs as pre-initialized stdio metadata rather than reopening them as ordinary
+  `FdKind::FilesystemFd` entries.
 - The wave-3 fs-parent-open bridge (`process.rs:5786-5827`) explicitly
   excludes any entry with `host_stdio_source_fd.is_some()` — stdio is
   routed via mux/direct-stdio, never the FilesystemFd bridge.

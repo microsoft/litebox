@@ -6618,12 +6618,11 @@ impl<FS: ShimFS> Task<FS> {
             _ => return Err(Errno::EINVAL),
         }
 
-        let timerfd = super::eventfd::EventFile::new_timer(
-            self.global.platform,
-            self.global.boot_time,
-            clockid,
-            flags,
-        );
+        let provider = super::eventfd::broker_timerfd_provider().ok_or(Errno::ENODEV)?;
+        let handle = provider
+            .create_timerfd(super::eventfd::timerfd_clockid_raw(clockid)?, flags.bits())
+            .map_err(super::broker_backed::broker_err_to_errno)?;
+        let timerfd = super::eventfd::EventFile::new_timer_broker_backed(provider, handle, flags);
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<super::eventfd::EventfdSubsystem>(timerfd);
         if flags.contains(TimerfdFlags::CLOEXEC) {
@@ -6631,6 +6630,17 @@ impl<FS: ShimFS> Task<FS> {
             assert!(old.is_none());
         }
         drop(dt);
+        // Eagerly subscribe to the broker timer so a blocking read() that is
+        // not preceded by poll/epoll (which would subscribe via
+        // register_observer) is still woken when the timer fires. Mirrors
+        // install_eventfd_at_slot's pre-subscribe for inherited fds; without
+        // it, sys_timerfd_create + read() hangs (TFD.basic_arm_and_read).
+        self.global.litebox.descriptor_table().with_entry(
+            &typed,
+            |ef: &super::eventfd::EventFile<crate::Platform>| {
+                ef.pre_subscribe_for_broker_blocking_read();
+            },
+        );
         let files = self.files.borrow();
         #[cfg(feature = "trace_syscalls")]
         let object_id = typed.object_id().as_u64();

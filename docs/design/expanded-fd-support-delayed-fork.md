@@ -2,10 +2,13 @@
 
 ## Problem
 
-Delayed fork rejects processes whose fd tables contain UnixSocket or
-non-host-stdio FilesystemFd entries.  This causes 100% fork failure for
-Node.js child processes: Node.js uses `socketpair(AF_UNIX)` for child stdio
-instead of `pipe()`, and sometimes redirects unused stdio to `/dev/null`.
+Historically, delayed fork rejected processes whose fd tables contained
+UnixSocket or non-host-stdio FilesystemFd entries.  That caused 100% fork
+failure for Node.js child processes: Node.js uses `socketpair(AF_UNIX)` for
+child stdio instead of `pipe()`, and sometimes redirects unused stdio to
+`/dev/null`. The landed `FdKind` design has since made those decisions
+explicit in an exhaustive snapshot gate rather than in a coarse-class
+reject-all path.
 
 From trace data (7 delayed forks attempted, 7 rejected, 0 succeeded):
 
@@ -14,18 +17,28 @@ From trace data (7 delayed forks attempted, 7 rejected, 0 succeeded):
 | fd 0/2 are `UnixSocket` | 4 | Node.js `socketpair()` for child stdio |
 | fd 0/1/2 are `FilesystemFd` (non-host-stdio OID) | 3 | stdio redirected to `/dev/null` or similar |
 
-Both patterns fall into the reject-all `_ => reject` arm of the snapshot
-gate in `snapshot_fd_table()` (process.rs:3693–3699).
+Historically, both patterns fell into a reject-all arm of the snapshot
+gate in `snapshot_fd_table()`. The landed code now uses an exhaustive
+`match` on `FdKind`, with no wildcard arm, so every fd kind has an explicit
+accept/reject decision.
 
 ## Background
 
 ### Current acceptance gate
 
+```text
+FdKind::FilesystemFd                                      → accepted (stdio identity is metadata)
+FdKind::UnixSocket                                        → accepted
+FdKind::HostPassthrough { .. }                            → accepted
+FdKind::BrokerPipe { .. } and broker socket/inet/pty kinds → accepted
+FdKind::Eventfd/Timerfd/Pidfd/Signalfd { .. }             → accepted
+FdKind::Epoll / FdKind::Inotify                           → accepted unless CLOEXEC needs bridging
+FdKind::BrokerInetRaw { .. } and local Net                → rejected
 ```
-FdClass::StdioFd | FdClass::Pipe                         → accepted
-FdClass::FilesystemFd  if terminal_meta.is_some()         → accepted
-_                                                         → REJECTED
-```
+
+Stdio no longer has its own kind. Host stdio slots are identified by
+`FdTableSnapshot::stdio_object_ids` plus per-fd metadata, while the entry's
+`FdKind` remains its real subsystem kind.
 
 ### How pipe bridging works today
 
@@ -167,42 +180,61 @@ This mirrors `pipe_pair_id()` (pipes.rs:274–288), which uses
 
 ### Phase G2: Snapshot gate expansion
 
-**Goal**: Accept `UnixSocket` on stdio slots and non-host-stdio
-`FilesystemFd` on stdio slots in the snapshot gate.
+**Goal**: Make `UnixSocket` and non-host-stdio `FilesystemFd` acceptance
+explicit in the `FdKind` snapshot gate, while keeping stdio routing as
+metadata rather than as a separate fd kind.
 
 **Changes to `snapshot_fd_table()`** (process.rs):
 
 ```rust
-match class {
-    FdClass::StdioFd | FdClass::Pipe => {}
-    FdClass::FilesystemFd if terminal_meta.is_some() => {}
-    // NEW: accept connected Unix sockets on stdio slots only
-    FdClass::UnixSocket if raw_fd <= 2 && socket_pair_id.is_some() => {}
-    // NEW: accept non-terminal FilesystemFd on stdio slots only
-    FdClass::FilesystemFd if raw_fd <= 2 => {}
-    _ => {
-        reject.push(UnsupportedFdClass { fd: raw_fd, class });
+match subsystem_kind {
+    FdKind::FilesystemFd
+    | FdKind::UnixSocket
+    | FdKind::HostPassthrough { .. }
+    | FdKind::BrokerPipe { .. }
+    | FdKind::Eventfd { .. }
+    | FdKind::Timerfd { .. }
+    | FdKind::Pidfd { .. }
+    | FdKind::Signalfd { .. }
+    | FdKind::BrokerSocketPair { .. }
+    | FdKind::BrokerSocketDgram { .. }
+    | FdKind::BrokerSocketSeqPacket { .. }
+    | FdKind::BrokerTcpConn { .. }
+    | FdKind::BrokerInetListener { .. }
+    | FdKind::BrokerInetDgram { .. }
+    | FdKind::BrokerPty { .. } => {}
+    FdKind::Epoll | FdKind::Inotify => {
+        if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
+            reject.push(ForkRejectReason::UnsupportedFdKind { fd: raw_fd, kind: subsystem_kind });
+        }
+    }
+    #[cfg(feature = "worker_local_inet")]
+    FdKind::Net => {
+        reject.push(ForkRejectReason::UnsupportedFdKind { fd: raw_fd, kind: subsystem_kind });
+    }
+    FdKind::BrokerInetRaw { .. } => {
+        reject.push(ForkRejectReason::UnsupportedFdKind { fd: raw_fd, kind: subsystem_kind });
     }
 }
 ```
 
-The gate restricts UnixSocket and non-terminal FilesystemFd acceptance to
-stdio slots (`raw_fd <= 2`) because:
-- G3 only creates bridges for stdio slots (fd 0/1/2).
-- Accepting sockets on higher fds would pass the gate but produce no
-  bridge, silently losing the fd in the child.
-- Non-stdio Unix sockets (e.g., Node.js IPC on fd 3) are explicitly
-  rejected to fail fast rather than silently break.
+The landed gate no longer restricts `FdKind::UnixSocket` or non-terminal
+`FdKind::FilesystemFd` to stdio slots. Later bridge and restore code still
+make stdio-specific routing decisions from fd number, `object_id`, and
+`FdTableSnapshot::stdio_object_ids` metadata.
 
-The `socket_pair_id` is computed during classification: probe
-`UnixSocketSubsystem`, downcast to `UnixSocket`, call
-`socket_pair_id()`.  If the socket is not connected (init, listen,
-datagram), `socket_pair_id` is `None` and the fd is rejected.
+The `socket_pair_id` is computed during classification for bridge setup:
+probe `UnixSocketSubsystem`, downcast to `UnixSocket`, and call
+`socket_pair_id()`.  It is not a second taxonomy key and does not replace
+`FdKind`; socket restore/bridging decisions still start from the matched
+`FdKind` variant.
 
 **No metadata extension needed**: `socket_pair_id` is only used at commit
 time (not serialized into the snapshot).  The non-stdio FilesystemFd
-condition is derivable at restore time from `class == FilesystemFd &&
-fd <= 2 && !has_terminal_metadata`.  Keep `FdMetadataSnapshot` unchanged.
+condition is derivable at restore time from `entry.kind == FdKind::FilesystemFd`,
+the fd number, terminal metadata, and `stdio_object_ids`.  Keep
+`FdMetadataSnapshot` focused on per-fd metadata; kind-specific broker handles
+belong inside `FdKind` variants.
 
 **Files**: `process.rs` (snapshot_fd_table)
 **Complexity**: Low — gate expansion only, no schema changes.
@@ -221,12 +253,14 @@ to `FdReplacement` to reflect broader scope:
 struct FdReplacement {
     guest_fd: usize,
     host_fd: i32,
-    direction: ExternalFdDirection,
-    subsystem: ReplacedSubsystem,  // Pipe or UnixSocket
+    direction: HostPassthroughFdDirection,
 }
-
-enum ReplacedSubsystem { Pipe, UnixSocket }
 ```
+
+The old replacement-subsystem tag was removed. Parent-side replacement code
+tries the concrete descriptor stores it knows how to replace (pipe, Unix
+socket, PTY, filesystem as applicable) and the fork snapshot itself uses
+`FdKind` as the only fd taxonomy.
 
 #### Fork-time capture
 
@@ -403,7 +437,7 @@ the open path and store it in the snapshot's `open_file_descriptions`
 vector (currently empty / TODO):
 
 ```rust
-if class == FdClass::FilesystemFd && raw_fd <= 2 && terminal_meta.is_none() {
+if subsystem_kind == FdKind::FilesystemFd && terminal_meta.is_none() {
     if let Some(path) = files.fd_path(&typed_fd) {
         open_file_descriptions.push(OpenFileDescriptionSnapshot {
             object_id: typed_fd.object_id(),
@@ -419,11 +453,11 @@ stdio slots, look up the `reopen_path` from `open_file_descriptions`.  If
 available, reopen.  Otherwise, open `/dev/null`:
 
 ```rust
-FdClass::FilesystemFd if entry.fd <= 2
-    && entry.metadata.host_stdio_source_fd.is_none()
-    && !entry.metadata.is_host_tty_alias
-    && !entry.metadata.is_host_pty_device =>
-{
+FdKind::FilesystemFd => {
+    if entry.fd <= 2 && snapshot.fd_table.stdio_object_ids.contains(&Some(entry.object_id)) {
+        continue;
+    }
+
     let path = snapshot.fd_table.open_file_descriptions.iter()
         .find(|ofd| ofd.object_id == entry.object_id)
         .and_then(|ofd| ofd.reopen_path.as_deref())
@@ -467,18 +501,24 @@ G5 is independent of G3/G4 and can be implemented in any order after G2.
    with `ForkRejectReason::BidirectionalSocketOnMultipleStdioSlots`.
    Full-duplex support via OS socketpair is deferred to future work.
 
-2. **Non-stdio Unix sockets**: the design only bridges Unix sockets on
-   stdio slots (0/1/2).  Sockets on arbitrary fd numbers (e.g., Node.js
-   IPC channel on fd 3) are rejected by the snapshot gate.
+2. **Non-stdio Unix sockets**: the old stdio-only gate is gone. Local
+   `FdKind::UnixSocket` entries are accepted by the snapshot gate, and
+   broker-backed socketpair/datagram/seqpacket sockets have distinct
+   `FdKind` variants carrying their handles. Any remaining limitation is in
+   the specific restore/bridge path, not in lossy snapshot classification.
 
 3. **SCM_RIGHTS (fd passing)**: `passed_fds` in drained messages are
    dropped.  Cross-process fd passing is not supported.
 
-4. **Datagram sockets**: only connected stream sockets are supported.
-   Datagram sockets and unconnected/listening sockets are still rejected.
+4. **Datagram sockets**: broker datagram and seqpacket sockets are no
+   longer folded into a generic Unix-socket bucket; they are accepted as
+   distinct `FdKind::BrokerSocketDgram` / `FdKind::BrokerSocketSeqPacket`
+   entries with their own broker handles. Local Unix-socket edge cases
+   should be evaluated against their concrete restore arm.
 
-5. **FilesystemFd on fd > 2**: still rejected.  Path-based reopen with
-   seek restoration is future work.
+5. **FilesystemFd on fd > 2**: non-stdio filesystem fds are accepted as
+   `FdKind::FilesystemFd` and reopened from the recorded OFD path when
+   available. Seek restoration remains future work.
 
 6. **Seek position**: `OpenFileDescriptionSnapshot.file_offset` is not yet
    captured.  Regular file redirections may resume at the wrong offset.

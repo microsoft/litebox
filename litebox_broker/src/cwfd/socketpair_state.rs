@@ -43,7 +43,7 @@ pub enum SocketPairError {
 }
 
 /// Which end of the pair an operation refers to. Encoded on the wire
-/// as the same byte position as `BrokerHandleSnapshot::pipe_direction`
+/// as the same byte position as `FdKind::pipe_direction`
 /// (per-kind interpretation): 1 = A, 2 = B.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketPairEndpoint {

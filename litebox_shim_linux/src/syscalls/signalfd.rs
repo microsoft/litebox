@@ -71,8 +71,8 @@ impl SignalfdFile {
         }
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> super::fork_snapshot::BrokerHandleSnapshot {
-        super::fork_snapshot::BrokerHandleSnapshot::Signalfd {
+    pub(crate) fn fork_snapshot_handle(&self) -> super::fork_snapshot::FdKind {
+        super::fork_snapshot::FdKind::Signalfd {
             handle_id: self.common.handle(),
         }
     }

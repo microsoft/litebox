@@ -1985,28 +1985,18 @@ impl<FS: ShimFS> Task<FS> {
         let subscription =
             crate::syscalls::guest_pid::try_subscribe_broker_process_exit(process_id)
                 .ok_or(Errno::ESRCH)?;
-        let state = self
-            .global
-            .litebox
-            .process_registry()
-            .exit_state(process_id);
-        let pidfd = if let Some(state) = state {
-            crate::syscalls::eventfd::EventFile::new_pidfd(
-                process_id,
-                state.exited,
-                state.subject,
-                flags & PIDFD_NONBLOCK != 0,
-                host_pid_opt,
-                Some(subscription),
-            )
-        } else {
-            crate::syscalls::eventfd::EventFile::new_broker_process_pidfd(
-                process_id,
-                subscription,
-                flags & PIDFD_NONBLOCK != 0,
-                host_pid_opt,
-            )
-        };
+        // Eager-broker model: a pidfd is always backed by the broker
+        // process-exit subscription, never a local exit-state fast path.
+        // The subscription fires for locally-tracked children too (every
+        // local-child exit path stamps `try_mark_broker_process_exited`),
+        // so a single broker-backed wake source is both sufficient and
+        // free of the dual-subject divergence the local fast path had.
+        let pidfd = crate::syscalls::eventfd::EventFile::new_broker_process_pidfd(
+            process_id,
+            subscription,
+            flags & PIDFD_NONBLOCK != 0,
+            host_pid_opt,
+        );
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<crate::syscalls::eventfd::EventfdSubsystem>(pidfd);
         let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
@@ -3384,7 +3374,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Compile-time gate: see `do_fork` above. The actual per-fd
         // accept/reject decision lives in `snapshot_fd_table` and is keyed
-        // on `FdClass`; this reference keeps the `RawFdRef`-level policy
+        // on `FdKind`; this reference keeps the `RawFdRef`-level policy
         // table in the build graph so new subsystems can't silently bypass
         // the snapshot gate.
         let _migration_gate = super::migration_policy::reference_gate::<FS>();
@@ -3636,7 +3626,7 @@ impl<FS: ShimFS> Task<FS> {
         type ForkBridgeParentInfo = Vec<(
             usize,
             super::host_passthrough_fd::HostPassthroughFdDirection,
-            crate::ReplacedSubsystem,
+            u8,
         )>;
         struct ForkBridgeAccum {
             drained: Vec<u8>,
@@ -3908,7 +3898,6 @@ impl<FS: ShimFS> Task<FS> {
                                             guest_fd: parent_fd,
                                             host_fd: parent_end,
                                             direction: HostPassthroughFdDirection::ReadWrite,
-                                            subsystem: crate::ReplacedSubsystem::UnixSocket,
                                         });
                                     }
                                 }
@@ -4101,11 +4090,8 @@ impl<FS: ShimFS> Task<FS> {
                         HostPassthroughFdDirection::ReadWrite => unreachable!("handled above"),
                     };
 
-                    let mut this_parent_info: Vec<(
-                        usize,
-                        HostPassthroughFdDirection,
-                        crate::ReplacedSubsystem,
-                    )> = Vec::new();
+                    let mut this_parent_info: Vec<(usize, HostPassthroughFdDirection, u8)> =
+                        Vec::new();
                     let mut found_parent = false;
                     for &(parent_fd, parent_pair_id, parent_oid) in &fc.parent_unix_socket_fds {
                         if parent_pair_id == info.pair_id && parent_oid != info.object_id {
@@ -4148,13 +4134,8 @@ impl<FS: ShimFS> Task<FS> {
                                 guest_fd: parent_fd,
                                 host_fd: parent_host_fd,
                                 direction: parent_dir,
-                                subsystem: crate::ReplacedSubsystem::UnixSocket,
                             });
-                            this_parent_info.push((
-                                parent_fd,
-                                parent_dir,
-                                crate::ReplacedSubsystem::UnixSocket,
-                            ));
+                            this_parent_info.push((parent_fd, parent_dir, b's'));
                         }
                     }
 
@@ -4293,10 +4274,8 @@ impl<FS: ShimFS> Task<FS> {
             // layer by reopening the path in the child, so route child writes back
             // through the parent's original open file description.
             {
-                use super::fork_snapshot::FdClass;
-
                 for entry in &fd_table.entries {
-                    if entry.class != FdClass::FilesystemFd
+                    if entry.kind != super::fork_snapshot::FdKind::FilesystemFd
                         || entry.metadata.is_host_tty_alias
                         || entry.metadata.is_host_pty_device
                         || entry.metadata.host_stdio_source_fd.is_some()
@@ -4459,11 +4438,7 @@ impl<FS: ShimFS> Task<FS> {
                     let type_byte = fork_bridge_accum
                         .get(i)
                         .and_then(|bridge| bridge.parent_info.first())
-                        .map_or(b'p', |&(_, _, sub)| match sub {
-                            crate::ReplacedSubsystem::UnixSocket => b's',
-                            crate::ReplacedSubsystem::Pty => b't',
-                            crate::ReplacedSubsystem::Filesystem => b'f',
-                        });
+                        .map_or(b'p', |&(_, _, sub)| sub);
 
                     // For Read-direction child pipes (child reads,
                     // parent writes): check if the parent's pipe is
@@ -4717,7 +4692,7 @@ impl<FS: ShimFS> Task<FS> {
                                     .parent_info
                                     .iter()
                                     .filter_map(|&(parent_fd, _, subsystem)| {
-                                        if subsystem == crate::ReplacedSubsystem::Pty {
+                                        if subsystem == b't' {
                                             Some(parent_fd)
                                         } else {
                                             None
@@ -6034,9 +6009,8 @@ impl<FS: ShimFS> Task<FS> {
         preserve_cloexec_fd: Option<usize>,
     ) -> super::fork_snapshot::FdTableSnapshot {
         use super::fork_snapshot::{
-            BrokerFdTokenSnapshot, BrokerHandleSnapshot, FdClass, FdEntrySnapshot,
-            FdMetadataSnapshot, ForkRejectReason, ForkSnapshotBrokerTransit,
-            ForkSnapshotFdTokenTransit,
+            BrokerFdTokenSnapshot, FdEntrySnapshot, FdKind, FdMetadataSnapshot, ForkRejectReason,
+            ForkSnapshotBrokerTransit, ForkSnapshotFdTokenTransit,
         };
 
         let files = self.files.borrow();
@@ -6091,11 +6065,11 @@ impl<FS: ShimFS> Task<FS> {
                 continue;
             }
 
-            // Classify by subsystem type first, then promote to StdioFd if
-            // the descriptor's object_id matches the original host stdio.
-            // For filesystem fds, also probe terminal metadata markers so we
-            // can accept terminal fds through the snapshot gate.
-            let (subsystem_class, object_id, terminal_meta, _socket_pair_id) = files
+            // Classify by subsystem type first. For filesystem fds, also probe
+            // terminal metadata markers so we can accept terminal fds through
+            // the snapshot gate. Host stdio is identified at restore via
+            // stdio_object_ids plus metadata, not a distinct kind.
+            let (subsystem_kind, object_id, terminal_meta, _socket_pair_id) = files
                 .run_on_raw_fd(raw_fd, |raw_fd_ref| {
                     #[deny(clippy::wildcard_enum_match_arm)]
                     match raw_fd_ref {
@@ -6132,17 +6106,17 @@ impl<FS: ShimFS> Task<FS> {
                                 } else {
                                     None
                                 };
-                            (FdClass::FilesystemFd, oid, meta, None)
+                            (FdKind::FilesystemFd, oid, meta, None)
                         }
                         #[cfg(feature = "worker_local_inet")]
                         crate::RawFdRef::Net(fd) => {
-                            (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
+                            (FdKind::Net, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::Eventfd(fd) => {
-                            (FdClass::EventFd, Some(fd.object_id()), None, None)
+                            (FdKind::Timerfd { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::Epoll(fd) => {
-                            (FdClass::Epoll, Some(fd.object_id()), None, None)
+                            (FdKind::Epoll, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::Unix(fd) => {
                             let pair_id = dt
@@ -6150,63 +6124,70 @@ impl<FS: ShimFS> Task<FS> {
                                     sock.socket_pair_id()
                                 })
                                 .flatten();
-                            (FdClass::UnixSocket, Some(fd.object_id()), None, pair_id)
+                            (FdKind::UnixSocket, Some(fd.object_id()), None, pair_id)
                         }
                         crate::RawFdRef::HostPassthroughFd(fd) => {
-                            // Host-backed pipe (from a prior delayed-fork bridge).
-                            (FdClass::Pipe, Some(fd.object_id()), None, None)
+                            // Host-backed fd (from a prior delayed-fork bridge).
+                            (
+                                FdKind::HostPassthrough {
+                                    token_id: 0,
+                                    direction: super::host_passthrough_fd::HostPassthroughFdDirection::ReadWrite,
+                                },
+                                Some(fd.object_id()),
+                                None,
+                                None,
+                            )
                         }
                         crate::RawFdRef::BrokerPipe(fd) => {
                             // Broker-backed pipe. Classify as Pipe so the
                             // broker-handle metadata is emitted below and the restored
                             // worker can re-attach to the same broker `PipeState`.
-                            (FdClass::Pipe, Some(fd.object_id()), None, None)
+                            (FdKind::BrokerPipe { handle_id: 0, direction: litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read }, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerSocketPair(fd) => {
-                            // Phase F: eager-broker socketpair. Classify as
-                            // UnixSocket so the broker-handle metadata is emitted
-                            // below and the restored worker can re-attach to the
-                            // same broker `SocketPairState` endpoint.
-                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                            (
+                                FdKind::BrokerSocketPair {
+                                    handle_id: 0,
+                                    endpoint: litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::A,
+                                },
+                                Some(fd.object_id()),
+                                None,
+                                None,
+                            )
                         }
                         crate::RawFdRef::BrokerSocketDgram(fd) => {
-                            // Broker-backed AF_UNIX SOCK_DGRAM. Same shape as
-                            // `BrokerSocketPair`: classify as UnixSocket so the
-                            // broker-handle metadata is emitted and the restored
-                            // worker reattaches by broker handle.
-                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                            (FdKind::BrokerSocketDgram { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerSocketSeqPacket(fd) => {
-                            // Broker-backed AF_UNIX SOCK_SEQPACKET. Same shape as
-                            // `BrokerSocketPair`.
-                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                            (FdKind::BrokerSocketSeqPacket { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerTcpConn(fd) => {
-                            // Broker-hosted connected TCP is fork-bridged via
-                            // broker_handle metadata; keep the existing UnixSocket
-                            // migratable class bucket until FdClass grows a TCP arm.
-                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                            (FdKind::BrokerTcpConn { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerInetDgram(fd) => {
-                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                            (FdKind::BrokerInetDgram { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerPty(fd) => (
-                            FdClass::FilesystemFd,
+                            FdKind::BrokerPty {
+                                handle_id: 0,
+                                role: litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master,
+                                pty_id: None,
+                            },
                             Some(fd.object_id()),
                             Some(FdMetadataSnapshot::default()),
                             None,
                         ),
                         crate::RawFdRef::Signalfd(fd) => {
-                            (FdClass::Signalfd, Some(fd.object_id()), None, None)
+                            (FdKind::Signalfd { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::Inotify(fd) => {
-                            (FdClass::Inotify, Some(fd.object_id()), None, None)
+                            (FdKind::Inotify, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerInetListener(fd) => {
-                            (FdClass::InetListener, Some(fd.object_id()), None, None)
+                            (FdKind::BrokerInetListener { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerInetRaw(fd) => {
-                            (FdClass::BrokerInetRaw, Some(fd.object_id()), None, None)
+                            (FdKind::BrokerInetRaw { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
                     }
                 })
@@ -6225,107 +6206,53 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 });
 
-            // Promote to StdioFd only if this fd sits at a stdio slot AND
-            // its object_id matches ANY of the original host stdio descriptors.
-            // This handles aliases like dup2(1, 2) where fd 2 shares stdout's
-            // object_id rather than stderr's original one.
-            let class = if raw_fd <= 2 {
-                let is_host_stdio = object_id.is_some() && host_stdio_oids.contains(&object_id);
-                if is_host_stdio {
-                    FdClass::StdioFd
-                } else {
-                    subsystem_class
-                }
-            } else {
-                subsystem_class
-            };
-
-            // Decide which fd classes are migratable across delayed-fork
-            // commit. Each variant of `FdClass` MUST be explicitly handled
+            // Decide which fd kinds are migratable across delayed-fork
+            // commit. Each variant of `FdKind` MUST be explicitly handled
             // — Rust enforces this via the exhaustive `match` (no `_` arm).
-            // Adding a new `FdClass` variant will fail to compile here,
+            // Adding a new `FdKind` variant will fail to compile here,
             // forcing the author to make an explicit accept/reject decision.
             //
-            // Accepting a class means: the snapshot mechanism can serialize
+            // Accepting a kind means: the snapshot mechanism can serialize
             // the fd and the restore path on the new worker can reconstruct
             // an equivalent fd. Reject means the parent will keep blocking
             // on VforkDone until the child execs or exits — surface this
-            // via `ForkRejectReason::UnsupportedFdClass`.
-            match class {
-                // Accepted:
-                FdClass::StdioFd | FdClass::Pipe => {}
-                // Filesystem fds: reopen by captured path during restore;
-                // terminal-meta variant is reattached via the same path.
-                FdClass::FilesystemFd => {}
-                // Unconnected Unix sockets can be recreated during restore;
-                // connected/socketpair fds are recreated first, then replaced
-                // by fork-bridge host fds when needed.
-                FdClass::UnixSocket => {}
-                // Phase B-Step12: local eventfds get a fresh counter (matches
-                // Linux fork semantics); broker-backed reattaches the same
-                // broker handle.
-                FdClass::EventFd | FdClass::Signalfd | FdClass::InetListener => {}
-                // wave-cleanup-2 fork-snapshot epoll extension: Epoll and
-                // Inotify are NOT carried by the snapshot's FdEntrySnapshot
-                // wire format. Instead, the caller of `snapshot_fd_table`
-                // (`commit_delayed_fork` / `true_fork`) emits matching
-                // `--broker-fd-bridge fd:epoll:...` / `fd:inotify:...`
-                // specs via `emit_inotify_bridge_specs` /
-                // `emit_epoll_bridge_specs`, mirroring
-                // the worker-exec migration shape added in 5387acc3. The
-                // snapshot's class=Epoll/Inotify FdEntrySnapshot is benign
-                // on restore: every restore-loop filters by class, none of
-                // them match Epoll/Inotify, so the slot stays empty until
-                // the matching bridge-spec install populates it. This
-                // ordering — snapshot-restore loops first, then bridge-spec
-                // install — also satisfies the invariant that epoll bridge
-                // installation runs after every other subsystem's install
-                // (see `install_epoll_bridge_fd` doc).
-                //
-                // CLOEXEC fds are rejected: they will be closed by the
-                // impending exec anyway, so emitting bridge specs and
-                // doing the migration work is wasted effort. Returning
-                // `UnsupportedFdClass` here causes `commit_delayed_fork`
-                // to return ENOSYS, falling through to vfork shared-AS
-                // — the fast pre-cf7348e5 behaviour. Tokio (used by the
-                // test harness runtime) creates `epoll_create1(EPOLL_CLOEXEC)`
-                // at startup, so without this gate every test handler
-                // that calls `Command::spawn(non-PIE)` incurs the +13.4s
-                // snapshot/serialize/worker-spawn cost, blowing the 15s
-                // `send_cmd` budget (regressed WORKER_READY_RACE.pidfd).
-                //
-                // Non-CLOEXEC epoll/inotify still take the migration
-                // path — that's the case cf7348e5 was actually written
-                // for, validated by `DF_PARENT_TRIGGER.{epoll,inotify}.*`
-                // which themselves use CLOEXEC (and so reach this reject
-                // arm) but passed pre-cf7348e5 via the same vfork
-                // shared-AS fall-through that this gate restores.
-                FdClass::Epoll | FdClass::Inotify => {
+            // via `ForkRejectReason::UnsupportedFdKind`.
+            match subsystem_kind {
+                FdKind::FilesystemFd
+                | FdKind::UnixSocket
+                | FdKind::HostPassthrough { .. }
+                | FdKind::BrokerPipe { .. }
+                | FdKind::Eventfd { .. }
+                | FdKind::Timerfd { .. }
+                | FdKind::Pidfd { .. }
+                | FdKind::Signalfd { .. }
+                | FdKind::BrokerSocketPair { .. }
+                | FdKind::BrokerSocketDgram { .. }
+                | FdKind::BrokerSocketSeqPacket { .. }
+                | FdKind::BrokerTcpConn { .. }
+                | FdKind::BrokerInetListener { .. }
+                | FdKind::BrokerInetDgram { .. }
+                | FdKind::BrokerPty { .. } => {}
+                FdKind::Epoll | FdKind::Inotify => {
                     if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
-                        reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
+                        reject.push(ForkRejectReason::UnsupportedFdKind {
+                            fd: raw_fd,
+                            kind: subsystem_kind,
+                        });
                     }
                 }
-                // Rejected — grouped by *why* this fd class can't migrate
-                // across worker hosts. Each variant is named explicitly so
-                // that adding a new `FdClass` variant fails to compile here
-                // and forces an explicit accept/reject decision. No
-                // catch-all arm by design.
-                //
-                // (a) Legacy `worker_local_inet` smoltcp socket. Phase F.3
-                //     moved inet to broker-held (`BrokerInetListener`,
-                //     `BrokerTcpConn`, `BrokerInetDgram`); on default
-                //     `platform_linux_userland` this variant is cfg-gated
-                //     out of existence. The arm is only present on builds
-                //     where the variant compiles.
                 #[cfg(feature = "worker_local_inet")]
-                FdClass::NetworkSocket => {
-                    reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
+                FdKind::Net => {
+                    reject.push(ForkRejectReason::UnsupportedFdKind {
+                        fd: raw_fd,
+                        kind: subsystem_kind,
+                    });
                 }
-                // (b) Broker-hosted raw IP socket. Migration support is not
-                //     wired up yet; lift this arm into the accept block
-                //     once cross-worker raw-socket state preservation lands.
-                FdClass::BrokerInetRaw => {
-                    reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
+                FdKind::BrokerInetRaw { .. } => {
+                    reject.push(ForkRejectReason::UnsupportedFdKind {
+                        fd: raw_fd,
+                        kind: subsystem_kind,
+                    });
                 }
             }
 
@@ -6344,29 +6271,29 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 litebox::log_println!(
                     self.global.platform,
-                    "[DELAYED-FORK-FD] pid={}: fd={} class={:?} subsystem_class={:?} terminal_meta={} host_stdio_oid_match={} path={:?}",
+                    "[DELAYED-FORK-FD] pid={}: fd={} subsystem_kind={:?} terminal_meta={} host_stdio_oid_match={} path={:?}",
                     self.pid,
                     raw_fd,
-                    class,
-                    subsystem_class,
+                    subsystem_kind,
                     terminal_meta.is_some(),
                     object_id.is_some() && host_stdio_oids.contains(&object_id),
                     fd_path_str,
                 );
             }
 
-            let is_non_terminal_fs = class == FdClass::FilesystemFd && terminal_meta.is_none();
+            let is_non_terminal_fs =
+                subsystem_kind == FdKind::FilesystemFd && terminal_meta.is_none();
 
             // Capture access mode flags for FilesystemFd so restore can
             // reopen with the correct mode (read-only, write-only, rdwr).
-            let fs_status_flags = if class == FdClass::FilesystemFd {
+            let fs_status_flags = if subsystem_kind == FdKind::FilesystemFd {
                 if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
                     dt.with_metadata(&fd, |crate::StdioStatusFlags(flags)| flags.bits())
                         .unwrap_or(0)
                 } else {
                     0
                 }
-            } else if class == FdClass::InetListener {
+            } else if matches!(subsystem_kind, FdKind::BrokerInetListener { .. }) {
                 rds.fd_from_raw_integer::<super::broker_inet_listener::BrokerInetListenerSubsystem>(
                     raw_fd,
                 )
@@ -6380,7 +6307,7 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 })
                 .unwrap_or(0)
-            } else if class == FdClass::Signalfd {
+            } else if matches!(subsystem_kind, FdKind::Signalfd { .. }) {
                 rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
                     .ok()
                     .and_then(|typed| {
@@ -6397,12 +6324,16 @@ impl<FS: ShimFS> Task<FS> {
             // handle so the child can reattach to shared state across
             // the cross-binary-type fork boundary. Falls back to
             // None on failure (child gets a fresh local eventfd).
-            let broker_handle_meta: Option<BrokerHandleSnapshot> = if class == FdClass::EventFd {
+            let broker_handle_meta: Option<FdKind> = if matches!(
+                subsystem_kind,
+                FdKind::Timerfd { .. }
+            ) {
                 if let Ok(typed) =
                     rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
                 {
                     let eventfd_provider = super::eventfd::broker_eventfd_provider();
                     let pidfd_provider = super::eventfd::broker_pidfd_provider();
+                    let timerfd_provider = super::eventfd::broker_timerfd_provider();
                     let result =
                         dt.with_entry(&typed, |ef: &super::eventfd::EventFile<crate::Platform>| {
                             ef.ensure_broker_backed_for_fork(
@@ -6427,30 +6358,43 @@ impl<FS: ShimFS> Task<FS> {
                                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                                 >,
                             > = match &snapshot {
-                                BrokerHandleSnapshot::Eventfd { .. } => eventfd_provider
+                                FdKind::Eventfd { .. } => eventfd_provider
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                                BrokerHandleSnapshot::Pidfd { .. } => pidfd_provider
+                                FdKind::Pidfd { .. } => pidfd_provider
+                                    .as_ref()
+                                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                                FdKind::Timerfd { .. } => timerfd_provider
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
                                 // `ensure_broker_backed_for_fork` only
-                                // produces `Eventfd` or `Pidfd` (see
+                                // produces broker-backed Eventfd, Pidfd, or Timerfd (see
                                 // `eventfd.rs`); other variants here
                                 // would be a logic error. Per AGENTS.md
                                 // "loud failure for logic errors".
-                                BrokerHandleSnapshot::Signalfd { .. }
-                                | BrokerHandleSnapshot::Pty { .. }
-                                | BrokerHandleSnapshot::Pipe { .. }
-                                | BrokerHandleSnapshot::UnixSocket { .. }
-                                | BrokerHandleSnapshot::SocketDgram { .. }
-                                | BrokerHandleSnapshot::SocketSeqPacket { .. }
-                                | BrokerHandleSnapshot::TcpConn { .. }
-                                | BrokerHandleSnapshot::InetListener { .. }
-                                | BrokerHandleSnapshot::InetDgram { .. } => unreachable!(
-                                    "ensure_broker_backed_for_fork must only return Eventfd or Pidfd, got {snapshot:?}",
+                                FdKind::Signalfd { .. }
+                                | FdKind::BrokerPty { .. }
+                                | FdKind::BrokerPipe { .. }
+                                | FdKind::BrokerSocketPair { .. }
+                                | FdKind::BrokerSocketDgram { .. }
+                                | FdKind::BrokerSocketSeqPacket { .. }
+                                | FdKind::BrokerTcpConn { .. }
+                                | FdKind::BrokerInetListener { .. }
+                                | FdKind::BrokerInetDgram { .. }
+                                | FdKind::BrokerInetRaw { .. }
+                                | FdKind::FilesystemFd
+                                | FdKind::UnixSocket
+                                | FdKind::Epoll
+                                | FdKind::Inotify
+                                | FdKind::HostPassthrough { .. } => unreachable!(
+                                    "ensure_broker_backed_for_fork must only return Eventfd, Pidfd, or Timerfd, got {snapshot:?}",
+                                ),
+                                #[cfg(feature = "worker_local_inet")]
+                                FdKind::Net => unreachable!(
+                                    "ensure_broker_backed_for_fork must only return Eventfd, Pidfd, or Timerfd, got {snapshot:?}",
                                 ),
                             };
-                            if matches!(snapshot, BrokerHandleSnapshot::Pidfd { .. }) {
+                            if matches!(snapshot, FdKind::Pidfd { .. }) {
                                 if let Ok(target_pid) = u32::try_from(handle_id)
                                     && let Some(wake) =
                                         super::guest_pid::try_subscribe_broker_process_exit(
@@ -6481,7 +6425,7 @@ impl<FS: ShimFS> Task<FS> {
                 } else {
                     None
                 }
-            } else if class == FdClass::Signalfd {
+            } else if matches!(subsystem_kind, FdKind::Signalfd { .. }) {
                 if let Ok(typed) =
                     rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
                 {
@@ -6545,7 +6489,7 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     None => None,
                 }
-            } else if class == FdClass::Pipe {
+            } else if matches!(subsystem_kind, FdKind::BrokerPipe { .. }) {
                 // Phase C.3: emit a broker-Pipe handle snapshot when the fd
                 // is a `BrokerPipeSubsystem` entry. Local `Pipes<Platform>`
                 // and `HostPassthroughFd` pipes don't have broker identity
@@ -6591,7 +6535,7 @@ impl<FS: ShimFS> Task<FS> {
                 } else {
                     None
                 }
-            } else if class == FdClass::InetListener {
+            } else if matches!(subsystem_kind, FdKind::BrokerInetListener { .. }) {
                 if let Ok(typed) = rds.fd_from_raw_integer::<
                     super::broker_inet_listener::BrokerInetListenerSubsystem,
                 >(raw_fd)
@@ -6606,8 +6550,7 @@ impl<FS: ShimFS> Task<FS> {
                     match (entry_result, listener_provider) {
                         (Some(handle_id), Some(releaser)) => match releaser.dup_handle(handle_id) {
                             Ok(()) => {
-                                let snapshot =
-                                    BrokerHandleSnapshot::InetListener { handle_id };
+                                let snapshot = FdKind::BrokerInetListener { handle_id };
                                 broker_transit.push(ForkSnapshotBrokerTransit {
                                     releaser: releaser as _,
                                     handle_id,
@@ -6622,7 +6565,15 @@ impl<FS: ShimFS> Task<FS> {
                 } else {
                     None
                 }
-            } else if class == FdClass::UnixSocket {
+            } else if matches!(
+                subsystem_kind,
+                FdKind::UnixSocket
+                    | FdKind::BrokerSocketPair { .. }
+                    | FdKind::BrokerSocketDgram { .. }
+                    | FdKind::BrokerSocketSeqPacket { .. }
+                    | FdKind::BrokerTcpConn { .. }
+                    | FdKind::BrokerInetDgram { .. }
+            ) {
                 // Phase F: emit a broker-UnixSocket handle snapshot
                 // when the fd is a `BrokerSocketPairSubsystem` entry.
                 // Local `UnixSocketSubsystem` pairs don't have broker
@@ -6824,13 +6775,23 @@ impl<FS: ShimFS> Task<FS> {
                 None
             };
 
-            let mut metadata = terminal_meta.unwrap_or_default();
-            metadata.broker_handle = broker_handle_meta;
-            metadata.broker_fd_token = broker_fd_token_meta;
+            let metadata = terminal_meta.unwrap_or_default();
+            let kind = if let Some(bh) = broker_handle_meta {
+                bh
+            } else if let Some(tok) = broker_fd_token_meta {
+                FdKind::HostPassthrough {
+                    token_id: tok.token_id,
+                    direction: tok.host_passthrough_fd_direction.unwrap_or(
+                        super::host_passthrough_fd::HostPassthroughFdDirection::ReadWrite,
+                    ),
+                }
+            } else {
+                subsystem_kind
+            };
 
             entries.push(FdEntrySnapshot {
                 fd: raw_fd,
-                class,
+                kind,
                 fd_flags: fd_flags.bits(),
                 status_flags: fs_status_flags,
                 object_id: object_id.map_or(0, litebox::fd::DescriptorObjectId::as_u64),
@@ -10012,7 +9973,7 @@ type BrokerTransitReleaseEntry = (
 /// each fd to its current backing broker handle via
 /// `EventFile::ensure_broker_backed_for_fork` (which promotes a host
 /// eventfd to broker-backed if needed and returns the
-/// `BrokerHandleSnapshot`).
+/// `FdKind`).
 ///
 /// Skips stdio (fds 0/1/2). Pairs with `emit_timerfd_bridge_specs`,
 /// which iterates the same bucket and handles the timerfd subset
@@ -10042,6 +10003,7 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
         }
         let eventfd_provider = super::eventfd::broker_eventfd_provider();
         let pidfd_provider = super::eventfd::broker_pidfd_provider();
+        let timerfd_provider = super::eventfd::broker_timerfd_provider();
         let dt_local = task.global.litebox.descriptor_table();
         let result =
             dt_local.with_entry(typed, |ef: &super::eventfd::EventFile<crate::Platform>| {
@@ -10049,35 +10011,48 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
             });
         drop(dt_local);
         if let Some(Ok(Some(snapshot))) = result {
-            use super::fork_snapshot::BrokerHandleSnapshot;
+            use super::fork_snapshot::FdKind;
             let handle_id = snapshot.handle_id();
             let kind_str = snapshot.spec_token();
-            // `ensure_broker_backed_for_fork` only produces `Eventfd`
-            // or `Pidfd`; any other variant here is a logic error.
+            // `ensure_broker_backed_for_fork` only produces broker-backed
+            // Eventfd, Pidfd, or Timerfd; any other variant here is a logic error.
             let releaser: Option<
                 alloc::sync::Arc<
                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                 >,
             > = match &snapshot {
-                BrokerHandleSnapshot::Eventfd { .. } => eventfd_provider
+                FdKind::Eventfd { .. } => eventfd_provider
                     .as_ref()
                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                BrokerHandleSnapshot::Pidfd { .. } => pidfd_provider
+                FdKind::Pidfd { .. } => pidfd_provider
                     .as_ref()
                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                BrokerHandleSnapshot::Signalfd { .. }
-                | BrokerHandleSnapshot::Pty { .. }
-                | BrokerHandleSnapshot::Pipe { .. }
-                | BrokerHandleSnapshot::UnixSocket { .. }
-                | BrokerHandleSnapshot::SocketDgram { .. }
-                | BrokerHandleSnapshot::SocketSeqPacket { .. }
-                | BrokerHandleSnapshot::TcpConn { .. }
-                | BrokerHandleSnapshot::InetListener { .. }
-                | BrokerHandleSnapshot::InetDgram { .. } => unreachable!(
-                    "ensure_broker_backed_for_fork must only return Eventfd or Pidfd, got {snapshot:?}",
+                FdKind::Timerfd { .. } => timerfd_provider
+                    .as_ref()
+                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                FdKind::Signalfd { .. }
+                | FdKind::BrokerPty { .. }
+                | FdKind::BrokerPipe { .. }
+                | FdKind::BrokerSocketPair { .. }
+                | FdKind::BrokerSocketDgram { .. }
+                | FdKind::BrokerSocketSeqPacket { .. }
+                | FdKind::BrokerTcpConn { .. }
+                | FdKind::BrokerInetListener { .. }
+                | FdKind::BrokerInetDgram { .. }
+                | FdKind::BrokerInetRaw { .. }
+                | FdKind::FilesystemFd
+                | FdKind::UnixSocket
+                | FdKind::Epoll
+                | FdKind::Inotify
+                | FdKind::HostPassthrough { .. } => unreachable!(
+                    "ensure_broker_backed_for_fork must only return Eventfd, Pidfd, or Timerfd, got {snapshot:?}",
+                ),
+                #[cfg(feature = "worker_local_inet")]
+                FdKind::Net => unreachable!(
+                    "ensure_broker_backed_for_fork must only return Eventfd, Pidfd, or Timerfd, got {snapshot:?}",
                 ),
             };
-            if matches!(snapshot, BrokerHandleSnapshot::Pidfd { .. }) {
+            if matches!(snapshot, FdKind::Pidfd { .. }) {
                 if let Ok(target_pid) = u32::try_from(handle_id)
                     && let Some(wake) = super::guest_pid::try_subscribe_broker_process_exit(
                         litebox::process::ProcessId(target_pid),

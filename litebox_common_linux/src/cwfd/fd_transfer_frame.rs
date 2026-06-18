@@ -887,7 +887,8 @@ mod tests {
                 | SubsystemTag::InetListener
                 | SubsystemTag::InetDgram
                 | SubsystemTag::InetRaw
-                | SubsystemTag::HostFd => panic!("expected Unknown({raw:#x}), got {tag:?}"),
+                | SubsystemTag::HostFd
+                | SubsystemTag::File => panic!("expected Unknown({raw:#x}), got {tag:?}"),
             }
         }
     }
@@ -905,6 +906,7 @@ mod tests {
         assert_eq!(SubsystemTag::PipeRead.as_u8(), 14);
         assert_eq!(SubsystemTag::PipeWrite.as_u8(), 15);
         assert_eq!(SubsystemTag::HostFd.as_u8(), 16);
+        assert_eq!(SubsystemTag::File.as_u8(), 17);
         for tag in [
             SubsystemTag::Eventfd,
             SubsystemTag::TcpSocket,
@@ -921,6 +923,8 @@ mod tests {
             SubsystemTag::InetRaw,
             SubsystemTag::PipeRead,
             SubsystemTag::PipeWrite,
+            SubsystemTag::HostFd,
+            SubsystemTag::File,
         ] {
             assert!(tag.is_known(), "{tag:?} should be known");
             assert_eq!(SubsystemTag::from_u8(tag.as_u8()), tag);
