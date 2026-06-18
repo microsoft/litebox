@@ -104,6 +104,7 @@
 
 use crate::{LoadedProgram, OpteeShim, SessionIdPool};
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use hashbrown::{HashMap, HashSet};
 use litebox_common_optee::{OpteeSmcReturnCode, TaFlags, TeeUuid};
 use spin::mutex::SpinMutex;
@@ -337,13 +338,19 @@ fn recycle_session_id(session_id: u32) {
     SessionIdPool::recycle(session_id);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeldUuidLock {
+    SingleInstance(TeeUuid),
+    UnknownUuid,
+}
+
 /// An unified RAII token to safely execute an OP-TEE TA operation with
 /// instance- or session-specific serialization primitives.
 ///
 /// Bundles whichever combination of locks the current operation requires:
 ///
-/// - **Known single-instance TAs**: a per-UUID `SpinMutex` that serializes
-///   all sessions on the same TA.
+/// - **Known single-instance TAs**: a per-UUID lock flag (a `bool` slot in
+///   `single_instance_locks`) that serializes all sessions on the same TA.
 /// - **First-ever load of an unknown UUID** (OpenSession only): the shared
 ///   `unknown_uuid_lock`, used until the TA's flags (single-instance vs
 ///   multi-instance) are observed.
@@ -364,11 +371,9 @@ fn recycle_session_id(session_id: u32) {
 /// (if still owned) the session id is recycled.
 pub struct SessionToken<'a> {
     manager: &'a SessionManager,
-    /// Held `Arc` of the per-UUID `SpinMutex`. The guard returned by
-    /// `try_lock()` was [`core::mem::forget`]-ed at acquisition time; this
-    /// type's `Drop` calls `force_unlock` to release the mutex. The `Arc`
-    /// keeps the mutex alive across acquisition and release.
-    uuid_lock: Option<Arc<SpinMutex<()>>>,
+    /// Logical UUID-level lock owned by this token. The actual lock state
+    /// lives in `SessionManager`; `Drop` releases it (clears the held flag).
+    uuid_lock: Option<HeldUuidLock>,
     /// `Some(id)` while the token holds the active-session marker for `id`
     /// in [`SessionManager::active_sessions`]. Drop releases the marker.
     active_session_id: Option<u32>,
@@ -404,10 +409,7 @@ impl SessionToken<'_> {
 impl Drop for SessionToken<'_> {
     fn drop(&mut self) {
         if let Some(lock) = self.uuid_lock.take() {
-            // SAFETY: This token holds the per-UUID lock because the
-            // acquisition path called `try_lock()` and forgot the resulting
-            // guard. No other holder exists, so `force_unlock` is sound.
-            unsafe { lock.force_unlock() };
+            self.manager.release_uuid_lock(lock);
         }
         if let Some(id) = self.active_session_id.take() {
             self.manager.active_sessions.lock().remove(&id);
@@ -443,15 +445,16 @@ pub struct SessionManager {
     /// versioning is wired through, so a re-loaded TA isn't serialized
     /// under the old flags.
     known_flags: SpinMutex<HashMap<TeeUuid, TaFlags>>,
-    /// Per-UUID serialization locks for single-instance TA handling.
-    /// Entries are created lazily only for UUIDs that have been observed
-    /// to be single-instance — never for unknown UUIDs whose load might
-    /// fail or turn out to be multi-instance.
-    single_instance_locks: SpinMutex<HashMap<TeeUuid, Arc<SpinMutex<()>>>>,
-    /// Shared serialization lock for first-ever loads of unknown UUIDs.
-    /// Held by OpenSession while flags are still unobserved, then released
-    /// once `known_flags` is updated. Per-UUID locks take over from there.
-    unknown_uuid_lock: Arc<SpinMutex<()>>,
+    /// Per-UUID serialization state for single-instance TA handling
+    /// (`true` == held). Entries are created lazily only for UUIDs that
+    /// have been observed to be single-instance — never for unknown UUIDs
+    /// whose load might fail or turn out to be multi-instance.
+    single_instance_locks: SpinMutex<HashMap<TeeUuid, bool>>,
+    /// Shared serialization state for first-ever loads of unknown UUIDs
+    /// (`true` == held). Held by OpenSession while flags are still
+    /// unobserved, then released once `known_flags` is updated. Per-UUID
+    /// locks take over from there.
+    unknown_uuid_lock: AtomicBool,
     /// Session ids currently being handled (Invoke/Close). Guards a session
     /// against concurrent SMC entry by another core that targets the same id.
     active_sessions: SpinMutex<HashSet<u32>>,
@@ -465,7 +468,7 @@ impl SessionManager {
             pending_count: SpinMutex::new(0),
             known_flags: SpinMutex::new(HashMap::new()),
             single_instance_locks: SpinMutex::new(HashMap::new()),
-            unknown_uuid_lock: Arc::new(SpinMutex::new(())),
+            unknown_uuid_lock: AtomicBool::new(false),
             active_sessions: SpinMutex::new(HashSet::new()),
         }
     }
@@ -531,43 +534,46 @@ impl SessionManager {
         self.known_flags.lock().get(uuid).copied()
     }
 
-    /// Get or create the per-UUID serialization mutex `Arc`. Only called
-    /// for UUIDs already observed to be single-instance.
-    fn uuid_lock_arc(&self, uuid: TeeUuid) -> Arc<SpinMutex<()>> {
-        self.single_instance_locks
-            .lock()
-            .entry(uuid)
-            .or_insert_with(|| Arc::new(SpinMutex::new(())))
-            .clone()
+    /// Try to take the per-UUID serialization state non-blockingly.
+    fn try_acquire_uuid_lock(&self, uuid: TeeUuid) -> Option<HeldUuidLock> {
+        let mut locks = self.single_instance_locks.lock();
+        let held = locks.entry(uuid).or_insert(false);
+        if *held {
+            None
+        } else {
+            *held = true;
+            Some(HeldUuidLock::SingleInstance(uuid))
+        }
     }
 
-    /// Try to take the per-UUID serialization mutex non-blockingly. On
-    /// success returns the `Arc` whose forgotten guard is owned by the
-    /// caller — release via `force_unlock` on the returned `Arc`.
-    fn try_acquire_uuid_lock(&self, uuid: TeeUuid) -> Option<Arc<SpinMutex<()>>> {
-        let lock = self.uuid_lock_arc(uuid);
-        let guard = lock.try_lock()?;
-        // The lock now belongs to the SessionToken about to wrap us. Forget
-        // the guard so its `Drop` does not unlock; the token's `Drop` calls
-        // `force_unlock` via the retained `Arc`.
-        core::mem::forget(guard);
-        Some(lock)
+    fn release_uuid_lock(&self, lock: HeldUuidLock) {
+        match lock {
+            HeldUuidLock::SingleInstance(uuid) => {
+                if let Some(held) = self.single_instance_locks.lock().get_mut(&uuid) {
+                    debug_assert!(*held);
+                    *held = false;
+                }
+            }
+            HeldUuidLock::UnknownUuid => {
+                let was_held = self.unknown_uuid_lock.swap(false, Ordering::Release);
+                debug_assert!(was_held);
+            }
+        }
     }
 
-    /// Try to take the shared `unknown_uuid_lock` non-blockingly using the
-    /// same forget/`force_unlock` pattern as [`Self::try_acquire_uuid_lock`].
-    fn try_acquire_unknown_uuid_lock(&self) -> Option<Arc<SpinMutex<()>>> {
-        let lock = self.unknown_uuid_lock.clone();
-        let guard = lock.try_lock()?;
-        core::mem::forget(guard);
-        Some(lock)
+    /// Try to take the shared `unknown_uuid_lock` non-blockingly.
+    fn try_acquire_unknown_uuid_lock(&self) -> Option<HeldUuidLock> {
+        self.unknown_uuid_lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| HeldUuidLock::UnknownUuid)
     }
 
     /// Acquire a `SessionToken` for an OpenSession request.
     ///
     /// Dispatches by what's known about `uuid`:
     ///
-    /// - **Known single-instance**: per-UUID `SpinMutex`.
+    /// - **Known single-instance**: per-UUID lock flag.
     /// - **Known multi-instance**: no lock (each session is independent).
     /// - **Unknown**: the shared `unknown_uuid_lock`. This serializes
     ///   first-loads of all unknown UUIDs together, but avoids minting a
@@ -601,7 +607,7 @@ impl SessionManager {
     /// callers don't need to look it up again.
     ///
     /// Always reserves the per-session-id slot in `active_sessions`. For
-    /// single-instance TAs additionally takes the per-UUID `SpinMutex` so
+    /// single-instance TAs additionally takes the per-UUID lock so
     /// sibling sessions on the same TA serialize against this operation.
     ///
     /// Returns `Err(EBadCmd)` if `session_id` is not registered, or
@@ -711,21 +717,19 @@ impl SessionManager {
     ///
     /// # Unknown→per-UUID transition
     ///
-    /// For single-instance TAs we pre-lock the per-UUID `SpinMutex` *before*
+    /// For single-instance TAs we mark the per-UUID state held *before*
     /// publishing `known_flags` so any later opener that observes `uuid`
-    /// as known single-instance and routes to the per-UUID lock finds it
-    /// already held. The lock state lives in `single_instance_locks`
-    /// (the `Arc` we get back is discarded — its only purpose was to
-    /// take the lock); [`Self::with_ta`] adopts by re-fetching the `Arc`
-    /// for *its own* `uuid` and installing it in its token. This is
-    /// UUID-keyed end-to-end: no shared side channel, so concurrent
-    /// `with_ta` calls for different UUIDs cannot interfere with each
-    /// other's adoptions.
+    /// as known single-instance and routes to the per-UUID state finds it
+    /// already held. [`Self::with_ta`] adopts this state for *its own*
+    /// `uuid` by replacing the token's unknown-lock marker with a
+    /// per-UUID marker. This is UUID-keyed end-to-end: no shared side
+    /// channel, so concurrent `with_ta` calls for different UUIDs cannot
+    /// interfere with each other's adoptions.
     ///
     /// `try_acquire_uuid_lock` succeeds only on the unknown path (caller
     /// holds `unknown_uuid_lock`, no sessions or `known_flags` entry for
     /// `uuid` yet). On the known-cache-evicted path the caller already
-    /// holds the per-UUID lock and the `try_lock` returns `None`, so
+    /// holds the per-UUID state and acquisition returns `None`, so
     /// nothing changes (the caller's existing lock is sufficient).
     pub fn register_new_session(
         &self,
@@ -743,10 +747,9 @@ impl SessionManager {
             ta_uuid,
         });
 
-        // Pre-lock per-UUID for atomic unknown→per-UUID transition (see
-        // method doc). The returned `Arc` is intentionally dropped; the
-        // forgotten guard inside `try_acquire_uuid_lock` keeps the lock
-        // state held in `single_instance_locks` until `with_ta` adopts.
+        // Pre-hold per-UUID state for atomic unknown→per-UUID transition
+        // (see method doc). On known-cache-evicted paths this returns
+        // `None` because the caller already owns the per-UUID state.
         if ta_flags.is_single_instance() {
             let _ = self.try_acquire_uuid_lock(ta_uuid);
         }
@@ -862,13 +865,9 @@ impl SessionManager {
         F: for<'a> FnOnce(OpenSessionTarget<'a>) -> Result<(), OpteeSmcReturnCode>,
     {
         let mut token = self.try_acquire_for_open(*uuid)?;
-        // Whether we started on the unknown-load path is determined by the
-        // identity of the lock the token carries. Captured before `f` runs
-        // so we know which branch to take in the post-`f` adoption step.
-        let on_unknown_uuid_path = token
-            .uuid_lock
-            .as_ref()
-            .is_some_and(|arc| Arc::ptr_eq(arc, &self.unknown_uuid_lock));
+        // Captured before `f` runs so we know whether to perform the
+        // unknown→per-UUID adoption step after successful registration.
+        let on_unknown_uuid_path = matches!(token.uuid_lock, Some(HeldUuidLock::UnknownUuid));
 
         // Cache lookup is unconditional: it returns `None` for known
         // multi-instance and unknown UUIDs (never populated), and only
@@ -908,19 +907,17 @@ impl SessionManager {
         // Complete the unknown→per-UUID transition (see
         // `register_new_session` doc). Only fires when we held
         // `unknown_uuid_lock` AND the closure registered a single-instance
-        // TA for *our* `uuid`. The per-UUID lock is already held (forgotten
-        // guard in `single_instance_locks` from `register_new_session`'s
-        // pre-lock); re-fetch the `Arc` by `uuid` and swap into the token,
-        // force-unlocking the old (unknown) lock. Token drop then releases
-        // the per-UUID lock at the end of `with_ta`. UUID-keyed throughout,
-        // so concurrent `with_ta(other_uuid)` cannot adopt our lock.
-        if result.is_ok() && on_unknown_uuid_path && self.single_instance_cache.get(uuid).is_some()
+        // TA for *our* `uuid`. The per-UUID state is already held from
+        // `register_new_session`'s pre-hold; swap the token to own that
+        // state and release the unknown state. Token drop then releases the
+        // per-UUID state at the end of `with_ta`. UUID-keyed throughout, so
+        // concurrent `with_ta(other_uuid)` cannot adopt our lock.
+        if result.is_ok()
+            && on_unknown_uuid_path
+            && self.single_instance_cache.get(uuid).is_some()
+            && let Some(old) = token.uuid_lock.replace(HeldUuidLock::SingleInstance(*uuid))
         {
-            let per_uuid = self.uuid_lock_arc(*uuid);
-            if let Some(old) = token.uuid_lock.replace(per_uuid) {
-                // SAFETY: see `SessionToken::drop` — same invariant.
-                unsafe { old.force_unlock() };
-            }
+            self.release_uuid_lock(old);
         }
 
         result
@@ -959,9 +956,9 @@ mod tests {
         TaFlags::SINGLE_INSTANCE | TaFlags::MULTI_SESSION
     }
 
-    /// Test helper: call `register_new_session` and release the per-UUID
-    /// lock the way `with_ta` would, so subsequent operations
-    /// (Invoke/Close, evict, count, etc.) aren't blocked by a held lock.
+    /// Test helper: call `register_new_session` directly and release the
+    /// pre-held per-UUID lock state the way `with_ta` would, so subsequent
+    /// operations (Invoke/Close, evict, count, etc.) aren't blocked.
     fn register_for_test(
         manager: &SessionManager,
         session_id: u32,
@@ -976,14 +973,10 @@ mod tests {
             task_page_table_id,
             ta_uuid,
         );
-        // For single-instance, `register_new_session` pre-locked the
-        // per-UUID mutex via a forgotten guard. Release here to mirror
-        // `with_ta`'s token-drop release.
         if ta_flags.is_single_instance()
-            && let Some(arc) = manager.single_instance_locks.lock().get(&ta_uuid).cloned()
+            && let Some(held) = manager.single_instance_locks.lock().get_mut(&ta_uuid)
         {
-            // SAFETY: same invariant as `SessionToken::drop`.
-            unsafe { arc.force_unlock() };
+            *held = false;
         }
     }
 
@@ -1077,8 +1070,8 @@ mod tests {
     }
 
     /// After `with_ta` completes the unknown→per-UUID transition, the
-    /// per-UUID lock must be released — a subsequent `try_lock` on the
-    /// per-UUID `SpinMutex` for the same UUID must succeed.
+    /// per-UUID lock state must be released — a subsequent acquisition for
+    /// the same UUID must succeed.
     #[test]
     fn with_ta_releases_per_uuid_lock_after_unknown_load() {
         let manager = SessionManager::new();
@@ -1098,15 +1091,11 @@ mod tests {
             })
             .unwrap();
 
-        // Per-UUID lock entry exists (pre-locked + adopted + released).
-        let arc = manager
-            .single_instance_locks
-            .lock()
-            .get(&uuid)
-            .cloned()
-            .expect("entry created by register_new_session");
-        // And it's currently unlocked — a fresh try_lock must succeed.
-        assert!(arc.try_lock().is_some());
+        assert_eq!(
+            manager.single_instance_locks.lock().get(&uuid),
+            Some(&false)
+        );
+        assert!(manager.try_acquire_uuid_lock(uuid).is_some());
     }
 
     /// A concurrent `with_ta` for an unrelated UUID must NOT adopt or
@@ -1120,35 +1109,19 @@ mod tests {
         let uuid_locked = make_uuid(0xE1);
         let uuid_other = make_uuid(0xE2);
 
-        // Simulate the "lock pre-taken under unknown-load" state by directly
-        // pre-locking the per-UUID mutex for `uuid_locked`. This mirrors
-        // what `register_new_session` does mid-unknown-load before
+        // Simulate the "lock pre-taken under unknown-load" state. This
+        // mirrors what `register_new_session` does mid-unknown-load before
         // `with_ta` adopts.
-        let pre_locked = manager
-            .try_acquire_uuid_lock(uuid_locked)
-            .expect("uncontended");
-        // Don't release `pre_locked` — emulating the forgotten-guard state.
-        core::mem::forget(pre_locked);
+        assert!(manager.try_acquire_uuid_lock(uuid_locked).is_some());
 
         // A `with_ta` call for a completely different UUID must not touch
         // `uuid_locked`'s lock. The closure registers nothing, but the
         // post-`f` adoption logic still runs.
         manager.with_ta(&uuid_other, |_| Ok(())).unwrap();
 
-        // `uuid_locked`'s per-UUID lock must still be held (not stolen).
-        let arc = manager
-            .single_instance_locks
-            .lock()
-            .get(&uuid_locked)
-            .cloned()
-            .expect("entry exists");
-        assert!(
-            arc.try_lock().is_none(),
-            "uuid_locked's per-UUID lock must remain held by the original opener"
+        assert_eq!(
+            manager.single_instance_locks.lock().get(&uuid_locked),
+            Some(&true)
         );
-
-        // Cleanup: release for SpinMutex sanity.
-        // SAFETY: we forgot the guard above; release here.
-        unsafe { arc.force_unlock() };
     }
 }
