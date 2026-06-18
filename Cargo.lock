@@ -1480,7 +1480,6 @@ dependencies = [
 name = "litebox_broker_core"
 version = "0.1.0"
 dependencies = [
- "bitflags 2.11.0",
  "litebox_broker_protocol",
  "slotmap",
 ]
