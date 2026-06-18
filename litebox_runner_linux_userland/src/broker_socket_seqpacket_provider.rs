@@ -9,6 +9,7 @@ use litebox_common_linux::cwfd::{
         BrokerEventCallback, BrokerOpError, BrokerSocketSeqPacketProvider,
     },
     broker_subscribable::BrokerSubscribable,
+    fd_transfer_frame::PassedToken,
 };
 use litebox_common_linux::fd_token_client::{ClientError, FdTokenClient};
 use std::sync::Arc;
@@ -106,13 +107,22 @@ impl BrokerSocketSeqPacketProvider for RunnerBrokerSocketSeqPacketProvider {
             .map_err(client_err_to_broker_err)
     }
 
-    fn send(&self, handle: u64, payload: &[u8]) -> Result<usize, BrokerOpError> {
+    fn send(
+        &self,
+        handle: u64,
+        payload: &[u8],
+        tokens: &[PassedToken],
+    ) -> Result<usize, BrokerOpError> {
         self.client
-            .socket_seqpacket_send(handle, payload)
+            .socket_seqpacket_send(handle, payload, tokens)
             .map_err(client_err_to_broker_err)
     }
 
-    fn recv(&self, handle: u64, max_len: u32) -> Result<(Vec<u8>, u32), BrokerOpError> {
+    fn recv(
+        &self,
+        handle: u64,
+        max_len: u32,
+    ) -> Result<(Vec<u8>, u32, Vec<PassedToken>), BrokerOpError> {
         self.client
             .socket_seqpacket_recv(handle, max_len)
             .map_err(client_err_to_broker_err)

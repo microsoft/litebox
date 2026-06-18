@@ -5,9 +5,9 @@
 //!
 //! Foundation support covers bind, sendto/recvfrom with source addresses,
 //! seqpacket truncation, connect, nonblocking waits, shutdown, and fork-restore
-//! inheritance. Ancillary data is deferred: sendmsg/recvmsg with SCM_RIGHTS or
-//! SCM_CREDENTIALS returns `EOPNOTSUPP` on this broker-backed path until the
-//! control protocol can carry per-seqpacket fd tokens and credentials.
+//! inheritance. `SCM_RIGHTS` is supported for broker-token-backed descriptors
+//! (files and pipes). `SCM_CREDENTIALS` is still deferred because credential
+//! passing has authentication implications.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -159,6 +159,7 @@ impl BrokerSocketSeqPacketFd<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         payload: &[u8],
+        tokens: &[litebox_common_linux::cwfd::fd_transfer_frame::PassedToken],
     ) -> Result<usize, Errno> {
         if self.write_shutdown.load(Ordering::Acquire) {
             return Err(Errno::EPIPE);
@@ -167,7 +168,7 @@ impl BrokerSocketSeqPacketFd<Platform> {
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::OUT, || {
-                match self.provider.send(self.handle(), payload) {
+                match self.provider.send(self.handle(), payload, tokens) {
                     Ok(n) => Ok(n),
                     Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(e) => Err(TryOpError::Other(broker_err_to_errno(e))),
@@ -180,16 +181,23 @@ impl BrokerSocketSeqPacketFd<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         max_len: u32,
-    ) -> Result<(alloc::vec::Vec<u8>, u32), Errno> {
+    ) -> Result<
+        (
+            alloc::vec::Vec<u8>,
+            u32,
+            alloc::vec::Vec<litebox_common_linux::cwfd::fd_transfer_frame::PassedToken>,
+        ),
+        Errno,
+    > {
         if self.read_shutdown.load(Ordering::Acquire) {
-            return Ok((alloc::vec::Vec::new(), 0));
+            return Ok((alloc::vec::Vec::new(), 0, alloc::vec::Vec::new()));
         }
         self.common.ensure_subscribed(&self.pollee);
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::IN, || {
                 match self.provider.recv(self.handle(), max_len) {
-                    Ok((payload, flags)) => Ok((payload, flags)),
+                    Ok((payload, flags, tokens)) => Ok((payload, flags, tokens)),
                     Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(e) => Err(TryOpError::Other(broker_err_to_errno(e))),
                 }

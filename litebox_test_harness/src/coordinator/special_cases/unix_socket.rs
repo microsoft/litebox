@@ -70,6 +70,9 @@ pub fn run(sub: &str) -> i32 {
         "seqpacket-msg-trunc" => test_seqpacket_msg_trunc(),
         "seqpacket-shutdown" => test_seqpacket_shutdown(),
         "seqpacket-fork-restore-inherit" => test_seqpacket_fork_restore_inherit(),
+        "seqpacket-scm-pipe-pair" => test_seqpacket_scm_pipe_pair(),
+        "seqpacket-scm-file" => test_seqpacket_scm_file(),
+        "seqpacket-scm-msg-ctrunc" => test_seqpacket_scm_msg_ctrunc(),
         "dgram-scm-pipe-pair" => test_dgram_scm_pipe_pair(),
         "dgram-scm-file" => test_dgram_scm_file(),
         "dgram-scm-msg-ctrunc" => test_dgram_scm_msg_ctrunc(),
@@ -1735,6 +1738,54 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
             });
     }
 
+    let seqpacket_scm_tests: &[(&str, &str, &str)] = &[
+        (
+            "pipe_pair_across_seqpacket",
+            "seqpacket-scm-pipe-pair",
+            "UDS_SEQPACKET_SCM_PIPE_PAIR_OK",
+        ),
+        (
+            "file_across_seqpacket",
+            "seqpacket-scm-file",
+            "UDS_SEQPACKET_SCM_FILE_OK",
+        ),
+        (
+            "msg_ctrunc",
+            "seqpacket-scm-msg-ctrunc",
+            "UDS_SEQPACKET_SCM_CTRUNC_OK",
+        ),
+    ];
+    for &(name, sub, expected) in seqpacket_scm_tests {
+        let id = format!("UDS_SEQPACKET_SCM.{name}");
+        let sub = sub.to_string();
+        let expected = expected.to_string();
+        reg.test("xworker", "unix_socket", id)
+            .timeout(60)
+            .build(move |cx| {
+                let a = cx.require(AgentName::Dpg1);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(crate::BinaryType::PieGlibc, &self_exe);
+                        let resp = run
+                            .send_named_typed(
+                                &a,
+                                &EXEC_BIN,
+                                ExecBinArgs {
+                                    argv: vec![target, "unix-socket-test".into(), sub.clone()],
+                                    timeout_ms: Some(10 * 1000),
+                                    stdin: None,
+                                    env: Vec::new(),
+                                },
+                            )
+                            .await;
+                        let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains(&*expected));
+                        crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                })
+            });
+    }
+
     let dgram_scm_tests: &[(&str, &str, &str)] = &[
         (
             "pipe_pair_across_dgram",
@@ -2355,6 +2406,211 @@ fn test_seqpacket_fork_restore_inherit() -> i32 {
     } else {
         println!("UDS_SEQPACKET_FORK_RESTORE_INHERIT_FAIL:n={n},errno={send_errno},code={code}");
         1
+    }
+}
+
+fn make_seqpacket_pair() -> Result<(i32, i32), String> {
+    let mut sv = [-1; 2];
+    // SAFETY: socketpair is called with valid constants and writes two fds on success.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(format!("socketpair: {}", errno()));
+    }
+    Ok((sv[0], sv[1]))
+}
+
+fn send_fd_seqpacket(sock: i32, fd_to_send: i32, payload: &[u8]) -> Result<isize, String> {
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast(),
+        iov_len: payload.len(),
+    };
+    let mut control =
+        vec![0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize];
+    // SAFETY: zeroed msghdr is filled with valid iov/control pointers before sendmsg.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = std::ptr::addr_of_mut!(iov);
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len().try_into().unwrap();
+    // SAFETY: msg_control points to a buffer of CMSG_SPACE(sizeof(i32)); CMSG_FIRSTHDR returns
+    // a header within it, and the fd payload write targets exactly one i32 in that buffer.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32)
+            .try_into()
+            .unwrap();
+        std::ptr::write(libc::CMSG_DATA(cmsg).cast::<i32>(), fd_to_send);
+        let n = libc::sendmsg(sock, std::ptr::addr_of!(msg), 0);
+        if n < 0 {
+            Err(format!("sendmsg: {}", errno()))
+        } else {
+            Ok(n)
+        }
+    }
+}
+
+fn send_two_fds_seqpacket(sock: i32, fd1: i32, fd2: i32) -> Result<(), String> {
+    let payload = b"xx";
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast(),
+        iov_len: payload.len(),
+    };
+    let mut control =
+        vec![0u8; unsafe { libc::CMSG_SPACE((2 * std::mem::size_of::<i32>()) as u32) } as usize];
+    // SAFETY: zeroed msghdr is filled with valid iov/control pointers before sendmsg.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = std::ptr::addr_of_mut!(iov);
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len().try_into().unwrap();
+    // SAFETY: control buffer is sized for two i32 fds; writes stay within CMSG_DATA payload.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN((2 * std::mem::size_of::<i32>()) as u32)
+            .try_into()
+            .unwrap();
+        let data = libc::CMSG_DATA(cmsg).cast::<i32>();
+        std::ptr::write(data, fd1);
+        std::ptr::write(data.add(1), fd2);
+        if libc::sendmsg(sock, std::ptr::addr_of!(msg), 0) < 0 {
+            return Err(format!("sendmsg2: {}", errno()));
+        }
+    }
+    Ok(())
+}
+
+fn test_seqpacket_scm_pipe_pair() -> i32 {
+    match (|| -> Result<(), String> {
+        let (left, right) = make_seqpacket_pair()?;
+        let mut pipefd = [0; 2];
+        // SAFETY: pipefd points to two writable i32 slots.
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe: {}", errno()));
+        }
+        send_fd_seqpacket(left, pipefd[1], b"pipe")?;
+        let (fds, _, _) = recv_fds_dgram(right, unsafe { libc::CMSG_SPACE(4) } as usize)?;
+        if fds.len() != 1 {
+            return Err(format!("fd count {}", fds.len()));
+        }
+        let byte = [b'Z'];
+        // SAFETY: fds[0] is the received pipe write end; byte points to one readable byte.
+        if unsafe { libc::write(fds[0], byte.as_ptr().cast(), 1) } != 1 {
+            return Err(format!("write: {}", errno()));
+        }
+        let mut out = [0u8; 1];
+        // SAFETY: pipefd[0] is the read end; out points to one writable byte.
+        if unsafe { libc::read(pipefd[0], out.as_mut_ptr().cast(), 1) } != 1 || out[0] != b'Z' {
+            return Err("pipe read mismatch".into());
+        }
+        for fd in [left, right, pipefd[0], pipefd[1], fds[0]] {
+            unsafe { libc::close(fd) };
+        }
+        Ok(())
+    })() {
+        Ok(()) => {
+            println!("UDS_SEQPACKET_SCM_PIPE_PAIR_OK");
+            0
+        }
+        Err(e) => {
+            println!("UDS_SEQPACKET_SCM_PIPE_PAIR_FAIL:{e}");
+            1
+        }
+    }
+}
+
+fn test_seqpacket_scm_file() -> i32 {
+    match (|| -> Result<(), String> {
+        let (left, right) = make_seqpacket_pair()?;
+        let file_path = format!(
+            "/shared/litebox-uds-seqpacket-scm-file-{}",
+            std::process::id()
+        );
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .map_err(|e| e.to_string())?;
+        send_fd_seqpacket(left, file.as_raw_fd(), b"file")?;
+        let (fds, _, _) = recv_fds_dgram(right, unsafe { libc::CMSG_SPACE(4) } as usize)?;
+        if fds.len() != 1 {
+            return Err(format!("fd count {}", fds.len()));
+        }
+        let data = b"abc";
+        // SAFETY: fds[0] is a received writable file descriptor; data is readable.
+        if unsafe { libc::write(fds[0], data.as_ptr().cast(), data.len()) } != data.len() as isize {
+            return Err(format!("file write: {}", errno()));
+        }
+        // SAFETY: file fd is valid; lseek sets offset to start for verification.
+        unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) };
+        let mut s = String::new();
+        std::io::Read::take(file, 3)
+            .read_to_string(&mut s)
+            .map_err(|e| e.to_string())?;
+        if s != "abc" {
+            return Err(format!("file contents {s:?}"));
+        }
+        for fd in [left, right, fds[0]] {
+            unsafe { libc::close(fd) };
+        }
+        let _ = std::fs::remove_file(file_path);
+        Ok(())
+    })() {
+        Ok(()) => {
+            println!("UDS_SEQPACKET_SCM_FILE_OK");
+            0
+        }
+        Err(e) => {
+            println!("UDS_SEQPACKET_SCM_FILE_FAIL:{e}");
+            1
+        }
+    }
+}
+
+fn test_seqpacket_scm_msg_ctrunc() -> i32 {
+    match (|| -> Result<(), String> {
+        let (left, right) = make_seqpacket_pair()?;
+        let mut p1 = [0; 2];
+        let mut p2 = [0; 2];
+        // SAFETY: p1/p2 point to writable pipe fd arrays.
+        if unsafe { libc::pipe(p1.as_mut_ptr()) } != 0
+            || unsafe { libc::pipe(p2.as_mut_ptr()) } != 0
+        {
+            return Err(format!("pipe: {}", errno()));
+        }
+        send_two_fds_seqpacket(left, p1[1], p2[1])?;
+        let (fds, flags, _) = recv_fds_dgram(right, unsafe { libc::CMSG_LEN(0) } as usize)?;
+        if flags & libc::MSG_CTRUNC == 0 {
+            return Err(format!("missing MSG_CTRUNC flags={flags}"));
+        }
+        if !fds.is_empty() {
+            return Err(format!("fd count {}", fds.len()));
+        }
+        for fd in [left, right, p1[0], p1[1], p2[0], p2[1]] {
+            unsafe { libc::close(fd) };
+        }
+        Ok(())
+    })() {
+        Ok(()) => {
+            println!("UDS_SEQPACKET_SCM_CTRUNC_OK");
+            0
+        }
+        Err(e) => {
+            println!("UDS_SEQPACKET_SCM_CTRUNC_FAIL:{e}");
+            1
+        }
     }
 }
 

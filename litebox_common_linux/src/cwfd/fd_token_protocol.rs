@@ -6880,8 +6880,20 @@ pub fn build_socket_seqpacket_connect_response_ok() -> OwnedFrame {
     }
 }
 pub fn build_socket_seqpacket_send_request(handle_id: u64, payload: &[u8]) -> OwnedFrame {
-    let mut body = Vec::with_capacity(12 + payload.len());
+    build_socket_seqpacket_send_request_with_tokens(handle_id, payload, &[])
+}
+
+pub fn build_socket_seqpacket_send_request_with_tokens(
+    handle_id: u64,
+    payload: &[u8],
+    tokens: &[PassedToken],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + payload.len() + 8 * tokens.len());
     put_u64(&mut body, handle_id);
+    body.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for token in tokens {
+        body.extend_from_slice(&token.raw().to_le_bytes());
+    }
     push_len_bytes(&mut body, payload);
     OwnedFrame {
         opcode: Opcode::SocketSeqPacketSend,
@@ -6890,16 +6902,41 @@ pub fn build_socket_seqpacket_send_request(handle_id: u64, payload: &[u8]) -> Ow
         body,
     }
 }
-pub fn parse_socket_seqpacket_send_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
-    if body.len() < 12 {
+pub fn parse_socket_seqpacket_send_body(
+    body: &[u8],
+) -> Result<(u64, Vec<PassedToken>, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::SocketSeqPacketSend,
-            want: 12,
+            want: 16,
             got: body.len(),
         });
     }
     let handle_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
     let mut off = 8;
+    let token_count = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    let token_bytes = token_count
+        .checked_mul(8)
+        .ok_or(ProtocolError::BodyTooLarge {
+            body_len: u32::MAX,
+            max: BODY_MAX,
+        })?;
+    if off + token_bytes > body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketSend,
+            want: off + token_bytes,
+            got: body.len(),
+        });
+    }
+    let mut tokens = Vec::with_capacity(token_count);
+    for i in 0..token_count {
+        let start = off + 8 * i;
+        tokens.push(PassedToken::from_raw(u64::from_le_bytes(
+            body[start..start + 8].try_into().unwrap(),
+        )));
+    }
+    off += token_bytes;
     let payload = parse_len_bytes(body, &mut off, Opcode::SocketSeqPacketSend)?.to_vec();
     if off != body.len() {
         return Err(ProtocolError::WrongBodyLen {
@@ -6908,7 +6945,7 @@ pub fn parse_socket_seqpacket_send_body(body: &[u8]) -> Result<(u64, Vec<u8>), P
             got: body.len(),
         });
     }
-    Ok((handle_id, payload))
+    Ok((handle_id, tokens, payload))
 }
 pub fn build_socket_seqpacket_send_response_ok(written: u64) -> OwnedFrame {
     build_handle_response(Opcode::SocketSeqPacketSendResponse, written)
@@ -6941,8 +6978,20 @@ pub fn parse_socket_seqpacket_recv_body(body: &[u8]) -> Result<(u64, u32), Proto
     ))
 }
 pub fn build_socket_seqpacket_recv_response_ok(payload: &[u8], flags: u32) -> OwnedFrame {
-    let mut body = Vec::with_capacity(8 + payload.len());
+    build_socket_seqpacket_recv_response_ok_with_tokens(payload, flags, &[])
+}
+
+pub fn build_socket_seqpacket_recv_response_ok_with_tokens(
+    payload: &[u8],
+    flags: u32,
+    tokens: &[PassedToken],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + payload.len() + 8 * tokens.len());
     body.extend_from_slice(&flags.to_le_bytes());
+    body.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for token in tokens {
+        body.extend_from_slice(&token.raw().to_le_bytes());
+    }
     push_len_bytes(&mut body, payload);
     OwnedFrame {
         opcode: Opcode::SocketSeqPacketRecvResponse,
@@ -6953,16 +7002,39 @@ pub fn build_socket_seqpacket_recv_response_ok(payload: &[u8], flags: u32) -> Ow
 }
 pub fn parse_socket_seqpacket_recv_response_ok(
     body: &[u8],
-) -> Result<(Vec<u8>, u32), ProtocolError> {
-    if body.len() < 8 {
+) -> Result<(Vec<u8>, u32, Vec<PassedToken>), ProtocolError> {
+    if body.len() < 12 {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::SocketSeqPacketRecvResponse,
-            want: 8,
+            want: 12,
             got: body.len(),
         });
     }
     let flags = u32::from_le_bytes(body[0..4].try_into().unwrap());
     let mut off = 4;
+    let token_count = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    let token_bytes = token_count
+        .checked_mul(8)
+        .ok_or(ProtocolError::BodyTooLarge {
+            body_len: u32::MAX,
+            max: BODY_MAX,
+        })?;
+    if off + token_bytes > body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketRecvResponse,
+            want: off + token_bytes,
+            got: body.len(),
+        });
+    }
+    let mut tokens = Vec::with_capacity(token_count);
+    for i in 0..token_count {
+        let start = off + 8 * i;
+        tokens.push(PassedToken::from_raw(u64::from_le_bytes(
+            body[start..start + 8].try_into().unwrap(),
+        )));
+    }
+    off += token_bytes;
     let payload = parse_len_bytes(body, &mut off, Opcode::SocketSeqPacketRecvResponse)?.to_vec();
     if off != body.len() {
         return Err(ProtocolError::WrongBodyLen {
@@ -6971,7 +7043,7 @@ pub fn parse_socket_seqpacket_recv_response_ok(
             got: body.len(),
         });
     }
-    Ok((payload, flags))
+    Ok((payload, flags, tokens))
 }
 pub fn build_socket_seqpacket_shutdown_request(handle_id: u64, how: u8) -> OwnedFrame {
     let mut body = Vec::with_capacity(9);

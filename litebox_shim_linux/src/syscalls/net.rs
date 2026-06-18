@@ -3470,7 +3470,7 @@ impl<FS: ShimFS> Task<FS> {
                         return Err(Errno::EISCONN);
                     }
                     let handle = self.broker_socket_seqpacket_handle(typed)?;
-                    handle.with_entry(|entry| entry.send(&self.wait_cx(), buf))
+                    handle.with_entry(|entry| entry.send(&self.wait_cx(), buf, &[]))
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             // inet-listener / inet-raw have no sendto fast path; preserve the
@@ -4152,7 +4152,8 @@ impl<FS: ShimFS> Task<FS> {
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketSeqPacket => self
                 .try_with_broker_socket_seqpacket(sockfd, |typed| {
-                    if msg.msg_controllen != 0 {
+                    let (passed_fds, passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
+                    if !passed_fds.is_empty() {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     if sock_addr.is_some() {
@@ -4160,7 +4161,7 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     let buf = Self::copy_sendmsg_iovs(&iovs)?;
                     let handle = self.broker_socket_seqpacket_handle(typed)?;
-                    handle.with_entry(|entry| entry.send(&self.wait_cx(), &buf))
+                    handle.with_entry(|entry| entry.send(&self.wait_cx(), &buf, &passed_tokens))
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerInetListener
@@ -5057,8 +5058,9 @@ impl<FS: ShimFS> Task<FS> {
                     } else {
                         buf.len() as u32
                     };
-                    let (payload, packet_flags) =
+                    let (payload, packet_flags, tokens) =
                         handle.with_entry(|entry| entry.recv(&self.wait_cx(), recv_len))?;
+                    received_tokens.extend(tokens);
                     let copied = buf.len().min(payload.len());
                     buf[..copied].copy_from_slice(&payload[..copied]);
                     if flags.contains(ReceiveFlags::TRUNC) {
