@@ -3,8 +3,8 @@
 
 //! Architecture-specific platform interfaces.
 //!
-//! As it currently stands, the interfaces here are mostly considered for x86-64, in the future other
-//! architectures might be supported.
+//! As it currently stands, the interfaces here are only considered for x86-64 and aarch64, in
+//! the future other architectures might be supported.
 
 use thiserror::Error;
 
@@ -48,9 +48,7 @@ pub enum ArchSpecificRegister {
 /// Architecture-specific registers for AArch64.
 #[cfg(target_arch = "aarch64")]
 #[non_exhaustive]
-pub enum ArchSpecificRegister {
-    TpidrEl0,
-}
+pub enum ArchSpecificRegister {}
 
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.
 #[non_exhaustive]
