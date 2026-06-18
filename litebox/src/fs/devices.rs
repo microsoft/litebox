@@ -15,8 +15,8 @@ use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
-    Backend, PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason,
-    WalkedComponent,
+    Backend, BackendHandles, DirHandle, FileHandle, PermissionCheck, Permissioned, SeekBehavior,
+    WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -179,6 +179,18 @@ impl<Platform> super::backend::private::Sealed for Devices<Platform> where
 {
 }
 
+impl<Platform> BackendHandles for Devices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::CrngProvider
+        + 'static,
+{
+    type WalkingDirHandle<'a> = DeviceDirHandle;
+    type FileHandle = DeviceFileHandle;
+    type DirHandle = DeviceDirHandle;
+}
+
 impl<Platform> Backend for Devices<Platform>
 where
     Platform: RawSyncPrimitivesProvider
@@ -186,24 +198,18 @@ where
         + crate::platform::CrngProvider
         + 'static,
 {
-    type WalkingDirHandle<'a>
-        = DeviceDirHandle
-    where
-        Self: 'a;
-    type FileHandle = DeviceFileHandle;
-    type DirHandle = DeviceDirHandle;
-
-    fn root(&self) -> Self::WalkingDirHandle<'_> {
-        DeviceDirHandle {
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(DeviceDirHandle {
             location: Location::Root,
-        }
+        })
     }
 
     fn walk_directories<'a>(
         &'a self,
-        from: Self::WalkingDirHandle<'a>,
+        from: WalkingDirHandle<'a>,
         components: &[&str],
-    ) -> Result<WalkOutcome<Self::WalkingDirHandle<'a>>, WalkError> {
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
         // This backend only exposes one directory below root. Device files are
         // final path targets, so directory walking must stop before them.
         let mut location = from.location;
@@ -219,7 +225,7 @@ where
                 (Location::Dev, name) if Device::from_name(name).is_some() => {
                     return Ok(WalkOutcome {
                         components: walked_components,
-                        last: DeviceDirHandle { location },
+                        last: WalkingDirHandle::from_typed::<Self>(DeviceDirHandle { location }),
                         stop_reason: WalkStopReason::StoppedAtNonDirectory,
                     });
                 }
@@ -230,25 +236,28 @@ where
         }
         Ok(WalkOutcome {
             components: walked_components,
-            last: DeviceDirHandle { location },
+            last: WalkingDirHandle::from_typed::<Self>(DeviceDirHandle { location }),
             stop_reason: WalkStopReason::CompleteDirectory,
         })
     }
 
-    fn owned_dir_at(&self, dir: Self::WalkingDirHandle<'_>) -> Self::DirHandle {
-        dir
+    fn owned_dir_at(&self, dir: WalkingDirHandle<'_>) -> DirHandle {
+        DirHandle::from_typed::<Self>(dir.into_typed::<Self>())
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &Self::DirHandle) -> Option<Self::WalkingDirHandle<'a>> {
-        Some(*dir)
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
     }
 
     fn open_file_at(
         &self,
-        dir: Self::WalkingDirHandle<'_>,
+        dir: WalkingDirHandle<'_>,
         name: &str,
         flags: OFlags,
-    ) -> Result<Permissioned<Self::FileHandle>, OpenError> {
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let dir = dir.into_typed::<Self>();
         if dir.location != Location::Dev {
             return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
         }
@@ -271,18 +280,22 @@ where
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
             debug_assert!(matches!(
-                self.truncate(&DeviceFileHandle { device }, 0),
+                self.truncate(
+                    &FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
+                    0
+                ),
                 Err(TruncateError::IsTerminalDevice)
             ));
         }
 
         Ok(Permissioned {
-            item: DeviceFileHandle { device },
+            item: FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
             permissions: PermissionCheck::ByBackend,
         })
     }
 
-    fn list_dir_at(&self, handle: Self::DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let handle = handle.into_typed::<Self>();
         match handle.location {
             Location::Root => Ok(alloc::vec![DirEntry {
                 name: String::from("dev"),
@@ -300,12 +313,8 @@ where
         }
     }
 
-    fn read(
-        &self,
-        h: &Self::FileHandle,
-        buf: &mut [u8],
-        _offset: usize,
-    ) -> Result<usize, ReadError> {
+    fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+        let h = h.get_typed::<Self>();
         match h.device {
             Device::Stdin => self
                 .litebox
@@ -327,7 +336,8 @@ where
         }
     }
 
-    fn write(&self, h: &Self::FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        let h = h.get_typed::<Self>();
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => crate::platform::StdioOutStream::Stdout,
@@ -353,22 +363,24 @@ where
             })
     }
 
-    fn truncate(&self, _h: &Self::FileHandle, _len: usize) -> Result<(), TruncateError> {
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
         Err(TruncateError::IsTerminalDevice)
     }
 
-    fn seek_behavior(&self, h: &Self::FileHandle) -> SeekBehavior {
+    fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
+        let h = h.get_typed::<Self>();
         match h.device {
             Device::Stdin | Device::Stdout | Device::Stderr => SeekBehavior::NonSeekable,
             Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
         }
     }
 
-    fn file_status(&self, h: &Self::FileHandle) -> Result<FileStatus, FileStatusError> {
-        Ok(h.device.file_status())
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(h.get_typed::<Self>().device.file_status())
     }
 
-    fn dir_status(&self, h: &Self::DirHandle) -> Result<FileStatus, FileStatusError> {
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let h = h.get_typed::<Self>();
         Ok(match h.location {
             Location::Root => FileStatus {
                 file_type: FileType::Directory,
@@ -395,37 +407,32 @@ where
 
     fn create_file_at(
         &self,
-        _dir: Self::DirHandle,
+        _dir: DirHandle,
         _name: &str,
         _mode: Mode,
-    ) -> Result<Self::FileHandle, OpenError> {
+    ) -> Result<FileHandle, OpenError> {
         Err(OpenError::ReadOnlyFileSystem)
     }
 
-    fn mkdir_at(
-        &self,
-        _dir: Self::DirHandle,
-        _name: &str,
-        _mode: Mode,
-    ) -> Result<Self::DirHandle, MkdirError> {
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
         Err(MkdirError::ReadOnlyFileSystem)
     }
 
-    fn unlink_at(&self, _dir: Self::DirHandle, _name: &str) -> Result<(), UnlinkError> {
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
         Err(UnlinkError::ReadOnlyFileSystem)
     }
 
-    fn rmdir_at(&self, _dir: Self::DirHandle, _name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
-    fn chmod_at(&self, _dir: Self::DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
     fn chown_at(
         &self,
-        _dir: Self::DirHandle,
+        _dir: DirHandle,
         _name: &str,
         _user: Option<u16>,
         _group: Option<u16>,

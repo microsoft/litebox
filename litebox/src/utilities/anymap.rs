@@ -32,7 +32,7 @@ mod private {
 }
 use private::Tid;
 
-trait AnyCloneSendSync: Any + Send + Sync {
+pub(crate) trait AnyCloneSendSync: Any + Send + Sync {
     fn clone_to_any(&self) -> Box<dyn AnyCloneSendSync>;
 }
 impl<T: Any + Clone + Send + Sync> AnyCloneSendSync for T {

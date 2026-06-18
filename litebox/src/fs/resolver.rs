@@ -18,7 +18,10 @@ use super::errors::{
 };
 use super::{
     FileType, Mode, OFlags,
-    backend::{PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome, WalkStopReason},
+    backend::{
+        DirHandle, FileHandle, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
+        WalkStopReason, WalkingDirHandle,
+    },
 };
 
 /// The north-facing filesystem entry point, generic over a [`Backend`](super::backend::Backend).
@@ -156,10 +159,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     Resolver<Platform, Backend>
 {
     fn parent_dir_and_name<'a>(
-        &'a self,
+        &self,
         context: &Context,
         path: &'a ResolvedPath,
-    ) -> Result<Option<(Backend::WalkingDirHandle<'a>, &'a str)>, WalkError> {
+    ) -> Result<Option<(WalkingDirHandle<'_>, &'a str)>, WalkError> {
         // Return the walking handle rather than an owned directory handle so backends can keep any
         // locks acquired during path resolution held across the final operation. This lets e.g.
         // "walk parent + mutate child" stay atomic.
@@ -179,10 +182,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     fn walk_to_directory<'a>(
         &'a self,
         context: &Context,
-        from: Backend::WalkingDirHandle<'a>,
+        from: WalkingDirHandle<'a>,
         components: &[&str],
         #[cfg(debug_assertions)] absolute_components: &[&str],
-    ) -> Result<Backend::WalkingDirHandle<'a>, WalkError> {
+    ) -> Result<WalkingDirHandle<'a>, WalkError> {
         if components.is_empty() {
             // TODO(jayb): Decide whether empty walks from a non-root handle need permission checks.
             return Ok(from);
@@ -215,10 +218,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     fn walk_path<'a>(
         &'a self,
         context: &Context,
-        from: Backend::WalkingDirHandle<'a>,
+        from: WalkingDirHandle<'a>,
         components: &[&str],
         #[cfg(debug_assertions)] absolute_components: &[&str],
-    ) -> Result<(WalkOutcome<Backend::WalkingDirHandle<'a>>, usize), WalkError> {
+    ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
         assert!(!components.is_empty());
         let outcome = self.backend.walk_directories(from, components)?;
         Self::check_walk_permissions(
@@ -251,7 +254,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     fn check_walk_permissions(
         context: &Context,
         #[cfg(debug_assertions)] absolute_components: &[&str],
-        outcome: &WalkOutcome<Backend::WalkingDirHandle<'_>>,
+        outcome: &WalkOutcome<WalkingDirHandle<'_>>,
     ) -> Result<(), PathError> {
         for (idx, walked) in outcome.components.iter().enumerate() {
             match &walked.permissions {
@@ -317,6 +320,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         let insert = |handle, seek_behavior| {
             self.litebox.descriptor_table_mut().insert(ResolverEntry {
                 handle,
+                _backend: core::marker::PhantomData,
                 read_allowed,
                 write_allowed,
                 position: 0,
@@ -740,9 +744,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 }
 
 /// A file or a directory handle
-enum OwnedHandle<Backend: super::backend::Backend> {
-    File(Backend::FileHandle),
-    Dir(Backend::DirHandle),
+enum OwnedHandle {
+    File(FileHandle),
+    Dir(DirHandle),
 }
 
 #[expect(
@@ -750,7 +754,8 @@ enum OwnedHandle<Backend: super::backend::Backend> {
     reason = "resolver fd entries carry independent descriptor flags"
 )]
 struct ResolverEntry<Backend: super::backend::Backend> {
-    handle: OwnedHandle<Backend>,
+    handle: OwnedHandle,
+    _backend: core::marker::PhantomData<Backend>,
     read_allowed: bool,
     write_allowed: bool,
     position: usize,

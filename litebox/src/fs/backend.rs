@@ -3,7 +3,12 @@
 
 //! [`Backend`] for filesystems supported by [`super::resolver`]
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::any::{Any, TypeId};
+use core::marker::PhantomData;
+
+use crate::utilities::anymap::AnyCloneSendSync;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
@@ -38,18 +43,9 @@ pub(super) mod private {
 }
 
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
-pub trait Backend: private::Sealed + Send + Sync + 'static {
-    /// Supporting walk through the backend
-    type WalkingDirHandle<'a>: 'a;
-
-    /// An owned handle to an open file
-    type FileHandle: Clone + Send + Sync + 'static;
-
-    /// An owned handle to an open directory
-    type DirHandle: Clone + Send + Sync + 'static;
-
+pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Obtain access to the root directory of the backend.
-    fn root(&self) -> Self::WalkingDirHandle<'_>;
+    fn root(&self) -> WalkingDirHandle<'_>;
 
     /// Walk one or more `components` starting from the `from` handle.
     ///
@@ -60,12 +56,12 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
     /// `WalkStopReason::StoppedAtNonDirectory`.
     fn walk_directories<'a>(
         &'a self,
-        from: Self::WalkingDirHandle<'a>,
+        from: WalkingDirHandle<'a>,
         components: &[&str],
-    ) -> Result<WalkOutcome<Self::WalkingDirHandle<'a>>, WalkError>;
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError>;
 
     /// Take an owned handle to a `dir` found via a walk.
-    fn owned_dir_at(&self, dir: Self::WalkingDirHandle<'_>) -> Self::DirHandle;
+    fn owned_dir_at(&self, dir: WalkingDirHandle<'_>) -> DirHandle;
 
     /// Obtain a walking handle to an existing owned dir.
     ///
@@ -74,28 +70,27 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
     ///
     /// XXX(jayb): We will likely migrate away from `Option` here when we do a bit of an overhaul of
     /// the `errors` module in order to more consistently support stale errors everywhere.
-    fn walking_dir_at<'a>(&'a self, dir: &Self::DirHandle) -> Option<Self::WalkingDirHandle<'a>>;
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>>;
 
     /// Open an (existing) file at `dir`.
     ///
     /// To create a file, you need [`Self::create_file_at`].
     fn open_file_at(
         &self,
-        dir: Self::WalkingDirHandle<'_>,
+        dir: WalkingDirHandle<'_>,
         name: &str,
         flags: OFlags,
-    ) -> Result<Permissioned<Self::FileHandle>, OpenError>;
+    ) -> Result<Permissioned<FileHandle>, OpenError>;
 
     /// Read directory entries at `dir`.
-    fn list_dir_at(&self, handle: Self::DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
 
     /// Read at `offset` into `buf`, returning the number of bytes read.
     ///
     /// Backends do not have an internal notion of offsets; instead the resolver maintains offsets
     /// as needed. For files with non-position-based [`SeekBehavior`], such as `stdin`, the resolver
     /// passes zero and the backend should ignore the offset.
-    fn read(&self, h: &Self::FileHandle, buf: &mut [u8], offset: usize)
-    -> Result<usize, ReadError>;
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError>;
 
     /// Optional performance hook: get static backing data for a file, if available and supported.
     ///
@@ -104,7 +99,7 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
     ///
     /// Returns `None` if indicating no static backing data is available/supported.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn get_static_backing_data(&self, h: &Self::FileHandle) -> Option<&'static [u8]> {
+    fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
         None
     }
 
@@ -116,57 +111,154 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
     // it ugly on the interface side here. It would be very ugly for us to pass in extra flags, or
     // indeed even need to maintain/handle seeking on every backend; mostly we need some sort of
     // nicer locking discipline, but I don't want to block the MVP for this just yet.
-    fn write(&self, h: &Self::FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError>;
+    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError>;
 
     /// Truncate the file to the specified length.
     ///
     /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
     /// adding `\0`s.
-    fn truncate(&self, h: &Self::FileHandle, length: usize) -> Result<(), TruncateError>;
+    fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError>;
 
     /// Describe seek behavior for an open file handle.
-    fn seek_behavior(&self, h: &Self::FileHandle) -> SeekBehavior;
+    fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
 
     /// Status of an open file handle.
-    fn file_status(&self, h: &Self::FileHandle) -> Result<FileStatus, FileStatusError>;
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError>;
 
     /// Status of an open directory handle.
-    fn dir_status(&self, h: &Self::DirHandle) -> Result<FileStatus, FileStatusError>;
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError>;
 
     /// Create a new file at `parent` with the given `name` and `mode`.
     fn create_file_at(
         &self,
-        dir: Self::DirHandle,
+        dir: DirHandle,
         name: &str,
         mode: Mode,
-    ) -> Result<Self::FileHandle, OpenError>;
+    ) -> Result<FileHandle, OpenError>;
 
     /// Create a new directory at `parent` with the given `name` and `mode`.
-    fn mkdir_at(
-        &self,
-        dir: Self::DirHandle,
-        name: &str,
-        mode: Mode,
-    ) -> Result<Self::DirHandle, MkdirError>;
+    fn mkdir_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<DirHandle, MkdirError>;
 
     /// Remove the file `name` at `parent`.
-    fn unlink_at(&self, dir: Self::DirHandle, name: &str) -> Result<(), UnlinkError>;
+    fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError>;
 
     /// Remove the directory `name` at `parent`.
     // XXX(jayb): I don't like that unlink and rmdir exist separately, we should probably merge them.
-    fn rmdir_at(&self, dir: Self::DirHandle, name: &str) -> Result<(), RmdirError>;
+    fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError>;
 
     /// Update the permissions for the file/dir `name` at `parent`.
-    fn chmod_at(&self, dir: Self::DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError>;
+    fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError>;
 
     /// Update the owner/group for the file/dir `name` at `parent`.
     fn chown_at(
         &self,
-        dir: Self::DirHandle,
+        dir: DirHandle,
         name: &str,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
+}
+
+/// Concrete handle types used by a backend.
+///
+/// This trait is intentionally separate from [`Backend`]: the dyn-safe [`Backend`] interface keeps
+/// using erased handle wrappers, while concrete backend implementations can use these associated
+/// types at their own boundaries instead of spelling out manual erased-handle downcasts.
+pub(crate) trait BackendHandles {
+    /// Supporting walk through the backend
+    type WalkingDirHandle<'a>: 'a;
+    /// An owned handle to an open file
+    type FileHandle: Clone + Send + Sync + 'static;
+    /// An owned handle to an open directory
+    type DirHandle: Clone + Send + Sync + 'static;
+}
+
+/// Supporting walk through the backend
+pub struct WalkingDirHandle<'a> {
+    backend_type: TypeId,
+    raw: Box<dyn ErasedWalkingDirHandle + 'a>,
+    _invariant: PhantomData<fn(&'a ()) -> &'a ()>,
+}
+
+/// An owned handle to an open file
+#[derive(Clone)]
+pub struct FileHandle {
+    raw: Box<dyn AnyCloneSendSync>,
+}
+
+/// An owned handle to an open directory
+#[derive(Clone)]
+pub struct DirHandle {
+    raw: Box<dyn AnyCloneSendSync>,
+}
+
+trait ErasedWalkingDirHandle {
+    fn into_raw(self: Box<Self>) -> *mut ();
+}
+
+impl<H> ErasedWalkingDirHandle for H {
+    fn into_raw(self: Box<Self>) -> *mut () {
+        Box::into_raw(self).cast()
+    }
+}
+
+impl<'a> WalkingDirHandle<'a> {
+    pub(super) fn from_typed<B: BackendHandles + 'static>(handle: B::WalkingDirHandle<'a>) -> Self {
+        Self {
+            backend_type: TypeId::of::<B>(),
+            raw: Box::new(handle),
+            _invariant: PhantomData,
+        }
+    }
+
+    /// Recover the concrete walking handle stored in this erased handle for `B`.
+    pub(super) fn into_typed<B: BackendHandles + 'static>(self) -> B::WalkingDirHandle<'a> {
+        assert_eq!(
+            self.backend_type,
+            TypeId::of::<B>(),
+            "backend walking directory handle type mismatch"
+        );
+        // SAFETY: `from_typed::<B>` records `TypeId::of::<B>()` and stores a
+        // `B::WalkingDirHandle<'a>`. `WalkingDirHandle<'a>` is invariant in `'a`, so the lifetime
+        // parameter cannot have been changed since construction. The assertion above confirms that
+        // this handle is being recovered for the same backend type, and together these guarantee
+        // that the allocation has the expected concrete type.
+        unsafe { *Box::from_raw(self.raw.into_raw().cast::<B::WalkingDirHandle<'a>>()) }
+    }
+}
+
+impl FileHandle {
+    pub(super) fn from_typed<B: BackendHandles>(handle: B::FileHandle) -> Self {
+        Self {
+            raw: Box::new(handle),
+        }
+    }
+
+    pub(super) fn get_typed<B: BackendHandles>(&self) -> &B::FileHandle {
+        (&*self.raw as &dyn Any)
+            .downcast_ref::<B::FileHandle>()
+            .expect("backend file handle type mismatch")
+    }
+}
+
+impl DirHandle {
+    pub(super) fn from_typed<B: BackendHandles>(handle: B::DirHandle) -> Self {
+        Self {
+            raw: Box::new(handle),
+        }
+    }
+
+    pub(super) fn get_typed<B: BackendHandles>(&self) -> &B::DirHandle {
+        (&*self.raw as &dyn Any)
+            .downcast_ref::<B::DirHandle>()
+            .expect("backend directory handle type mismatch")
+    }
+
+    pub(super) fn into_typed<B: BackendHandles>(self) -> B::DirHandle {
+        let raw: Box<dyn Any> = self.raw;
+        *raw.downcast::<B::DirHandle>()
+            .expect("backend directory handle type mismatch")
+    }
 }
 
 /// A successful walk of directories through the backend
@@ -231,4 +323,16 @@ pub(super) struct WalkedComponent {
 pub(super) struct PermissionInfo {
     pub(super) mode: Mode,
     pub(super) owner: UserInfo,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Backend;
+
+    #[test]
+    fn backend_is_dyn_safe() {
+        fn assert_dyn_safe(_: Option<&dyn Backend>) {}
+
+        assert_dyn_safe(None);
+    }
 }
