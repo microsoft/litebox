@@ -18,8 +18,8 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
     }
 
     let rights = {
-        let state = session.core.state.read();
-        state
+        session
+            .core
             .policy
             .authorize_create_event(session.caller_credential)?
     };

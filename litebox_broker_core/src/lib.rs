@@ -84,22 +84,19 @@ const MAX_OBJECTS: usize = u32::MAX as usize - 1;
 /// core has already been constructed.
 #[derive(Clone)]
 pub struct BrokerCore {
-    pub(crate) state: Arc<RwLock<BrokerCoreState>>,
-}
-
-pub(crate) struct BrokerCoreState {
     pub(crate) policy: PolicyEngine,
     pub(crate) limits: BrokerCoreLimits,
-    pub(crate) next_session_id: u64,
-    pub(crate) next_reference_handle: u64,
-    pub(crate) objects: SlotMap<ObjectId, Arc<RwLock<ObjectEntry>>>,
-    pub(crate) references: BTreeMap<ObjectHandle, ObjectReference>,
+    pub(crate) next_session_id: Arc<RwLock<u64>>,
+    pub(crate) next_reference_handle: Arc<RwLock<u64>>,
+    pub(crate) objects: Arc<RwLock<SlotMap<ObjectId, Arc<RwLock<ObjectEntry>>>>>,
+    pub(crate) references: Arc<RwLock<BTreeMap<ObjectHandle, ObjectReference>>>,
 }
 
-impl BrokerCoreState {
-    pub(crate) fn allocate_reference_handle(&mut self) -> Result<ObjectHandle> {
-        let handle = ObjectHandle(self.next_reference_handle);
-        self.next_reference_handle = handle
+impl BrokerCore {
+    pub(crate) fn allocate_reference_handle(&self) -> Result<ObjectHandle> {
+        let mut next_reference_handle = self.next_reference_handle.write();
+        let handle = ObjectHandle(*next_reference_handle);
+        *next_reference_handle = handle
             .0
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
@@ -126,22 +123,20 @@ impl BrokerCore {
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
 
         Ok(Self {
-            state: Arc::new(RwLock::new(BrokerCoreState {
-                policy,
-                limits,
-                next_session_id: 1,
-                next_reference_handle: 1,
-                objects: SlotMap::with_key(),
-                references: BTreeMap::new(),
-            })),
+            policy,
+            limits,
+            next_session_id: Arc::new(RwLock::new(1)),
+            next_reference_handle: Arc::new(RwLock::new(1)),
+            objects: Arc::new(RwLock::new(SlotMap::with_key())),
+            references: Arc::new(RwLock::new(BTreeMap::new())),
         })
     }
 
     /// Allocates broker authority state for one authenticated caller session.
     pub fn create_session(&self, caller_credential: CallerCredential) -> Result<BrokerSession> {
-        let mut state = self.state.write();
-        let session_id = state.next_session_id;
-        state.next_session_id = session_id
+        let mut next_session_id = self.next_session_id.write();
+        let session_id = *next_session_id;
+        *next_session_id = session_id
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         Ok(BrokerSession::new(
