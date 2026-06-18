@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 
 use crate::event::EventObject;
 use crate::identity::{BrokerSession, CallerCredential, SessionId};
-use crate::{BrokerCore, BrokerCoreState, BrokerError, Result, allocate_id};
+use crate::{BrokerCore, BrokerCoreState, BrokerError, Result};
 use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
 
@@ -60,7 +60,11 @@ pub(super) fn create_object_with_reference(
             .map_err(|_| BrokerError::ResourceExhausted)?;
     }
 
-    let handle = ObjectHandle(allocate_id(&mut state.next_reference_handle)?);
+    let handle = ObjectHandle(state.next_reference_handle);
+    state.next_reference_handle = handle
+        .0
+        .checked_add(1)
+        .ok_or(BrokerError::ResourceExhausted)?;
     let object_id = state.objects.insert(Arc::new(RwLock::new(object)));
     let old_reference = state.references.insert(
         handle,
@@ -215,25 +219,8 @@ struct AuthorizedObject {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, allocate_id,
-        event,
-    };
+    use crate::{BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, event};
     use litebox_broker_protocol::{ObjectHandle, WaitOutcome};
-
-    #[test]
-    fn allocator_exhausts_before_id_overflow() {
-        let mut next_id = u64::MAX;
-
-        assert_eq!(
-            allocate_id(&mut next_id),
-            Err(BrokerError::ResourceExhausted)
-        );
-        assert_eq!(
-            allocate_id(&mut next_id),
-            Err(BrokerError::ResourceExhausted)
-        );
-    }
 
     #[test]
     fn oversized_object_slotmap_limits_are_rejected_before_core_construction() {

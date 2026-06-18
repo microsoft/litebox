@@ -129,7 +129,10 @@ impl BrokerCore {
     /// Allocates broker authority state for one authenticated caller session.
     pub fn create_session(&self, caller_credential: CallerCredential) -> Result<BrokerSession> {
         let mut state = self.state.write();
-        let session_id = allocate_id(&mut state.next_session_id)?;
+        let session_id = state.next_session_id;
+        state.next_session_id = session_id
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
         Ok(BrokerSession::new(
             self.clone(),
             identity::SessionId::new(session_id),
@@ -140,10 +143,4 @@ impl BrokerCore {
     pub(crate) fn close_session(&self, session_id: identity::SessionId) {
         object::drop_references_for_session(self, session_id);
     }
-}
-
-fn allocate_id(next_id: &mut u64) -> Result<u64> {
-    let id = *next_id;
-    *next_id = id.checked_add(1).ok_or(BrokerError::ResourceExhausted)?;
-    Ok(id)
 }
