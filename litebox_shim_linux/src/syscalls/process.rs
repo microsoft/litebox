@@ -7186,16 +7186,28 @@ impl<FS: ShimFS> Task<FS> {
                 .parked_count
                 .underlying_atomic()
                 .load(Ordering::Acquire);
-            let expected_now = {
+            let (expected_now, threads_to_interrupt) = {
                 let inner = self.thread.process.inner.lock();
-                u32::try_from(
+                let expected_now = u32::try_from(
                     inner
                         .threads
                         .len()
                         .checked_sub(1)
                         .expect("calling thread must be in the map"),
                 )
-                .expect("thread count must fit in u32")
+                .expect("thread count must fit in u32");
+                let threads_to_interrupt = inner
+                    .threads
+                    .iter()
+                    .filter_map(|(&tid, thread)| {
+                        if tid == self.tid || !thread.is_suspended.load(Ordering::Relaxed) {
+                            None
+                        } else {
+                            Some(thread.clone())
+                        }
+                    })
+                    .collect::<alloc::vec::Vec<_>>();
+                (expected_now, threads_to_interrupt)
             };
             if n >= expected_now {
                 break;
@@ -7207,7 +7219,17 @@ impl<FS: ShimFS> Task<FS> {
                 .process_registry()
                 .notify_waiters(self.process_id);
             self.thread.process.nr_threads.wake_all();
-            let _ = ps.vfork_parking.parked_count.block(n);
+            // ThreadHandle::interrupt is edge-triggered while the target is
+            // running in host/shim code. Re-arm it on a conservative timeout
+            // so a sibling that enters a guest futex wait after the initial
+            // interrupt still breaks out and reaches the park checkpoint.
+            for thread in threads_to_interrupt {
+                thread.interrupt();
+            }
+            let _ = ps
+                .vfork_parking
+                .parked_count
+                .block_or_timeout(n, core::time::Duration::from_millis(50));
         }
         Ok(true)
     }

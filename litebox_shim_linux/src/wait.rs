@@ -129,16 +129,37 @@ impl<FS: ShimFS> Task<FS> {
 
         let ps = self.process_state.borrow();
 
-        // Fast path: check the process-wide flag first (Acquire pairs with
-        // the Release store in park_other_threads).
+        // Fast path: either suspension signal must force a park. Most threads
+        // observe `park=1`, but `park_other_threads` sets per-thread
+        // `is_suspended` before publishing `park`, so a sibling interrupted in
+        // that narrow window can reach this checkpoint with `is_suspended=true`
+        // and `park=0`.
         if ps
             .vfork_parking
             .park
             .underlying_atomic()
             .load(Ordering::Acquire)
             == 0
+            && !self.is_suspended()
         {
             return;
+        }
+
+        // Close the setup window described above. Do not count ourselves as
+        // parked until the process-wide futex is published; otherwise we could
+        // increment and immediately decrement while `park` is still 0, letting
+        // the forker miss our park entirely.
+        while ps
+            .vfork_parking
+            .park
+            .underlying_atomic()
+            .load(Ordering::Acquire)
+            == 0
+        {
+            if !self.is_suspended() || self.is_exiting() {
+                return;
+            }
+            core::hint::spin_loop();
         }
 
         // Before doing a normal park (which increments parked_count), try

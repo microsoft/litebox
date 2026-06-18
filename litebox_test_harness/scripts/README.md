@@ -490,6 +490,72 @@ sqlite3 <main-worktree>/.dashboard/results.sqlite \
   "SELECT value FROM meta WHERE key='schema_version'"
 ```
 
+### Standardized regression classification (`regression_class` view)
+
+Instead of hand-rolling "is this test regressing on my branch?"
+queries, read the **`regression_class`** view — a pure-SQL,
+flaky-aware, confidence-tiered classifier. It's consumable from plain
+`sqlite3` (no Python), and every consumer gets the identical verdict.
+
+```sh
+# CLI:
+sqlite3 <main-worktree>/.dashboard/results.sqlite \
+  "SELECT test_id, classification, confidence FROM regression_class
+    WHERE branch='wportnoy/my-branch' AND mode='litebox'
+      AND classification='hard_regression'"
+
+# or the wrapper (refreshes caches first, then prints grouped):
+dashboard.py regressions wportnoy/my-branch
+dashboard.py regressions <sha-prefix> --format sql
+```
+
+Each failing `(test_id, mode)` on a branch is classified by comparing
+its state at the branch HEAD against its `merge-base` baseline, plus
+the test's recent flakiness **on the upstream lineage** (tracked-ref CI
+runs only — so a genuine branch regression isn't mistaken for a flake):
+
+| `classification` | Meaning |
+|---|---|
+| `hard_regression` | Stable pass upstream → **fails** on branch. **Really bad.** |
+| `soft_regression` | Fails on branch, but was already flaky upstream / at baseline. Discount. |
+| `new_fail` | Fails on branch, no definitive baseline pass to compare. |
+| `preexisting_fail` | Failed at baseline too — not a regression. |
+| `flaky_pass` | Passes on branch but flaked (retry-recovered) at the sha. |
+| `no_result` | Branch produced only `no_result` (infra non-outcome, ~1% background) — **not** a regression. |
+| `not_run` | In the comparable universe (has a baseline verdict) but **not yet run at the branch sha** — an explicit coverage gap, *not* a pass. |
+| `ok` | Pass, no regression. |
+
+The view drives off the **comparable universe** (every test with a
+definitive verdict at the merge-base baseline, plus everything covered
+at the branch) via a LEFT JOIN, so a test that simply hasn't run on the
+branch surfaces as `not_run` instead of vanishing. This is the guard
+against a *partial* run reading as "clean": `dashboard.py regressions`
+prints a coverage line per pass — e.g. `litebox: hard_regression/high=80
+… [covered 1543/5677, 4134 not_run]` — so a thin sample is obviously
+provisional, never silently mistaken for green.
+
+Classification keys off the **freshest *definitive* verdict** (most
+recent `pass`/`fail`, ignoring `no_result`): a `no_result` never reads
+as a failure (it's infra noise, and `dashboard.py regressions` reports
+it separately), and a real `fail` is never masked by a later
+`no_result` hiccup. A regression requires a definitive `pass` at the
+merge-base baseline *and* a definitive `fail` on the branch.
+
+`confidence` is `high` / `medium` / `low` (or `n/a`): `high` needs the
+branch to fail the **full retry budget** (`LITEBOX_FILL_FAIL_RETRIES`,
+default 3, all definitive fails) *and* the upstream to be
+well-observed-stable — so a 2-of-3 (which a timing/load-sensitive test
+can hit under the shadow's build load while upstream passes it) stays
+`medium`, not high. `low` flags thin evidence — the explicit "not enough
+data to judge yet" signal. Almost everything is a live derivation:
+`test_flake_stats` (the upstream recent-flake tally) is itself a view,
+kept cheap by an index on
+`runs(worktree_path)`. The *only* materialized table is `branch_baseline`
+— the git `merge-base(branch_HEAD, tracked_tip)` map, which SQLite has no
+way to compute — refreshed each cycle by the `dashboard.py auto`
+supervisor. `(hard + soft)` reconciles exactly with the old binary
+regression count; it just splits it by severity.
+
 ## `analyze-test-timing.py` — per-test timing summaries
 
 Reads `run_results` from
