@@ -384,12 +384,12 @@ driving.
 
 **Surfacing.** Results land in the existing `runs` /
 `run_results` tables under the worktree's own `(commit_sha,
-dirty_hash, worktree_path)`, so they automatically appear in the
-Result-groups stacked-state breakdown. A NEW "Agent worktrees"
-section in `summary.md` is rendered **directly from the
-`regression_class` view** (the same classifier as `dashboard.py
-regressions <branch>`) — one materialization of the view drives
-every row. Per worktree it reports, per pass (native / litebox):
+dirty_hash, worktree_path)`, so they feed every per-state query
+in the store. The "Agent worktrees" section in `summary.md` is
+rendered **directly from the `regression_class` view** (the same
+classifier as `dashboard.py regressions <branch>`) — one
+materialization of the view drives every row. Per worktree it
+reports, per pass (native / litebox):
 
 - **Regressions** — hard / soft counts with the classifier's
   `hi/md/lo` confidence, and `N inh` when some are *inherited*
@@ -453,31 +453,39 @@ dashboard.py untrack origin/wportnoy/vscode-server-in-litebox --force
 
 ### Render shape
 
-`summary.md` shows two **orthogonal** dimensions per (pass, tracked
-ref):
+`summary.md` is top-weighted on the two tables consumers read:
 
-- **Coverage** — `covered / universe (%)` of `(test_id, pass)`
-  pairs with a clean-state result at the ref's current HEAD.
-- **Pass rate** — `N pass / N FAIL` of the covered set.
+- **Tracked refs** — per (pass, tracked ref): **Coverage**
+  (`covered / universe (%)` of `(test_id, pass)` pairs with a
+  clean-state result at the ref's current HEAD) and **Pass rate**
+  (`N pass / N FAIL` of the covered set).
+- **Agent worktrees** — per agent worktree: the `regression_class`
+  classification (hard/soft with confidence, fixed, inherited) and
+  coverage vs the merge-base baseline (see the regression-classifier
+  section above).
 
-Plus a **Result groups** table partitioned by
-`(commit_sha, dirty_hash)` — each unique test-state stands alone, so
-a pass on branch A can't mask a FAIL on branch B. Tracked refs are
-italic-tagged in the table; ad-hoc agent-worktree runs appear as
-their own rows.
+Plus a meta header, a velocity pulse, and a **Current FAILs** section
+(collapsed in a `<details>`) — the absolute "red right now" list of
+failing `(test_id, pass)` at the 5 most recent states, which the
+*relative* classifier can't provide. Its `<summary>` shows the failing
+count at a glance.
 
-Plus a current-FAILs list and recent-runs log.
+The former **Result groups** (per-`(commit_sha, dirty_hash)`
+stacked-state breakdown), **By suite × group**, and **Recent runs**
+sections were retired from the always-on render to keep it focused on
+what's read. Nothing is lost: that data is unchanged in sqlite and
+reachable on demand — `dashboard.py regressions <branch>` for
+per-branch triage, `dashboard.py status` for a snapshot, or a direct
+SQL query against `run_results` / `regression_class`.
 
-**Live-branch filter.** Per-branch sections (Result groups, Recent
-runs) hide rows whose only branch attribution is a branch that no
-longer exists in the canonical clone (`git for-each-ref refs/heads/`
-union `tracked_refs.ref`). This keeps the report focused on
-in-flight work — data is never deleted from sqlite, just not
-rendered. Tracked-ref-tagged rows always survive (tracked refs
-are live by definition). A small footer note records the count of
-hidden rows so the omission is visible. The Agent worktrees and
-Tracked refs sections are already live-only (driven by `git
-worktree list` and the explicit `tracked_refs` table).
+**Live-branch filter.** Current FAILs and the per-branch sections hide
+rows whose only branch attribution is a branch that no longer exists in
+the canonical clone (`git for-each-ref refs/heads/` union
+`tracked_refs.ref`). This keeps the report focused on in-flight work —
+data is never deleted from sqlite, just not rendered. Tracked-ref-tagged
+rows always survive (tracked refs are live by definition). The Agent
+worktrees and Tracked refs sections are already live-only (driven by
+`git worktree list` and the explicit `tracked_refs` table).
 
 ### Consuming the dashboard from a coding-agent session
 
