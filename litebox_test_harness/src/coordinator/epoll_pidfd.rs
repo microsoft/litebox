@@ -122,6 +122,8 @@ const EPOLL_SPIN_TIMERFD: HandlerToken<(), EpollSpinOut> =
     HandlerToken::new("epoll_pidfd.epoll_spin_timerfd");
 const EPOLL_SPIN_TIMERFD_INHERITED_FORK: HandlerToken<(), EpollSpinOut> =
     HandlerToken::new("epoll_pidfd.epoll_spin_timerfd_inherited_fork");
+const EPOLL_SPIN_BROKER_UDP_WRITABLE: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_spin_broker_udp_writable");
 
 #[derive(Serialize, Deserialize, Debug)]
 struct EpollSpinOut {
@@ -388,6 +390,64 @@ async fn handle_epoll_spin_eventfd_idle(
     })
 }
 
+async fn handle_epoll_spin_broker_udp_writable(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    // A broker-held InetDgram (UDP) socket is *always* writable: under
+    // litebox its broker readiness (`current_events`) always includes
+    // NOTIFY_EVENT_OUT. Register it EPOLLOUT|EPOLLET — the writable edge
+    // must fire exactly once, then `epoll_pwait` must BLOCK (no new edge),
+    // which is what the native kernel does. If litebox's worker-local
+    // epoll does not honor EPOLLET for a broker fd's persistent
+    // writability, EPOLLOUT re-fires on every wait and the loop spins —
+    // the VS Code agent-host signature (epoll_pwait + clock_gettime hot
+    // loop). This is the axis the eventfd/timerfd spin probes do not
+    // cover: a broker *socket* whose readiness lives in the broker.
+    let sock = std::net::UdpSocket::bind(("127.0.0.1", 0))
+        .map_err(|e| HandlerError(format!("udp bind: {e}")))?;
+    sock.set_nonblocking(true)
+        .map_err(|e| HandlerError(format!("set_nonblocking: {e}")))?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        sock.as_raw_fd(),
+        (libc::EPOLLOUT | libc::EPOLLET) as u32,
+        3,
+    )?;
+
+    // First wait consumes the initial writable edge.
+    let first = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+    let loop_start = Instant::now();
+    let loop_deadline = loop_start + Duration::from_secs(5);
+    let mut iterations = 0_u64;
+    let mut zero_event_returns = u64::from(first.events == 0);
+    // Never write to the socket: no new writable edge should occur, so an
+    // EPOLLET registration must block until each timeout.
+    while Instant::now() < loop_deadline {
+        let sample = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+        iterations += 1;
+        zero_event_returns += u64::from(sample.events == 0);
+    }
+    let loop_elapsed_ms = elapsed_ms(loop_start.elapsed());
+    Ok(EpollSpinOut {
+        detail: format!(
+            "step=broker_udp_writable_et first_events={} first_elapsed_ms={} iterations={} loop_elapsed_ms={} zero_event_returns={}",
+            first.events,
+            elapsed_ms(first.elapsed),
+            iterations,
+            loop_elapsed_ms,
+            zero_event_returns
+        ),
+        first_elapsed_ms: elapsed_ms(first.elapsed),
+        first_events: first.events,
+        iterations,
+        loop_elapsed_ms,
+        timer_ready: 0,
+        zero_event_returns,
+    })
+}
+
 async fn handle_epoll_spin_timerfd(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -512,6 +572,10 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
         EPOLL_SPIN_TIMERFD_INHERITED_FORK,
         handle_epoll_spin_timerfd_inherited_fork
     );
+    register_handler!(
+        EPOLL_SPIN_BROKER_UDP_WRITABLE,
+        handle_epoll_spin_broker_udp_writable
+    );
 
     for &agent in EPI_AGENTS {
         for def in EPI_SCENARIOS {
@@ -591,6 +655,14 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
             &EPOLL_SPIN_TIMERFD_INHERITED_FORK,
             check_epoll_spin_timerfd,
         );
+        reg.single_agent_handler_test(
+            "vscode",
+            "epoll_pidfd",
+            format!("EP.spin.broker_udp_writable_et.{agent}"),
+            agent,
+            &EPOLL_SPIN_BROKER_UDP_WRITABLE,
+            check_epoll_spin_broker_udp_writable,
+        );
     }
 }
 
@@ -614,6 +686,19 @@ fn check_epoll_spin_timerfd(out: &EpollSpinOut) -> Result<String, String> {
         && out.timer_ready == out.iterations + 1
         && out.zero_event_returns == 0
     {
+        Ok(out.detail.clone())
+    } else {
+        Err(out.detail.clone())
+    }
+}
+
+fn check_epoll_spin_broker_udp_writable(out: &EpollSpinOut) -> Result<String, String> {
+    // 5s loop with 1000ms timeouts: a correctly-blocking EPOLLET epoll
+    // does at most ~5 iterations (each wait blocks until the timeout
+    // because the writable edge already fired once). A spin — the broker
+    // fd's persistent writability re-firing on every wait — does
+    // thousands. `iterations` is the discriminator.
+    if out.iterations <= 10 {
         Ok(out.detail.clone())
     } else {
         Err(out.detail.clone())
