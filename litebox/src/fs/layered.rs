@@ -697,6 +697,56 @@ impl<
         }))
     }
 
+    fn allocate_fid_number(&self) -> Result<u32, OpenError> {
+        self.lower.allocate_fid_number()
+    }
+
+    fn free_fid_number(&self, fid: u32) {
+        self.lower.free_fid_number(fid);
+    }
+
+    fn clunk_fid_number(&self, fid: u32) {
+        self.lower.clunk_fid_number(fid);
+    }
+
+    fn wrap_existing_fid(
+        &self,
+        remote_fid: u32,
+        path: &str,
+        status_flags: OFlags,
+    ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
+        let lower_fd = self
+            .lower
+            .wrap_existing_fid(remote_fid, path, status_flags)?;
+        let descriptor_path = if path.is_empty() {
+            alloc::format!("<wrapped-fid:{remote_fid}>")
+        } else {
+            String::from(path)
+        };
+        let descriptor_flags = if status_flags.is_empty() {
+            OFlags::RDWR | OFlags::LARGEFILE
+        } else {
+            status_flags
+        };
+        Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+            path: descriptor_path,
+            flags: descriptor_flags,
+            entry: Arc::new(EntryX::Lower { fd: lower_fd }),
+            position: 0.into(),
+        }))
+    }
+
+    fn descriptor_backend_fid(&self, fd: &FileFd<Platform, Upper, Lower>) -> Option<u32> {
+        self.litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| match descriptor.entry.entry.as_ref() {
+                EntryX::Upper { fd } => self.upper.descriptor_backend_fid(fd),
+                EntryX::Lower { fd } => self.lower.descriptor_backend_fid(fd),
+                EntryX::Tombstone => unreachable!(),
+            })
+            .flatten()
+    }
+
     fn open(
         &self,
         path: impl crate::path::Arg,

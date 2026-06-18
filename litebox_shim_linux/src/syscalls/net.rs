@@ -306,6 +306,10 @@ fn passthrough_sockopt_value(level: u32, optname: u32) -> Option<u32> {
     }
 }
 
+fn linux_set_to_reported_socket_buffer_value(value: u32) -> u32 {
+    value.saturating_mul(2)
+}
+
 impl SocketAddress {
     pub(crate) fn inet(self) -> Option<SocketAddr> {
         // reason: unsupported variants intentionally share this fallback path.
@@ -3576,17 +3580,43 @@ impl<FS: ShimFS> Task<FS> {
             let fds_ptr = ConstPtr::<i32>::from_usize(control_ptr + offset + data_offset);
             let fd_array = fds_ptr.to_owned_slice(fd_count).ok_or(Errno::EFAULT)?;
 
-            // Duplicate each fd for passing. We take the descriptor_table_mut
-            // lock first (matching the established dt -> rds lock order), then
-            // briefly read from raw_descriptor_store for each fd.
-            //
-            // For each fd, also peek at the underlying subsystem entry
-            // to identify broker-backed eventfds; if so, ask the broker
-            // to bump the handle refcount via dup_handle and record a
-            // PassedToken for the cross-worker LBFD path (Phase B-Step8e).
-            let mut dt = self.global.litebox.descriptor_table_mut();
+            // Duplicate each fd for passing. Broker-file tokens are resolved
+            // before taking descriptor_table_mut: layered FS fid lookup itself
+            // reads the descriptor table, so doing it under the mutable fd-table
+            // lock self-deadlocks.
             for &guest_fd in &fd_array {
                 let raw_fd = usize::try_from(guest_fd).map_err(|_| Errno::EBADF)?;
+                {
+                    let files = self.files.borrow();
+                    let sent_file_token =
+                        files.run_on_raw_fd(raw_fd, |raw_fd_ref| -> Result<bool, Errno> {
+                            let crate::RawFdRef::Fs(fd) = raw_fd_ref else {
+                                return Ok(false);
+                            };
+                            let Some(provider) = super::broker_fs_provider() else {
+                                return Ok(false);
+                            };
+                            let Some(fid) = files.fs.descriptor_backend_fid(fd) else {
+                                return Ok(false);
+                            };
+                            let open_file_id = provider.register_ofd(fid).map_err(|err| {
+                                super::broker_backed::broker_err_to_errno(err)
+                            })?;
+                            passed_tokens.push(
+                                litebox_common_linux::cwfd::fd_transfer_frame::PassedToken::new(
+                                    litebox_common_linux::cwfd::fd_transfer_frame::SubsystemTag::File,
+                                    open_file_id,
+                                )
+                                .map_err(|_| Errno::EINVAL)?,
+                            );
+                            Ok(true)
+                        })??;
+                    if sent_file_token {
+                        continue;
+                    }
+                }
+
+                let mut dt = self.global.litebox.descriptor_table_mut();
                 let files = self.files.borrow();
                 let rds = files.raw_descriptor_store.read();
 
@@ -3630,23 +3660,7 @@ impl<FS: ShimFS> Task<FS> {
                 let files = self.files.borrow();
                 let sent_broker_token = files.run_on_raw_fd(raw_fd, |raw_fd_ref| -> Result<bool, Errno> {
                     match raw_fd_ref {
-                        crate::RawFdRef::Fs(fd) => {
-                            let Some(provider) = super::broker_fs_provider() else {
-                                return Ok(false);
-                            };
-                            let Some(fid) = files.fs.descriptor_backend_fid(fd) else {
-                                return Ok(false);
-                            };
-                            let open_file_id = provider.register_ofd(fid).map_err(|_| Errno::EOPNOTSUPP)?;
-                            passed_tokens.push(
-                                litebox_common_linux::cwfd::fd_transfer_frame::PassedToken::new(
-                                    litebox_common_linux::cwfd::fd_transfer_frame::SubsystemTag::File,
-                                    open_file_id,
-                                )
-                                .map_err(|_| Errno::EINVAL)?,
-                            );
-                            Ok(true)
-                        }
+                        crate::RawFdRef::Fs(_) => Ok(false),
                         #[cfg(feature = "worker_local_inet")]
                         crate::RawFdRef::Net(_) => {
                             // Network descriptors are kernel-backed and transfer as PassedFd.
@@ -4408,14 +4422,12 @@ impl<FS: ShimFS> Task<FS> {
                 match token.tag() {
                     SubsystemTag::File => {
                         let Some(provider) = super::broker_fs_provider() else {
-                            continue;
+                            return Err(Errno::ENODEV);
                         };
-                        let Ok(new_fid) = self.fs_allocate_fid_number() else {
-                            continue;
-                        };
-                        if provider.clone_ofd(token.id(), new_fid).is_err() {
+                        let new_fid = self.fs_allocate_fid_number()?;
+                        if let Err(err) = provider.clone_ofd(token.id(), new_fid) {
                             self.fs_free_fid_number(new_fid);
-                            continue;
+                            return Err(super::broker_backed::broker_err_to_errno(err));
                         }
                         let file = match self.files.borrow().fs.wrap_existing_fid(
                             new_fid,
@@ -4425,7 +4437,7 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(file) => file,
                             Err(_) => {
                                 self.fs_clunk_fid_number(new_fid);
-                                continue;
+                                return Err(Errno::EINVAL);
                             }
                         };
                         if cloexec {

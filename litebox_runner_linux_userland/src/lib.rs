@@ -1388,7 +1388,6 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // Open a dedicated 9P channel using shared-memory ring buffers.
     if !is_tcp {
         let (ring_writer, ring_reader, nine_p_conn_id) = connect_nine_p_channel(broker_addr)?;
-        bind_nine_p_session_for_broker(nine_p_conn_id);
         litebox_timing::emit("runner_broker_connected_ns");
 
         let shim = shim_builder.build();
@@ -1402,6 +1401,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         let (nine_p_fs, mut reader) =
             litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
                 .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+        bind_nine_p_session_for_broker(nine_p_conn_id);
         litebox_timing::emit("runner_rootfs_ready_ns");
 
         // Spawn the 9P response worker thread.
@@ -1964,7 +1964,6 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         }
 
         let (ring_writer, ring_reader, nine_p_conn_id) = connect_nine_p_channel(broker_addr)?;
-        bind_nine_p_session_for_broker(nine_p_conn_id);
 
         let shim = shim_builder.build();
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -1977,6 +1976,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         let (nine_p_fs, mut reader) =
             litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
                 .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+        bind_nine_p_session_for_broker(nine_p_conn_id);
 
         // Spawn the 9P response worker thread.
         let worker_handle = nine_p_fs.worker_handle();
