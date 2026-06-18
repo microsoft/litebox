@@ -56,11 +56,7 @@ pub(super) fn create_object_reference(
             .map_err(|_| BrokerError::ResourceExhausted)?;
     }
 
-    let handle = ObjectHandle(state.next_reference_handle);
-    state.next_reference_handle = handle
-        .0
-        .checked_add(1)
-        .ok_or(BrokerError::ResourceExhausted)?;
+    let handle = state.allocate_reference_handle()?;
     let object_id = state.objects.insert(Arc::new(RwLock::new(object)));
     let old_reference = state.references.insert(
         handle,

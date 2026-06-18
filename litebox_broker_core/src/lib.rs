@@ -96,6 +96,17 @@ pub(crate) struct BrokerCoreState {
     pub(crate) references: BTreeMap<ObjectHandle, ObjectReference>,
 }
 
+impl BrokerCoreState {
+    pub(crate) fn allocate_reference_handle(&mut self) -> Result<ObjectHandle> {
+        let handle = ObjectHandle(self.next_reference_handle);
+        self.next_reference_handle = handle
+            .0
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        Ok(handle)
+    }
+}
+
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
