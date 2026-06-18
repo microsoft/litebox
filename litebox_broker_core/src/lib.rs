@@ -20,7 +20,6 @@ extern crate std;
 
 mod error;
 pub mod event;
-mod object;
 mod policy;
 mod session;
 
@@ -33,10 +32,9 @@ use slotmap::SlotMap;
 use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
-pub use object::ObjectRights;
-use object::{ObjectEntry, ObjectId, ObjectReference};
 pub use policy::{PolicyEngine, PolicyProfile};
-pub use session::{BrokerSession, CallerCredential};
+pub use session::{BrokerSession, CallerCredential, ObjectRights};
+use session::{ObjectEntry, ObjectId, ObjectReference};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -147,6 +145,6 @@ impl BrokerCore {
     }
 
     pub(crate) fn close_session(&self, session_id: session::SessionId) {
-        object::drop_references_for_session(self, session_id);
+        session::drop_references_for_session(self, session_id);
     }
 }
