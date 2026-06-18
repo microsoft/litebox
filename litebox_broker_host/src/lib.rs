@@ -295,14 +295,14 @@ mod tests {
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
-        let core = BrokerCore::new(PolicyEngine::event_only()).unwrap();
+        let broker = BrokerCore::new(PolicyEngine::event_only()).unwrap();
 
-        serve_connection_negotiates_routes_one_request_and_returns_peer_closed(&core);
-        serve_connection_closes_after_protocol_violation(&core);
-        serve_connection_returns_channel_error_when_response_send_fails(&core);
+        serve_connection_negotiates_routes_one_request_and_returns_peer_closed(&broker);
+        serve_connection_closes_after_protocol_violation(&broker);
+        serve_connection_returns_channel_error_when_response_send_fails(&broker);
     }
 
-    fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(core: &BrokerCore) {
+    fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([
             Ok(Some(ReceivedBrokerRequest::Request(
                 BrokerRequest::Negotiate {
@@ -316,7 +316,7 @@ mod tests {
         ]));
 
         assert_eq!(
-            serve_connection(core, &mut channel).unwrap(),
+            serve_connection(broker, &mut channel).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -334,7 +334,7 @@ mod tests {
         assert_ne!(handle.0, 0);
     }
 
-    fn serve_connection_closes_after_protocol_violation(core: &BrokerCore) {
+    fn serve_connection_closes_after_protocol_violation(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([
             Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
                 0,
@@ -347,7 +347,7 @@ mod tests {
         ]));
 
         assert_eq!(
-            serve_connection(core, &mut channel).unwrap(),
+            serve_connection(broker, &mut channel).unwrap(),
             ConnectionTermination::BrokerClosed(CloseReason::ProtocolViolation)
         );
         assert_eq!(
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(channel.requests.len(), 1);
     }
 
-    fn serve_connection_returns_channel_error_when_response_send_fails(core: &BrokerCore) {
+    fn serve_connection_returns_channel_error_when_response_send_fails(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([Ok(Some(
             ReceivedBrokerRequest::Request(BrokerRequest::Negotiate {
                 protocol_version: HOST_PROTOCOL_VERSION,
@@ -365,7 +365,7 @@ mod tests {
         ))]));
         channel.send_error = true;
 
-        match serve_connection(core, &mut channel) {
+        match serve_connection(broker, &mut channel) {
             Err(BrokerHostError::Channel(())) => {}
             result => panic!("unexpected serve result: {result:?}"),
         }

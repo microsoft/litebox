@@ -250,11 +250,11 @@ mod tests {
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
-        let core = BrokerCore::new(PolicyEngine::event_only()).unwrap();
-        let session = core
+        let broker = BrokerCore::new(PolicyEngine::event_only()).unwrap();
+        let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let other = core
+        let other = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = event::create(&session, 0).unwrap();
@@ -278,7 +278,7 @@ mod tests {
 
         assert_eq!(session.close_object_reference(handle), Ok(()));
         {
-            let state = core.state.read();
+            let state = broker.state.read();
             assert!(state.references.is_empty());
             assert!(state.objects.is_empty());
         }
@@ -287,12 +287,12 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        let session = core
+        let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let _handle = event::create(&session, 0).unwrap();
         {
-            let state = core.state.read();
+            let state = broker.state.read();
             assert_eq!(state.references.len(), 1);
             assert_eq!(state.objects.len(), 1);
         }
@@ -300,23 +300,23 @@ mod tests {
         drop(session);
 
         {
-            let state = core.state.read();
+            let state = broker.state.read();
             assert!(state.references.is_empty());
             assert!(state.objects.is_empty());
         }
 
-        let session = core
+        let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         {
-            let mut state = core.state.write();
+            let mut state = broker.state.write();
             state.next_reference_handle = u64::MAX;
         }
         assert_eq!(
             event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
         );
-        let state = core.state.read();
+        let state = broker.state.read();
         assert!(state.references.is_empty());
         assert!(state.objects.is_empty());
     }
