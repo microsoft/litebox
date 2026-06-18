@@ -186,14 +186,21 @@ impl BrokerSession {
     /// The underlying object is released when this was the last live reference.
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
         let mut references = self.core.references.write();
-        let mut objects = self.core.objects.write();
         let object_id = reference_for_handle(&references, self.session_id, handle)?.object_id;
-        if !objects.contains_key(object_id) {
-            return Err(BrokerError::UnknownObject);
-        }
+        let last_reference = !references.iter().any(|(other_handle, reference)| {
+            *other_handle != handle && reference.object_id == object_id
+        });
 
-        references.remove(&handle);
-        drop_object_if_unreferenced(&mut objects, &references, object_id);
+        if last_reference {
+            let mut objects = self.core.objects.write();
+            if !objects.contains_key(object_id) {
+                return Err(BrokerError::UnknownObject);
+            }
+            references.remove(&handle);
+            objects.remove(object_id);
+        } else {
+            references.remove(&handle);
+        }
         Ok(())
     }
 }
@@ -239,19 +246,6 @@ fn reference_for_handle(
         return Err(BrokerError::UnknownObject);
     }
     Ok(reference)
-}
-
-fn drop_object_if_unreferenced(
-    objects: &mut SlotMap<ObjectId, Arc<RwLock<ObjectEntry>>>,
-    references: &BTreeMap<ObjectHandle, ObjectReference>,
-    object_id: ObjectId,
-) {
-    if !references
-        .values()
-        .any(|reference| reference.object_id == object_id)
-    {
-        objects.remove(object_id);
-    }
 }
 
 #[cfg(test)]
