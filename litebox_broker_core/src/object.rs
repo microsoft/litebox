@@ -4,7 +4,7 @@
 use alloc::sync::Arc;
 
 use crate::event::EventObject;
-use crate::identity::{BrokerSession, CallerCredential, SessionId};
+use crate::session::{BrokerSession, CallerCredential, SessionId};
 use crate::{BrokerCore, BrokerCoreState, BrokerError, Result};
 use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
@@ -153,8 +153,17 @@ pub(super) fn close_object_reference(session: &BrokerSession, handle: ObjectHand
     Ok(())
 }
 
-pub(super) fn drop_references_for_session(core: &BrokerCore, session_id: SessionId) {
-    let mut state = core.state.write();
+impl BrokerSession {
+    /// Closes one object reference owned by this session.
+    ///
+    /// The underlying object is released when this was the last live reference.
+    pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
+        close_object_reference(self, handle)
+    }
+}
+
+pub(super) fn drop_references_for_session(broker: &BrokerCore, session_id: SessionId) {
+    let mut state = broker.state.write();
     let BrokerCoreState {
         objects,
         references,

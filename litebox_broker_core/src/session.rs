@@ -1,8 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{BrokerCore, Result, object};
-use litebox_broker_protocol::ObjectHandle;
+use crate::BrokerCore;
 
 /// Caller identity information supplied by the broker entry layer.
 ///
@@ -52,13 +51,6 @@ impl BrokerSession {
             session_id,
             caller_credential,
         }
-    }
-
-    /// Closes one object reference owned by this session.
-    ///
-    /// The underlying object is released when this was the last live reference.
-    pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
-        object::close_object_reference(self, handle)
     }
 }
 

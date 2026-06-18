@@ -20,9 +20,9 @@ extern crate std;
 
 mod error;
 pub mod event;
-mod identity;
 mod object;
 mod policy;
+mod session;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -33,10 +33,10 @@ use slotmap::SlotMap;
 use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
-pub use identity::{BrokerSession, CallerCredential};
 pub use object::ObjectRights;
 use object::{ObjectEntry, ObjectId, ObjectReference};
 pub use policy::{PolicyEngine, PolicyProfile};
+pub use session::{BrokerSession, CallerCredential};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -135,12 +135,12 @@ impl BrokerCore {
             .ok_or(BrokerError::ResourceExhausted)?;
         Ok(BrokerSession::new(
             self.clone(),
-            identity::SessionId::new(session_id),
+            session::SessionId::new(session_id),
             caller_credential,
         ))
     }
 
-    pub(crate) fn close_session(&self, session_id: identity::SessionId) {
+    pub(crate) fn close_session(&self, session_id: session::SessionId) {
         object::drop_references_for_session(self, session_id);
     }
 }
