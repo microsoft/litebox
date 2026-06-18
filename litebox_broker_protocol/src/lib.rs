@@ -16,7 +16,6 @@ pub mod channel;
 pub mod error;
 pub mod event;
 pub mod message;
-pub mod object;
 pub mod wire;
 
 pub use channel::{
@@ -32,7 +31,17 @@ pub use event::{
 pub use message::{
     BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,
 };
-pub use object::ObjectHandle;
+
+/// Broker object reference handle returned to the local core.
+///
+/// The local core may cache this value, but the broker remains authoritative for
+/// object identity, object lifetime, reference lifetime, type, and rights.
+///
+/// The value is an opaque broker reference identifier owned by one authenticated
+/// process association.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectHandle(pub u64);
 
 /// Major/minor broker protocol version.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
