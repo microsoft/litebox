@@ -168,6 +168,17 @@ fn validate_worker_factory_object_attributes<Platform: RawPointerProvider>(
     Ok(())
 }
 
+fn commit_worker_factory_shutdown<Platform: crate::ShimPlatform>(
+    factory: &WorkerFactoryObject<Platform>,
+    pending_worker_count: MutPtr<Platform, i32>,
+) -> NtStatus {
+    if pending_worker_count.write_at_offset(0, 0).is_none() {
+        return NtStatus::ACCESS_VIOLATION;
+    }
+    factory.shutdown.store(true, Ordering::Relaxed);
+    NtStatus::SUCCESS
+}
+
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn worker_factory_entry(
         &self,
@@ -403,22 +414,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        let status = entry
-            .with_entry(|entry| {
-                entry
-                    .granted_access
-                    .require(WorkerFactoryAccess::SHUTDOWN)?;
-                entry.factory.shutdown.store(true, Ordering::Relaxed);
-                Ok(())
-            })
-            .map_or_else(|status| status, |()| NtStatus::SUCCESS);
-        if status != NtStatus::SUCCESS {
-            return status;
-        }
-        params
-            .pending_worker_count
-            .write_at_offset(0, 0)
-            .map_or(NtStatus::ACCESS_VIOLATION, |()| NtStatus::SUCCESS)
+        let factory = match entry.with_entry(|entry| {
+            entry
+                .granted_access
+                .require(WorkerFactoryAccess::SHUTDOWN)?;
+            Ok(Arc::clone(&entry.factory))
+        }) {
+            Ok(factory) => factory,
+            Err(status) => return status,
+        };
+        commit_worker_factory_shutdown(&factory, params.pending_worker_count)
     }
 }
 
@@ -899,6 +904,45 @@ mod tests {
 
         assert_eq!(task.sys_nt_close(worker_factory), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn shutdown_output_fault_preserves_factory_state() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let io_completion = create_io_completion_handle(&task);
+            let mut worker_factory = Handle::default();
+            assert_eq!(
+                create_worker_factory(
+                    &task,
+                    &mut worker_factory,
+                    None,
+                    io_completion,
+                    ProcessHandle::CURRENT,
+                ),
+                NtStatus::SUCCESS
+            );
+            let factory = task
+                .worker_factory_entry(worker_factory)
+                .expect("worker factory handle is valid")
+                .with_entry(|entry| Arc::clone(&entry.factory));
+            assert!(!factory.shutdown.load(Ordering::Relaxed));
+
+            assert_eq!(
+                shutdown_worker_factory(&task, worker_factory, null_mut_ptr()),
+                NtStatus::ACCESS_VIOLATION
+            );
+            assert!(!factory.shutdown.load(Ordering::Relaxed));
+
+            assert_eq!(
+                commit_worker_factory_shutdown(&factory, null_mut_ptr()),
+                NtStatus::ACCESS_VIOLATION
+            );
+            assert!(!factory.shutdown.load(Ordering::Relaxed));
+
+            assert_eq!(task.sys_nt_close(worker_factory), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
+        });
     }
 
     #[test]
