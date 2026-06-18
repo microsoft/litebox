@@ -37,7 +37,7 @@ pub(crate) enum ObjectEntry {
     Event(EventObject),
 }
 
-pub(super) fn create_object_with_reference(
+pub(super) fn create_object_reference(
     session: &BrokerSession,
     object: ObjectEntry,
 ) -> Result<ObjectHandle> {
