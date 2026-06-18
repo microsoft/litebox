@@ -3914,6 +3914,47 @@ impl<FS: ShimFS> Task<FS> {
             }
             return ret;
         }
+        if let Some(ret) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            // Broker-held inet TCP connection. `do_sendto`/`write` already
+            // handle this; `sendmsg` must too, otherwise musl's resolver —
+            // which sends its DNS-over-TCP fallback query via `sendmsg`
+            // rather than `send`/`write` like glibc — gets ENOTSOCK and
+            // fails to resolve CNAME-heavy names (the truncated-UDP→TCP
+            // fallback path). See `BL.dns_resolve_cname_heavy.*musl*`.
+            if sock_addr.is_some() {
+                return Err(Errno::EISCONN);
+            }
+            if msg.msg_controllen != 0 {
+                let (passed_fds, _passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
+                if !passed_fds.is_empty() {
+                    // SCM_RIGHTS fd passing is not meaningful on a TCP stream.
+                    return Err(Errno::EOPNOTSUPP);
+                }
+            }
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(typed)
+                .ok_or(Errno::EBADF)?;
+            if total_len == 0 {
+                handle.with_entry(|entry| entry.write(&self.wait_cx(), &[]))
+            } else {
+                Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                    handle.with_entry(|entry| entry.write(&self.wait_cx(), chunk))
+                })
+            }
+        }) {
+            if let Err(Errno::EPIPE) = ret
+                && !flags.contains(SendFlags::NOSIGNAL)
+            {
+                self.send_signal(
+                    litebox_common_linux::signal::Signal::SIGPIPE,
+                    super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+                );
+            }
+            return ret;
+        }
         if let Some(ret) = self.try_with_broker_inet_dgram(sockfd, |typed| {
             if msg.msg_controllen != 0 {
                 return Err(Errno::EOPNOTSUPP);
