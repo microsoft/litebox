@@ -160,7 +160,6 @@ def open_db(state_dir: Path, *, bootstrap: bool = False,
     if with_state_views:
         _ensure_views(conn)
     _ensure_classification_schema(conn)
-    _ensure_classification_schema(conn)
     return conn
 
 
@@ -272,7 +271,7 @@ def _ensure_views(conn: sqlite3.Connection) -> None:
 # meta-keyed definition version) — no SCHEMA_VERSION bump, no producer
 # change, no data migration.
 
-_CLASSIFICATION_SCHEMA_VERSION = 5
+_CLASSIFICATION_SCHEMA_VERSION = 6
 
 # "Recently flaky" lookback for the soft-regression discount.
 _RECENT_FLAKE_WINDOW_MS = 7 * 24 * 3600 * 1000
@@ -321,12 +320,18 @@ SELECT rr.mode, rr.test_id,
 -- is classified `no_result`, never a regression; and a real `fail`
 -- isn't masked by a later `no_result` hiccup. A regression requires a
 -- definitive `pass` at the merge-base baseline and a definitive `fail`
--- on the branch.
+-- on the branch. The inverse (baseline `fail` → branch `pass`) is
+-- `fixed`. `tip_verdict` reports the same test's freshest definitive
+-- verdict at the baseline ref's *current* HEAD (tip_sha), letting a
+-- consumer tell a branch-introduced regression (tip passes) from one
+-- merely inherited from an already-broken upstream tip (tip fails too).
 CREATE VIEW regression_class AS
 WITH relevant(sha) AS (
     SELECT branch_sha   FROM branch_baseline
     UNION
     SELECT baseline_sha FROM branch_baseline
+    UNION
+    SELECT tip_sha      FROM branch_baseline WHERE tip_sha IS NOT NULL
 ),
 ranked AS (
     -- Definitive verdicts (pass/fail) sorted ahead of no_result, then
@@ -366,18 +371,18 @@ universe AS (
     -- branch yet surface as `not_run` instead of vanishing — so a
     -- thin/partial run can't be mistaken for "clean". UNION of two
     -- equality joins (deduped) is cheaper than one OR-join.
-    SELECT bb.branch, bb.ref, bb.branch_sha, bb.baseline_sha,
+    SELECT bb.branch, bb.ref, bb.branch_sha, bb.baseline_sha, bb.tip_sha,
            s.mode, s.test_id
       FROM branch_baseline bb
       JOIN sha_state s ON s.sha = bb.branch_sha
     UNION
-    SELECT bb.branch, bb.ref, bb.branch_sha, bb.baseline_sha,
+    SELECT bb.branch, bb.ref, bb.branch_sha, bb.baseline_sha, bb.tip_sha,
            s.mode, s.test_id
       FROM branch_baseline bb
       JOIN sha_state s ON s.sha = bb.baseline_sha
 )
 SELECT
-    u.branch, u.ref, u.branch_sha, u.baseline_sha,
+    u.branch, u.ref, u.branch_sha, u.baseline_sha, u.tip_sha,
     u.mode, u.test_id,
     b.freshest_def AS baseline_verdict,
     b.n            AS baseline_n,
@@ -387,11 +392,14 @@ SELECT
     a.n_fail       AS branch_n_fail,
     a.n_other      AS branch_n_noresult,
     a.flaky_atsha  AS branch_atsha_flaky,
+    t.freshest_def AS tip_verdict,
     COALESCE(f.recent_flaky, 0) AS recent_flaky,
     COALESCE(f.n_pass, 0)       AS recent_pass,
     COALESCE(f.n_fail, 0)       AS recent_fail,
     CASE
       WHEN a.n IS NULL                                   THEN 'not_run'
+      WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 0
+       AND b.freshest_def = 'fail'                       THEN 'fixed'
       WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 0 THEN 'ok'
       WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 1 THEN 'flaky_pass'
       WHEN a.freshest_def IS NULL                        THEN 'no_result'
@@ -418,6 +426,8 @@ SELECT
          ON a.sha = u.branch_sha AND a.mode = u.mode AND a.test_id = u.test_id
   LEFT JOIN sha_state b
          ON b.sha = u.baseline_sha AND b.mode = u.mode AND b.test_id = u.test_id
+  LEFT JOIN sha_state t
+         ON t.sha = u.tip_sha AND t.mode = u.mode AND t.test_id = u.test_id
   LEFT JOIN test_flake_stats f
          ON f.mode = u.mode AND f.test_id = u.test_id;
 """
@@ -442,6 +452,7 @@ def _ensure_classification_schema(conn: sqlite3.Connection) -> None:
             baseline_sha   TEXT NOT NULL,
             ref            TEXT,
             branch         TEXT,
+            tip_sha        TEXT,
             computed_at_ms INTEGER NOT NULL
         );
         -- Lets the test_flake_stats view seek the upstream (tracked-ref
@@ -450,6 +461,13 @@ def _ensure_classification_schema(conn: sqlite3.Connection) -> None:
             ON runs(worktree_path);
         """
     )
+    # Additive: older DBs created branch_baseline without tip_sha (the
+    # tracked-ref's current HEAD, for the inherited-vs-branch-introduced
+    # signal). ALTER preserves the cache's rows; the supervisor repopulates
+    # tip_sha on its next refresh.
+    bb_cols = {r[1] for r in conn.execute("PRAGMA table_info(branch_baseline)")}
+    if "tip_sha" not in bb_cols:
+        conn.execute("ALTER TABLE branch_baseline ADD COLUMN tip_sha TEXT")
     row = conn.execute(
         "SELECT value FROM meta WHERE key = 'classification_schema_version'"
     ).fetchone()
@@ -498,14 +516,30 @@ def _refresh_branch_baseline(conn: sqlite3.Connection, canonical: Path) -> int:
         base = _pick_baseline_ref(conn, canonical, head)
         if base is None:
             continue
-        rows.append((head, base["merge_base"], base["ref"], label, now))
-    conn.execute("DELETE FROM branch_baseline")
-    conn.executemany(
-        "INSERT OR REPLACE INTO branch_baseline"
-        "(branch_sha, baseline_sha, ref, branch, computed_at_ms) "
-        "VALUES (?,?,?,?,?)",
-        rows,
-    )
+        rows.append((head, base["merge_base"], base["ref"], label,
+                     base["ref_head"], now))
+    if not rows:
+        # Resolved nothing — almost always a transient git failure or a
+        # misconfigured canonical clone (there is normally ≥1 tracked
+        # ref). Do NOT blow away the existing cache: a blank
+        # branch_baseline makes every branch read as "no baseline" and
+        # the classifier go dark. Keep the stale rows; the next good
+        # refresh replaces them. Legitimate shrink (a deleted branch)
+        # still happens whenever ≥1 row resolves.
+        return 0
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM branch_baseline")
+        conn.executemany(
+            "INSERT OR REPLACE INTO branch_baseline"
+            "(branch_sha, baseline_sha, ref, branch, tip_sha, computed_at_ms) "
+            "VALUES (?,?,?,?,?,?)",
+            rows,
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     return len(rows)
 
 
@@ -1548,57 +1582,6 @@ def _pick_baseline_ref(
     return best
 
 
-def _regression_counts(
-    conn: sqlite3.Connection,
-    baseline_sha: str, agent_sha: str,
-) -> dict[str, dict[str, int]]:
-    """Compare state-scoped freshest verdicts at `baseline_sha` (clean)
-    vs `agent_sha` (clean). Returns
-    `{pass: {regressions, improvements, common}}`.
-
-    "Regression" = passed at baseline, failed at agent_sha.
-    "Improvement" = failed at baseline, passed at agent_sha.
-    "Common" = (test_id, pass) with verdicts at both states.
-    Uses the state_test_pass TEMP TABLE (clean filter via
-    `state_wt IS NULL AND dirty_hash IS NULL`).
-    """
-    out: dict[str, dict[str, int]] = {}
-    for pass_name in ("native", "litebox"):
-        b = {
-            r["test_id"]: r["freshest_verdict"]
-            for r in conn.execute(
-                "SELECT test_id, freshest_verdict FROM state_test_pass "
-                " WHERE commit_sha = ? AND state_wt IS NULL AND mode = ?",
-                (baseline_sha, pass_name),
-            )
-        }
-        a = {
-            r["test_id"]: r["freshest_verdict"]
-            for r in conn.execute(
-                "SELECT test_id, freshest_verdict FROM state_test_pass "
-                " WHERE commit_sha = ? AND state_wt IS NULL AND mode = ?",
-                (agent_sha, pass_name),
-            )
-        }
-        regressions = sum(
-            1 for tid, va in a.items()
-            if tid in b and b[tid] == "pass" and va != "pass"
-        )
-        improvements = sum(
-            1 for tid, va in a.items()
-            if tid in b and b[tid] != "pass" and va == "pass"
-        )
-        common = sum(1 for tid in a if tid in b)
-        out[pass_name] = {
-            "regressions": regressions,
-            "improvements": improvements,
-            "common": common,
-            "agent_cov": len(a),
-            "baseline_cov": len(b),
-        }
-    return out
-
-
 def _regression_test_ids(
     conn: sqlite3.Connection,
     baseline_sha: str, agent_sha: str, pass_name: str,
@@ -2426,17 +2409,99 @@ def _verdict_history(
     return "".join(chars) or "—"
 
 
+def _agent_rc_summary(conn: sqlite3.Connection,
+                      branch_sha: str) -> dict[str, dict[str, int]]:
+    """Aggregate the materialized `_rc_render` slice for one agent
+    worktree HEAD into `{mode: {hard, hard_high, hard_med, soft, fixed,
+    not_run, covered, universe, inherited}}`. `inherited` counts
+    regression rows whose baseline-ref *tip* also fails the test (so the
+    branch inherits an already-broken upstream rather than introducing
+    the break)."""
+    keys = ("hard", "hard_high", "hard_med", "soft", "fixed",
+            "not_run", "covered", "universe", "inherited")
+    out: dict[str, dict[str, int]] = {}
+    for r in conn.execute(
+        "SELECT mode,"
+        " SUM(classification='hard_regression') AS hard,"
+        " SUM(classification='hard_regression' AND confidence='high') AS hard_high,"
+        " SUM(classification='hard_regression' AND confidence='medium') AS hard_med,"
+        " SUM(classification='soft_regression') AS soft,"
+        " SUM(classification='fixed') AS fixed,"
+        " SUM(classification='not_run') AS not_run,"
+        " SUM(classification <> 'not_run') AS covered,"
+        " COUNT(*) AS universe,"
+        " SUM(classification IN ('hard_regression','soft_regression')"
+        "     AND tip_verdict = 'fail') AS inherited"
+        " FROM _rc_render WHERE branch_sha = ? GROUP BY mode",
+        (branch_sha,),
+    ):
+        out[r["mode"]] = {k: (r[k] or 0) for k in keys}
+    return out
+
+
+def _agent_rc_regressed(conn: sqlite3.Connection, branch_sha: str,
+                        limit: int = 40) -> list[sqlite3.Row]:
+    """Hard+soft regressed (mode, test_id) rows for one worktree HEAD,
+    hard-before-soft then high-confidence-first, for the detail block."""
+    return conn.execute(
+        "SELECT mode, test_id, classification, confidence, tip_verdict"
+        "  FROM _rc_render WHERE branch_sha = ?"
+        "   AND classification IN ('hard_regression','soft_regression')"
+        " ORDER BY mode,"
+        "   CASE classification WHEN 'hard_regression' THEN 0 ELSE 1 END,"
+        "   CASE confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1"
+        "        ELSE 2 END,"
+        "   test_id LIMIT ?",
+        (branch_sha, limit),
+    ).fetchall()
+
+
+_RC_EMPTY = {"hard": 0, "hard_high": 0, "hard_med": 0, "soft": 0,
+             "fixed": 0, "not_run": 0, "covered": 0, "universe": 0,
+             "inherited": 0}
+
+
+def _fmt_rc_regressions(s: dict[str, int]) -> str:
+    """One mode's regression summary → a compact cell string."""
+    if s["covered"] == 0:
+        return "—"
+    if s["hard"] == 0 and s["soft"] == 0:
+        return "clean"
+    parts: list[str] = []
+    if s["hard"]:
+        conf = []
+        if s["hard_high"]:
+            conf.append(f"{s['hard_high']}hi")
+        if s["hard_med"]:
+            conf.append(f"{s['hard_med']}md")
+        lo = s["hard"] - s["hard_high"] - s["hard_med"]
+        if lo:
+            conf.append(f"{lo}lo")
+        parts.append(f"**{s['hard']}** hard ({' '.join(conf)})")
+    if s["soft"]:
+        parts.append(f"{s['soft']} soft")
+    if s["inherited"]:
+        parts.append(f"{s['inherited']} inh")
+    return ", ".join(parts)
+
+
 def _render_agent_worktrees(conn: sqlite3.Connection,
                             state_dir: Path) -> str:
-    """Per-agent-worktree coverage + regression delta vs the best-fit
-    tracked-ref baseline. Auto-discovered from `git worktree list` in
-    the canonical clone (any worktree that isn't a tracked-ref CI
-    worktree and has a branch checked out).
+    """Per-agent-worktree regression summary, rendered from the
+    `regression_class` view (the same classifier the `regressions`
+    subcommand and other sessions consume). Auto-discovered from
+    `git worktree list` in the canonical clone (any worktree that isn't
+    a tracked-ref CI worktree and has a branch checked out).
 
-    Two regression metrics per worktree:
-      * Δ vs merge-base(HEAD, baseline_ref_HEAD) — agent's own
-        regressions since they forked.
-      * Δ vs baseline_ref_HEAD — absolute drift vs current upstream.
+    Each worktree HEAD is compared against the merge-base with its
+    best-fit tracked-ref baseline. Per mode (native / litebox) the
+    section reports how many tests are hard/soft regressions (with the
+    classifier's high/med/low confidence), how many were `fixed`
+    (baseline fail → branch pass), how many are `inherited` (the
+    baseline ref's current tip also fails — not the branch's fault),
+    and coverage (`covered/universe`, with the `not_run` gap so a thin
+    run can't read as clean). One materialization of the view drives
+    every row.
     """
     canonical = _canonical_worktree_for_render(state_dir)
     tips, non_tips = _agent_tip_worktrees(conn, canonical)
@@ -2446,21 +2511,48 @@ def _render_agent_worktrees(conn: sqlite3.Connection,
         # — keeps summary.md uncluttered for single-session use.
         return ""
     tip_paths = {t["path"] for t in tips}
+
+    # Refresh branch_baseline so the view reflects the current
+    # worktree HEADs AND the current tracked-ref tips (the `tip_sha`
+    # that powers the `inherited` signal moves when the amalgamation
+    # advances even if the agent HEADs don't). Cheap — git object-graph
+    # merge-base calls + a tiny transactional rewrite. The supervisor
+    # also refreshes each cycle; the transactional `_refresh_branch_baseline`
+    # makes the concurrent writes safe. Fail-open: a stale baseline is
+    # better than a blank section.
+    try:
+        _refresh_branch_baseline(conn, canonical)
+    except Exception:  # noqa: BLE001 — fail-open; stale > blank
+        pass
+
+    # Materialize the classifier once (the full view ~ a few seconds on
+    # the live store); branch_baseline already scopes it to live
+    # branches, so this is every agent worktree's slice in one shot.
+    # Per-worktree aggregation then scans the small indexed temp table.
+    conn.execute("DROP TABLE IF EXISTS _rc_render")
+    conn.execute(
+        "CREATE TEMP TABLE _rc_render AS "
+        "SELECT branch_sha, baseline_sha, tip_sha, ref, mode, test_id,"
+        "       classification, confidence, tip_verdict "
+        "  FROM regression_class"
+    )
+    conn.execute("CREATE INDEX _rc_render_ix ON _rc_render(branch_sha, mode)")
+
     lines = [
         "## Agent worktrees\n",
-        "_Opportunistic coverage for live worktrees. Each row's "
-        "regression columns compare the worktree's HEAD against the "
-        "tracked-ref baseline whose HEAD shares the most recent "
-        "merge-base — i.e., the upstream this branch forked from._\n",
+        "_Opportunistic coverage for live worktrees, classified by the "
+        "`regression_class` view (same as `dashboard.py regressions "
+        "<branch>`). Each worktree HEAD is compared against the "
+        "merge-base with its best-fit tracked-ref baseline — the "
+        "upstream this branch forked from._\n",
         "_Marker: `→` = tip (the supervisor opportunistically tests "
         "this worktree). `~` = subsumed (another worktree's HEAD "
         "already contains this one's history; testing the tip covers "
         "it too)._\n",
-        "| | Worktree | Branch | HEAD | Baseline ref | "
-        "Δ vs merge-base (native) | Δ vs merge-base (litebox) | "
-        "Δ vs baseline HEAD (native) | Δ vs baseline HEAD (litebox) | "
-        "Cov (native) | Cov (litebox) | Last tested |",
-        "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+        "| | Worktree | Branch | HEAD | Baseline | "
+        "Regressions (litebox) | Regressions (native) | Fixed | "
+        "Coverage (lbx) | Last tested |",
+        "|---|---|---|---|---|---|---|---:|---:|---|",
     ]
     details: list[str] = []
     for wt in candidates:
@@ -2468,86 +2560,90 @@ def _render_agent_worktrees(conn: sqlite3.Connection,
         path = wt["path"]
         marker = "→" if path in tip_paths else "~"
         branch = _branch_display(wt.get("branch"))
-        baseline = _pick_baseline_ref(conn, canonical, agent_head)
-        if baseline is None:
-            lines.append(
-                f"| {marker} | `{Path(path).name}` | {branch} | "
-                f"`{short_sha(agent_head)}` | _no baseline_ | — | — | — | — | "
-                f"— | — | — |"
-            )
-            continue
-        mb = baseline["merge_base"]
-        ref_head = baseline["ref_head"]
-        # Δ vs merge-base
-        delta_mb = _regression_counts(conn, mb, agent_head)
-        # Δ vs baseline HEAD
-        delta_bh = _regression_counts(conn, ref_head, agent_head)
+        bb = conn.execute(
+            "SELECT baseline_sha, ref FROM branch_baseline "
+            " WHERE branch_sha = ?", (agent_head,)).fetchone()
         last_age = _last_run_age_at_sha(conn, agent_head)
         last_age_str = (
             f"{fmt_age_ms(now_ms() - last_age)} ago"
             if last_age is not None else "_never_"
         )
-        def cell(d: dict, p: str) -> str:
-            r = d[p]["regressions"]
-            i = d[p]["improvements"]
-            if r == 0 and i == 0:
-                if d[p]["common"] == 0:
-                    return "—"
-                return "0"
-            parts = [f"**{r}**"] if r else []
-            if i:
-                parts.append(f"_+{i}_")
-            return " ".join(parts) or "0"
+        if bb is None:
+            # No baseline computed (e.g. merge-base resolution failed)
+            # — show the worktree but no comparison.
+            lines.append(
+                f"| {marker} | `{Path(path).name}` | {branch} | "
+                f"`{short_sha(agent_head)}` | _no baseline_ | — | — | — | "
+                f"— | {last_age_str} |"
+            )
+            continue
+        summ = _agent_rc_summary(conn, agent_head)
+        lbx = summ.get("litebox", _RC_EMPTY)
+        nat = summ.get("native", _RC_EMPTY)
+        regr_lbx = _fmt_rc_regressions(lbx)
+        regr_nat = _fmt_rc_regressions(nat)
+        if lbx["fixed"] == 0 and nat["fixed"] == 0:
+            fixed_cell = "—"
+        else:
+            fixed_cell = str(lbx["fixed"])
+            if nat["fixed"]:
+                fixed_cell += f" _(+{nat['fixed']} nat)_"
+        if lbx["universe"] == 0:
+            cov_cell = "—"
+        else:
+            cov_cell = f"{lbx['covered']}/{lbx['universe']}"
+            if lbx["not_run"]:
+                cov_cell += f" · **{lbx['not_run']}** not run"
         lines.append(
             f"| {marker} | `{Path(path).name}` | {branch} | "
             f"`{short_sha(agent_head)}` | "
-            f"`{baseline['ref']}` @ `{short_sha(ref_head)}` | "
-            f"{cell(delta_mb, 'native')} | {cell(delta_mb, 'litebox')} | "
-            f"{cell(delta_bh, 'native')} | {cell(delta_bh, 'litebox')} | "
-            f"{delta_mb['native']['agent_cov']} | "
-            f"{delta_mb['litebox']['agent_cov']} | "
+            f"`{bb['ref']}` @ `{short_sha(bb['baseline_sha'])}` | "
+            f"{regr_lbx} | {regr_nat} | {fixed_cell} | {cov_cell} | "
             f"{last_age_str} |"
         )
-        # Per-worktree regression detail block (only if non-zero).
-        if last_age is not None:
-            blocks: list[str] = []
-            for label, base_sha in (
-                (f"merge-base `{short_sha(mb)}`", mb),
-                (f"baseline HEAD `{short_sha(ref_head)}`", ref_head),
-            ):
-                for pass_name in ("native", "litebox"):
-                    ids = _regression_test_ids(conn, base_sha, agent_head,
-                                               pass_name, limit=20)
-                    if not ids:
-                        continue
-                    blocks.append(
-                        f"  - vs {label} ({pass_name}, {len(ids)} shown):\n    "
-                        + ", ".join(f"`{tid}`" for tid in ids)
-                    )
-            if blocks:
-                details.append(
-                    f"\n<details><summary>"
-                    f"Regressed test_ids — `{Path(path).name}` "
-                    f"@ `{short_sha(agent_head)}`</summary>\n\n"
-                    + "\n".join(blocks)
-                    + "\n\n</details>"
-                )
+        # Per-worktree regressed-test_id detail (hard + soft, both modes).
+        regr_rows = _agent_rc_regressed(conn, agent_head, limit=40)
+        if regr_rows:
+            by_mode: dict[str, list[str]] = {}
+            for r in regr_rows:
+                tag = "hard" if r["classification"] == "hard_regression" \
+                    else "soft"
+                ann = [tag, r["confidence"]]
+                if r["tip_verdict"] == "fail":
+                    ann.append("inherited")
+                by_mode.setdefault(r["mode"], []).append(
+                    f"`{r['test_id']}` ({'/'.join(ann)})")
+            blocks = [
+                f"  - {mode} ({len(ids)} shown): " + ", ".join(ids)
+                for mode, ids in sorted(by_mode.items())
+            ]
+            details.append(
+                f"\n<details><summary>"
+                f"Regressed test_ids — `{Path(path).name}` "
+                f"@ `{short_sha(agent_head)}`</summary>\n\n"
+                + "\n".join(blocks)
+                + "\n\n</details>"
+            )
     lines.append("")
     lines.append(
-        "_Bold = regressions (pass → fail). Italic `+N` = improvements "
-        "(fail → pass). `—` = no overlapping coverage with that "
-        "baseline yet (run more cycles). Worktrees are auto-discovered "
-        "from `git worktree list`; tracked-ref CI worktrees are "
-        "excluded. The supervisor opportunistically tests only the "
-        "tip-set (marker `→`) — when subagents fan out from a session "
-        "branch, only the worktrees whose HEAD isn't already contained "
-        "in another worktree's HEAD are tested directly. Idle gate: "
-        "source files untouched for `LITEBOX_AGENT_IDLE_SECS` (default "
-        "300s) AND no live lease from the worktree._"
+        "_Regressions: a test that passed at the merge-base baseline "
+        "and fails on the branch. **hard** = baseline & upstream were "
+        "stable (likely a real break); soft = upstream/baseline was "
+        "flaky (discounted). Confidence `hi/md/lo`: `hi` = failed the "
+        "full retry budget with a rock-solid upstream history; `lo` = "
+        "insufficient evidence. `inh` (inherited) = the baseline ref's "
+        "current tip fails the same test, so the branch isn't the "
+        "cause. Fixed = baseline fail → branch pass. Coverage `c/u` is "
+        "litebox tests run / comparable universe; `not run` is the gap "
+        "(a partial run can't read as clean). Worktrees are "
+        "auto-discovered from `git worktree list`; the supervisor "
+        "opportunistically tests only the tip-set (marker `→`). Full "
+        "per-test detail: `dashboard.py regressions <branch>`._"
     )
     out = "\n".join(lines) + "\n"
     if details:
         out += "\n" + "\n".join(details) + "\n"
+    conn.execute("DROP TABLE IF EXISTS _rc_render")
     return out
 
 
@@ -2640,11 +2736,13 @@ def write_summary(conn: sqlite3.Connection, state_dir: Path) -> Path:
 
 def cmd_regressions(args: argparse.Namespace) -> int:
     """Standardized regression classification for a branch, read from
-    the `regression_class` view. Buckets each failing (test, mode) as
+    the `regression_class` view. Buckets each (test, mode) as
     hard_regression (clean upstream → fail), soft_regression (was flaky
-    upstream), new_fail (no baseline), preexisting_fail, or flaky_pass,
-    each with a confidence tier — so sessions don't hand-roll triage
-    queries."""
+    upstream), new_fail (no baseline), preexisting_fail, fixed (baseline
+    fail → branch pass), or flaky_pass, each with a confidence tier. A
+    regression is flagged `inherited` when the baseline ref's current
+    tip fails the same test (the branch isn't the cause) — so sessions
+    don't hand-roll triage queries."""
     state_dir = resolve_state_dir(args.state_dir)
     conn = open_db(state_dir, with_state_views=False)
     if not args.no_refresh:
@@ -2678,20 +2776,20 @@ def cmd_regressions(args: argparse.Namespace) -> int:
     conn.execute("DROP TABLE IF EXISTS temp._rc")
     conn.execute(
         "CREATE TEMP TABLE _rc AS "
-        "SELECT mode, test_id, classification, confidence "
+        "SELECT mode, test_id, classification, confidence, tip_verdict "
         "  FROM regression_class WHERE branch_sha = ?",
         (branch_sha,),
     )
     if args.format == "sql":
         for r in conn.execute(
-            "SELECT mode, test_id, classification, confidence "
+            "SELECT mode, test_id, classification, confidence, tip_verdict "
             "  FROM _rc "
             "   WHERE classification NOT IN "
             "       ('ok','flaky_pass','no_result','not_run') "
             " ORDER BY mode, classification, confidence DESC, test_id",
         ):
             print(f"{r['mode']}\t{r['classification']}\t{r['confidence']}"
-                  f"\t{r['test_id']}")
+                  f"\t{r['test_id']}\t{r['tip_verdict'] or ''}")
         conn.close()
         return 0
     print(f"# Regressions — {row['branch']} @ {short_sha(branch_sha)} "
@@ -2727,13 +2825,20 @@ def cmd_regressions(args: argparse.Namespace) -> int:
             cov_str += f", {not_run} not_run"
         if n_nr:
             cov_str += f", {n_nr} no_result infra"
-        print(f"_{mode}_: {summary}   [{cov_str}]")
+        inh = conn.execute(
+            "SELECT COUNT(*) n FROM _rc WHERE mode = ? "
+            "   AND classification IN ('hard_regression','soft_regression') "
+            "   AND tip_verdict = 'fail'",
+            (mode,),
+        ).fetchone()["n"]
+        inh_str = f"   ({inh} inherited)" if inh else ""
+        print(f"_{mode}_: {summary}   [{cov_str}]{inh_str}")
     print()
     # List the actionable buckets, hardest first.
     for mode in ("native", "litebox"):
         for cls in ("hard_regression", "new_fail", "soft_regression"):
             ids = conn.execute(
-                "SELECT test_id, confidence FROM _rc "
+                "SELECT test_id, confidence, tip_verdict FROM _rc "
                 " WHERE mode = ? AND classification = ? "
                 " ORDER BY CASE confidence WHEN 'high' THEN 0 "
                 "          WHEN 'medium' THEN 1 ELSE 2 END, test_id",
@@ -2743,7 +2848,10 @@ def cmd_regressions(args: argparse.Namespace) -> int:
                 continue
             print(f"## {cls} ({mode}) — {len(ids)}")
             for r in ids[: args.limit]:
-                print(f"- `{r['test_id']}`  [{r['confidence']}]")
+                tags = [r["confidence"]]
+                if r["tip_verdict"] == "fail":
+                    tags.append("inherited")
+                print(f"- `{r['test_id']}`  [{', '.join(tags)}]")
             if len(ids) > args.limit:
                 print(f"  … and {len(ids) - args.limit} more "
                       f"(use --limit or --format sql)")

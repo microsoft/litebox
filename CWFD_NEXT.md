@@ -31,18 +31,18 @@ memory.
 handle when migrating across workers:
 
 1. At `commit_delayed_fork` snapshot time, iterate the parent's
-   fd table. For each `EventFileInner::Pidfd { exited, subject }`
-   entry, get the target's host PID from
+   fd table. For each local pidfd entry that must survive a
+   cross-worker migration, get the target's host PID from
    `global.fork_child_host_pids` and call
    `broker_pidfd_provider().create_pidfd(host_pid)` to mint a
-   broker handle. Record the handle ID in `FdEntrySnapshot`
-   alongside the existing fields.
+   broker handle. Emit that descriptor as
+   `FdKind::Pidfd { handle_id }` in `FdEntrySnapshot.kind`.
 
-2. At restore time, for `FdClass::EventFd` entries with a recorded
-   broker pidfd handle, construct an
+2. At restore time, the single exhaustive `match entry.kind` handles
+   `FdKind::Pidfd { handle_id }` by constructing an
    `EventFileInner::PidfdBrokerBacked { provider, handle, common }`
-   using the worker-side `broker_pidfd_provider()` and the
-   recorded handle id.
+   using the worker-side `broker_pidfd_provider()` and the matched
+   handle id.
 
 **Subtleties** (must be designed before implementing):
 - Refcounting: parent's broker handle creation increments the
@@ -52,10 +52,10 @@ handle when migrating across workers:
   (so the parent's tokio doesn't see a behavior change) and the
   broker handle exist only in the snapshot record? Yes — the
   snapshot is child-side; parent's view stays put.
-- `FdEntrySnapshot` wire format: needs a new optional field for
-  the broker-handle id. The structure has a `FdMetadataSnapshot`
-  carrying per-fd metadata — extend that with
-  `broker_pidfd_handle: Option<u64>`.
+- `FdEntrySnapshot` wire format: the broker-handle id belongs in the
+  `FdKind::Pidfd { handle_id }` variant. Do not add a second per-fd key in
+  metadata; the taxonomy collapse intentionally made the snapshot a single
+  `FdKind` sum rather than `(kind, optional handle)`.
 - What about non-fork-child pidfds (e.g. tokio's pidfds for its
   own subprocess management)? Only enter the broker path when the
   target IS in `fork_child_host_pids`. Tokio's children are also

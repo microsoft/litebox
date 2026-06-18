@@ -16,7 +16,7 @@
 //!   the child's fd table into a `FdTableSnapshot` and restore it in
 //!   a freshly spawned worker host. The per-fd accept/reject decision
 //!   lives in [`process::Task::snapshot_fd_table`], which exhaustively
-//!   matches on [`FdClass`] (the canonical fork-path gate today).
+//!   matches on [`FdKind`] (the canonical fork-path gate today).
 //! * **`exec_on_remote_host` (cross-binary-type exec)** — when a
 //!   non-PIE binary is `execve`'d we spawn a fresh worker host and
 //!   hand it `--broker-fd-bridge` specs for every fd that should
@@ -114,15 +114,15 @@ pub(crate) enum WorkerExecMigrationPolicy {
 
 /// Policy for an fd kind when crossing a vfork-style delayed-fork
 /// commit. Today every accept/reject decision is taken by
-/// `snapshot_fd_table`'s exhaustive `FdClass` match; this enum
+/// `snapshot_fd_table`'s exhaustive `FdKind` match; this enum
 /// records that linkage at the [`RawFdRef`] level so the two gates
-/// (RawFdRef + FdClass) stay in sync.
+/// (RawFdRef + FdKind) stay in sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DelayedForkPolicy {
     /// The fd is serialized into the `FdTableSnapshot` and restored
     /// on the new worker host. `snapshot_fd_table` decides whether
-    /// the fd is accepted or rejected based on its `FdClass`.
-    SnapshottedByFdClass,
+    /// the fd is accepted or rejected based on its `FdKind`.
+    SnapshottedByFdKind,
     /// The fd kind cannot be created by guest code on the default
     /// non-`worker_local_inet` build, so the arm exists for
     /// compile-time gating only and is never reached at runtime.
@@ -187,7 +187,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::FS_BROKERFILE_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::KernelInherits,
         },
         // Legacy `worker_local_inet` smoltcp socket. Only compiles
@@ -208,7 +208,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::EVENTFD_AND_TIMERFD_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         // epoll. Snapshot interest list and re-add per-interest in
@@ -218,7 +218,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::EPOLL_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::KernelInherits,
         },
         // Shim-local Unix domain socket (no broker backing). Not
@@ -228,7 +228,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::NotBridged {
                 reason: NoBridgeReason::NoCrossWorkerStatePreservation,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::KernelInherits,
         },
         // Host-backed kernel fd (a real Linux pipe end imported
@@ -238,7 +238,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::NotBridged {
                 reason: NoBridgeReason::HostKernelDupAcrossExec,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::KernelInherits,
         },
         // Broker-backed pipe. Emit-side `dup_handle` + bridge spec;
@@ -247,14 +247,14 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::BROKER_PIPE_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::BrokerSocketPair(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::BROKER_SOCKETPAIR_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         // Broker-backed AF_UNIX SOCK_DGRAM. Emit-side `dup_handle` +
@@ -263,7 +263,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::BROKER_SOCKET_DGRAM_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         // Broker-backed AF_UNIX SOCK_SEQPACKET. Emit-side `dup_handle`
@@ -272,42 +272,42 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::BROKER_SOCKET_SEQPACKET_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::BrokerTcpConn(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::BROKER_TCP_CONN_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::BrokerPty(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::BROKER_PTY_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::Signalfd(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::SIGNALFD_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::Inotify(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::INOTIFY_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::BrokerInetListener(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::BROKER_INET_LISTENER_BRIDGE_LOOP_NAME,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         // Broker-hosted datagram socket. No exec bridge yet (kernel
@@ -317,7 +317,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::NotBridged {
                 reason: NoBridgeReason::BrokerStateNotYetMigratable,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         // Broker-hosted raw IP socket (e.g. ICMP). Same status as
@@ -327,7 +327,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             worker_exec: WorkerExecMigrationPolicy::NotBridged {
                 reason: NoBridgeReason::BrokerStateNotYetMigratable,
             },
-            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
     }

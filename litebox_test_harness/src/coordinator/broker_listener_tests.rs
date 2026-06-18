@@ -971,6 +971,43 @@ pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
         &DNS_RESOLVE_CNAME_HEAVY,
         |out| Ok(format!("remote={}", out.remote_addrs.join(";"))),
     );
+    // Non-default binary legs for the CNAME-heavy resolver path. The
+    // pie-glibc leg above passes, but the real VS Code agent-host is the
+    // static-pie-musl `code` CLI, and it hangs at startup because musl's
+    // resolver (bind a UDP socket, fire parallel A+AAAA at the virtual
+    // DNS 10.0.0.1:53) never receives a reply through the broker — see
+    // session 05a42e59's audit of `update.code.visualstudio.com`. These
+    // legs reproduce that on the gold-standard native baseline (pass) vs
+    // litebox (the two musl legs FAIL) until the broker virtual DNS
+    // answers musl's query pattern. The glibc non-default legs are
+    // controls that isolate "musl resolver" from "non-PIE/static worker".
+    for (id, agent) in [
+        (
+            "BL.dns_resolve_cname_heavy.nonpie-glibc.dpg1_dng",
+            AgentName::Dpg1Dng,
+        ),
+        (
+            "BL.dns_resolve_cname_heavy.static-pie-glibc.dpg1_spg",
+            AgentName::Dpg1Spg,
+        ),
+        (
+            "BL.dns_resolve_cname_heavy.static-pie-musl.dpg1_spm",
+            AgentName::Dpg1Spm,
+        ),
+        (
+            "BL.dns_resolve_cname_heavy.non-pie-static-musl.dpg1_snm",
+            AgentName::Dpg1Snm,
+        ),
+    ] {
+        reg.single_agent_handler_test(
+            "broker_listener",
+            "dns_resolve_cname_heavy",
+            id,
+            agent,
+            &DNS_RESOLVE_CNAME_HEAVY,
+            |out| Ok(format!("remote={}", out.remote_addrs.join(";"))),
+        );
+    }
     reg.single_agent_handler_test(
         "broker_listener",
         "raw_icmp_echo",

@@ -88,7 +88,11 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
     match e {
         ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
-        ClientError::Protocol(_) => BrokerOpError::InvalidValue,
+        ClientError::InvalidValue { .. } | ClientError::Protocol(_) => BrokerOpError::InvalidValue,
+        ClientError::PermissionDenied => BrokerOpError::PermissionDenied,
+        ClientError::ProtocolNotSupported | ClientError::SubsystemMismatch => {
+            BrokerOpError::ProtocolNotSupported
+        }
         _ => BrokerOpError::Io,
     }
 }

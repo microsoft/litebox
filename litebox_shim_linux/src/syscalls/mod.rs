@@ -32,18 +32,11 @@ pub use broker_inet_listener::{broker_inet_listener_provider, set_broker_inet_li
 pub use broker_inet_raw::{broker_inet_raw_provider, set_broker_inet_raw_provider};
 pub use broker_pipe::{broker_pipe_provider, set_broker_pipe_provider};
 pub use broker_pty::{broker_pty_provider, set_broker_pty_provider};
-pub use broker_socket_dgram::{
-    broker_socket_dgram_provider, eager_broker_socket_dgram_enabled,
-    set_broker_socket_dgram_provider, set_eager_broker_socket_dgram_enabled,
-};
+pub use broker_socket_dgram::{broker_socket_dgram_provider, set_broker_socket_dgram_provider};
 pub use broker_socket_seqpacket::{
-    broker_socket_seqpacket_provider, eager_broker_socket_seqpacket_enabled,
-    set_broker_socket_seqpacket_provider, set_eager_broker_socket_seqpacket_enabled,
+    broker_socket_seqpacket_provider, set_broker_socket_seqpacket_provider,
 };
-pub use broker_socketpair::{
-    broker_socketpair_provider, eager_broker_socketpair_enabled, set_broker_socketpair_provider,
-    set_eager_broker_socketpair_enabled,
-};
+pub use broker_socketpair::{broker_socketpair_provider, set_broker_socketpair_provider};
 pub use broker_tcp_conn::{
     broker_inet_tcp_conn_provider_outbound_enabled, broker_tcp_conn_provider,
     set_broker_inet_tcp_conn_provider_outbound_enabled, set_broker_tcp_conn_accept_enabled,
@@ -52,9 +45,11 @@ pub use broker_tcp_conn::{
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::broker_pgrp_signal_provider;
 pub use eventfd::broker_pidfd_provider;
+pub use eventfd::broker_timerfd_provider;
 pub use eventfd::set_broker_eventfd_provider;
 pub use eventfd::set_broker_pgrp_signal_provider;
 pub use eventfd::set_broker_pidfd_provider;
+pub use eventfd::set_broker_timerfd_provider;
 pub use guest_pid::{
     broker_guest_pid_provider, set_broker_guest_pid_provider, try_mark_broker_process_exited,
     try_register_broker_guest_pid, try_release_all_broker_for_pid, try_release_broker_guest_pid,
@@ -77,6 +72,8 @@ pub(crate) mod signalfd;
 pub(crate) mod unix;
 
 pub(crate) mod signal;
+#[cfg(test)]
+pub(crate) mod test_broker_sockets;
 #[cfg(test)]
 pub(crate) mod tests;
 

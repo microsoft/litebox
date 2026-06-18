@@ -1181,11 +1181,13 @@ impl<FS: ShimFS> Task<FS> {
         // SIGKILL is not deferrable; publish process exit immediately so pidfd
         // pollers observe readiness even if the target is asleep in a futex.
         if is_local && signal == Signal::SIGKILL {
+            let exit_status = 128 + signal.as_i32();
+            super::guest_pid::try_mark_broker_process_exited(target.0, exit_status);
             let _ = self
                 .global
                 .litebox
                 .process_registry()
-                .exit_process(target, 128 + signal.as_i32());
+                .exit_process(target, exit_status);
             self.global
                 .litebox
                 .process_registry()

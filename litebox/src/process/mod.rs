@@ -11,13 +11,9 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::event::{
-    Events,
-    observer::Subject,
-    wait::{WaitContext, Waker},
-};
+use crate::event::wait::{WaitContext, Waker};
 use crate::platform::{RawMutex as RawMutexTrait, TimeProvider};
 use crate::sync::{Mutex, RawSyncPrimitivesProvider, RwLock};
 use zerocopy::byteorder::{I32, LE, U32};
@@ -418,16 +414,6 @@ struct ProcessEntry<Platform: RawSyncPrimitivesProvider> {
     /// Notification channel for this process's `waitpid` callers.
     /// Wrapped in [`Arc`] so it can be held outside the table lock.
     wait_channel: Arc<WaitChannel<Platform>>,
-    /// Shared exit state for pidfd-style readiness polling.
-    exited: Arc<AtomicBool>,
-    /// Observer subject notified when this process exits.
-    exit_subject: Arc<Subject<Events, Events, Platform>>,
-}
-
-/// Shared child-exit readiness state used by pidfd-style polling.
-pub struct ProcessExitState<Platform: RawSyncPrimitivesProvider> {
-    pub exited: Arc<AtomicBool>,
-    pub subject: Arc<Subject<Events, Events, Platform>>,
 }
 
 /// RAII guard that unregisters a [`Waker`] from a [`WaitChannel`] on drop.
@@ -584,8 +570,6 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             },
             children: Vec::new(),
             wait_channel: Arc::new(WaitChannel::new()),
-            exited: Arc::new(AtomicBool::new(false)),
-            exit_subject: Arc::new(Subject::new()),
         };
 
         let prev = table.insert(pid, entry);
@@ -677,7 +661,6 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     {
         let parent_wait_channel;
         let exit_notification;
-        let exit_subject;
 
         {
             let mut table = self.table.write();
@@ -712,11 +695,9 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                 return None;
             }
             entry.context.state = ProcessState::Zombie(status);
-            entry.exited.store(true, Ordering::Release);
 
             let parent = entry.context.parent;
             let exit_signal = entry.context.exit_signal;
-            exit_subject = Arc::clone(&entry.exit_subject);
 
             // In Linux, init (PID 1) exiting is a kernel panic. In LiteBox,
             // we allow it (sandbox teardown) but skip reparenting since there
@@ -797,8 +778,6 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
 
         before_notify(exit_notification);
 
-        exit_subject.notify_observers(Events::IN | Events::HUP);
-
         // Notify the parent outside the table lock.
         if let Some(wc) = parent_wait_channel {
             wc.notify();
@@ -815,16 +794,6 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         if let Some(entry) = table.get(&pid) {
             entry.wait_channel.notify();
         }
-    }
-
-    /// Return shared exit readiness state for the given process.
-    pub fn exit_state(&self, id: ProcessId) -> Option<ProcessExitState<Platform>> {
-        let table = self.table.read();
-        let entry = table.get(&id)?;
-        Some(ProcessExitState {
-            exited: Arc::clone(&entry.exited),
-            subject: Arc::clone(&entry.exit_subject),
-        })
     }
 
     /// Wait for a child process to exit (`waitpid` semantics).

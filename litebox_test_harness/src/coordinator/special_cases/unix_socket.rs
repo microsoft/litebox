@@ -1777,10 +1777,7 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                                     argv: vec![target, "unix-socket-test".into(), sub.clone()],
                                     timeout_ms: Some(10 * 1000),
                                     stdin: None,
-                                    env: vec![(
-                                        "LITEBOX_EAGER_BROKER_SOCKETDGRAM".into(),
-                                        "1".into(),
-                                    )],
+                                    env: Vec::new(),
                                 },
                             )
                             .await;
