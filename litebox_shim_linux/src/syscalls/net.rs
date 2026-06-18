@@ -4963,204 +4963,189 @@ impl<FS: ShimFS> Task<FS> {
         received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
-        let files = self.files.borrow();
-        let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
+        // Exhaustive socket-I/O dispatch over the shared `socket_io_class` gate
+        // (mirrors `do_sendto`); a new socket subsystem is an E0004 here instead
+        // of silently falling through to `with_socket`/ENOTSOCK or — for the
+        // broker stream types — tripping the `with_socket` panic net.
+        match self.socket_io_class_of(sockfd)? {
+            // F.8: broker-backed AF_UNIX SOCK_STREAM socketpair. recv() on a
+            // connected stream socketpair degenerates to read(); SCM_RIGHTS
+            // arrive in-band as broker tokens (FdTransferReader). A connected
+            // socketpair has no peer address, so `source_addr` is left unset
+            // (caller writes msg_namelen 0). The pre-gate code limited this to
+            // `!want_source` and let the `want_source` case fall through to the
+            // `with_socket` panic net; the gate handles both here.
+            SocketIoClass::BrokerSocketPair => self
+                .try_with_broker_sp(sockfd, |typed| {
+                    if buf.is_empty() {
+                        return Ok(0);
+                    }
+                    let handle = self.broker_sp_handle(typed)?;
+                    let mut staging = alloc::vec![0u8; buf.len()];
+                    let size =
+                        handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut staging))?;
+                    staging.truncate(size);
+                    let mut reader = FdTransferReader::new();
+                    reader.push(&staging);
+                    match reader.take_frame() {
+                        Ok(Some(frame)) => {
+                            received_tokens.extend(frame.tokens);
+                            let n = buf.len().min(frame.data.len());
+                            buf[..n].copy_from_slice(&frame.data[..n]);
+                            Ok(n)
+                        }
+                        Ok(None) | Err(FrameError::BadMagic { .. }) => {
+                            let n = buf.len().min(staging.len());
+                            buf[..n].copy_from_slice(&staging[..n]);
+                            Ok(n)
+                        }
+                        Err(_) => Err(Errno::EPROTO),
+                    }
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            // Connected broker TCP stream: recv() degenerates to read(); a
+            // connected socket has no source address, so `source_addr` is left
+            // unset for both the `want_source` and `!want_source` callers.
+            SocketIoClass::BrokerTcpConn => self
+                .try_with_broker_tcp_conn(sockfd, |typed| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(typed)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerInetDgram => self
+                .try_with_broker_inet_dgram(sockfd, |typed| {
+                    let handle = self.broker_inet_dgram_handle(typed)?;
+                    let (peer_raw, payload, dgram_flags) = handle
+                        .with_entry(|entry| entry.recvfrom(&self.wait_cx(), buf.len() as u32))?;
+                    let copied = buf.len().min(payload.len());
+                    buf[..copied].copy_from_slice(&payload[..copied]);
+                    if let Some(source_addr) = source_addr {
+                        *source_addr = Some(inet_listener_wire_to_socket_address(peer_raw)?);
+                    }
+                    let truncated = (dgram_flags
+                        & litebox_common_linux::cwfd::fd_token_protocol::INET_DGRAM_RECV_FLAG_TRUNC)
+                        != 0;
+                    Ok(if truncated {
+                        copied.saturating_add(1)
+                    } else {
+                        copied
+                    })
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketSeqPacket => self
+                .try_with_broker_socket_seqpacket(sockfd, |typed| {
+                    let handle = self.broker_socket_seqpacket_handle(typed)?;
+                    let recv_len = if flags.contains(ReceiveFlags::TRUNC) {
+                        u32::MAX
+                    } else {
+                        buf.len() as u32
+                    };
+                    let (payload, packet_flags) =
+                        handle.with_entry(|entry| entry.recv(&self.wait_cx(), recv_len))?;
+                    let copied = buf.len().min(payload.len());
+                    buf[..copied].copy_from_slice(&payload[..copied]);
+                    if flags.contains(ReceiveFlags::TRUNC) {
+                        return Ok(payload.len());
+                    }
+                    Ok(
+                        if super::broker_socket_seqpacket::recv_truncated(packet_flags) {
+                            copied.saturating_add(1)
+                        } else {
+                            copied
+                        },
+                    )
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerSocketDgram => self
+                .try_with_broker_socket_dgram(sockfd, |typed| {
+                    let handle = self.broker_socket_dgram_handle(typed)?;
+                    let recv_len = if flags.contains(ReceiveFlags::TRUNC) {
+                        u32::MAX
+                    } else {
+                        buf.len() as u32
+                    };
+                    let (src, payload, dgram_flags, tokens) =
+                        handle.with_entry(|entry| entry.recvfrom(&self.wait_cx(), recv_len))?;
+                    received_tokens.extend(tokens);
+                    let copied = buf.len().min(payload.len());
+                    buf[..copied].copy_from_slice(&payload[..copied]);
+                    if let Some(source_addr) = source_addr {
+                        *source_addr = Some(SocketAddress::Unix(src));
+                    }
+                    if flags.contains(ReceiveFlags::TRUNC) {
+                        return Ok(payload.len());
+                    }
+                    Ok(if super::broker_socket_dgram::recv_truncated(dgram_flags) {
+                        copied.saturating_add(1)
+                    } else {
+                        copied
+                    })
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            // inet-listener / inet-raw have no recv fast path; preserve the
+            // historical fall-through to `with_socket`. AF_UNIX / worker-local
+            // inet are dispatched by `with_socket`.
+            SocketIoClass::BrokerInetListener
+            | SocketIoClass::BrokerInetRaw
+            | SocketIoClass::WithSocket => {
+                let (size, addr) = {
+                    let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
+                    self.files.borrow().with_socket(
+                        &self.global,
+                        sockfd,
+                        |fd| {
+                            #[cfg(feature = "worker_local_inet")]
+                            {
+                                let mut addr = None;
+                                let size = self.global.receive(
+                                    &self.wait_cx(),
+                                    fd,
+                                    &mut buf.borrow_mut(),
+                                    flags,
+                                    if want_source { Some(&mut addr) } else { None },
+                                )?;
+                                let src_addr = addr.map(SocketAddress::Inet);
+                                Ok((size, src_addr))
+                            }
+                            #[cfg(not(feature = "worker_local_inet"))]
+                            {
+                                let _ = fd;
+                                Err(Errno::ENOTSOCK)
+                            }
+                        },
+                        |entry| {
+                            let mut addr = None;
+                            let size = entry.recvfrom(
+                                &self.wait_cx(),
+                                &mut buf.borrow_mut(),
+                                flags,
+                                if want_source { Some(&mut addr) } else { None },
+                                received_fds,
+                                received_tokens,
+                            )?;
+                            let src_addr = addr.map(SocketAddress::Unix);
+                            Ok((size, src_addr))
+                        },
+                    )?
+                };
 
-        // F.8 prep: broker-backed AF_UNIX SOCK_STREAM socketpair fast
-        // path. with_socket's two-arm dispatch (INET / shim-UnixSocket)
-        // doesn't know about BrokerSocketPair, so without this branch
-        // any recv() on a broker-backed socketpair would fall through
-        // to ENOTSOCK. tokio's signal self-pipe is the prominent
-        // caller hitting this under eager-broker-socketpair.
-        //
-        // recv() on a connected stream socketpair degenerates to
-        // read() when caller doesn't ask for addr/fds — exactly
-        // tokio's use. Limit this fast path to that case; richer
-        // recvmsg semantics (SCM_RIGHTS, peer addr) are deferred
-        // until BrokerSocketPair is plumbed through with_socket
-        // properly.
-        if !want_source {
-            let broker_sp = files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
-                .ok();
-            if let Some(typed) = broker_sp {
-                if buf.is_empty() {
-                    return Ok(0);
+                if !flags.contains(ReceiveFlags::TRUNC) {
+                    let len = buf.len();
+                    assert!(size <= len, "{size} should be smaller than {len}");
                 }
-                let handle = self.broker_sp_handle(typed.as_ref())?;
-                let mut staging = alloc::vec![0u8; buf.len()];
-                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut staging))?;
-                staging.truncate(size);
-                let mut reader = FdTransferReader::new();
-                reader.push(&staging);
-                match reader.take_frame() {
-                    Ok(Some(frame)) => {
-                        received_tokens.extend(frame.tokens);
-                        let n = buf.len().min(frame.data.len());
-                        buf[..n].copy_from_slice(&frame.data[..n]);
-                        return Ok(n);
-                    }
-                    Ok(None) | Err(FrameError::BadMagic { .. }) => {
-                        let n = buf.len().min(staging.len());
-                        buf[..n].copy_from_slice(&staging[..n]);
-                        return Ok(n);
-                    }
-                    Err(_) => return Err(Errno::EPROTO),
+
+                if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
+                    *source_addr = Some(addr);
                 }
+                Ok(size)
             }
-            let broker_tcp_conn = files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
-                .ok();
-            if let Some(typed) = broker_tcp_conn {
-                let handle = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(&typed)
-                    .ok_or(Errno::EBADF)?;
-                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
-                return Ok(size);
-            }
+            SocketIoClass::NotASocket => Err(Errno::ENOTSOCK),
         }
-
-        let broker_dgram = files
-            .raw_descriptor_store
-            .read()
-            .fd_from_raw_integer::<super::broker_inet_dgram::BrokerInetDgramSubsystem>(raw_fd)
-            .ok();
-        if let Some(typed) = broker_dgram {
-            let handle = self.broker_inet_dgram_handle(typed.as_ref())?;
-            let (peer_raw, payload, dgram_flags) =
-                handle.with_entry(|entry| entry.recvfrom(&self.wait_cx(), buf.len() as u32))?;
-            let copied = buf.len().min(payload.len());
-            buf[..copied].copy_from_slice(&payload[..copied]);
-            if let Some(source_addr) = source_addr {
-                *source_addr = Some(inet_listener_wire_to_socket_address(peer_raw)?);
-            }
-            let truncated = (dgram_flags
-                & litebox_common_linux::cwfd::fd_token_protocol::INET_DGRAM_RECV_FLAG_TRUNC)
-                != 0;
-            return Ok(if truncated {
-                copied.saturating_add(1)
-            } else {
-                copied
-            });
-        }
-
-        let broker_unix_seqpacket = files
-            .raw_descriptor_store
-            .read()
-            .fd_from_raw_integer::<super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(
-                raw_fd,
-            )
-            .ok();
-        if let Some(typed) = broker_unix_seqpacket {
-            let handle = self.broker_socket_seqpacket_handle(typed.as_ref())?;
-            let recv_len = if flags.contains(ReceiveFlags::TRUNC) {
-                u32::MAX
-            } else {
-                buf.len() as u32
-            };
-            let (payload, packet_flags) =
-                handle.with_entry(|entry| entry.recv(&self.wait_cx(), recv_len))?;
-            let copied = buf.len().min(payload.len());
-            buf[..copied].copy_from_slice(&payload[..copied]);
-            if flags.contains(ReceiveFlags::TRUNC) {
-                return Ok(payload.len());
-            }
-            return Ok(
-                if super::broker_socket_seqpacket::recv_truncated(packet_flags) {
-                    copied.saturating_add(1)
-                } else {
-                    copied
-                },
-            );
-        }
-
-        let broker_unix_dgram = files
-            .raw_descriptor_store
-            .read()
-            .fd_from_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(raw_fd)
-            .ok();
-        if let Some(typed) = broker_unix_dgram {
-            let handle = self.broker_socket_dgram_handle(typed.as_ref())?;
-            let recv_len = if flags.contains(ReceiveFlags::TRUNC) {
-                u32::MAX
-            } else {
-                buf.len() as u32
-            };
-            let (src, payload, dgram_flags, tokens) =
-                handle.with_entry(|entry| entry.recvfrom(&self.wait_cx(), recv_len))?;
-            received_tokens.extend(tokens);
-            let copied = buf.len().min(payload.len());
-            buf[..copied].copy_from_slice(&payload[..copied]);
-            if let Some(source_addr) = source_addr {
-                *source_addr = Some(SocketAddress::Unix(src));
-            }
-            if flags.contains(ReceiveFlags::TRUNC) {
-                return Ok(payload.len());
-            }
-            return Ok(if super::broker_socket_dgram::recv_truncated(dgram_flags) {
-                copied.saturating_add(1)
-            } else {
-                copied
-            });
-        }
-
-        let (size, addr) = {
-            let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-            files.with_socket(
-                &self.global,
-                raw_fd.truncate(),
-                |fd| {
-                    #[cfg(feature = "worker_local_inet")]
-                    {
-                        let mut addr = None;
-                        let size = self.global.receive(
-                            &self.wait_cx(),
-                            fd,
-                            &mut buf.borrow_mut(),
-                            flags,
-                            if want_source { Some(&mut addr) } else { None },
-                        )?;
-                        let src_addr = addr.map(SocketAddress::Inet);
-                        Ok((size, src_addr))
-                    }
-                    #[cfg(not(feature = "worker_local_inet"))]
-                    {
-                        let _ = fd;
-                        Err(Errno::ENOTSOCK)
-                    }
-                },
-                |entry| {
-                    let mut addr = None;
-                    let size = entry.recvfrom(
-                        &self.wait_cx(),
-                        &mut buf.borrow_mut(),
-                        flags,
-                        if want_source { Some(&mut addr) } else { None },
-                        received_fds,
-                        received_tokens,
-                    )?;
-                    let src_addr = addr.map(SocketAddress::Unix);
-                    Ok((size, src_addr))
-                },
-            )?
-        };
-
-        if !flags.contains(ReceiveFlags::TRUNC) {
-            let len = buf.len();
-            assert!(size <= len, "{size} should be smaller than {len}");
-        }
-
-        if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
-            *source_addr = Some(addr);
-        }
-        Ok(size)
     }
 
     pub(crate) fn sys_setsockopt(
