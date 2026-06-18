@@ -2836,7 +2836,7 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(u32::try_from(raw_fd).unwrap())
                 })
                 .unwrap_or(Err(Errno::EBADF))
-                .map(|fd| (fd, None)),
+                .map(|fd| (fd, Some(SocketAddress::Unix(UnixSocketAddr::Unnamed)))),
             SocketIoClass::BrokerSocketSeqPacket => self
                 .try_with_broker_socket_seqpacket(sockfd, |typed| {
                     let handle = self.broker_socket_seqpacket_handle(typed)?;

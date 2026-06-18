@@ -2094,6 +2094,25 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
+        if let Ok(usfd) =
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_unix_stream::BrokerUnixStreamSubsystem>(raw_fd)
+        {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&usfd)
+                .ok_or(Errno::EBADF)?;
+            let payload =
+                handle.with_entry(|entry| entry.recv(&self.wait_cx(), buf.len() as u32))?;
+            let n = payload.len().min(buf.len());
+            buf[..n].copy_from_slice(&payload[..n]);
+            return Ok(n);
+        }
+
         if let Ok(inofd) = files
             .raw_descriptor_store
             .read()
@@ -2395,6 +2414,21 @@ impl<FS: ShimFS> Task<FS> {
                 .entry_handle(&spfd)
                 .ok_or(Errno::EBADF)?;
             return handle.with_entry(|entry| entry.write(&self.wait_cx(), buf));
+        }
+
+        if let Ok(usfd) =
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_unix_stream::BrokerUnixStreamSubsystem>(raw_fd)
+        {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&usfd)
+                .ok_or(Errno::EBADF)?;
+            return handle.with_entry(|entry| entry.send(&self.wait_cx(), buf));
         }
 
         let res = files

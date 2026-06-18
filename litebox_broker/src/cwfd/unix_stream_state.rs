@@ -313,6 +313,19 @@ impl UnixStreamState {
 
 impl Drop for UnixStreamState {
     fn drop(&mut self) {
+        // Wake a peer that may be blocked in `recv`/`send` so it observes the
+        // disconnect (EOF on read, EPIPE on write) instead of hanging on a
+        // subscription that will never fire again.
+        if let Some(peer) = self
+            .inner
+            .lock()
+            .expect("UnixStreamState poisoned")
+            .peer
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            peer.notify_current();
+        }
         if let Some(addr) = self
             .inner
             .lock()
