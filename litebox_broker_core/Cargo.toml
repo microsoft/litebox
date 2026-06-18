@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bitflags = { version = "2.9.0", default-features = false }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 slotmap = { version = "1.1.1", default-features = false }
 
