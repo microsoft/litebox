@@ -718,15 +718,24 @@ impl<FS: ShimFS> Task<FS> {
             .flatten()
     }
 
-    /// Handle syscall `mkdir`
-    pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
-        let pathname = self.resolve_path(pathname)?;
-        let mode = Mode::from_bits_retain(mode) & !self.get_umask();
+    fn do_mkdir(&self, pathname: impl path::Arg, mode: Mode) -> Result<(), Errno> {
+        let mode = mode & !self.get_umask();
         self.files
             .borrow()
             .fs
             .mkdir(pathname, mode)
             .map_err(Errno::from)
+    }
+
+    /// Handle syscall `mkdirat`
+    pub(crate) fn sys_mkdirat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: u32,
+    ) -> Result<(), Errno> {
+        let pathname = self.resolve_path_at(dirfd, pathname)?;
+        self.do_mkdir(pathname, Mode::from_bits_retain(mode))
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
@@ -2726,7 +2735,8 @@ mod tests {
         assert_eq!(cwd, "/");
 
         // chdir + getcwd round trip.
-        task.sys_mkdir("/test_chdir_dir", 0o777).unwrap();
+        task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/test_chdir_dir", 0o777)
+            .unwrap();
         task.sys_chdir("/test_chdir_dir").unwrap();
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
@@ -2762,8 +2772,14 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
 
         // Create nested dirs: /rel_parent/rel_child
-        task.sys_mkdir("/rel_parent", 0o777).unwrap();
-        task.sys_mkdir("/rel_parent/rel_child", 0o777).unwrap();
+        task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/rel_parent", 0o777)
+            .unwrap();
+        task.sys_mkdirat(
+            litebox_common_linux::AT_FDCWD,
+            "/rel_parent/rel_child",
+            0o777,
+        )
+        .unwrap();
 
         // chdir to /rel_parent first, then relative chdir into child.
         task.sys_chdir("/rel_parent").unwrap();
@@ -2831,7 +2847,11 @@ mod tests {
                 .unwrap_err(),
             Errno::ENOENT
         );
-        assert_eq!(task.sys_mkdir("", 0o755).unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "", 0o755)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
         assert_eq!(
             task.sys_mknodat(
                 litebox_common_linux::AT_FDCWD,
@@ -2858,7 +2878,8 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
 
         // Set up: mkdir + chdir into /cwd_test/.
-        task.sys_mkdir("/cwd_test", 0o777).unwrap();
+        task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/cwd_test", 0o777)
+            .unwrap();
         task.sys_chdir("/cwd_test").unwrap();
 
         // ── sys_open: create a file via relative path ──
@@ -2886,8 +2907,9 @@ mod tests {
         )
         .unwrap();
 
-        // ── sys_mkdir: create a subdirectory via relative path ──
-        task.sys_mkdir("subdir", 0o777).unwrap();
+        // ── create a subdirectory via relative path ──
+        task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "subdir", 0o777)
+            .unwrap();
         task.sys_stat("/cwd_test/subdir").unwrap(); // verify via absolute
 
         // ── sys_openat (AT_FDCWD + relative): open inside the new subdir ──
