@@ -35,6 +35,7 @@ pub mod broker_socketpair_provider;
 pub mod broker_subscribable;
 pub mod broker_tcp_conn_provider;
 pub mod broker_timerfd_provider;
+pub mod broker_unix_stream_provider;
 pub mod fd_token_protocol;
 pub mod fd_transfer_frame;
 pub mod guest_pid_provider;

@@ -90,6 +90,10 @@ impl<FS: ShimFS> Task<FS> {
                     super::broker_socket_seqpacket::BrokerSocketSeqPacketFd<Platform>,
                 >(),
             ),
+            litebox::fd::SubsystemKind::BrokerUnixStream => (
+                TypeId::of::<super::broker_unix_stream::BrokerUnixStreamFd<Platform>>(),
+                core::any::type_name::<super::broker_unix_stream::BrokerUnixStreamFd<Platform>>(),
+            ),
             litebox::fd::SubsystemKind::BrokerPty => (
                 TypeId::of::<super::broker_pty::BrokerPtyFd<Platform>>(),
                 core::any::type_name::<super::broker_pty::BrokerPtyFd<Platform>>(),
@@ -885,6 +889,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerPipe(_fd) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::BrokerSocketPair(_)
                 | crate::RawFdRef::BrokerSocketDgram(_)
+                | crate::RawFdRef::BrokerUnixStream(_)
                 | crate::RawFdRef::BrokerSocketSeqPacket(_) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::BrokerTcpConn(_fd) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::BrokerPty(_fd) => None, // direct BrokerPty lookup is handled above
@@ -1607,6 +1612,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -1701,6 +1707,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerPipe(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerSocketPair(_)
                 | crate::RawFdRef::BrokerSocketDgram(_)
+                | crate::RawFdRef::BrokerUnixStream(_)
                 | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerTcpConn(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerPty(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
@@ -1795,6 +1802,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -1873,6 +1881,7 @@ impl<FS: ShimFS> Task<FS> {
                         crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::BrokerSocketPair(_)
                         | crate::RawFdRef::BrokerSocketDgram(_)
+                        | crate::RawFdRef::BrokerUnixStream(_)
                         | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -2329,6 +2338,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Inotify(_fd) => Err(Errno::EINVAL),
                 crate::RawFdRef::BrokerInetListener(_fd) => Err(Errno::EINVAL),
                 crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+                crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerInetRaw(_fd) => Err(Errno::EINVAL),
             })
@@ -2533,6 +2543,7 @@ impl<FS: ShimFS> Task<FS> {
                 | crate::RawFdRef::BrokerInetListener(_)
                 | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+                crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
             })
@@ -2909,6 +2920,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerPipe(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::BrokerSocketPair(_)
                 | crate::RawFdRef::BrokerSocketDgram(_)
+                | crate::RawFdRef::BrokerUnixStream(_)
                 | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::BrokerPty(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
@@ -3182,6 +3194,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -3212,6 +3225,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::BrokerPipe(_) => (),
             crate::RawFdRef::BrokerSocketPair(_)
             | crate::RawFdRef::BrokerSocketDgram(_)
+            | crate::RawFdRef::BrokerUnixStream(_)
             | crate::RawFdRef::BrokerSocketSeqPacket(_) => (),
             crate::RawFdRef::BrokerTcpConn(_) => (),
             crate::RawFdRef::BrokerPty(_) => (),
@@ -3298,6 +3312,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerSocketPair(_)
             | crate::RawFdRef::BrokerSocketDgram(_)
+            | crate::RawFdRef::BrokerUnixStream(_)
             | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -3623,6 +3638,14 @@ impl<FS: ShimFS> Task<FS> {
             drop(entry);
             return Ok(());
         }
+        if let Ok(fd) = rds
+            .fd_consume_raw_integer::<super::broker_unix_stream::BrokerUnixStreamSubsystem>(raw_fd)
+        {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
         if let Ok(fd) =
             rds.fd_consume_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
         {
@@ -3772,6 +3795,13 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
             }
             crate::RawFdRef::BrokerSocketDgram(fd) => {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            }
+            crate::RawFdRef::BrokerUnixStream(fd) => {
                 let _old = self
                     .global
                     .litebox
@@ -4070,6 +4100,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Inotify(_fd) => Err(Errno::EINVAL),
                 crate::RawFdRef::BrokerInetListener(_fd) => Err(Errno::EINVAL),
                 crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+                crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerInetRaw(_fd) => Err(Errno::EINVAL),
             })
@@ -4174,6 +4205,7 @@ fn fcntl_status_flags<FS: ShimFS>(
             crate::RawFdRef::BrokerInetListener(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::BrokerInetDgram(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+            crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerInetRaw(fd) => getfl_from_handle!(fd),
         })
@@ -4479,6 +4511,7 @@ impl<FS: ShimFS> Task<FS> {
                 | crate::RawFdRef::BrokerInetListener(_)
                 | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+                crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
             })
@@ -4556,6 +4589,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_) => Ok(()),
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => Ok(()),
                     crate::RawFdRef::BrokerTcpConn(_) => Ok(()),
                     crate::RawFdRef::BrokerPty(_) => Ok(()),
@@ -4586,6 +4620,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -4875,6 +4910,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_) => (),
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => (),
                     crate::RawFdRef::BrokerTcpConn(_) => (),
                     crate::RawFdRef::BrokerPty(_) => (),
@@ -4914,6 +4950,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -5278,6 +5315,7 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                 })
             }
             crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+            crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerInetRaw(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
@@ -5351,6 +5389,7 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
             crate::RawFdRef::BrokerPipe(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::BrokerSocketPair(_)
             | crate::RawFdRef::BrokerSocketDgram(_)
+            | crate::RawFdRef::BrokerUnixStream(_)
             | crate::RawFdRef::BrokerSocketSeqPacket(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::BrokerTcpConn(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::BrokerPty(_) => false, // broker PTYs report their own synthetic stat
@@ -5432,6 +5471,7 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
         crate::RawFdRef::BrokerInetListener(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerInetDgram(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerSocketDgram(fd) => get_flags(global, fd),
+        crate::RawFdRef::BrokerUnixStream(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerSocketSeqPacket(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerInetRaw(fd) => get_flags(global, fd),
     })
@@ -5471,6 +5511,7 @@ fn set_file_descriptor_flags<FS: ShimFS>(
         crate::RawFdRef::BrokerInetListener(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerInetDgram(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerSocketDgram(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::BrokerUnixStream(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerSocketSeqPacket(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerInetRaw(fd) => set_flags(global, fd, flags),
     })?;
@@ -5729,6 +5770,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -6177,6 +6219,7 @@ impl<FS: ShimFS> Task<FS> {
                         })
                     }
                     crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+                    crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
                     crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
                     crate::RawFdRef::BrokerInetRaw(fd) => {
                         let handle = self
@@ -6309,6 +6352,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerSocketPair(_)
             | crate::RawFdRef::BrokerSocketDgram(_)
+            | crate::RawFdRef::BrokerUnixStream(_)
             | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -7370,6 +7414,7 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         crate::RawFdRef::BrokerSocketPair(_)
                         | crate::RawFdRef::BrokerSocketDgram(_)
+                        | crate::RawFdRef::BrokerUnixStream(_)
                         | crate::RawFdRef::BrokerSocketSeqPacket(_) => {
                             todo!(
                                 "FIONREAD on broker socketpair: real Linux returns queued readable byte count"
@@ -7619,6 +7664,7 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(())
                         }
                         crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+                        crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
                         crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
                         crate::RawFdRef::BrokerInetRaw(fd) => {
                             let handle = self
@@ -7753,6 +7799,7 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 }
                 crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+                crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerInetRaw(fd) => {
                     let _old = self
@@ -7878,6 +7925,7 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 }
                 crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+                crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
                 crate::RawFdRef::BrokerInetRaw(fd) => {
                     let _old = self
@@ -7911,6 +7959,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerPty(_) => {
@@ -7964,6 +8013,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerPipe(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerSocketPair(_)
                     | crate::RawFdRef::BrokerSocketDgram(_)
+                    | crate::RawFdRef::BrokerUnixStream(_)
                     | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerTcpConn(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerPty(_fd) => {
@@ -8766,6 +8816,7 @@ impl<FS: ShimFS> Task<FS> {
                 min_fd,
             ),
             crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+            crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerInetRaw(fd) => dup(
                 &self.global,
@@ -8952,6 +9003,7 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(())
                         }
                         crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+                        crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
                         crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
                         crate::RawFdRef::BrokerInetRaw(fd) => {
                             self.global
@@ -9095,6 +9147,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::BrokerPipe(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerSocketPair(_)
             | crate::RawFdRef::BrokerSocketDgram(_)
+            | crate::RawFdRef::BrokerUnixStream(_)
             | crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerTcpConn(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPty(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd

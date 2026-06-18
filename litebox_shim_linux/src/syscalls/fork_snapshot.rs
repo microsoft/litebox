@@ -348,6 +348,8 @@ pub enum FdKind {
     BrokerSocketDgram { handle_id: u64 },
     /// Broker-hosted AF_UNIX SOCK_SEQPACKET socket.
     BrokerSocketSeqPacket { handle_id: u64 },
+    /// Broker-hosted AF_UNIX named SOCK_STREAM socket.
+    BrokerUnixStream { handle_id: u64 },
     /// Broker-hosted connected TCP socket.
     BrokerTcpConn { handle_id: u64 },
     /// Broker-hosted TCP listener.
@@ -378,6 +380,7 @@ impl FdKind {
             Self::BrokerSocketSeqPacket { .. } => 11,
             Self::Timerfd { .. } => 12,
             Self::BrokerInetRaw { .. } => 13,
+            Self::BrokerUnixStream { .. } => 14,
             Self::FilesystemFd => 20,
             Self::UnixSocket => 21,
             Self::Epoll => 22,
@@ -403,6 +406,7 @@ impl FdKind {
             | Self::BrokerSocketPair { handle_id, .. }
             | Self::BrokerSocketDgram { handle_id }
             | Self::BrokerSocketSeqPacket { handle_id }
+            | Self::BrokerUnixStream { handle_id }
             | Self::BrokerTcpConn { handle_id }
             | Self::BrokerInetListener { handle_id }
             | Self::BrokerInetDgram { handle_id }
@@ -442,6 +446,7 @@ impl FdKind {
             Self::BrokerInetDgram { .. } => "inet_dgram",
             Self::BrokerSocketDgram { .. } => "socket_dgram",
             Self::BrokerSocketSeqPacket { .. } => "socket_seqpacket",
+            Self::BrokerUnixStream { .. } => "unix_stream",
             Self::BrokerInetRaw { .. } => "inet_raw",
             Self::FilesystemFd => "filesystem",
             Self::UnixSocket => "unix_socket_local",
@@ -474,6 +479,7 @@ impl FdKind {
             | Self::Signalfd { handle_id }
             | Self::BrokerSocketDgram { handle_id }
             | Self::BrokerSocketSeqPacket { handle_id }
+            | Self::BrokerUnixStream { handle_id }
             | Self::BrokerTcpConn { handle_id }
             | Self::BrokerInetListener { handle_id }
             | Self::BrokerInetDgram { handle_id }
@@ -564,6 +570,9 @@ impl FdKind {
                 handle_id: r.read_u64()?,
             },
             13 => Self::BrokerInetRaw {
+                handle_id: r.read_u64()?,
+            },
+            14 => Self::BrokerUnixStream {
                 handle_id: r.read_u64()?,
             },
             20 => Self::FilesystemFd,

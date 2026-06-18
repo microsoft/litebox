@@ -84,6 +84,12 @@ type BrokerSocketSeqPacketHandle = litebox::fd::EntryHandle<
     Platform,
     crate::syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem,
 >;
+type BrokerUnixStreamTypedFd =
+    litebox::fd::TypedFd<crate::syscalls::broker_unix_stream::BrokerUnixStreamSubsystem>;
+type BrokerUnixStreamHandle = litebox::fd::EntryHandle<
+    Platform,
+    crate::syscalls::broker_unix_stream::BrokerUnixStreamSubsystem,
+>;
 type BrokerTcpConnTypedFd =
     litebox::fd::TypedFd<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>;
 type BrokerTcpConnHandle =
@@ -1413,6 +1419,7 @@ pub(super) enum SocketIoClass {
     BrokerSocketPair,
     BrokerSocketDgram,
     BrokerSocketSeqPacket,
+    BrokerUnixStream,
     BrokerTcpConn,
     BrokerInetListener,
     BrokerInetDgram,
@@ -1433,6 +1440,7 @@ pub(super) fn socket_io_class<FS: ShimFS>(r: &crate::RawFdRef<'_, FS>) -> Socket
         RawFdRef::BrokerSocketPair(_) => SocketIoClass::BrokerSocketPair,
         RawFdRef::BrokerSocketDgram(_) => SocketIoClass::BrokerSocketDgram,
         RawFdRef::BrokerSocketSeqPacket(_) => SocketIoClass::BrokerSocketSeqPacket,
+        RawFdRef::BrokerUnixStream(_) => SocketIoClass::BrokerUnixStream,
         RawFdRef::BrokerTcpConn(_) => SocketIoClass::BrokerTcpConn,
         RawFdRef::BrokerInetListener(_) => SocketIoClass::BrokerInetListener,
         RawFdRef::BrokerInetDgram(_) => SocketIoClass::BrokerInetDgram,
@@ -1558,6 +1566,37 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         typed: &BrokerSocketSeqPacketTypedFd,
     ) -> Result<BrokerSocketSeqPacketHandle, Errno> {
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(typed)
+            .ok_or(Errno::EBADF)
+    }
+
+    fn try_with_broker_unix_stream<R>(
+        &self,
+        sockfd: u32,
+        op: impl FnOnce(&BrokerUnixStreamTypedFd) -> Result<R, Errno>,
+    ) -> Option<Result<R, Errno>> {
+        let raw_fd = match usize::try_from(sockfd) {
+            Ok(raw_fd) => raw_fd,
+            Err(_) => return Some(Err(Errno::EBADF)),
+        };
+        let broker_unix_stream = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_unix_stream::BrokerUnixStreamSubsystem>(raw_fd)
+                .ok()
+        };
+        broker_unix_stream.map(|typed| op(typed.as_ref()))
+    }
+
+    fn broker_unix_stream_handle(
+        &self,
+        typed: &BrokerUnixStreamTypedFd,
+    ) -> Result<BrokerUnixStreamHandle, Errno> {
         self.global
             .litebox
             .descriptor_table()
@@ -1917,7 +1956,55 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         return Ok(u32::try_from(raw_fd).unwrap());
                     }
-                    SockType::Stream => {}
+                    SockType::Stream => {
+                        // Proper Model: a named AF_UNIX stream socket is a
+                        // first-class broker subsystem when the provider is
+                        // available (the Linux default). The local
+                        // `UnixSocket` path below is the no-broker fallback
+                        // used by unit tests.
+                        if let Some(provider) =
+                            crate::syscalls::broker_unix_stream::broker_unix_stream_provider()
+                        {
+                            let mut status = OFlags::empty();
+                            status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                            let handle = provider
+                                .create()
+                                .map_err(super::broker_backed::broker_err_to_errno)?;
+                            let stream = crate::syscalls::broker_unix_stream::BrokerUnixStreamFd::<
+                                Platform,
+                            >::new(
+                                provider, handle, status
+                            );
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let typed = dt.insert::<crate::syscalls::broker_unix_stream::BrokerUnixStreamSubsystem>(stream);
+                            if flags.contains(SockFlags::CLOEXEC) {
+                                let old =
+                                    dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                                assert!(old.is_none());
+                            }
+                            drop(dt);
+                            #[cfg(feature = "trace_syscalls")]
+                            let object_id = typed.object_id().as_u64();
+                            let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                                Errno::EMFILE
+                            })?;
+                            #[cfg(feature = "trace_syscalls")]
+                            if raw_fd <= 20 {
+                                litebox::log_println!(
+                                    self.global.platform,
+                                    "[FD-TRACE] pid={} socket raw_fd={} object_id={} domain={:?} type={:?} flags={:?}",
+                                    self.pid,
+                                    raw_fd,
+                                    object_id,
+                                    domain,
+                                    ty,
+                                    flags,
+                                );
+                            }
+                            return Ok(u32::try_from(raw_fd).unwrap());
+                        }
+                    }
                     #[allow(
                         clippy::wildcard_enum_match_arm,
                         reason = "SockType is non_exhaustive; unknown socket types are unsupported"
@@ -2711,6 +2798,45 @@ impl<FS: ShimFS> Task<FS> {
                     ))
                 })
                 .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerUnixStream => self
+                .try_with_broker_unix_stream(sockfd, |typed| {
+                    let handle = self.broker_unix_stream_handle(typed)?;
+                    let accepted_handle =
+                        handle.with_entry(|entry| entry.accept(&self.wait_cx()))?;
+                    let provider =
+                        crate::syscalls::broker_unix_stream::broker_unix_stream_provider()
+                            .ok_or(Errno::EIO)?;
+                    let mut status = OFlags::empty();
+                    status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                    let stream =
+                        crate::syscalls::broker_unix_stream::BrokerUnixStreamFd::<Platform>::new(
+                            provider,
+                            accepted_handle,
+                            status,
+                        );
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let typed_stream = dt.insert::<
+                        crate::syscalls::broker_unix_stream::BrokerUnixStreamSubsystem,
+                    >(stream);
+                    if flags.contains(SockFlags::CLOEXEC) {
+                        let old =
+                            dt.set_fd_metadata(&typed_stream, FileDescriptorFlags::FD_CLOEXEC);
+                        assert!(old.is_none());
+                    }
+                    drop(dt);
+                    let files = self.files.borrow();
+                    let raw_fd = files.insert_raw_fd(typed_stream).map_err(|typed_stream| {
+                        let _ = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .remove(&typed_stream);
+                        Errno::EMFILE
+                    })?;
+                    Ok(u32::try_from(raw_fd).unwrap())
+                })
+                .unwrap_or(Err(Errno::EBADF))
+                .map(|fd| (fd, None)),
             SocketIoClass::BrokerSocketSeqPacket => self
                 .try_with_broker_socket_seqpacket(sockfd, |typed| {
                     let handle = self.broker_socket_seqpacket_handle(typed)?;
@@ -2952,6 +3078,13 @@ impl<FS: ShimFS> Task<FS> {
                     handle.with_entry(|entry| entry.connect(addr))
                 })
                 .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerUnixStream => self
+                .try_with_broker_unix_stream(sockfd, |typed| {
+                    let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
+                    let handle = self.broker_unix_stream_handle(typed)?;
+                    handle.with_entry(|entry| entry.connect(addr))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketSeqPacket => self
                 .try_with_broker_socket_seqpacket(sockfd, |typed| {
                     let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -3086,6 +3219,13 @@ impl<FS: ShimFS> Task<FS> {
                     handle.with_entry(|entry| entry.bind(addr)).map(|_| ())
                 })
                 .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerUnixStream => self
+                .try_with_broker_unix_stream(sockfd, |typed| {
+                    let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
+                    let handle = self.broker_unix_stream_handle(typed)?;
+                    handle.with_entry(|entry| entry.bind(addr)).map(|_| ())
+                })
+                .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketSeqPacket => self
                 .try_with_broker_socket_seqpacket(sockfd, |typed| {
                     let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -3132,6 +3272,12 @@ impl<FS: ShimFS> Task<FS> {
             SocketIoClass::BrokerInetListener => self
                 .try_with_broker_inet_listener(sockfd, |typed| {
                     let handle = self.broker_inet_listener_handle(typed)?;
+                    handle.with_entry(|entry| entry.listen(u32::from(backlog)))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerUnixStream => self
+                .try_with_broker_unix_stream(sockfd, |typed| {
+                    let handle = self.broker_unix_stream_handle(typed)?;
                     handle.with_entry(|entry| entry.listen(u32::from(backlog)))
                 })
                 .unwrap_or(Err(Errno::EBADF)),
@@ -3299,6 +3445,18 @@ impl<FS: ShimFS> Task<FS> {
     }
     #[deny(clippy::wildcard_enum_match_arm)]
     fn do_shutdown(&self, sockfd: u32, read: bool, write: bool) -> Result<(), Errno> {
+        if let Some(result) = self.try_with_broker_unix_stream(sockfd, |typed| {
+            let handle = self.broker_unix_stream_handle(typed)?;
+            let how = match (read, write) {
+                (true, false) => 0,
+                (false, true) => 1,
+                (true, true) => 2,
+                (false, false) => return Ok(()),
+            };
+            handle.with_entry(|entry| entry.shutdown(how))
+        }) {
+            return result;
+        }
         if let Some(result) = self.try_with_broker_socket_seqpacket(sockfd, |typed| {
             let handle = self.broker_socket_seqpacket_handle(typed)?;
             let how = match (read, write) {
@@ -3370,6 +3528,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
+            crate::RawFdRef::BrokerUnixStream(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::EINVAL),
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::ENOTSOCK),
@@ -3462,6 +3621,15 @@ impl<FS: ShimFS> Task<FS> {
                         .transpose()?;
                     let handle = self.broker_socket_dgram_handle(typed)?;
                     handle.with_entry(|entry| entry.sendto(&self.wait_cx(), addr, buf, &[]))
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerUnixStream => self
+                .try_with_broker_unix_stream(sockfd, |typed| {
+                    if sockaddr.is_some() {
+                        return Err(Errno::EISCONN);
+                    }
+                    let handle = self.broker_unix_stream_handle(typed)?;
+                    handle.with_entry(|entry| entry.send(&self.wait_cx(), buf))
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketSeqPacket => self
@@ -3904,7 +4072,8 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         crate::RawFdRef::BrokerInetDgram(_) => Ok(false),
                         crate::RawFdRef::BrokerSocketDgram(_)
-                        | crate::RawFdRef::BrokerSocketSeqPacket(_) => {
+                        | crate::RawFdRef::BrokerSocketSeqPacket(_)
+                        | crate::RawFdRef::BrokerUnixStream(_) => {
                             // Broker socket dgram/seqpacket are not broker-token-
                             // transferable over SCM yet (same status as BrokerSocketPair).
                             Ok(false)
@@ -4148,6 +4317,19 @@ impl<FS: ShimFS> Task<FS> {
                     handle.with_entry(|entry| {
                         entry.sendto(&self.wait_cx(), addr, &buf, &passed_tokens)
                     })
+                })
+                .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerUnixStream => self
+                .try_with_broker_unix_stream(sockfd, |typed| {
+                    if msg.msg_controllen != 0 {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
+                    if sock_addr.is_some() {
+                        return Err(Errno::EISCONN);
+                    }
+                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
+                    let handle = self.broker_unix_stream_handle(typed)?;
+                    handle.with_entry(|entry| entry.send(&self.wait_cx(), &buf))
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketSeqPacket => self
@@ -5049,6 +5231,17 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 })
                 .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerUnixStream => self
+                .try_with_broker_unix_stream(sockfd, |typed| {
+                    let handle = self.broker_unix_stream_handle(typed)?;
+                    let recv_len = buf.len() as u32;
+                    let payload =
+                        handle.with_entry(|entry| entry.recv(&self.wait_cx(), recv_len))?;
+                    let copied = buf.len().min(payload.len());
+                    buf[..copied].copy_from_slice(&payload[..copied]);
+                    Ok(copied)
+                })
+                .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketSeqPacket => self
                 .try_with_broker_socket_seqpacket(sockfd, |typed| {
                     let handle = self.broker_socket_seqpacket_handle(typed)?;
@@ -5264,6 +5457,7 @@ impl<FS: ShimFS> Task<FS> {
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketDgram
+            | SocketIoClass::BrokerUnixStream
             | SocketIoClass::BrokerSocketSeqPacket
             | SocketIoClass::BrokerInetRaw
             | SocketIoClass::WithSocket => self.files.borrow().with_socket(
@@ -5432,6 +5626,7 @@ impl<FS: ShimFS> Task<FS> {
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketDgram
+            | SocketIoClass::BrokerUnixStream
             | SocketIoClass::BrokerSocketSeqPacket
             | SocketIoClass::BrokerInetRaw
             | SocketIoClass::WithSocket => self.files.borrow().with_socket(
@@ -5499,6 +5694,14 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Some(result) = self.try_with_broker_socket_dgram(sockfd, |typed| {
             let handle = self.broker_socket_dgram_handle(typed)?;
+            handle
+                .with_entry(|entry| entry.getsockname())
+                .map(SocketAddress::Unix)
+        }) {
+            return result;
+        }
+        if let Some(result) = self.try_with_broker_unix_stream(sockfd, |typed| {
+            let handle = self.broker_unix_stream_handle(typed)?;
             handle
                 .with_entry(|entry| entry.getsockname())
                 .map(SocketAddress::Unix)
@@ -5583,6 +5786,14 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Some(result) = self.try_with_broker_socket_dgram(sockfd, |typed| {
             let handle = self.broker_socket_dgram_handle(typed)?;
+            handle
+                .with_entry(|entry| entry.getpeername())
+                .map(SocketAddress::Unix)
+        }) {
+            return result;
+        }
+        if let Some(result) = self.try_with_broker_unix_stream(sockfd, |typed| {
+            let handle = self.broker_unix_stream_handle(typed)?;
             handle
                 .with_entry(|entry| entry.getpeername())
                 .map(SocketAddress::Unix)

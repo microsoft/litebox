@@ -67,6 +67,7 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
     BrokerPty(Arc<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
     BrokerSocketPair(Arc<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
     BrokerTcpConn(Arc<TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>>),
+    BrokerUnixStream(Arc<TypedFd<super::broker_unix_stream::BrokerUnixStreamSubsystem>>),
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
@@ -111,6 +112,9 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             }
             crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
+            crate::RawFdRef::BrokerUnixStream(fd) => {
+                Ok(EpollDescriptor::BrokerUnixStream(Arc::clone(fd)))
+            }
             crate::RawFdRef::BrokerInetRaw(fd) => {
                 Ok(EpollDescriptor::BrokerInetRaw(Arc::clone(fd)))
             }
@@ -135,6 +139,7 @@ enum DescriptorRef<FS: ShimFS> {
     BrokerPty(Weak<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
     BrokerSocketPair(Weak<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
     BrokerTcpConn(Weak<TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>>),
+    BrokerUnixStream(Weak<TypedFd<super::broker_unix_stream::BrokerUnixStreamSubsystem>>),
 }
 
 impl<FS: ShimFS> DescriptorRef<FS> {
@@ -158,6 +163,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             EpollDescriptor::BrokerPty(pty) => Self::BrokerPty(Arc::downgrade(pty)),
             EpollDescriptor::BrokerSocketPair(sp) => Self::BrokerSocketPair(Arc::downgrade(sp)),
             EpollDescriptor::BrokerTcpConn(tcp) => Self::BrokerTcpConn(Arc::downgrade(tcp)),
+            EpollDescriptor::BrokerUnixStream(us) => Self::BrokerUnixStream(Arc::downgrade(us)),
         }
     }
 
@@ -187,6 +193,9 @@ impl<FS: ShimFS> DescriptorRef<FS> {
                 sp.upgrade().map(EpollDescriptor::BrokerSocketPair)
             }
             DescriptorRef::BrokerTcpConn(tcp) => tcp.upgrade().map(EpollDescriptor::BrokerTcpConn),
+            DescriptorRef::BrokerUnixStream(us) => {
+                us.upgrade().map(EpollDescriptor::BrokerUnixStream)
+            }
         }
     }
 
@@ -208,6 +217,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerPty(_) => "BrokerPty",
             DescriptorRef::BrokerSocketPair(_) => "BrokerSocketPair",
             DescriptorRef::BrokerTcpConn(_) => "BrokerTcpConn",
+            DescriptorRef::BrokerUnixStream(_) => "BrokerUnixStream",
         }
     }
 
@@ -228,7 +238,8 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             | DescriptorRef::HostPassthroughFd(_)
             | DescriptorRef::BrokerPipe(_)
             | DescriptorRef::BrokerPty(_)
-            | DescriptorRef::BrokerSocketPair(_) => false,
+            | DescriptorRef::BrokerSocketPair(_)
+            | DescriptorRef::BrokerUnixStream(_) => false,
         }
     }
 }
@@ -326,6 +337,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
+            EpollDescriptor::BrokerUnixStream(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
         }
     }
 
@@ -356,6 +371,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             EpollDescriptor::BrokerPty(_) => false,
             EpollDescriptor::BrokerSocketPair(_) => false,
             EpollDescriptor::BrokerTcpConn(_) => false,
+            EpollDescriptor::BrokerUnixStream(_) => false,
             #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(_) => false,
             EpollDescriptor::Unix(fd) => global
@@ -925,6 +941,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                 EpollDescriptor::BrokerPty(_) => "BrokerPty",
                 EpollDescriptor::BrokerSocketPair(_) => "BrokerSocketPair",
                 EpollDescriptor::BrokerTcpConn(_) => "BrokerTcpConn",
+                EpollDescriptor::BrokerUnixStream(_) => "BrokerUnixStream",
             };
             let msg = alloc::format!(
                 "[epoll-diag] ADD fd={fd} type={fd_type} mask={mask:?} events={events:?} host_poll={is_host_poll} ready={}\n",
@@ -1021,6 +1038,7 @@ impl EpollEntryKey {
             EpollDescriptor::BrokerPty(pty) => pty.object_id(),
             EpollDescriptor::BrokerSocketPair(sp) => sp.object_id(),
             EpollDescriptor::BrokerTcpConn(tcp) => tcp.object_id(),
+            EpollDescriptor::BrokerUnixStream(us) => us.object_id(),
         };
         Self(fd, object_id)
     }

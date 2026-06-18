@@ -275,6 +275,15 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
+        // Broker-backed AF_UNIX named SOCK_STREAM. Emit-side `dup_handle`
+        // + bridge spec; same shape as `BrokerSocketPair`.
+        RawFdRef::BrokerUnixStream(_) => PerFdMigrationPolicies {
+            worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
+                loop_name: process::BROKER_UNIX_STREAM_BRIDGE_LOOP_NAME,
+            },
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdKind,
+            independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
+        },
         RawFdRef::BrokerTcpConn(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::BROKER_TCP_CONN_BRIDGE_LOOP_NAME,
