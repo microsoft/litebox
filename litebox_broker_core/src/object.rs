@@ -6,14 +6,6 @@ use crate::identity::{BrokerAssociation, ProcessId};
 use crate::{BrokerCore, BrokerError, Result, allocate_id};
 use litebox_broker_protocol::ObjectHandle;
 
-/// Broker object type known to the authority core and policy engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ObjectType {
-    /// Broker-owned event object.
-    Event,
-}
-
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -40,14 +32,6 @@ pub(crate) struct ObjectReference {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObjectEntry {
     Event(EventObject),
-}
-
-impl ObjectEntry {
-    pub(crate) const fn object_type(self) -> ObjectType {
-        match self {
-            Self::Event(_) => ObjectType::Event,
-        }
-    }
 }
 
 impl BrokerCore {
@@ -79,27 +63,25 @@ impl BrokerCore {
         Ok(handle)
     }
 
-    pub(crate) fn authorize_create_object(
+    pub(crate) fn authorize_create_event(
         &mut self,
         association: &BrokerAssociation,
-        object_type: ObjectType,
     ) -> Result<ObjectRights> {
         self.policy
-            .authorize_create_object(association.caller_credential(), object_type)
+            .authorize_create_event(association.caller_credential())
     }
 
-    pub(crate) fn authorize_use_object(
+    pub(crate) fn authorize_use_event(
         &mut self,
         association: &BrokerAssociation,
         handle: ObjectHandle,
-        object_type: ObjectType,
         rights: ObjectRights,
     ) -> Result<AuthorizedObject> {
-        let reference = self.validate_handle(association, handle, object_type, rights)?;
+        let reference = self.validate_handle(association, handle, rights)?;
         let object_id = reference.object_id;
         let reference_rights = reference.rights;
         self.policy
-            .authorize_use_object(association.caller_credential(), object_type, rights)?;
+            .authorize_use_event(association.caller_credential(), rights)?;
         Ok(AuthorizedObject {
             object_id,
             rights: reference_rights,
@@ -122,7 +104,6 @@ impl BrokerCore {
         &self,
         association: &BrokerAssociation,
         handle: ObjectHandle,
-        expected_type: ObjectType,
         required_rights: ObjectRights,
     ) -> Result<ObjectReference> {
         let reference = self.reference_for_handle(association, handle)?;
@@ -130,13 +111,9 @@ impl BrokerCore {
             return Err(BrokerError::InvalidRights);
         }
 
-        let object = self
-            .objects
+        self.objects
             .get(reference.object_id)
             .ok_or(BrokerError::UnknownObject)?;
-        if object.object_type() != expected_type {
-            return Err(BrokerError::WrongObjectType);
-        }
 
         Ok(*reference)
     }

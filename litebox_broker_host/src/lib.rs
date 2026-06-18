@@ -234,7 +234,6 @@ fn to_protocol_error(error: BrokerError) -> ErrorCode {
     match error {
         BrokerError::PolicyDenied => ErrorCode::PolicyDenied,
         BrokerError::UnknownObject => ErrorCode::UnknownObject,
-        BrokerError::WrongObjectType => ErrorCode::WrongObjectType,
         BrokerError::InvalidRights => ErrorCode::InvalidRights,
         BrokerError::ResourceExhausted => ErrorCode::ResourceExhausted,
         BrokerError::WouldBlock => ErrorCode::WouldBlock,

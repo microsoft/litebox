@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::object::{ObjectEntry, ObjectId};
-use crate::{BrokerAssociation, BrokerCore, BrokerError, ObjectRights, ObjectType, Result};
+use crate::{BrokerAssociation, BrokerCore, BrokerError, ObjectRights, Result};
 use litebox_broker_protocol::{
     EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState, WaitOutcome,
 };
@@ -24,7 +24,7 @@ impl BrokerCore {
         if initial_count > MAX_EVENT_COUNT {
             return Err(BrokerError::ResourceExhausted);
         }
-        let rights = self.authorize_create_object(association, ObjectType::Event)?;
+        let rights = self.authorize_create_event(association)?;
 
         self.insert_object_with_reference(
             association,
@@ -43,8 +43,7 @@ impl BrokerCore {
         association: &BrokerAssociation,
         handle: ObjectHandle,
     ) -> Result<WaitOutcome> {
-        let authorized =
-            self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
+        let authorized = self.authorize_use_event(association, handle, ObjectRights::WAIT)?;
         let state = Self::filter_readiness_for_rights(
             self.event_state(authorized.object_id)?,
             authorized.rights,
@@ -63,8 +62,7 @@ impl BrokerCore {
         handle: ObjectHandle,
         value: u64,
     ) -> Result<ReadinessState> {
-        let authorized =
-            self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WRITE)?;
+        let authorized = self.authorize_use_event(association, handle, ObjectRights::WRITE)?;
         match self.object_mut(authorized.object_id)? {
             ObjectEntry::Event(event) => event
                 .add(value)
@@ -79,8 +77,7 @@ impl BrokerCore {
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> Result<EventConsumption> {
-        let authorized =
-            self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
+        let authorized = self.authorize_use_event(association, handle, ObjectRights::WAIT)?;
         match self.object_mut(authorized.object_id)? {
             ObjectEntry::Event(event) => event.consume(mode).map(|response| {
                 EventConsumption::new(

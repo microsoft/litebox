@@ -32,8 +32,8 @@ use slotmap::SlotMap;
 pub use error::BrokerError;
 pub use identity::{BrokerAssociation, CallerCredential};
 use litebox_broker_protocol::ObjectHandle;
+pub use object::ObjectRights;
 use object::{ObjectEntry, ObjectId, ObjectReference};
-pub use object::{ObjectRights, ObjectType};
 pub use policy::{PolicyEngine, PolicyProfile};
 
 /// BrokerCore result type.
