@@ -64,7 +64,7 @@ impl BrokerCore {
     }
 
     pub(crate) fn authorize_create_event(
-        &mut self,
+        &self,
         association: &BrokerAssociation,
     ) -> Result<ObjectRights> {
         self.policy
@@ -72,20 +72,15 @@ impl BrokerCore {
     }
 
     pub(crate) fn authorize_use_event(
-        &mut self,
+        &self,
         association: &BrokerAssociation,
         handle: ObjectHandle,
         rights: ObjectRights,
-    ) -> Result<AuthorizedObject> {
+    ) -> Result<ObjectReference> {
         let reference = self.validate_handle(association, handle, rights)?;
-        let object_id = reference.object_id;
-        let reference_rights = reference.rights;
         self.policy
             .authorize_use_event(association.caller_credential(), rights)?;
-        Ok(AuthorizedObject {
-            object_id,
-            rights: reference_rights,
-        })
+        Ok(reference)
     }
 
     pub(crate) fn object(&self, object_id: ObjectId) -> Result<&ObjectEntry> {
@@ -175,12 +170,6 @@ impl BrokerCore {
             self.objects.remove(object_id);
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct AuthorizedObject {
-    pub(crate) object_id: ObjectId,
-    pub(crate) rights: ObjectRights,
 }
 
 #[cfg(test)]

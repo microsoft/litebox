@@ -39,7 +39,7 @@ impl BrokerCore {
     /// concept. Userland or kernel deployments can block on deployment-specific
     /// wait primitives after BrokerCore authorizes and reports readiness state.
     pub fn wait_event(
-        &mut self,
+        &self,
         association: &BrokerAssociation,
         handle: ObjectHandle,
     ) -> Result<WaitOutcome> {
