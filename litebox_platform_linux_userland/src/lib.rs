@@ -2377,7 +2377,9 @@ impl litebox::platform::DerivedKeyProvider for LinuxUserland {
 /// In general, userland platforms do not support `vmap` and `vunmap` (which are kernel functions).
 /// We might need to emulate these functions' behaviors using virtual addresses for development or
 /// testing, or use a kernel module to provide this functionality (if needed).
-impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {}
+unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {
+    type MapInfo = litebox_common_linux::vmap::NoopPhysPageMapInfo;
+}
 
 /// Dummy `VmemPageFaultHandler`.
 ///

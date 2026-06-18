@@ -3,67 +3,39 @@
 
 //! Physical Pointer Abstraction with On-demand Mapping
 //!
-//! This module adds supports for accessing physical addresses (e.g., VTL0 or
-//! normal-world physical memory) from LiteBox with on-demand mapping.
-//! In the context of LVBS and OP-TEE, accessing physical memory is necessary
-//! because VTL0 and VTL1 as well as normal world and secure world do not share
-//! the same virtual address space, but they still have to share data through memory.
-//! VTL1 and secure world receive physical addresses from VTL0 and normal world,
-//! respectively, and they need to read from or write to those addresses.
+//! This module adds supports for accessing physical addresses (e.g., VTL0
+//! or normal-world physical memory) from LiteBox with on-demand mapping.
+//! In the context of LVBS and OP-TEE, accessing physical memory is
+//! necessary because VTL0 and VTL1 as well as normal world and secure
+//! world exchange data using physical addresses.
 //!
-//! To simplify all these, we could persistently map the entire VTL0/normal-world
-//! physical memory into VTL1/secure-world address space at once and just access them
-//! through corresponding virtual addresses. However, this module does not take these
-//! approaches due to scalability (e.g., how to deal with a system with terabytes of
-//! physical memory?) and security concerns (e.g., data corruption or information
-//! leakage due to concurrent or persistent access).
+//! The safe read/write APIs in this module follow the same safety model as
+//! safe wrappers around DMA buffers or shared physical memory. The
+//! physical memory is external to Rust's ordinary ownership model and may
+//! be changed by hardware or another privilege level. These APIs remain
+//! safe because they do not create Rust references into that external
+//! memory; they only perform bounded copies between a temporary mapping
+//! and memory owned by LiteBox.
 //!
-//! Instead, the approach this module takes is to map the required physical memory
-//! region on-demand when accessing them while using a LiteBox-owned buffer to copy
-//! data to/from those regions. This way, this module can ensure that data must be
-//! copied into LiteBox-owned memory before being used while avoiding any unknown
-//! side effects due to persistent memory mapping.
-//!
-//! Considerations:
-//!
-//! Ideally, this module should be able to validate whether a given physical address
-//! is okay to access or even exists in the first place. For example, accessing
-//! LiteBox's own memory with this physical pointer abstraction must be prohibited to
-//! prevent the Boomerang attack and any other undefined memory access. Also, some
-//! device memory is mapped to certain physical address ranges and LiteBox should not
-//! touch them without in-depth knowledge. However, this is a bit tricky because, in
-//! many cases, LiteBox does not directly interact with the underlying hardware or
-//! BIOS/UEFI such that it does not have complete knowledge of the physical memory
-//! layout. In the case of LVBS, LiteBox obtains the physical memory information
-//! from VTL0 including the total physical memory size and the memory range assigned
-//! to VTL1/LiteBox. Thus, this module can at least confirm a given physical address
-//! does not belong to VTL1's physical memory.
-//!
-//! This module should allow byte-level access while transparently handling page
-//! mapping and data access across page boundaries. This could become complicated
-//! when we consider multiple page sizes (e.g., 4 KiB, 2 MiB, 1 GiB). Also,
-//! unaligned access is a matter to be considered.
-//!
-//! In addition, often times, this physical pointer abstraction is involved with
-//! a list of physical addresses (i.e., scatter-gather list). For example, in
-//! the worse case, a two-byte value can span across two non-contiguous physical
-//! pages (the last byte of the first page and the first byte of the second page).
-//! Thus, to enhance the performance, we may need to consider mapping multiple pages
-//! at once, copy data from/to them, and unmap them later.
-//!
-//! When this module needs to access data across physical page boundaries, it assumes
-//! that those physical pages are virtually contiguous in VTL0 or normal-world address
-//! space. Otherwise, this module could end up with accessing misordered data. This is
-//! best-effort assumption and ensuring this is the caller's responsibility (e.g., even
-//! if this module always requires a list of physical addresses, the caller might
-//! provide a wrong list by mistake or intentionally).
+//! The safe APIs should validate whether a given physical address is okay
+//! to access. For example, accessing LiteBox's own memory through this
+//! physical pointer abstraction is prohibited to avoid confused-deputy
+//! attacks and to ensure Rust memory safety. In the case of LVBS, LiteBox
+//! obtains the physical memory information from VTL0 like the total
+//! physical memory range assigned to VTL1/LiteBox. Thus, this module can
+//! confirm a given physical address does not belong to VTL1's physical
+//! memory.
 
 use crate::vmap::{
     GlobalVmapManager, PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
     VmapManager,
 };
 use core::marker::PhantomData;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
+
+/// The concrete [`PhysPageMapInfo`] produced by the `VmapManager` behind a [`GlobalVmapManager`].
+type MapInfoOf<V, const ALIGN: usize> =
+    <<V as GlobalVmapManager<ALIGN>>::Manager as VmapManager<ALIGN>>::MapInfo;
 
 /// Allocate a zeroed `Box<T>` on the heap.
 ///
@@ -93,20 +65,25 @@ fn align_down(address: usize, align: usize) -> usize {
 }
 
 /// Represent a physical pointer to an object with on-demand mapping.
+///
+/// Safe methods on this type copy to or from a temporary mapping. They never expose
+/// references or slices into the mapped physical memory.
+///
+/// Read methods require `T: FromBytes` because external memory may contain any bit pattern.
+/// Write methods require `T: IntoBytes` because values are written by copying their byte
+/// representation.
+///
 /// - `pages`: An array of page-aligned physical addresses. We expect physical addresses in this array are
 ///   virtually contiguous.
 /// - `offset`: The offset within `pages[0]` where the object starts. It should be smaller than `ALIGN`.
 /// - `count`: The number of objects of type `T` that can be accessed from this pointer.
-/// - `map_info`: The mapping information of the currently mapped physical pages, if any.
 /// - `T`: The type of the object being pointed to. `pages` with respect to `offset` should cover enough
 ///   memory for an object of type `T`.
-#[derive(Clone)]
 #[repr(C)]
 pub struct PhysMutPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
     offset: usize,
     count: usize,
-    map_info: Option<PhysPageMapInfo<ALIGN>>,
     _type: PhantomData<T>,
     _vmap: PhantomData<V>,
 }
@@ -148,7 +125,6 @@ where
             pages: pages.into(),
             offset,
             count: size / core::mem::size_of::<T>(),
-            map_info: None,
             _type: PhantomData,
             _vmap: PhantomData,
         })
@@ -200,53 +176,31 @@ where
 
     /// Read the value at the given offset from the physical pointer.
     ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
-    /// `FromBytes` is required to ensure T is valid for any bit pattern from untrusted physical memory.
-    pub unsafe fn read_at_offset(
-        &mut self,
-        count: usize,
-    ) -> Result<alloc::boxed::Box<T>, PhysPointerError>
+    /// Returns an owned copy of the value read from physical memory.
+    pub fn read_at_offset(&self, count: usize) -> Result<alloc::boxed::Box<T>, PhysPointerError>
     where
         T: FromBytes,
     {
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let guard = unsafe {
-            self.map_and_get_ptr_guard(
-                count,
-                core::mem::size_of::<T>(),
-                PhysPageMapPermissions::READ,
-            )?
-        };
+        let guard = self.map_and_get_ptr_guard(
+            count,
+            core::mem::size_of::<T>(),
+            PhysPageMapPermissions::READ,
+        )?;
         let mut boxed = box_new_zeroed::<T>();
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                core::ptr::from_mut::<T>(boxed.as_mut()).cast::<u8>(),
-                guard.ptr.cast::<u8>(),
-                guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault reading from mapped physical page");
-        result.map_err(|_| PhysPointerError::CopyFailed)?;
+        // SAFETY: `boxed` is a freshly allocated `T` and is thus valid for writes
+        // of `size_of::<T>()` bytes, which is the guard's mapped size.
+        unsafe { guard.copy_out(core::ptr::from_mut::<T>(boxed.as_mut()).cast::<u8>())? };
         Ok(boxed)
     }
 
     /// Read a slice of values at the given offset from the physical pointer.
     ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
-    /// `FromBytes` is required to ensure T is valid for any bit pattern from untrusted physical memory.
-    pub unsafe fn read_slice_at_offset(
-        &mut self,
+    /// Copies values from physical memory into the caller-provided slice.
+    pub fn read_slice_at_offset(
+        &self,
         count: usize,
         values: &mut [T],
     ) -> Result<(), PhysPointerError>
@@ -262,73 +216,41 @@ where
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let guard = unsafe {
-            self.map_and_get_ptr_guard(
-                count,
-                core::mem::size_of_val(values),
-                PhysPageMapPermissions::READ,
-            )?
-        };
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                values.as_mut_ptr().cast::<u8>(),
-                guard.ptr.cast::<u8>(),
-                guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault reading from mapped physical page");
-        result.map_err(|_| PhysPointerError::CopyFailed)?;
+        let guard = self.map_and_get_ptr_guard(
+            count,
+            core::mem::size_of_val(values),
+            PhysPageMapPermissions::READ,
+        )?;
+        // SAFETY: `values` is valid for writes of `size_of_val(values)` bytes, which is
+        // the guard's mapped size.
+        unsafe { guard.copy_out(values.as_mut_ptr().cast::<u8>())? };
         Ok(())
     }
 
     /// Write the value at the given offset to the physical pointer.
-    ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, data it writes might be overwritten.
-    pub unsafe fn write_at_offset(
-        &mut self,
-        count: usize,
-        value: T,
-    ) -> Result<(), PhysPointerError> {
+    pub fn write_at_offset(&self, count: usize, value: T) -> Result<(), PhysPointerError>
+    where
+        T: IntoBytes,
+    {
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let guard = unsafe {
-            self.map_and_get_ptr_guard(
-                count,
-                core::mem::size_of::<T>(),
-                PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?
-        };
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                guard.ptr.cast::<u8>(),
-                core::ptr::from_ref(&value).cast::<u8>(),
-                guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault writing to mapped physical page");
-        result.map_err(|_| PhysPointerError::CopyFailed)?;
+        let guard = self.map_and_get_ptr_guard(
+            count,
+            core::mem::size_of::<T>(),
+            PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
+        )?;
+        // SAFETY: `value` is valid for reads of `size_of::<T>()` bytes, which is the
+        // guard's mapped size.
+        unsafe { guard.copy_in(core::ptr::from_ref(&value).cast::<u8>())? };
         Ok(())
     }
 
     /// Write a slice of values at the given offset to the physical pointer.
-    ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, data it writes might be overwritten.
-    pub unsafe fn write_slice_at_offset(
-        &mut self,
-        count: usize,
-        values: &[T],
-    ) -> Result<(), PhysPointerError> {
+    pub fn write_slice_at_offset(&self, count: usize, values: &[T]) -> Result<(), PhysPointerError>
+    where
+        T: IntoBytes,
+    {
         if values.is_empty() {
             return Ok(());
         }
@@ -338,23 +260,14 @@ where
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
-        let guard = unsafe {
-            self.map_and_get_ptr_guard(
-                count,
-                core::mem::size_of_val(values),
-                PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
-            )?
-        };
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                guard.ptr.cast::<u8>(),
-                values.as_ptr().cast::<u8>(),
-                guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault writing to mapped physical page");
-        result.map_err(|_| PhysPointerError::CopyFailed)?;
+        let guard = self.map_and_get_ptr_guard(
+            count,
+            core::mem::size_of_val(values),
+            PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
+        )?;
+        // SAFETY: `values` is valid for reads of `size_of_val(values)` bytes, which is
+        // the guard's mapped size.
+        unsafe { guard.copy_in(values.as_ptr().cast::<u8>())? };
         Ok(())
     }
 
@@ -370,12 +283,10 @@ where
     /// - `size`: Total byte size to map (must cover the data being accessed).
     /// - `perms`: Required page permissions (read, write).
     ///
-    /// # Safety
-    ///
-    /// Same as [`Self::map_range`]. The returned guard borrows `self` mutably, ensuring
-    /// the mapping is released when the guard goes out of scope.
-    unsafe fn map_and_get_ptr_guard(
-        &mut self,
+    /// The returned guard is tied to `self`'s lifetime and releases the mapping when it
+    /// goes out of scope.
+    fn map_and_get_ptr_guard(
+        &self,
         count: usize,
         size: usize,
         perms: PhysPageMapPermissions,
@@ -393,34 +304,23 @@ where
             .checked_add(size)
             .ok_or(PhysPointerError::Overflow)?
             .div_ceil(ALIGN);
-        unsafe {
-            self.map_range(start, end, perms)?;
-        }
-        let map_info = self
-            .map_info
-            .as_ref()
-            .ok_or(PhysPointerError::NoMappingInfo)?;
-        let ptr = map_info.base.wrapping_add(skip % ALIGN).cast::<T>();
-        let _ = map_info;
+        let map_info = self.map_range(start, end, perms)?;
+        let ptr = map_info.base().wrapping_add(skip % ALIGN).cast::<T>();
         Ok(MappedGuard {
-            owner: self,
+            map_info: Some(map_info),
             ptr,
             size,
+            _owner: PhantomData,
         })
     }
 
     /// Map the physical pages from `start` to `end` indexes.
-    ///
-    /// # Safety
-    ///
-    /// This function assumes that the underlying platform safely handles concurrent mapping/unmapping
-    /// requests for the same physical pages.
-    unsafe fn map_range(
-        &mut self,
+    fn map_range(
+        &self,
         start: usize,
         end: usize,
         perms: PhysPageMapPermissions,
-    ) -> Result<(), PhysPointerError> {
+    ) -> Result<MapInfoOf<V, ALIGN>, PhysPointerError> {
         if start >= end || end > self.pages.len() {
             return Err(PhysPointerError::IndexOutOfBounds(end, self.pages.len()));
         }
@@ -428,72 +328,78 @@ where
         if perms.bits() & !accept_perms.bits() != 0 {
             return Err(PhysPointerError::UnsupportedPermissions(perms.bits()));
         }
-        if self.map_info.is_none() {
-            let sub_pages = &self.pages[start..end];
-            unsafe {
-                self.map_info = Some(V::manager().vmap(sub_pages, perms)?);
-            }
-            Ok(())
-        } else {
-            Err(PhysPointerError::AlreadyMapped(
-                self.pages.first().map_or(0, |p| p.as_usize()),
-            ))
-        }
-    }
-
-    /// Unmap the physical pages if mapped.
-    ///
-    /// # Safety
-    ///
-    /// This function assumes that the underlying platform safely handles concurrent mapping/unmapping
-    /// requests for the same physical pages.
-    unsafe fn unmap(&mut self) -> Result<(), PhysPointerError> {
-        if let Some(map_info) = self.map_info.take() {
-            unsafe {
-                V::manager().vunmap(map_info)?;
-            }
-            Ok(())
-        } else {
-            Err(PhysPointerError::Unmapped(
-                self.pages.first().map_or(0, |p| p.as_usize()),
-            ))
-        }
+        let sub_pages = &self.pages[start..end];
+        // SAFETY: This caller never creates Rust references from the returned mapped pointer.
+        // The mapping is wrapped in `MapInfo`, then consumed by `MappedGuard`, which accesses it
+        // only through fault-tolerant raw copies. That avoids relying on Rust aliasing or validity
+        // guarantees for the external physical memory.
+        unsafe { V::manager().vmap(sub_pages, perms) }
     }
 }
 
 /// RAII guard that unmaps physical pages when dropped.
 ///
-/// Created by `map_and_get_ptr_guard`. Holds a mutable borrow on the parent
-/// `PhysMutPtr` and provides the mapped base pointer for the duration of the mapping.
+/// Created by `map_and_get_ptr_guard`. Its lifetime is tied to the parent
+/// `PhysMutPtr`, and it owns the map info for the duration of the temporary mapping.
+///
+/// # Invariant
+///
+/// `ptr` points into the live mapping owned by `map_info`, and the `size` bytes starting
+/// at `ptr` lie within that mapping. The mapping refers to foreign (non-Rust) physical
+/// memory that another core may unmap concurrently, so `ptr` must only ever be accessed
+/// through [`Self::copy_in`]/[`Self::copy_out`], which perform fault-tolerant copies.
 struct MappedGuard<'a, T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
-    owner: &'a mut PhysMutPtr<T, ALIGN, V>,
+    map_info: Option<MapInfoOf<V, ALIGN>>,
     ptr: *mut T,
     size: usize,
+    _owner: PhantomData<&'a PhysMutPtr<T, ALIGN, V>>,
+}
+
+impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, T, ALIGN, V> {
+    /// Copy the `self.size` mapped bytes out into `dst`.
+    ///
+    /// This is the only path through which the raw mapped pointer is dereferenced.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be valid for writes of `self.size` bytes.
+    unsafe fn copy_out(&self, dst: *mut u8) -> Result<(), PhysPointerError> {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
+            litebox::mm::exception_table::memcpy_fallible(dst, self.ptr.cast::<u8>(), self.size)
+        };
+        debug_assert!(result.is_ok(), "fault reading from mapped physical page");
+        result.map_err(|_| PhysPointerError::CopyFailed)
+    }
+
+    /// Copy `self.size` bytes from `src` into the mapped memory.
+    ///
+    /// This is the only path through which the raw mapped pointer is dereferenced.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `self.size` bytes.
+    unsafe fn copy_in(&self, src: *const u8) -> Result<(), PhysPointerError> {
+        // Fallible: another core may unmap this page concurrently.
+        let result = unsafe {
+            litebox::mm::exception_table::memcpy_fallible(self.ptr.cast::<u8>(), src, self.size)
+        };
+        debug_assert!(result.is_ok(), "fault writing to mapped physical page");
+        result.map_err(|_| PhysPointerError::CopyFailed)
+    }
 }
 
 impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
     for MappedGuard<'_, T, ALIGN, V>
 {
     fn drop(&mut self) {
-        // SAFETY: The platform is expected to handle unmapping safely, including
-        // the case where pages were never mapped (returns Unmapped error, ignored).
-        let result = unsafe { self.owner.unmap() };
-        debug_assert!(
-            result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
-            "unexpected error during unmap in drop: {result:?}",
-        );
-    }
-}
-
-impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop for PhysMutPtr<T, ALIGN, V> {
-    fn drop(&mut self) {
-        // SAFETY: The platform is expected to handle unmapping safely, including
-        // the case where pages were never mapped (returns Unmapped error, ignored).
-        let result = unsafe { self.unmap() };
-        debug_assert!(
-            result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
-            "unexpected error during unmap in drop: {result:?}",
-        );
+        // SAFETY: The platform is expected to handle unmapping safely. Drop cannot
+        // report errors. If unmapping fails, drop the returned private map_info;
+        // platform-specific resources that cannot be reclaimed are handled by the
+        // platform `vunmap` implementation.
+        if let Some(map_info) = self.map_info.take() {
+            let _ = unsafe { V::manager().vunmap(map_info) };
+        }
     }
 }
 
@@ -509,8 +415,7 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
 }
 
 /// Represent a physical pointer to a read-only object. This wraps around [`PhysMutPtr`] and
-/// exposes only read access.
-#[derive(Clone)]
+/// exposes only copy-out access.
 #[repr(C)]
 pub struct PhysConstPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     inner: PhysMutPtr<T, ALIGN, V>,
@@ -557,37 +462,26 @@ where
 
     /// Read the value at the given offset from the physical pointer.
     ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
-    pub unsafe fn read_at_offset(
-        &mut self,
-        count: usize,
-    ) -> Result<alloc::boxed::Box<T>, PhysPointerError>
+    /// Returns an owned copy of the value read from physical memory.
+    pub fn read_at_offset(&self, count: usize) -> Result<alloc::boxed::Box<T>, PhysPointerError>
     where
         T: FromBytes,
     {
-        unsafe { self.inner.read_at_offset(count) }
+        self.inner.read_at_offset(count)
     }
 
     /// Read a slice of values at the given offset from the physical pointer.
     ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
-    pub unsafe fn read_slice_at_offset(
-        &mut self,
+    /// Copies values from physical memory into the caller-provided slice.
+    pub fn read_slice_at_offset(
+        &self,
         count: usize,
         values: &mut [T],
     ) -> Result<(), PhysPointerError>
     where
         T: FromBytes,
     {
-        unsafe { self.inner.read_slice_at_offset(count, values) }
+        self.inner.read_slice_at_offset(count, values)
     }
 }
 

@@ -2175,7 +2175,7 @@ impl From<&OpteeSmcArgsPage> for OpteeSmcArgs {
 }
 
 /// OP-TEE SMC call arguments.
-#[derive(Clone, Copy, Default, FromBytes)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
 pub struct OpteeSmcArgs {
     args: [usize; Self::NUM_OPTEE_SMC_ARGS],
 }

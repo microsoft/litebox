@@ -279,10 +279,10 @@ fn optee_smc_handler_entry_inner(
 
     // Write back the SMC arguments page to normal world memory.
     // All OP-TEE return codes (success or error) are delivered via smc_args.args[0].
-    let mut smc_args_ptr = NormalWorldMutPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)
+    let smc_args_ptr = NormalWorldMutPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)
         .map_err(|_| litebox_common_linux::errno::Errno::EINVAL)?;
-    // SAFETY: The SMC args are written back to normal world memory.
-    unsafe { smc_args_ptr.write_at_offset(0, smc_args_updated) }
+    smc_args_ptr
+        .write_at_offset(0, smc_args_updated)
         .map_err(|_| litebox_common_linux::errno::Errno::EFAULT)?;
     Ok(0)
 }
@@ -439,13 +439,12 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
         args
     };
 
-    let Ok(mut smc_args_ptr) =
+    let Ok(smc_args_ptr) =
         NormalWorldConstPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)
     else {
         return make_error_response(OpteeSmcReturnCode::EBadAddr);
     };
-    // SAFETY: The SMC args are read from normal world memory into an owned copy.
-    let Ok(mut smc_args) = (unsafe { smc_args_ptr.read_at_offset(0) }) else {
+    let Ok(mut smc_args) = smc_args_ptr.read_at_offset(0) else {
         return make_error_response(OpteeSmcReturnCode::EBadAddr);
     };
     let Ok(smc_result) = handle_optee_smc_args(&mut smc_args) else {
@@ -1217,13 +1216,11 @@ fn write_msg_args_to_normal_world(
     let mut blob = vec![0u8; msg_args_size];
     msg_args.serialize(&mut blob)?;
 
-    let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+    let ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         msg_args_phys_addr.trunc(),
         msg_args_size,
     )?;
-    // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
-    // The blob contains the serialized variable-length optee_msg_arg structure(s).
-    unsafe { ptr.write_slice_at_offset(0, &blob) }?;
+    ptr.write_slice_at_offset(0, &blob)?;
     Ok(())
 }
 
@@ -1243,15 +1240,13 @@ fn write_non_ta_msg_args_to_normal_world(
     let mut blob = vec![0u8; msg_args_size];
     msg_args.serialize(&mut blob)?;
 
-    let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+    let ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         msg_args_phys_addr.trunc(),
         msg_args_size,
     )?;
-    // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
-    // The blob contains the serialized variable-length optee_msg_arg structure(s).
     // Serialize the packed-page write. See `packed_msg_args_lock`.
     let _packed_guard = packed_msg_args_lock();
-    unsafe { ptr.write_slice_at_offset(0, &blob) }?;
+    ptr.write_slice_at_offset(0, &blob)?;
     Ok(())
 }
 
@@ -1277,10 +1272,8 @@ fn write_rpc_args_to_normal_world(
     let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::trunc(msg_args_phys_addr)
         .checked_add(msg_args_size)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?; // RPC args are placed right after the main msg_args blob
-    let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(rpc_pa, rpc_args_size)?;
-    // SAFETY: Writing rpc_args back to normal world memory at a valid physical address.
-    // The blob contains the serialized variable-length optee_msg_arg structure(s).
-    unsafe { ptr.write_slice_at_offset(0, &blob) }?;
+    let ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(rpc_pa, rpc_args_size)?;
+    ptr.write_slice_at_offset(0, &blob)?;
     Ok(())
 }
 
