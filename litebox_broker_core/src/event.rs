@@ -23,7 +23,7 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
             .policy
             .authorize_create_event(session.caller_credential)?
     };
-    object::create_object_reference(
+    object::create_object(
         session,
         ObjectEntry::Event(EventObject::new(initial_count)),
         rights,

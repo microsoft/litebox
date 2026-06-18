@@ -39,27 +39,45 @@ pub(crate) enum ObjectEntry {
     Event(EventObject),
 }
 
-pub(super) fn create_object_reference(
+pub(super) fn create_object(
     session: &BrokerSession,
     object: ObjectEntry,
     rights: ObjectRights,
 ) -> Result<ObjectHandle> {
-    let mut references = session.core.references.write();
-    let mut objects = session.core.objects.write();
+    let object_id = {
+        let mut objects = session.core.objects.write();
+        if objects.len() >= session.core.limits.max_objects {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        if objects.len() == objects.capacity() {
+            objects
+                .try_reserve(1)
+                .map_err(|_| BrokerError::ResourceExhausted)?;
+        }
+        objects.insert(Arc::new(RwLock::new(object)))
+    };
 
-    if objects.len() >= session.core.limits.max_objects
-        || references.len() >= session.core.limits.max_references
-    {
-        return Err(BrokerError::ResourceExhausted);
+    match create_object_reference(session, object_id, rights) {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            let removed_object = session.core.objects.write().remove(object_id);
+            debug_assert!(removed_object.is_some());
+            Err(error)
+        }
     }
-    if objects.len() == objects.capacity() {
-        objects
-            .try_reserve(1)
-            .map_err(|_| BrokerError::ResourceExhausted)?;
+}
+
+fn create_object_reference(
+    session: &BrokerSession,
+    object_id: ObjectId,
+    rights: ObjectRights,
+) -> Result<ObjectHandle> {
+    let mut references = session.core.references.write();
+    if references.len() >= session.core.limits.max_references {
+        return Err(BrokerError::ResourceExhausted);
     }
 
     let handle = session.core.allocate_reference_handle()?;
-    let object_id = objects.insert(Arc::new(RwLock::new(object)));
     let old_reference = references.insert(
         handle,
         ObjectReference {
