@@ -162,11 +162,25 @@ impl<Platform: crate::ShimPlatform> EventObject<Platform> {
         }
     }
 
+    pub(crate) fn is_signaled(&self) -> bool {
+        *self.signaled.lock()
+    }
+
     fn replace_state(&self, next: bool) -> i32 {
         let mut signaled = self.signaled.lock();
         let previous = i32::from(*signaled);
         *signaled = next;
         previous
+    }
+}
+
+impl<Platform: crate::ShimPlatform> EventHandleObject<Platform> {
+    pub(crate) fn require_access(&self, required: EventAccess) -> Result<(), NtStatus> {
+        self.granted_access.require(required)
+    }
+
+    pub(crate) fn is_signaled(&self) -> bool {
+        self.event.is_signaled()
     }
 }
 

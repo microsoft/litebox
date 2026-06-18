@@ -33,7 +33,20 @@ use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
 use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
+use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::timer::{
+    TimerCreateParameters, TimerHandleObject, TimerSetParameters, TimerSubsystem,
+};
+use crate::syscalls::wait_completion_packet::{
+    WaitCompletionPacketAssociateParameters, WaitCompletionPacketCancelParameters,
+    WaitCompletionPacketCreateParameters, WaitCompletionPacketHandleObject,
+    WaitCompletionPacketSubsystem,
+};
+use crate::syscalls::worker_factory::{
+    WorkerFactoryCreateParameters, WorkerFactoryHandleObject,
+    WorkerFactorySetInformationParameters, WorkerFactoryShutdownParameters, WorkerFactorySubsystem,
+};
 use crate::syscalls::{SyscallRequest, mm};
 
 mod loader;
@@ -466,6 +479,152 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtCreateIoCompletion {
+                io_completion_handle,
+                desired_access,
+                object_attributes,
+                number_of_concurrent_threads,
+            } => {
+                let status = self.sys_nt_create_io_completion(
+                    io_completion_handle,
+                    desired_access,
+                    object_attributes,
+                    number_of_concurrent_threads,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateWaitCompletionPacket {
+                wait_completion_packet_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_create_wait_completion_packet(
+                    WaitCompletionPacketCreateParameters {
+                        wait_completion_packet_handle,
+                        desired_access,
+                        object_attributes,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtAssociateWaitCompletionPacket {
+                wait_completion_packet_handle,
+                io_completion_handle,
+                target_object_handle,
+                key_context,
+                apc_context,
+                io_status,
+                io_status_information,
+                already_signaled,
+            } => {
+                let status = self.sys_nt_associate_wait_completion_packet(
+                    WaitCompletionPacketAssociateParameters {
+                        wait_completion_packet_handle,
+                        io_completion_handle,
+                        target_object_handle,
+                        key_context,
+                        apc_context,
+                        io_status,
+                        io_status_information,
+                        already_signaled,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCancelWaitCompletionPacket {
+                wait_completion_packet_handle,
+                remove_signaled_packet,
+            } => {
+                let status = self.sys_nt_cancel_wait_completion_packet(
+                    WaitCompletionPacketCancelParameters {
+                        wait_completion_packet_handle,
+                        remove_signaled_packet,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateWorkerFactory {
+                worker_factory_handle,
+                desired_access,
+                object_attributes,
+                completion_port_handle,
+                worker_process_handle,
+                start_routine,
+                start_parameter,
+                max_thread_count,
+                stack_reserve,
+                stack_commit,
+            } => {
+                let status = self.sys_nt_create_worker_factory(WorkerFactoryCreateParameters {
+                    worker_factory_handle,
+                    desired_access,
+                    object_attributes,
+                    completion_port_handle,
+                    worker_process_handle,
+                    start_routine,
+                    start_parameter,
+                    max_thread_count,
+                    stack_reserve,
+                    stack_commit,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetInformationWorkerFactory {
+                worker_factory_handle,
+                worker_factory_information_class,
+                worker_factory_information,
+                worker_factory_information_length,
+            } => {
+                let status = self.sys_nt_set_information_worker_factory(
+                    WorkerFactorySetInformationParameters {
+                        handle: worker_factory_handle,
+                        information_class: worker_factory_information_class,
+                        information: worker_factory_information,
+                        information_length: worker_factory_information_length,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtShutdownWorkerFactory {
+                worker_factory_handle,
+                pending_worker_count,
+            } => {
+                let status = self.sys_nt_shutdown_worker_factory(WorkerFactoryShutdownParameters {
+                    handle: worker_factory_handle,
+                    pending_worker_count,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateTimer2 {
+                timer_handle,
+                timer_id,
+                object_attributes,
+                attributes,
+                desired_access,
+            } => {
+                let status = self.sys_nt_create_timer2(TimerCreateParameters {
+                    timer_handle,
+                    timer_id,
+                    object_attributes,
+                    attributes,
+                    desired_access,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetTimer2 {
+                timer_handle,
+                due_time,
+                period,
+                parameters,
+            } => {
+                let status = self.sys_nt_set_timer2(TimerSetParameters {
+                    timer_handle,
+                    due_time,
+                    period,
+                    parameters,
+                });
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenEvent {
                 event_handle,
                 desired_access,
@@ -869,6 +1028,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, IoCompletionSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |io_completion| visitor.io_completion(io_completion),
+        ) {
+            return NtStatus::SUCCESS;
+        }
+        if remove_raw_handle_by_raw_fd::<Platform, TimerSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |timer| visitor.timer(timer),
+        ) {
+            return NtStatus::SUCCESS;
+        }
+        if remove_raw_handle_by_raw_fd::<Platform, WaitCompletionPacketSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |wait_completion_packet| visitor.wait_completion_packet(wait_completion_packet),
+        ) {
+            return NtStatus::SUCCESS;
+        }
+        if remove_raw_handle_by_raw_fd::<Platform, WorkerFactorySubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |worker_factory| visitor.worker_factory(worker_factory),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         NtStatus::INVALID_HANDLE
     }
 
@@ -890,6 +1081,17 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     fn registry_key(&self, key: RegistryKeyObject<Platform>);
 
     fn event(&self, event: EventHandleObject<Platform>);
+
+    fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
+
+    fn timer(&self, timer: TimerHandleObject<Platform>);
+
+    fn wait_completion_packet(
+        &self,
+        wait_completion_packet: WaitCompletionPacketHandleObject<Platform>,
+    );
+
+    fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
 }
 
 struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
@@ -909,6 +1111,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn event(&self, event: EventHandleObject<Platform>) {
         Task::<Platform, FS>::close_event(event);
+    }
+
+    fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
+        Task::<Platform, FS>::close_io_completion(io_completion);
+    }
+
+    fn timer(&self, timer: TimerHandleObject<Platform>) {
+        Task::<Platform, FS>::close_timer(timer);
+    }
+
+    fn wait_completion_packet(
+        &self,
+        wait_completion_packet: WaitCompletionPacketHandleObject<Platform>,
+    ) {
+        Task::<Platform, FS>::close_wait_completion_packet(wait_completion_packet);
+    }
+
+    fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {
+        Task::<Platform, FS>::close_worker_factory(worker_factory);
     }
 }
 
