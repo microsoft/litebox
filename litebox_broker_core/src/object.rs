@@ -40,13 +40,9 @@ pub(crate) enum ObjectEntry {
 pub(super) fn create_object_reference(
     session: &BrokerSession,
     object: ObjectEntry,
+    rights: ObjectRights,
 ) -> Result<ObjectHandle> {
     let mut state = session.core.state.write();
-    let rights = match &object {
-        ObjectEntry::Event(_) => state
-            .policy
-            .authorize_create_event(session.caller_credential)?,
-    };
 
     if state.objects.len() >= state.limits.max_objects
         || state.references.len() >= state.limits.max_references

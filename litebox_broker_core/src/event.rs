@@ -17,7 +17,17 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
         return Err(BrokerError::ResourceExhausted);
     }
 
-    object::create_object_reference(session, ObjectEntry::Event(EventObject::new(initial_count)))
+    let rights = {
+        let state = session.core.state.read();
+        state
+            .policy
+            .authorize_create_event(session.caller_credential)?
+    };
+    object::create_object_reference(
+        session,
+        ObjectEntry::Event(EventObject::new(initial_count)),
+        rights,
+    )
 }
 
 /// Checks whether an event wait would complete now.
