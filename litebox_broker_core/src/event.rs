@@ -3,7 +3,7 @@
 
 //! Broker-owned event object operations.
 
-use crate::object::{self, ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result};
 use litebox_broker_protocol::{
     EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState, WaitOutcome,
@@ -23,11 +23,7 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
             .policy
             .authorize_create_event(session.caller_credential)?
     };
-    object::create_object(
-        session,
-        ObjectEntry::Event(EventObject::new(initial_count)),
-        rights,
-    )
+    session.create_object(ObjectEntry::Event(EventObject::new(initial_count)), rights)
 }
 
 /// Checks whether an event wait would complete now.
@@ -37,7 +33,7 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
 /// wait primitives after BrokerCore authorizes and reports readiness state.
 pub fn wait(session: &BrokerSession, handle: ObjectHandle) -> Result<WaitOutcome> {
     let required_rights = ObjectRights::WAIT;
-    object::with_authorized_object(session, handle, required_rights, |object| match object {
+    session.with_authorized_object(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => {
             let readiness = filter_readiness_for_rights(event.readiness_state(), required_rights);
             Ok(if readiness.read_ready {
@@ -52,7 +48,7 @@ pub fn wait(session: &BrokerSession, handle: ObjectHandle) -> Result<WaitOutcome
 /// Adds readiness credits to a broker-owned event object.
 pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<ReadinessState> {
     let required_rights = ObjectRights::WRITE;
-    object::with_authorized_object_mut(session, handle, required_rights, |object| match object {
+    session.with_authorized_object_mut(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => event
             .add(value)
             .map(|state| filter_readiness_for_rights(state, required_rights)),
@@ -66,7 +62,7 @@ pub fn consume(
     mode: EventConsumeMode,
 ) -> Result<EventConsumption> {
     let required_rights = ObjectRights::WAIT;
-    object::with_authorized_object_mut(session, handle, required_rights, |object| match object {
+    session.with_authorized_object_mut(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => event.consume(mode).map(|response| {
             EventConsumption::new(
                 response.value,
