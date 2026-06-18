@@ -659,6 +659,97 @@ class MigrationV3ToV4Tests(unittest.TestCase):
         )
 
 
+class ClassificationSchemaUpgradeTests(unittest.TestCase):
+    """Data-safety of the classification-schema version bump: upgrading
+    an older DB must be additive (add `branch_baseline.tip_sha`, recreate
+    the views) and must NEVER touch the producer `schema_version` or drop
+    any `run_results` / `branch_baseline` data."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-clsup-")
+        self.conn = _init_db(Path(self.tmp) / "results.sqlite")
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_tip_sha_added_without_losing_rows(self):
+        # Simulate an older classification schema: branch_baseline WITHOUT
+        # tip_sha, an old version meta, and a pre-existing cache row.
+        self.conn.executescript(
+            """
+            CREATE TABLE branch_baseline (
+                branch_sha     TEXT NOT NULL PRIMARY KEY,
+                baseline_sha   TEXT NOT NULL,
+                ref            TEXT,
+                branch         TEXT,
+                computed_at_ms INTEGER NOT NULL
+            );
+            """
+        )
+        self.conn.execute(
+            "INSERT INTO branch_baseline"
+            "(branch_sha, baseline_sha, ref, branch, computed_at_ms)"
+            " VALUES('B','BASE','up','wt/x',123)"
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value)"
+            " VALUES('classification_schema_version','5')"
+        )
+        # A producer row that must be untouched by a classifier upgrade.
+        rid = _add_run(self.conn, commit="B")
+        _add_result(self.conn, run_id=rid, test_id="T", pass_="litebox",
+                    verdict="pass", ts_ms=1000)
+
+        dashboard._ensure_classification_schema(self.conn)
+
+        cols = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(branch_baseline)")}
+        self.assertIn("tip_sha", cols)  # additive column present
+        # Pre-existing cache row preserved (tip_sha defaults NULL).
+        row = self.conn.execute(
+            "SELECT baseline_sha, tip_sha FROM branch_baseline"
+            " WHERE branch_sha='B'").fetchone()
+        self.assertEqual(row["baseline_sha"], "BASE")
+        self.assertIsNone(row["tip_sha"])
+        # Version bumped; producer schema_version untouched.
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT value FROM meta WHERE key='classification_schema_version'"
+            ).fetchone()[0],
+            str(dashboard._CLASSIFICATION_SCHEMA_VERSION),
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0],
+            "4",
+        )
+        # Producer data intact; the view is live.
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM run_results").fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT type FROM sqlite_master WHERE name='regression_class'"
+            ).fetchone()[0],
+            "view",
+        )
+
+    def test_idempotent_when_already_current(self):
+        dashboard._ensure_classification_schema(self.conn)
+        # Second call is a no-op (no raise, version stable).
+        dashboard._ensure_classification_schema(self.conn)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT value FROM meta WHERE key='classification_schema_version'"
+            ).fetchone()[0],
+            str(dashboard._CLASSIFICATION_SCHEMA_VERSION),
+        )
+
+
 class RegressionClassTests(unittest.TestCase):
     """The `regression_class` view: flaky-aware, confidence-tiered
     classification, computed purely in SQL over run_results + the
@@ -694,20 +785,25 @@ class RegressionClassTests(unittest.TestCase):
         _add_result(self.conn, run_id=rid, test_id=test_id, pass_="litebox",
                     verdict=verdict, ts_ms=self.now - dt)
 
-    def _classify(self):
+    def _classify_rows(self, tip_sha=None):
         self.conn.execute(
             "INSERT OR REPLACE INTO branch_baseline"
-            "(branch_sha, baseline_sha, ref, branch, computed_at_ms) "
-            "VALUES('BRANCH','BASE','up','wt/x',?)",
-            (self.now,),
+            "(branch_sha, baseline_sha, ref, branch, tip_sha, computed_at_ms) "
+            "VALUES('BRANCH','BASE','up','wt/x',?,?)",
+            (tip_sha, self.now),
         )
         # test_flake_stats is a live view now — no refresh needed.
         return {
-            r["test_id"]: (r["classification"], r["confidence"])
+            r["test_id"]: r
             for r in self.conn.execute(
-                "SELECT test_id, classification, confidence "
-                "FROM regression_class WHERE mode='litebox'"
+                "SELECT * FROM regression_class WHERE mode='litebox'"
             )
+        }
+
+    def _classify(self, tip_sha=None):
+        return {
+            tid: (r["classification"], r["confidence"])
+            for tid, r in self._classify_rows(tip_sha).items()
         }
 
     def test_hard_regression_high_confidence(self):
@@ -829,6 +925,66 @@ class RegressionClassTests(unittest.TestCase):
         res = self._classify()
         self.assertEqual(res["GAP"][0], "not_run")
         self.assertEqual(res["NR"][0], "no_result")
+
+    def test_fixed_when_baseline_failed_and_branch_passes(self):
+        # Inverse of a regression: failed at the merge-base baseline,
+        # now passes on the branch → 'fixed' (the branch repaired a
+        # previously-broken test). Confidence is n/a (a pass isn't a
+        # regression to grade).
+        self._upstream("BASE", "T", "fail")
+        self._branch("BRANCH", "T", "pass")
+        self.assertEqual(self._classify()["T"], ("fixed", "n/a"))
+
+    def test_fixed_distinct_from_ok(self):
+        # ok = passed at baseline AND branch; fixed = failed at baseline,
+        # passes at branch. They must not be conflated.
+        self._upstream("BASE", "OKT", "pass")
+        self._branch("BRANCH", "OKT", "pass")
+        self._upstream("BASE", "FIXT", "fail")
+        self._branch("BRANCH", "FIXT", "pass")
+        res = self._classify()
+        self.assertEqual(res["OKT"][0], "ok")
+        self.assertEqual(res["FIXT"][0], "fixed")
+
+    def test_tip_verdict_pass_marks_branch_introduced(self):
+        # Branch-introduced regression: baseline passed, branch fails the
+        # full retry budget, and the baseline ref's CURRENT tip still
+        # passes → the branch broke it. tip_verdict='pass' lets the render
+        # label it branch-introduced (not inherited).
+        for i in range(3):
+            self._upstream("UP", "T", "pass", dt=i * 1000)
+        self._upstream("BASE", "T", "pass")
+        self._upstream("TIP", "T", "pass")
+        self._branch("BRANCH", "T", "fail", dt=15)
+        self._branch("BRANCH", "T", "fail", dt=10)
+        self._branch("BRANCH", "T", "fail", dt=5)
+        row = self._classify_rows(tip_sha="TIP")["T"]
+        self.assertEqual(row["classification"], "hard_regression")
+        self.assertEqual(row["confidence"], "high")
+        self.assertEqual(row["tip_verdict"], "pass")
+
+    def test_tip_verdict_fail_marks_inherited(self):
+        # Inherited regression: the baseline ref's CURRENT tip ALSO fails
+        # T — the branch merely inherits an already-broken upstream. The
+        # tip fail also (correctly) makes upstream observably flaky in the
+        # window → soft_regression; but tip_verdict='fail' is the precise
+        # "broken on the tip right now" signal the render uses to mark it
+        # inherited rather than blaming the branch.
+        self._upstream("BASE", "T", "pass")
+        self._upstream("TIP", "T", "fail")
+        self._branch("BRANCH", "T", "fail")
+        row = self._classify_rows(tip_sha="TIP")["T"]
+        self.assertEqual(row["tip_verdict"], "fail")
+        self.assertEqual(row["classification"], "soft_regression")
+
+    def test_tip_verdict_null_when_tip_not_covered(self):
+        # No runs at the tip sha → tip_verdict is NULL; the regression is
+        # surfaced as-is with no inherited/branch-introduced distinction.
+        self._upstream("BASE", "T", "pass")
+        self._branch("BRANCH", "T", "fail")
+        row = self._classify_rows(tip_sha="TIP")["T"]  # TIP has no runs
+        self.assertIsNone(row["tip_verdict"])
+        self.assertEqual(row["classification"], "hard_regression")
 
 
 if __name__ == "__main__":
