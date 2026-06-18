@@ -61,7 +61,7 @@ impl PolicyEngine {
             PolicyProfile::EventOnly {
                 event_reference_rights,
                 ..
-            } => authorize_event_create(event_reference_rights, caller_credential, object_type),
+            } => authorize_create_event(event_reference_rights, caller_credential, object_type),
         }
     }
 
@@ -75,7 +75,7 @@ impl PolicyEngine {
             PolicyProfile::DefaultDeny => Err(BrokerError::PolicyDenied),
             PolicyProfile::EventOnly {
                 event_use_rights, ..
-            } => authorize_event_use(event_use_rights, caller_credential, object_type, rights),
+            } => authorize_use_event(event_use_rights, caller_credential, object_type, rights),
         }
     }
 }
@@ -93,7 +93,7 @@ impl Default for PolicyEngine {
 /// use rights; BrokerCore separately enforces each reference's actual rights.
 const EVENT_REFERENCE_RIGHTS: ObjectRights = ObjectRights::WAIT.union(ObjectRights::WRITE);
 
-fn authorize_event_create(
+fn authorize_create_event(
     event_reference_rights: ObjectRights,
     caller_credential: CallerCredential,
     object_type: ObjectType,
@@ -105,7 +105,7 @@ fn authorize_event_create(
     }
 }
 
-fn authorize_event_use(
+fn authorize_use_event(
     event_use_rights: ObjectRights,
     caller_credential: CallerCredential,
     object_type: ObjectType,
