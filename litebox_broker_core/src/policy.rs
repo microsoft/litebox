@@ -216,7 +216,7 @@ mod tests {
             policy.authorize(PolicyOperation::use_object(
                 CallerCredential::Unauthenticated,
                 ObjectType::Event,
-                ObjectRights::NONE
+                ObjectRights::empty()
             )),
             Err(BrokerError::PolicyDenied)
         );

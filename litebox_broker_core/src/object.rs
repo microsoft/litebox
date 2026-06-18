@@ -18,8 +18,6 @@ bitflags::bitflags! {
     /// Broker rights attached to an object reference.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct ObjectRights: u32 {
-        /// Empty rights set.
-        const NONE = 0;
         /// Right to wait for readiness.
         const WAIT = 1 << 0;
         /// Right to mutate object state, such as adding event readiness credits.
