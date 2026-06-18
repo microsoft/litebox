@@ -9,7 +9,7 @@
 //! - `POLL.*` — epoll/ppoll IN-event readiness over a pipe
 
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -116,6 +116,23 @@ const EDGE_TRIGGER: HandlerToken<PeerAddrArgs, DetailOut> =
     HandlerToken::new("epoll_pidfd.edge_trigger");
 const SETUP_TCP_LISTEN: HandlerToken<SetupTcpListenArgs, SetupTcpListenOut> =
     HandlerToken::new("epoll_pidfd.setup_tcp_listen");
+const EPOLL_SPIN_EVENTFD_IDLE: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_spin_eventfd_idle");
+const EPOLL_SPIN_TIMERFD: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_spin_timerfd");
+const EPOLL_SPIN_TIMERFD_INHERITED_FORK: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_spin_timerfd_inherited_fork");
+
+#[derive(Serialize, Deserialize, Debug)]
+struct EpollSpinOut {
+    detail: String,
+    first_elapsed_ms: u64,
+    first_events: i32,
+    iterations: u64,
+    loop_elapsed_ms: u64,
+    timer_ready: u64,
+    zero_event_returns: u64,
+}
 
 async fn handle_pidfd_exit(
     args: PidfdExitArgs,
@@ -329,6 +346,124 @@ async fn handle_setup_tcp_listen(
     Ok(SetupTcpListenOut { port })
 }
 
+async fn handle_epoll_spin_eventfd_idle(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let epfd = epoll_create()?;
+    let eventfd = EventFd::open(0, "cloexec")?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        eventfd.as_raw_fd(),
+        libc::EPOLLIN as u32,
+        1,
+    )?;
+
+    let first = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+    let loop_start = Instant::now();
+    let loop_deadline = loop_start + Duration::from_secs(5);
+    let mut iterations = 0_u64;
+    let mut zero_event_returns = u64::from(first.events == 0);
+    while Instant::now() < loop_deadline {
+        let sample = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+        iterations += 1;
+        zero_event_returns += u64::from(sample.events == 0);
+    }
+    let loop_elapsed_ms = elapsed_ms(loop_start.elapsed());
+    Ok(EpollSpinOut {
+        detail: format!(
+            "step=1 eventfd_idle first_events={} first_elapsed_ms={} iterations={} loop_elapsed_ms={} zero_event_returns={}",
+            first.events,
+            elapsed_ms(first.elapsed),
+            iterations,
+            loop_elapsed_ms,
+            zero_event_returns
+        ),
+        first_elapsed_ms: elapsed_ms(first.elapsed),
+        first_events: first.events,
+        iterations,
+        loop_elapsed_ms,
+        timer_ready: 0,
+        zero_event_returns,
+    })
+}
+
+async fn handle_epoll_spin_timerfd(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let epfd = epoll_create()?;
+    let timerfd = timerfd_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        timerfd.as_raw_fd(),
+        libc::EPOLLIN as u32,
+        2,
+    )?;
+    run_epoll_spin_timerfd_probe(epfd.as_raw_fd(), timerfd.as_raw_fd(), "step=2 timerfd")
+}
+
+async fn handle_epoll_spin_timerfd_inherited_fork(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let epfd = epoll_create()?;
+    let timerfd = timerfd_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        timerfd.as_raw_fd(),
+        libc::EPOLLIN as u32,
+        2,
+    )?;
+    run_timerfd_probe_in_forked_child(epfd.as_raw_fd(), timerfd.as_raw_fd())
+}
+
+fn run_epoll_spin_timerfd_probe(
+    epfd: i32,
+    timerfd: i32,
+    detail_prefix: &str,
+) -> Result<EpollSpinOut, HandlerError> {
+    arm_timerfd(timerfd, Duration::from_secs(1))?;
+    let first = timed_epoll_pwait(epfd, 2000, 4)?;
+    let mut timer_ready = u64::from(first.timer_ready);
+    if first.timer_ready {
+        drain_timerfd(timerfd)?;
+    }
+
+    let loop_start = Instant::now();
+    let loop_deadline = loop_start + Duration::from_secs(5);
+    let mut iterations = 0_u64;
+    let mut zero_event_returns = u64::from(first.events == 0);
+    while Instant::now() < loop_deadline {
+        arm_timerfd(timerfd, Duration::from_secs(1))?;
+        let sample = timed_epoll_pwait(epfd, 2000, 4)?;
+        iterations += 1;
+        zero_event_returns += u64::from(sample.events == 0);
+        if sample.timer_ready {
+            timer_ready += 1;
+            drain_timerfd(timerfd)?;
+        }
+    }
+    let loop_elapsed_ms = elapsed_ms(loop_start.elapsed());
+    Ok(EpollSpinOut {
+        detail: format!(
+            "{detail_prefix} first_events={} first_elapsed_ms={} iterations={} loop_elapsed_ms={} timer_ready={} zero_event_returns={}",
+            first.events,
+            elapsed_ms(first.elapsed),
+            iterations,
+            loop_elapsed_ms,
+            timer_ready,
+            zero_event_returns
+        ),
+        first_elapsed_ms: elapsed_ms(first.elapsed),
+        first_events: first.events,
+        iterations,
+        loop_elapsed_ms,
+        timer_ready,
+        zero_event_returns,
+    })
+}
+
 static SETUP_LISTENERS: OnceLock<Mutex<Vec<tokio::task::JoinHandle<()>>>> = OnceLock::new();
 
 fn setup_listeners() -> &'static Mutex<Vec<tokio::task::JoinHandle<()>>> {
@@ -371,6 +506,12 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
     register_handler!(TIMEOUT_ZERO, handle_timeout_zero);
     register_handler!(EDGE_TRIGGER, handle_edge_trigger);
     register_handler!(SETUP_TCP_LISTEN, handle_setup_tcp_listen);
+    register_handler!(EPOLL_SPIN_EVENTFD_IDLE, handle_epoll_spin_eventfd_idle);
+    register_handler!(EPOLL_SPIN_TIMERFD, handle_epoll_spin_timerfd);
+    register_handler!(
+        EPOLL_SPIN_TIMERFD_INHERITED_FORK,
+        handle_epoll_spin_timerfd_inherited_fork
+    );
 
     for &agent in EPI_AGENTS {
         for def in EPI_SCENARIOS {
@@ -419,6 +560,324 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
             }
         }
     }
+
+    for &agent in &[
+        AgentName::Dpg1,
+        AgentName::Dpg1DngSpm,
+        AgentName::VsCodeCli,
+        AgentName::VsCodeNode,
+    ] {
+        reg.single_agent_handler_test(
+            "vscode",
+            "epoll_pidfd",
+            format!("EP.spin.eventfd_idle.{agent}"),
+            agent,
+            &EPOLL_SPIN_EVENTFD_IDLE,
+            check_epoll_spin_eventfd_idle,
+        );
+        reg.single_agent_handler_test(
+            "vscode",
+            "epoll_pidfd",
+            format!("EP.spin.timerfd.{agent}"),
+            agent,
+            &EPOLL_SPIN_TIMERFD,
+            check_epoll_spin_timerfd,
+        );
+        reg.single_agent_handler_test(
+            "vscode",
+            "epoll_pidfd",
+            format!("EP.spin.timerfd_inherited_fork.{agent}"),
+            agent,
+            &EPOLL_SPIN_TIMERFD_INHERITED_FORK,
+            check_epoll_spin_timerfd,
+        );
+    }
+}
+
+fn check_epoll_spin_eventfd_idle(out: &EpollSpinOut) -> Result<String, String> {
+    if out.first_events == 0
+        && out.first_elapsed_ms >= 500
+        && out.iterations <= 10
+        && out.zero_event_returns == out.iterations + 1
+    {
+        Ok(out.detail.clone())
+    } else {
+        Err(out.detail.clone())
+    }
+}
+
+fn check_epoll_spin_timerfd(out: &EpollSpinOut) -> Result<String, String> {
+    if out.first_events > 0
+        && out.first_elapsed_ms >= 500
+        && out.first_elapsed_ms <= 1800
+        && out.iterations <= 10
+        && out.timer_ready == out.iterations + 1
+        && out.zero_event_returns == 0
+    {
+        Ok(out.detail.clone())
+    } else {
+        Err(out.detail.clone())
+    }
+}
+
+fn run_timerfd_probe_in_forked_child(
+    epfd: i32,
+    timerfd: i32,
+) -> Result<EpollSpinOut, HandlerError> {
+    let mut pipe_fds = [0_i32; 2];
+    // SAFETY: pipe writes two fresh fds into pipe_fds on success.
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        return Err(HandlerError(format!(
+            "pipe: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let read_fd = pipe_fds[0];
+    let write_fd = pipe_fds[1];
+
+    // SAFETY: fork creates a child process. The child writes one JSON result
+    // to the dedicated pipe and exits without returning to the async runtime.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        // SAFETY: both fds were returned by pipe and are owned here.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(HandlerError(format!(
+            "fork: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if child == 0 {
+        // SAFETY: the child owns its inherited copy of read_fd and does not use it.
+        unsafe {
+            libc::close(read_fd);
+        }
+        let exit_code =
+            match run_epoll_spin_timerfd_probe(epfd, timerfd, "step=3 timerfd_inherited_fork") {
+                Ok(out) => match serde_json::to_vec(&out) {
+                    Ok(bytes) => write_all_fd(write_fd, &bytes).map_or(1, |()| 0),
+                    Err(_) => 1,
+                },
+                Err(err) => {
+                    let message = format!("ERR:{err:?}");
+                    write_all_fd(write_fd, message.as_bytes()).map_or(1, |()| 2)
+                }
+            };
+        // SAFETY: write_fd is no longer needed in the child; _exit avoids
+        // running non-async-signal-safe destructors in the forked child.
+        unsafe {
+            libc::close(write_fd);
+            libc::_exit(exit_code);
+        }
+    }
+
+    // SAFETY: parent only reads from the pipe.
+    unsafe {
+        libc::close(write_fd);
+    }
+    let bytes = read_all_fd(read_fd);
+    // SAFETY: read_fd is owned by the parent.
+    unsafe {
+        libc::close(read_fd);
+    }
+    let mut status = 0_i32;
+    // SAFETY: child is the pid just returned by fork; status points to valid storage.
+    let wait_rc = unsafe { libc::waitpid(child, &raw mut status, 0) };
+    if wait_rc < 0 {
+        return Err(HandlerError(format!(
+            "waitpid({child}): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let output = String::from_utf8_lossy(&bytes).into_owned();
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err(HandlerError(format!(
+            "forked timerfd probe child status={status:#x} output={output}"
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| HandlerError(format!("forked timerfd probe JSON parse: {e}; {output}")))
+}
+
+fn write_all_fd(fd: i32, mut bytes: &[u8]) -> Result<(), ()> {
+    while !bytes.is_empty() {
+        // SAFETY: bytes points to readable memory for bytes.len() bytes.
+        let n = unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(());
+        }
+        let n = usize::try_from(n).map_err(|_| ())?;
+        if n == 0 {
+            return Err(());
+        }
+        bytes = &bytes[n..];
+    }
+    Ok(())
+}
+
+fn read_all_fd(fd: i32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0_u8; 4096];
+    loop {
+        // SAFETY: buf is valid writable storage for buf.len() bytes.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n == 0 {
+            break;
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        let Ok(n) = usize::try_from(n) else {
+            break;
+        };
+        out.extend_from_slice(&buf[..n]);
+    }
+    out
+}
+
+struct EpollWaitSample {
+    elapsed: Duration,
+    events: i32,
+    timer_ready: bool,
+}
+
+fn epoll_create() -> Result<OwnedFd, HandlerError> {
+    // SAFETY: epoll_create1 creates a fresh descriptor on success.
+    let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if fd < 0 {
+        return Err(HandlerError(format!(
+            "epoll_create1: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: fd is a newly returned descriptor owned by this handler.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn epoll_add(epfd: i32, fd: i32, events: u32, token: u64) -> Result<(), HandlerError> {
+    let mut ev = libc::epoll_event { events, u64: token };
+    // SAFETY: epfd and fd are live descriptors; ev is initialized.
+    let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &raw mut ev) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "epoll_ctl ADD fd={fd}: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+fn timed_epoll_pwait(
+    epfd: i32,
+    timeout_ms: i32,
+    max_events: usize,
+) -> Result<EpollWaitSample, HandlerError> {
+    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; max_events];
+    let start = Instant::now();
+    // SAFETY: events is valid writable storage for max_events entries, epfd is
+    // live, and a null sigmask requests the current signal mask.
+    let n = unsafe {
+        libc::epoll_pwait(
+            epfd,
+            events.as_mut_ptr(),
+            i32::try_from(max_events).unwrap_or(i32::MAX),
+            timeout_ms,
+            std::ptr::null(),
+        )
+    };
+    let elapsed = start.elapsed();
+    if n < 0 {
+        return Err(HandlerError(format!(
+            "epoll_pwait: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let timer_ready = events
+        .iter()
+        .take(usize::try_from(n).unwrap_or(0))
+        .any(|ev| ev.u64 == 2 && (ev.events & libc::EPOLLIN as u32) != 0);
+    Ok(EpollWaitSample {
+        elapsed,
+        events: n,
+        timer_ready,
+    })
+}
+
+fn timerfd_create() -> Result<OwnedFd, HandlerError> {
+    // SAFETY: timerfd_create is called with constant clock/flag values; errors are checked.
+    let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(HandlerError(format!(
+            "timerfd_create(CLOCK_MONOTONIC): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: fd is a newly returned descriptor owned by this handler.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn arm_timerfd(fd: i32, duration: Duration) -> Result<(), HandlerError> {
+    let spec = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: duration_to_timespec(duration)?,
+    };
+    // SAFETY: spec is initialized and fd is expected to refer to a live timerfd.
+    let rc =
+        unsafe { libc::timerfd_settime(fd, 0, std::ptr::from_ref(&spec), std::ptr::null_mut()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "timerfd_settime fd={fd}: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+fn duration_to_timespec(duration: Duration) -> Result<libc::timespec, HandlerError> {
+    Ok(libc::timespec {
+        tv_sec: libc::time_t::try_from(duration.as_secs())
+            .map_err(|_| HandlerError("duration seconds exceed time_t".to_string()))?,
+        tv_nsec: libc::c_long::from(duration.subsec_nanos()),
+    })
+}
+
+fn drain_timerfd(fd: i32) -> Result<(), HandlerError> {
+    let mut count = 0_u64;
+    // SAFETY: count is valid writable storage for one timerfd expiration count.
+    let n = unsafe {
+        libc::read(
+            fd,
+            std::ptr::from_mut(&mut count).cast::<libc::c_void>(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    if n == std::mem::size_of::<u64>() as isize {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "timerfd read n={n}: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+fn elapsed_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn register_peer_addr_test(
