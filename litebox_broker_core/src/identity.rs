@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{BrokerCore, Result, close_session, object};
+use crate::{BrokerCore, Result, object};
 use litebox_broker_protocol::ObjectHandle;
 
 /// Caller identity information supplied by the broker entry layer.
@@ -64,6 +64,6 @@ impl BrokerSession {
 
 impl Drop for BrokerSession {
     fn drop(&mut self) {
-        close_session(&self.core, self.session_id);
+        self.core.close_session(self.session_id);
     }
 }

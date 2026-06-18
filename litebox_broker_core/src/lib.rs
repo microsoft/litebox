@@ -136,10 +136,10 @@ impl BrokerCore {
             caller_credential,
         ))
     }
-}
 
-fn close_session(core: &BrokerCore, session_id: identity::SessionId) {
-    object::drop_references_for_session(core, session_id);
+    pub(crate) fn close_session(&self, session_id: identity::SessionId) {
+        object::drop_references_for_session(self, session_id);
+    }
 }
 
 fn allocate_id(next_id: &mut u64) -> Result<u64> {
