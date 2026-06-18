@@ -386,13 +386,23 @@ driving.
 `run_results` tables under the worktree's own `(commit_sha,
 dirty_hash, worktree_path)`, so they automatically appear in the
 Result-groups stacked-state breakdown. A NEW "Agent worktrees"
-section in `summary.md` adds two regression columns per pass:
+section in `summary.md` is rendered **directly from the
+`regression_class` view** (the same classifier as `dashboard.py
+regressions <branch>`) — one materialization of the view drives
+every row. Per worktree it reports, per pass (native / litebox):
 
-- **Δ vs merge-base** — pass-at-baseline-merge-base → fail-at-HEAD.
-  This is "regressions the agent introduced since they forked."
-- **Δ vs baseline HEAD** — pass-at-baseline-HEAD → fail-at-HEAD.
-  This is "absolute drift from current upstream."
+- **Regressions** — hard / soft counts with the classifier's
+  `hi/md/lo` confidence, and `N inh` when some are *inherited*
+  (the baseline ref's current tip fails the same test, so the
+  branch isn't the cause).
+- **Fixed** — tests that failed at the baseline and now pass
+  (the branch repaired them).
+- **Coverage** — `covered / universe` of the comparable test
+  universe, with the `not run` gap called out so a partial cycle
+  can't read as clean.
 
+A `<details>` block per worktree lists the regressed test_ids
+(hard before soft, high-confidence first, inherited tagged).
 The "baseline" for each agent worktree is picked dynamically: the
 tracked_ref whose HEAD shares the most recent merge-base with the
 agent worktree's HEAD (= the upstream they most recently forked
@@ -520,6 +530,7 @@ runs only — so a genuine branch regression isn't mistaken for a flake):
 | `soft_regression` | Fails on branch, but was already flaky upstream / at baseline. Discount. |
 | `new_fail` | Fails on branch, no definitive baseline pass to compare. |
 | `preexisting_fail` | Failed at baseline too — not a regression. |
+| `fixed` | Failed at the merge-base baseline, now **passes** on the branch — the branch repaired it. |
 | `flaky_pass` | Passes on branch but flaked (retry-recovered) at the sha. |
 | `no_result` | Branch produced only `no_result` (infra non-outcome, ~1% background) — **not** a regression. |
 | `not_run` | In the comparable universe (has a baseline verdict) but **not yet run at the branch sha** — an explicit coverage gap, *not* a pass. |
@@ -547,13 +558,25 @@ default 3, all definitive fails) *and* the upstream to be
 well-observed-stable — so a 2-of-3 (which a timing/load-sensitive test
 can hit under the shadow's build load while upstream passes it) stays
 `medium`, not high. `low` flags thin evidence — the explicit "not enough
-data to judge yet" signal. Almost everything is a live derivation:
+data to judge yet" signal.
+
+A regression is **inherited** when the `tip_verdict` column (the same
+test's freshest definitive verdict at the baseline ref's *current* HEAD,
+`tip_sha`) is also `fail`: the upstream tip is already broken, so the
+branch isn't the cause. `dashboard.py regressions` reports the inherited
+count per pass and tags each inherited test; the "Agent worktrees"
+render section shows it as `N inh`. This separates a branch-introduced
+break (tip passes) from one merely inherited from an already-broken
+upstream.
+
+Almost everything is a live derivation:
 `test_flake_stats` (the upstream recent-flake tally) is itself a view,
 kept cheap by an index on
 `runs(worktree_path)`. The *only* materialized table is `branch_baseline`
-— the git `merge-base(branch_HEAD, tracked_tip)` map, which SQLite has no
-way to compute — refreshed each cycle by the `dashboard.py auto`
-supervisor. `(hard + soft)` reconciles exactly with the old binary
+— the git `merge-base(branch_HEAD, tracked_tip)` map plus the tracked
+ref's current `tip_sha`, which SQLite has no way to compute — refreshed
+each cycle by the `dashboard.py auto` supervisor (and at render time).
+`(hard + soft)` reconciles exactly with the old binary
 regression count; it just splits it by severity.
 
 ## `analyze-test-timing.py` — per-test timing summaries
