@@ -135,7 +135,7 @@ impl BrokerCore {
             .ok_or(BrokerError::ResourceExhausted)?;
         Ok(BrokerSession::new(
             self.clone(),
-            session::SessionId::new(session_id),
+            session::SessionId(session_id),
             caller_credential,
         ))
     }

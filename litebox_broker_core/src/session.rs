@@ -18,13 +18,7 @@ pub enum CallerCredential {
 /// Broker-assigned session identity.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct SessionId(u64);
-
-impl SessionId {
-    pub(crate) const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-}
+pub(crate) struct SessionId(pub u64);
 
 /// Broker-owned authority token for one authenticated caller session.
 ///
