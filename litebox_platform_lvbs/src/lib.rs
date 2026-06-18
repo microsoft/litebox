@@ -7,11 +7,8 @@
 #![no_std]
 
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
-use alloc::vec::Vec;
 use core::{
     arch::asm,
-    mem::ManuallyDrop,
-    ops::Range,
     sync::atomic::{AtomicU32, AtomicU64},
 };
 use hashbrown::HashMap;
@@ -52,35 +49,16 @@ pub mod mshv;
 pub mod syscall_entry;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
-static PHYS_RANGE_RESERVATIONS: spin::Mutex<PhysRangeReservationInner> =
-    spin::Mutex::new(PhysRangeReservationInner::new());
-
-struct PhysRangeReservationInner {
-    entries: Vec<Range<usize>>,
-}
 
 /// Mapping info returned by [`LinuxKernel`]'s [`VmapManager::vmap`].
-///
-/// Carries the virtual base/size of the mapping together with an access reservation for the
-/// physical ranges it covers. The reservation is released explicitly only after successful
-/// `vunmap`; dropping this map info does not release it.
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
-    access_reservation: LvbsPhysRangeReservation,
-}
-
-struct LvbsPhysRangeReservation {
-    ranges: Vec<Range<usize>>,
 }
 
 impl LvbsPhysPageMapInfo {
-    fn new(base: *mut u8, size: usize, access_reservation: LvbsPhysRangeReservation) -> Self {
-        Self {
-            base,
-            size,
-            access_reservation,
-        }
+    fn new(base: *mut u8, size: usize) -> Self {
+        Self { base, size }
     }
 }
 
@@ -91,127 +69,6 @@ impl PhysPageMapInfo for LvbsPhysPageMapInfo {
 
     fn size(&self) -> usize {
         self.size
-    }
-}
-
-impl PhysRangeReservationInner {
-    const fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-}
-
-fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
-    left.start < right.end && right.start < left.end
-}
-
-fn build_phys_access_reservation_ranges<const ALIGN: usize>(
-    pages: &PhysPageAddrArray<ALIGN>,
-) -> Result<Vec<Range<usize>>, PhysPointerError> {
-    let mut page_ranges = Vec::with_capacity(pages.len());
-    for page in pages {
-        let start = page.as_usize();
-        let end = start.checked_add(ALIGN).ok_or(PhysPointerError::Overflow)?;
-        page_ranges.push(start..end);
-    }
-    page_ranges.sort_unstable_by_key(|range| range.start);
-
-    let mut ranges: Vec<Range<usize>> = Vec::new();
-    for range in page_ranges {
-        let start = range.start;
-        let end = range.end;
-        if let Some(last) = ranges.last_mut() {
-            if start == last.end {
-                last.end = end;
-                continue;
-            }
-            if start < last.end {
-                return Err(PhysPointerError::DuplicatePhysicalAddress(start));
-            }
-        }
-        ranges.push(start..end);
-    }
-    Ok(ranges)
-}
-
-/// Reserve exclusive LiteBox access to the ALIGN-sized physical range covering each entry in
-/// `pages`.
-///
-/// Adjacent pages are coalesced into one range to keep the global lock list compact for the
-/// common contiguous mapping path. Duplicate pages are rejected so explicit release removes every
-/// reserved range exactly once. This is a cooperative LiteBox reservation, not Rust ownership of
-/// the foreign physical memory; external agents may still access it unless hardware protection is
-/// applied separately.
-fn reserve_phys_range_access<const ALIGN: usize>(
-    pages: &PhysPageAddrArray<ALIGN>,
-) -> Result<LvbsPhysRangeReservation, PhysPointerError> {
-    let ranges = build_phys_access_reservation_ranges(pages)?;
-
-    let mut inner = PHYS_RANGE_RESERVATIONS.lock();
-    for entry in &inner.entries {
-        for range in &ranges {
-            if ranges_overlap(entry, range) {
-                return Err(PhysPointerError::PhysicalAddressRangeLocked(range.start));
-            }
-        }
-    }
-
-    inner.entries.extend(ranges.iter().cloned());
-    drop(inner);
-
-    Ok(LvbsPhysRangeReservation { ranges })
-}
-
-impl LvbsPhysRangeReservation {
-    fn release(self) {
-        let mut inner = PHYS_RANGE_RESERVATIONS.lock();
-        for range in self.ranges {
-            if let Some(index) = inner.entries.iter().position(|entry| *entry == range) {
-                inner.entries.swap_remove(index);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TEST_ALIGN: usize = 4096;
-
-    fn page(addr: usize) -> PhysPageAddr<TEST_ALIGN> {
-        PhysPageAddr::<TEST_ALIGN>::new(addr).unwrap()
-    }
-
-    #[test]
-    fn access_reservation_ranges_coalesce_contiguous_pages() {
-        let pages = [page(0x1000), page(0x2000), page(0x3000)];
-
-        let ranges = build_phys_access_reservation_ranges(&pages).unwrap();
-
-        assert_eq!(ranges, alloc::vec![0x1000..0x4000]);
-    }
-
-    #[test]
-    fn access_reservation_ranges_sort_and_coalesce_out_of_order_pages() {
-        let pages = [page(0x5000), page(0x1000), page(0x2000), page(0x4000)];
-
-        let ranges = build_phys_access_reservation_ranges(&pages).unwrap();
-
-        assert_eq!(ranges, alloc::vec![0x1000..0x3000, 0x4000..0x6000]);
-    }
-
-    #[test]
-    fn access_reservation_ranges_reject_duplicate_pages() {
-        let pages = [page(0x1000), page(0x1000)];
-
-        let err = build_phys_access_reservation_ranges(&pages).unwrap_err();
-
-        assert!(matches!(
-            err,
-            PhysPointerError::DuplicatePhysicalAddress(0x1000)
-        ));
     }
 }
 
@@ -1319,9 +1176,8 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        // Reject duplicate page addresses for non-contiguous input. Contiguous input cannot
-        // repeat by construction. This upholds `reserve_phys_range_access`'s no-duplicate
-        // precondition so its drop path can correctly release every reserved range.
+        // Reject duplicates early as an API-level validation. The page-table implementation also
+        // rejects duplicate/shared mappings, but this keeps the error local to the input array.
         if !is_contiguous(pages) {
             let mut seen = hashbrown::HashSet::with_capacity(pages.len());
             for page in pages {
@@ -1330,10 +1186,6 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 }
             }
         }
-
-        // Reserve the physical ranges before installing the mapping. This serializes cooperating
-        // LiteBox mappings; it is not Rust ownership of the foreign physical memory.
-        let access_reservation = reserve_phys_range_access(pages)?;
 
         // VTL0 memory must never be executable from VTL1 (DEP).
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
@@ -1363,11 +1215,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 .current_page_table()
                 .map_phys_frame_range_direct(frame_range, flags, None)
             {
-                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(
-                    page_addr,
-                    pages.len() * ALIGN,
-                    access_reservation,
-                )),
+                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(page_addr, pages.len() * ALIGN)),
                 Err(MapToError::PageAlreadyMapped(_)) => {
                     Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
                 }
@@ -1403,11 +1251,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 .current_page_table()
                 .map_non_contiguous_phys_frames(&frames, base_va, flags)
             {
-                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(
-                    page_addr,
-                    pages.len() * ALIGN,
-                    access_reservation,
-                )),
+                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(page_addr, pages.len() * ALIGN)),
                 Err(e) => {
                     let _ = vmap_allocator().unregister_allocation(base_va);
                     match e {
@@ -1434,9 +1278,6 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        // Hold the map info in `ManuallyDrop` so its reservation is only
-        // released once unmapping actually succeeds; on failure we hand it back to the caller.
-        let vmap_info = ManuallyDrop::new(vmap_info);
         let base = vmap_info.base();
         let size = vmap_info.size();
         let base_va = x86_64::VirtAddr::new(base as u64);
@@ -1445,17 +1286,13 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         // to the allocator when unmapping succeeds; if it fails, stale PTE
         // entries remain and recycling the VA would cause collisions.
         if self.unmap_vtl0_pages(base, size).is_err() {
-            return Err((
-                PhysPointerError::Unmapped(base as usize),
-                ManuallyDrop::into_inner(vmap_info),
-            ));
+            return Err((PhysPointerError::Unmapped(base as usize), vmap_info));
         }
 
         // PTEs are already cleared at this point, so the mapping is functionally gone
         // and a retry would only re-fail against empty page-table entries. If the VA
         // allocator's bookkeeping is inconsistent, surface it via `debug_assert!`. The
-        // VA region is leaked but cannot be safely recycled; the physical access
-        // reservation is still explicitly released below.
+        // VA region is leaked but cannot be safely recycled.
         let unregister_ok = !crate::mm::vmap::is_vmap_address(base_va)
             || crate::mm::vmap::vmap_allocator()
                 .unregister_allocation(base_va)
@@ -1465,9 +1302,6 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             "vmap allocator unregister failed at {base_va:?}",
         );
 
-        ManuallyDrop::into_inner(vmap_info)
-            .access_reservation
-            .release();
         Ok(())
     }
 

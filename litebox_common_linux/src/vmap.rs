@@ -254,6 +254,4 @@ pub enum PhysPointerError {
     VaSpaceExhausted,
     #[error("Page-table frame allocation failed (out of memory)")]
     FrameAllocationFailed,
-    #[error("Physical address range starting at {0:#x} is already locked")]
-    PhysicalAddressRangeLocked(usize),
 }
