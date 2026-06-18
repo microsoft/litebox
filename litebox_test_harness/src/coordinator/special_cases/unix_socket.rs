@@ -67,6 +67,7 @@ pub fn run(sub: &str) -> i32 {
         // pidfd. Companion to p1-pidfd-inherit TODO.
         "pidfd-inherit-fork" => test_pidfd_inherit_fork(),
         "seqpacket-socketpair-boundary" => test_seqpacket_socketpair_boundary(),
+        "stream-selfconnect" => test_stream_selfconnect(),
         "seqpacket-msg-trunc" => test_seqpacket_msg_trunc(),
         "seqpacket-shutdown" => test_seqpacket_shutdown(),
         "seqpacket-fork-restore-inherit" => test_seqpacket_fork_restore_inherit(),
@@ -1679,6 +1680,11 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
     ];
     let seqpacket_tests: &[(&str, &str, &str)] = &[
         (
+            "stream_selfconnect",
+            "stream-selfconnect",
+            "STREAM_SELFCONNECT_OK",
+        ),
+        (
             "socketpair_boundary",
             "seqpacket-socketpair-boundary",
             "UDS_SEQPACKET_SOCKETPAIR_BOUNDARY_OK",
@@ -2199,6 +2205,114 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
             );
         }
     }
+}
+
+/// Minimal single-process named AF_UNIX stream rendezvous: socket → bind →
+/// listen → (client) connect → accept → PING/PONG, all nonblocking in one
+/// process. Isolates the broker named-stream state/protocol/shim path from the
+/// cross-process fork/wake machinery the US* tests also exercise.
+fn test_stream_selfconnect() -> i32 {
+    let path = "/tmp/litebox-stream-selfconnect.sock";
+    let _ = std::fs::remove_file(path);
+
+    unsafe fn set_nonblock(fd: i32) {
+        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
+    }
+
+    fn make_sockaddr(path: &str) -> (libc::sockaddr_un, libc::socklen_t) {
+        let mut addr: libc::sockaddr_un = unsafe { core::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as _;
+        let bytes = path.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            addr.sun_path[i] = b as libc::c_char;
+        }
+        let len = (core::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+        (addr, len)
+    }
+
+    let listener = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if listener < 0 {
+        println!("STREAM_SELF_SOCKET_FAIL:errno={}", errno());
+        return 1;
+    }
+    let (addr, len) = make_sockaddr(path);
+    if unsafe { libc::bind(listener, (&raw const addr).cast(), len) } != 0 {
+        println!("STREAM_SELF_BIND_FAIL:errno={}", errno());
+        return 1;
+    }
+    if unsafe { libc::listen(listener, 4) } != 0 {
+        println!("STREAM_SELF_LISTEN_FAIL:errno={}", errno());
+        return 1;
+    }
+    unsafe { set_nonblock(listener) };
+
+    let client = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if client < 0 {
+        println!("STREAM_SELF_CLIENT_SOCKET_FAIL:errno={}", errno());
+        return 1;
+    }
+    unsafe { set_nonblock(client) };
+    let cr = unsafe { libc::connect(client, (&raw const addr).cast(), len) };
+    if cr != 0 {
+        let e = errno();
+        if e != libc::EINPROGRESS && e != libc::EAGAIN {
+            println!("STREAM_SELF_CONNECT_FAIL:errno={e}");
+            return 1;
+        }
+    }
+
+    // Accept (nonblocking poll loop).
+    let mut conn = -1;
+    for _ in 0..200 {
+        conn = unsafe { libc::accept(listener, core::ptr::null_mut(), core::ptr::null_mut()) };
+        if conn >= 0 {
+            break;
+        }
+        let e = errno();
+        if e != libc::EAGAIN && e != libc::EWOULDBLOCK {
+            println!("STREAM_SELF_ACCEPT_FAIL:errno={e}");
+            return 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if conn < 0 {
+        println!("STREAM_SELF_ACCEPT_TIMEOUT");
+        return 1;
+    }
+
+    // client → conn: PING
+    let ping = b"PING";
+    let mut sent = false;
+    for _ in 0..200 {
+        let n = unsafe { libc::send(client, ping.as_ptr().cast(), ping.len(), 0) };
+        if n == ping.len() as isize {
+            sent = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !sent {
+        println!("STREAM_SELF_SEND_FAIL:errno={}", errno());
+        return 1;
+    }
+    let mut buf = [0u8; 16];
+    let mut got = 0isize;
+    for _ in 0..200 {
+        got = unsafe { libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if got > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if got != ping.len() as isize || &buf[..4] != ping {
+        println!("STREAM_SELF_RECV_FAIL:got={got} errno={}", errno());
+        return 1;
+    }
+
+    let _ = std::fs::remove_file(path);
+    println!("STREAM_SELFCONNECT_OK");
+    0
 }
 
 fn test_seqpacket_socketpair_boundary() -> i32 {
