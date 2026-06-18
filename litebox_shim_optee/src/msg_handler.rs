@@ -696,7 +696,6 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
         let ptr = NormalWorldConstPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
-        // Copy lands in a buffer owned by LiteBox to avoid TOCTOU issues.
         ptr.read_slice_at_offset(offset, buffer)?;
         Ok(())
     }
@@ -709,7 +708,6 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
         let ptr = NormalWorldMutPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
-        // Data comes from a buffer owned by LiteBox.
         ptr.write_slice_at_offset(0, buffer)?;
         Ok(())
     }

@@ -659,11 +659,9 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// Allocator does not allocate memory frames for VTL0 pages, so frame deallocation is not needed.
     ///
     /// Note: VTL0 physical memory is external memory not owned by LiteBox, similar to DMA/shared
-    /// physical memory. Safe physical pointer APIs access it by creating a temporary mapping,
-    /// acquiring the cooperating LiteBox access reservation, copying data to/from a
-    /// LiteBox-owned buffer with fallible raw-pointer copies, and unmapping immediately. They do not
-    /// create Rust references to the mapped VTL0 memory. Direct `vmap()` remains unsafe because it
-    /// exposes raw mapped memory to the caller.
+    /// physical memory. Physical pointer APIs access it by creating a temporary mapping, copying
+    /// data to/from a LiteBox-owned buffer with fallible raw-pointer copies, and unmapping
+    /// immediately. These APIs do not create Rust references to the mapped VTL0 memory.
     fn unmap_vtl0_pages(
         &self,
         page_addr: *const u8,

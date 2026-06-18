@@ -15,9 +15,7 @@
 //! be changed by hardware or another privilege level. These APIs remain
 //! safe because they do not create Rust references into that external
 //! memory; they only perform bounded copies between a temporary mapping
-//! and memory owned by LiteBox. Cooperating LiteBox mappings are
-//! serialized by the platform's access reservation policy so safe
-//! callers cannot create conflicting mappings through this abstraction.
+//! and memory owned by LiteBox.
 //!
 //! The safe APIs should validate whether a given physical address is okay
 //! to access. For example, accessing LiteBox's own memory through this
@@ -328,10 +326,10 @@ where
             return Err(PhysPointerError::UnsupportedPermissions(perms.bits()));
         }
         let sub_pages = &self.pages[start..end];
-        // SAFETY: `vmap`'s only caller-side obligation is to not form Rust references into
-        // the mapped memory. This is upheld here: the function returns the opaque `MapInfo`
-        // without dereferencing the pointer, and its sole consumer (`MappedGuard`) accesses
-        // the mapping only through fault-tolerant raw copies, never as a reference.
+        // SAFETY: This caller never creates Rust references from the returned mapped pointer.
+        // The mapping is wrapped in `MapInfo`, then consumed by `MappedGuard`, which accesses it
+        // only through fault-tolerant raw copies. That avoids relying on Rust aliasing or validity
+        // guarantees for the external physical memory.
         unsafe { V::manager().vmap(sub_pages, perms) }
     }
 }

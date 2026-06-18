@@ -14,22 +14,11 @@ use thiserror::Error;
 ///
 /// # Safety
 ///
-/// Implementors must ensure that [`Self::vmap`] returns a valid mapping covering exactly the
-/// requested physical pages in order, that the returned [`Self::MapInfo`] owns the mapping and any
-/// access reservation needed for the mapping lifetime, and that [`Self::vunmap`] does not release
-/// that reservation unless the mapping has been invalidated or safely retained in the returned
-/// [`Self::MapInfo`]. Implementors must also ensure [`Self::validate_unowned`] rejects physical
-/// pages owned by LiteBox when mapping them through this abstraction would violate Rust memory
-/// safety.
-///
-/// An access reservation is the platform's cooperative physical-range exclusion mechanism for
-/// LiteBox mappings. It does not imply Rust ownership of the foreign physical memory and does not
-/// exclude external agents such as DMA devices or another VM privilege level.
+/// Implementors must uphold each unsafe method's contract and keep [`Self::MapInfo`] tied to the
+/// mapping it identifies.
 pub unsafe trait VmapManager<const ALIGN: usize> {
-    /// Mapping information returned by [`VmapManager::vmap`]. See [`PhysPageMapInfo`].
-    ///
-    /// Implementors use this to carry the virtual mapping and any platform-specific reservation
-    /// guard for the lifetime of the mapping.
+    /// Implementors use this to carry the virtual mapping and any platform-specific bookkeeping
+    /// needed for unmapping.
     type MapInfo: PhysPageMapInfo;
 
     /// Map the given `PhysPageAddrArray` into virtually contiguous addresses with the given
@@ -39,14 +28,11 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     ///
     /// # Safety
     ///
-    /// This function exposes raw mapped physical memory. The caller must not create Rust
-    /// references from the returned pointer unless it can uphold Rust's aliasing and validity
-    /// rules for the full lifetime of those references.
-    ///
-    /// Implementations should reserve access before installing mappings so cooperating LiteBox
-    /// mappings observe the platform's reservation policy. For copy-based physical pointer access,
-    /// an exclusive reservation among LiteBox mappings is sufficient. Callers must still treat the
-    /// mapped memory like DMA/shared physical memory rather than ordinary Rust-owned RAM.
+    /// The returned pointer is a raw address; creating or holding it does not access memory or
+    /// create a Rust reference. Any later use of that pointer must satisfy the platform's access
+    /// requirements for the mapped physical pages. Even when access is logically exclusive, callers
+    /// must treat the mapped memory like DMA/shared physical memory rather than ordinary Rust-owned
+    /// RAM.
     unsafe fn vmap(
         &self,
         _pages: &PhysPageAddrArray<ALIGN>,
@@ -59,10 +45,10 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     ///
     /// This function is analogous to Linux kernel's `vunmap()`.
     ///
-    /// On failure, the unchanged `vmap_info` is returned alongside the error so the caller does
-    /// not lose the reservation it carries and can retry or drop it explicitly. Dropping returned
-    /// map info is not guaranteed to release platform resources; each implementation owns the
-    /// retention policy for resources that cannot be safely reclaimed after a failed unmap.
+    /// On failure, the unchanged `vmap_info` is returned alongside the error so the caller can
+    /// retry or otherwise preserve the mapping state. Dropping returned map info is not guaranteed
+    /// to release platform resources; each implementation owns the retention policy for resources
+    /// that cannot be safely reclaimed after a failed unmap.
     ///
     /// # Safety
     ///
