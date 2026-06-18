@@ -13,7 +13,7 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProv
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, read_object_attributes};
-use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionObject, IoCompletionSubsystem};
+use crate::syscalls::iocp::{IoCompletionAccess, IoCompletionObject, IoCompletionSubsystem};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{
     ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
@@ -214,7 +214,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(entry) = self.global.litebox.descriptor_table().entry_handle(&typed) else {
             return Err(NtStatus::INVALID_HANDLE);
         };
-        Ok(entry.with_entry(IoCompletionHandleObject::port))
+        entry.with_entry(|entry| {
+            entry.require_access(IoCompletionAccess::MODIFY_STATE)?;
+            Ok(entry.port())
+        })
     }
 
     fn validate_worker_process_handle(
@@ -433,6 +436,7 @@ mod tests {
     };
 
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
+    const IO_COMPLETION_QUERY_STATE: u32 = 0x0000_0001;
     const IO_COMPLETION_ALL_ACCESS: u32 = 0x001f_0003;
     const WORKER_FACTORY_ALL_ACCESS: u32 = 0x001f_003f;
     const WORKER_FACTORY_QUERY_INFORMATION: u32 = 0x0008;
@@ -453,14 +457,16 @@ mod tests {
     }
 
     fn create_io_completion_handle(task: &Task<TestPlatform, TestFS>) -> Handle {
+        create_io_completion_handle_with_access(task, IO_COMPLETION_ALL_ACCESS)
+    }
+
+    fn create_io_completion_handle_with_access(
+        task: &Task<TestPlatform, TestFS>,
+        access: u32,
+    ) -> Handle {
         let mut handle = Handle::default();
         assert_eq!(
-            task.sys_nt_create_io_completion(
-                mut_ptr(&mut handle),
-                IO_COMPLETION_ALL_ACCESS,
-                None,
-                0,
-            ),
+            task.sys_nt_create_io_completion(mut_ptr(&mut handle), access, None, 0),
             NtStatus::SUCCESS
         );
         handle
@@ -659,6 +665,27 @@ mod tests {
         );
         assert_eq!(worker_factory, Handle::from_raw(usize::MAX));
         assert_eq!(task.sys_nt_close(event), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn create_requires_modify_state_on_completion_port() {
+        let task = test_task();
+        let io_completion =
+            create_io_completion_handle_with_access(&task, IO_COMPLETION_QUERY_STATE);
+        let mut worker_factory = Handle::from_raw(usize::MAX);
+
+        assert_eq!(
+            create_worker_factory(
+                &task,
+                &mut worker_factory,
+                None,
+                io_completion,
+                ProcessHandle::CURRENT
+            ),
+            NtStatus::ACCESS_DENIED
+        );
+        assert_eq!(worker_factory, Handle::from_raw(usize::MAX));
         assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
     }
 
@@ -1032,6 +1059,75 @@ mod tests {
         assert!(!shim_worker_factory.is_null());
         assert_eq!(task.sys_nt_close(shim_worker_factory), NtStatus::SUCCESS);
 
+        let mut host_query_io_completion = core::ptr::null_mut();
+        // SAFETY: The output pointer is valid, attributes are null, and the handle is closed below.
+        let status = unsafe {
+            NtCreateIoCompletion(
+                &raw mut host_query_io_completion,
+                IO_COMPLETION_QUERY_STATE,
+                core::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(status, NtStatus::SUCCESS.as_raw());
+        let mut shim_query_io_completion = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_io_completion(
+                mut_ptr(&mut shim_query_io_completion),
+                IO_COMPLETION_QUERY_STATE,
+                None,
+                0
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut host_query_worker_factory = core::ptr::null_mut();
+        // SAFETY: All pointers are valid; the completion port intentionally lacks modify access to
+        // compare native access checking with the shim.
+        let host_query_only_completion = unsafe {
+            let status = NtCreateWorkerFactory(
+                &raw mut host_query_worker_factory,
+                WORKER_FACTORY_ALL_ACCESS,
+                core::ptr::null(),
+                host_query_io_completion,
+                usize::MAX as *mut c_void,
+                START_ROUTINE as *mut c_void,
+                core::ptr::null_mut(),
+                1,
+                0,
+                0,
+            );
+            if status == NtStatus::SUCCESS.as_raw() && !host_query_worker_factory.is_null() {
+                assert_eq!(
+                    NtClose(host_query_worker_factory),
+                    NtStatus::SUCCESS.as_raw()
+                );
+            }
+            status
+        };
+        let mut shim_query_worker_factory = Handle::default();
+        assert_eq!(
+            create_worker_factory(
+                &task,
+                &mut shim_query_worker_factory,
+                None,
+                shim_query_io_completion,
+                ProcessHandle::CURRENT
+            )
+            .as_raw(),
+            host_query_only_completion
+        );
+        if !shim_query_worker_factory.is_null() {
+            assert_eq!(
+                task.sys_nt_close(shim_query_worker_factory),
+                NtStatus::SUCCESS
+            );
+        }
+        assert_eq!(
+            task.sys_nt_close(shim_query_io_completion),
+            NtStatus::SUCCESS
+        );
+
         let bad_length = ObjectAttributes {
             length: 1,
             root_directory: Handle::default(),
@@ -1148,6 +1244,10 @@ mod tests {
         unsafe {
             assert_eq!(NtClose(host_event), NtStatus::SUCCESS.as_raw());
             assert_eq!(NtClose(host_io_completion), NtStatus::SUCCESS.as_raw());
+            assert_eq!(
+                NtClose(host_query_io_completion),
+                NtStatus::SUCCESS.as_raw()
+            );
         }
     }
 
