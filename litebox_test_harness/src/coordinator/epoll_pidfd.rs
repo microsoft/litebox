@@ -124,6 +124,8 @@ const EPOLL_SPIN_TIMERFD_INHERITED_FORK: HandlerToken<(), EpollSpinOut> =
     HandlerToken::new("epoll_pidfd.epoll_spin_timerfd_inherited_fork");
 const EPOLL_SPIN_BROKER_UDP_WRITABLE: HandlerToken<(), EpollSpinOut> =
     HandlerToken::new("epoll_pidfd.epoll_spin_broker_udp_writable");
+const EPOLL_SPIN_BROKER_TCP_STICKY_OUT: HandlerToken<PeerAddrArgs, EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_spin_broker_tcp_sticky_out");
 
 #[derive(Serialize, Deserialize, Debug)]
 struct EpollSpinOut {
@@ -448,6 +450,61 @@ async fn handle_epoll_spin_broker_udp_writable(
     })
 }
 
+async fn handle_epoll_spin_broker_tcp_sticky_out(
+    args: PeerAddrArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let mut stream = connect_peer(&args.peer_addr)
+        .map_err(|e| HandlerError(format!("tcp connect {}: {e}", args.peer_addr)))?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| HandlerError(format!("tcp set_nonblocking: {e}")))?;
+
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        stream.as_raw_fd(),
+        (libc::EPOLLOUT | libc::EPOLLET) as u32,
+        4,
+    )?;
+
+    let first = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+    let loop_start = Instant::now();
+    let loop_deadline = loop_start + Duration::from_secs(3);
+    let mut iterations = 0_u64;
+    let mut zero_event_returns = u64::from(first.events == 0);
+    let mut write_seq = 0_u64;
+    while Instant::now() < loop_deadline {
+        write_seq += 1;
+        let payload = [(write_seq & 0xff) as u8];
+        match stream.write(&payload) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(HandlerError(format!("tcp write: {e}"))),
+        }
+        let sample = timed_epoll_pwait(epfd.as_raw_fd(), 100, 4)?;
+        iterations += 1;
+        zero_event_returns += u64::from(sample.events == 0);
+    }
+    let loop_elapsed_ms = elapsed_ms(loop_start.elapsed());
+    Ok(EpollSpinOut {
+        detail: format!(
+            "step=broker_tcp_sticky_out_et first_events={} first_elapsed_ms={} iterations={} loop_elapsed_ms={} zero_event_returns={}",
+            first.events,
+            elapsed_ms(first.elapsed),
+            iterations,
+            loop_elapsed_ms,
+            zero_event_returns
+        ),
+        first_elapsed_ms: elapsed_ms(first.elapsed),
+        first_events: first.events,
+        iterations,
+        loop_elapsed_ms,
+        timer_ready: 0,
+        zero_event_returns,
+    })
+}
+
 async fn handle_epoll_spin_timerfd(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -576,6 +633,10 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
         EPOLL_SPIN_BROKER_UDP_WRITABLE,
         handle_epoll_spin_broker_udp_writable
     );
+    register_handler!(
+        EPOLL_SPIN_BROKER_TCP_STICKY_OUT,
+        handle_epoll_spin_broker_tcp_sticky_out
+    );
 
     for &agent in EPI_AGENTS {
         for def in EPI_SCENARIOS {
@@ -661,9 +722,39 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
             format!("EP.spin.broker_udp_writable_et.{agent}"),
             agent,
             &EPOLL_SPIN_BROKER_UDP_WRITABLE,
-            check_epoll_spin_broker_udp_writable,
+            check_epoll_spin_broker_writable_et,
         );
+        register_broker_tcp_sticky_out_test(reg, agent);
     }
+}
+
+fn register_broker_tcp_sticky_out_test(reg: &mut Registry<'_>, agent: AgentName) {
+    let label = agent.to_string();
+    reg.test(
+        "vscode",
+        "epoll_pidfd",
+        format!("EP.spin.broker_tcp_sticky_out_et.{agent}"),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let observer = cx.require(agent);
+        let peer_agent = peer_for(agent);
+        let peer = if peer_agent == agent {
+            observer.clone()
+        } else {
+            cx.require(peer_agent)
+        };
+        let label = label.clone();
+        Box::new(move |run| {
+            Box::pin(async move {
+                let result = drive_broker_tcp_sticky_out_probe(run, &observer, &peer).await;
+                match result {
+                    Ok(detail) => TestOutcome::new(&label, true, detail),
+                    Err(detail) => TestOutcome::new(&label, false, detail),
+                }
+            })
+        })
+    });
 }
 
 fn check_epoll_spin_eventfd_idle(out: &EpollSpinOut) -> Result<String, String> {
@@ -692,13 +783,23 @@ fn check_epoll_spin_timerfd(out: &EpollSpinOut) -> Result<String, String> {
     }
 }
 
-fn check_epoll_spin_broker_udp_writable(out: &EpollSpinOut) -> Result<String, String> {
+fn check_epoll_spin_broker_writable_et(out: &EpollSpinOut) -> Result<String, String> {
     // 5s loop with 1000ms timeouts: a correctly-blocking EPOLLET epoll
     // does at most ~5 iterations (each wait blocks until the timeout
     // because the writable edge already fired once). A spin — the broker
     // fd's persistent writability re-firing on every wait — does
     // thousands. `iterations` is the discriminator.
     if out.iterations <= 10 {
+        Ok(out.detail.clone())
+    } else {
+        Err(out.detail.clone())
+    }
+}
+
+fn check_epoll_spin_broker_tcp_sticky_out(out: &EpollSpinOut) -> Result<String, String> {
+    // 3s loop with 100ms timeouts: native completes about 30 blocking waits.
+    // The sticky-broker-notification bug returns immediately thousands of times.
+    if out.first_events > 0 && out.iterations <= 40 && out.zero_event_returns == out.iterations {
         Ok(out.detail.clone())
     } else {
         Err(out.detail.clone())
@@ -1044,6 +1145,22 @@ async fn drive_peer_addr_scenario(
     Ok(out.detail)
 }
 
+async fn drive_broker_tcp_sticky_out_probe(
+    run: &mut RunContext<'_>,
+    observer: &super::agents::AgentHandle,
+    peer: &super::agents::AgentHandle,
+) -> Result<String, String> {
+    let peer_addr = open_peer_addr(run, peer).await?;
+    let out = run
+        .send_named_typed(
+            observer,
+            &EPOLL_SPIN_BROKER_TCP_STICKY_OUT,
+            PeerAddrArgs { peer_addr },
+        )
+        .await
+        .map_err(|e| format!("send_named: {e}"))?;
+    check_epoll_spin_broker_tcp_sticky_out(&out)
+}
 async fn open_peer_addr(
     run: &mut RunContext<'_>,
     peer: &super::agents::AgentHandle,
