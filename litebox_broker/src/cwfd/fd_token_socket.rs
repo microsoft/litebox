@@ -1425,6 +1425,16 @@ fn handle_control_connection_inner(
                     | Opcode::SocketSeqPacketShutdown
                     | Opcode::SocketSeqPacketGetSockName
                     | Opcode::SocketSeqPacketGetPeerName
+                    | Opcode::CreateUnixStream
+                    | Opcode::UnixStreamBind
+                    | Opcode::UnixStreamListen
+                    | Opcode::UnixStreamAccept
+                    | Opcode::UnixStreamConnect
+                    | Opcode::UnixStreamSend
+                    | Opcode::UnixStreamRecv
+                    | Opcode::UnixStreamShutdown
+                    | Opcode::UnixStreamGetSockName
+                    | Opcode::UnixStreamGetPeerName
                     | Opcode::CreateSocketPair
                     | Opcode::ReadSocketPair
                     | Opcode::WriteSocketPair
@@ -1673,6 +1683,16 @@ fn handle_control_connection_inner(
                     | Opcode::SocketSeqPacketShutdownResponse
                     | Opcode::SocketSeqPacketGetSockNameResponse
                     | Opcode::SocketSeqPacketGetPeerNameResponse
+                    | Opcode::CreateUnixStreamResponse
+                    | Opcode::UnixStreamBindResponse
+                    | Opcode::UnixStreamListenResponse
+                    | Opcode::UnixStreamAcceptResponse
+                    | Opcode::UnixStreamConnectResponse
+                    | Opcode::UnixStreamSendResponse
+                    | Opcode::UnixStreamRecvResponse
+                    | Opcode::UnixStreamShutdownResponse
+                    | Opcode::UnixStreamGetSockNameResponse
+                    | Opcode::UnixStreamGetPeerNameResponse
                     | Opcode::PtyReadResponse
                     | Opcode::PtyWriteResponse
                     | Opcode::SubscribePtyResponse
