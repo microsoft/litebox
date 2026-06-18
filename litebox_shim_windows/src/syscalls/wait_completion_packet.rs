@@ -369,9 +369,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return status;
         }
-        let mut association = packet.association.lock();
-        if association.is_some() {
-            return NtStatus::INVALID_PARAMETER_1;
+        {
+            let association = packet.association.lock();
+            if association.is_some() {
+                return NtStatus::INVALID_PARAMETER_1;
+            }
         }
         let already_signaled = match self
             .target_object_signaled_for_wait_completion_packet(params.target_object_handle)
@@ -379,6 +381,18 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(already_signaled) => already_signaled,
             Err(status) => return status,
         };
+        if let Some(already_signaled_ptr) = params.already_signaled
+            && already_signaled_ptr
+                .write_at_offset(0, u8::from(already_signaled))
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        let mut association = packet.association.lock();
+        if association.is_some() {
+            return NtStatus::INVALID_PARAMETER_1;
+        }
         *association = Some(WaitCompletionPacketAssociation {
             _key_context: params.key_context,
             _apc_context: params.apc_context,
@@ -386,10 +400,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             _io_status_information: params.io_status_information,
             already_signaled,
         });
-
-        if let Some(already_signaled_ptr) = params.already_signaled {
-            let _ = already_signaled_ptr.write_at_offset(0, u8::from(already_signaled));
-        }
         NtStatus::SUCCESS
     }
 
@@ -745,12 +755,13 @@ mod tests {
     }
 
     #[test]
-    fn associate_ignores_invalid_already_signaled_pointer_on_success() {
+    fn associate_invalid_already_signaled_does_not_commit_association() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
             let mut packet = Handle::default();
             let mut io_completion = Handle::default();
             let mut event = Handle::default();
+            let mut already_signaled = 0xaa;
 
             assert_eq!(
                 create_wait_completion_packet(&task, &mut packet, None),
@@ -773,8 +784,23 @@ mod tests {
                     event,
                     Some(MutPtr::<TestPlatform, u8>::from_usize(1)),
                 ),
+                NtStatus::ACCESS_VIOLATION
+            );
+            assert_eq!(
+                cancel_wait_completion_packet(&task, packet, true),
+                NtStatus::CANCELLED
+            );
+            assert_eq!(
+                associate_wait_completion_packet(
+                    &task,
+                    packet,
+                    io_completion,
+                    event,
+                    Some(mut_ptr(&mut already_signaled)),
+                ),
                 NtStatus::SUCCESS
             );
+            assert_eq!(already_signaled, 1);
         });
     }
 
