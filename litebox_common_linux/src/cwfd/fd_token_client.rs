@@ -2925,8 +2925,11 @@ fn map_status_no_handle(opcode: Opcode, status: StatusCode) -> ClientError {
         StatusCode::Protocol => ClientError::BrokerRejectedProtocol,
         StatusCode::Internal => ClientError::BrokerInternal { opcode },
         StatusCode::Io => ClientError::OperationIo { opcode },
+        StatusCode::UnknownHandle => ClientError::UnknownHandle { handle_id: 0 },
+        StatusCode::InvalidValue => ClientError::InvalidValue { value: 0 },
         StatusCode::PermissionDenied => ClientError::PermissionDenied,
         StatusCode::ProtocolNotSupported => ClientError::ProtocolNotSupported,
+        StatusCode::SubsystemMismatch => ClientError::SubsystemMismatch,
         s => ClientError::OtherStatus { opcode, status: s },
     }
 }

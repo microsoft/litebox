@@ -382,4 +382,28 @@ mod tests {
         assert_eq!(payload, b"ping");
         assert!(tokens.is_empty());
     }
+
+    #[test]
+    fn datagram_preserves_scm_tokens() {
+        let a = SocketDgramState::new();
+        let b = SocketDgramState::new();
+        a.bind(SocketDgramAddr::Abstract(b"scm-a".to_vec()))
+            .unwrap();
+        b.bind(SocketDgramAddr::Abstract(b"scm-b".to_vec()))
+            .unwrap();
+        let token = PassedToken::new(SubsystemTag::File, 0x1234).unwrap();
+
+        a.sendto(
+            Some(SocketDgramAddr::Abstract(b"scm-b".to_vec())),
+            b"fd",
+            &[token],
+        )
+        .unwrap();
+        let (src, payload, flags, tokens) = b.recvfrom(16).unwrap();
+
+        assert_eq!(src, SocketDgramAddr::Abstract(b"scm-a".to_vec()));
+        assert_eq!(payload, b"fd");
+        assert_eq!(flags, 0);
+        assert_eq!(tokens, vec![token]);
+    }
 }
