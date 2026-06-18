@@ -231,6 +231,26 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             | DescriptorRef::BrokerSocketPair(_) => false,
         }
     }
+
+    fn edge_dedup_mask(&self) -> Events {
+        match self {
+            DescriptorRef::BrokerInetDgram(_) | DescriptorRef::BrokerTcpConn(_) => Events::OUT,
+            DescriptorRef::Eventfd(_)
+            | DescriptorRef::Signalfd(_)
+            | DescriptorRef::Inotify(_)
+            | DescriptorRef::BrokerInetListener(_)
+            | DescriptorRef::BrokerInetRaw(_)
+            | DescriptorRef::Epoll(_)
+            | DescriptorRef::File(_)
+            | DescriptorRef::Unix(_)
+            | DescriptorRef::HostPassthroughFd(_)
+            | DescriptorRef::BrokerPipe(_)
+            | DescriptorRef::BrokerPty(_)
+            | DescriptorRef::BrokerSocketPair(_) => Events::empty(),
+            #[cfg(feature = "worker_local_inet")]
+            DescriptorRef::Socket(_) => Events::empty(),
+        }
+    }
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
@@ -591,7 +611,7 @@ impl<FS: ShimFS> EpollFile<FS> {
             if !entry.desc.needs_network_drive() {
                 continue;
             }
-            if let Some((Some(event), _)) = entry.poll(global, fs, false)
+            if let Some((Some(event), _)) = entry.poll(global, fs, false, true)
                 && !events.iter().any(|existing| existing.data == event.data)
             {
                 events.push(event);
@@ -656,7 +676,7 @@ impl<FS: ShimFS> EpollFile<FS> {
             if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
                 continue; // already in the ready set
             }
-            if let Some((Some(event), _)) = entry.poll(global, fs, false) {
+            if let Some((Some(event), _)) = entry.poll(global, fs, false, false) {
                 {
                     use litebox::platform::DebugLogProvider as _;
                     let ev = { event.events };
@@ -895,7 +915,19 @@ impl<FS: ShimFS> EpollFile<FS> {
             .poll(global, fs, mask, Some(entry.weak_self.clone() as _))
             .ok_or(Errno::EBADF)?;
         // Add the new entry to the ready list if the file is ready
-        if !events.is_empty() {
+        let initial_event = {
+            let mut inner = entry.inner.lock();
+            EpollEntry::<FS>::event_from_polled_events(
+                &mut inner,
+                events,
+                false,
+                false,
+                entry.edge_dedup_mask,
+                &entry.is_enabled,
+            )
+            .is_some_and(|(event, _)| event.is_some())
+        };
+        if initial_event {
             self.ready.push(&entry);
         }
         let is_host_poll = file.needs_host_poll(global, fs);
@@ -975,7 +1007,7 @@ impl<FS: ShimFS> EpollFile<FS> {
         inner.mask = mask;
         inner.flags = flags;
         inner.data = event.data;
-
+        inner.last_delivered_events = Events::empty();
         entry
             .is_enabled
             .store(true, core::sync::atomic::Ordering::Relaxed);
@@ -1032,6 +1064,7 @@ struct EpollEntry<FS: ShimFS> {
     ready: Arc<ReadySet<FS>>,
     is_ready: AtomicBool,
     is_enabled: AtomicBool,
+    edge_dedup_mask: Events,
     weak_self: Weak<Self>,
 }
 
@@ -1039,6 +1072,7 @@ struct EpollEntryInner {
     mask: Events,
     flags: EpollFlags,
     data: u64,
+    last_delivered_events: Events,
 }
 
 impl<FS: ShimFS> EpollEntry<FS> {
@@ -1049,12 +1083,19 @@ impl<FS: ShimFS> EpollEntry<FS> {
         data: u64,
         ready: Arc<ReadySet<FS>>,
     ) -> Arc<Self> {
+        let edge_dedup_mask = desc.edge_dedup_mask();
         Arc::new_cyclic(|weak_self| EpollEntry {
             desc,
-            inner: litebox::sync::Mutex::new(EpollEntryInner { mask, flags, data }),
+            inner: litebox::sync::Mutex::new(EpollEntryInner {
+                mask,
+                flags,
+                data,
+                last_delivered_events: Events::empty(),
+            }),
             ready,
             is_ready: AtomicBool::new(false),
             is_enabled: AtomicBool::new(true),
+            edge_dedup_mask,
             weak_self: weak_self.clone(),
         })
     }
@@ -1077,9 +1118,10 @@ impl<FS: ShimFS> EpollEntry<FS> {
         global: &GlobalState<FS>,
         fs: &FS,
         disable_oneshot: bool,
+        deliver: bool,
     ) -> Option<(Option<EpollEvent>, bool)> {
         let file = self.desc.upgrade()?;
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
 
         if !self.is_enabled.load(core::sync::atomic::Ordering::Relaxed) {
             // the entry is disabled
@@ -1087,31 +1129,63 @@ impl<FS: ShimFS> EpollEntry<FS> {
         }
 
         let events = file.poll(global, fs, inner.mask, None)?;
+        Self::event_from_polled_events(
+            &mut inner,
+            events,
+            disable_oneshot,
+            deliver,
+            self.edge_dedup_mask,
+            &self.is_enabled,
+        )
+    }
+
+    fn event_from_polled_events(
+        inner: &mut EpollEntryInner,
+        events: Events,
+        disable_oneshot: bool,
+        deliver: bool,
+        edge_dedup_mask: Events,
+        is_enabled: &AtomicBool,
+    ) -> Option<(Option<EpollEvent>, bool)> {
         if events.is_empty() {
-            Some((None, false))
-        } else {
-            let event = Some(EpollEvent {
-                events: events.bits(),
-                data: inner.data,
-            });
-
-            // keep the entry in the ready list if it is not edge-triggered or one-shot
-            let is_still_ready = event.is_some()
-                && !inner
-                    .flags
-                    .intersects(EpollFlags::EDGE_TRIGGER | EpollFlags::ONE_SHOT);
-
-            // Disable ONESHOT entries atomically under the inner lock when
-            // delivering events (pop_multiple path). This is NOT done in the
-            // rescan_interests path — disabling here would cause push() to
-            // reject the entry, silently dropping the event.
-            if disable_oneshot && inner.flags.contains(EpollFlags::ONE_SHOT) {
-                self.is_enabled
-                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            if inner.flags.contains(EpollFlags::EDGE_TRIGGER) && !edge_dedup_mask.is_empty() {
+                inner.last_delivered_events = Events::empty();
             }
-
-            Some((event, is_still_ready))
+            return Some((None, false));
         }
+
+        if inner.flags.contains(EpollFlags::EDGE_TRIGGER) && !edge_dedup_mask.is_empty() {
+            let dedup_events = events & edge_dedup_mask;
+            let newly_ready = dedup_events & !inner.last_delivered_events;
+            if newly_ready.is_empty() {
+                inner.last_delivered_events = dedup_events;
+                if (events & !edge_dedup_mask).is_empty() {
+                    return Some((None, false));
+                }
+            } else if deliver {
+                inner.last_delivered_events = dedup_events;
+            }
+        }
+
+        let event = Some(EpollEvent {
+            events: events.bits(),
+            data: inner.data,
+        });
+
+        // keep the entry in the ready list if it is not edge-triggered or one-shot
+        let is_still_ready = !inner
+            .flags
+            .intersects(EpollFlags::EDGE_TRIGGER | EpollFlags::ONE_SHOT);
+
+        // Disable ONESHOT entries atomically under the inner lock when
+        // delivering events (pop_multiple path). This is NOT done in the
+        // rescan_interests path — disabling here would cause push() to
+        // reject the entry, silently dropping the event.
+        if disable_oneshot && inner.flags.contains(EpollFlags::ONE_SHOT) {
+            is_enabled.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+
+        Some((event, is_still_ready))
     }
 }
 
@@ -1193,7 +1267,7 @@ impl<FS: ShimFS> ReadySet<FS> {
                 .is_ready
                 .store(false, core::sync::atomic::Ordering::Relaxed);
 
-            let Some((event, is_still_ready)) = entry.poll(global, fs, true) else {
+            let Some((event, is_still_ready)) = entry.poll(global, fs, true, true) else {
                 // the entry is disabled or the associated file is closed
                 continue;
             };
