@@ -3,7 +3,6 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::event::EventObject;
 use crate::{BrokerCore, BrokerError, Result};
@@ -38,14 +37,8 @@ bitflags::bitflags! {
     }
 }
 
-slotmap::new_key_type! {
-    /// Broker-owned object identifier.
-    pub(crate) struct ObjectId;
-}
-
 pub(crate) struct ObjectReference {
-    pub(crate) object_id: ObjectId,
-    pub(crate) object: Arc<ObjectRecord>,
+    pub(crate) object: Arc<RwLock<ObjectEntry>>,
     pub(crate) session_id: SessionId,
     pub(crate) rights: ObjectRights,
 }
@@ -53,11 +46,6 @@ pub(crate) struct ObjectReference {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObjectEntry {
     Event(EventObject),
-}
-
-pub(crate) struct ObjectRecord {
-    entry: RwLock<ObjectEntry>,
-    reference_count: AtomicUsize,
 }
 
 /// Broker-owned authority token for one authenticated caller session.
@@ -92,52 +80,19 @@ impl BrokerSession {
         object: ObjectEntry,
         rights: ObjectRights,
     ) -> Result<ObjectHandle> {
-        let object = Arc::new(ObjectRecord {
-            entry: RwLock::new(object),
-            reference_count: AtomicUsize::new(0),
-        });
-        let object_id = {
-            let mut objects = self.core.objects.write();
-            if objects.len() >= self.core.limits.max_objects {
-                return Err(BrokerError::ResourceExhausted);
-            }
-            if objects.len() == objects.capacity() {
-                objects
-                    .try_reserve(1)
-                    .map_err(|_| BrokerError::ResourceExhausted)?;
-            }
-            objects.insert(Arc::clone(&object))
-        };
-
-        match self.create_object_reference(object_id, object, rights) {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                let removed_object = self.core.objects.write().remove(object_id);
-                debug_assert!(removed_object.is_some());
-                Err(error)
-            }
-        }
-    }
-
-    fn create_object_reference(
-        &self,
-        object_id: ObjectId,
-        object: Arc<ObjectRecord>,
-        rights: ObjectRights,
-    ) -> Result<ObjectHandle> {
         let mut references = self.core.references.write();
-        if references.len() >= self.core.limits.max_references {
+        // The reference table is the only owning object registry; with the
+        // current API each new object starts with exactly one reference.
+        if references.len() >= self.core.limits.max_objects
+            || references.len() >= self.core.limits.max_references
+        {
             return Err(BrokerError::ResourceExhausted);
         }
-
         let handle = self.core.allocate_reference_handle()?;
-        let old_count = object.reference_count.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(old_count < self.core.limits.max_references);
         let old_reference = references.insert(
             handle,
             ObjectReference {
-                object_id,
-                object,
+                object: Arc::new(RwLock::new(object)),
                 session_id: self.session_id,
                 rights,
             },
@@ -157,7 +112,7 @@ impl BrokerSession {
             let references = self.core.references.read();
             self.authorize_use_object(&references, handle, required_rights)?
         };
-        let object = object.entry.read();
+        let object = object.read();
         f(&object)
     }
 
@@ -171,7 +126,7 @@ impl BrokerSession {
             let references = self.core.references.read();
             self.authorize_use_object(&references, handle, required_rights)?
         };
-        let mut object = object.entry.write();
+        let mut object = object.write();
         f(&mut object)
     }
 
@@ -180,7 +135,7 @@ impl BrokerSession {
         references: &BTreeMap<ObjectHandle, ObjectReference>,
         handle: ObjectHandle,
         required_rights: ObjectRights,
-    ) -> Result<Arc<ObjectRecord>> {
+    ) -> Result<Arc<RwLock<ObjectEntry>>> {
         let reference = validate_handle(references, self.session_id, handle, required_rights)?;
         self.core
             .policy
@@ -193,34 +148,8 @@ impl BrokerSession {
     /// The underlying object is released when this was the last live reference.
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
         let mut references = self.core.references.write();
-        let reference = reference_for_handle(&references, self.session_id, handle)?;
-        let object_id = reference.object_id;
-        let last_reference = reference.object.reference_count.load(Ordering::Acquire) == 1;
-
-        if last_reference {
-            let mut objects = self.core.objects.write();
-            if !objects.contains_key(object_id) {
-                return Err(BrokerError::UnknownObject);
-            }
-            let reference = references
-                .remove(&handle)
-                .ok_or(BrokerError::UnknownObject)?;
-            let old_count = reference
-                .object
-                .reference_count
-                .fetch_sub(1, Ordering::AcqRel);
-            debug_assert_eq!(old_count, 1);
-            objects.remove(object_id);
-        } else {
-            let reference = references
-                .remove(&handle)
-                .ok_or(BrokerError::UnknownObject)?;
-            let old_count = reference
-                .object
-                .reference_count
-                .fetch_sub(1, Ordering::AcqRel);
-            debug_assert!(old_count > 1);
-        }
+        reference_for_handle(&references, self.session_id, handle)?;
+        references.remove(&handle);
         Ok(())
     }
 }
@@ -233,22 +162,7 @@ impl Drop for BrokerSession {
 
 pub(crate) fn drop_references_for_session(broker: &BrokerCore, session_id: SessionId) {
     let mut references = broker.references.write();
-    let mut objects = broker.objects.write();
-    references.retain(|_, reference| {
-        if reference.session_id != session_id {
-            return true;
-        }
-
-        let old_count = reference
-            .object
-            .reference_count
-            .fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(old_count > 0);
-        if old_count == 1 {
-            objects.remove(reference.object_id);
-        }
-        false
-    });
+    references.retain(|_, reference| reference.session_id != session_id);
 }
 
 fn validate_handle(
@@ -283,7 +197,7 @@ mod tests {
     use litebox_broker_protocol::{ObjectHandle, WaitOutcome};
 
     #[test]
-    fn oversized_object_slotmap_limits_are_rejected_before_core_construction() {
+    fn oversized_object_limits_are_rejected_before_core_construction() {
         let too_many_entries = u32::MAX as usize;
 
         assert!(matches!(
@@ -326,9 +240,7 @@ mod tests {
         assert_eq!(session.close_object_reference(handle), Ok(()));
         {
             let references = broker.references.read();
-            let objects = broker.objects.read();
             assert!(references.is_empty());
-            assert!(objects.is_empty());
         }
         assert_eq!(
             session.close_object_reference(handle),
@@ -341,18 +253,14 @@ mod tests {
         let _handle = event::create(&session, 0).unwrap();
         {
             let references = broker.references.read();
-            let objects = broker.objects.read();
             assert_eq!(references.len(), 1);
-            assert_eq!(objects.len(), 1);
         }
 
         drop(session);
 
         {
             let references = broker.references.read();
-            let objects = broker.objects.read();
             assert!(references.is_empty());
-            assert!(objects.is_empty());
         }
 
         let session = broker
@@ -367,8 +275,6 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
         let references = broker.references.read();
-        let objects = broker.objects.read();
         assert!(references.is_empty());
-        assert!(objects.is_empty());
     }
 }

@@ -28,13 +28,12 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::ObjectHandle;
-use slotmap::SlotMap;
 use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
 pub use policy::{PolicyEngine, PolicyProfile};
+use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights};
-use session::{ObjectId, ObjectRecord, ObjectReference};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -86,7 +85,6 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
-    pub(crate) objects: Arc<RwLock<SlotMap<ObjectId, Arc<ObjectRecord>>>>,
     pub(crate) references: Arc<RwLock<BTreeMap<ObjectHandle, ObjectReference>>>,
 }
 
@@ -125,7 +123,6 @@ impl BrokerCore {
             limits,
             next_session_id: Arc::new(RwLock::new(1)),
             next_reference_handle: Arc::new(RwLock::new(1)),
-            objects: Arc::new(RwLock::new(SlotMap::with_key())),
             references: Arc::new(RwLock::new(BTreeMap::new())),
         })
     }
