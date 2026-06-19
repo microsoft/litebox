@@ -8904,6 +8904,7 @@ impl<FS: ShimFS> Task<FS> {
                 self,
                 &collected.broker_unix_stream,
                 &mut broker_eventfd_specs,
+                &mut broker_tcp_conn_transit_release,
             );
             emit_broker_tcp_conn_bridge_specs(
                 self,
@@ -10343,6 +10344,7 @@ fn emit_broker_unix_stream_bridge_specs<FS: ShimFS>(
         >,
     )],
     specs: &mut alloc::vec::Vec<alloc::string::String>,
+    transit_release: &mut alloc::vec::Vec<BrokerTransitReleaseEntry>,
 ) {
     for (raw_fd, typed) in bucket {
         let raw_fd = *raw_fd;
@@ -10361,6 +10363,12 @@ fn emit_broker_unix_stream_bridge_specs<FS: ShimFS>(
                 continue;
             }
             specs.push(alloc::format!("{raw_fd}:unix_stream:{handle_id}"));
+            // Like BrokerTcpConn, a connected named stream is a peer-EOF-bearing
+            // handle: the emit-side transit dup MUST be released after the child
+            // worker claims its own ref, otherwise the parent connection's
+            // lingering reference keeps the broker endpoint alive and the peer
+            // never observes EOF when this worker exits.
+            transit_release.push((releaser, handle_id));
         }
     }
 }
