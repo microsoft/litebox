@@ -169,7 +169,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
-        // TODO: associates it with a specified file handle
+        // TODO: model the IOCP packet queue, concurrency accounting, named-object lookup,
+        // and file-handle association once completion posting/removal and file completion
+        // context syscalls are implemented.
         let port = Arc::new(IoCompletionObject::new(number_of_concurrent_threads));
         let granted_access = IoCompletionAccess::from_desired_access(desired_access);
         let Ok(handle) = self.insert_io_completion_handle(port, granted_access) else {

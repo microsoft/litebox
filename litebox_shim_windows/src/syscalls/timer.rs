@@ -204,6 +204,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let timer = Arc::new(TimerObject {
+            // TODO: store timer state once NtSetTimer2 schedules due times and waiters can
+            // observe expiration/signaling instead of only validating the handle shape.
             _attributes: Timer2Attributes::from_bits_retain(params.attributes),
             _not_send_without_platform: PhantomData,
         });
@@ -250,8 +252,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None => None,
         };
 
+        // TODO: parse T2_SET_PARAMETERS and model callbacks/tolerable delay when the timer
+        // object grows real scheduling and notification behavior.
         let _ = parameters;
 
+        // TODO: store due_time/period, transition the timer's signaled state, and notify
+        // waiters or associated wait-completion packets instead of returning a no-op success.
         NtStatus::SUCCESS
     }
 }

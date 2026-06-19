@@ -293,6 +293,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let factory = Arc::new(WorkerFactoryObject {
+            // TODO: create and manage actual worker threads using start_routine/start_parameter
+            // once worker dispatch, NtWaitForWorkViaWorkerFactory, and
+            // NtReleaseWorkerFactoryWorker are implemented.
             _completion_port: completion_port,
             _start_routine: params.start_routine,
             _start_parameter: params.start_parameter,
@@ -357,8 +360,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 entry
                     .granted_access
                     .require(WorkerFactoryAccess::SET_INFORMATION)?;
+                // TODO: enforce these limits against real worker creation/drain behavior
+                // once worker threads are modeled; today they are only recorded.
                 match information_class {
                     WorkerFactoryInformationClass::BindingCount => {
+                        // TODO: bind this to real worker/IOCP association state once worker
+                        // factories track live bindings.
                         entry.factory.binding_count.store(value, Ordering::Relaxed);
                     }
                     WorkerFactoryInformationClass::ThreadMinimum => {
@@ -414,6 +421,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(factory) => factory,
             Err(status) => return status,
         };
+        // TODO: report the actual pending worker count and wake/release workers once worker
+        // threads are modeled; the current subset has no workers to drain.
         commit_worker_factory_shutdown(&factory, pending_worker_count)
     }
 }

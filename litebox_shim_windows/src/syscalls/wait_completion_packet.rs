@@ -201,6 +201,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         handle: Handle,
     ) -> Result<bool, NtStatus> {
+        // TODO: support every waitable target object type that Windows accepts here; the
+        // current subset only recognizes event and timer handles.
         let Some(raw_fd) = handle.raw_fd() else {
             return Err(NtStatus::ACCESS_DENIED);
         };
@@ -254,6 +256,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(entry) = self.global.litebox.descriptor_table().entry_handle(&typed) else {
             return Err(NtStatus::ACCESS_DENIED);
         };
+        // TODO: return the timer object's real signaled state after NtSetTimer2 models
+        // due-time expiration and periodic re-signaling.
         entry
             .with_entry(|entry| {
                 entry
@@ -318,7 +322,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
-        // TODO: associates it with I/O completion objects
         let packet = Arc::new(WaitCompletionPacketObject {
             association: Mutex::new(None),
             _not_send_without_platform: PhantomData,
@@ -380,6 +383,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
 
+        // TODO: link the packet into the target object's wait notification path and post to
+        // the associated IOCP when the target is already signaled or becomes signaled later.
         let mut association = packet.association.lock();
         if association.is_some() {
             return NtStatus::INVALID_PARAMETER_1;
@@ -422,6 +427,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::PENDING;
         }
 
+        // TODO: if a signaled packet has been posted to the IOCP, honor
+        // remove_signaled_packet by removing that queued completion packet.
         *association = None;
         NtStatus::SUCCESS
     }
