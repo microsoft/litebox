@@ -534,9 +534,10 @@ runs only — so a genuine branch regression isn't mistaken for a flake):
 
 | `classification` | Meaning |
 |---|---|
-| `hard_regression` | Stable pass upstream → **fails** on branch. **Really bad.** |
-| `soft_regression` | Fails on branch, but was already flaky upstream / at baseline. Discount. |
-| `new_fail` | Fails on branch, no definitive baseline pass to compare. |
+| `hard_regression` | Genuinely solid upstream (no flaps **and** no fails in the 30d window) → **fails** on branch. **Really bad.** |
+| `soft_regression` | Fails on branch, but the test is at all unstable upstream (flaps, or any upstream fail in 30d) / flaky at baseline. Discount. |
+| `new_fail` | Fails on branch, no definitive baseline verdict, **and** no upstream flake history — genuinely unexplained, worth a look. |
+| `preexisting_flake` | Fails on branch, no definitive baseline verdict, but the test **already flakes upstream** — a pre-existing flake the thin merge-base didn't cover, **not** a branch regression. |
 | `preexisting_fail` | Failed at baseline too — not a regression. |
 | `fixed` | Failed at the merge-base baseline, now **passes** on the branch — the branch repaired it. |
 | `flaky_pass` | Passes on branch but flaked (retry-recovered) at the sha. |
@@ -567,6 +568,20 @@ well-observed-stable — so a 2-of-3 (which a timing/load-sensitive test
 can hit under the shadow's build load while upstream passes it) stays
 `medium`, not high. `low` flags thin evidence — the explicit "not enough
 data to judge yet" signal.
+
+**`hard_regression` is deliberately hard to earn.** A test only qualifies
+when it is genuinely solid on the upstream lineage — *no* pass/fail
+flapping **and** zero upstream fails in the **30d** `_RECENT_FLAKE_WINDOW_MS`.
+Any upstream instability demotes it to `soft_regression`. The window was
+widened from 7d after low-rate flakes (a test that fails on upstream
+roughly every ~10 days) slipped outside a tighter window and made a
+single branch fail of an occasionally-flaky test — against a thin,
+often single-pass merge-base baseline — read as a false `hard`. The same
+upstream-flake signal splits the no-baseline case: a branch fail with no
+merge-base verdict is `new_fail` only when upstream is *also* clean;
+if the test already flakes upstream it's `preexisting_flake` (benign),
+which `dashboard.py regressions` reports as its own bucket rather than
+making you re-derive it from cross-branch history.
 
 A regression is **inherited** when the `tip_verdict` column (the same
 test's freshest definitive verdict at the baseline ref's *current* HEAD,
