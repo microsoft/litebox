@@ -19,7 +19,6 @@ use num_enum::TryFromPrimitive;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SystemPta;
 
 /// A common interface to interact with various PTAs including the system PTA.
@@ -27,13 +26,13 @@ pub(crate) struct SystemPta;
 /// Add new PTAs here as needed.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum PseudoTa {
-    System(SystemPta),
+    System,
 }
 
 impl PseudoTa {
     pub(crate) fn from_uuid(uuid: &TeeUuid) -> Option<Self> {
         match *uuid {
-            SystemPta::UUID => Some(Self::System(SystemPta)),
+            SystemPta::UUID => Some(Self::System),
             _ => None,
         }
     }
@@ -41,7 +40,7 @@ impl PseudoTa {
     /// Open a session to this PTA, returning the allocated session ID.
     fn open_session(self, params: &UteeParams) -> Result<u32, TeeResult> {
         match self {
-            Self::System(_) => SystemPta::open_session(params),
+            Self::System => SystemPta::open_session(params),
         }
     }
 
@@ -53,19 +52,19 @@ impl PseudoTa {
     ) -> Result<(), TeeResult> {
         let _busy = task.enter_pta(self)?;
         match self {
-            Self::System(_) => SystemPta::invoke_command(task, cmd_id, params),
+            Self::System => SystemPta::invoke_command(task, cmd_id, params),
         }
     }
 
     fn close_session(self, task: &Task, session_id: u32) {
         match self {
-            Self::System(_) => SystemPta::close_session(task, session_id),
+            Self::System => SystemPta::close_session(task, session_id),
         }
     }
 
     fn flags(self) -> TaFlags {
         match self {
-            Self::System(_) => SystemPta::FLAGS,
+            Self::System => SystemPta::FLAGS,
         }
     }
 }
