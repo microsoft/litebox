@@ -5456,8 +5456,10 @@ impl<FS: ShimFS> Task<FS> {
                     handle.with_entry(|entry| entry.setsockopt(level, raw_optname, &value))
                 })
                 .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerUnixStream => self
+                .try_with_broker_unix_stream(sockfd, |_typed| broker_sockopt(optname))
+                .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketDgram
-            | SocketIoClass::BrokerUnixStream
             | SocketIoClass::BrokerSocketSeqPacket
             | SocketIoClass::BrokerInetRaw
             | SocketIoClass::WithSocket => self.files.borrow().with_socket(
@@ -5625,8 +5627,10 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(write_len)
                 })
                 .unwrap_or(Err(Errno::EBADF)),
+            SocketIoClass::BrokerUnixStream => self
+                .try_with_broker_unix_stream(sockfd, |_typed| broker_getsockopt(optname))
+                .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketDgram
-            | SocketIoClass::BrokerUnixStream
             | SocketIoClass::BrokerSocketSeqPacket
             | SocketIoClass::BrokerInetRaw
             | SocketIoClass::WithSocket => self.files.borrow().with_socket(
