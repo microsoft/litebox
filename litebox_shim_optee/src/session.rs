@@ -40,9 +40,9 @@
 //! the waiting logic in normal world (where scheduling is appropriate), without
 //! requiring RPCs that would give untrusted code control over secure world execution.
 //!
-//! Cleanup paths flip sibling sessions to `Dead` before evicting the
-//! cached instance; see [`SessionManager::evict_cached_instance`]
-//! for the ordering rationale.
+//! Panic cleanup paths flip all sessions for the failed instance to `Dead`
+//! and evict the matching cached instance via
+//! [`SessionManager::mark_sessions_dead_for_instance`].
 //!
 //! Reference: <https://optee.readthedocs.io/en/latest/architecture/trusted_applications.html#multi-session>
 //!
@@ -510,13 +510,15 @@ impl SessionManager {
         })
     }
 
-    /// Mark every session currently pointing at `instance` as `Dead`.
+    /// Retire a dead single-instance TA from service.
     ///
-    /// Use before [`SessionManager::evict_cached_instance`] when tearing down
-    /// a *failed* TA that may still have sibling sessions.
+    /// Marks every session currently pointing at `instance` as `Dead` and
+    /// evicts the matching entry from the single-instance cache. Use when
+    /// tearing down a *failed* TA that may still have sibling sessions.
     pub fn mark_sessions_dead_for_instance(&self, instance: &TaInstance) {
         self.sessions
             .mark_sessions_dead_for_pt(instance.task_page_table_id);
+        let _ = self.evict_cached_instance(instance);
     }
 
     /// Count live sessions currently pointing at `instance` (`Dead` entries
@@ -800,11 +802,13 @@ impl SessionManager {
     /// instance — matched by `task_page_table_id` to distinguish the
     /// caller's instance from a freshly-cached replacement.
     ///
-    /// Callers tearing down on TA panic must have already called
-    /// [`SessionManager::mark_sessions_dead_for_instance`] before invoking
-    /// this, so any handler that subsequently enters
-    /// [`SessionManager::with_ta`] or [`SessionManager::with_session`] for
-    /// the UUID will observe `Dead` on its re-read of the session entry.
+    /// TA panic teardown should use
+    /// [`SessionManager::mark_sessions_dead_for_instance`] instead; it marks
+    /// all sessions for the failed instance dead and evicts the cache entry
+    /// in one transition. Later [`SessionManager::with_session`] calls for
+    /// existing session IDs will observe `Dead` on re-read, while later
+    /// [`SessionManager::with_ta`] calls for the UUID cannot reuse the dead
+    /// cached instance.
     /// Callers on the last-session-close path may skip the mark step — by
     /// that point there are no sibling sessions to fence out.
     pub fn evict_cached_instance(&self, instance: &TaInstance) -> bool {
@@ -990,9 +994,10 @@ mod tests {
         assert!(manager.single_instance_cache.get(&uuid).is_some());
     }
 
-    /// `mark_sessions_dead_for_instance` flips Live entries to Dead — they
-    /// stop counting for `count_sessions_for_instance`, and `with_session`
-    /// thereafter sees `None` so cleanup paths run.
+    /// `mark_sessions_dead_for_instance` retires the cached single-instance
+    /// TA: Live entries become Dead, stop counting for
+    /// `count_sessions_for_instance`, `with_session` thereafter sees `None`,
+    /// and new opens cannot reuse the dead cached instance.
     #[test]
     fn mark_dead_makes_with_session_observe_none() {
         let manager = SessionManager::new();
@@ -1003,6 +1008,7 @@ mod tests {
 
         manager.mark_sessions_dead_for_instance(&arc);
         assert_eq!(manager.count_sessions_for_instance(&arc), 0);
+        assert!(manager.single_instance_cache.get(&uuid).is_none());
 
         manager
             .with_session(108, |instance| {

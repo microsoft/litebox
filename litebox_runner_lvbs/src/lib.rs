@@ -547,7 +547,8 @@ fn handle_open_session(
 /// Open a new session on an existing single-instance TA.
 ///
 /// If the TA's OpenSession entry point returns an error, the session is not registered.
-/// On TARGET_DEAD the cached instance is destroyed unconditionally.
+/// On TARGET_DEAD, sessions for the failed instance are marked `Dead`, the matching
+/// single-instance cache entry is evicted, and the TA instance is torn down.
 /// For cleanup semantics, see OP-TEE OS `tee_ta_open_session()` in `tee_ta_manager.c`.
 fn open_session_single_instance(
     msg_args: &mut OpteeMsgArgs,
@@ -636,9 +637,7 @@ fn open_session_single_instance(
         if return_code == TeeResult::TargetDead {
             debug_serial_println!("Single-instance TA panicked during OpenSession, cleaning up");
 
-            // Mark-then-evict ordering: see SessionManager::evict_cached_instance.
             session_manager().mark_sessions_dead_for_instance(instance);
-            let _ = session_manager().evict_cached_instance(instance);
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
             unsafe {
@@ -1027,9 +1026,7 @@ fn handle_invoke_command(
             );
 
             if instance.loaded_program().ta_flags.is_single_instance() {
-                // Mark-then-evict ordering: see SessionManager::evict_cached_instance.
                 session_manager().mark_sessions_dead_for_instance(instance);
-                let _ = session_manager().evict_cached_instance(instance);
             }
 
             session_manager().unregister_session(session_id);
