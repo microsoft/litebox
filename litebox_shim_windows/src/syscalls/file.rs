@@ -755,6 +755,18 @@ fn create_directory_mode(file_attributes: u32) -> Mode {
     create_mode(file_attributes) | Mode::XUSR
 }
 
+/// Convert the NT file-name forms we currently support at the object-manager to
+/// filesystem seam.
+///
+/// Native NT reaches this seam by walking object-manager directories until it
+/// reaches a device object, then the device parse routine hands the remaining
+/// path to the filesystem driver. LiteBox intentionally uses the Wine-style
+/// shortcut here instead: known NT prefixes are recognized as strings and then
+/// mapped directly into the sandbox filesystem. Today that includes `\??\`,
+/// `\\?\`, any drive-letter prefix, both `\SystemRoot\` and `/SystemRoot/`,
+/// `\Device\HarddiskVolume1\`, and `\Device\ConDrv\`. A unified object-manager
+/// walk through directory, symbolic-link, and device objects is the parked
+/// symlink/device increment, not part of this file-path mapper.
 fn absolute_nt_file_name_to_fs_path(name: &str) -> Result<String, NtStatus> {
     let mut name = name;
     if let Some(rest) = strip_case_insensitive_prefix(name, "\\??\\") {

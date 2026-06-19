@@ -2,6 +2,27 @@
 // Licensed under the MIT license.
 
 //! Windows NT object-manager directory syscalls.
+//!
+//! Object-manager directories are not filesystem directories. They name typed
+//! kernel objects such as directories, symbolic links, sections, events, and
+//! devices inside the NT object namespace; filesystem files only enter the
+//! picture after a real NT object-manager walk reaches a device object and the
+//! I/O manager hands the remaining path to a filesystem driver.
+//!
+//! This subset keeps the object namespace as a flat map keyed by normalized full
+//! NT paths. That is deliberate for now: the map is small and auditable, cannot
+//! form traversal cycles, and the only hierarchy invariant the current syscalls
+//! need is that a named node may exist only if every ancestor exists. The seeded
+//! directories include their ancestors, and directory creation enforces the
+//! immediate parent, so a single parent lookup is enough to distinguish a
+//! missing leaf from an earlier path-component miss in `NtOpenDirectoryObject`.
+//!
+//! A future implementation of real directory enumeration and symbolic-link
+//! traversal may justify replacing this map with a purpose-built in-memory tree
+//! of typed object nodes. `litebox::fs` is not the right backing for that tree:
+//! it is a byte-stream filesystem interface, while object-manager directories
+//! hold typed kernel objects with object-specific handle semantics rather than
+//! file contents.
 
 use alloc::string::{String, ToString as _};
 use alloc::sync::Arc;
