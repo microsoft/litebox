@@ -2279,6 +2279,7 @@ mod tests {
             cases.push(FdKind::Signalfd { handle_id: id });
             cases.push(FdKind::BrokerSocketDgram { handle_id: id });
             cases.push(FdKind::BrokerSocketSeqPacket { handle_id: id });
+            cases.push(FdKind::BrokerUnixStream { handle_id: id });
             cases.push(FdKind::BrokerTcpConn { handle_id: id });
             cases.push(FdKind::BrokerInetListener { handle_id: id });
             cases.push(FdKind::BrokerInetDgram { handle_id: id });
@@ -2333,6 +2334,7 @@ mod tests {
             | FdKind::BrokerSocketPair { .. }
             | FdKind::BrokerSocketDgram { .. }
             | FdKind::BrokerSocketSeqPacket { .. }
+            | FdKind::BrokerUnixStream { .. }
             | FdKind::BrokerTcpConn { .. }
             | FdKind::BrokerInetListener { .. }
             | FdKind::BrokerInetDgram { .. }
@@ -2372,6 +2374,7 @@ mod tests {
             },
             FdKind::BrokerSocketDgram { handle_id: 0 },
             FdKind::BrokerSocketSeqPacket { handle_id: 0 },
+            FdKind::BrokerUnixStream { handle_id: 0 },
             FdKind::BrokerTcpConn { handle_id: 0 },
             FdKind::BrokerInetListener { handle_id: 0 },
             FdKind::BrokerInetDgram { handle_id: 0 },
