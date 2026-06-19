@@ -9,7 +9,7 @@
 extern crate alloc;
 
 use crate::loader::elf::ElfLoaderError;
-use crate::syscalls::pta::{PseudoTa, PtaSession};
+use crate::syscalls::pta::PseudoTa;
 use aes::{Aes128, Aes192, Aes256};
 use alloc::{sync::Arc, vec};
 use core::cell::Cell;
@@ -1287,8 +1287,8 @@ struct Task {
     tee_obj_map: TeeObjMap,
     /// TA handle to UUID map
     ta_handle_map: TaHandleMap,
-    /// PTA sessions opened by this TA task.
-    pta_sessions: spin::mutex::SpinMutex<HashMap<u32, PtaSession>>,
+    /// PTA sessions opened by this TA task, mapping each session ID to its PTA.
+    pta_sessions: spin::mutex::SpinMutex<HashMap<u32, PseudoTa>>,
     /// TA entry point
     ta_entry_point: Cell<usize>,
     /// TA stack base address

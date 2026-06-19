@@ -30,11 +30,6 @@ pub(crate) enum PseudoTa {
     System(SystemPta),
 }
 
-pub(crate) struct PtaSession {
-    pub(crate) pta: PseudoTa,
-    pub(crate) owner_session_id: u32,
-}
-
 impl PseudoTa {
     pub(crate) fn from_uuid(uuid: &TeeUuid) -> Option<Self> {
         match *uuid {
@@ -79,7 +74,7 @@ const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
     .union(TaFlags::MULTI_SESSION)
     .union(TaFlags::INSTANCE_KEEP_ALIVE);
 
-const MAX_PTA_SESSIONS_PER_TASK: usize = 20;
+const MAX_PTA_SESSIONS_PER_TASK: usize = 100;
 
 struct PtaBusyGuard<'a> {
     task: &'a Task,
@@ -158,20 +153,15 @@ impl Task {
     ) -> Result<u32, TeeResult> {
         let _busy = self.enter_pta(pta)?;
         let mut pta_sessions = self.pta_sessions.lock();
-        // OP-TEE OS permits multiple sessions to the same PTA. We cap this shim
-        // to prevent a TA from exhausting session IDs or memory.
+        // OP-TEE OS permits multiple sessions to the same PTA. We cap the number
+        // of PTA sessions per TA instance to prevent a TA from exhausting session
+        // IDs or memory.
         if pta_sessions.len() >= MAX_PTA_SESSIONS_PER_TASK {
             return Err(TeeResult::Busy);
         }
 
         let session_id = pta.open_session(params)?;
-        let prev = pta_sessions.insert(
-            session_id,
-            PtaSession {
-                pta,
-                owner_session_id: self.session_id,
-            },
-        );
+        let prev = pta_sessions.insert(session_id, pta);
         debug_assert!(
             prev.is_none(),
             "freshly allocated session ID collided with an existing PTA session",
@@ -181,13 +171,8 @@ impl Task {
 
     pub(crate) fn close_pta_session(&self, ta_session_id: u32) -> Option<PseudoTa> {
         let mut pta_sessions = self.pta_sessions.lock();
-        if pta_sessions.get(&ta_session_id)?.owner_session_id != self.session_id {
-            return None;
-        }
-
-        let session = pta_sessions.remove(&ta_session_id)?;
+        let pta = pta_sessions.remove(&ta_session_id)?;
         drop(pta_sessions);
-        let pta = session.pta;
         pta.close_session(self, ta_session_id);
         crate::SessionIdPool::recycle(ta_session_id);
         Some(pta)
@@ -195,20 +180,14 @@ impl Task {
 
     /// Get the PTA associated with a session (if exists).
     pub(crate) fn pta_for_session(&self, ta_sess_id: u32) -> Option<PseudoTa> {
-        self.pta_sessions
-            .lock()
-            .get(&ta_sess_id)
-            .filter(|s| s.owner_session_id == self.session_id)
-            .map(|s| s.pta)
+        self.pta_sessions.lock().get(&ta_sess_id).copied()
     }
 
     pub(crate) fn close_all_pta_sessions(&self) {
         // Drain into a local buffer and release the lock before invoking
         // `close_session` to avoid potential dead locks.
-        let sessions: alloc::vec::Vec<(u32, PtaSession)> =
-            self.pta_sessions.lock().drain().collect();
-        for (session_id, session) in sessions {
-            let pta = session.pta;
+        let sessions: alloc::vec::Vec<(u32, PseudoTa)> = self.pta_sessions.lock().drain().collect();
+        for (session_id, pta) in sessions {
             pta.close_session(self, session_id);
             crate::SessionIdPool::recycle(session_id);
         }
@@ -372,43 +351,4 @@ fn huk_subkey_derive_inner(huk: &[u8], params: KDFParams<'_>) -> Result<(), TeeR
     params.output.copy_from_slice(&hmac_bytes[..subkey_len]);
     hmac_bytes.zeroize();
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::syscalls::tests::init_platform;
-
-    #[test]
-    fn pta_session_tracks_owner_ta_session() {
-        let task = init_platform();
-        let params = UteeParams::default();
-
-        let session_id = task
-            .open_pta_session(PseudoTa::System(SystemPta), &params)
-            .unwrap();
-
-        let sessions = task.pta_sessions.lock();
-        let session = sessions.get(&session_id).unwrap();
-        assert_eq!(session.owner_session_id, task.session_id);
-    }
-
-    #[test]
-    fn pta_session_rejects_non_owner_session() {
-        let task = init_platform();
-        let session_id = crate::SessionIdPool::allocate().unwrap();
-        task.pta_sessions.lock().insert(
-            session_id,
-            PtaSession {
-                pta: PseudoTa::System(SystemPta),
-                owner_session_id: task.session_id + 1,
-            },
-        );
-
-        assert_eq!(task.pta_for_session(session_id), None);
-        assert_eq!(task.close_pta_session(session_id), None);
-
-        task.pta_sessions.lock().remove(&session_id);
-        crate::SessionIdPool::recycle(session_id);
-    }
 }
