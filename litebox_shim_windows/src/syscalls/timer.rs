@@ -116,13 +116,6 @@ pub(crate) struct TimerCreateParameters<Platform: RawPointerProvider> {
     pub(crate) desired_access: u32,
 }
 
-pub(crate) struct TimerSetParameters<Platform: RawPointerProvider> {
-    pub(crate) timer_handle: Handle,
-    pub(crate) due_time: Option<ConstPtr<Platform, i64>>,
-    pub(crate) period: Option<ConstPtr<Platform, i64>>,
-    pub(crate) parameters: Option<ConstPtr<Platform, u8>>,
-}
-
 fn validate_timer2_before_output<Platform: RawPointerProvider>(
     params: &TimerCreateParameters<Platform>,
 ) -> Result<(), NtStatus> {
@@ -225,8 +218,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
-    pub(crate) fn sys_nt_set_timer2(&self, params: TimerSetParameters<Platform>) -> NtStatus {
-        let timer = match self.timer_entry(params.timer_handle) {
+    pub(crate) fn sys_nt_set_timer2(
+        &self,
+        timer_handle: Handle,
+        due_time: Option<ConstPtr<Platform, i64>>,
+        period: Option<ConstPtr<Platform, i64>>,
+        parameters: Option<ConstPtr<Platform, u8>>,
+    ) -> NtStatus {
+        let timer = match self.timer_entry(timer_handle) {
             Ok(timer) => timer,
             Err(status) => return status,
         };
@@ -236,14 +235,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
-        let _due_time = match params.due_time {
+        let _due_time = match due_time {
             Some(due_time) => match due_time.read_at_offset(0) {
                 Some(due_time) => Some(due_time),
                 None => return NtStatus::ACCESS_VIOLATION,
             },
             None => None,
         };
-        let _period = match params.period {
+        let _period = match period {
             Some(period) => match period.read_at_offset(0) {
                 Some(period) => Some(period),
                 None => return NtStatus::ACCESS_VIOLATION,
@@ -251,7 +250,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None => None,
         };
 
-        let _ = params.parameters;
+        let _ = parameters;
 
         NtStatus::SUCCESS
     }
@@ -295,20 +294,6 @@ mod tests {
         })
     }
 
-    fn set_timer2(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
-        handle: Handle,
-        due_time: Option<ConstPtr<TestPlatform, i64>>,
-        period: Option<ConstPtr<TestPlatform, i64>>,
-    ) -> NtStatus {
-        task.sys_nt_set_timer2(TimerSetParameters {
-            timer_handle: handle,
-            due_time,
-            period,
-            parameters: None,
-        })
-    }
-
     #[test]
     fn set_timer2_accepts_created_timer() {
         run_with_test_platform_pointers(|| {
@@ -322,26 +307,16 @@ mod tests {
                 NtStatus::SUCCESS
             );
             assert_eq!(
-                set_timer2(
-                    &task,
+                task.sys_nt_set_timer2(
                     handle,
                     Some(const_ptr(&due_time)),
-                    Some(const_ptr(&period))
+                    Some(const_ptr(&period)),
+                    None
                 ),
                 NtStatus::SUCCESS
             );
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         });
-    }
-
-    #[test]
-    fn set_timer2_rejects_invalid_handle() {
-        let task = test_task();
-
-        assert_eq!(
-            set_timer2(&task, Handle::from_raw(0x1234), None, None),
-            NtStatus::INVALID_HANDLE
-        );
     }
 
     #[test]

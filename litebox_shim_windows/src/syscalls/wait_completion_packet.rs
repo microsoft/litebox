@@ -114,11 +114,6 @@ pub(crate) struct WaitCompletionPacketAssociateParameters<Platform: RawPointerPr
     pub(crate) already_signaled: Option<MutPtr<Platform, u8>>,
 }
 
-pub(crate) struct WaitCompletionPacketCancelParameters {
-    pub(crate) wait_completion_packet_handle: Handle,
-    pub(crate) remove_signaled_packet: u8,
-}
-
 fn validate_wait_completion_packet_object_attributes<Platform: RawPointerProvider>(
     object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
 ) -> Result<(), NtStatus> {
@@ -401,14 +396,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_nt_cancel_wait_completion_packet(
         &self,
-        params: WaitCompletionPacketCancelParameters,
+        wait_completion_packet_handle: Handle,
+        remove_signaled_packet: u8,
     ) -> NtStatus {
-        let entry = match self
-            .wait_completion_packet_entry_for_cancel(params.wait_completion_packet_handle)
-        {
-            Ok(entry) => entry,
-            Err(status) => return status,
-        };
+        let entry =
+            match self.wait_completion_packet_entry_for_cancel(wait_completion_packet_handle) {
+                Ok(entry) => entry,
+                Err(status) => return status,
+            };
         let packet = match entry.with_entry(|entry| {
             entry
                 .granted_access
@@ -423,7 +418,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(current_association) = *association else {
             return NtStatus::CANCELLED;
         };
-        if current_association.already_signaled && params.remove_signaled_packet == 0 {
+        if current_association.already_signaled && remove_signaled_packet == 0 {
             return NtStatus::PENDING;
         }
 
@@ -541,10 +536,7 @@ mod tests {
         packet: Handle,
         remove_signaled_packet: bool,
     ) -> NtStatus {
-        task.sys_nt_cancel_wait_completion_packet(WaitCompletionPacketCancelParameters {
-            wait_completion_packet_handle: packet,
-            remove_signaled_packet: u8::from(remove_signaled_packet),
-        })
+        task.sys_nt_cancel_wait_completion_packet(packet, u8::from(remove_signaled_packet))
     }
 
     #[test]

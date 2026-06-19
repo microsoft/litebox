@@ -35,16 +35,13 @@ use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
-use crate::syscalls::timer::{
-    TimerCreateParameters, TimerHandleObject, TimerSetParameters, TimerSubsystem,
-};
+use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::wait_completion_packet::{
-    WaitCompletionPacketAssociateParameters, WaitCompletionPacketCancelParameters,
-    WaitCompletionPacketHandleObject, WaitCompletionPacketSubsystem,
+    WaitCompletionPacketAssociateParameters, WaitCompletionPacketHandleObject,
+    WaitCompletionPacketSubsystem,
 };
 use crate::syscalls::worker_factory::{
-    WorkerFactoryCreateParameters, WorkerFactoryHandleObject,
-    WorkerFactorySetInformationParameters, WorkerFactoryShutdownParameters, WorkerFactorySubsystem,
+    WorkerFactoryCreateParameters, WorkerFactoryHandleObject, WorkerFactorySubsystem,
 };
 use crate::syscalls::{SyscallRequest, mm};
 
@@ -533,10 +530,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 remove_signaled_packet,
             } => {
                 let status = self.sys_nt_cancel_wait_completion_packet(
-                    WaitCompletionPacketCancelParameters {
-                        wait_completion_packet_handle,
-                        remove_signaled_packet,
-                    },
+                    wait_completion_packet_handle,
+                    remove_signaled_packet,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -573,12 +568,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 worker_factory_information_length,
             } => {
                 let status = self.sys_nt_set_information_worker_factory(
-                    WorkerFactorySetInformationParameters {
-                        handle: worker_factory_handle,
-                        information_class: worker_factory_information_class,
-                        information: worker_factory_information,
-                        information_length: worker_factory_information_length,
-                    },
+                    worker_factory_handle,
+                    worker_factory_information_class,
+                    worker_factory_information,
+                    worker_factory_information_length,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -586,10 +579,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 worker_factory_handle,
                 pending_worker_count,
             } => {
-                let status = self.sys_nt_shutdown_worker_factory(WorkerFactoryShutdownParameters {
-                    handle: worker_factory_handle,
-                    pending_worker_count,
-                });
+                let status = self
+                    .sys_nt_shutdown_worker_factory(worker_factory_handle, pending_worker_count);
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtCreateTimer2 {
@@ -614,12 +605,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 period,
                 parameters,
             } => {
-                let status = self.sys_nt_set_timer2(TimerSetParameters {
-                    timer_handle,
-                    due_time,
-                    period,
-                    parameters,
-                });
+                let status = self.sys_nt_set_timer2(timer_handle, due_time, period, parameters);
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtOpenEvent {

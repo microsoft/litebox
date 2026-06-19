@@ -143,18 +143,6 @@ pub(crate) struct WorkerFactoryCreateParameters<Platform: RawPointerProvider> {
     pub(crate) stack_commit: usize,
 }
 
-pub(crate) struct WorkerFactorySetInformationParameters<Platform: RawPointerProvider> {
-    pub(crate) handle: Handle,
-    pub(crate) information_class: u32,
-    pub(crate) information: ConstPtr<Platform, u8>,
-    pub(crate) information_length: u32,
-}
-
-pub(crate) struct WorkerFactoryShutdownParameters<Platform: RawPointerProvider> {
-    pub(crate) handle: Handle,
-    pub(crate) pending_worker_count: MutPtr<Platform, i32>,
-}
-
 fn validate_worker_factory_object_attributes<Platform: RawPointerProvider>(
     object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
 ) -> Result<(), NtStatus> {
@@ -333,22 +321,24 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_nt_set_information_worker_factory(
         &self,
-        params: WorkerFactorySetInformationParameters<Platform>,
+        handle: Handle,
+        information_class: u32,
+        information: ConstPtr<Platform, u8>,
+        information_length: u32,
     ) -> NtStatus {
         litebox_util_log::debug!(
-            information_class = params.information_class,
-            information_length = params.information_length;
+            information_class = information_class,
+            information_length = information_length;
             "NtSetInformationWorkerFactory parameters"
         );
-        let Ok(information_class) =
-            WorkerFactoryInformationClass::from_raw(params.information_class)
+        let Ok(information_class) = WorkerFactoryInformationClass::from_raw(information_class)
         else {
             return NtStatus::INVALID_INFO_CLASS;
         };
-        if params.information_length as usize != size_of::<u32>() {
+        if information_length as usize != size_of::<u32>() {
             return NtStatus::INFO_LENGTH_MISMATCH;
         }
-        let Some(value_bytes) = params.information.to_owned_slice(size_of::<u32>()) else {
+        let Some(value_bytes) = information.to_owned_slice(size_of::<u32>()) else {
             return NtStatus::ACCESS_VIOLATION;
         };
         let value = u32::from_le_bytes(
@@ -358,7 +348,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .expect("ULONG input is four bytes"),
         );
 
-        let entry = match self.worker_factory_entry(params.handle) {
+        let entry = match self.worker_factory_entry(handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
@@ -403,14 +393,15 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_nt_shutdown_worker_factory(
         &self,
-        params: WorkerFactoryShutdownParameters<Platform>,
+        handle: Handle,
+        pending_worker_count: MutPtr<Platform, i32>,
     ) -> NtStatus {
         if let Err(status) =
-            probe_guest_output_preserving_value::<Platform, _>(params.pending_worker_count)
+            probe_guest_output_preserving_value::<Platform, _>(pending_worker_count)
         {
             return status;
         }
-        let entry = match self.worker_factory_entry(params.handle) {
+        let entry = match self.worker_factory_entry(handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
@@ -423,7 +414,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(factory) => factory,
             Err(status) => return status,
         };
-        commit_worker_factory_shutdown(&factory, params.pending_worker_count)
+        commit_worker_factory_shutdown(&factory, pending_worker_count)
     }
 }
 
@@ -513,32 +504,6 @@ mod tests {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
     }
 
-    fn set_worker_factory_information(
-        task: &Task<TestPlatform, TestFS>,
-        worker_factory_handle: Handle,
-        worker_factory_information_class: u32,
-        worker_factory_information: ConstPtr<TestPlatform, u8>,
-        worker_factory_information_length: u32,
-    ) -> NtStatus {
-        task.sys_nt_set_information_worker_factory(WorkerFactorySetInformationParameters {
-            handle: worker_factory_handle,
-            information_class: worker_factory_information_class,
-            information: worker_factory_information,
-            information_length: worker_factory_information_length,
-        })
-    }
-
-    fn shutdown_worker_factory(
-        task: &Task<TestPlatform, TestFS>,
-        worker_factory_handle: Handle,
-        pending_worker_count: MutPtr<TestPlatform, i32>,
-    ) -> NtStatus {
-        task.sys_nt_shutdown_worker_factory(WorkerFactoryShutdownParameters {
-            handle: worker_factory_handle,
-            pending_worker_count,
-        })
-    }
-
     #[test]
     fn create_requires_modify_state_on_completion_port() {
         let task = test_task();
@@ -571,8 +536,7 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(
-            set_worker_factory_information(
-                &task,
+            task.sys_nt_set_information_worker_factory(
                 event,
                 WorkerFactoryInformationClass::ThreadMaximum as u32,
                 information_ptr(&value),
@@ -594,8 +558,7 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(
-            set_worker_factory_information(
-                &task,
+            task.sys_nt_set_information_worker_factory(
                 worker_factory,
                 WorkerFactoryInformationClass::ThreadMaximum as u32,
                 information_ptr(&value),
@@ -627,7 +590,7 @@ mod tests {
 
         let mut pending_worker_count = 7;
         assert_eq!(
-            shutdown_worker_factory(&task, worker_factory, mut_ptr(&mut pending_worker_count)),
+            task.sys_nt_shutdown_worker_factory(worker_factory, mut_ptr(&mut pending_worker_count)),
             NtStatus::SUCCESS
         );
         assert_eq!(pending_worker_count, 0);
@@ -659,7 +622,7 @@ mod tests {
             assert!(!factory.shutdown.load(Ordering::Relaxed));
 
             assert_eq!(
-                shutdown_worker_factory(&task, worker_factory, null_mut_ptr()),
+                task.sys_nt_shutdown_worker_factory(worker_factory, null_mut_ptr()),
                 NtStatus::ACCESS_VIOLATION
             );
             assert!(!factory.shutdown.load(Ordering::Relaxed));
@@ -681,7 +644,7 @@ mod tests {
             let task = test_task();
 
             assert_eq!(
-                shutdown_worker_factory(&task, Handle::default(), null_mut_ptr()),
+                task.sys_nt_shutdown_worker_factory(Handle::default(), null_mut_ptr()),
                 NtStatus::ACCESS_VIOLATION
             );
         });
@@ -698,7 +661,7 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(
-            shutdown_worker_factory(&task, event, mut_ptr(&mut pending_worker_count)),
+            task.sys_nt_shutdown_worker_factory(event, mut_ptr(&mut pending_worker_count)),
             NtStatus::OBJECT_TYPE_MISMATCH
         );
         assert_eq!(pending_worker_count, 1);
@@ -716,7 +679,7 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(
-            shutdown_worker_factory(&task, worker_factory, mut_ptr(&mut pending_worker_count)),
+            task.sys_nt_shutdown_worker_factory(worker_factory, mut_ptr(&mut pending_worker_count)),
             NtStatus::ACCESS_DENIED
         );
         assert_eq!(pending_worker_count, 1);
@@ -739,7 +702,7 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(
-            shutdown_worker_factory(&task, worker_factory, mut_ptr(&mut pending_worker_count)),
+            task.sys_nt_shutdown_worker_factory(worker_factory, mut_ptr(&mut pending_worker_count)),
             NtStatus::SUCCESS
         );
 
@@ -1073,8 +1036,7 @@ mod tests {
             // points to a live local and no native worker factory can be started.
             let host_status = unsafe { NtSetInformationWorkerFactory(handle, class, info, length) };
             assert_eq!(
-                set_worker_factory_information(
-                    &task,
+                task.sys_nt_set_information_worker_factory(
                     Handle::default(),
                     class,
                     if info.is_null() {
@@ -1142,8 +1104,7 @@ mod tests {
             )
         };
         assert_eq!(
-            set_worker_factory_information(
-                &task,
+            task.sys_nt_set_information_worker_factory(
                 shim_event,
                 WorkerFactoryInformationClass::ThreadMaximum as u32,
                 information_ptr(&value),
