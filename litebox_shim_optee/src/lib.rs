@@ -165,8 +165,13 @@ struct GlobalState {
     _litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: TaUuidMap,
-    /// Maintain whether non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
-    /// are busy or not to serialize their command invocation
+    /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
+    /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
+    /// rather than queued.
+    ///
+    /// TODO: OP-TEE serializes concurrent access to a non-concurrent PTA by
+    /// blocking/queuing the caller until the PTA is free. We currently reject
+    /// instead of serialize; revisit if a PTA needs true serialization.
     pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
 }
 

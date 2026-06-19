@@ -131,6 +131,12 @@ pub(crate) enum PtaSystemCommandId {
 type HmacSha256 = Hmac<Sha256>;
 
 impl Task {
+    /// Mark a non-concurrent PTA as busy for the duration of the returned guard,
+    /// gating both `open_pta_session` and command invocation.
+    ///
+    /// Returns `Ok(None)` for PTAs flagged `TaFlags::CONCURRENT` (no gating).
+    /// For a non-concurrent PTA that is already busy, returns `Err(Busy)`
+    /// immediately rather than blocking/queuing the caller as OP-TEE does.
     fn enter_pta(&self, pta: PseudoTa) -> Result<Option<PtaBusyGuard<'_>>, TeeResult> {
         if pta.flags().contains(TaFlags::CONCURRENT) {
             return Ok(None);
@@ -151,16 +157,24 @@ impl Task {
         params: &UteeParams,
     ) -> Result<u32, TeeResult> {
         let _busy = self.enter_pta(pta)?;
-        let mut pta_sessions = self.pta_sessions.lock();
+
         // OP-TEE OS permits multiple sessions to the same PTA. We cap the number
         // of PTA sessions per TA instance to prevent a TA from exhausting session
-        // IDs or memory.
-        if pta_sessions.len() >= MAX_PTA_SESSIONS_PER_TASK {
-            return Err(TeeResult::Busy);
+        // IDs or memory. The cap is checked while holding the lock, then the lock
+        // is released before `open_session` runs.
+        {
+            let pta_sessions = self.pta_sessions.lock();
+            if pta_sessions.len() >= MAX_PTA_SESSIONS_PER_TASK {
+                return Err(TeeResult::Busy);
+            }
         }
 
+        // Run the PTA hook without holding `pta_sessions`. OP-TEE `Task` is
+        // single-threaded, so nothing else mutates `pta_sessions` in the meantime.
+        // Keeping the hook outside the lock to avoid a self deadlock.
         let session_id = pta.open_session(params)?;
-        let prev = pta_sessions.insert(session_id, pta);
+
+        let prev = self.pta_sessions.lock().insert(session_id, pta);
         debug_assert!(
             prev.is_none(),
             "freshly allocated session ID collided with an existing PTA session",
@@ -185,7 +199,7 @@ impl Task {
     pub(crate) fn close_all_pta_sessions(&self) {
         // Drain into a local buffer and release the lock before invoking
         // `close_session` to avoid potential dead locks.
-        let sessions: alloc::vec::Vec<(u32, PseudoTa)> = self.pta_sessions.lock().drain().collect();
+        let sessions: Vec<(u32, PseudoTa)> = self.pta_sessions.lock().drain().collect();
         for (session_id, pta) in sessions {
             pta.close_session(self, session_id);
             crate::SessionIdPool::recycle(session_id);
