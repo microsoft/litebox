@@ -124,14 +124,6 @@ pub(crate) struct DirectoryObject<Platform: crate::ShimPlatform> {
     _not_send_without_platform: PhantomData<fn(Platform)>,
 }
 
-pub(crate) struct DirectoryCreateParameters<Platform: RawPointerProvider> {
-    pub(crate) directory_handle: MutPtr<Platform, Handle>,
-    pub(crate) desired_access: u32,
-    pub(crate) object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
-    pub(crate) shadow_directory_handle: Handle,
-    pub(crate) flags: u32,
-}
-
 pub(crate) struct DirectoryQueryParameters<Platform: RawPointerProvider> {
     pub(crate) directory_handle: Handle,
     pub(crate) buffer: MutPtr<Platform, u8>,
@@ -327,27 +319,29 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_nt_create_directory_object(
         &self,
-        params: DirectoryCreateParameters<Platform>,
+        directory_handle: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        shadow_directory_handle: Handle,
+        flags: u32,
     ) -> NtStatus {
-        if let Err(status) =
-            probe_guest_output_preserving_value::<Platform, _>(params.directory_handle)
-        {
+        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(directory_handle) {
             return status;
         }
-        if params.flags != 0 {
+        if flags != 0 {
             return NtStatus::INVALID_PARAMETER;
         }
-        if !params.shadow_directory_handle.is_null()
-            && let Err(status) = self.directory_entry(params.shadow_directory_handle)
+        if !shadow_directory_handle.is_null()
+            && let Err(status) = self.directory_entry(shadow_directory_handle)
         {
             return status;
         }
         let (object_attributes, directory_name) =
-            match self.read_directory_object_attributes(params.object_attributes, false) {
+            match self.read_directory_object_attributes(object_attributes, false) {
                 Ok(value) => value,
                 Err(status) => return status,
             };
-        let granted_access = DirectoryAccess::from_desired_access(params.desired_access);
+        let granted_access = DirectoryAccess::from_desired_access(desired_access);
 
         if let Some(directory_name) = directory_name {
             let mut namespace = self.process.directory_namespace.write();
@@ -361,7 +355,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
                     return NtStatus::QUOTA_EXCEEDED;
                 };
-                if params.directory_handle.write_at_offset(0, handle).is_none() {
+                if directory_handle.write_at_offset(0, handle).is_none() {
                     self.close_directory_handle(handle);
                     return NtStatus::ACCESS_VIOLATION;
                 }
@@ -379,7 +373,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Ok(handle) = self.insert_directory_handle(directory.clone(), granted_access) else {
                 return NtStatus::QUOTA_EXCEEDED;
             };
-            if params.directory_handle.write_at_offset(0, handle).is_none() {
+            if directory_handle.write_at_offset(0, handle).is_none() {
                 self.close_directory_handle(handle);
                 return NtStatus::ACCESS_VIOLATION;
             }
@@ -391,7 +385,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
             return NtStatus::QUOTA_EXCEEDED;
         };
-        if params.directory_handle.write_at_offset(0, handle).is_none() {
+        if directory_handle.write_at_offset(0, handle).is_none() {
             self.close_directory_handle(handle);
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -507,19 +501,6 @@ mod tests {
         <TestPlatform as ThreadProvider>::run_test_thread(f)
     }
 
-    fn directory_create_params(
-        handle: &mut Handle,
-        object_attributes: Option<ConstPtr<TestPlatform, ObjectAttributes>>,
-    ) -> DirectoryCreateParameters<TestPlatform> {
-        DirectoryCreateParameters {
-            directory_handle: mut_ptr(handle),
-            desired_access: DIRECTORY_ALL_ACCESS,
-            object_attributes,
-            shadow_directory_handle: Handle::default(),
-            flags: 0,
-        }
-    }
-
     #[test]
     fn open_seeded_root_directory_succeeds() {
         run_with_test_platform_pointers(|| {
@@ -570,10 +551,13 @@ mod tests {
             };
             let mut created = Handle::default();
             assert_eq!(
-                task.sys_nt_create_directory_object(directory_create_params(
-                    &mut created,
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut created),
+                    DIRECTORY_ALL_ACCESS,
                     Some(const_ptr(&child_attrs)),
-                )),
+                    Handle::default(),
+                    0,
+                ),
                 NtStatus::SUCCESS
             );
 
@@ -603,19 +587,25 @@ mod tests {
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let mut first = Handle::default();
             assert_eq!(
-                task.sys_nt_create_directory_object(directory_create_params(
-                    &mut first,
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut first),
+                    DIRECTORY_ALL_ACCESS,
                     Some(const_ptr(&attrs)),
-                )),
+                    Handle::default(),
+                    0,
+                ),
                 NtStatus::SUCCESS
             );
 
             let mut collision = Handle::default();
             assert_eq!(
-                task.sys_nt_create_directory_object(directory_create_params(
-                    &mut collision,
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut collision),
+                    DIRECTORY_ALL_ACCESS,
                     Some(const_ptr(&attrs)),
-                )),
+                    Handle::default(),
+                    0,
+                ),
                 NtStatus::OBJECT_NAME_COLLISION
             );
             assert_eq!(collision, Handle::default());
@@ -626,10 +616,13 @@ mod tests {
             };
             let mut opened = Handle::default();
             assert_eq!(
-                task.sys_nt_create_directory_object(directory_create_params(
-                    &mut opened,
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut opened),
+                    DIRECTORY_ALL_ACCESS,
                     Some(const_ptr(&openif_attrs)),
-                )),
+                    Handle::default(),
+                    0,
+                ),
                 NtStatus::OBJECT_NAME_EXISTS
             );
             assert_ne!(opened, Handle::default());
@@ -720,13 +713,13 @@ mod tests {
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
 
             assert_eq!(
-                task.sys_nt_create_directory_object(DirectoryCreateParameters {
-                    directory_handle: null_mut_ptr(),
-                    desired_access: DIRECTORY_ALL_ACCESS,
-                    object_attributes: Some(const_ptr(&attrs)),
-                    shadow_directory_handle: Handle::default(),
-                    flags: 0,
-                }),
+                task.sys_nt_create_directory_object(
+                    null_mut_ptr(),
+                    DIRECTORY_ALL_ACCESS,
+                    Some(const_ptr(&attrs)),
+                    Handle::default(),
+                    0,
+                ),
                 NtStatus::ACCESS_VIOLATION
             );
         });

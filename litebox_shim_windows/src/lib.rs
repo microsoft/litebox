@@ -32,7 +32,7 @@ use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
 use crate::syscalls::directory::{
-    DirectoryCreateParameters, DirectoryHandleObject, DirectoryObject, DirectoryObjectSubsystem,
+    DirectoryHandleObject, DirectoryObject, DirectoryObjectSubsystem,
 };
 use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
@@ -488,13 +488,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 desired_access,
                 object_attributes,
             } => {
-                let status = self.sys_nt_create_directory_object(DirectoryCreateParameters {
+                let status = self.sys_nt_create_directory_object(
                     directory_handle,
                     desired_access,
                     object_attributes,
-                    shadow_directory_handle: syscalls::Handle::default(),
-                    flags: 0,
-                });
+                    syscalls::Handle::default(),
+                    0,
+                );
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtCreateDirectoryObjectEx {
@@ -504,13 +504,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 shadow_directory_handle,
                 flags,
             } => {
-                let status = self.sys_nt_create_directory_object(DirectoryCreateParameters {
+                let status = self.sys_nt_create_directory_object(
                     directory_handle,
                     desired_access,
                     object_attributes,
                     shadow_directory_handle,
                     flags,
-                });
+                );
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtOpenDirectoryObject {
