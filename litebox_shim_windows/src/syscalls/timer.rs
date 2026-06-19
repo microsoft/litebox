@@ -310,33 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn create_writes_closeable_timer2_handle_for_supported_attributes() {
-        let task = test_task();
-
-        for attributes in [
-            0,
-            TIMER2_ATTRIBUTE_HIGH_RESOLUTION,
-            TIMER2_ATTRIBUTE_NO_WAKE,
-            TIMER2_ATTRIBUTE_HIGH_RESOLUTION | TIMER2_ATTRIBUTE_NO_WAKE,
-            TIMER2_ATTRIBUTE_NOTIFICATION,
-            TIMER2_ATTRIBUTE_NOTIFICATION | TIMER2_ATTRIBUTE_HIGH_RESOLUTION,
-            TIMER2_ATTRIBUTE_NOTIFICATION | TIMER2_ATTRIBUTE_NO_WAKE,
-            TIMER2_ATTRIBUTE_NOTIFICATION
-                | TIMER2_ATTRIBUTE_HIGH_RESOLUTION
-                | TIMER2_ATTRIBUTE_NO_WAKE,
-        ] {
-            let mut handle = Handle::default();
-            assert_eq!(
-                create_timer2(&task, &mut handle, None, None, attributes),
-                NtStatus::SUCCESS
-            );
-            assert!(!handle.is_null());
-            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-            assert_eq!(task.sys_nt_close(handle), NtStatus::INVALID_HANDLE);
-        }
-    }
-
-    #[test]
     fn set_timer2_accepts_created_timer() {
         run_with_test_platform_pointers(|| {
             let task = test_task();

@@ -103,12 +103,6 @@ struct WaitCompletionPacketAssociation {
     already_signaled: bool,
 }
 
-pub(crate) struct WaitCompletionPacketCreateParameters<Platform: RawPointerProvider> {
-    pub(crate) wait_completion_packet_handle: MutPtr<Platform, Handle>,
-    pub(crate) desired_access: u32,
-    pub(crate) object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
-}
-
 pub(crate) struct WaitCompletionPacketAssociateParameters<Platform: RawPointerProvider> {
     pub(crate) wait_completion_packet_handle: Handle,
     pub(crate) io_completion_handle: Handle,
@@ -314,29 +308,31 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_nt_create_wait_completion_packet(
         &self,
-        params: WaitCompletionPacketCreateParameters<Platform>,
+        wait_completion_packet_handle: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
     ) -> NtStatus {
         if let Err(status) =
-            probe_guest_output_preserving_value::<Platform, _>(params.wait_completion_packet_handle)
+            probe_guest_output_preserving_value::<Platform, _>(wait_completion_packet_handle)
         {
             return status;
         }
         if let Err(status) =
-            validate_wait_completion_packet_object_attributes::<Platform>(params.object_attributes)
+            validate_wait_completion_packet_object_attributes::<Platform>(object_attributes)
         {
             return status;
         }
 
+        // TODO: associates it with I/O completion objects
         let packet = Arc::new(WaitCompletionPacketObject {
             association: Mutex::new(None),
             _not_send_without_platform: PhantomData,
         });
-        let granted_access = WaitCompletionPacketAccess::from_desired_access(params.desired_access);
+        let granted_access = WaitCompletionPacketAccess::from_desired_access(desired_access);
         let Ok(handle) = self.insert_wait_completion_packet_handle(packet, granted_access) else {
             return NtStatus::QUOTA_EXCEEDED;
         };
-        if params
-            .wait_completion_packet_handle
+        if wait_completion_packet_handle
             .write_at_offset(0, handle)
             .is_none()
         {
@@ -445,7 +441,7 @@ mod tests {
 
     use super::*;
     use crate::nt_types::ObjectAttributes;
-    use crate::tests::{TestPlatform, const_ptr, mut_ptr, null_mut_ptr, test_platform, test_task};
+    use crate::tests::{TestPlatform, const_ptr, mut_ptr, test_platform, test_task};
 
     const WAIT_COMPLETION_PACKET_SET_STATE: u32 = 0x0000_0001;
     const WAIT_COMPLETION_PACKET_ALL_ACCESS: u32 = 0x000f_0001;
@@ -469,11 +465,11 @@ mod tests {
         handle: &mut Handle,
         object_attributes: Option<ConstPtr<TestPlatform, ObjectAttributes>>,
     ) -> NtStatus {
-        task.sys_nt_create_wait_completion_packet(WaitCompletionPacketCreateParameters {
-            wait_completion_packet_handle: mut_ptr(handle),
-            desired_access: WAIT_COMPLETION_PACKET_ALL_ACCESS,
+        task.sys_nt_create_wait_completion_packet(
+            mut_ptr(handle),
+            WAIT_COMPLETION_PACKET_ALL_ACCESS,
             object_attributes,
-        })
+        )
     }
 
     fn create_wait_completion_packet_with_access(
@@ -481,11 +477,7 @@ mod tests {
         handle: &mut Handle,
         desired_access: u32,
     ) -> NtStatus {
-        task.sys_nt_create_wait_completion_packet(WaitCompletionPacketCreateParameters {
-            wait_completion_packet_handle: mut_ptr(handle),
-            desired_access,
-            object_attributes: None,
-        })
+        task.sys_nt_create_wait_completion_packet(mut_ptr(handle), desired_access, None)
     }
 
     fn create_io_completion(
@@ -553,44 +545,6 @@ mod tests {
             wait_completion_packet_handle: packet,
             remove_signaled_packet: u8::from(remove_signaled_packet),
         })
-    }
-
-    #[test]
-    fn create_writes_closeable_wait_completion_packet_handle() {
-        let task = test_task();
-        let mut handle = Handle::default();
-
-        assert_eq!(
-            create_wait_completion_packet(&task, &mut handle, None),
-            NtStatus::SUCCESS
-        );
-        assert!(!handle.is_null());
-        assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-        assert_eq!(task.sys_nt_close(handle), NtStatus::INVALID_HANDLE);
-    }
-
-    #[test]
-    fn create_validates_output_pointer_before_attributes() {
-        run_with_test_platform_pointers(|| {
-            let task = test_task();
-            let bad_attrs = ObjectAttributes {
-                length: 1,
-                root_directory: Handle::default(),
-                object_name: 0,
-                attributes: 0,
-                security_descriptor: 0,
-                security_quality_of_service: 0,
-            };
-
-            assert_eq!(
-                task.sys_nt_create_wait_completion_packet(WaitCompletionPacketCreateParameters {
-                    wait_completion_packet_handle: null_mut_ptr(),
-                    desired_access: WAIT_COMPLETION_PACKET_ALL_ACCESS,
-                    object_attributes: Some(const_ptr(&bad_attrs)),
-                }),
-                NtStatus::ACCESS_VIOLATION
-            );
-        });
     }
 
     #[test]

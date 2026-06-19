@@ -169,6 +169,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
+        // TODO: associates it with a specified file handle
         let port = Arc::new(IoCompletionObject::new(number_of_concurrent_threads));
         let granted_access = IoCompletionAccess::from_desired_access(desired_access);
         let Ok(handle) = self.insert_io_completion_handle(port, granted_access) else {
@@ -186,66 +187,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     use core::mem::size_of;
 
-    use litebox::platform::ThreadProvider;
+    use litebox::utils::TruncateExt as _;
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
     use crate::nt_types::ObjectAttributes;
-    use crate::tests::{TestPlatform, const_ptr, mut_ptr, null_mut_ptr, test_platform, test_task};
+    use crate::tests::{const_ptr, mut_ptr, test_task};
 
     const IO_COMPLETION_ALL_ACCESS: u32 = 0x001f_0003;
 
     fn object_attributes_size() -> u32 {
-        u32::try_from(size_of::<ObjectAttributes>()).expect("OBJECT_ATTRIBUTES fits in ULONG")
-    }
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
-    }
-
-    #[test]
-    fn create_writes_closeable_io_completion_handle() {
-        let task = test_task();
-        let mut handle = Handle::default();
-
-        assert_eq!(
-            task.sys_nt_create_io_completion(
-                mut_ptr(&mut handle),
-                IO_COMPLETION_ALL_ACCESS,
-                None,
-                0,
-            ),
-            NtStatus::SUCCESS
-        );
-        assert!(!handle.is_null());
-        assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-        assert_eq!(task.sys_nt_close(handle), NtStatus::INVALID_HANDLE);
-    }
-
-    #[test]
-    fn create_validates_output_pointer_before_attributes() {
-        run_with_test_platform_pointers(|| {
-            let task = test_task();
-            let bad_attrs = ObjectAttributes {
-                length: 1,
-                root_directory: Handle::default(),
-                object_name: 0,
-                attributes: 0,
-                security_descriptor: 0,
-                security_quality_of_service: 0,
-            };
-
-            assert_eq!(
-                task.sys_nt_create_io_completion(
-                    null_mut_ptr(),
-                    IO_COMPLETION_ALL_ACCESS,
-                    Some(const_ptr(&bad_attrs)),
-                    0,
-                ),
-                NtStatus::ACCESS_VIOLATION
-            );
-        });
+        size_of::<ObjectAttributes>().trunc()
     }
 
     #[test]

@@ -40,8 +40,7 @@ use crate::syscalls::timer::{
 };
 use crate::syscalls::wait_completion_packet::{
     WaitCompletionPacketAssociateParameters, WaitCompletionPacketCancelParameters,
-    WaitCompletionPacketCreateParameters, WaitCompletionPacketHandleObject,
-    WaitCompletionPacketSubsystem,
+    WaitCompletionPacketHandleObject, WaitCompletionPacketSubsystem,
 };
 use crate::syscalls::worker_factory::{
     WorkerFactoryCreateParameters, WorkerFactoryHandleObject,
@@ -499,11 +498,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 object_attributes,
             } => {
                 let status = self.sys_nt_create_wait_completion_packet(
-                    WaitCompletionPacketCreateParameters {
-                        wait_completion_packet_handle,
-                        desired_access,
-                        object_attributes,
-                    },
+                    wait_completion_packet_handle,
+                    desired_access,
+                    object_attributes,
                 );
                 (status, ContinueOperation::Resume)
             }
