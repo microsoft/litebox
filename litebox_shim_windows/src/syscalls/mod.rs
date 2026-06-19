@@ -815,7 +815,10 @@ mod tests {
         );
         assert_eq!(key_context, associate_register_args[3]);
         assert_eq!(apc_context, associate_stack_args[0]);
-        assert_eq!(io_status, associate_stack_args[1] as i32);
+        assert_eq!(
+            io_status,
+            i32::try_from(associate_stack_args[1]).expect("io_status sentinel fits in i32")
+        );
         assert_eq!(io_status_information, associate_stack_args[2]);
         assert_eq!(
             already_signaled
@@ -859,7 +862,11 @@ mod tests {
             worker_factory_handle.as_usize(),
             worker_factory_register_args[0]
         );
-        assert_eq!(desired_access, worker_factory_register_args[1] as u32);
+        assert_eq!(
+            desired_access,
+            u32::try_from(worker_factory_register_args[1])
+                .expect("desired_access sentinel fits in u32")
+        );
         assert_eq!(
             object_attributes
                 .expect("object_attributes should be non-null")
@@ -876,7 +883,11 @@ mod tests {
         );
         assert_eq!(start_routine, worker_factory_stack_args[1]);
         assert_eq!(start_parameter, worker_factory_stack_args[2]);
-        assert_eq!(max_thread_count, worker_factory_stack_args[3] as u32);
+        assert_eq!(
+            max_thread_count,
+            u32::try_from(worker_factory_stack_args[3])
+                .expect("max_thread_count sentinel fits in u32")
+        );
         assert_eq!(stack_reserve, worker_factory_stack_args[4]);
         assert_eq!(stack_commit, worker_factory_stack_args[5]);
 
@@ -910,7 +921,13 @@ mod tests {
                 .as_usize(),
             timer_register_args[2]
         );
-        assert_eq!(attributes, timer_register_args[3] as u32);
-        assert_eq!(desired_access, timer_stack_args[0] as u32);
+        assert_eq!(
+            attributes,
+            u32::try_from(timer_register_args[3]).expect("attributes sentinel fits in u32")
+        );
+        assert_eq!(
+            desired_access,
+            u32::try_from(timer_stack_args[0]).expect("desired_access sentinel fits in u32")
+        );
     }
 }
