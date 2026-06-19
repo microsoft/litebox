@@ -548,6 +548,11 @@ fn update_tracker_from_response(
         | Opcode::InetTcpConnCreate
         | Opcode::InetDgramCreate
         | Opcode::InetRawCreate
+        | Opcode::CreateSocketDgram
+        | Opcode::CreateSocketSeqPacket
+        | Opcode::SocketSeqPacketAccept
+        | Opcode::CreateUnixStream
+        | Opcode::UnixStreamAccept
         | Opcode::AttachHostFd => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(caller_scope, id);
