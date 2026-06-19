@@ -80,7 +80,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         ta_sess_id: u32,
         cancel_req_to: u32,
         cmd_id: u32,
-        params: Platform::RawConstPointer<UteeParams>,
+        params: Platform::RawMutPointer<UteeParams>,
         ret_orig: Platform::RawMutPointer<TeeOrigin>,
     },
     CheckAccessRights {
@@ -194,7 +194,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 ta_sess_id: u32::try_from(ctx.syscall_arg(0)).map_err(|_| Errno::EINVAL)?,
                 cancel_req_to: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
                 cmd_id: u32::try_from(ctx.syscall_arg(2)).map_err(|_| Errno::EINVAL)?,
-                params: Platform::RawConstPointer::from_usize(ctx.syscall_arg(3)),
+                params: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 ret_orig: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
             TeeSyscallNr::CheckAccessRights => SyscallRequest::CheckAccessRights {
@@ -508,6 +508,18 @@ impl UteeParams {
     /// Return `true` if every parameter matches the expected type.
     pub fn has_types(&self, expected: [TeeParamType; Self::TEE_NUM_PARAMS]) -> bool {
         (0..Self::TEE_NUM_PARAMS).all(|i| self.get_type(i).is_ok_and(|t| t == expected[i]))
+    }
+
+    /// Return `true` if any parameter is an output or inout type, i.e., the
+    /// command may write results that must be copied back to the caller.
+    pub fn needs_copy_back(&self) -> bool {
+        use TeeParamType::{MemrefInout, MemrefOutput, ValueInout, ValueOutput};
+        (0..Self::TEE_NUM_PARAMS).any(|i| {
+            matches!(
+                self.get_type(i),
+                Ok(ValueOutput | ValueInout | MemrefOutput | MemrefInout)
+            )
+        })
     }
 
     pub fn get_type(&self, index: usize) -> Result<TeeParamType, Errno> {

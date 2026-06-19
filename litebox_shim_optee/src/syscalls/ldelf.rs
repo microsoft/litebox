@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use crate::syscalls::Cleanup;
 use crate::{Task, UserMutPtr};
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::{RawConstPointer, RawMutPointer, SystemInfoProvider as _};
@@ -68,28 +69,27 @@ impl Task {
     }
 
     /// OP-TEE's syscall to map zero-initialized memory with padding.
-    /// This function pads `pad_begin` bytes before and `pad_end` bytes after the
-    /// zero-initialized `num_bytes` bytes. `va` can contain a hint address which
-    /// is `pad_begin` bytes lower than the starting address of the memory region.
-    /// (`start - pad_begin`, ...,  `start`, ..., `start + num_bytes`, ..., `start + num_bytes + pad_end`)
-    /// Memory regions between `start - pad_begin` and `start` and between
-    /// `start + num_bytes` and `start + num_bytes + pad_end` are reserved and must not be used.
+    ///
+    /// Maps `pad_begin + num_bytes + pad_end` bytes (rounded up to a page) and
+    /// zero-initializes the `num_bytes` usable region. `va` is a page-aligned
+    /// hint for the *base of the whole mapping* (`0` means no hint). The usable
+    /// region thus starts at `start = va + pad_begin`; the `pad_begin`/`pad_end`
+    /// regions are reserved and must not be accessed.
+    ///
+    /// On success, returns `start` plus a `Cleanup` that unmaps the usable
+    /// region. The caller communicates the address back to userspace and must
+    /// run the cleanup if that write-back fails.
     pub fn sys_map_zi(
         &self,
-        va: UserMutPtr<usize>,
+        va: usize,
         num_bytes: usize,
         pad_begin: usize,
         pad_end: usize,
         flags: LdelfMapFlags,
-    ) -> Result<(), TeeResult> {
-        let Some(addr) = va.read_at_offset(0) else {
-            return Err(TeeResult::BadParameters);
-        };
-
+    ) -> Result<(usize, Cleanup), TeeResult> {
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(
-            va:% = format_args!("{:#x}", va.as_usize()),
-            addr:% = format_args!("{:#x}", addr),
+            va:% = format_args!("{:#x}", va),
             num_bytes:% = num_bytes,
             flags:% = format_args!("{:#x}", flags);
             "sys_map_zi"
@@ -101,20 +101,28 @@ impl Task {
         }
         // TODO: Check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` once we support sharing of file-based mappings.
 
+        // OP-TEE requires the address hint and padding to be page-aligned.
+        if !va.is_multiple_of(PAGE_SIZE)
+            || !pad_begin.is_multiple_of(PAGE_SIZE)
+            || !pad_end.is_multiple_of(PAGE_SIZE)
+        {
+            return Err(TeeResult::AccessConflict);
+        }
+
         let total_size = Self::checked_map_size(num_bytes, pad_begin, pad_end)?;
-        if addr.checked_add(total_size).is_none() {
+        if va.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
         // `sys_map_zi` always creates read/writeable mapping.
         //
         // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE.
         let mut flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
-        if addr != 0 {
+        if va != 0 {
             flags |= MapFlags::MAP_FIXED;
         }
 
         let addr = self
-            .sys_mmap(addr, total_size, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
+            .sys_mmap(va, total_size, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
             .map_err(|_| TeeResult::OutOfMemory)?;
         let guard = MmapGuard::new(self, addr, total_size);
 
@@ -143,9 +151,12 @@ impl Task {
             );
         }
 
-        let _ = va.write_at_offset(0, padded_start);
         guard.disarm();
-        Ok(())
+        let cleanup = Cleanup::Unmap {
+            addr: padded_start,
+            len: pad_end_start - padded_start,
+        };
+        Ok((padded_start, cleanup))
     }
 
     /// OP-TEE's syscall to open a TA binary.
@@ -213,6 +224,14 @@ impl Task {
             | LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE;
         if flags.bits() & !accept_flags.bits() != 0 {
             return Err(TeeResult::BadParameters);
+        }
+
+        // OP-TEE requires the address hint and padding to be page-aligned.
+        if !addr.is_multiple_of(PAGE_SIZE)
+            || !pad_begin.is_multiple_of(PAGE_SIZE)
+            || !pad_end.is_multiple_of(PAGE_SIZE)
+        {
+            return Err(TeeResult::AccessConflict);
         }
 
         if self.ta_handle_map.get(handle).is_none() {

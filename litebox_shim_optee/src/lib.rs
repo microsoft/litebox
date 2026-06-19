@@ -469,8 +469,24 @@ impl Task {
                 params,
                 ret_orig,
             } => {
-                if let Some(params) = params.read_at_offset(0) {
-                    self.sys_invoke_ta_command(ta_sess_id, cancel_req_to, cmd_id, params, ret_orig)
+                if let Some(mut params_copied) = params.read_at_offset(0) {
+                    self.sys_invoke_ta_command(
+                        ta_sess_id,
+                        cancel_req_to,
+                        cmd_id,
+                        &mut params_copied,
+                        ret_orig,
+                    )
+                    .and_then(|cleanup| {
+                        if !params_copied.needs_copy_back()
+                            || params.write_at_offset(0, params_copied).is_some()
+                        {
+                            Ok(())
+                        } else {
+                            cleanup.run(self);
+                            Err(TeeResult::AccessDenied)
+                        }
+                    })
                 } else {
                     Err(TeeResult::BadParameters)
                 }
@@ -664,7 +680,19 @@ impl Task {
                 pad_begin,
                 pad_end,
                 flags,
-            } => self.sys_map_zi(va, num_bytes, pad_begin, pad_end, flags),
+            } => match va.read_at_offset(0) {
+                Some(hint) => self
+                    .sys_map_zi(hint, num_bytes, pad_begin, pad_end, flags)
+                    .and_then(|(mapped, cleanup)| {
+                        if va.write_at_offset(0, mapped).is_some() {
+                            Ok(())
+                        } else {
+                            cleanup.run(self);
+                            Err(TeeResult::AccessDenied)
+                        }
+                    }),
+                None => Err(TeeResult::BadParameters),
+            },
             LdelfSyscallRequest::OpenBin {
                 uuid,
                 uuid_size,

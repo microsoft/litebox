@@ -15,7 +15,10 @@ use litebox_common_optee::{
 use num_enum::TryFromPrimitive;
 use zerocopy::IntoBytes;
 
-use crate::{Task, UserConstPtr, UserMutPtr, syscalls::pta::PseudoTa};
+use crate::{
+    Task, UserConstPtr, UserMutPtr,
+    syscalls::{Cleanup, pta::PseudoTa},
+};
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> Option<usize> {
@@ -170,9 +173,6 @@ impl Task {
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
-        ret_orig
-            .write_at_offset(0, TeeOrigin::Tee)
-            .ok_or(TeeResult::AccessDenied)?;
         if let Some(pta) = PseudoTa::from_uuid(&ta_uuid) {
             // `open_ta_session` syscall lets a user-mode TA open a session to a PTA which provides
             // several import services (it works as a proxy for extra system calls).
@@ -181,6 +181,9 @@ impl Task {
                 self.close_pta_session(session_id);
                 return Err(TeeResult::AccessDenied);
             }
+            // Best-effort write-back of the return origin, matching OP-TEE OS
+            // (`syscall_open_ta_session`): the copy result is ignored.
+            let _ = ret_orig.write_at_offset(0, TeeOrigin::Tee);
             Ok(())
         } else {
             // `open_ta_session` syscall lets a user-mode TA open a session to another user-mode TA
@@ -208,20 +211,24 @@ impl Task {
     }
 
     /// A system call to invoke a command on a TA.
+    ///
+    /// Returns `Cleanup` that the caller must run if the surrounding
+    /// dispatch then fails.
     pub fn sys_invoke_ta_command(
         &self,
         ta_sess_id: u32,
         _cancel_req_to: u32,
         cmd_id: u32,
-        params: UteeParams,
+        params: &mut UteeParams,
         ret_orig: UserMutPtr<TeeOrigin>,
-    ) -> Result<(), TeeResult> {
+    ) -> Result<Cleanup, TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
-        ret_orig
-            .write_at_offset(0, TeeOrigin::Tee)
-            .ok_or(TeeResult::AccessDenied)?;
         if let Some(pta) = self.pta_for_session(ta_sess_id) {
-            pta.invoke_command(self, cmd_id, &params)
+            let cleanup = pta.invoke_command(self, cmd_id, params)?;
+            // Best-effort write-back of the return origin, matching OP-TEE OS
+            // (`syscall_invoke_ta_command`): the copy result is ignored.
+            let _ = ret_orig.write_at_offset(0, TeeOrigin::Tee);
+            Ok(cleanup)
         } else {
             #[cfg(debug_assertions)]
             todo!("support inter TA interaction");
