@@ -535,8 +535,6 @@ fn update_tracker_from_response(
     if response.status != StatusCode::Ok {
         return;
     }
-    // reason: unsupported variants intentionally share this fallback path.
-    #[allow(clippy::wildcard_enum_match_arm)]
     match request_opcode {
         // State-registry creators: response body is one or two handle ids.
         Opcode::CreateEventfd
@@ -612,7 +610,219 @@ fn update_tracker_from_response(
                 tracker.record_release(caller_scope, id);
             }
         }
-        _ => {}
+        // Non-creating request opcodes (and every response opcode, which the
+        // router never dispatches here in request position) make no
+        // per-connection registry ref change. Listed exhaustively rather than
+        // wildcarded: when this was a `_ => {}` arm it silently dropped the
+        // dgram/seqpacket/unix-stream creators, leaking their create-ref across
+        // fork-migration (the PTY.parent_exit_then_child_io hang). E0004 now
+        // forces every new Opcode to be classified as a creator (above) or a
+        // no-op (here).
+        Opcode::Register
+        | Opcode::Materialize
+        | Opcode::RegisterNotificationRing
+        | Opcode::ReadEventfd
+        | Opcode::WriteEventfd
+        | Opcode::SubscribeEventfd
+        | Opcode::ReadTimerfd
+        | Opcode::SetTimerfd
+        | Opcode::GetTimerfd
+        | Opcode::ReadSiginfo
+        | Opcode::PushSiginfo
+        | Opcode::InotifyAddWatch
+        | Opcode::InotifyRmWatch
+        | Opcode::InotifyRead
+        | Opcode::InotifyQueryEvents
+        | Opcode::InetListenerBind
+        | Opcode::InetListenerListen
+        | Opcode::InetListenerQueryEvents
+        | Opcode::InetListenerSetSockOpt
+        | Opcode::InetListenerGetSockName
+        | Opcode::InetListenerGetSockOpt
+        | Opcode::ReadPipe
+        | Opcode::WritePipe
+        | Opcode::RegisterOfd
+        | Opcode::CloneOfd
+        | Opcode::BindNinePSession
+        | Opcode::SocketDgramBind
+        | Opcode::SocketDgramConnect
+        | Opcode::SocketDgramSendTo
+        | Opcode::SocketDgramRecvFrom
+        | Opcode::SocketDgramShutdown
+        | Opcode::SocketDgramGetSockName
+        | Opcode::SocketDgramGetPeerName
+        | Opcode::ReadSocketPair
+        | Opcode::WriteSocketPair
+        | Opcode::ShutdownSocketPairWrite
+        | Opcode::InetRawSendTo
+        | Opcode::InetRawRecvFrom
+        | Opcode::InetRawQueryEvents
+        | Opcode::InetTcpConnConnect
+        | Opcode::InetTcpConnQueryEvents
+        | Opcode::InetTcpConnGetSockName
+        | Opcode::InetTcpConnGetPeerName
+        | Opcode::SocketSeqPacketBind
+        | Opcode::SocketSeqPacketListen
+        | Opcode::SocketSeqPacketConnect
+        | Opcode::SocketSeqPacketSend
+        | Opcode::SocketSeqPacketRecv
+        | Opcode::SocketSeqPacketShutdown
+        | Opcode::SocketSeqPacketGetSockName
+        | Opcode::SocketSeqPacketGetPeerName
+        | Opcode::UnixStreamBind
+        | Opcode::UnixStreamListen
+        | Opcode::UnixStreamConnect
+        | Opcode::UnixStreamSend
+        | Opcode::UnixStreamRecv
+        | Opcode::UnixStreamShutdown
+        | Opcode::UnixStreamGetSockName
+        | Opcode::UnixStreamGetPeerName
+        | Opcode::PtyRead
+        | Opcode::PtyWrite
+        | Opcode::SubscribePty
+        | Opcode::PtyIoctl
+        | Opcode::Unsubscribe
+        | Opcode::QueryEvents
+        | Opcode::PidfdExited
+        | Opcode::InetDgramBind
+        | Opcode::InetDgramConnect
+        | Opcode::InetDgramSendTo
+        | Opcode::InetDgramRecvFrom
+        | Opcode::InetDgramShutdown
+        | Opcode::InetDgramGetSockName
+        | Opcode::InetDgramGetPeerName
+        | Opcode::InetDgramSetSockOpt
+        | Opcode::InetDgramGetSockOpt
+        | Opcode::InetDgramQueryEvents
+        | Opcode::SubscribeProcessExit
+        | Opcode::MarkProcessExited
+        | Opcode::ReleaseAllForPid
+        | Opcode::SubscribeSignalInbox
+        | Opcode::UnsubscribeSignalInbox
+        | Opcode::DeliverSignalInbox
+        | Opcode::SetPgid
+        | Opcode::SetSid
+        | Opcode::ReadTcpConn
+        | Opcode::WriteTcpConn
+        | Opcode::ShutdownTcpConn
+        | Opcode::PollTcpConnEvents
+        | Opcode::InetTcpConnSetSockOpt
+        | Opcode::InetTcpConnGetSockOpt
+        | Opcode::RegisterResponse
+        | Opcode::MaterializeResponse
+        | Opcode::ReleaseResponse
+        | Opcode::RegisterNotificationRingResponse
+        | Opcode::CreateEventfdResponse
+        | Opcode::ReadEventfdResponse
+        | Opcode::WriteEventfdResponse
+        | Opcode::SubscribeEventfdResponse
+        | Opcode::CreateTimerfdResponse
+        | Opcode::ReadTimerfdResponse
+        | Opcode::SetTimerfdResponse
+        | Opcode::GetTimerfdResponse
+        | Opcode::CreateSignalfdResponse
+        | Opcode::ReadSiginfoResponse
+        | Opcode::PushSiginfoResponse
+        | Opcode::InotifyInit1Response
+        | Opcode::InotifyAddWatchResponse
+        | Opcode::InotifyRmWatchResponse
+        | Opcode::InotifyReadResponse
+        | Opcode::InotifyQueryEventsResponse
+        | Opcode::InetListenerCreateResponse
+        | Opcode::InetListenerBindResponse
+        | Opcode::InetListenerListenResponse
+        | Opcode::InetListenerAcceptResponse
+        | Opcode::InetListenerQueryEventsResponse
+        | Opcode::InetListenerSetSockOptResponse
+        | Opcode::InetListenerGetSockNameResponse
+        | Opcode::InetListenerGetSockOptResponse
+        | Opcode::CreatePipeResponse
+        | Opcode::ReadPipeResponse
+        | Opcode::WritePipeResponse
+        | Opcode::AttachHostFdResponse
+        | Opcode::RegisterOfdResponse
+        | Opcode::CloneOfdResponse
+        | Opcode::BindNinePSessionResponse
+        | Opcode::CreateSocketDgramResponse
+        | Opcode::SocketDgramBindResponse
+        | Opcode::SocketDgramConnectResponse
+        | Opcode::SocketDgramSendToResponse
+        | Opcode::SocketDgramRecvFromResponse
+        | Opcode::SocketDgramShutdownResponse
+        | Opcode::SocketDgramGetSockNameResponse
+        | Opcode::SocketDgramGetPeerNameResponse
+        | Opcode::CreateSocketPairResponse
+        | Opcode::ReadSocketPairResponse
+        | Opcode::WriteSocketPairResponse
+        | Opcode::ShutdownSocketPairWriteResponse
+        | Opcode::InetRawCreateResponse
+        | Opcode::InetRawSendToResponse
+        | Opcode::InetRawRecvFromResponse
+        | Opcode::InetRawQueryEventsResponse
+        | Opcode::InetTcpConnCreateResponse
+        | Opcode::InetTcpConnConnectResponse
+        | Opcode::InetTcpConnQueryEventsResponse
+        | Opcode::InetTcpConnGetSockNameResponse
+        | Opcode::InetTcpConnGetPeerNameResponse
+        | Opcode::CreatePtyResponse
+        | Opcode::OpenPtySlaveResponse
+        | Opcode::CreateSocketSeqPacketResponse
+        | Opcode::SocketSeqPacketBindResponse
+        | Opcode::SocketSeqPacketListenResponse
+        | Opcode::SocketSeqPacketAcceptResponse
+        | Opcode::SocketSeqPacketConnectResponse
+        | Opcode::SocketSeqPacketSendResponse
+        | Opcode::SocketSeqPacketRecvResponse
+        | Opcode::SocketSeqPacketShutdownResponse
+        | Opcode::SocketSeqPacketGetSockNameResponse
+        | Opcode::SocketSeqPacketGetPeerNameResponse
+        | Opcode::CreateUnixStreamResponse
+        | Opcode::UnixStreamBindResponse
+        | Opcode::UnixStreamListenResponse
+        | Opcode::UnixStreamAcceptResponse
+        | Opcode::UnixStreamConnectResponse
+        | Opcode::UnixStreamSendResponse
+        | Opcode::UnixStreamRecvResponse
+        | Opcode::UnixStreamShutdownResponse
+        | Opcode::UnixStreamGetSockNameResponse
+        | Opcode::UnixStreamGetPeerNameResponse
+        | Opcode::PtyReadResponse
+        | Opcode::PtyWriteResponse
+        | Opcode::SubscribePtyResponse
+        | Opcode::PtyIoctlResponse
+        | Opcode::UnsubscribeResponse
+        | Opcode::DupHandleResponse
+        | Opcode::QueryEventsResponse
+        | Opcode::CreatePidfdResponse
+        | Opcode::PidfdExitedResponse
+        | Opcode::InetDgramCreateResponse
+        | Opcode::InetDgramBindResponse
+        | Opcode::InetDgramConnectResponse
+        | Opcode::InetDgramSendToResponse
+        | Opcode::InetDgramRecvFromResponse
+        | Opcode::InetDgramShutdownResponse
+        | Opcode::InetDgramGetSockNameResponse
+        | Opcode::InetDgramGetPeerNameResponse
+        | Opcode::InetDgramSetSockOptResponse
+        | Opcode::InetDgramGetSockOptResponse
+        | Opcode::InetDgramQueryEventsResponse
+        | Opcode::RegisterProcessResponse
+        | Opcode::SubscribeProcessExitResponse
+        | Opcode::MarkProcessExitedResponse
+        | Opcode::ReleaseAllForPidResponse
+        | Opcode::SubscribeSignalInboxResponse
+        | Opcode::UnsubscribeSignalInboxResponse
+        | Opcode::DeliverSignalInboxResponse
+        | Opcode::SetPgidResponse
+        | Opcode::SetSidResponse
+        | Opcode::ReadTcpConnResponse
+        | Opcode::WriteTcpConnResponse
+        | Opcode::ShutdownTcpConnResponse
+        | Opcode::PollTcpConnEventsResponse
+        | Opcode::InetTcpConnSetSockOptResponse
+        | Opcode::InetTcpConnGetSockOptResponse => {}
+        #[cfg(debug_assertions)]
+        Opcode::DebugQueryStateObject | Opcode::DebugQueryStateObjectResponse => {}
     }
     let _ = parse_create_pidfd_response_ok;
 }

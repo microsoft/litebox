@@ -224,10 +224,21 @@ to ship and easy to diagnose when they do:
    `[workspace.lints.clippy] wildcard_enum_match_arm = "deny"`
    (commit `3d51e5cd merge: narrow-wildcard-allows-shim`) blocks the
    `_ => ...` arm by default; you must `#[allow(clippy::wildcard_enum_match_arm)]`
-   the rare match where a wildcard is legitimate (most opcodes don't
-   need creator-tracking, for instance — see
-   `litebox_broker/src/cwfd/fd_token_socket.rs:470`). The narrow allow
-   is a deliberate choice that survives review; an unscoped allow is
+   the rare match where a wildcard is genuinely legitimate — almost always a
+   match over an enum **you do not own** (a third-party / std enum), never an
+   owned `Opcode`/`RawFdRef`/`FdKind`-style dispatch table. **Cautionary
+   tale:** the broker per-connection creator-tracking match in
+   `litebox_broker/src/cwfd/fd_token_socket.rs` (`update_tracker_from_response`)
+   was once `#[allow]`ed on the reasoning "most opcodes don't need
+   creator-tracking." That wildcard silently swallowed the
+   `CreateSocketDgram`/`CreateSocketSeqPacket`/`CreateUnixStream`/`*Accept`
+   creators as they were added, so the created handle's per-connection ref went
+   untracked and leaked across fork-migration — the broker `UnixStreamState`
+   never dropped, its peer never saw EOF, and `PTY.parent_exit_then_child_io`
+   hung. It is now an exhaustive match (no wildcard): adding a new `Opcode`
+   trips E0004 there, forcing a creator-vs-no-op decision. Treat "most X don't
+   need Y" wildcards over owned enums as rot waiting to happen. The narrow
+   allow is a deliberate choice that survives review; an unscoped allow is
    not.
 3. **Loud panic for internal-consistency bugs, errno for runtime
    conditions.** When a code path can only be reached because our own
