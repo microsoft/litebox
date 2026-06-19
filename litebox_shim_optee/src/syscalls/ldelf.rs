@@ -76,8 +76,10 @@ impl Task {
     /// Memory regions between `start - pad_begin` and `start` and between
     /// `start + num_bytes` and `start + num_bytes + pad_end` are reserved and must not be used.
     ///
-    /// On success, returns the page-aligned starting address of the usable
-    /// region (`start`, i.e., `pad_begin` bytes above the base of the mapping).
+    /// On success, returns the starting address of the usable region (`start`),
+    /// which is `pad_begin` bytes above the page-aligned base of the mapping.
+    /// This address is itself page-aligned whenever `pad_begin` is a multiple of
+    /// `PAGE_SIZE`, as it is for the ldelf and system-PTA callers.
     /// The caller decides how to communicate this back to userspace (writing it
     /// to a non-zero `va` pointer, into utee params, etc.).
     pub fn sys_map_zi(

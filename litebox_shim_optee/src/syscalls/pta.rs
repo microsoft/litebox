@@ -362,6 +362,9 @@ impl SystemPta {
             .get_values(0)
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
+        if num_bytes == 0 {
+            return Err(TeeResult::BadParameters);
+        }
         let (addr_high, addr_low) = params
             .get_values(1)
             .map_err(|_| TeeResult::BadParameters)?
@@ -377,18 +380,14 @@ impl SystemPta {
             num_bytes.trunc(),
             pad_begin.trunc(),
             pad_end.trunc(),
-            LdelfMapFlags::from_bits_truncate(flags.trunc()),
+            LdelfMapFlags::from_bits_retain(flags.trunc()),
         )?;
 
         // Return the mapped address to the caller via the inout value param.
-        if let Err(_err) =
-            params.set_values(1, (mapped as u64) >> 32, (mapped as u64) & 0xffff_ffff)
-        {
-            let _ = task.sys_munmap(UserMutPtr::<u8>::from_usize(mapped), num_bytes.trunc());
-            return Err(TeeResult::BadParameters);
-        }
-
-        Ok(())
+        // This `set_values` cannot fail because the index is fixed.
+        params
+            .set_values(1, (mapped as u64) >> 32, (mapped as u64) & 0xffff_ffff)
+            .map_err(|_| TeeResult::BadParameters)
     }
 
     fn unmap(task: &Task, params: &UteeParams) -> Result<(), TeeResult> {

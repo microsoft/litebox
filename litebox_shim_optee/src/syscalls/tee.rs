@@ -220,6 +220,9 @@ impl Task {
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
+        if ret_orig.as_usize() == 0 {
+            return Err(TeeResult::BadParameters);
+        }
         ret_orig
             .write_at_offset(0, TeeOrigin::Tee)
             .ok_or(TeeResult::AccessDenied)?;
