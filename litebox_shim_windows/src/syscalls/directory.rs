@@ -409,7 +409,15 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let directory = {
             let namespace = self.process.directory_namespace.read();
             let Some(directory) = namespace.get(&directory_name.path) else {
-                return NtStatus::OBJECT_NAME_NOT_FOUND;
+                // Created names require their immediate parent to exist, and seeded
+                // directories include their ancestors, so the parent check distinguishes
+                // a missing leaf from an earlier path-component miss.
+                return match parent_directory_path(&directory_name.path) {
+                    Some(parent) if !namespace.contains_key(&parent) => {
+                        NtStatus::OBJECT_PATH_NOT_FOUND
+                    }
+                    _ => NtStatus::OBJECT_NAME_NOT_FOUND,
+                };
             };
             directory.clone()
         };
@@ -519,6 +527,47 @@ mod tests {
                 NtStatus::SUCCESS
             );
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn open_directory_distinguishes_missing_leaf_from_missing_parent() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            for (path, expected_status) in [
+                (
+                    r"\BaseNamedObjects\DefinitelyMissingLiteBoxDir",
+                    NtStatus::OBJECT_NAME_NOT_FOUND,
+                ),
+                (
+                    r"\KnownDlls\DefinitelyMissingLiteBoxDir",
+                    NtStatus::OBJECT_NAME_NOT_FOUND,
+                ),
+                (
+                    r"\MissingParentLiteBox\Child",
+                    NtStatus::OBJECT_PATH_NOT_FOUND,
+                ),
+                (
+                    r"\DefinitelyMissingLiteBoxDir",
+                    NtStatus::OBJECT_NAME_NOT_FOUND,
+                ),
+            ] {
+                let name_units: alloc::vec::Vec<u16> = path.encode_utf16().collect();
+                let name = unicode_string(&name_units);
+                let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+                let mut handle = Handle::default();
+
+                assert_eq!(
+                    task.sys_nt_open_directory_object(
+                        mut_ptr(&mut handle),
+                        DIRECTORY_QUERY,
+                        Some(const_ptr(&attrs)),
+                    ),
+                    expected_status,
+                    "unexpected status opening {path}",
+                );
+                assert_eq!(handle, Handle::default());
+            }
         });
     }
 
