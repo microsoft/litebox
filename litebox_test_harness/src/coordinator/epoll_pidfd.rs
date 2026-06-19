@@ -126,6 +126,10 @@ const EPOLL_SPIN_BROKER_UDP_WRITABLE: HandlerToken<(), EpollSpinOut> =
     HandlerToken::new("epoll_pidfd.epoll_spin_broker_udp_writable");
 const EPOLL_SPIN_BROKER_TCP_STICKY_OUT: HandlerToken<PeerAddrArgs, EpollSpinOut> =
     HandlerToken::new("epoll_pidfd.epoll_spin_broker_tcp_sticky_out");
+const EPOLL_SPIN_BROKER_TCP_STICKY_IN: HandlerToken<PeerAddrArgs, EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_spin_broker_tcp_sticky_in");
+const EPOLL_SPIN_BROKER_TCP_HALF_CLOSED: HandlerToken<PeerAddrArgs, EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_spin_broker_tcp_half_closed");
 // EP.span.* — full-span EPOLLET / level-triggered / EPOLLONESHOT readiness
 // matrix across always-ready broker fd kinds (eventfd, pipe, socketpair) for
 // both IN and OUT readiness, plus the correctness guards (ET re-fires after a
@@ -740,6 +744,111 @@ fn persistent_et_spin_out(label: &str, epfd: i32) -> Result<EpollSpinOut, Handle
     })
 }
 
+async fn handle_epoll_spin_broker_tcp_sticky_in(
+    args: PeerAddrArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let mut stream = connect_peer(&args.peer_addr)
+        .map_err(|e| HandlerError(format!("tcp connect {}: {e}", args.peer_addr)))?;
+    // Write a few bytes; the echo peer sends them back so our conn becomes
+    // persistently readable (sticky IN) without us ever draining it.
+    stream
+        .write_all(b"spin-probe")
+        .map_err(|e| HandlerError(format!("tcp write: {e}")))?;
+    wait_readable(&stream, Duration::from_secs(2))
+        .map_err(|e| HandlerError(format!("await echo: {e}")))?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| HandlerError(format!("set_nonblocking: {e}")))?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        stream.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLET) as u32,
+        7,
+    )?;
+    // Never read the echoed data: the sticky IN must fire once then block. A
+    // litebox that re-delivers IN on every broker notification spins — the VS
+    // Code agent-host's unread-HTTPS-response (update.code.visualstudio.com)
+    // signature that the OUT-only dedup missed.
+    persistent_et_spin_out("broker_tcp_sticky_in_et", epfd.as_raw_fd())
+}
+
+async fn handle_epoll_spin_broker_tcp_half_closed(
+    args: PeerAddrArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let mut stream = connect_peer(&args.peer_addr)
+        .map_err(|e| HandlerError(format!("tcp connect {}: {e}", args.peer_addr)))?;
+    stream
+        .write_all(b"spin-probe")
+        .map_err(|e| HandlerError(format!("tcp write: {e}")))?;
+    wait_readable(&stream, Duration::from_secs(2))
+        .map_err(|e| HandlerError(format!("await echo: {e}")))?;
+    // Half-close our write side: the echo peer reads EOF and closes, so our
+    // conn gains a sticky RDHUP on top of the sticky IN — the exact half-closed
+    // agent-host connection signature (IN|RDHUP under EPOLLET).
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|e| HandlerError(format!("shutdown write: {e}")))?;
+    std::thread::sleep(Duration::from_millis(150));
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| HandlerError(format!("set_nonblocking: {e}")))?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        stream.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET) as u32,
+        7,
+    )?;
+    persistent_et_spin_out("broker_tcp_half_closed_et", epfd.as_raw_fd())
+}
+
+async fn drive_broker_tcp_in_probe(
+    run: &mut RunContext<'_>,
+    observer: &super::agents::AgentHandle,
+    peer: &super::agents::AgentHandle,
+    token: &'static HandlerToken<PeerAddrArgs, EpollSpinOut>,
+) -> Result<String, String> {
+    let peer_addr = open_peer_addr(run, peer).await?;
+    let out = run
+        .send_named_typed(observer, token, PeerAddrArgs { peer_addr })
+        .await
+        .map_err(|e| format!("send_named: {e}"))?;
+    check_span_et_no_spin(&out)
+}
+
+fn register_broker_tcp_in_test(
+    reg: &mut Registry<'_>,
+    agent: AgentName,
+    name: &str,
+    token: &'static HandlerToken<PeerAddrArgs, EpollSpinOut>,
+) {
+    let label = agent.to_string();
+    reg.test("vscode", "epoll_pidfd", format!("EP.spin.{name}.{agent}"))
+        .timeout(60)
+        .build(move |cx| {
+            let observer = cx.require(agent);
+            let peer_agent = peer_for(agent);
+            let peer = if peer_agent == agent {
+                observer.clone()
+            } else {
+                cx.require(peer_agent)
+            };
+            let label = label.clone();
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let result = drive_broker_tcp_in_probe(run, &observer, &peer, token).await;
+                    match result {
+                        Ok(detail) => TestOutcome::new(&label, true, detail),
+                        Err(detail) => TestOutcome::new(&label, false, detail),
+                    }
+                })
+            })
+        });
+}
+
 async fn handle_span_eventfd_out_et(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -984,6 +1093,14 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
         EPOLL_SPIN_BROKER_TCP_STICKY_OUT,
         handle_epoll_spin_broker_tcp_sticky_out
     );
+    register_handler!(
+        EPOLL_SPIN_BROKER_TCP_STICKY_IN,
+        handle_epoll_spin_broker_tcp_sticky_in
+    );
+    register_handler!(
+        EPOLL_SPIN_BROKER_TCP_HALF_CLOSED,
+        handle_epoll_spin_broker_tcp_half_closed
+    );
     register_handler!(EPOLL_SPAN_EVENTFD_OUT_ET, handle_span_eventfd_out_et);
     register_handler!(EPOLL_SPAN_EVENTFD_IN_ET, handle_span_eventfd_in_et);
     register_handler!(EPOLL_SPAN_PIPE_OUT_ET, handle_span_pipe_out_et);
@@ -1084,6 +1201,18 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
             check_epoll_spin_broker_writable_et,
         );
         register_broker_tcp_sticky_out_test(reg, agent);
+        register_broker_tcp_in_test(
+            reg,
+            agent,
+            "broker_tcp_sticky_in_et",
+            &EPOLL_SPIN_BROKER_TCP_STICKY_IN,
+        );
+        register_broker_tcp_in_test(
+            reg,
+            agent,
+            "broker_tcp_half_closed_et",
+            &EPOLL_SPIN_BROKER_TCP_HALF_CLOSED,
+        );
         for (name, token, check) in [
             (
                 "eventfd_out_et",

@@ -233,13 +233,30 @@ impl<FS: ShimFS> DescriptorRef<FS> {
     }
 
     fn edge_dedup_mask(&self) -> Events {
+        // Broker-held inet sockets re-assert their FULL current readiness on
+        // every broker notification (the broker tracks level state, not edges).
+        // For an EPOLLET interest the worker-local epoll must therefore compute
+        // edges itself across ALL sticky bits — not just OUT. A half-closed TCP
+        // conn (sticky RDHUP|IN), an idle readable conn (sticky IN with an
+        // unread response), or a writable conn (sticky OUT) otherwise re-fires
+        // on every wait and the reactor spins — the VS Code agent-host hang on
+        // its update.code.visualstudio.com connections (sticky IN|OUT|RDHUP).
+        const BROKER_INET_STICKY: Events = Events::from_bits_truncate(
+            Events::IN.bits()
+                | Events::PRI.bits()
+                | Events::OUT.bits()
+                | Events::ERR.bits()
+                | Events::HUP.bits()
+                | Events::RDHUP.bits(),
+        );
         match self {
-            DescriptorRef::BrokerInetDgram(_) | DescriptorRef::BrokerTcpConn(_) => Events::OUT,
+            DescriptorRef::BrokerInetDgram(_)
+            | DescriptorRef::BrokerTcpConn(_)
+            | DescriptorRef::BrokerInetListener(_)
+            | DescriptorRef::BrokerInetRaw(_) => BROKER_INET_STICKY,
             DescriptorRef::Eventfd(_)
             | DescriptorRef::Signalfd(_)
             | DescriptorRef::Inotify(_)
-            | DescriptorRef::BrokerInetListener(_)
-            | DescriptorRef::BrokerInetRaw(_)
             | DescriptorRef::Epoll(_)
             | DescriptorRef::File(_)
             | DescriptorRef::Unix(_)
