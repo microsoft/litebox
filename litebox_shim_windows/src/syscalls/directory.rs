@@ -235,6 +235,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         handle: Handle,
     ) -> Result<Arc<DirectoryObject<Platform>>, NtStatus> {
         let entry = self.directory_entry(handle)?;
+        // TODO: enforce DIRECTORY_TRAVERSE on root handles before resolving relative
+        // object-manager paths.
         Ok(entry.with_entry(|entry| Arc::clone(&entry.directory)))
     }
 
