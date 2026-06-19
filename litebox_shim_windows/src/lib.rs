@@ -31,6 +31,9 @@ use litebox::sync::RawSyncPrimitivesProvider;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
+use crate::syscalls::directory::{
+    DirectoryCreateParameters, DirectoryHandleObject, DirectoryObject, DirectoryObjectSubsystem,
+};
 use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
@@ -88,6 +91,8 @@ pub(crate) type WindowsVirtualAllocations<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
 pub(crate) type WindowsEventNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Weak<EventObject<Platform>>>>;
+pub(crate) type WindowsDirectoryNamespace<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<String, Arc<DirectoryObject<Platform>>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {
@@ -331,10 +336,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
     ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
+        let directory_namespace = syscalls::directory::seed_directory_namespace();
         let process = Arc::new(Process {
             ntdll_mapping: load_info.ntdll_mapping,
             peb_address: load_info.environment.peb,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
+            directory_namespace,
             event_namespace: WindowsEventNamespace::<Platform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
             virtual_allocations: load_info.virtual_allocations,
@@ -378,6 +385,7 @@ pub struct Process<Platform: ShimPlatform> {
     ntdll_mapping: Option<MappingInfo>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
+    directory_namespace: WindowsDirectoryNamespace<Platform>,
     event_namespace: WindowsEventNamespace<Platform>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,
@@ -472,6 +480,70 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     object_attributes,
                     event_type,
                     initial_state,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateDirectoryObject {
+                directory_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_create_directory_object(DirectoryCreateParameters {
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                    shadow_directory_handle: syscalls::Handle::default(),
+                    flags: 0,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateDirectoryObjectEx {
+                directory_handle,
+                desired_access,
+                object_attributes,
+                shadow_directory_handle,
+                flags,
+            } => {
+                let status = self.sys_nt_create_directory_object(DirectoryCreateParameters {
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                    shadow_directory_handle,
+                    flags,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenDirectoryObject {
+                directory_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_open_directory_object(
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryDirectoryObject {
+                directory_handle,
+                buffer,
+                buffer_length,
+                return_single_entry,
+                restart_scan,
+                context,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_directory_object(
+                    syscalls::directory::DirectoryQueryParameters {
+                        directory_handle,
+                        buffer,
+                        buffer_length,
+                        return_single_entry,
+                        restart_scan,
+                        context,
+                        return_length,
+                    },
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -1011,6 +1083,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, DirectoryObjectSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |directory| visitor.directory(directory),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         if remove_raw_handle_by_raw_fd::<Platform, IoCompletionSubsystem<Platform>>(
             &self.global.litebox,
             &self.process.handles,
@@ -1065,6 +1145,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn event(&self, event: EventHandleObject<Platform>);
 
+    fn directory(&self, directory: DirectoryHandleObject<Platform>);
+
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
 
     fn timer(&self, timer: TimerHandleObject<Platform>);
@@ -1094,6 +1176,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn event(&self, event: EventHandleObject<Platform>) {
         Task::<Platform, FS>::close_event(event);
+    }
+
+    fn directory(&self, directory: DirectoryHandleObject<Platform>) {
+        Task::<Platform, FS>::close_directory(directory);
     }
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {

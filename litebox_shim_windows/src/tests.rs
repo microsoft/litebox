@@ -134,6 +134,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
     let tar_ro =
         litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
     let fs = Arc::new(crate::default_fs(&litebox, in_mem, tar_ro));
+    let directory_namespace = crate::syscalls::directory::seed_directory_namespace();
     Task {
         global: Arc::new(GlobalState {
             platform,
@@ -147,6 +148,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             ntdll_mapping: None,
             peb_address: 0,
             handles: WindowsHandleStore::<TestPlatform>::new(RawDescriptorStorage::new()),
+            directory_namespace,
             event_namespace: crate::WindowsEventNamespace::<TestPlatform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
             virtual_allocations: crate::WindowsVirtualAllocations::<TestPlatform>::new(
