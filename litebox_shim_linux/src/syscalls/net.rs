@@ -4321,15 +4321,36 @@ impl<FS: ShimFS> Task<FS> {
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerUnixStream => self
                 .try_with_broker_unix_stream(sockfd, |typed| {
-                    if msg.msg_controllen != 0 {
-                        return Err(Errno::EOPNOTSUPP);
-                    }
                     if sock_addr.is_some() {
                         return Err(Errno::EISCONN);
                     }
-                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
                     let handle = self.broker_unix_stream_handle(typed)?;
-                    handle.with_entry(|entry| entry.send(&self.wait_cx(), &buf))
+                    if msg.msg_controllen != 0 {
+                        // SCM_RIGHTS over the connected stream: broker-backed fds
+                        // ride in-band as tokens inside an LBFD frame (same
+                        // mechanism as the broker socketpair); raw host fds are
+                        // not transferable on this path.
+                        let (passed_fds, passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
+                        if !passed_fds.is_empty() {
+                            return Err(Errno::EOPNOTSUPP);
+                        }
+                        let data = Self::copy_sendmsg_iovs(&iovs)?;
+                        let mut frame = Vec::new();
+                        FdTransferFrame {
+                            tokens: &passed_tokens,
+                            data: &data,
+                        }
+                        .encode(&mut frame)
+                        .map_err(|_| Errno::EMSGSIZE)?;
+                        handle.with_entry(|entry| entry.send(&self.wait_cx(), &frame))?;
+                        Ok(total_len)
+                    } else if total_len == 0 {
+                        handle.with_entry(|entry| entry.send(&self.wait_cx(), &[]))
+                    } else {
+                        Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                            handle.with_entry(|entry| entry.send(&self.wait_cx(), chunk))
+                        })
+                    }
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketSeqPacket => self
@@ -5233,13 +5254,31 @@ impl<FS: ShimFS> Task<FS> {
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerUnixStream => self
                 .try_with_broker_unix_stream(sockfd, |typed| {
+                    if buf.is_empty() {
+                        return Ok(0);
+                    }
                     let handle = self.broker_unix_stream_handle(typed)?;
-                    let recv_len = buf.len() as u32;
                     let payload =
-                        handle.with_entry(|entry| entry.recv(&self.wait_cx(), recv_len))?;
-                    let copied = buf.len().min(payload.len());
-                    buf[..copied].copy_from_slice(&payload[..copied]);
-                    Ok(copied)
+                        handle.with_entry(|entry| entry.recv(&self.wait_cx(), buf.len() as u32))?;
+                    // SCM_RIGHTS frames arrive in-band as an LBFD frame (same as
+                    // the broker socketpair); opportunistically de-frame, falling
+                    // back to raw bytes when there is no frame magic.
+                    let mut reader = FdTransferReader::new();
+                    reader.push(&payload);
+                    match reader.take_frame() {
+                        Ok(Some(frame)) => {
+                            received_tokens.extend(frame.tokens);
+                            let n = buf.len().min(frame.data.len());
+                            buf[..n].copy_from_slice(&frame.data[..n]);
+                            Ok(n)
+                        }
+                        Ok(None) | Err(FrameError::BadMagic { .. }) => {
+                            let n = buf.len().min(payload.len());
+                            buf[..n].copy_from_slice(&payload[..n]);
+                            Ok(n)
+                        }
+                        Err(_) => Err(Errno::EPROTO),
+                    }
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketSeqPacket => self
