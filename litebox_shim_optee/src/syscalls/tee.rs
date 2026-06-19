@@ -170,6 +170,9 @@ impl Task {
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
+        if ret_orig.as_usize() == 0 {
+            return Err(TeeResult::BadParameters);
+        }
         ret_orig
             .write_at_offset(0, TeeOrigin::Tee)
             .ok_or(TeeResult::AccessDenied)?;
@@ -213,7 +216,7 @@ impl Task {
         ta_sess_id: u32,
         _cancel_req_to: u32,
         cmd_id: u32,
-        params: UteeParams,
+        params: &mut UteeParams,
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
@@ -221,7 +224,7 @@ impl Task {
             .write_at_offset(0, TeeOrigin::Tee)
             .ok_or(TeeResult::AccessDenied)?;
         if let Some(pta) = self.pta_for_session(ta_sess_id) {
-            pta.invoke_command(self, cmd_id, &params)
+            pta.invoke_command(self, cmd_id, params)
         } else {
             #[cfg(debug_assertions)]
             todo!("support inter TA interaction");

@@ -69,27 +69,28 @@ impl Task {
 
     /// OP-TEE's syscall to map zero-initialized memory with padding.
     /// This function pads `pad_begin` bytes before and `pad_end` bytes after the
-    /// zero-initialized `num_bytes` bytes. `va` can contain a hint address which
-    /// is `pad_begin` bytes lower than the starting address of the memory region.
+    /// zero-initialized `num_bytes` bytes. `va` is a hint address which is
+    /// `pad_begin` bytes lower than the starting address of the memory region
+    /// (`0` means no hint).
     /// (`start - pad_begin`, ...,  `start`, ..., `start + num_bytes`, ..., `start + num_bytes + pad_end`)
     /// Memory regions between `start - pad_begin` and `start` and between
     /// `start + num_bytes` and `start + num_bytes + pad_end` are reserved and must not be used.
+    ///
+    /// On success, returns the page-aligned starting address of the usable
+    /// region (`start`, i.e., `pad_begin` bytes above the base of the mapping).
+    /// The caller decides how to communicate this back to userspace (writing it
+    /// to a non-zero `va` pointer, into utee params, etc.).
     pub fn sys_map_zi(
         &self,
-        va: UserMutPtr<usize>,
+        va: usize,
         num_bytes: usize,
         pad_begin: usize,
         pad_end: usize,
         flags: LdelfMapFlags,
-    ) -> Result<(), TeeResult> {
-        let Some(addr) = va.read_at_offset(0) else {
-            return Err(TeeResult::BadParameters);
-        };
-
+    ) -> Result<usize, TeeResult> {
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(
-            va:% = format_args!("{:#x}", va.as_usize()),
-            addr:% = format_args!("{:#x}", addr),
+            va:% = format_args!("{:#x}", va),
             num_bytes:% = num_bytes,
             flags:% = format_args!("{:#x}", flags);
             "sys_map_zi"
@@ -102,19 +103,19 @@ impl Task {
         // TODO: Check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` once we support sharing of file-based mappings.
 
         let total_size = Self::checked_map_size(num_bytes, pad_begin, pad_end)?;
-        if addr.checked_add(total_size).is_none() {
+        if va.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
         // `sys_map_zi` always creates read/writeable mapping.
         //
         // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE.
         let mut flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
-        if addr != 0 {
+        if va != 0 {
             flags |= MapFlags::MAP_FIXED;
         }
 
         let addr = self
-            .sys_mmap(addr, total_size, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
+            .sys_mmap(va, total_size, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
             .map_err(|_| TeeResult::OutOfMemory)?;
         let guard = MmapGuard::new(self, addr, total_size);
 
@@ -143,9 +144,8 @@ impl Task {
             );
         }
 
-        let _ = va.write_at_offset(0, padded_start);
         guard.disarm();
-        Ok(())
+        Ok(padded_start)
     }
 
     /// OP-TEE's syscall to open a TA binary.

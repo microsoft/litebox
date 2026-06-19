@@ -80,7 +80,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         ta_sess_id: u32,
         cancel_req_to: u32,
         cmd_id: u32,
-        params: Platform::RawConstPointer<UteeParams>,
+        params: Platform::RawMutPointer<UteeParams>,
         ret_orig: Platform::RawMutPointer<TeeOrigin>,
     },
     CheckAccessRights {
@@ -194,7 +194,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 ta_sess_id: u32::try_from(ctx.syscall_arg(0)).map_err(|_| Errno::EINVAL)?,
                 cancel_req_to: u32::try_from(ctx.syscall_arg(1)).map_err(|_| Errno::EINVAL)?,
                 cmd_id: u32::try_from(ctx.syscall_arg(2)).map_err(|_| Errno::EINVAL)?,
-                params: Platform::RawConstPointer::from_usize(ctx.syscall_arg(3)),
+                params: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 ret_orig: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
             TeeSyscallNr::CheckAccessRights => SyscallRequest::CheckAccessRights {
