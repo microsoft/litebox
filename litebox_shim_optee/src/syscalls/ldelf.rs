@@ -76,12 +76,10 @@ impl Task {
     /// Memory regions between `start - pad_begin` and `start` and between
     /// `start + num_bytes` and `start + num_bytes + pad_end` are reserved and must not be used.
     ///
-    /// On success, returns the starting address of the usable region (`start`),
-    /// which is `pad_begin` bytes above the page-aligned base of the mapping.
-    /// This address is itself page-aligned whenever `pad_begin` is a multiple of
-    /// `PAGE_SIZE`, as it is for the ldelf and system-PTA callers.
-    /// The caller decides how to communicate this back to userspace (writing it
-    /// to a non-zero `va` pointer, into utee params, etc.).
+    /// On success, returns the page-aligned starting address of the usable region
+    /// (`start`, i.e., `pad_begin` bytes above the page-aligned base of the mapping).
+    /// The caller decides how to communicate this back to userspace (writing it to
+    /// a non-zero `va` pointer, into utee params, etc.).
     pub fn sys_map_zi(
         &self,
         va: usize,
@@ -103,6 +101,14 @@ impl Task {
             return Err(TeeResult::BadParameters);
         }
         // TODO: Check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` once we support sharing of file-based mappings.
+
+        // OP-TEE requires the address hint and padding to be page-aligned.
+        if !va.is_multiple_of(PAGE_SIZE)
+            || !pad_begin.is_multiple_of(PAGE_SIZE)
+            || !pad_end.is_multiple_of(PAGE_SIZE)
+        {
+            return Err(TeeResult::AccessConflict);
+        }
 
         let total_size = Self::checked_map_size(num_bytes, pad_begin, pad_end)?;
         if va.checked_add(total_size).is_none() {
@@ -215,6 +221,14 @@ impl Task {
             | LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE;
         if flags.bits() & !accept_flags.bits() != 0 {
             return Err(TeeResult::BadParameters);
+        }
+
+        // OP-TEE requires the address hint and padding to be page-aligned.
+        if !addr.is_multiple_of(PAGE_SIZE)
+            || !pad_begin.is_multiple_of(PAGE_SIZE)
+            || !pad_end.is_multiple_of(PAGE_SIZE)
+        {
+            return Err(TeeResult::AccessConflict);
         }
 
         if self.ta_handle_map.get(handle).is_none() {
