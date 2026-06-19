@@ -510,9 +510,10 @@ impl SessionManager {
         })
     }
 
-    /// Mark every session currently pointing at `instance` as `Dead`. Must
-    /// be paired with [`SessionManager::evict_cached_instance`]
-    /// in the documented order — see that function for the rationale.
+    /// Mark every session currently pointing at `instance` as `Dead`.
+    ///
+    /// Use before [`SessionManager::evict_cached_instance`] when tearing down
+    /// a *failed* TA that may still have sibling sessions.
     pub fn mark_sessions_dead_for_instance(&self, instance: &TaInstance) {
         self.sessions
             .mark_sessions_dead_for_pt(instance.task_page_table_id);
@@ -764,16 +765,8 @@ impl SessionManager {
 
     /// Register a session that re-uses an existing single-instance TA.
     ///
-    /// `instance` is the borrow handed to the [`SessionManager::with_ta`]
-    /// closure on the cache-hit branch. The cached instance for `ta_uuid`
-    /// is matched against `task_page_table_id`. Under correct usage the
-    /// caller holds the per-UUID lock (via `with_ta`'s token) for the
-    /// duration, so the cache entry is stable and the lookup succeeds.
-    ///
-    /// Returns `Err(EBadCmd)` if no matching cached instance is found.
-    /// This is an internal-consistency check rather than a recoverable
-    /// runtime condition; in kernel code we surface it as an error rather
-    /// than panicking.
+    /// `instance` is the cached handle handed to the
+    /// [`SessionManager::with_ta`] closure on the cache-hit branch.
     pub fn register_sibling_session(
         &self,
         session_id: u32,
