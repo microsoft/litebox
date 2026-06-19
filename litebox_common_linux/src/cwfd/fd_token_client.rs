@@ -1970,11 +1970,12 @@ impl FdTokenClient {
         &self,
         handle_id: u64,
         payload: &[u8],
+        tokens: &[PassedToken],
     ) -> Result<usize, ClientError> {
         let stream = self.lock();
         send_frame(
             &stream,
-            &proto::build_socket_seqpacket_send_request(handle_id, payload),
+            &proto::build_socket_seqpacket_send_request_with_tokens(handle_id, payload, tokens),
             None,
         )?;
         let (resp_bytes, attached) = recv_frame(&stream)?;
@@ -2000,7 +2001,7 @@ impl FdTokenClient {
         &self,
         handle_id: u64,
         max_len: u32,
-    ) -> Result<(Vec<u8>, u32), ClientError> {
+    ) -> Result<(Vec<u8>, u32, Vec<PassedToken>), ClientError> {
         let stream = self.lock();
         send_frame(
             &stream,

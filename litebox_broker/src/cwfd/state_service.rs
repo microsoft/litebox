@@ -4998,7 +4998,7 @@ fn handle_socket_seqpacket_send(
     if !in_fds.is_empty() {
         return protocol_err(Opcode::SocketSeqPacketSendResponse);
     }
-    let (handle_id, payload) = match proto::parse_socket_seqpacket_send_body(request.body) {
+    let (handle_id, tokens, payload) = match proto::parse_socket_seqpacket_send_body(request.body) {
         Ok(v) => v,
         Err(_) => return protocol_err(Opcode::SocketSeqPacketSendResponse),
     };
@@ -5011,7 +5011,7 @@ fn handle_socket_seqpacket_send(
             );
         }
     };
-    match state.send(&payload) {
+    match state.send(&payload, &tokens) {
         Ok(n) => HandlerResult {
             frame: proto::build_socket_seqpacket_send_response_ok(n as u64),
             out_fd: None,
@@ -5045,8 +5045,10 @@ fn handle_socket_seqpacket_recv(
         }
     };
     match state.recv(max_len as usize) {
-        Ok((payload, flags)) => HandlerResult {
-            frame: proto::build_socket_seqpacket_recv_response_ok(&payload, flags),
+        Ok((payload, flags, tokens)) => HandlerResult {
+            frame: proto::build_socket_seqpacket_recv_response_ok_with_tokens(
+                &payload, flags, &tokens,
+            ),
             out_fd: None,
         },
         Err(e) => status_err(

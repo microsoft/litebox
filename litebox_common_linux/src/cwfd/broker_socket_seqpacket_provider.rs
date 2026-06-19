@@ -5,10 +5,10 @@
 //!
 //! The broker owns the seqpacket endpoint, its bind/connect state, and its
 //! receive queue so the socket survives delayed-fork-restore across workers.
-//! `SCM_RIGHTS` and `SCM_CREDENTIALS` are intentionally not represented in this
-//! first protocol shape; callers that need ancillary data receive `EOPNOTSUPP`.
+//! `SCM_RIGHTS` fd tokens are represented per packet; `SCM_CREDENTIALS` is
+//! still deliberately out of scope because it has authentication implications.
 
-use crate::cwfd::broker_subscribable::BrokerSubscribable;
+use crate::cwfd::{broker_subscribable::BrokerSubscribable, fd_transfer_frame::PassedToken};
 
 #[doc(inline)]
 pub use crate::cwfd::broker_subscribable::{BrokerEventCallback, BrokerOpError};
@@ -34,11 +34,21 @@ pub trait BrokerSocketSeqPacketProvider: BrokerSubscribable {
     /// Connects to a listening Unix address.
     fn connect(&self, handle: u64, addr: &[u8]) -> Result<(), BrokerOpError>;
 
-    /// Sends one packet to the connected peer.
-    fn send(&self, handle: u64, payload: &[u8]) -> Result<usize, BrokerOpError>;
+    /// Sends one packet to the connected peer. `tokens` carries SCM_RIGHTS
+    /// broker handles atomically with `payload`.
+    fn send(
+        &self,
+        handle: u64,
+        payload: &[u8],
+        tokens: &[PassedToken],
+    ) -> Result<usize, BrokerOpError>;
 
-    /// Receives one packet and returns `(payload, flags)`.
-    fn recv(&self, handle: u64, max_len: u32) -> Result<(alloc::vec::Vec<u8>, u32), BrokerOpError>;
+    /// Receives one packet and returns `(payload, flags, tokens)`.
+    fn recv(
+        &self,
+        handle: u64,
+        max_len: u32,
+    ) -> Result<(alloc::vec::Vec<u8>, u32, alloc::vec::Vec<PassedToken>), BrokerOpError>;
 
     /// Applies `shutdown(2)` semantics (`0=RD`, `1=WR`, `2=RDWR`).
     fn shutdown(&self, handle: u64, how: u8) -> Result<(), BrokerOpError>;
