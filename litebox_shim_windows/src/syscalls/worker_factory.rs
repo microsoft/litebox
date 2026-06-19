@@ -437,9 +437,7 @@ mod tests {
 
     use super::*;
     use crate::nt_types::ObjectAttributes;
-    use crate::tests::{
-        TestFS, TestPlatform, const_ptr, mut_ptr, null_mut_ptr, test_platform, test_task,
-    };
+    use crate::tests::{TestFS, TestPlatform, mut_ptr, null_mut_ptr, test_platform, test_task};
 
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
     const IO_COMPLETION_QUERY_STATE: u32 = 0x0000_0001;
@@ -902,7 +900,7 @@ mod tests {
             create_worker_factory(
                 &task,
                 &mut shim_worker_factory,
-                Some(const_ptr(&bad_length)),
+                Some(crate::tests::const_ptr(&bad_length)),
                 io_completion,
                 ProcessHandle::CURRENT
             )
