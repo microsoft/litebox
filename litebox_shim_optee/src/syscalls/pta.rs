@@ -238,7 +238,6 @@ impl SystemPta {
 
     /// Handle a command of the system PTA.
     fn invoke_command(task: &Task, cmd_id: u32, params: &mut UteeParams) -> Result<(), TeeResult> {
-        #[allow(clippy::single_match_else)]
         match PtaSystemCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
             PtaSystemCommandId::DeriveTaUniqueKey => Self::derive_ta_unique_key(task, params),
             PtaSystemCommandId::MapZi => Self::map_zi(task, params),
