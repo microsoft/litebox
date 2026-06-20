@@ -24,6 +24,8 @@ const RAW_ICMP_ECHO: HandlerToken<(), RawOut> = HandlerToken::new("broker_listen
 const DNS_RESOLVE: HandlerToken<(), DnsOut> = HandlerToken::new("broker_listener.dns_resolve");
 const DNS_RESOLVE_CNAME_HEAVY: HandlerToken<(), DnsOut> =
     HandlerToken::new("broker_listener.dns_resolve_cname_heavy");
+const DNS_PARALLEL_UDP: HandlerToken<(), DnsOut> =
+    HandlerToken::new("broker_listener.dns_parallel_udp");
 
 #[derive(Serialize, Deserialize, Debug)]
 struct BLOut {
@@ -758,6 +760,79 @@ fn dns_probe_server() -> Ipv4Addr {
         .unwrap_or_else(|| Ipv4Addr::new(10, 0, 0, 1))
 }
 
+/// Build a DNS query for `hostname` with the given id and qtype (1=A, 28=AAAA).
+fn build_dns_query(hostname: &str, id: u16, qtype: u8) -> Vec<u8> {
+    let mut query = vec![
+        (id >> 8) as u8,
+        id as u8,
+        0x01,
+        0x00,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+    ];
+    for label in hostname.split('.') {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0x00, 0x00, qtype, 0x00, 0x01]);
+    query
+}
+
+/// Reproduce the musl resolver's UDP query shape: one *unconnected*, bound,
+/// non-blocking socket fires A and AAAA *in parallel* at the virtual DNS, then
+/// reads replies (matched by query id). The single-query blocking
+/// `raw_dns_probe_for` works under litebox; the real Alpine-musl agent-host
+/// hangs, and the untested difference is the parallel A+AAAA pattern. Native
+/// answers both; if litebox's broker virtual DNS delivers fewer than 2 replies,
+/// this is the agent-host hang.
+fn raw_dns_parallel_probe(hostname: &str) -> String {
+    let server = dns_probe_server();
+    let a_query = build_dns_query(hostname, 0x1234, 0x01);
+    let aaaa_query = build_dns_query(hostname, 0x5678, 0x1c);
+
+    let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        Ok(socket) => socket,
+        Err(e) => return format!("bind failed: {e}"),
+    };
+    if let Err(e) = socket.set_nonblocking(true) {
+        return format!("set_nonblocking failed: {e}");
+    }
+    if let Err(e) = socket.send_to(&a_query, (server, 53)) {
+        return format!("send A failed: {e}");
+    }
+    if let Err(e) = socket.send_to(&aaaa_query, (server, 53)) {
+        return format!("send AAAA failed: {e}");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut ids = Vec::new();
+    let mut buf = [0u8; 512];
+    while ids.len() < 2 && Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) if n >= 2 => {
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                return format!("recv_from failed after {} replies: {e}", ids.len());
+            }
+        }
+    }
+    format!("got={} server={server} ids={ids:?}", ids.len())
+}
+
 fn raw_dns_probe_for(hostname: &str) -> String {
     let server = dns_probe_server();
     let mut query = vec![
@@ -847,6 +922,14 @@ async fn handle_dns_resolve(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<DnsO
     })
 }
 
+async fn handle_dns_parallel(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<DnsOut, HandlerError> {
+    let result = raw_dns_parallel_probe("update.code.visualstudio.com");
+    Ok(DnsOut {
+        localhost_addrs: Vec::new(),
+        remote_addrs: vec![result],
+    })
+}
+
 async fn handle_dns_resolve_cname_heavy(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -897,6 +980,7 @@ pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
     register_handler!(RAW_ICMP_ECHO, handle_raw_icmp_echo);
     register_handler!(DNS_RESOLVE, handle_dns_resolve);
     register_handler!(DNS_RESOLVE_CNAME_HEAVY, handle_dns_resolve_cname_heavy);
+    register_handler!(DNS_PARALLEL_UDP, handle_dns_parallel);
     reg.single_agent_handler_test(
         "broker_listener",
         "listen_basic",
@@ -1006,6 +1090,33 @@ pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
             agent,
             &DNS_RESOLVE_CNAME_HEAVY,
             |out| Ok(format!("remote={}", out.remote_addrs.join(";"))),
+        );
+    }
+    for (id, agent) in [
+        ("BL.dns_parallel_udp.pie-glibc.dpg1", AgentName::Dpg1),
+        (
+            "BL.dns_parallel_udp.static-pie-musl.dpg1_spm",
+            AgentName::Dpg1Spm,
+        ),
+        (
+            "BL.dns_parallel_udp.non-pie-static-musl.dpg1_snm",
+            AgentName::Dpg1Snm,
+        ),
+    ] {
+        reg.single_agent_handler_test(
+            "broker_listener",
+            "dns_parallel_udp",
+            id,
+            agent,
+            &DNS_PARALLEL_UDP,
+            |out| {
+                let detail = out.remote_addrs.join(",");
+                if detail.starts_with("got=2") {
+                    Ok(detail)
+                } else {
+                    Err(detail)
+                }
+            },
         );
     }
     reg.single_agent_handler_test(
