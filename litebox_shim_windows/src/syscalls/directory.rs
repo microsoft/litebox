@@ -137,12 +137,12 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for DirectoryObjectSubsys
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for DirectoryHandleObject<Platform> {}
 
 pub(crate) struct DirectoryHandleObject<Platform: crate::ShimPlatform> {
-    directory: Arc<ObjectNode<Platform>>,
+    pub(super) directory: Arc<ObjectNode<Platform>>,
     granted_access: DirectoryAccess,
 }
 
-struct ObjectNode<Platform: crate::ShimPlatform> {
-    path: String,
+pub(super) struct ObjectNode<Platform: crate::ShimPlatform> {
+    pub(super) path: String,
     parent: Option<Weak<ObjectNode<Platform>>>,
     body: litebox::sync::RwLock<Platform, NamedObject<Platform>>,
     _not_send_without_platform: PhantomData<fn(Platform)>,
@@ -152,15 +152,13 @@ pub(crate) struct DirectoryNamespace<Platform: crate::ShimPlatform> {
     root: Arc<ObjectNode<Platform>>,
 }
 
-enum NamedObject<Platform: crate::ShimPlatform> {
+pub(super) enum NamedObject<Platform: crate::ShimPlatform> {
     Directory {
         children: BTreeMap<String, Arc<ObjectNode<Platform>>>,
     },
-    #[expect(
-        dead_code,
-        reason = "symbolic-link nodes are inserted by the next object-manager increment"
-    )]
-    Symlink { target: String },
+    Symlink {
+        target: String,
+    },
 }
 
 #[repr(C)]
@@ -221,6 +219,19 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         }
     }
 
+    fn new_symlink(
+        path: String,
+        parent: Option<Weak<ObjectNode<Platform>>>,
+        target: String,
+    ) -> Self {
+        Self {
+            path,
+            parent,
+            body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Symlink { target }),
+            _not_send_without_platform: PhantomData,
+        }
+    }
+
     fn child(&self, name: &str) -> Option<Arc<Self>> {
         match &*self.body.read() {
             NamedObject::Directory { children } => children.get(name).cloned(),
@@ -241,8 +252,19 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         }
     }
 
-    fn is_directory(&self) -> bool {
+    pub(super) fn is_directory(&self) -> bool {
         matches!(&*self.body.read(), NamedObject::Directory { .. })
+    }
+
+    pub(super) fn is_symlink(&self) -> bool {
+        matches!(&*self.body.read(), NamedObject::Symlink { .. })
+    }
+
+    pub(super) fn symlink_target(&self) -> Result<String, NtStatus> {
+        match &*self.body.read() {
+            NamedObject::Symlink { target } => Ok(target.clone()),
+            NamedObject::Directory { .. } => Err(NtStatus::OBJECT_TYPE_MISMATCH),
+        }
     }
 
     fn type_name(&self) -> &'static str {
@@ -279,6 +301,39 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         on_exists: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
         on_created: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
     ) -> NtStatus {
+        self.create_child(
+            path,
+            ObjectNode::is_directory,
+            ObjectNode::new_directory,
+            on_exists,
+            on_created,
+        )
+    }
+
+    pub(super) fn create_symlink(
+        &self,
+        path: &str,
+        target: String,
+        on_exists: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
+        on_created: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
+    ) -> NtStatus {
+        self.create_child(
+            path,
+            ObjectNode::is_symlink,
+            |path, parent| ObjectNode::new_symlink(path, parent, target),
+            on_exists,
+            on_created,
+        )
+    }
+
+    fn create_child(
+        &self,
+        path: &str,
+        existing_matches: impl Fn(&ObjectNode<Platform>) -> bool,
+        construct: impl FnOnce(String, Option<Weak<ObjectNode<Platform>>>) -> ObjectNode<Platform>,
+        on_exists: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
+        on_created: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
+    ) -> NtStatus {
         let tail = match absolute_path_tail(path) {
             Ok(tail) => tail,
             Err(status) => return status,
@@ -304,13 +359,13 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
             return NtStatus::OBJECT_TYPE_MISMATCH;
         };
         if let Some(existing) = children.get(leaf_name) {
-            if !existing.is_directory() {
+            if !existing_matches(existing) {
                 return NtStatus::OBJECT_TYPE_MISMATCH;
             }
             return on_exists(Arc::clone(existing));
         }
 
-        let node = Arc::new(ObjectNode::new_directory(
+        let node = Arc::new(construct(
             join_directory_path(&parent.path, leaf_name),
             Some(Arc::downgrade(&parent)),
         ));
@@ -320,6 +375,18 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
             children.insert(leaf_name.to_string(), node);
         }
         status
+    }
+
+    pub(super) fn resolve_symlink(
+        &self,
+        path: &str,
+    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+        let node = self.resolve_node(path)?;
+        if node.is_symlink() {
+            Ok(node)
+        } else {
+            Err(NtStatus::OBJECT_TYPE_MISMATCH)
+        }
     }
 
     fn seed_directory(&self, path: &str) {
@@ -373,8 +440,8 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct DirectoryName {
-    path: String,
+pub(super) struct DirectoryName {
+    pub(super) path: String,
 }
 
 fn normalize_directory_path(path: &str) -> String {
@@ -567,7 +634,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(entry.with_entry(|entry| Arc::clone(&entry.directory)))
     }
 
-    fn read_directory_object_attributes(
+    pub(super) fn read_directory_object_attributes(
         &self,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
         require_name: bool,

@@ -9,6 +9,7 @@ pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod process;
 pub(crate) mod registry;
+pub(crate) mod symlink;
 mod sysinfo;
 pub(crate) mod timer;
 pub(crate) mod wait_completion_packet;
@@ -131,6 +132,22 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         restart_scan: u8,
         context: Platform::RawMutPointer<u32>,
         return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtCreateSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        link_target: Platform::RawConstPointer<nt_types::UnicodeString>,
+    },
+    NtOpenSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtQuerySymbolicLinkObject {
+        link_handle: Handle,
+        link_target: Platform::RawMutPointer<nt_types::UnicodeString>,
+        returned_length: Option<Platform::RawMutPointer<u32>>,
     },
     NtCreateIoCompletion {
         io_completion_handle: Platform::RawMutPointer<Handle>,
@@ -418,6 +435,22 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 restart_scan,
                 context:*,
                 return_length:*,
+            })),
+            NtSysno::NtCreateSymbolicLinkObject => Some(sys_req!(NtCreateSymbolicLinkObject {
+                link_handle:*,
+                desired_access,
+                object_attributes:*,
+                link_target:*,
+            })),
+            NtSysno::NtOpenSymbolicLinkObject => Some(sys_req!(NtOpenSymbolicLinkObject {
+                link_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQuerySymbolicLinkObject => Some(sys_req!(NtQuerySymbolicLinkObject {
+                link_handle:{Handle::from_raw},
+                link_target:*,
+                returned_length:*,
             })),
             NtSysno::NtCreateIoCompletion => Some(sys_req!(NtCreateIoCompletion {
                 io_completion_handle:*,

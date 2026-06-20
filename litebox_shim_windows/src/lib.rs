@@ -38,6 +38,7 @@ use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::wait_completion_packet::{
     WaitCompletionPacketAssociateParameters, WaitCompletionPacketHandleObject,
@@ -543,6 +544,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         context,
                         return_length,
                     },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateSymbolicLinkObject {
+                link_handle,
+                desired_access,
+                object_attributes,
+                link_target,
+            } => {
+                let status = self.sys_nt_create_symbolic_link_object(
+                    link_handle,
+                    desired_access,
+                    object_attributes,
+                    link_target,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenSymbolicLinkObject {
+                link_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_open_symbolic_link_object(
+                    link_handle,
+                    desired_access,
+                    object_attributes,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQuerySymbolicLinkObject {
+                link_handle,
+                link_target,
+                returned_length,
+            } => {
+                let status = self.sys_nt_query_symbolic_link_object(
+                    link_handle,
+                    link_target,
+                    returned_length,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -1090,6 +1129,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, SymbolicLinkSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |link| visitor.symbolic_link(link),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         if remove_raw_handle_by_raw_fd::<Platform, IoCompletionSubsystem<Platform>>(
             &self.global.litebox,
             &self.process.handles,
@@ -1146,6 +1193,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn directory(&self, directory: DirectoryHandleObject<Platform>);
 
+    fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>);
+
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
 
     fn timer(&self, timer: TimerHandleObject<Platform>);
@@ -1179,6 +1228,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn directory(&self, directory: DirectoryHandleObject<Platform>) {
         Task::<Platform, FS>::close_directory(directory);
+    }
+
+    fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>) {
+        Task::<Platform, FS>::close_symbolic_link(link);
     }
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
