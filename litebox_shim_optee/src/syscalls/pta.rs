@@ -50,7 +50,7 @@ impl PseudoTa {
         cmd_id: u32,
         params: &UteeParams,
     ) -> Result<(), TeeResult> {
-        let _busy = task.enter_pta(self)?;
+        let _busy = task.try_set_busy(self)?;
         match self {
             Self::System => SystemPta::invoke_command(task, cmd_id, params),
         }
@@ -131,13 +131,13 @@ pub(crate) enum PtaSystemCommandId {
 type HmacSha256 = Hmac<Sha256>;
 
 impl Task {
-    /// Mark a non-concurrent PTA as busy for the duration of the returned guard,
-    /// gating both `open_pta_session` and command invocation.
+    /// Try to mark a non-concurrent PTA as busy, returning a guard that clears
+    /// the busy state on drop. This gates both session opening and command
+    /// invocation.
     ///
     /// Returns `Ok(None)` for PTAs flagged `TaFlags::CONCURRENT` (no gating).
-    /// For a non-concurrent PTA that is already busy, returns `Err(Busy)`
-    /// immediately rather than blocking/queuing the caller as OP-TEE does.
-    fn enter_pta(&self, pta: PseudoTa) -> Result<Option<PtaBusyGuard<'_>>, TeeResult> {
+    /// For a non-concurrent PTA that is busy, returns `Err(Busy)` immediately.
+    fn try_set_busy(&self, pta: PseudoTa) -> Result<Option<PtaBusyGuard<'_>>, TeeResult> {
         if pta.flags().contains(TaFlags::CONCURRENT) {
             return Ok(None);
         }
@@ -156,7 +156,7 @@ impl Task {
         pta: PseudoTa,
         params: &UteeParams,
     ) -> Result<u32, TeeResult> {
-        let _busy = self.enter_pta(pta)?;
+        let _busy = self.try_set_busy(pta)?;
 
         // OP-TEE OS permits multiple sessions to the same PTA. We cap the number
         // of PTA sessions per TA instance to prevent a TA from exhausting session
