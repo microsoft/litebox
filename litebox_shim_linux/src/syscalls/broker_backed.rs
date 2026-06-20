@@ -27,7 +27,7 @@
 //! the dispatcher thread processing the corresponding frame.
 
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use litebox::event::{Events, polling::Pollee};
 use litebox::platform::TimeProvider;
@@ -122,6 +122,20 @@ pub(crate) struct BrokerBackedCommon<P: RawSyncPrimitivesProvider + TimeProvider
     /// fd-table-slot (via `on_dup`/`on_close`), where Drop would
     /// double-release. The unsubscribe step in Drop still runs.
     release_on_drop: AtomicBool,
+    /// Number of fd-table slots referencing this (shared) broker-backed
+    /// fd object. Starts at 1 for the slot the object is created in;
+    /// [`note_slot_dup`](Self::note_slot_dup) increments it on every
+    /// additional slot (`dup`/`dup2`/fork-clone of the fd table), and
+    /// [`force_unsubscribe_if_last_slot`](Self::force_unsubscribe_if_last_slot)
+    /// decrements it on slot close. The broker subscription is shared by
+    /// every slot, so it must only be torn down when the LAST slot
+    /// closes — otherwise a forked child closing its inherited copy
+    /// (e.g. CLOEXEC on `exec`) would unsubscribe a subscription the
+    /// parent still relies on (e.g. a parent blocked in `accept()` on a
+    /// named-unix listener). Subsystems with their own slot accounting
+    /// (PTY) don't use this; subsystems that never eagerly unsubscribe
+    /// in `on_close` (socketpair) leave it at its initial value.
+    slot_refs: AtomicUsize,
 }
 
 impl<P> BrokerBackedCommon<P>
@@ -139,6 +153,7 @@ where
             sub: litebox::sync::Mutex::new(None),
             events_mask,
             release_on_drop: AtomicBool::new(true),
+            slot_refs: AtomicUsize::new(1),
         }
     }
 
@@ -159,6 +174,39 @@ where
     pub(crate) fn force_unsubscribe(&self) {
         if let Some(sub) = self.sub.lock().take() {
             sub.provider.unsubscribe(sub.handle, sub.subscription_id);
+        }
+    }
+
+    /// Records that this fd object has been installed into an additional
+    /// fd-table slot (`dup`/`dup2`/fork-clone). Must be called from the
+    /// embedding subsystem's `on_dup` alongside `provider.dup_handle`,
+    /// and balances a later [`force_unsubscribe_if_last_slot`] in
+    /// `on_close`. See [`slot_refs`](Self::slot_refs).
+    pub(crate) fn note_slot_dup(&self) {
+        self.slot_refs.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Per-slot `on_close` teardown of the broker subscription that only
+    /// actually unsubscribes when the **last** fd-table slot referencing
+    /// this shared object closes.
+    ///
+    /// The fd object (and its single broker subscription) is shared by
+    /// `Arc` across every slot it was duped/forked into. A non-final
+    /// slot close must NOT unsubscribe, or it would kill a subscription
+    /// the surviving slots still rely on — the concrete failure is a
+    /// forked child's CLOEXEC close of an inherited named-unix listener
+    /// fd tearing down the parent accept loop's subscription so the
+    /// parent never wakes. On the final slot the unsubscribe still
+    /// precedes the caller's `release`, preserving the eager-before-
+    /// release ordering strict-assertion broker StateObjects require.
+    pub(crate) fn force_unsubscribe_if_last_slot(&self) {
+        let prev = self.slot_refs.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(
+            prev > 0,
+            "BrokerBackedCommon slot underflow: on_close called with slot_refs=0"
+        );
+        if prev == 1 {
+            self.force_unsubscribe();
         }
     }
 

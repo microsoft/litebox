@@ -251,10 +251,11 @@ impl IOPollable for BrokerSocketSeqPacketFd<Platform> {
 
 impl FdEnabledSubsystemEntry for BrokerSocketSeqPacketFd<Platform> {
     fn on_dup(&self) {
+        self.common.note_slot_dup();
         let _ = self.provider.dup_handle(self.handle());
     }
     fn on_close(&self) {
-        self.common.force_unsubscribe();
+        self.common.force_unsubscribe_if_last_slot();
         self.provider.release(self.handle());
     }
 }
