@@ -450,6 +450,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ContinueOperation::Resume
     }
 
+    fn typed_handle_entry<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+    ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
+    where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
+        let Some(raw_fd) = handle.raw_fd() else {
+            return Err(NtStatus::INVALID_HANDLE);
+        };
+        let typed = {
+            let handles = self.process.handles.read();
+            match handles.fd_from_raw_integer::<Subsystem>(raw_fd) {
+                Ok(typed) => typed,
+                Err(litebox::fd::ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
+                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
+                    return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+                }
+            }
+        };
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&typed)
+            .ok_or(NtStatus::INVALID_HANDLE)
+    }
+
+    fn insert_typed_handle<Subsystem>(
+        &self,
+        entry: Subsystem::Entry,
+    ) -> Result<syscalls::Handle, NtStatus>
+    where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<Subsystem>(entry);
+        insert_raw_handle::<Platform, Subsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            typed,
+            drop,
+        )
+    }
+
+    fn close_typed_handle<Subsystem>(&self, handle: syscalls::Handle)
+    where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
+        remove_raw_handle::<Platform, Subsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            handle,
+            drop,
+        );
+    }
+
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             litebox_util_log::debug!(

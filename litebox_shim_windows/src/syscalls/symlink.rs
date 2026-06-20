@@ -9,17 +9,14 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::size_of;
 
-use litebox::fd::{ErrRawIntFd, FdEnabledSubsystem, FdEnabledSubsystemEntry};
+use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString};
 use crate::syscalls::directory::ObjectNode;
 use crate::syscalls::{Handle, directory::DirectoryName};
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    remove_raw_handle,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 const OBJ_OPENIF: u32 = 0x0000_0080;
 const OBJ_OPENLINK: u32 = 0x0000_0100;
@@ -105,22 +102,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         handle: Handle,
     ) -> Result<litebox::fd::EntryHandle<Platform, SymbolicLinkSubsystem<Platform>>, NtStatus> {
-        let Some(raw_fd) = handle.raw_fd() else {
-            return Err(NtStatus::INVALID_HANDLE);
-        };
-        let typed = {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<SymbolicLinkSubsystem<Platform>>(raw_fd) {
-                Ok(typed) => typed,
-                Err(ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
-                Err(ErrRawIntFd::InvalidSubsystem) => return Err(NtStatus::OBJECT_TYPE_MISMATCH),
-            }
-        };
-        self.global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&typed)
-            .ok_or(NtStatus::INVALID_HANDLE)
+        self.typed_handle_entry::<SymbolicLinkSubsystem<Platform>>(handle)
     }
 
     fn insert_symbolic_link_handle(
@@ -128,29 +110,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         link: Arc<ObjectNode<Platform>>,
         granted_access: SymbolicLinkAccess,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<SymbolicLinkSubsystem<Platform>>(SymbolicLinkHandleObject {
-                link,
-                granted_access,
-            });
-        insert_raw_handle::<Platform, SymbolicLinkSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
-            drop,
-        )
+        self.insert_typed_handle::<SymbolicLinkSubsystem<Platform>>(SymbolicLinkHandleObject {
+            link,
+            granted_access,
+        })
     }
 
     fn close_symbolic_link_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, SymbolicLinkSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            drop,
-        );
+        self.close_typed_handle::<SymbolicLinkSubsystem<Platform>>(handle);
     }
 
     pub(crate) fn close_symbolic_link(link: SymbolicLinkHandleObject<Platform>) {

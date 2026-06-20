@@ -28,17 +28,14 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::size_of;
 
-use litebox::fd::{ErrRawIntFd, FdEnabledSubsystem, FdEnabledSubsystemEntry};
+use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
 use crate::syscalls::Handle;
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    remove_raw_handle,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 const OBJ_OPENIF: u32 = 0x0000_0080;
 const OBJ_OPENLINK: u32 = 0x0000_0100;
@@ -288,7 +285,8 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     }
 
     fn resolve_directory(&self, path: &str) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        let node = self.resolve_node(path, false)?;
+        let tail = absolute_path_tail(path)?;
+        let node = self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, false)?;
         if node.is_directory() {
             Ok(node)
         } else {
@@ -383,7 +381,8 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         path: &str,
         open_final_symlink: bool,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        let node = self.resolve_node(path, open_final_symlink)?;
+        let tail = absolute_path_tail(path)?;
+        let node = self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, open_final_symlink)?;
         if node.is_symlink() {
             Ok(node)
         } else {
@@ -397,15 +396,6 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
             status == NtStatus::SUCCESS,
             "seeded NT object directory must have seeded ancestors: {status:?}"
         );
-    }
-
-    fn resolve_node(
-        &self,
-        path: &str,
-        open_final_symlink: bool,
-    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        let tail = absolute_path_tail(path)?;
-        self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, open_final_symlink)
     }
 
     fn resolve_tail(
@@ -653,24 +643,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         handle: Handle,
     ) -> Result<litebox::fd::EntryHandle<Platform, DirectoryObjectSubsystem<Platform>>, NtStatus>
     {
-        let Some(raw_fd) = handle.raw_fd() else {
-            return Err(NtStatus::INVALID_HANDLE);
-        };
-        let typed = {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<DirectoryObjectSubsystem<Platform>>(raw_fd) {
-                Ok(typed) => typed,
-                Err(ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
-                Err(ErrRawIntFd::InvalidSubsystem) => {
-                    return Err(NtStatus::OBJECT_TYPE_MISMATCH);
-                }
-            }
-        };
-        self.global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&typed)
-            .ok_or(NtStatus::INVALID_HANDLE)
+        self.typed_handle_entry::<DirectoryObjectSubsystem<Platform>>(handle)
     }
 
     fn directory_object_for_name_resolution(
@@ -736,29 +709,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         directory: Arc<ObjectNode<Platform>>,
         granted_access: DirectoryAccess,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<DirectoryObjectSubsystem<Platform>>(DirectoryHandleObject {
-                directory,
-                granted_access,
-            });
-        insert_raw_handle::<Platform, DirectoryObjectSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
-            drop,
-        )
+        self.insert_typed_handle::<DirectoryObjectSubsystem<Platform>>(DirectoryHandleObject {
+            directory,
+            granted_access,
+        })
     }
 
     pub(crate) fn close_directory_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, DirectoryObjectSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            drop,
-        );
+        self.close_typed_handle::<DirectoryObjectSubsystem<Platform>>(handle);
     }
 
     pub(crate) fn close_directory(directory: DirectoryHandleObject<Platform>) {
