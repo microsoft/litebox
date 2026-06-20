@@ -798,6 +798,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if start_index >= entries.len() {
             let context =
                 u32::try_from(entries.len()).expect("directory entry count fits in ULONG");
+            // Saturate the opaque resume cookie at end-of-directory so repeated
+            // continuation calls remain stable.
             if params.context.write_at_offset(0, context).is_none() {
                 return NtStatus::ACCESS_VIOLATION;
             }
@@ -948,6 +950,12 @@ mod tests {
         let offset = address
             .checked_sub(buffer_base)
             .expect("string buffer points into output buffer");
+        assert!(
+            offset
+                .checked_add(length)
+                .is_some_and(|end| end <= buffer.len()),
+            "string buffer range stays inside output buffer"
+        );
         let units: alloc::vec::Vec<u16> = buffer[offset..offset + length]
             .chunks_exact(2)
             .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("u16 bytes")))
