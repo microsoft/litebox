@@ -42,6 +42,7 @@ use crate::{
 
 const OBJ_OPENIF: u32 = 0x0000_0080;
 const OBJ_OPENLINK: u32 = 0x0000_0100;
+const MAX_SYMLINK_REPARSE_DEPTH: usize = 64;
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
     | AccessMask::READ_CONTROL.bits()
     | AccessMask::WRITE_DAC.bits()
@@ -287,7 +288,7 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     }
 
     fn resolve_directory(&self, path: &str) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        let node = self.resolve_node(path)?;
+        let node = self.resolve_node(path, false)?;
         if node.is_directory() {
             Ok(node)
         } else {
@@ -350,7 +351,7 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
             return NtStatus::OBJECT_NAME_INVALID;
         }
 
-        let parent = match self.resolve_tail(parent_tail, NtStatus::OBJECT_PATH_NOT_FOUND) {
+        let parent = match self.resolve_tail(parent_tail, NtStatus::OBJECT_PATH_NOT_FOUND, false) {
             Ok(parent) => parent,
             Err(status) => return status,
         };
@@ -380,8 +381,9 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     pub(super) fn resolve_symlink(
         &self,
         path: &str,
+        open_final_symlink: bool,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        let node = self.resolve_node(path)?;
+        let node = self.resolve_node(path, open_final_symlink)?;
         if node.is_symlink() {
             Ok(node)
         } else {
@@ -397,10 +399,46 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         );
     }
 
-    fn resolve_node(&self, path: &str) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+    fn resolve_node(
+        &self,
+        path: &str,
+        open_final_symlink: bool,
+    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
         let tail = absolute_path_tail(path)?;
+        self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, open_final_symlink)
+    }
+
+    fn resolve_tail(
+        &self,
+        tail: &str,
+        final_missing_status: NtStatus,
+        open_final_symlink: bool,
+    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+        let mut tail = tail.to_string();
+        let mut reparses = 0usize;
+
+        loop {
+            match self.resolve_tail_once(&tail, final_missing_status, open_final_symlink)? {
+                TailResolution::Resolved(node) => return Ok(node),
+                TailResolution::Reparse(next_tail) => {
+                    reparses += 1;
+                    if reparses > MAX_SYMLINK_REPARSE_DEPTH {
+                        return Err(NtStatus::NAME_TOO_LONG);
+                    }
+                    tail = next_tail;
+                }
+            }
+        }
+    }
+
+    fn resolve_tail_once(
+        &self,
+        tail: &str,
+        final_missing_status: NtStatus,
+        open_final_symlink: bool,
+    ) -> Result<TailResolution<Platform>, NtStatus> {
         if tail.is_empty() {
-            return Ok(Arc::clone(&self.root));
+            return Ok(TailResolution::Resolved(Arc::clone(&self.root)));
         }
 
         let mut current = Arc::clone(&self.root);
@@ -409,34 +447,35 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
             if component.is_empty() {
                 return Err(NtStatus::OBJECT_NAME_INVALID);
             }
-            let missing_status = if components.peek().is_some() {
-                NtStatus::OBJECT_PATH_NOT_FOUND
+            let final_component = components.peek().is_none();
+            let missing_status = if final_component {
+                final_missing_status
             } else {
-                NtStatus::OBJECT_NAME_NOT_FOUND
+                NtStatus::OBJECT_PATH_NOT_FOUND
             };
-            current = current.child(component).ok_or(missing_status)?;
-        }
-        Ok(current)
-    }
-
-    fn resolve_tail(
-        &self,
-        tail: &str,
-        missing_status: NtStatus,
-    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        let mut current = Arc::clone(&self.root);
-        if tail.is_empty() {
-            return Ok(current);
-        }
-
-        for component in tail.split('\\') {
-            if component.is_empty() {
-                return Err(NtStatus::OBJECT_NAME_INVALID);
+            let child = current.child(component).ok_or(missing_status)?;
+            if child.is_symlink() && (!final_component || !open_final_symlink) {
+                let target = normalize_reparse_target(&child.symlink_target()?)?;
+                let target_tail = absolute_path_tail(&target)?;
+                let remaining = components.collect::<Vec<_>>().join("\\");
+                let next_tail = if target_tail.is_empty() {
+                    remaining
+                } else if remaining.is_empty() {
+                    target_tail.to_string()
+                } else {
+                    alloc::format!("{target_tail}\\{remaining}")
+                };
+                return Ok(TailResolution::Reparse(next_tail));
             }
-            current = current.child(component).ok_or(missing_status)?;
+            current = child;
         }
-        Ok(current)
+        Ok(TailResolution::Resolved(current))
     }
+}
+
+enum TailResolution<Platform: crate::ShimPlatform> {
+    Resolved(Arc<ObjectNode<Platform>>),
+    Reparse(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -449,6 +488,16 @@ fn normalize_directory_path(path: &str) -> String {
         return r"\".to_string();
     }
     path.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+fn normalize_reparse_target(path: &str) -> Result<String, NtStatus> {
+    if !path.starts_with('\\') {
+        return Err(NtStatus::OBJECT_PATH_SYNTAX_BAD);
+    }
+    if path.len() > 1 && path[1..].contains(r"\\") {
+        return Err(NtStatus::OBJECT_NAME_INVALID);
+    }
+    Ok(normalize_directory_path(path))
 }
 
 fn absolute_path_tail(path: &str) -> Result<&str, NtStatus> {
@@ -646,9 +695,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Ok((None, None));
         };
         let object_attributes = read_object_attributes::<Platform>(object_attributes_ptr)?;
-        if object_attributes.attributes & OBJ_OPENLINK != 0 {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
 
         let Some(raw_name) = read_directory_name_string::<Platform>(object_attributes.object_name)?
         else {
@@ -743,6 +789,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(value) => value,
                 Err(status) => return status,
             };
+        if let Some(object_attributes) = object_attributes
+            && object_attributes.attributes & OBJ_OPENLINK != 0
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
         let granted_access = DirectoryAccess::from_desired_access(desired_access);
 
         if let Some(directory_name) = directory_name {
@@ -798,8 +849,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
         let directory_name = match self.read_directory_object_attributes(object_attributes, true) {
-            Ok((_, Some(directory_name))) => directory_name,
+            Ok((Some(object_attributes), Some(directory_name))) => {
+                if object_attributes.attributes & OBJ_OPENLINK != 0 {
+                    return NtStatus::INVALID_PARAMETER;
+                }
+                directory_name
+            }
             Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
+            Ok((None, Some(_))) => return NtStatus::INVALID_PARAMETER,
             Err(status) => return status,
         };
         let directory = {
@@ -984,6 +1041,7 @@ mod tests {
     const DIRECTORY_TRAVERSE: u32 = 0x0000_0002;
     const DIRECTORY_ALL_ACCESS: u32 = 0x000f_000f;
     const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+    const OBJ_OPENLINK: u32 = 0x0000_0100;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct ParsedDirectoryInformation {
@@ -1112,6 +1170,27 @@ mod tests {
                 NtStatus::SUCCESS
             );
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn open_directory_rejects_openlink_attribute() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let name_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let name = unicode_string(&name_units);
+            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE | OBJ_OPENLINK);
+            let mut handle = Handle::default();
+
+            assert_eq!(
+                task.sys_nt_open_directory_object(
+                    mut_ptr(&mut handle),
+                    DIRECTORY_QUERY,
+                    Some(const_ptr(&attrs)),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(handle, Handle::default());
         });
     }
 

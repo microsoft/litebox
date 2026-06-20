@@ -22,6 +22,7 @@ use crate::{
 };
 
 const OBJ_OPENIF: u32 = 0x0000_0080;
+const OBJ_OPENLINK: u32 = 0x0000_0100;
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
     | AccessMask::READ_CONTROL.bits()
     | AccessMask::WRITE_DAC.bits()
@@ -183,6 +184,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if target.is_empty() {
             return NtStatus::INVALID_PARAMETER;
         }
+        if object_attributes.attributes & OBJ_OPENLINK != 0 {
+            return NtStatus::INVALID_PARAMETER;
+        }
 
         let granted_access = SymbolicLinkAccess::from_desired_access(desired_access);
         self.create_symbolic_link(
@@ -240,15 +244,19 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(link_handle) {
             return status;
         }
-        let link_name = match self.read_directory_object_attributes(object_attributes, true) {
-            Ok((_, Some(link_name))) => link_name,
-            Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
-            Err(status) => return status,
-        };
+        let (open_link, link_name) =
+            match self.read_directory_object_attributes(object_attributes, true) {
+                Ok((Some(object_attributes), Some(link_name))) => {
+                    (object_attributes.attributes & OBJ_OPENLINK != 0, link_name)
+                }
+                Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
+                Ok((None, Some(_))) => return NtStatus::INVALID_PARAMETER,
+                Err(status) => return status,
+            };
         let link = match self
             .process
             .directory_namespace
-            .resolve_symlink(&link_name.path)
+            .resolve_symlink(&link_name.path, open_link)
         {
             Ok(link) => link,
             Err(status) => return status,
@@ -349,8 +357,10 @@ mod tests {
 
     const SYMBOLIC_LINK_QUERY: u32 = 0x0000_0001;
     const SYMBOLIC_LINK_ALL_ACCESS: u32 = 0x000f_0001;
+    const DIRECTORY_QUERY: u32 = 0x0000_0001;
     const DIRECTORY_ALL_ACCESS: u32 = 0x000f_000f;
     const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+    const OBJ_OPENLINK: u32 = 0x0000_0100;
     const OBJ_OPENIF: u32 = 0x0000_0080;
 
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
@@ -386,10 +396,44 @@ mod tests {
         handle
     }
 
-    fn open_link(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
+    fn create_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
         let path_units: Vec<u16> = path.encode_utf16().collect();
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let mut handle = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_directory_object(
+                mut_ptr(&mut handle),
+                DIRECTORY_ALL_ACCESS,
+                Some(const_ptr(&attrs)),
+                Handle::default(),
+                0,
+            ),
+            NtStatus::SUCCESS
+        );
+        handle
+    }
+
+    fn open_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
+        let path_units: Vec<u16> = path.encode_utf16().collect();
+        let name = unicode_string(&path_units);
+        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let mut handle = Handle::default();
+        assert_eq!(
+            task.sys_nt_open_directory_object(
+                mut_ptr(&mut handle),
+                DIRECTORY_QUERY,
+                Some(const_ptr(&attrs)),
+            ),
+            NtStatus::SUCCESS
+        );
+        handle
+    }
+
+    fn open_link(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
+        let path_units: Vec<u16> = path.encode_utf16().collect();
+        let name = unicode_string(&path_units);
+        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE | OBJ_OPENLINK);
         let mut handle = Handle::default();
         assert_eq!(
             task.sys_nt_open_symbolic_link_object(
@@ -471,6 +515,117 @@ mod tests {
                 NtStatus::INVALID_PARAMETER
             );
             assert_eq!(handle, Handle::default());
+        });
+    }
+
+    #[test]
+    fn open_symbolic_link_without_openlink_follows_and_detects_cycle() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let first = create_link(
+                &task,
+                r"\BaseNamedObjects\LiteBoxCycleA",
+                r"\BaseNamedObjects\LiteBoxCycleB",
+            );
+            let second = create_link(
+                &task,
+                r"\BaseNamedObjects\LiteBoxCycleB",
+                r"\BaseNamedObjects\LiteBoxCycleA",
+            );
+            let path_units: Vec<u16> = r"\BaseNamedObjects\LiteBoxCycleA".encode_utf16().collect();
+            let name = unicode_string(&path_units);
+            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let mut handle = Handle::default();
+
+            assert_eq!(
+                task.sys_nt_open_directory_object(
+                    mut_ptr(&mut handle),
+                    DIRECTORY_QUERY,
+                    Some(const_ptr(&attrs)),
+                ),
+                NtStatus::NAME_TOO_LONG
+            );
+            assert_eq!(handle, Handle::default());
+            assert_eq!(task.sys_nt_close(second), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(first), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn open_symbolic_link_openlink_returns_final_link_itself() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let created = create_link(
+                &task,
+                r"\BaseNamedObjects\LiteBoxOpenLinkFinal",
+                r"\BaseNamedObjects\MissingTarget",
+            );
+            let opened = open_link(&task, r"\BaseNamedObjects\LiteBoxOpenLinkFinal");
+            let mut output = [0u16; 64];
+            let (target, _) = query_link(&task, opened, &mut output);
+
+            assert_eq!(
+                String::from_utf16_lossy(&output[..usize::from(target.length) / 2]),
+                r"\BaseNamedObjects\MissingTarget"
+            );
+            assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(created), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn directory_open_follows_intermediate_symbolic_link() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let real = create_directory(&task, r"\BaseNamedObjects\LiteBoxRealDir");
+            let child = create_directory(&task, r"\BaseNamedObjects\LiteBoxRealDir\Child");
+            let link = create_link(
+                &task,
+                r"\BaseNamedObjects\LiteBoxDirLink",
+                r"\BaseNamedObjects\LiteBoxRealDir",
+            );
+
+            let opened = open_directory(&task, r"\BaseNamedObjects\LiteBoxDirLink\Child");
+            assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(link), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(child), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(real), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn directory_create_follows_symlinked_parent() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let real = create_directory(&task, r"\BaseNamedObjects\LiteBoxCreateRealDir");
+            let link = create_link(
+                &task,
+                r"\BaseNamedObjects\LiteBoxCreateDirLink",
+                r"\BaseNamedObjects\LiteBoxCreateRealDir",
+            );
+            let created = create_directory(&task, r"\BaseNamedObjects\LiteBoxCreateDirLink\Child");
+            let opened = open_directory(&task, r"\BaseNamedObjects\LiteBoxCreateRealDir\Child");
+
+            assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(created), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(link), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(real), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn dos_device_style_symbolic_link_resolves_through_seeded_directory() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let real = create_directory(&task, r"\BaseNamedObjects\LiteBoxDriveTarget");
+            let child = create_directory(&task, r"\BaseNamedObjects\LiteBoxDriveTarget\Child");
+            let link = create_link(&task, r"\??\C:", r"\BaseNamedObjects\LiteBoxDriveTarget");
+
+            let opened = open_directory(&task, r"\??\C:\Child");
+            assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(link), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(child), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(real), NtStatus::SUCCESS);
         });
     }
 
