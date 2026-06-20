@@ -26,6 +26,10 @@ use crate::cwfd::inet_listener_state::{
 };
 use crate::cwfd::inet_raw_state::{InetRawError, InetRawState};
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
+use crate::cwfd::unix_stream_state::{
+    UnixStreamError, UnixStreamState, decode_addr as decode_unix_stream_addr,
+    encode_addr as encode_unix_stream_addr,
+};
 use crate::eventfd_state::{EventfdError, EventfdState};
 use crate::inotify_dispatcher::InotifyDispatcher;
 use crate::inotify_state::InotifyState;
@@ -378,6 +382,16 @@ fn dispatch_request(
         Opcode::SocketSeqPacketGetPeerName => {
             handle_socket_seqpacket_getpeername(registry, request, in_fds)
         }
+        Opcode::CreateUnixStream => handle_create_unix_stream(registry, request, in_fds),
+        Opcode::UnixStreamBind => handle_unix_stream_bind(registry, request, in_fds),
+        Opcode::UnixStreamListen => handle_unix_stream_listen(registry, request, in_fds),
+        Opcode::UnixStreamAccept => handle_unix_stream_accept(registry, request, in_fds),
+        Opcode::UnixStreamConnect => handle_unix_stream_connect(registry, request, in_fds),
+        Opcode::UnixStreamSend => handle_unix_stream_send(registry, request, in_fds),
+        Opcode::UnixStreamRecv => handle_unix_stream_recv(registry, request, in_fds),
+        Opcode::UnixStreamShutdown => handle_unix_stream_shutdown(registry, request, in_fds),
+        Opcode::UnixStreamGetSockName => handle_unix_stream_getsockname(registry, request, in_fds),
+        Opcode::UnixStreamGetPeerName => handle_unix_stream_getpeername(registry, request, in_fds),
         Opcode::CreateSocketPair => handle_create_socketpair(registry, request, in_fds),
         Opcode::ReadSocketPair => handle_read_socketpair(registry, request, in_fds),
         Opcode::WriteSocketPair => handle_write_socketpair(registry, request, in_fds),
@@ -500,6 +514,16 @@ fn dispatch_request(
         | Opcode::SocketSeqPacketShutdownResponse
         | Opcode::SocketSeqPacketGetSockNameResponse
         | Opcode::SocketSeqPacketGetPeerNameResponse
+        | Opcode::CreateUnixStreamResponse
+        | Opcode::UnixStreamBindResponse
+        | Opcode::UnixStreamListenResponse
+        | Opcode::UnixStreamAcceptResponse
+        | Opcode::UnixStreamConnectResponse
+        | Opcode::UnixStreamSendResponse
+        | Opcode::UnixStreamRecvResponse
+        | Opcode::UnixStreamShutdownResponse
+        | Opcode::UnixStreamGetSockNameResponse
+        | Opcode::UnixStreamGetPeerNameResponse
         | Opcode::PtyReadResponse
         | Opcode::PtyWriteResponse
         | Opcode::SubscribePtyResponse
@@ -1087,6 +1111,7 @@ fn resolve_timerfd(
         | StateObjectEnum::SocketPairEnd(_)
         | StateObjectEnum::SocketDgram(_)
         | StateObjectEnum::SocketSeqPacket(_)
+        | StateObjectEnum::UnixStream(_)
         | StateObjectEnum::TcpConn(_)
         | StateObjectEnum::InetListener(_)
         | StateObjectEnum::InetDgram(_)
@@ -1426,6 +1451,7 @@ fn resolve_pipe_read(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::SocketSeqPacket(_)
+            | StateObjectEnum::UnixStream(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
@@ -1462,6 +1488,7 @@ fn resolve_pipe_write(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::SocketSeqPacket(_)
+            | StateObjectEnum::UnixStream(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
@@ -1632,6 +1659,7 @@ fn resolve_socket_dgram(
             StateObjectEnum::SocketDgram(state) => Ok(Arc::clone(state)),
             StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketSeqPacket(_)
+            | StateObjectEnum::UnixStream(_)
             | StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
@@ -1923,6 +1951,7 @@ fn resolve_socketpair_end(
             StateObjectEnum::SocketPairEnd(end) => Ok(Arc::clone(end)),
             StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::SocketSeqPacket(_)
+            | StateObjectEnum::UnixStream(_)
             | StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
@@ -2274,6 +2303,7 @@ fn resolve_tcp_conn(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::SocketSeqPacket(_)
+            | StateObjectEnum::UnixStream(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::InetRaw(_)
@@ -2627,6 +2657,7 @@ fn resolve_inet_dgram(
         | StateObjectEnum::SocketPairEnd(_)
         | StateObjectEnum::SocketDgram(_)
         | StateObjectEnum::SocketSeqPacket(_)
+        | StateObjectEnum::UnixStream(_)
         | StateObjectEnum::TcpConn(_)
         | StateObjectEnum::InetListener(_)
         | StateObjectEnum::InetRaw(_)
@@ -3597,6 +3628,7 @@ fn resolve_pty(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::SocketSeqPacket(_)
+            | StateObjectEnum::UnixStream(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
@@ -4741,7 +4773,8 @@ fn resolve_socket_seqpacket(
     match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::UnixSocket) {
         Ok(state) => match state.as_ref() {
             StateObjectEnum::SocketSeqPacket(seqpacket) => Ok(Arc::clone(seqpacket)),
-            StateObjectEnum::Eventfd(_)
+            StateObjectEnum::UnixStream(_)
+            | StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
@@ -4965,7 +4998,7 @@ fn handle_socket_seqpacket_send(
     if !in_fds.is_empty() {
         return protocol_err(Opcode::SocketSeqPacketSendResponse);
     }
-    let (handle_id, payload) = match proto::parse_socket_seqpacket_send_body(request.body) {
+    let (handle_id, tokens, payload) = match proto::parse_socket_seqpacket_send_body(request.body) {
         Ok(v) => v,
         Err(_) => return protocol_err(Opcode::SocketSeqPacketSendResponse),
     };
@@ -4978,7 +5011,7 @@ fn handle_socket_seqpacket_send(
             );
         }
     };
-    match state.send(&payload) {
+    match state.send(&payload, &tokens) {
         Ok(n) => HandlerResult {
             frame: proto::build_socket_seqpacket_send_response_ok(n as u64),
             out_fd: None,
@@ -5012,8 +5045,10 @@ fn handle_socket_seqpacket_recv(
         }
     };
     match state.recv(max_len as usize) {
-        Ok((payload, flags)) => HandlerResult {
-            frame: proto::build_socket_seqpacket_recv_response_ok(&payload, flags),
+        Ok((payload, flags, tokens)) => HandlerResult {
+            frame: proto::build_socket_seqpacket_recv_response_ok_with_tokens(
+                &payload, flags, &tokens,
+            ),
             out_fd: None,
         },
         Err(e) => status_err(
@@ -5119,5 +5154,327 @@ fn handle_socket_seqpacket_getpeername(
             Opcode::SocketSeqPacketGetPeerNameResponse,
             socket_seqpacket_status(e),
         ),
+    }
+}
+
+fn unix_stream_status(err: UnixStreamError) -> StatusCode {
+    match err {
+        UnixStreamError::WouldBlock => StatusCode::WouldBlock,
+        UnixStreamError::NoPeer
+        | UnixStreamError::NotConnected
+        | UnixStreamError::NotListening
+        | UnixStreamError::ConnectionRefused => StatusCode::UnknownHandle,
+        UnixStreamError::InvalidSockaddr
+        | UnixStreamError::AlreadyBound
+        | UnixStreamError::AddrInUse
+        | UnixStreamError::Shutdown
+        | UnixStreamError::AlreadyConnected => StatusCode::InvalidValue,
+    }
+}
+
+fn resolve_unix_stream(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+) -> Result<Arc<UnixStreamState>, HandlerResult> {
+    match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::UnixSocket) {
+        Ok(state) => match state.as_ref() {
+            StateObjectEnum::UnixStream(stream) => Ok(Arc::clone(stream)),
+            StateObjectEnum::SocketSeqPacket(_)
+            | StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::SocketDgram(_)
+            | StateObjectEnum::TcpConn(_)
+            | StateObjectEnum::InetListener(_)
+            | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_)
+            | StateObjectEnum::HostFdAttached(_)
+            | StateObjectEnum::Timerfd(_) => Err(status_err(
+                Opcode::ReleaseResponse,
+                StatusCode::SubsystemMismatch,
+            )),
+        },
+        Err(StateRegistryError::UnknownHandle(_)) => Err(status_err(
+            Opcode::ReleaseResponse,
+            StatusCode::UnknownHandle,
+        )),
+        Err(StateRegistryError::TagMismatch { .. }) => Err(status_err(
+            Opcode::ReleaseResponse,
+            StatusCode::SubsystemMismatch,
+        )),
+        Err(_) => Err(status_err(Opcode::ReleaseResponse, StatusCode::Internal)),
+    }
+}
+
+fn handle_create_unix_stream(
+    registry: &BrokerStateRegistry,
+    _request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::CreateUnixStreamResponse);
+    }
+    let handle = registry.register(UnixStreamState::new());
+    HandlerResult {
+        frame: proto::build_create_unix_stream_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn handle_unix_stream_bind(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnixStreamBindResponse);
+    }
+    let (handle_id, raw_addr) = match proto::parse_unix_stream_bind_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnixStreamBindResponse),
+    };
+    let state = match resolve_unix_stream(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => return status_err(Opcode::UnixStreamBindResponse, StatusCode::UnknownHandle),
+    };
+    let addr = match decode_unix_stream_addr(&raw_addr) {
+        Ok(a) => a,
+        Err(e) => return status_err(Opcode::UnixStreamBindResponse, unix_stream_status(e)),
+    };
+    match state.bind(addr) {
+        Ok(bound) => HandlerResult {
+            frame: proto::build_unix_stream_bind_response_ok(&encode_unix_stream_addr(&bound)),
+            out_fd: None,
+        },
+        Err(e) => status_err(Opcode::UnixStreamBindResponse, unix_stream_status(e)),
+    }
+}
+
+fn handle_unix_stream_listen(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnixStreamListenResponse);
+    }
+    let (handle_id, backlog) = match proto::parse_unix_stream_listen_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnixStreamListenResponse),
+    };
+    let state = match resolve_unix_stream(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => return status_err(Opcode::UnixStreamListenResponse, StatusCode::UnknownHandle),
+    };
+    match state.listen(backlog) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_unix_stream_listen_response_ok(),
+            out_fd: None,
+        },
+        Err(e) => status_err(Opcode::UnixStreamListenResponse, unix_stream_status(e)),
+    }
+}
+
+fn handle_unix_stream_accept(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnixStreamAcceptResponse);
+    }
+    let handle_id = match proto::parse_unix_stream_accept_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnixStreamAcceptResponse),
+    };
+    let state = match resolve_unix_stream(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => return status_err(Opcode::UnixStreamAcceptResponse, StatusCode::UnknownHandle),
+    };
+    match state.accept() {
+        Ok(accepted) => {
+            let h = registry.register(accepted);
+            HandlerResult {
+                frame: proto::build_unix_stream_accept_response_ok(h.id()),
+                out_fd: None,
+            }
+        }
+        Err(e) => status_err(Opcode::UnixStreamAcceptResponse, unix_stream_status(e)),
+    }
+}
+
+fn handle_unix_stream_connect(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnixStreamConnectResponse);
+    }
+    let (handle_id, raw_addr) = match proto::parse_unix_stream_connect_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnixStreamConnectResponse),
+    };
+    let state = match resolve_unix_stream(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => return status_err(Opcode::UnixStreamConnectResponse, StatusCode::UnknownHandle),
+    };
+    let addr = match decode_unix_stream_addr(&raw_addr) {
+        Ok(a) => a,
+        Err(e) => return status_err(Opcode::UnixStreamConnectResponse, unix_stream_status(e)),
+    };
+    match state.connect(addr) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_unix_stream_connect_response_ok(),
+            out_fd: None,
+        },
+        Err(e) => status_err(Opcode::UnixStreamConnectResponse, unix_stream_status(e)),
+    }
+}
+
+fn handle_unix_stream_send(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnixStreamSendResponse);
+    }
+    let (handle_id, payload) = match proto::parse_unix_stream_send_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnixStreamSendResponse),
+    };
+    let state = match resolve_unix_stream(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => return status_err(Opcode::UnixStreamSendResponse, StatusCode::UnknownHandle),
+    };
+    match state.send(&payload) {
+        Ok(n) => HandlerResult {
+            frame: proto::build_unix_stream_send_response_ok(n as u64),
+            out_fd: None,
+        },
+        Err(e) => status_err(Opcode::UnixStreamSendResponse, unix_stream_status(e)),
+    }
+}
+
+fn handle_unix_stream_recv(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnixStreamRecvResponse);
+    }
+    let (handle_id, max_len) = match proto::parse_unix_stream_recv_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnixStreamRecvResponse),
+    };
+    let state = match resolve_unix_stream(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => return status_err(Opcode::UnixStreamRecvResponse, StatusCode::UnknownHandle),
+    };
+    match state.recv(max_len as usize) {
+        Ok(payload) => HandlerResult {
+            frame: proto::build_unix_stream_recv_response_ok(&payload),
+            out_fd: None,
+        },
+        Err(e) => status_err(Opcode::UnixStreamRecvResponse, unix_stream_status(e)),
+    }
+}
+
+fn handle_unix_stream_shutdown(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnixStreamShutdownResponse);
+    }
+    let (handle_id, how) = match proto::parse_unix_stream_shutdown_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnixStreamShutdownResponse),
+    };
+    let state = match resolve_unix_stream(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::UnixStreamShutdownResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    match state.shutdown(how) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_unix_stream_shutdown_response_ok(),
+            out_fd: None,
+        },
+        Err(e) => status_err(Opcode::UnixStreamShutdownResponse, unix_stream_status(e)),
+    }
+}
+
+fn handle_unix_stream_getsockname(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnixStreamGetSockNameResponse);
+    }
+    let handle_id = match proto::parse_handle_body(request.body, Opcode::UnixStreamGetSockName) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnixStreamGetSockNameResponse),
+    };
+    let state = match resolve_unix_stream(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::UnixStreamGetSockNameResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    HandlerResult {
+        frame: proto::build_unix_stream_getsockname_response_ok(&encode_unix_stream_addr(
+            &state.getsockname(),
+        )),
+        out_fd: None,
+    }
+}
+
+fn handle_unix_stream_getpeername(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnixStreamGetPeerNameResponse);
+    }
+    let handle_id = match proto::parse_handle_body(request.body, Opcode::UnixStreamGetPeerName) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnixStreamGetPeerNameResponse),
+    };
+    let state = match resolve_unix_stream(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::UnixStreamGetPeerNameResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    match state.getpeername() {
+        Ok(addr) => HandlerResult {
+            frame: proto::build_unix_stream_getpeername_response_ok(&encode_unix_stream_addr(
+                &addr,
+            )),
+            out_fd: None,
+        },
+        Err(e) => status_err(Opcode::UnixStreamGetPeerNameResponse, unix_stream_status(e)),
     }
 }

@@ -1,31 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Runner-side implementation of [`BrokerSocketSeqPacketProvider`].
+//! Runner-side implementation of [`BrokerUnixStreamProvider`].
 
 use litebox_common_linux::broker_eventfd::{NotificationCallback, NotificationDispatcher};
 use litebox_common_linux::cwfd::{
-    broker_socket_seqpacket_provider::{
-        BrokerEventCallback, BrokerOpError, BrokerSocketSeqPacketProvider,
-    },
     broker_subscribable::BrokerSubscribable,
-    fd_transfer_frame::PassedToken,
+    broker_unix_stream_provider::{BrokerEventCallback, BrokerOpError, BrokerUnixStreamProvider},
 };
 use litebox_common_linux::fd_token_client::{ClientError, FdTokenClient};
 use std::sync::Arc;
 
-pub struct RunnerBrokerSocketSeqPacketProvider {
+pub struct RunnerBrokerUnixStreamProvider {
     client: Arc<FdTokenClient>,
     dispatcher: Arc<NotificationDispatcher>,
 }
 
-impl RunnerBrokerSocketSeqPacketProvider {
+impl RunnerBrokerUnixStreamProvider {
     pub fn new(client: Arc<FdTokenClient>, dispatcher: Arc<NotificationDispatcher>) -> Self {
         Self { client, dispatcher }
     }
 }
 
-impl BrokerSubscribable for RunnerBrokerSocketSeqPacketProvider {
+impl BrokerSubscribable for RunnerBrokerUnixStreamProvider {
     fn subscribe(
         &self,
         handle: u64,
@@ -47,13 +44,13 @@ impl BrokerSubscribable for RunnerBrokerSocketSeqPacketProvider {
     fn unsubscribe(&self, handle: u64, subscription_id: u64) {
         self.dispatcher.unregister_callback(subscription_id);
         if let Err(e) = self.client.unsubscribe(handle, subscription_id) {
-            tracing::warn!(handle, subscription_id, error = %e, "socket seqpacket unsubscribe failed");
+            tracing::warn!(handle, subscription_id, error = %e, "unix stream unsubscribe failed");
         }
     }
 
     fn release(&self, handle: u64) {
         if let Err(e) = self.client.release(handle) {
-            tracing::warn!(handle, error = %e, "socket seqpacket release failed; broker handle may leak");
+            tracing::warn!(handle, error = %e, "unix stream release failed; broker handle may leak");
         }
     }
 
@@ -70,79 +67,64 @@ impl BrokerSubscribable for RunnerBrokerSocketSeqPacketProvider {
     }
 }
 
-impl BrokerSocketSeqPacketProvider for RunnerBrokerSocketSeqPacketProvider {
+impl BrokerUnixStreamProvider for RunnerBrokerUnixStreamProvider {
     fn create(&self) -> Result<u64, BrokerOpError> {
         self.client
-            .socket_seqpacket_create()
+            .unix_stream_create()
             .map_err(client_err_to_broker_err)
     }
 
     fn bind(&self, handle: u64, addr: &[u8]) -> Result<Vec<u8>, BrokerOpError> {
         self.client
-            .socket_seqpacket_bind(handle, addr)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn create_socketpair(&self) -> Result<(u64, u64), BrokerOpError> {
-        self.client
-            .socket_seqpacket_create_socketpair()
+            .unix_stream_bind(handle, addr)
             .map_err(client_err_to_broker_err)
     }
 
     fn listen(&self, handle: u64, backlog: u32) -> Result<(), BrokerOpError> {
         self.client
-            .socket_seqpacket_listen(handle, backlog)
+            .unix_stream_listen(handle, backlog)
             .map_err(client_err_to_broker_err)
     }
 
     fn accept(&self, handle: u64) -> Result<u64, BrokerOpError> {
         self.client
-            .socket_seqpacket_accept(handle)
+            .unix_stream_accept(handle)
             .map_err(client_err_to_broker_err)
     }
 
     fn connect(&self, handle: u64, addr: &[u8]) -> Result<(), BrokerOpError> {
         self.client
-            .socket_seqpacket_connect(handle, addr)
+            .unix_stream_connect(handle, addr)
             .map_err(client_err_to_broker_err)
     }
 
-    fn send(
-        &self,
-        handle: u64,
-        payload: &[u8],
-        tokens: &[PassedToken],
-    ) -> Result<usize, BrokerOpError> {
+    fn send(&self, handle: u64, payload: &[u8]) -> Result<usize, BrokerOpError> {
         self.client
-            .socket_seqpacket_send(handle, payload, tokens)
+            .unix_stream_send(handle, payload)
             .map_err(client_err_to_broker_err)
     }
 
-    fn recv(
-        &self,
-        handle: u64,
-        max_len: u32,
-    ) -> Result<(Vec<u8>, u32, Vec<PassedToken>), BrokerOpError> {
+    fn recv(&self, handle: u64, max_len: u32) -> Result<Vec<u8>, BrokerOpError> {
         self.client
-            .socket_seqpacket_recv(handle, max_len)
+            .unix_stream_recv(handle, max_len)
             .map_err(client_err_to_broker_err)
     }
 
     fn shutdown(&self, handle: u64, how: u8) -> Result<(), BrokerOpError> {
         self.client
-            .socket_seqpacket_shutdown(handle, how)
+            .unix_stream_shutdown(handle, how)
             .map_err(client_err_to_broker_err)
     }
 
     fn getsockname(&self, handle: u64) -> Result<Vec<u8>, BrokerOpError> {
         self.client
-            .socket_seqpacket_getsockname(handle)
+            .unix_stream_getsockname(handle)
             .map_err(client_err_to_broker_err)
     }
 
     fn getpeername(&self, handle: u64) -> Result<Vec<u8>, BrokerOpError> {
         self.client
-            .socket_seqpacket_getpeername(handle)
+            .unix_stream_getpeername(handle)
             .map_err(client_err_to_broker_err)
     }
 
