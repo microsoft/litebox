@@ -15,10 +15,7 @@ use litebox_common_optee::{
 use num_enum::TryFromPrimitive;
 use zerocopy::IntoBytes;
 
-use crate::{
-    Task, UserConstPtr, UserMutPtr,
-    syscalls::pta::{close_pta_session, is_pta, is_pta_session},
-};
+use crate::{Task, UserConstPtr, UserMutPtr, syscalls::pta::PseudoTa};
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> Option<usize> {
@@ -165,6 +162,7 @@ impl Task {
 
     /// A system call to open a session with a PTA or another user-mode TA.
     pub fn sys_open_ta_session(
+        &self,
         ta_uuid: TeeUuid,
         _cancel_req_to: u32,
         usr_params: UteeParams,
@@ -175,12 +173,14 @@ impl Task {
         ret_orig
             .write_at_offset(0, TeeOrigin::Tee)
             .ok_or(TeeResult::AccessDenied)?;
-        if is_pta(&ta_uuid, &usr_params) {
+        if let Some(pta) = PseudoTa::from_uuid(&ta_uuid) {
             // `open_ta_session` syscall lets a user-mode TA open a session to a PTA which provides
             // several import services (it works as a proxy for extra system calls).
-            ta_sess_id
-                .write_at_offset(0, crate::SessionIdPool::get_pta_session_id())
-                .ok_or(TeeResult::AccessDenied)?;
+            let session_id = self.open_pta_session(pta, &usr_params)?;
+            if ta_sess_id.write_at_offset(0, session_id).is_none() {
+                self.close_pta_session(session_id);
+                return Err(TeeResult::AccessDenied);
+            }
             Ok(())
         } else {
             // `open_ta_session` syscall lets a user-mode TA open a session to another user-mode TA
@@ -196,9 +196,8 @@ impl Task {
 
     /// A system call to close an opened session.
     #[allow(clippy::unnecessary_wraps)]
-    pub fn sys_close_ta_session(ta_sess_id: u32) -> Result<(), TeeResult> {
-        if is_pta_session(ta_sess_id) {
-            close_pta_session(ta_sess_id);
+    pub fn sys_close_ta_session(&self, ta_sess_id: u32) -> Result<(), TeeResult> {
+        if self.close_pta_session(ta_sess_id).is_some() {
             Ok(())
         } else {
             #[cfg(debug_assertions)]
@@ -221,9 +220,8 @@ impl Task {
         ret_orig
             .write_at_offset(0, TeeOrigin::Tee)
             .ok_or(TeeResult::AccessDenied)?;
-        if is_pta_session(ta_sess_id) {
-            // TODO: check whether `ta_sess_id` is associated with the system PTA.
-            self.handle_system_pta_command(cmd_id, &params)
+        if let Some(pta) = self.pta_for_session(ta_sess_id) {
+            pta.invoke_command(self, cmd_id, &params)
         } else {
             #[cfg(debug_assertions)]
             todo!("support inter TA interaction");

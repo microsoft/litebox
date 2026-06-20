@@ -9,11 +9,12 @@
 extern crate alloc;
 
 use crate::loader::elf::ElfLoaderError;
+use crate::syscalls::pta::PseudoTa;
 use aes::{Aes128, Aes192, Aes256};
 use alloc::{sync::Arc, vec};
 use core::cell::Cell;
 use ctr::Ctr128BE;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use litebox::{
     LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
@@ -148,6 +149,7 @@ impl OpteeShimBuilder {
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
             ta_uuid_map: TaUuidMap::new(),
+            pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
         });
         OpteeShim(global)
     }
@@ -163,6 +165,14 @@ struct GlobalState {
     _litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: TaUuidMap,
+    /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
+    /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
+    /// rather than queued.
+    ///
+    /// TODO: OP-TEE serializes concurrent access to a non-concurrent PTA by
+    /// blocking/queuing the caller until the PTA is free. We currently reject
+    /// instead of serialize; revisit if a PTA needs true serialization.
+    pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
 }
 
 impl GlobalState {
@@ -244,6 +254,7 @@ impl OpteeShim {
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
+                pta_sessions: spin::mutex::SpinMutex::new(HashMap::new()),
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
@@ -439,7 +450,7 @@ impl Task {
                 if let Some(ta_uuid) = ta_uuid.read_at_offset(0)
                     && let Some(usr_params) = usr_params.read_at_offset(0)
                 {
-                    Task::sys_open_ta_session(
+                    self.sys_open_ta_session(
                         ta_uuid,
                         cancel_req_to,
                         usr_params,
@@ -450,7 +461,7 @@ impl Task {
                     Err(TeeResult::BadParameters)
                 }
             }
-            SyscallRequest::CloseTaSession { ta_sess_id } => Task::sys_close_ta_session(ta_sess_id),
+            SyscallRequest::CloseTaSession { ta_sess_id } => self.sys_close_ta_session(ta_sess_id),
             SyscallRequest::InvokeTaCommand {
                 ta_sess_id,
                 cancel_req_to,
@@ -1285,6 +1296,8 @@ struct Task {
     tee_obj_map: TeeObjMap,
     /// TA handle to UUID map
     ta_handle_map: TaHandleMap,
+    /// PTA sessions opened by this TA task, mapping each session ID to its PTA.
+    pta_sessions: spin::mutex::SpinMutex<HashMap<u32, PseudoTa>>,
     /// TA entry point
     ta_entry_point: Cell<usize>,
     /// TA stack base address
@@ -1310,6 +1323,12 @@ impl ThreadState {
             init_state: Cell::new(ThreadInitState::None),
             initialized: Cell::new(false),
         }
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.close_all_pta_sessions();
     }
 }
 
@@ -1341,8 +1360,7 @@ pub(crate) enum ThreadInitState {
 /// With MAX_RECYCLABLE_SESSION_ID = 65536:
 /// - Bitmap memory usage: 65536 bits = 8 KB
 /// - Recyclable IDs: 1..=65536 (65536 IDs)
-/// - Fallback (non-recyclable) IDs: 65537..=0xffff_fffd (~4.3B IDs, excluding PTA_SESSION_ID)
-/// - PTA_SESSION_ID (0xffff_fffe) is reserved and never allocated
+/// - Fallback (non-recyclable) IDs: 65537..=u32::MAX (~4.3B IDs)
 ///
 /// Design notes:
 /// - A single TA instance can serve many concurrent sessions (no per-instance cap),
@@ -1357,6 +1375,8 @@ pub(crate) struct SessionIdPool {
     pool: litebox::utils::id_pool::IdPool,
     /// Next one-time ID when the recyclable pool is exhausted.
     fallback_next: u32,
+    /// Whether all fallback IDs have been issued.
+    fallback_exhausted: bool,
 }
 
 fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
@@ -1367,6 +1387,7 @@ fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
                 SessionIdPool::MAX_RECYCLABLE_SESSION_ID,
             ),
             fallback_next: SessionIdPool::MAX_RECYCLABLE_SESSION_ID + 1,
+            fallback_exhausted: false,
         })
     })
 }
@@ -1374,27 +1395,32 @@ fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
 impl SessionIdPool {
     /// Maximum recyclable session ID tracked by the bitmap.
     const MAX_RECYCLABLE_SESSION_ID: u32 = 65536;
-    /// Reserved session ID for PTA.
-    const PTA_SESSION_ID: u32 = 0xffff_fffe;
-
     /// Allocate a new session ID.
     ///
     /// Returns `None` if all recyclable session IDs are currently in use and
     /// the fallback one-time IDs are exhausted.
     pub fn allocate() -> Option<u32> {
         let mut pool = session_id_pool().lock();
+        pool.allocate_inner()
+    }
 
+    fn allocate_inner(&mut self) -> Option<u32> {
         // Try recyclable pool first (pool ID 0 → session ID 1, etc.)
-        if let Some(id) = pool.pool.allocate() {
+        if let Some(id) = self.pool.allocate() {
             return Some(id + 1);
         }
 
         // Bitmap exhausted - use fallback one-time IDs if available
-        let fallback_id = pool.fallback_next;
-        if fallback_id >= Self::PTA_SESSION_ID {
+        if self.fallback_exhausted {
             return None;
         }
-        pool.fallback_next = fallback_id + 1;
+
+        let fallback_id = self.fallback_next;
+        if fallback_id == u32::MAX {
+            self.fallback_exhausted = true;
+        } else {
+            self.fallback_next = fallback_id + 1;
+        }
         Some(fallback_id)
     }
 
@@ -1405,10 +1431,6 @@ impl SessionIdPool {
         }
 
         session_id_pool().lock().pool.recycle(session_id - 1);
-    }
-
-    pub fn get_pta_session_id() -> u32 {
-        Self::PTA_SESSION_ID
     }
 }
 
@@ -1434,6 +1456,7 @@ mod test_utils {
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
+                pta_sessions: spin::mutex::SpinMutex::new(HashMap::new()),
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
