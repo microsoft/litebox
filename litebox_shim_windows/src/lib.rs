@@ -32,7 +32,7 @@ use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
 use crate::syscalls::directory::{
-    DirectoryHandleObject, DirectoryObject, DirectoryObjectSubsystem,
+    DirectoryHandleObject, DirectoryNamespace, DirectoryObjectSubsystem,
 };
 use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
@@ -91,8 +91,7 @@ pub(crate) type WindowsVirtualAllocations<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
 pub(crate) type WindowsEventNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Weak<EventObject<Platform>>>>;
-pub(crate) type WindowsDirectoryNamespace<Platform> =
-    litebox::sync::RwLock<Platform, BTreeMap<String, Arc<DirectoryObject<Platform>>>>;
+pub(crate) type WindowsDirectoryNamespace<Platform> = DirectoryNamespace<Platform>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {

@@ -88,6 +88,7 @@ impl NtStatus {
             }
             0x00000102 => "STATUS_TIMEOUT: The given timeout interval expired",
             0x00000103 => "STATUS_PENDING: The operation that was requested is pending completion",
+            0x00000105 => "STATUS_MORE_ENTRIES: More entries are available",
             0x00010001 => "DBG_EXCEPTION_HANDLED: Exception handled by debugger",
             0x00010002 => "DBG_CONTINUE: Continue from exception",
             0x40000000 => "STATUS_OBJECT_NAME_EXISTS: The object name already exists",
@@ -231,6 +232,9 @@ impl NtStatus {
 
     /// STATUS_TIMEOUT
     pub const TIMEOUT: Self = Self::from_raw(0x00000102);
+
+    /// STATUS_MORE_ENTRIES
+    pub const MORE_ENTRIES: Self = Self::from_raw(0x00000105);
 
     /// DBG_EXCEPTION_HANDLED
     pub const EXCEPTION_HANDLED: Self = Self::from_raw(0x00010001);
