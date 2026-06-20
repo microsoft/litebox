@@ -19,7 +19,7 @@ use num_enum::TryFromPrimitive;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
-pub(crate) struct SystemPta;
+struct SystemPta;
 
 /// A common interface to interact with various PTAs including the system PTA.
 ///
@@ -111,7 +111,7 @@ const TA_DERIVED_EXTRA_DATA_MAX_SIZE: usize = 1024;
 /// `PTA_SYSTEM_*` command ID from `optee_os/lib/libutee/include/pta_system.h`
 #[derive(Clone, Copy, TryFromPrimitive)]
 #[repr(u32)]
-pub(crate) enum PtaSystemCommandId {
+enum PtaSystemCommandId {
     AddRngEntropy = PTA_SYSTEM_ADD_RNG_ENTROPY,
     DeriveTaUniqueKey = PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY,
     MapZi = PTA_SYSTEM_MAP_ZI,
