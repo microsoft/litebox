@@ -164,11 +164,6 @@ impl Drop for BrokerSession {
     }
 }
 
-pub(crate) fn drop_references_for_session(broker: &BrokerCore, session_id: SessionId) {
-    let mut references = broker.references.write();
-    references.retain(|_, reference| reference.session_id != session_id);
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, event};

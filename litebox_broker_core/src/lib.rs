@@ -130,6 +130,7 @@ impl BrokerCore {
     }
 
     pub(crate) fn close_session(&self, session_id: session::SessionId) {
-        session::drop_references_for_session(self, session_id);
+        let mut references = self.references.write();
+        references.retain(|_, reference| reference.session_id != session_id);
     }
 }
