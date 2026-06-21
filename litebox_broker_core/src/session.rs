@@ -131,7 +131,13 @@ impl BrokerSession {
         handle: ObjectHandle,
         required_rights: ObjectRights,
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
-        let reference = validate_handle(references, self.session_id, handle, required_rights)?;
+        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
+        if reference.session_id != self.session_id {
+            return Err(BrokerError::UnknownObject);
+        }
+        if !reference.rights.contains(required_rights) {
+            return Err(BrokerError::InvalidRights);
+        }
         self.core
             .policy
             .authorize_use_event(self.caller_credential, required_rights)?;
@@ -161,23 +167,6 @@ impl Drop for BrokerSession {
 pub(crate) fn drop_references_for_session(broker: &BrokerCore, session_id: SessionId) {
     let mut references = broker.references.write();
     references.retain(|_, reference| reference.session_id != session_id);
-}
-
-fn validate_handle(
-    references: &BTreeMap<ObjectHandle, ObjectReference>,
-    session_id: SessionId,
-    handle: ObjectHandle,
-    required_rights: ObjectRights,
-) -> Result<&ObjectReference> {
-    let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-    if reference.session_id != session_id {
-        return Err(BrokerError::UnknownObject);
-    }
-    if !reference.rights.contains(required_rights) {
-        return Err(BrokerError::InvalidRights);
-    }
-
-    Ok(reference)
 }
 
 #[cfg(test)]
