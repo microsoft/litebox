@@ -23,10 +23,10 @@ pub mod event;
 mod policy;
 mod session;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
 
@@ -77,7 +77,7 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
-    pub(crate) references: Arc<RwLock<BTreeMap<ObjectHandle, ObjectReference>>>,
+    pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
 }
 
 impl BrokerCore {
@@ -111,7 +111,7 @@ impl BrokerCore {
             limits,
             next_session_id: Arc::new(RwLock::new(1)),
             next_reference_handle: Arc::new(RwLock::new(1)),
-            references: Arc::new(RwLock::new(BTreeMap::new())),
+            references: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 

@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
 use crate::event::EventObject;
 use crate::{BrokerCore, BrokerError, Result};
+use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
 
@@ -145,7 +145,7 @@ impl BrokerSession {
 
     fn authorize_use_object(
         &self,
-        references: &BTreeMap<ObjectHandle, ObjectReference>,
+        references: &HashMap<ObjectHandle, ObjectReference>,
         handle: ObjectHandle,
         required_rights: ObjectRights,
     ) -> Result<Arc<RwLock<ObjectEntry>>> {

@@ -1481,6 +1481,7 @@ name = "litebox_broker_core"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
+ "hashbrown",
  "litebox_broker_protocol",
  "spin 0.9.8",
  "thiserror",
