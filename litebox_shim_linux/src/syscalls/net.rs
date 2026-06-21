@@ -5186,37 +5186,24 @@ impl<FS: ShimFS> Task<FS> {
         match self.socket_io_class_of(sockfd)? {
             // F.8: broker-backed AF_UNIX SOCK_STREAM socketpair. recv() on a
             // connected stream socketpair degenerates to read(); SCM_RIGHTS
-            // arrive in-band as broker tokens (FdTransferReader). A connected
-            // socketpair has no peer address, so `source_addr` is left unset
-            // (caller writes msg_namelen 0). The pre-gate code limited this to
-            // `!want_source` and let the `want_source` case fall through to the
-            // `with_socket` panic net; the gate handles both here.
+            // arrive in-band as LBFD frames interleaved with raw bytes.
+            // `read_deframed` keeps a *persistent* reassembly reader on the
+            // endpoint so coalesced / split frames are each surfaced with
+            // their own fd tokens (a fresh-per-call reader silently dropped
+            // every frame after the first coalesced one — the VS Code
+            // exthost handle-passing stall). A connected socketpair has no
+            // peer address, so `source_addr` is left unset (caller writes
+            // msg_namelen 0).
             SocketIoClass::BrokerSocketPair => self
                 .try_with_broker_sp(sockfd, |typed| {
                     if buf.is_empty() {
                         return Ok(0);
                     }
                     let handle = self.broker_sp_handle(typed)?;
-                    let mut staging = alloc::vec![0u8; buf.len()];
-                    let size =
-                        handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut staging))?;
-                    staging.truncate(size);
-                    let mut reader = FdTransferReader::new();
-                    reader.push(&staging);
-                    match reader.take_frame() {
-                        Ok(Some(frame)) => {
-                            received_tokens.extend(frame.tokens);
-                            let n = buf.len().min(frame.data.len());
-                            buf[..n].copy_from_slice(&frame.data[..n]);
-                            Ok(n)
-                        }
-                        Ok(None) | Err(FrameError::BadMagic { .. }) => {
-                            let n = buf.len().min(staging.len());
-                            buf[..n].copy_from_slice(&staging[..n]);
-                            Ok(n)
-                        }
-                        Err(_) => Err(Errno::EPROTO),
-                    }
+                    let (n, tokens) =
+                        handle.with_entry(|entry| entry.read_deframed(&self.wait_cx(), buf))?;
+                    received_tokens.extend(tokens);
+                    Ok(n)
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             // Connected broker TCP stream: recv() degenerates to read(); a

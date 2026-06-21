@@ -302,6 +302,25 @@ pub struct OwnedFrame {
     pub data: Vec<u8>,
 }
 
+/// A single unit pulled from a mixed framed/raw byte stream by
+/// [`FdTransferReader::take_unit`].
+///
+/// Stream transports (the broker AF_UNIX `SOCK_STREAM` socketpair and
+/// named unix-stream) carry SCM-bearing LBFD frames *interleaved* with
+/// ordinary unframed `write(2)` bytes, and `read(2)` boundaries split or
+/// coalesce them arbitrarily. `take_unit` resynchronises the stream one
+/// unit at a time.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReaderUnit {
+    /// A complete decoded frame; its bytes have been consumed.
+    Frame(OwnedFrame),
+    /// A run of raw, non-framed bytes (consumed). They precede the next
+    /// frame magic, or are trailing bytes when no frame follows.
+    Raw(Vec<u8>),
+    /// Not enough buffered bytes to decide yet — `push` more and retry.
+    NeedMore,
+}
+
 impl Default for FdTransferReader {
     fn default() -> Self {
         Self::new()
@@ -354,6 +373,93 @@ impl FdTransferReader {
             Err(other) => Err(other),
         }
     }
+
+    /// Extract the next [`ReaderUnit`] from the front of the buffer,
+    /// transparently separating interleaved LBFD frames from raw bytes
+    /// across arbitrary `read(2)` chunking.
+    ///
+    /// Semantics:
+    /// - Buffer empty → [`ReaderUnit::NeedMore`].
+    /// - Begins with [`FRAME_MAGIC`] and a full frame is buffered →
+    ///   [`ReaderUnit::Frame`] (bytes consumed).
+    /// - Begins with the magic but the frame body has not fully arrived →
+    ///   [`ReaderUnit::NeedMore`].
+    /// - Begins with the magic but the frame is structurally malformed (a
+    ///   false-positive magic embedded in raw data, or genuine
+    ///   corruption) → one raw byte is yielded so the stream
+    ///   resynchronises (`decode_frame` bounds every length field, so this
+    ///   cannot mistake garbage for an unbounded truncated body).
+    /// - Otherwise the leading non-framed bytes up to the next magic
+    ///   occurrence are returned as [`ReaderUnit::Raw`]. A 1..=3-byte
+    ///   partial magic at the very tail is retained (it may be the head of
+    ///   an as-yet-incomplete frame); if that prefix is all that remains,
+    ///   [`ReaderUnit::NeedMore`] is returned.
+    pub fn take_unit(&mut self) -> ReaderUnit {
+        let magic = FRAME_MAGIC.to_le_bytes();
+        let n = self.buf.len();
+        if n == 0 {
+            return ReaderUnit::NeedMore;
+        }
+        let starts_with_magic = n >= 4 && self.buf[..4] == magic;
+        if starts_with_magic {
+            return match decode_frame(&self.buf) {
+                Ok(decoded) => {
+                    let frame = OwnedFrame {
+                        tokens: decoded.tokens,
+                        data: decoded.data.to_vec(),
+                    };
+                    self.buf.drain(..decoded.consumed);
+                    ReaderUnit::Frame(frame)
+                }
+                Err(FrameError::HeaderTruncated { .. } | FrameError::BodyTruncated { .. }) => {
+                    ReaderUnit::NeedMore
+                }
+                Err(_) => {
+                    // Valid magic word but malformed frame: treat the lead
+                    // byte as raw and resync.
+                    let b = self.buf.remove(0);
+                    ReaderUnit::Raw(alloc::vec![b])
+                }
+            };
+        }
+        // Does not begin with a full magic. If the whole (short) buffer is
+        // a strict prefix of the magic, it might be a frame head still
+        // arriving — wait for more.
+        if n < 4 && self.buf[..] == magic[..n] {
+            return ReaderUnit::NeedMore;
+        }
+        // Raw run: bytes up to the next full magic occurrence (scan from
+        // offset 1 since offset 0 is known not to start a full magic).
+        let mut i = 1usize;
+        let mut found = None;
+        while i + 4 <= n {
+            if self.buf[i..i + 4] == magic {
+                found = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let cut = if let Some(f) = found {
+            f
+        } else {
+            // Retain a trailing partial-magic prefix (1..=3 bytes).
+            let maxp = core::cmp::min(3, n);
+            let mut keep = 0usize;
+            for p in (1..=maxp).rev() {
+                if self.buf[n - p..] == magic[..p] {
+                    keep = p;
+                    break;
+                }
+            }
+            n - keep
+        };
+        if cut == 0 {
+            return ReaderUnit::NeedMore;
+        }
+        let raw: Vec<u8> = self.buf[..cut].to_vec();
+        self.buf.drain(..cut);
+        ReaderUnit::Raw(raw)
+    }
 }
 
 #[cfg(test)]
@@ -400,6 +506,94 @@ mod reader_tests {
         let frame = r.take_frame().unwrap().expect("frame ready");
         assert_eq!(frame.tokens, vec![pt(42)]);
         assert_eq!(frame.data, b"trickle");
+    }
+
+    #[test]
+    fn take_unit_empty_is_need_more() {
+        let mut r = FdTransferReader::new();
+        assert_eq!(r.take_unit(), ReaderUnit::NeedMore);
+    }
+
+    #[test]
+    fn take_unit_drains_two_coalesced_frames() {
+        // The regression that broke VS Code: two SCM frames in one read
+        // must both be recoverable, one per take_unit call.
+        let mut r = FdTransferReader::new();
+        r.push(&encoded_frame(&[pt(1)], b"a"));
+        r.push(&encoded_frame(&[pt(2)], b"b"));
+        let ReaderUnit::Frame(f) = r.take_unit() else {
+            panic!("expected first frame");
+        };
+        assert_eq!(f.tokens, vec![pt(1)]);
+        assert_eq!(f.data, b"a");
+        let ReaderUnit::Frame(f) = r.take_unit() else {
+            panic!("expected second frame");
+        };
+        assert_eq!(f.tokens, vec![pt(2)]);
+        assert_eq!(f.data, b"b");
+        assert_eq!(r.take_unit(), ReaderUnit::NeedMore);
+    }
+
+    #[test]
+    fn take_unit_raw_then_frame() {
+        let mut r = FdTransferReader::new();
+        r.push(b"plain json bytes");
+        r.push(&encoded_frame(&[pt(9)], b"x"));
+        let ReaderUnit::Raw(raw) = r.take_unit() else {
+            panic!("expected raw run");
+        };
+        assert_eq!(raw, b"plain json bytes");
+        let ReaderUnit::Frame(f) = r.take_unit() else {
+            panic!("expected frame");
+        };
+        assert_eq!(f.tokens, vec![pt(9)]);
+        assert_eq!(f.data, b"x");
+    }
+
+    #[test]
+    fn take_unit_frame_then_raw() {
+        let mut r = FdTransferReader::new();
+        r.push(&encoded_frame(&[pt(3)], b"hdr"));
+        r.push(b"tail-bytes");
+        assert!(matches!(r.take_unit(), ReaderUnit::Frame(_)));
+        let ReaderUnit::Raw(raw) = r.take_unit() else {
+            panic!("expected trailing raw");
+        };
+        assert_eq!(raw, b"tail-bytes");
+    }
+
+    #[test]
+    fn take_unit_partial_frame_is_need_more() {
+        let mut r = FdTransferReader::new();
+        let bytes = encoded_frame(&[pt(5)], b"incomplete");
+        r.push(&bytes[..bytes.len() - 1]); // header complete, body short
+        assert_eq!(r.take_unit(), ReaderUnit::NeedMore);
+        r.push(&bytes[bytes.len() - 1..]);
+        assert!(matches!(r.take_unit(), ReaderUnit::Frame(_)));
+    }
+
+    #[test]
+    fn take_unit_retains_tail_partial_magic() {
+        // A raw run that ends in the first bytes of a magic must NOT
+        // consume the partial magic — it could be the head of the next
+        // frame.
+        let mut r = FdTransferReader::new();
+        let magic = FRAME_MAGIC.to_le_bytes();
+        r.push(b"raw");
+        r.push(&magic[..2]); // two leading magic bytes, frame not yet here
+        let ReaderUnit::Raw(raw) = r.take_unit() else {
+            panic!("expected raw without the partial magic");
+        };
+        assert_eq!(raw, b"raw");
+        // Only the 2-byte partial magic remains; still undecidable.
+        assert_eq!(r.take_unit(), ReaderUnit::NeedMore);
+        // Completing the frame makes it decodable.
+        let frame = encoded_frame(&[pt(8)], b"z");
+        r.push(&frame[2..]);
+        let ReaderUnit::Frame(f) = r.take_unit() else {
+            panic!("expected frame after completion");
+        };
+        assert_eq!(f.data, b"z");
     }
 
     #[test]

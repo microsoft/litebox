@@ -35,6 +35,28 @@ use litebox_platform_multiplex::Platform;
 
 use super::broker_backed::{BrokerBackedCommon, broker_err_to_errno};
 use super::fork_snapshot::FdKind;
+use litebox_common_linux::cwfd::fd_transfer_frame::{FdTransferReader, PassedToken, ReaderUnit};
+
+/// Per-endpoint receive-side reassembly state for the in-band LBFD
+/// framing used to carry `SCM_RIGHTS` fd tokens. The socketpair is a true
+/// byte stream: framed (fd-bearing) and unframed writes interleave and
+/// `read(2)` boundaries coalesce or split them arbitrarily, so the
+/// receiver must keep a persistent reader across calls. Building a fresh
+/// reader per `recvmsg` (the pre-fix behaviour) silently dropped every
+/// frame after the first whenever two coalesced in one read — the bug
+/// that stalled VS Code's exthost handle passing.
+///
+/// Reset to empty after fork-restore (the snapshot carries only
+/// `handle_id` + `endpoint`); leftover undelivered bytes do not survive a
+/// fork, which matches the cross-process handoff usage (the child is the
+/// sole reader and starts clean).
+#[derive(Default)]
+struct SocketPairRecvState {
+    reader: FdTransferReader,
+    /// Decoded data bytes not yet delivered because they exceeded a
+    /// caller's buffer. Returned (token-less) on subsequent reads.
+    pending: alloc::vec::Vec<u8>,
+}
 
 static BROKER_SOCKETPAIR_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerSocketPairProvider>> =
     once_cell::race::OnceBox::new();
@@ -79,6 +101,9 @@ pub(crate) struct BrokerSocketPairFd<P: RawSyncPrimitivesProvider + litebox::pla
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
     pollee: Arc<Pollee<P>>,
+    /// In-band SCM_RIGHTS frame reassembly state (see
+    /// [`SocketPairRecvState`]).
+    recv: litebox::sync::Mutex<P, SocketPairRecvState>,
 }
 
 impl<P> BrokerSocketPairFd<P>
@@ -124,6 +149,7 @@ where
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
             pollee: Arc::new(Pollee::new()),
+            recv: litebox::sync::Mutex::new(SocketPairRecvState::default()),
         }
     }
 
@@ -202,6 +228,63 @@ impl BrokerSocketPairFd<Platform> {
                 litebox::event::polling::TryOpError::WaitError(_) => Errno::EINTR,
                 litebox::event::polling::TryOpError::Other(errno) => errno,
             })
+    }
+
+    /// Receive into `buf`, transparently de-framing any in-band LBFD
+    /// `SCM_RIGHTS` frames. Returns `(bytes_copied, tokens)`; `tokens`
+    /// carries the fd tokens that arrived with this unit (empty for
+    /// ordinary unframed data). One *unit* — a single frame, or a run of
+    /// raw bytes — is returned per call, so coalesced frames each surface
+    /// with their own fds. The caller (`recvmsg`) materialises the tokens
+    /// into descriptor-table fds.
+    pub(crate) fn read_deframed(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+    ) -> Result<(usize, alloc::vec::Vec<PassedToken>), Errno> {
+        if buf.is_empty() {
+            return Ok((0, alloc::vec::Vec::new()));
+        }
+        // 60 KB staging chunk: matches the per-RPC cap in `read`.
+        const STAGE: usize = 60 * 1024;
+        let mut st = self.recv.lock();
+        // Deliver any leftover decoded bytes first (token-less tail of a
+        // frame / raw run that overran a prior caller's buffer).
+        if !st.pending.is_empty() {
+            let n = buf.len().min(st.pending.len());
+            buf[..n].copy_from_slice(&st.pending[..n]);
+            st.pending.drain(..n);
+            return Ok((n, alloc::vec::Vec::new()));
+        }
+        loop {
+            match st.reader.take_unit() {
+                ReaderUnit::Frame(frame) => {
+                    let n = buf.len().min(frame.data.len());
+                    buf[..n].copy_from_slice(&frame.data[..n]);
+                    if n < frame.data.len() {
+                        st.pending.extend_from_slice(&frame.data[n..]);
+                    }
+                    return Ok((n, frame.tokens));
+                }
+                ReaderUnit::Raw(bytes) => {
+                    let n = buf.len().min(bytes.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        st.pending.extend_from_slice(&bytes[n..]);
+                    }
+                    return Ok((n, alloc::vec::Vec::new()));
+                }
+                ReaderUnit::NeedMore => {
+                    let mut staging = alloc::vec![0u8; STAGE];
+                    let size = self.read(cx, &mut staging)?;
+                    if size == 0 {
+                        // EOF / read-shutdown: no further frames possible.
+                        return Ok((0, alloc::vec::Vec::new()));
+                    }
+                    st.reader.push(&staging[..size]);
+                }
+            }
+        }
     }
 
     pub(crate) fn shutdown(&self, read: bool, write: bool) -> Result<(), Errno> {
