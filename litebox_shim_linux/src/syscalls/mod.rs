@@ -14,6 +14,7 @@ pub(crate) mod broker_socket_dgram;
 pub(crate) mod broker_socket_seqpacket;
 pub(crate) mod broker_socketpair;
 pub(crate) mod broker_tcp_conn;
+pub(crate) mod broker_unix_stream;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub(crate) mod guest_pid;
@@ -42,6 +43,7 @@ pub use broker_tcp_conn::{
     set_broker_inet_tcp_conn_provider_outbound_enabled, set_broker_tcp_conn_accept_enabled,
     set_broker_tcp_conn_provider,
 };
+pub use broker_unix_stream::{broker_unix_stream_provider, set_broker_unix_stream_provider};
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::broker_pgrp_signal_provider;
 pub use eventfd::broker_pidfd_provider;

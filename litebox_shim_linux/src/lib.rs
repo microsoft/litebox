@@ -765,6 +765,28 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     "socket_seqpacket",
                 )
             }
+            FdKind::BrokerUnixStream { handle_id } => {
+                let provider =
+                    syscalls::broker_unix_stream::broker_unix_stream_provider().ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                Self::dup_broker_bridge_handle(releaser, handle_id)?;
+                let unix_stream = syscalls::broker_unix_stream::BrokerUnixStreamFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_unix_stream::BrokerUnixStreamSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(unix_stream);
+                self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "unix_stream")
+            }
             FdKind::BrokerTcpConn { handle_id } => {
                 let provider = syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -2361,6 +2383,43 @@ impl<FS: ShimFS> LinuxShim<FS> {
                             entry.fd
                         );
                     }
+                    FdKind::BrokerUnixStream { handle_id } => {
+                        // AF_UNIX named SOCK_STREAM: re-attach by broker handle
+                        // so a forked/exec'd child keeps the same connected
+                        // stream endpoint rather than a fresh socket.
+                        let Some(provider) =
+                            syscalls::broker_unix_stream::broker_unix_stream_provider()
+                        else {
+                            continue;
+                        };
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(handle_id);
+                        let stream_fd =
+                            syscalls::broker_unix_stream::BrokerUnixStreamFd::<Platform>::new(
+                                provider,
+                                handle_id,
+                                litebox::fs::OFlags::from_bits_retain(entry.status_flags),
+                            );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::broker_unix_stream::BrokerUnixStreamSubsystem>(
+                            stream_fd,
+                        );
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker_unix_stream fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                    }
                     FdKind::BrokerTcpConn { handle_id } => {
                         let Some(provider) = syscalls::broker_tcp_conn::broker_tcp_conn_provider()
                         else {
@@ -3096,6 +3155,10 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
+            return Ok(f(RawFdRef::BrokerUnixStream(&fd)));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
             return Ok(f(RawFdRef::BrokerTcpConn(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -3146,6 +3209,7 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     BrokerSocketSeqPacket(
         &'a Arc<TypedFd<syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>>,
     ),
+    BrokerUnixStream(&'a Arc<TypedFd<syscalls::broker_unix_stream::BrokerUnixStreamSubsystem>>),
     BrokerTcpConn(&'a Arc<TypedFd<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>>),
     BrokerPty(&'a Arc<TypedFd<syscalls::broker_pty::BrokerPtySubsystem>>),
     Signalfd(&'a Arc<TypedFd<syscalls::signalfd::SignalfdSubsystem>>),
@@ -3420,6 +3484,9 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 crate::RawFdRef::BrokerSocketSeqPacket(_fd) => {
                     alloc::format!("raw={raw_fd} broker_socket_seqpacket")
+                }
+                crate::RawFdRef::BrokerUnixStream(_fd) => {
+                    alloc::format!("raw={raw_fd} broker_unix_stream")
                 }
                 crate::RawFdRef::BrokerTcpConn(_fd) => {
                     alloc::format!("raw={raw_fd} broker_tcp_conn")

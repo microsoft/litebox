@@ -39,6 +39,7 @@ pub mod socketpair_state;
 pub mod state_registry;
 pub mod state_service;
 pub mod subscription_list;
+pub mod unix_stream_state;
 
 #[cfg(loom)]
 mod subscription_list_loom;

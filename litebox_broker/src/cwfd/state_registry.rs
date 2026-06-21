@@ -85,6 +85,7 @@ use crate::cwfd::socketpair_state::SocketPairEnd;
 use crate::cwfd::subscription_list::{SubscribeError, UnsubscribeError};
 use crate::cwfd::tcp_conn_state::TcpConnState;
 use crate::cwfd::timerfd_state::TimerfdState;
+use crate::cwfd::unix_stream_state::UnixStreamState;
 
 /// An opaque, broker-global handle to a [`StateObject`] held by the
 /// broker on behalf of one or more workers.
@@ -197,6 +198,7 @@ pub enum StateKind {
     SocketPairEnd,
     SocketDgram,
     SocketSeqPacket,
+    UnixStream,
     TcpConn,
     InetListener,
     InetDgram,
@@ -219,6 +221,7 @@ pub enum StateObjectEnum {
     SocketPairEnd(Arc<SocketPairEnd>),
     SocketDgram(Arc<SocketDgramState>),
     SocketSeqPacket(Arc<SocketSeqPacketState>),
+    UnixStream(Arc<UnixStreamState>),
     TcpConn(Arc<TcpConnState>),
     InetListener(Arc<InetListenerState>),
     InetDgram(Arc<InetDgramState>),
@@ -241,6 +244,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(_) => StateKind::SocketPairEnd,
             StateObjectEnum::SocketDgram(_) => StateKind::SocketDgram,
             StateObjectEnum::SocketSeqPacket(_) => StateKind::SocketSeqPacket,
+            StateObjectEnum::UnixStream(_) => StateKind::UnixStream,
             StateObjectEnum::TcpConn(_) => StateKind::TcpConn,
             StateObjectEnum::InetListener(_) => StateKind::InetListener,
             StateObjectEnum::InetDgram(_) => StateKind::InetDgram,
@@ -263,6 +267,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.subsystem_tag(),
             StateObjectEnum::SocketDgram(state) => state.subsystem_tag(),
             StateObjectEnum::SocketSeqPacket(state) => state.subsystem_tag(),
+            StateObjectEnum::UnixStream(state) => state.subsystem_tag(),
             StateObjectEnum::TcpConn(state) => state.subsystem_tag(),
             StateObjectEnum::InetListener(state) => state.subsystem_tag(),
             StateObjectEnum::InetDgram(state) => state.subsystem_tag(),
@@ -300,6 +305,9 @@ impl StateObjectEnum {
                 state.subscribe(subscription_id, events_mask, sender)
             }
             StateObjectEnum::SocketSeqPacket(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
+            StateObjectEnum::UnixStream(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
             StateObjectEnum::TcpConn(state) => {
@@ -342,6 +350,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::SocketDgram(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::SocketSeqPacket(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::UnixStream(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::TcpConn(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::InetListener(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::InetDgram(state) => state.unsubscribe(subscription_id),
@@ -364,6 +373,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.current_events(),
             StateObjectEnum::SocketDgram(state) => state.current_events(),
             StateObjectEnum::SocketSeqPacket(state) => state.current_events(),
+            StateObjectEnum::UnixStream(state) => state.current_events(),
             StateObjectEnum::TcpConn(state) => state.current_events(),
             StateObjectEnum::InetListener(state) => state.current_events(),
             StateObjectEnum::InetDgram(state) => state.current_events(),
@@ -386,6 +396,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.try_flush_subscriptions(),
             StateObjectEnum::SocketDgram(state) => state.try_flush_subscriptions(),
             StateObjectEnum::SocketSeqPacket(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::UnixStream(state) => state.try_flush_subscriptions(),
             StateObjectEnum::TcpConn(state) => state.try_flush_subscriptions(),
             StateObjectEnum::InetListener(state) => state.try_flush_subscriptions(),
             StateObjectEnum::InetDgram(state) => state.try_flush_subscriptions(),
@@ -409,6 +420,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.debug_repr(),
             StateObjectEnum::SocketDgram(state) => state.debug_repr(),
             StateObjectEnum::SocketSeqPacket(state) => state.debug_repr(),
+            StateObjectEnum::UnixStream(state) => state.debug_repr(),
             StateObjectEnum::TcpConn(state) => state.debug_repr(),
             StateObjectEnum::InetListener(state) => state.debug_repr(),
             StateObjectEnum::InetDgram(state) => state.debug_repr(),
@@ -493,6 +505,12 @@ impl From<Arc<SocketDgramState>> for StateObjectEnum {
 impl From<Arc<SocketSeqPacketState>> for StateObjectEnum {
     fn from(state: Arc<SocketSeqPacketState>) -> Self {
         StateObjectEnum::SocketSeqPacket(state)
+    }
+}
+
+impl From<Arc<UnixStreamState>> for StateObjectEnum {
+    fn from(state: Arc<UnixStreamState>) -> Self {
+        StateObjectEnum::UnixStream(state)
     }
 }
 
@@ -826,6 +844,7 @@ impl BrokerStateRegistry {
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::SocketSeqPacket(_)
+            | StateObjectEnum::UnixStream(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::InetRaw(_)
@@ -891,6 +910,7 @@ impl BrokerStateRegistry {
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::SocketSeqPacket(_)
+            | StateObjectEnum::UnixStream(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::InetRaw(_)

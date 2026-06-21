@@ -27,6 +27,7 @@ pub mod broker_socket_seqpacket_provider;
 pub mod broker_socketpair_provider;
 pub mod broker_tcp_conn_provider;
 pub mod broker_timerfd_provider;
+pub mod broker_unix_stream_provider;
 pub mod guest_pid_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -370,6 +371,13 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
             ensure_no_subkind(spec, kind_str, &parts)?;
             (
                 FdKind::BrokerSocketSeqPacket { handle_id },
+                litebox::fs::OFlags::empty(),
+            )
+        }
+        "unix_stream" => {
+            ensure_no_subkind(spec, kind_str, &parts)?;
+            (
+                FdKind::BrokerUnixStream { handle_id },
                 litebox::fs::OFlags::empty(),
             )
         }
@@ -3338,6 +3346,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_socket_seqpacket_provider(socket_seqpacket_provider)
         .map_err(|_| anyhow!("socket seqpacket provider already set"))?;
+
+    let unix_stream_provider = Arc::new(
+        crate::broker_unix_stream_provider::RunnerBrokerUnixStreamProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_unix_stream_provider(unix_stream_provider)
+        .map_err(|_| anyhow!("unix stream provider already set"))?;
 
     litebox_shim_linux::syscalls::set_broker_inet_dgram_enabled(broker_inet_udp_enabled());
 

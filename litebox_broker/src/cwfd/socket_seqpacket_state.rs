@@ -6,8 +6,9 @@
 //! Seqpacket is connection-oriented like stream, but preserves packet
 //! boundaries like datagram. This first broker-backed shape models pathname
 //! Unix addresses, socketpair/connect/listen/accept, shutdown, readiness, and
-//! fork-restore inheritance. Ancillary data (`SCM_RIGHTS`, `SCM_CREDENTIALS`)
-//! and abstract namespace addresses are intentionally deferred.
+//! fork-restore inheritance. `SCM_RIGHTS` is carried as broker handle tokens
+//! alongside each packet. `SCM_CREDENTIALS` and abstract namespace addresses are
+//! intentionally deferred.
 
 use core::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use litebox_common_linux::fd_token_protocol::SOCKET_SEQPACKET_RECV_FLAG_TRUNC;
-use litebox_common_linux::fd_transfer_frame::SubsystemTag;
+use litebox_common_linux::fd_transfer_frame::{PassedToken, SubsystemTag};
 use litebox_common_linux::notification_frame::{
     NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
 };
@@ -58,6 +59,7 @@ pub enum SocketSeqPacketError {
 #[derive(Clone, Debug)]
 struct Packet {
     payload: Vec<u8>,
+    tokens: Vec<PassedToken>,
 }
 
 #[derive(Debug, Default)]
@@ -212,7 +214,11 @@ impl SocketSeqPacketState {
         Ok(accepted)
     }
 
-    pub fn send(&self, payload: &[u8]) -> Result<usize, SocketSeqPacketError> {
+    pub fn send(
+        &self,
+        payload: &[u8],
+        tokens: &[PassedToken],
+    ) -> Result<usize, SocketSeqPacketError> {
         let peer = {
             let inner = self.inner.lock().expect("SocketSeqPacketState poisoned");
             if inner.write_shutdown {
@@ -237,20 +243,24 @@ impl SocketSeqPacketState {
             }
             peer_inner.queue.push_back(Packet {
                 payload: payload.to_vec(),
+                tokens: tokens.to_vec(),
             });
         }
         peer.notify_current();
         Ok(payload.len())
     }
 
-    pub fn recv(&self, max_len: usize) -> Result<(Vec<u8>, u32), SocketSeqPacketError> {
+    pub fn recv(
+        &self,
+        max_len: usize,
+    ) -> Result<(Vec<u8>, u32, Vec<PassedToken>), SocketSeqPacketError> {
         let mut inner = self.inner.lock().expect("SocketSeqPacketState poisoned");
         if inner.read_shutdown {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), 0, Vec::new()));
         }
         let Some(mut packet) = inner.queue.pop_front() else {
             if inner.peer.as_ref().and_then(Weak::upgrade).is_none() && inner.peer_addr.is_some() {
-                return Ok((Vec::new(), 0));
+                return Ok((Vec::new(), 0, Vec::new()));
             }
             return Err(SocketSeqPacketError::WouldBlock);
         };
@@ -261,7 +271,7 @@ impl SocketSeqPacketState {
         }
         drop(inner);
         self.notify_current();
-        Ok((packet.payload, flags))
+        Ok((packet.payload, flags, packet.tokens))
     }
 
     pub fn shutdown(&self, how: u8) -> Result<(), SocketSeqPacketError> {
@@ -428,13 +438,28 @@ mod tests {
     #[test]
     fn socketpair_preserves_messages_and_truncates() {
         let (a, b) = SocketSeqPacketState::new_pair();
-        a.send(b"hello").unwrap();
-        a.send(b"world").unwrap();
-        let (payload, flags) = b.recv(3).unwrap();
+        a.send(b"hello", &[]).unwrap();
+        a.send(b"world", &[]).unwrap();
+        let (payload, flags, tokens) = b.recv(3).unwrap();
         assert_eq!(payload, b"hel");
         assert_ne!(flags & SOCKET_SEQPACKET_RECV_FLAG_TRUNC, 0);
-        let (payload, flags) = b.recv(16).unwrap();
+        assert!(tokens.is_empty());
+        let (payload, flags, tokens) = b.recv(16).unwrap();
         assert_eq!(payload, b"world");
         assert_eq!(flags, 0);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn seqpacket_preserves_scm_tokens() {
+        let (a, b) = SocketSeqPacketState::new_pair();
+        let token = PassedToken::new(SubsystemTag::File, 0x1234).unwrap();
+
+        a.send(b"fd", &[token]).unwrap();
+        let (payload, flags, tokens) = b.recv(16).unwrap();
+
+        assert_eq!(payload, b"fd");
+        assert_eq!(flags, 0);
+        assert_eq!(tokens, vec![token]);
     }
 }

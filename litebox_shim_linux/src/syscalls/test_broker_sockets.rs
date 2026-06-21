@@ -95,6 +95,7 @@ struct DgramState {
 #[derive(Clone)]
 struct Packet {
     payload: Vec<u8>,
+    tokens: Vec<PassedToken>,
 }
 
 #[derive(Default)]
@@ -634,7 +635,12 @@ impl BrokerSocketSeqPacketProvider for TestBrokerSocketProvider {
         Ok(())
     }
 
-    fn send(&self, handle: u64, payload: &[u8]) -> Result<usize, SeqPacketBrokerOpError> {
+    fn send(
+        &self,
+        handle: u64,
+        payload: &[u8],
+        tokens: &[PassedToken],
+    ) -> Result<usize, SeqPacketBrokerOpError> {
         let callbacks = {
             let mut state = self.state.lock().unwrap();
             let seq = seq_ref(&state, handle)?;
@@ -651,6 +657,7 @@ impl BrokerSocketSeqPacketProvider for TestBrokerSocketProvider {
             }
             peer.queue.push_back(Packet {
                 payload: payload.to_vec(),
+                tokens: tokens.to_vec(),
             });
             callbacks_for_current_locked(&state, peer_handle)
         };
@@ -658,7 +665,11 @@ impl BrokerSocketSeqPacketProvider for TestBrokerSocketProvider {
         Ok(payload.len())
     }
 
-    fn recv(&self, handle: u64, max_len: u32) -> Result<(Vec<u8>, u32), SeqPacketBrokerOpError> {
+    fn recv(
+        &self,
+        handle: u64,
+        max_len: u32,
+    ) -> Result<(Vec<u8>, u32, Vec<PassedToken>), SeqPacketBrokerOpError> {
         let (result, callbacks) = {
             let mut state = self.state.lock().unwrap();
             let peer_gone = {
@@ -670,11 +681,11 @@ impl BrokerSocketSeqPacketProvider for TestBrokerSocketProvider {
             };
             let seq = seq_mut(&mut state, handle)?;
             if seq.read_shutdown {
-                return Ok((Vec::new(), 0));
+                return Ok((Vec::new(), 0, Vec::new()));
             }
             let Some(mut packet) = seq.queue.pop_front() else {
                 if peer_gone {
-                    return Ok((Vec::new(), 0));
+                    return Ok((Vec::new(), 0, Vec::new()));
                 }
                 return Err(BrokerOpError::WouldBlock);
             };
@@ -685,7 +696,7 @@ impl BrokerSocketSeqPacketProvider for TestBrokerSocketProvider {
                 flags |= SOCKET_SEQPACKET_RECV_FLAG_TRUNC;
             }
             (
-                (packet.payload, flags),
+                (packet.payload, flags, packet.tokens),
                 callbacks_for_current_locked(&state, handle),
             )
         };

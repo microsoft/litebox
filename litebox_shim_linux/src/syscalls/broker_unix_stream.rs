@@ -1,13 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-backed AF_UNIX SOCK_DGRAM sockets.
+//! Broker-backed AF_UNIX SOCK_STREAM named sockets.
 //!
-//! Foundation support covers bind, sendto/recvfrom with source addresses,
-//! datagram truncation, connect, nonblocking waits, shutdown, and fork-restore
-//! inheritance. `SCM_RIGHTS` is supported for broker-token-backed descriptors
-//! (files, pipes, and broker AF_UNIX datagram sockets). `SCM_CREDENTIALS` is
-//! still deferred because credential passing has authentication implications.
+//! Covers bind-to-path/abstract, listen, accept, connect, byte-stream
+//! send/recv, nonblocking waits, shutdown, getsockname/getpeername, and
+//! fork-restore inheritance. The named stream is a first-class broker subsystem
+//! (path registry + accept backlog + byte-stream connected path) rather than a
+//! unix-socket-over-bridged-TCP shim. Ancillary `SCM_RIGHTS` data is framed
+//! inline over the byte stream by the caller, so the broker carries opaque
+//! bytes and no per-message fd tokens appear on this path.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -24,10 +26,9 @@ use litebox::{
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{
-    broker_socket_dgram_provider::{BrokerOpError, BrokerSocketDgramProvider},
     cwfd::{
         broker_subscribable::BrokerSubscribable,
-        fd_token_protocol::SOCKET_DGRAM_RECV_FLAG_TRUNC,
+        broker_unix_stream_provider::{BrokerOpError, BrokerUnixStreamProvider},
         notification_frame::{
             NOTIFY_EVENT_ERR, NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
         },
@@ -42,29 +43,28 @@ use super::{
     unix::UnixSocketAddr,
 };
 
-static BROKER_SOCKET_DGRAM_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerSocketDgramProvider>> =
+static BROKER_UNIX_STREAM_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerUnixStreamProvider>> =
     once_cell::race::OnceBox::new();
 
-pub fn set_broker_socket_dgram_provider(
-    provider: Arc<dyn BrokerSocketDgramProvider>,
-) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerSocketDgramProvider>>> {
-    BROKER_SOCKET_DGRAM_PROVIDER.set(alloc::boxed::Box::new(provider))
+pub fn set_broker_unix_stream_provider(
+    provider: Arc<dyn BrokerUnixStreamProvider>,
+) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerUnixStreamProvider>>> {
+    BROKER_UNIX_STREAM_PROVIDER.set(alloc::boxed::Box::new(provider))
 }
 
-pub fn broker_socket_dgram_provider() -> Option<Arc<dyn BrokerSocketDgramProvider>> {
-    BROKER_SOCKET_DGRAM_PROVIDER.get().cloned()
+pub fn broker_unix_stream_provider() -> Option<Arc<dyn BrokerUnixStreamProvider>> {
+    BROKER_UNIX_STREAM_PROVIDER.get().cloned()
 }
 
-pub(crate) struct BrokerSocketDgramSubsystem;
-impl FdEnabledSubsystem for BrokerSocketDgramSubsystem {
-    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::BrokerSocketDgram;
-    type Entry = BrokerSocketDgramFd<Platform>;
+pub(crate) struct BrokerUnixStreamSubsystem;
+impl FdEnabledSubsystem for BrokerUnixStreamSubsystem {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::BrokerUnixStream;
+    type Entry = BrokerUnixStreamFd<Platform>;
 }
 
-pub(crate) struct BrokerSocketDgramFd<
-    P: RawSyncPrimitivesProvider + litebox::platform::TimeProvider,
-> {
-    provider: Arc<dyn BrokerSocketDgramProvider>,
+pub(crate) struct BrokerUnixStreamFd<P: RawSyncPrimitivesProvider + litebox::platform::TimeProvider>
+{
+    provider: Arc<dyn BrokerUnixStreamProvider>,
     common: BrokerBackedCommon<P>,
     status: AtomicU32,
     read_shutdown: AtomicBool,
@@ -72,12 +72,12 @@ pub(crate) struct BrokerSocketDgramFd<
     pollee: Arc<Pollee<P>>,
 }
 
-impl<P> BrokerSocketDgramFd<P>
+impl<P> BrokerUnixStreamFd<P>
 where
     P: RawSyncPrimitivesProvider + litebox::platform::TimeProvider,
 {
     pub(crate) fn new(
-        provider: Arc<dyn BrokerSocketDgramProvider>,
+        provider: Arc<dyn BrokerUnixStreamProvider>,
         handle: u64,
         flags: OFlags,
     ) -> Self {
@@ -112,13 +112,13 @@ where
     }
 
     pub(crate) fn fork_snapshot_handle(&self) -> FdKind {
-        FdKind::BrokerSocketDgram {
+        FdKind::BrokerUnixStream {
             handle_id: self.handle(),
         }
     }
 }
 
-impl BrokerSocketDgramFd<Platform> {
+impl BrokerUnixStreamFd<Platform> {
     pub(crate) fn bind(&self, addr: UnixSocketAddr) -> Result<UnixSocketAddr, Errno> {
         let raw = encode_unix_addr(&addr);
         self.provider
@@ -134,24 +134,39 @@ impl BrokerSocketDgramFd<Platform> {
             .map_err(broker_err_to_errno)
     }
 
-    pub(crate) fn sendto(
+    pub(crate) fn listen(&self, backlog: u32) -> Result<(), Errno> {
+        self.provider
+            .listen(self.handle(), backlog)
+            .map_err(broker_err_to_errno)
+    }
+
+    pub(crate) fn accept(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
+        self.common.ensure_subscribed(&self.pollee);
+        let nonblock = self.get_status().contains(OFlags::NONBLOCK);
+        self.pollee
+            .wait(cx, nonblock, Events::IN, || {
+                match self.provider.accept(self.handle()) {
+                    Ok(handle) => Ok(handle),
+                    Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Err(e) => Err(TryOpError::Other(broker_err_to_errno(e))),
+                }
+            })
+            .map_err(map_try_op_err)
+    }
+
+    pub(crate) fn send(
         &self,
         cx: &WaitContext<'_, Platform>,
-        addr: Option<UnixSocketAddr>,
         payload: &[u8],
-        tokens: &[litebox_common_linux::cwfd::fd_transfer_frame::PassedToken],
     ) -> Result<usize, Errno> {
         if self.write_shutdown.load(Ordering::Acquire) {
             return Err(Errno::EPIPE);
         }
         self.common.ensure_subscribed(&self.pollee);
-        let raw = addr
-            .as_ref()
-            .map_or_else(alloc::vec::Vec::new, encode_unix_addr);
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::OUT, || {
-                match self.provider.sendto(self.handle(), &raw, payload, tokens) {
+                match self.provider.send(self.handle(), payload) {
                     Ok(n) => Ok(n),
                     Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(e) => Err(TryOpError::Other(broker_err_to_errno(e))),
@@ -160,35 +175,20 @@ impl BrokerSocketDgramFd<Platform> {
             .map_err(map_try_op_err)
     }
 
-    pub(crate) fn recvfrom(
+    pub(crate) fn recv(
         &self,
         cx: &WaitContext<'_, Platform>,
         max_len: u32,
-    ) -> Result<
-        (
-            UnixSocketAddr,
-            alloc::vec::Vec<u8>,
-            u32,
-            alloc::vec::Vec<litebox_common_linux::cwfd::fd_transfer_frame::PassedToken>,
-        ),
-        Errno,
-    > {
+    ) -> Result<alloc::vec::Vec<u8>, Errno> {
         if self.read_shutdown.load(Ordering::Acquire) {
-            return Ok((
-                UnixSocketAddr::Unnamed,
-                alloc::vec::Vec::new(),
-                0,
-                alloc::vec::Vec::new(),
-            ));
+            return Ok(alloc::vec::Vec::new());
         }
         self.common.ensure_subscribed(&self.pollee);
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::IN, || {
-                match self.provider.recvfrom(self.handle(), max_len) {
-                    Ok((raw, payload, flags, tokens)) => decode_unix_addr(&raw)
-                        .map(|addr| (addr, payload, flags, tokens))
-                        .map_err(TryOpError::Other),
+                match self.provider.recv(self.handle(), max_len) {
+                    Ok(payload) => Ok(payload),
                     Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(e) => Err(TryOpError::Other(broker_err_to_errno(e))),
                 }
@@ -226,9 +226,9 @@ impl BrokerSocketDgramFd<Platform> {
     }
 }
 
-impl IOPollable for BrokerSocketDgramFd<Platform> {
+impl IOPollable for BrokerUnixStreamFd<Platform> {
     fn check_io_events(&self) -> Events {
-        match BrokerSocketDgramProvider::query_events(&*self.provider, self.handle()) {
+        match BrokerUnixStreamProvider::query_events(&*self.provider, self.handle()) {
             Ok(events) => Events::from_bits_truncate(events),
             Err(_) => self.common.check_io_events(),
         }
@@ -240,7 +240,7 @@ impl IOPollable for BrokerSocketDgramFd<Platform> {
     }
 }
 
-impl FdEnabledSubsystemEntry for BrokerSocketDgramFd<Platform> {
+impl FdEnabledSubsystemEntry for BrokerUnixStreamFd<Platform> {
     fn on_dup(&self) {
         self.common.note_slot_dup();
         let _ = self.provider.dup_handle(self.handle());
@@ -290,8 +290,4 @@ pub(crate) fn decode_unix_addr(raw: &[u8]) -> Result<UnixSocketAddr, Errno> {
         2 => Ok(UnixSocketAddr::Abstract(bytes)),
         _ => Err(Errno::EINVAL),
     }
-}
-
-pub(crate) fn recv_truncated(flags: u32) -> bool {
-    (flags & SOCKET_DGRAM_RECV_FLAG_TRUNC) != 0
 }

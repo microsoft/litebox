@@ -69,6 +69,7 @@ pub(crate) const BROKER_PTY_BRIDGE_LOOP_NAME: &str = "broker_pty";
 pub(crate) const BROKER_SOCKETPAIR_BRIDGE_LOOP_NAME: &str = "broker_socketpair";
 pub(crate) const BROKER_SOCKET_DGRAM_BRIDGE_LOOP_NAME: &str = "broker_socket_dgram";
 pub(crate) const BROKER_SOCKET_SEQPACKET_BRIDGE_LOOP_NAME: &str = "broker_socket_seqpacket";
+pub(crate) const BROKER_UNIX_STREAM_BRIDGE_LOOP_NAME: &str = "broker_unix_stream";
 pub(crate) const BROKER_TCP_CONN_BRIDGE_LOOP_NAME: &str = "broker_tcp_conn";
 pub(crate) const BROKER_INET_LISTENER_BRIDGE_LOOP_NAME: &str = "broker_inet_listener";
 pub(crate) const FS_BROKERFILE_BRIDGE_LOOP_NAME: &str = "fs_brokerfile";
@@ -3708,6 +3709,7 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::BrokerSocketPair(_)
                         | crate::RawFdRef::BrokerSocketDgram(_)
                         | crate::RawFdRef::BrokerSocketSeqPacket(_)
+                        | crate::RawFdRef::BrokerUnixStream(_)
                         | crate::RawFdRef::BrokerTcpConn(_)
                         | crate::RawFdRef::BrokerPty(_)
                         | crate::RawFdRef::Signalfd(_)
@@ -6161,6 +6163,9 @@ impl<FS: ShimFS> Task<FS> {
                         crate::RawFdRef::BrokerSocketSeqPacket(fd) => {
                             (FdKind::BrokerSocketSeqPacket { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
+                        crate::RawFdRef::BrokerUnixStream(fd) => {
+                            (FdKind::BrokerUnixStream { handle_id: 0 }, Some(fd.object_id()), None, None)
+                        }
                         crate::RawFdRef::BrokerTcpConn(fd) => {
                             (FdKind::BrokerTcpConn { handle_id: 0 }, Some(fd.object_id()), None, None)
                         }
@@ -6229,6 +6234,7 @@ impl<FS: ShimFS> Task<FS> {
                 | FdKind::BrokerSocketPair { .. }
                 | FdKind::BrokerSocketDgram { .. }
                 | FdKind::BrokerSocketSeqPacket { .. }
+                | FdKind::BrokerUnixStream { .. }
                 | FdKind::BrokerTcpConn { .. }
                 | FdKind::BrokerInetListener { .. }
                 | FdKind::BrokerInetDgram { .. }
@@ -6378,6 +6384,7 @@ impl<FS: ShimFS> Task<FS> {
                                 | FdKind::BrokerSocketPair { .. }
                                 | FdKind::BrokerSocketDgram { .. }
                                 | FdKind::BrokerSocketSeqPacket { .. }
+                                | FdKind::BrokerUnixStream { .. }
                                 | FdKind::BrokerTcpConn { .. }
                                 | FdKind::BrokerInetListener { .. }
                                 | FdKind::BrokerInetDgram { .. }
@@ -6571,6 +6578,7 @@ impl<FS: ShimFS> Task<FS> {
                     | FdKind::BrokerSocketPair { .. }
                     | FdKind::BrokerSocketDgram { .. }
                     | FdKind::BrokerSocketSeqPacket { .. }
+                    | FdKind::BrokerUnixStream { .. }
                     | FdKind::BrokerTcpConn { .. }
                     | FdKind::BrokerInetDgram { .. }
             ) {
@@ -6670,6 +6678,42 @@ impl<FS: ShimFS> Task<FS> {
                         |seqpacket_fd: &super::broker_socket_seqpacket::BrokerSocketSeqPacketFd<
                             crate::Platform,
                         >| { seqpacket_fd.fork_snapshot_handle() },
+                    );
+                    match snapshot_opt {
+                        Some(snapshot) => {
+                            let releaser_opt: Option<
+                                alloc::sync::Arc<
+                                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                                >,
+                            > = provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
+                            if let Some(releaser) = releaser_opt {
+                                let handle_id = snapshot.handle_id();
+                                match releaser.dup_handle(handle_id) {
+                                    Ok(()) => {
+                                        broker_transit.push(ForkSnapshotBrokerTransit {
+                                            releaser,
+                                            handle_id,
+                                            kind: snapshot.spec_token(),
+                                        });
+                                        Some(snapshot)
+                                    }
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                } else if let Ok(typed) = rds
+                    .fd_from_raw_integer::<super::broker_unix_stream::BrokerUnixStreamSubsystem>(raw_fd)
+                {
+                    let provider = super::broker_unix_stream::broker_unix_stream_provider();
+                    let snapshot_opt = dt.with_entry(
+                        &typed,
+                        |stream_fd: &super::broker_unix_stream::BrokerUnixStreamFd<
+                            crate::Platform,
+                        >| { stream_fd.fork_snapshot_handle() },
                     );
                     match snapshot_opt {
                         Some(snapshot) => {
@@ -8856,6 +8900,12 @@ impl<FS: ShimFS> Task<FS> {
                 &collected.broker_socket_seqpacket,
                 &mut broker_eventfd_specs,
             );
+            emit_broker_unix_stream_bridge_specs(
+                self,
+                &collected.broker_unix_stream,
+                &mut broker_eventfd_specs,
+                &mut broker_tcp_conn_transit_release,
+            );
             emit_broker_tcp_conn_bridge_specs(
                 self,
                 &collected.broker_tcp_conn,
@@ -9790,6 +9840,12 @@ pub(crate) struct CollectedMigratableFds<FS: ShimFS> {
             litebox::fd::TypedFd<super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>,
         >,
     )>,
+    pub(crate) broker_unix_stream: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<
+            litebox::fd::TypedFd<super::broker_unix_stream::BrokerUnixStreamSubsystem>,
+        >,
+    )>,
     pub(crate) broker_tcp_conn: alloc::vec::Vec<(
         usize,
         alloc::sync::Arc<litebox::fd::TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>>,
@@ -9826,6 +9882,7 @@ impl<FS: ShimFS> Default for CollectedMigratableFds<FS> {
             broker_socketpair: alloc::vec::Vec::new(),
             broker_socket_dgram: alloc::vec::Vec::new(),
             broker_socket_seqpacket: alloc::vec::Vec::new(),
+            broker_unix_stream: alloc::vec::Vec::new(),
             broker_tcp_conn: alloc::vec::Vec::new(),
             broker_inet_listener: alloc::vec::Vec::new(),
             fs: alloc::vec::Vec::new(),
@@ -9886,6 +9943,9 @@ fn collect_migratable_fds<FS: ShimFS>(
                 .push((raw_fd, alloc::sync::Arc::clone(typed))),
             crate::RawFdRef::BrokerSocketSeqPacket(typed) => out
                 .broker_socket_seqpacket
+                .push((raw_fd, alloc::sync::Arc::clone(typed))),
+            crate::RawFdRef::BrokerUnixStream(typed) => out
+                .broker_unix_stream
                 .push((raw_fd, alloc::sync::Arc::clone(typed))),
             crate::RawFdRef::BrokerTcpConn(typed) => out
                 .broker_tcp_conn
@@ -10036,6 +10096,7 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
                 | FdKind::BrokerSocketPair { .. }
                 | FdKind::BrokerSocketDgram { .. }
                 | FdKind::BrokerSocketSeqPacket { .. }
+                | FdKind::BrokerUnixStream { .. }
                 | FdKind::BrokerTcpConn { .. }
                 | FdKind::BrokerInetListener { .. }
                 | FdKind::BrokerInetDgram { .. }
@@ -10269,6 +10330,45 @@ fn emit_broker_socket_seqpacket_bridge_specs<FS: ShimFS>(
                 continue;
             }
             specs.push(alloc::format!("{raw_fd}:socket_seqpacket:{handle_id}"));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for broker-unix-stream fds.
+fn emit_broker_unix_stream_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<
+            litebox::fd::TypedFd<super::broker_unix_stream::BrokerUnixStreamSubsystem>,
+        >,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+    transit_release: &mut alloc::vec::Vec<BrokerTransitReleaseEntry>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let provider = super::broker_unix_stream::broker_unix_stream_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let handle_id = dt_local.with_entry(
+            typed,
+            |fd: &super::broker_unix_stream::BrokerUnixStreamFd<crate::Platform>| fd.handle(),
+        );
+        drop(dt_local);
+        if let (Some(provider), Some(handle_id)) = (provider, handle_id) {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            specs.push(alloc::format!("{raw_fd}:unix_stream:{handle_id}"));
+            // Like BrokerTcpConn, a connected named stream is a peer-EOF-bearing
+            // handle: the emit-side transit dup MUST be released after the child
+            // worker claims its own ref, otherwise the parent connection's
+            // lingering reference keeps the broker endpoint alive and the peer
+            // never observes EOF when this worker exits.
+            transit_release.push((releaser, handle_id));
         }
     }
 }
@@ -10779,6 +10879,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 crate::RawFdRef::BrokerSocketPair(_broker_socketpair) => false,
                 crate::RawFdRef::BrokerSocketDgram(_broker_socket_dgram) => false,
                 crate::RawFdRef::BrokerSocketSeqPacket(_broker_socket_seqpacket) => false,
+                crate::RawFdRef::BrokerUnixStream(_broker_unix_stream) => false,
                 crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => false,
                 crate::RawFdRef::BrokerPty(_broker_pty) => false,
                 crate::RawFdRef::Signalfd(_signalfd) => false,
@@ -10953,6 +11054,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
             crate::RawFdRef::BrokerSocketSeqPacket(_broker_socket_seqpacket) => {
                 WorkerExecInputBinding::Close
             }
+            crate::RawFdRef::BrokerUnixStream(_broker_unix_stream) => WorkerExecInputBinding::Close,
             crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => WorkerExecInputBinding::Close,
 
             // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
@@ -11112,6 +11214,9 @@ fn worker_exec_output_binding<FS: ShimFS>(
                 WorkerExecOutputBinding::Close
             }
             crate::RawFdRef::BrokerSocketSeqPacket(_broker_socket_seqpacket) => {
+                WorkerExecOutputBinding::Close
+            }
+            crate::RawFdRef::BrokerUnixStream(_broker_unix_stream) => {
                 WorkerExecOutputBinding::Close
             }
             crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => WorkerExecOutputBinding::Close,

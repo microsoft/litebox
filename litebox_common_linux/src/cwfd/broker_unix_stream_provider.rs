@@ -1,29 +1,31 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Trait abstraction for broker-hosted AF_UNIX SOCK_SEQPACKET sockets.
+//! Trait abstraction for broker-hosted AF_UNIX SOCK_STREAM (named) sockets.
 //!
-//! The broker owns the seqpacket endpoint, its bind/connect state, and its
-//! receive queue so the socket survives delayed-fork-restore across workers.
-//! `SCM_RIGHTS` fd tokens are represented per packet; `SCM_CREDENTIALS` is
-//! still deliberately out of scope because it has authentication implications.
+//! The broker owns the named listener (path registry, accept backlog) and the
+//! connected stream endpoints (byte buffers) so named unix streams survive
+//! delayed-fork-restore and cross worker boundaries natively — replacing the
+//! legacy shim-local `UnixSocketSubsystem` that bridged cross-worker connections
+//! over a broker TCP connection with sidecar metadata files.
+//!
+//! `SCM_RIGHTS` is framed inline in the byte stream by the shim (the same
+//! `FdTransferReader` mechanism the broker socketpair uses); the broker carries
+//! the framed bytes opaquely, so it is not represented in this provider.
 
-use crate::cwfd::{broker_subscribable::BrokerSubscribable, fd_transfer_frame::PassedToken};
+use crate::cwfd::broker_subscribable::BrokerSubscribable;
 
 #[doc(inline)]
 pub use crate::cwfd::broker_subscribable::{BrokerEventCallback, BrokerOpError};
 
 /// Object-safe provider used by the shim to talk to broker-hosted AF_UNIX
-/// seqpacket sockets.
-pub trait BrokerSocketSeqPacketProvider: BrokerSubscribable {
-    /// Creates an unbound broker-hosted AF_UNIX SOCK_SEQPACKET socket.
+/// named SOCK_STREAM sockets.
+pub trait BrokerUnixStreamProvider: BrokerSubscribable {
+    /// Creates an unbound, unconnected broker-hosted AF_UNIX SOCK_STREAM socket.
     fn create(&self) -> Result<u64, BrokerOpError>;
 
     /// Binds `handle` to an encoded Unix address and returns the bound address.
     fn bind(&self, handle: u64, addr: &[u8]) -> Result<alloc::vec::Vec<u8>, BrokerOpError>;
-
-    /// Creates a connected broker-hosted AF_UNIX SOCK_SEQPACKET socketpair.
-    fn create_socketpair(&self) -> Result<(u64, u64), BrokerOpError>;
 
     /// Marks a bound socket as a listener.
     fn listen(&self, handle: u64, backlog: u32) -> Result<(), BrokerOpError>;
@@ -34,21 +36,11 @@ pub trait BrokerSocketSeqPacketProvider: BrokerSubscribable {
     /// Connects to a listening Unix address.
     fn connect(&self, handle: u64, addr: &[u8]) -> Result<(), BrokerOpError>;
 
-    /// Sends one packet to the connected peer. `tokens` carries SCM_RIGHTS
-    /// broker handles atomically with `payload`.
-    fn send(
-        &self,
-        handle: u64,
-        payload: &[u8],
-        tokens: &[PassedToken],
-    ) -> Result<usize, BrokerOpError>;
+    /// Writes `payload` to the connected peer's stream; returns bytes written.
+    fn send(&self, handle: u64, payload: &[u8]) -> Result<usize, BrokerOpError>;
 
-    /// Receives one packet and returns `(payload, flags, tokens)`.
-    fn recv(
-        &self,
-        handle: u64,
-        max_len: u32,
-    ) -> Result<(alloc::vec::Vec<u8>, u32, alloc::vec::Vec<PassedToken>), BrokerOpError>;
+    /// Reads up to `max_len` bytes from the stream (no packet boundary).
+    fn recv(&self, handle: u64, max_len: u32) -> Result<alloc::vec::Vec<u8>, BrokerOpError>;
 
     /// Applies `shutdown(2)` semantics (`0=RD`, `1=WR`, `2=RDWR`).
     fn shutdown(&self, handle: u64, how: u8) -> Result<(), BrokerOpError>;

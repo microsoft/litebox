@@ -216,6 +216,17 @@ pub enum Opcode {
     SocketSeqPacketShutdown = 0x6D,
     SocketSeqPacketGetSockName = 0x6E,
     SocketSeqPacketGetPeerName = 0x6F,
+    // UnixStream (AF_UNIX SOCK_STREAM, named) — scattered free request slots.
+    CreateUnixStream = 0x0D,
+    UnixStreamBind = 0x0E,
+    UnixStreamListen = 0x0F,
+    UnixStreamAccept = 0x1B,
+    UnixStreamConnect = 0x1C,
+    UnixStreamSend = 0x1D,
+    UnixStreamRecv = 0x1E,
+    UnixStreamShutdown = 0x1F,
+    UnixStreamGetSockName = 0x2D,
+    UnixStreamGetPeerName = 0x2E,
     PtyRead = 0x61,
     PtyWrite = 0x62,
     SubscribePty = 0x63,
@@ -352,6 +363,17 @@ pub enum Opcode {
     SocketSeqPacketShutdownResponse = 0xED,
     SocketSeqPacketGetSockNameResponse = 0xEE,
     SocketSeqPacketGetPeerNameResponse = 0xEF,
+    // UnixStream responses (= request opcode + 0x80).
+    CreateUnixStreamResponse = 0x8D,
+    UnixStreamBindResponse = 0x8E,
+    UnixStreamListenResponse = 0x8F,
+    UnixStreamAcceptResponse = 0x9B,
+    UnixStreamConnectResponse = 0x9C,
+    UnixStreamSendResponse = 0x9D,
+    UnixStreamRecvResponse = 0x9E,
+    UnixStreamShutdownResponse = 0x9F,
+    UnixStreamGetSockNameResponse = 0xAD,
+    UnixStreamGetPeerNameResponse = 0xAE,
     PtyReadResponse = 0xE1,
     PtyWriteResponse = 0xE2,
     SubscribePtyResponse = 0xE3,
@@ -500,8 +522,6 @@ impl Opcode {
     /// Returns the matching response opcode for a request opcode, or
     /// `None` if `self` is itself a response.
     pub fn response_for(self) -> Option<Opcode> {
-        // reason: large protocol enum; response opcodes intentionally have no paired response.
-        #[allow(clippy::wildcard_enum_match_arm)]
         match self {
             Opcode::Register => Some(Opcode::RegisterResponse),
             Opcode::Materialize => Some(Opcode::MaterializeResponse),
@@ -571,6 +591,16 @@ impl Opcode {
             Opcode::SocketSeqPacketShutdown => Some(Opcode::SocketSeqPacketShutdownResponse),
             Opcode::SocketSeqPacketGetSockName => Some(Opcode::SocketSeqPacketGetSockNameResponse),
             Opcode::SocketSeqPacketGetPeerName => Some(Opcode::SocketSeqPacketGetPeerNameResponse),
+            Opcode::CreateUnixStream => Some(Opcode::CreateUnixStreamResponse),
+            Opcode::UnixStreamBind => Some(Opcode::UnixStreamBindResponse),
+            Opcode::UnixStreamListen => Some(Opcode::UnixStreamListenResponse),
+            Opcode::UnixStreamAccept => Some(Opcode::UnixStreamAcceptResponse),
+            Opcode::UnixStreamConnect => Some(Opcode::UnixStreamConnectResponse),
+            Opcode::UnixStreamSend => Some(Opcode::UnixStreamSendResponse),
+            Opcode::UnixStreamRecv => Some(Opcode::UnixStreamRecvResponse),
+            Opcode::UnixStreamShutdown => Some(Opcode::UnixStreamShutdownResponse),
+            Opcode::UnixStreamGetSockName => Some(Opcode::UnixStreamGetSockNameResponse),
+            Opcode::UnixStreamGetPeerName => Some(Opcode::UnixStreamGetPeerNameResponse),
             Opcode::PtyRead => Some(Opcode::PtyReadResponse),
             Opcode::PtyWrite => Some(Opcode::PtyWriteResponse),
             Opcode::SubscribePty => Some(Opcode::SubscribePtyResponse),
@@ -608,7 +638,121 @@ impl Opcode {
             Opcode::InetTcpConnGetSockOpt => Some(Opcode::InetTcpConnGetSockOptResponse),
             #[cfg(debug_assertions)]
             Opcode::DebugQueryStateObject => Some(Opcode::DebugQueryStateObjectResponse),
-            _ => None,
+            #[cfg(debug_assertions)]
+            Opcode::DebugQueryStateObjectResponse => None,
+            Opcode::RegisterResponse
+            | Opcode::MaterializeResponse
+            | Opcode::ReleaseResponse
+            | Opcode::RegisterNotificationRingResponse
+            | Opcode::CreateEventfdResponse
+            | Opcode::ReadEventfdResponse
+            | Opcode::WriteEventfdResponse
+            | Opcode::SubscribeEventfdResponse
+            | Opcode::CreateTimerfdResponse
+            | Opcode::ReadTimerfdResponse
+            | Opcode::SetTimerfdResponse
+            | Opcode::GetTimerfdResponse
+            | Opcode::CreateSignalfdResponse
+            | Opcode::ReadSiginfoResponse
+            | Opcode::PushSiginfoResponse
+            | Opcode::InotifyInit1Response
+            | Opcode::InotifyAddWatchResponse
+            | Opcode::InotifyRmWatchResponse
+            | Opcode::InotifyReadResponse
+            | Opcode::InotifyQueryEventsResponse
+            | Opcode::InetListenerCreateResponse
+            | Opcode::InetListenerBindResponse
+            | Opcode::InetListenerListenResponse
+            | Opcode::InetListenerAcceptResponse
+            | Opcode::InetListenerQueryEventsResponse
+            | Opcode::InetListenerSetSockOptResponse
+            | Opcode::InetListenerGetSockNameResponse
+            | Opcode::InetListenerGetSockOptResponse
+            | Opcode::CreatePipeResponse
+            | Opcode::ReadPipeResponse
+            | Opcode::WritePipeResponse
+            | Opcode::AttachHostFdResponse
+            | Opcode::RegisterOfdResponse
+            | Opcode::CloneOfdResponse
+            | Opcode::BindNinePSessionResponse
+            | Opcode::CreateSocketDgramResponse
+            | Opcode::SocketDgramBindResponse
+            | Opcode::SocketDgramConnectResponse
+            | Opcode::SocketDgramSendToResponse
+            | Opcode::SocketDgramRecvFromResponse
+            | Opcode::SocketDgramShutdownResponse
+            | Opcode::SocketDgramGetSockNameResponse
+            | Opcode::SocketDgramGetPeerNameResponse
+            | Opcode::CreateSocketPairResponse
+            | Opcode::ReadSocketPairResponse
+            | Opcode::WriteSocketPairResponse
+            | Opcode::ShutdownSocketPairWriteResponse
+            | Opcode::InetRawCreateResponse
+            | Opcode::InetRawSendToResponse
+            | Opcode::InetRawRecvFromResponse
+            | Opcode::InetRawQueryEventsResponse
+            | Opcode::InetTcpConnCreateResponse
+            | Opcode::InetTcpConnConnectResponse
+            | Opcode::InetTcpConnQueryEventsResponse
+            | Opcode::InetTcpConnGetSockNameResponse
+            | Opcode::InetTcpConnGetPeerNameResponse
+            | Opcode::CreatePtyResponse
+            | Opcode::OpenPtySlaveResponse
+            | Opcode::CreateSocketSeqPacketResponse
+            | Opcode::SocketSeqPacketBindResponse
+            | Opcode::SocketSeqPacketListenResponse
+            | Opcode::SocketSeqPacketAcceptResponse
+            | Opcode::SocketSeqPacketConnectResponse
+            | Opcode::SocketSeqPacketSendResponse
+            | Opcode::SocketSeqPacketRecvResponse
+            | Opcode::SocketSeqPacketShutdownResponse
+            | Opcode::SocketSeqPacketGetSockNameResponse
+            | Opcode::SocketSeqPacketGetPeerNameResponse
+            | Opcode::CreateUnixStreamResponse
+            | Opcode::UnixStreamBindResponse
+            | Opcode::UnixStreamListenResponse
+            | Opcode::UnixStreamAcceptResponse
+            | Opcode::UnixStreamConnectResponse
+            | Opcode::UnixStreamSendResponse
+            | Opcode::UnixStreamRecvResponse
+            | Opcode::UnixStreamShutdownResponse
+            | Opcode::UnixStreamGetSockNameResponse
+            | Opcode::UnixStreamGetPeerNameResponse
+            | Opcode::PtyReadResponse
+            | Opcode::PtyWriteResponse
+            | Opcode::SubscribePtyResponse
+            | Opcode::PtyIoctlResponse
+            | Opcode::UnsubscribeResponse
+            | Opcode::DupHandleResponse
+            | Opcode::QueryEventsResponse
+            | Opcode::CreatePidfdResponse
+            | Opcode::PidfdExitedResponse
+            | Opcode::InetDgramCreateResponse
+            | Opcode::InetDgramBindResponse
+            | Opcode::InetDgramConnectResponse
+            | Opcode::InetDgramSendToResponse
+            | Opcode::InetDgramRecvFromResponse
+            | Opcode::InetDgramShutdownResponse
+            | Opcode::InetDgramGetSockNameResponse
+            | Opcode::InetDgramGetPeerNameResponse
+            | Opcode::InetDgramSetSockOptResponse
+            | Opcode::InetDgramGetSockOptResponse
+            | Opcode::InetDgramQueryEventsResponse
+            | Opcode::RegisterProcessResponse
+            | Opcode::SubscribeProcessExitResponse
+            | Opcode::MarkProcessExitedResponse
+            | Opcode::ReleaseAllForPidResponse
+            | Opcode::SubscribeSignalInboxResponse
+            | Opcode::UnsubscribeSignalInboxResponse
+            | Opcode::DeliverSignalInboxResponse
+            | Opcode::SetPgidResponse
+            | Opcode::SetSidResponse
+            | Opcode::ReadTcpConnResponse
+            | Opcode::WriteTcpConnResponse
+            | Opcode::ShutdownTcpConnResponse
+            | Opcode::PollTcpConnEventsResponse
+            | Opcode::InetTcpConnSetSockOptResponse
+            | Opcode::InetTcpConnGetSockOptResponse => None,
         }
     }
 
@@ -750,6 +894,16 @@ impl TryFrom<u8> for Opcode {
             0x18 => Ok(Opcode::ReadTimerfd),
             0x19 => Ok(Opcode::SetTimerfd),
             0x1A => Ok(Opcode::GetTimerfd),
+            0x0D => Ok(Opcode::CreateUnixStream),
+            0x0E => Ok(Opcode::UnixStreamBind),
+            0x0F => Ok(Opcode::UnixStreamListen),
+            0x1B => Ok(Opcode::UnixStreamAccept),
+            0x1C => Ok(Opcode::UnixStreamConnect),
+            0x1D => Ok(Opcode::UnixStreamSend),
+            0x1E => Ok(Opcode::UnixStreamRecv),
+            0x1F => Ok(Opcode::UnixStreamShutdown),
+            0x2D => Ok(Opcode::UnixStreamGetSockName),
+            0x2E => Ok(Opcode::UnixStreamGetPeerName),
             0x40 => Ok(Opcode::CreateSignalfd),
             0x41 => Ok(Opcode::ReadSiginfo),
             0x42 => Ok(Opcode::PushSiginfo),
@@ -855,6 +1009,16 @@ impl TryFrom<u8> for Opcode {
             0x98 => Ok(Opcode::ReadTimerfdResponse),
             0x99 => Ok(Opcode::SetTimerfdResponse),
             0x9A => Ok(Opcode::GetTimerfdResponse),
+            0x8D => Ok(Opcode::CreateUnixStreamResponse),
+            0x8E => Ok(Opcode::UnixStreamBindResponse),
+            0x8F => Ok(Opcode::UnixStreamListenResponse),
+            0x9B => Ok(Opcode::UnixStreamAcceptResponse),
+            0x9C => Ok(Opcode::UnixStreamConnectResponse),
+            0x9D => Ok(Opcode::UnixStreamSendResponse),
+            0x9E => Ok(Opcode::UnixStreamRecvResponse),
+            0x9F => Ok(Opcode::UnixStreamShutdownResponse),
+            0xAD => Ok(Opcode::UnixStreamGetSockNameResponse),
+            0xAE => Ok(Opcode::UnixStreamGetPeerNameResponse),
             0xC0 => Ok(Opcode::CreateSignalfdResponse),
             0xC1 => Ok(Opcode::ReadSiginfoResponse),
             0xC2 => Ok(Opcode::PushSiginfoResponse),
@@ -5820,75 +5984,525 @@ pub fn parse_handle_body(body: &[u8], opcode: Opcode) -> Result<u64, ProtocolErr
 mod tests {
     use super::*;
 
+    macro_rules! define_opcode_test_helpers {
+        ($($(#[$meta:meta])* $variant:ident),+ $(,)?) => {
+            fn all_opcodes() -> &'static [Opcode] {
+                &[
+                    $(
+                        $(#[$meta])*
+                        Opcode::$variant,
+                    )+
+                ]
+            }
+
+            fn opcode_exhaustiveness_guard(op: Opcode) {
+                match op {
+                    $(
+                        $(#[$meta])*
+                        Opcode::$variant => {}
+                    )+
+                }
+            }
+        };
+    }
+
+    define_opcode_test_helpers! {
+        Register,
+        Materialize,
+        Release,
+        RegisterNotificationRing,
+        CreateEventfd,
+        ReadEventfd,
+        WriteEventfd,
+        SubscribeEventfd,
+        CreateTimerfd,
+        ReadTimerfd,
+        SetTimerfd,
+        GetTimerfd,
+        CreateSignalfd,
+        ReadSiginfo,
+        PushSiginfo,
+        InotifyInit1,
+        InotifyAddWatch,
+        InotifyRmWatch,
+        InotifyRead,
+        InotifyQueryEvents,
+        InetListenerCreate,
+        InetListenerBind,
+        InetListenerListen,
+        InetListenerAccept,
+        InetListenerQueryEvents,
+        InetListenerSetSockOpt,
+        InetListenerGetSockName,
+        InetListenerGetSockOpt,
+        CreatePipe,
+        ReadPipe,
+        WritePipe,
+        AttachHostFd,
+        RegisterOfd,
+        CloneOfd,
+        BindNinePSession,
+        CreateSocketDgram,
+        SocketDgramBind,
+        SocketDgramConnect,
+        SocketDgramSendTo,
+        SocketDgramRecvFrom,
+        SocketDgramShutdown,
+        SocketDgramGetSockName,
+        SocketDgramGetPeerName,
+        CreateSocketPair,
+        ReadSocketPair,
+        WriteSocketPair,
+        ShutdownSocketPairWrite,
+        InetRawCreate,
+        InetRawSendTo,
+        InetRawRecvFrom,
+        InetRawQueryEvents,
+        InetTcpConnCreate,
+        InetTcpConnConnect,
+        InetTcpConnQueryEvents,
+        InetTcpConnGetSockName,
+        InetTcpConnGetPeerName,
+        CreatePty,
+        OpenPtySlave,
+        CreateSocketSeqPacket,
+        SocketSeqPacketBind,
+        SocketSeqPacketListen,
+        SocketSeqPacketAccept,
+        SocketSeqPacketConnect,
+        SocketSeqPacketSend,
+        SocketSeqPacketRecv,
+        SocketSeqPacketShutdown,
+        SocketSeqPacketGetSockName,
+        SocketSeqPacketGetPeerName,
+        CreateUnixStream,
+        UnixStreamBind,
+        UnixStreamListen,
+        UnixStreamAccept,
+        UnixStreamConnect,
+        UnixStreamSend,
+        UnixStreamRecv,
+        UnixStreamShutdown,
+        UnixStreamGetSockName,
+        UnixStreamGetPeerName,
+        PtyRead,
+        PtyWrite,
+        SubscribePty,
+        PtyIoctl,
+        Unsubscribe,
+        DupHandle,
+        QueryEvents,
+        CreatePidfd,
+        PidfdExited,
+        InetDgramCreate,
+        InetDgramBind,
+        InetDgramConnect,
+        InetDgramSendTo,
+        InetDgramRecvFrom,
+        InetDgramShutdown,
+        InetDgramGetSockName,
+        InetDgramGetPeerName,
+        InetDgramSetSockOpt,
+        InetDgramGetSockOpt,
+        InetDgramQueryEvents,
+        RegisterProcess,
+        SubscribeProcessExit,
+        MarkProcessExited,
+        ReleaseAllForPid,
+        SubscribeSignalInbox,
+        UnsubscribeSignalInbox,
+        DeliverSignalInbox,
+        SetPgid,
+        SetSid,
+        ReadTcpConn,
+        WriteTcpConn,
+        ShutdownTcpConn,
+        PollTcpConnEvents,
+        InetTcpConnSetSockOpt,
+        InetTcpConnGetSockOpt,
+        #[cfg(debug_assertions)]
+        DebugQueryStateObject,
+        RegisterResponse,
+        MaterializeResponse,
+        ReleaseResponse,
+        RegisterNotificationRingResponse,
+        CreateEventfdResponse,
+        ReadEventfdResponse,
+        WriteEventfdResponse,
+        SubscribeEventfdResponse,
+        CreateTimerfdResponse,
+        ReadTimerfdResponse,
+        SetTimerfdResponse,
+        GetTimerfdResponse,
+        CreateSignalfdResponse,
+        ReadSiginfoResponse,
+        PushSiginfoResponse,
+        InotifyInit1Response,
+        InotifyAddWatchResponse,
+        InotifyRmWatchResponse,
+        InotifyReadResponse,
+        InotifyQueryEventsResponse,
+        InetListenerCreateResponse,
+        InetListenerBindResponse,
+        InetListenerListenResponse,
+        InetListenerAcceptResponse,
+        InetListenerQueryEventsResponse,
+        InetListenerSetSockOptResponse,
+        InetListenerGetSockNameResponse,
+        InetListenerGetSockOptResponse,
+        CreatePipeResponse,
+        ReadPipeResponse,
+        WritePipeResponse,
+        AttachHostFdResponse,
+        RegisterOfdResponse,
+        CloneOfdResponse,
+        BindNinePSessionResponse,
+        CreateSocketDgramResponse,
+        SocketDgramBindResponse,
+        SocketDgramConnectResponse,
+        SocketDgramSendToResponse,
+        SocketDgramRecvFromResponse,
+        SocketDgramShutdownResponse,
+        SocketDgramGetSockNameResponse,
+        SocketDgramGetPeerNameResponse,
+        CreateSocketPairResponse,
+        ReadSocketPairResponse,
+        WriteSocketPairResponse,
+        ShutdownSocketPairWriteResponse,
+        InetRawCreateResponse,
+        InetRawSendToResponse,
+        InetRawRecvFromResponse,
+        InetRawQueryEventsResponse,
+        InetTcpConnCreateResponse,
+        InetTcpConnConnectResponse,
+        InetTcpConnQueryEventsResponse,
+        InetTcpConnGetSockNameResponse,
+        InetTcpConnGetPeerNameResponse,
+        CreatePtyResponse,
+        OpenPtySlaveResponse,
+        CreateSocketSeqPacketResponse,
+        SocketSeqPacketBindResponse,
+        SocketSeqPacketListenResponse,
+        SocketSeqPacketAcceptResponse,
+        SocketSeqPacketConnectResponse,
+        SocketSeqPacketSendResponse,
+        SocketSeqPacketRecvResponse,
+        SocketSeqPacketShutdownResponse,
+        SocketSeqPacketGetSockNameResponse,
+        SocketSeqPacketGetPeerNameResponse,
+        CreateUnixStreamResponse,
+        UnixStreamBindResponse,
+        UnixStreamListenResponse,
+        UnixStreamAcceptResponse,
+        UnixStreamConnectResponse,
+        UnixStreamSendResponse,
+        UnixStreamRecvResponse,
+        UnixStreamShutdownResponse,
+        UnixStreamGetSockNameResponse,
+        UnixStreamGetPeerNameResponse,
+        PtyReadResponse,
+        PtyWriteResponse,
+        SubscribePtyResponse,
+        PtyIoctlResponse,
+        UnsubscribeResponse,
+        DupHandleResponse,
+        QueryEventsResponse,
+        CreatePidfdResponse,
+        PidfdExitedResponse,
+        InetDgramCreateResponse,
+        InetDgramBindResponse,
+        InetDgramConnectResponse,
+        InetDgramSendToResponse,
+        InetDgramRecvFromResponse,
+        InetDgramShutdownResponse,
+        InetDgramGetSockNameResponse,
+        InetDgramGetPeerNameResponse,
+        InetDgramSetSockOptResponse,
+        InetDgramGetSockOptResponse,
+        InetDgramQueryEventsResponse,
+        RegisterProcessResponse,
+        SubscribeProcessExitResponse,
+        MarkProcessExitedResponse,
+        ReleaseAllForPidResponse,
+        SubscribeSignalInboxResponse,
+        UnsubscribeSignalInboxResponse,
+        DeliverSignalInboxResponse,
+        SetPgidResponse,
+        SetSidResponse,
+        ReadTcpConnResponse,
+        WriteTcpConnResponse,
+        ShutdownTcpConnResponse,
+        PollTcpConnEventsResponse,
+        InetTcpConnSetSockOptResponse,
+        InetTcpConnGetSockOptResponse,
+        #[cfg(debug_assertions)]
+        DebugQueryStateObjectResponse,
+    }
+
+    fn expected_response_for(op: Opcode) -> Option<Opcode> {
+        match op {
+            Opcode::Register => Some(Opcode::RegisterResponse),
+            Opcode::Materialize => Some(Opcode::MaterializeResponse),
+            Opcode::Release => Some(Opcode::ReleaseResponse),
+            Opcode::RegisterNotificationRing => Some(Opcode::RegisterNotificationRingResponse),
+            Opcode::CreateEventfd => Some(Opcode::CreateEventfdResponse),
+            Opcode::ReadEventfd => Some(Opcode::ReadEventfdResponse),
+            Opcode::WriteEventfd => Some(Opcode::WriteEventfdResponse),
+            Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
+            Opcode::CreateTimerfd => Some(Opcode::CreateTimerfdResponse),
+            Opcode::ReadTimerfd => Some(Opcode::ReadTimerfdResponse),
+            Opcode::SetTimerfd => Some(Opcode::SetTimerfdResponse),
+            Opcode::GetTimerfd => Some(Opcode::GetTimerfdResponse),
+            Opcode::CreateSignalfd => Some(Opcode::CreateSignalfdResponse),
+            Opcode::ReadSiginfo => Some(Opcode::ReadSiginfoResponse),
+            Opcode::PushSiginfo => Some(Opcode::PushSiginfoResponse),
+            Opcode::InotifyInit1 => Some(Opcode::InotifyInit1Response),
+            Opcode::InotifyAddWatch => Some(Opcode::InotifyAddWatchResponse),
+            Opcode::InotifyRmWatch => Some(Opcode::InotifyRmWatchResponse),
+            Opcode::InotifyRead => Some(Opcode::InotifyReadResponse),
+            Opcode::InotifyQueryEvents => Some(Opcode::InotifyQueryEventsResponse),
+            Opcode::InetListenerCreate => Some(Opcode::InetListenerCreateResponse),
+            Opcode::InetListenerBind => Some(Opcode::InetListenerBindResponse),
+            Opcode::InetListenerListen => Some(Opcode::InetListenerListenResponse),
+            Opcode::InetListenerAccept => Some(Opcode::InetListenerAcceptResponse),
+            Opcode::InetListenerQueryEvents => Some(Opcode::InetListenerQueryEventsResponse),
+            Opcode::InetListenerSetSockOpt => Some(Opcode::InetListenerSetSockOptResponse),
+            Opcode::InetListenerGetSockName => Some(Opcode::InetListenerGetSockNameResponse),
+            Opcode::InetListenerGetSockOpt => Some(Opcode::InetListenerGetSockOptResponse),
+            Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
+            Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
+            Opcode::WritePipe => Some(Opcode::WritePipeResponse),
+            Opcode::AttachHostFd => Some(Opcode::AttachHostFdResponse),
+            Opcode::RegisterOfd => Some(Opcode::RegisterOfdResponse),
+            Opcode::CloneOfd => Some(Opcode::CloneOfdResponse),
+            Opcode::BindNinePSession => Some(Opcode::BindNinePSessionResponse),
+            Opcode::CreateSocketDgram => Some(Opcode::CreateSocketDgramResponse),
+            Opcode::SocketDgramBind => Some(Opcode::SocketDgramBindResponse),
+            Opcode::SocketDgramConnect => Some(Opcode::SocketDgramConnectResponse),
+            Opcode::SocketDgramSendTo => Some(Opcode::SocketDgramSendToResponse),
+            Opcode::SocketDgramRecvFrom => Some(Opcode::SocketDgramRecvFromResponse),
+            Opcode::SocketDgramShutdown => Some(Opcode::SocketDgramShutdownResponse),
+            Opcode::SocketDgramGetSockName => Some(Opcode::SocketDgramGetSockNameResponse),
+            Opcode::SocketDgramGetPeerName => Some(Opcode::SocketDgramGetPeerNameResponse),
+            Opcode::CreateSocketPair => Some(Opcode::CreateSocketPairResponse),
+            Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
+            Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
+            Opcode::ShutdownSocketPairWrite => Some(Opcode::ShutdownSocketPairWriteResponse),
+            Opcode::InetRawCreate => Some(Opcode::InetRawCreateResponse),
+            Opcode::InetRawSendTo => Some(Opcode::InetRawSendToResponse),
+            Opcode::InetRawRecvFrom => Some(Opcode::InetRawRecvFromResponse),
+            Opcode::InetRawQueryEvents => Some(Opcode::InetRawQueryEventsResponse),
+            Opcode::InetTcpConnCreate => Some(Opcode::InetTcpConnCreateResponse),
+            Opcode::InetTcpConnConnect => Some(Opcode::InetTcpConnConnectResponse),
+            Opcode::InetTcpConnQueryEvents => Some(Opcode::InetTcpConnQueryEventsResponse),
+            Opcode::InetTcpConnGetSockName => Some(Opcode::InetTcpConnGetSockNameResponse),
+            Opcode::InetTcpConnGetPeerName => Some(Opcode::InetTcpConnGetPeerNameResponse),
+            Opcode::CreatePty => Some(Opcode::CreatePtyResponse),
+            Opcode::OpenPtySlave => Some(Opcode::OpenPtySlaveResponse),
+            Opcode::CreateSocketSeqPacket => Some(Opcode::CreateSocketSeqPacketResponse),
+            Opcode::SocketSeqPacketBind => Some(Opcode::SocketSeqPacketBindResponse),
+            Opcode::SocketSeqPacketListen => Some(Opcode::SocketSeqPacketListenResponse),
+            Opcode::SocketSeqPacketAccept => Some(Opcode::SocketSeqPacketAcceptResponse),
+            Opcode::SocketSeqPacketConnect => Some(Opcode::SocketSeqPacketConnectResponse),
+            Opcode::SocketSeqPacketSend => Some(Opcode::SocketSeqPacketSendResponse),
+            Opcode::SocketSeqPacketRecv => Some(Opcode::SocketSeqPacketRecvResponse),
+            Opcode::SocketSeqPacketShutdown => Some(Opcode::SocketSeqPacketShutdownResponse),
+            Opcode::SocketSeqPacketGetSockName => Some(Opcode::SocketSeqPacketGetSockNameResponse),
+            Opcode::SocketSeqPacketGetPeerName => Some(Opcode::SocketSeqPacketGetPeerNameResponse),
+            Opcode::CreateUnixStream => Some(Opcode::CreateUnixStreamResponse),
+            Opcode::UnixStreamBind => Some(Opcode::UnixStreamBindResponse),
+            Opcode::UnixStreamListen => Some(Opcode::UnixStreamListenResponse),
+            Opcode::UnixStreamAccept => Some(Opcode::UnixStreamAcceptResponse),
+            Opcode::UnixStreamConnect => Some(Opcode::UnixStreamConnectResponse),
+            Opcode::UnixStreamSend => Some(Opcode::UnixStreamSendResponse),
+            Opcode::UnixStreamRecv => Some(Opcode::UnixStreamRecvResponse),
+            Opcode::UnixStreamShutdown => Some(Opcode::UnixStreamShutdownResponse),
+            Opcode::UnixStreamGetSockName => Some(Opcode::UnixStreamGetSockNameResponse),
+            Opcode::UnixStreamGetPeerName => Some(Opcode::UnixStreamGetPeerNameResponse),
+            Opcode::PtyRead => Some(Opcode::PtyReadResponse),
+            Opcode::PtyWrite => Some(Opcode::PtyWriteResponse),
+            Opcode::SubscribePty => Some(Opcode::SubscribePtyResponse),
+            Opcode::PtyIoctl => Some(Opcode::PtyIoctlResponse),
+            Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
+            Opcode::DupHandle => Some(Opcode::DupHandleResponse),
+            Opcode::QueryEvents => Some(Opcode::QueryEventsResponse),
+            Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
+            Opcode::PidfdExited => Some(Opcode::PidfdExitedResponse),
+            Opcode::InetDgramCreate => Some(Opcode::InetDgramCreateResponse),
+            Opcode::InetDgramBind => Some(Opcode::InetDgramBindResponse),
+            Opcode::InetDgramConnect => Some(Opcode::InetDgramConnectResponse),
+            Opcode::InetDgramSendTo => Some(Opcode::InetDgramSendToResponse),
+            Opcode::InetDgramRecvFrom => Some(Opcode::InetDgramRecvFromResponse),
+            Opcode::InetDgramShutdown => Some(Opcode::InetDgramShutdownResponse),
+            Opcode::InetDgramGetSockName => Some(Opcode::InetDgramGetSockNameResponse),
+            Opcode::InetDgramGetPeerName => Some(Opcode::InetDgramGetPeerNameResponse),
+            Opcode::InetDgramSetSockOpt => Some(Opcode::InetDgramSetSockOptResponse),
+            Opcode::InetDgramGetSockOpt => Some(Opcode::InetDgramGetSockOptResponse),
+            Opcode::InetDgramQueryEvents => Some(Opcode::InetDgramQueryEventsResponse),
+            Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
+            Opcode::SubscribeProcessExit => Some(Opcode::SubscribeProcessExitResponse),
+            Opcode::MarkProcessExited => Some(Opcode::MarkProcessExitedResponse),
+            Opcode::ReleaseAllForPid => Some(Opcode::ReleaseAllForPidResponse),
+            Opcode::SubscribeSignalInbox => Some(Opcode::SubscribeSignalInboxResponse),
+            Opcode::UnsubscribeSignalInbox => Some(Opcode::UnsubscribeSignalInboxResponse),
+            Opcode::DeliverSignalInbox => Some(Opcode::DeliverSignalInboxResponse),
+            Opcode::SetPgid => Some(Opcode::SetPgidResponse),
+            Opcode::SetSid => Some(Opcode::SetSidResponse),
+            Opcode::ReadTcpConn => Some(Opcode::ReadTcpConnResponse),
+            Opcode::WriteTcpConn => Some(Opcode::WriteTcpConnResponse),
+            Opcode::ShutdownTcpConn => Some(Opcode::ShutdownTcpConnResponse),
+            Opcode::PollTcpConnEvents => Some(Opcode::PollTcpConnEventsResponse),
+            Opcode::InetTcpConnSetSockOpt => Some(Opcode::InetTcpConnSetSockOptResponse),
+            Opcode::InetTcpConnGetSockOpt => Some(Opcode::InetTcpConnGetSockOptResponse),
+            #[cfg(debug_assertions)]
+            Opcode::DebugQueryStateObject => Some(Opcode::DebugQueryStateObjectResponse),
+            Opcode::RegisterResponse => None,
+            Opcode::MaterializeResponse => None,
+            Opcode::ReleaseResponse => None,
+            Opcode::RegisterNotificationRingResponse => None,
+            Opcode::CreateEventfdResponse => None,
+            Opcode::ReadEventfdResponse => None,
+            Opcode::WriteEventfdResponse => None,
+            Opcode::SubscribeEventfdResponse => None,
+            Opcode::CreateTimerfdResponse => None,
+            Opcode::ReadTimerfdResponse => None,
+            Opcode::SetTimerfdResponse => None,
+            Opcode::GetTimerfdResponse => None,
+            Opcode::CreateSignalfdResponse => None,
+            Opcode::ReadSiginfoResponse => None,
+            Opcode::PushSiginfoResponse => None,
+            Opcode::InotifyInit1Response => None,
+            Opcode::InotifyAddWatchResponse => None,
+            Opcode::InotifyRmWatchResponse => None,
+            Opcode::InotifyReadResponse => None,
+            Opcode::InotifyQueryEventsResponse => None,
+            Opcode::InetListenerCreateResponse => None,
+            Opcode::InetListenerBindResponse => None,
+            Opcode::InetListenerListenResponse => None,
+            Opcode::InetListenerAcceptResponse => None,
+            Opcode::InetListenerQueryEventsResponse => None,
+            Opcode::InetListenerSetSockOptResponse => None,
+            Opcode::InetListenerGetSockNameResponse => None,
+            Opcode::InetListenerGetSockOptResponse => None,
+            Opcode::CreatePipeResponse => None,
+            Opcode::ReadPipeResponse => None,
+            Opcode::WritePipeResponse => None,
+            Opcode::AttachHostFdResponse => None,
+            Opcode::RegisterOfdResponse => None,
+            Opcode::CloneOfdResponse => None,
+            Opcode::BindNinePSessionResponse => None,
+            Opcode::CreateSocketDgramResponse => None,
+            Opcode::SocketDgramBindResponse => None,
+            Opcode::SocketDgramConnectResponse => None,
+            Opcode::SocketDgramSendToResponse => None,
+            Opcode::SocketDgramRecvFromResponse => None,
+            Opcode::SocketDgramShutdownResponse => None,
+            Opcode::SocketDgramGetSockNameResponse => None,
+            Opcode::SocketDgramGetPeerNameResponse => None,
+            Opcode::CreateSocketPairResponse => None,
+            Opcode::ReadSocketPairResponse => None,
+            Opcode::WriteSocketPairResponse => None,
+            Opcode::ShutdownSocketPairWriteResponse => None,
+            Opcode::InetRawCreateResponse => None,
+            Opcode::InetRawSendToResponse => None,
+            Opcode::InetRawRecvFromResponse => None,
+            Opcode::InetRawQueryEventsResponse => None,
+            Opcode::InetTcpConnCreateResponse => None,
+            Opcode::InetTcpConnConnectResponse => None,
+            Opcode::InetTcpConnQueryEventsResponse => None,
+            Opcode::InetTcpConnGetSockNameResponse => None,
+            Opcode::InetTcpConnGetPeerNameResponse => None,
+            Opcode::CreatePtyResponse => None,
+            Opcode::OpenPtySlaveResponse => None,
+            Opcode::CreateSocketSeqPacketResponse => None,
+            Opcode::SocketSeqPacketBindResponse => None,
+            Opcode::SocketSeqPacketListenResponse => None,
+            Opcode::SocketSeqPacketAcceptResponse => None,
+            Opcode::SocketSeqPacketConnectResponse => None,
+            Opcode::SocketSeqPacketSendResponse => None,
+            Opcode::SocketSeqPacketRecvResponse => None,
+            Opcode::SocketSeqPacketShutdownResponse => None,
+            Opcode::SocketSeqPacketGetSockNameResponse => None,
+            Opcode::SocketSeqPacketGetPeerNameResponse => None,
+            Opcode::CreateUnixStreamResponse => None,
+            Opcode::UnixStreamBindResponse => None,
+            Opcode::UnixStreamListenResponse => None,
+            Opcode::UnixStreamAcceptResponse => None,
+            Opcode::UnixStreamConnectResponse => None,
+            Opcode::UnixStreamSendResponse => None,
+            Opcode::UnixStreamRecvResponse => None,
+            Opcode::UnixStreamShutdownResponse => None,
+            Opcode::UnixStreamGetSockNameResponse => None,
+            Opcode::UnixStreamGetPeerNameResponse => None,
+            Opcode::PtyReadResponse => None,
+            Opcode::PtyWriteResponse => None,
+            Opcode::SubscribePtyResponse => None,
+            Opcode::PtyIoctlResponse => None,
+            Opcode::UnsubscribeResponse => None,
+            Opcode::DupHandleResponse => None,
+            Opcode::QueryEventsResponse => None,
+            Opcode::CreatePidfdResponse => None,
+            Opcode::PidfdExitedResponse => None,
+            Opcode::InetDgramCreateResponse => None,
+            Opcode::InetDgramBindResponse => None,
+            Opcode::InetDgramConnectResponse => None,
+            Opcode::InetDgramSendToResponse => None,
+            Opcode::InetDgramRecvFromResponse => None,
+            Opcode::InetDgramShutdownResponse => None,
+            Opcode::InetDgramGetSockNameResponse => None,
+            Opcode::InetDgramGetPeerNameResponse => None,
+            Opcode::InetDgramSetSockOptResponse => None,
+            Opcode::InetDgramGetSockOptResponse => None,
+            Opcode::InetDgramQueryEventsResponse => None,
+            Opcode::RegisterProcessResponse => None,
+            Opcode::SubscribeProcessExitResponse => None,
+            Opcode::MarkProcessExitedResponse => None,
+            Opcode::ReleaseAllForPidResponse => None,
+            Opcode::SubscribeSignalInboxResponse => None,
+            Opcode::UnsubscribeSignalInboxResponse => None,
+            Opcode::DeliverSignalInboxResponse => None,
+            Opcode::SetPgidResponse => None,
+            Opcode::SetSidResponse => None,
+            Opcode::ReadTcpConnResponse => None,
+            Opcode::WriteTcpConnResponse => None,
+            Opcode::ShutdownTcpConnResponse => None,
+            Opcode::PollTcpConnEventsResponse => None,
+            Opcode::InetTcpConnSetSockOptResponse => None,
+            Opcode::InetTcpConnGetSockOptResponse => None,
+            #[cfg(debug_assertions)]
+            Opcode::DebugQueryStateObjectResponse => None,
+        }
+    }
+
     #[test]
     fn opcode_round_trip() {
-        for op in [
-            Opcode::Register,
-            Opcode::Materialize,
-            Opcode::Release,
-            Opcode::RegisterNotificationRing,
-            Opcode::CreateEventfd,
-            Opcode::ReadEventfd,
-            Opcode::WriteEventfd,
-            Opcode::SubscribeEventfd,
-            Opcode::Unsubscribe,
-            Opcode::CreatePidfd,
-            Opcode::PidfdExited,
-            Opcode::SubscribeProcessExit,
-            Opcode::MarkProcessExited,
-            Opcode::RegisterResponse,
-            Opcode::MaterializeResponse,
-            Opcode::ReleaseResponse,
-            Opcode::RegisterNotificationRingResponse,
-            Opcode::CreateEventfdResponse,
-            Opcode::ReadEventfdResponse,
-            Opcode::WriteEventfdResponse,
-            Opcode::SubscribeEventfdResponse,
-            Opcode::UnsubscribeResponse,
-            Opcode::CreatePidfdResponse,
-            Opcode::PidfdExitedResponse,
-            Opcode::SubscribeProcessExit,
-            Opcode::MarkProcessExited,
-            Opcode::SubscribeProcessExitResponse,
-            Opcode::MarkProcessExitedResponse,
-            Opcode::QueryEvents,
-            Opcode::QueryEventsResponse,
-        ] {
-            assert_eq!(Opcode::try_from(op as u8).unwrap(), op);
+        let mut seen = [false; 256];
+
+        for &op in all_opcodes() {
+            opcode_exhaustiveness_guard(op);
+            let byte = op as u8;
+            assert!(
+                !seen[usize::from(byte)],
+                "duplicate opcode byte 0x{byte:02X} for {op:?}"
+            );
+            seen[usize::from(byte)] = true;
+            assert_eq!(
+                Opcode::try_from(byte).unwrap(),
+                op,
+                "opcode byte 0x{byte:02X}"
+            );
         }
     }
 
     #[test]
     fn response_for_pairs() {
-        assert_eq!(
-            Opcode::Register.response_for(),
-            Some(Opcode::RegisterResponse)
-        );
-        assert_eq!(
-            Opcode::CreateEventfd.response_for(),
-            Some(Opcode::CreateEventfdResponse)
-        );
-        assert_eq!(
-            Opcode::Unsubscribe.response_for(),
-            Some(Opcode::UnsubscribeResponse)
-        );
-        assert_eq!(
-            Opcode::CreatePidfd.response_for(),
-            Some(Opcode::CreatePidfdResponse)
-        );
-        assert_eq!(
-            Opcode::PidfdExited.response_for(),
-            Some(Opcode::PidfdExitedResponse)
-        );
-        assert_eq!(
-            Opcode::SubscribeProcessExit.response_for(),
-            Some(Opcode::SubscribeProcessExitResponse)
-        );
-        assert_eq!(
-            Opcode::MarkProcessExited.response_for(),
-            Some(Opcode::MarkProcessExitedResponse)
-        );
-        assert_eq!(Opcode::ReadEventfdResponse.response_for(), None);
+        for &op in all_opcodes() {
+            assert_eq!(
+                op.response_for(),
+                expected_response_for(op),
+                "response_for({op:?})"
+            );
+        }
     }
 
     #[test]
@@ -6148,10 +6762,10 @@ mod tests {
     #[test]
     fn decode_unknown_opcode() {
         let mut buf = build_register_request().encode().unwrap();
-        // 0x0D is unallocated. Update if 0x0D ever gets allocated.
-        buf[6] = 0x0D;
+        // 0x00 is outside the allocated opcode ranges. Update if it ever gets allocated.
+        buf[6] = 0x00;
         match decode(&buf) {
-            Err(ProtocolError::UnknownOpcode { opcode: 0x0D }) => {}
+            Err(ProtocolError::UnknownOpcode { opcode: 0x00 }) => {}
             other => panic!("expected UnknownOpcode, got {other:?}"),
         }
     }
@@ -6880,8 +7494,20 @@ pub fn build_socket_seqpacket_connect_response_ok() -> OwnedFrame {
     }
 }
 pub fn build_socket_seqpacket_send_request(handle_id: u64, payload: &[u8]) -> OwnedFrame {
-    let mut body = Vec::with_capacity(12 + payload.len());
+    build_socket_seqpacket_send_request_with_tokens(handle_id, payload, &[])
+}
+
+pub fn build_socket_seqpacket_send_request_with_tokens(
+    handle_id: u64,
+    payload: &[u8],
+    tokens: &[PassedToken],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + payload.len() + 8 * tokens.len());
     put_u64(&mut body, handle_id);
+    body.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for token in tokens {
+        body.extend_from_slice(&token.raw().to_le_bytes());
+    }
     push_len_bytes(&mut body, payload);
     OwnedFrame {
         opcode: Opcode::SocketSeqPacketSend,
@@ -6890,16 +7516,41 @@ pub fn build_socket_seqpacket_send_request(handle_id: u64, payload: &[u8]) -> Ow
         body,
     }
 }
-pub fn parse_socket_seqpacket_send_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
-    if body.len() < 12 {
+pub fn parse_socket_seqpacket_send_body(
+    body: &[u8],
+) -> Result<(u64, Vec<PassedToken>, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::SocketSeqPacketSend,
-            want: 12,
+            want: 16,
             got: body.len(),
         });
     }
     let handle_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
     let mut off = 8;
+    let token_count = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    let token_bytes = token_count
+        .checked_mul(8)
+        .ok_or(ProtocolError::BodyTooLarge {
+            body_len: u32::MAX,
+            max: BODY_MAX,
+        })?;
+    if off + token_bytes > body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketSend,
+            want: off + token_bytes,
+            got: body.len(),
+        });
+    }
+    let mut tokens = Vec::with_capacity(token_count);
+    for i in 0..token_count {
+        let start = off + 8 * i;
+        tokens.push(PassedToken::from_raw(u64::from_le_bytes(
+            body[start..start + 8].try_into().unwrap(),
+        )));
+    }
+    off += token_bytes;
     let payload = parse_len_bytes(body, &mut off, Opcode::SocketSeqPacketSend)?.to_vec();
     if off != body.len() {
         return Err(ProtocolError::WrongBodyLen {
@@ -6908,7 +7559,7 @@ pub fn parse_socket_seqpacket_send_body(body: &[u8]) -> Result<(u64, Vec<u8>), P
             got: body.len(),
         });
     }
-    Ok((handle_id, payload))
+    Ok((handle_id, tokens, payload))
 }
 pub fn build_socket_seqpacket_send_response_ok(written: u64) -> OwnedFrame {
     build_handle_response(Opcode::SocketSeqPacketSendResponse, written)
@@ -6941,8 +7592,20 @@ pub fn parse_socket_seqpacket_recv_body(body: &[u8]) -> Result<(u64, u32), Proto
     ))
 }
 pub fn build_socket_seqpacket_recv_response_ok(payload: &[u8], flags: u32) -> OwnedFrame {
-    let mut body = Vec::with_capacity(8 + payload.len());
+    build_socket_seqpacket_recv_response_ok_with_tokens(payload, flags, &[])
+}
+
+pub fn build_socket_seqpacket_recv_response_ok_with_tokens(
+    payload: &[u8],
+    flags: u32,
+    tokens: &[PassedToken],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + payload.len() + 8 * tokens.len());
     body.extend_from_slice(&flags.to_le_bytes());
+    body.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for token in tokens {
+        body.extend_from_slice(&token.raw().to_le_bytes());
+    }
     push_len_bytes(&mut body, payload);
     OwnedFrame {
         opcode: Opcode::SocketSeqPacketRecvResponse,
@@ -6953,16 +7616,39 @@ pub fn build_socket_seqpacket_recv_response_ok(payload: &[u8], flags: u32) -> Ow
 }
 pub fn parse_socket_seqpacket_recv_response_ok(
     body: &[u8],
-) -> Result<(Vec<u8>, u32), ProtocolError> {
-    if body.len() < 8 {
+) -> Result<(Vec<u8>, u32, Vec<PassedToken>), ProtocolError> {
+    if body.len() < 12 {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::SocketSeqPacketRecvResponse,
-            want: 8,
+            want: 12,
             got: body.len(),
         });
     }
     let flags = u32::from_le_bytes(body[0..4].try_into().unwrap());
     let mut off = 4;
+    let token_count = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    let token_bytes = token_count
+        .checked_mul(8)
+        .ok_or(ProtocolError::BodyTooLarge {
+            body_len: u32::MAX,
+            max: BODY_MAX,
+        })?;
+    if off + token_bytes > body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketRecvResponse,
+            want: off + token_bytes,
+            got: body.len(),
+        });
+    }
+    let mut tokens = Vec::with_capacity(token_count);
+    for i in 0..token_count {
+        let start = off + 8 * i;
+        tokens.push(PassedToken::from_raw(u64::from_le_bytes(
+            body[start..start + 8].try_into().unwrap(),
+        )));
+    }
+    off += token_bytes;
     let payload = parse_len_bytes(body, &mut off, Opcode::SocketSeqPacketRecvResponse)?.to_vec();
     if off != body.len() {
         return Err(ProtocolError::WrongBodyLen {
@@ -6971,7 +7657,7 @@ pub fn parse_socket_seqpacket_recv_response_ok(
             got: body.len(),
         });
     }
-    Ok((payload, flags))
+    Ok((payload, flags, tokens))
 }
 pub fn build_socket_seqpacket_shutdown_request(handle_id: u64, how: u8) -> OwnedFrame {
     let mut body = Vec::with_capacity(9);
@@ -7052,6 +7738,316 @@ pub fn parse_socket_seqpacket_getpeername_response_ok(
     if off != body.len() {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::SocketSeqPacketGetPeerNameResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(addr)
+}
+
+// UnixStream (AF_UNIX SOCK_STREAM, named) wire format. Connection-oriented like
+// seqpacket but with byte-stream data semantics (send/recv carry bytes, no
+// packet boundary / TRUNC). `SCM_RIGHTS` is framed inline in the byte stream by
+// the shim; the broker carries the framed bytes opaquely.
+pub fn build_create_unix_stream_request() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreateUnixStream,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+pub fn build_create_unix_stream_response_ok(handle_id: u64) -> OwnedFrame {
+    build_handle_response(Opcode::CreateUnixStreamResponse, handle_id)
+}
+pub fn parse_create_unix_stream_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::CreateUnixStreamResponse)
+}
+
+fn build_unix_stream_addr_request(opcode: Opcode, handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + addr.len());
+    put_u64(&mut body, handle_id);
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+fn parse_unix_stream_addr_body(
+    body: &[u8],
+    opcode: Opcode,
+) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    let handle_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut off = 8;
+    let addr = parse_len_bytes(body, &mut off, opcode)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok((handle_id, addr))
+}
+
+pub fn build_unix_stream_bind_request(handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    build_unix_stream_addr_request(Opcode::UnixStreamBind, handle_id, addr)
+}
+pub fn parse_unix_stream_bind_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    parse_unix_stream_addr_body(body, Opcode::UnixStreamBind)
+}
+pub fn build_unix_stream_bind_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::new();
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamBindResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_bind_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::UnixStreamBindResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamBindResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(addr)
+}
+
+pub fn build_unix_stream_listen_request(handle_id: u64, backlog: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12);
+    put_u64(&mut body, handle_id);
+    body.extend_from_slice(&backlog.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::UnixStreamListen,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_listen_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamListen,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+pub fn build_unix_stream_listen_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::UnixStreamListenResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_unix_stream_accept_request(handle_id: u64) -> OwnedFrame {
+    build_handle_request(Opcode::UnixStreamAccept, handle_id)
+}
+pub fn parse_unix_stream_accept_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::UnixStreamAccept)
+}
+pub fn build_unix_stream_accept_response_ok(handle_id: u64) -> OwnedFrame {
+    build_handle_response(Opcode::UnixStreamAcceptResponse, handle_id)
+}
+pub fn parse_unix_stream_accept_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::UnixStreamAcceptResponse)
+}
+
+pub fn build_unix_stream_connect_request(handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    build_unix_stream_addr_request(Opcode::UnixStreamConnect, handle_id, addr)
+}
+pub fn parse_unix_stream_connect_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    parse_unix_stream_addr_body(body, Opcode::UnixStreamConnect)
+}
+pub fn build_unix_stream_connect_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::UnixStreamConnectResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_unix_stream_send_request(handle_id: u64, payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + payload.len());
+    put_u64(&mut body, handle_id);
+    push_len_bytes(&mut body, payload);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamSend,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_send_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamSend,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    let handle_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut off = 8;
+    let payload = parse_len_bytes(body, &mut off, Opcode::UnixStreamSend)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamSend,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok((handle_id, payload))
+}
+pub fn build_unix_stream_send_response_ok(written: u64) -> OwnedFrame {
+    build_handle_response(Opcode::UnixStreamSendResponse, written)
+}
+pub fn parse_unix_stream_send_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::UnixStreamSendResponse)
+}
+
+pub fn build_unix_stream_recv_request(handle_id: u64, max_len: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12);
+    put_u64(&mut body, handle_id);
+    body.extend_from_slice(&max_len.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::UnixStreamRecv,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_recv_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamRecv,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+pub fn build_unix_stream_recv_response_ok(payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(4 + payload.len());
+    push_len_bytes(&mut body, payload);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamRecvResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_recv_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let payload = parse_len_bytes(body, &mut off, Opcode::UnixStreamRecvResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamRecvResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(payload)
+}
+
+pub fn build_unix_stream_shutdown_request(handle_id: u64, how: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(9);
+    put_u64(&mut body, handle_id);
+    body.push(how);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamShutdown,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_shutdown_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    if body.len() != 9 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamShutdown,
+            want: 9,
+            got: body.len(),
+        });
+    }
+    Ok((u64::from_le_bytes(body[0..8].try_into().unwrap()), body[8]))
+}
+pub fn build_unix_stream_shutdown_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::UnixStreamShutdownResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_unix_stream_getsockname_request(handle_id: u64) -> OwnedFrame {
+    build_handle_request(Opcode::UnixStreamGetSockName, handle_id)
+}
+pub fn build_unix_stream_getpeername_request(handle_id: u64) -> OwnedFrame {
+    build_handle_request(Opcode::UnixStreamGetPeerName, handle_id)
+}
+pub fn build_unix_stream_getsockname_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::new();
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamGetSockNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn build_unix_stream_getpeername_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::new();
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::UnixStreamGetPeerNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_unix_stream_getsockname_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::UnixStreamGetSockNameResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamGetSockNameResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(addr)
+}
+pub fn parse_unix_stream_getpeername_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::UnixStreamGetPeerNameResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnixStreamGetPeerNameResponse,
             want: off,
             got: body.len(),
         });

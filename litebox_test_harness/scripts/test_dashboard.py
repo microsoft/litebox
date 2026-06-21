@@ -986,6 +986,60 @@ class RegressionClassTests(unittest.TestCase):
         self.assertIsNone(row["tip_verdict"])
         self.assertEqual(row["classification"], "hard_regression")
 
+    # ── flake-aware classification (preexisting_flake + hard-demotion) ──
+
+    def test_preexisting_flake_when_no_baseline_but_upstream_flaky(self):
+        # Branch fails, NO definitive baseline verdict, but the test flaps
+        # pass/fail on the upstream lineage → it's a pre-existing flake the
+        # thin merge-base just didn't cover, NOT a failure the branch
+        # introduced. Must be `preexisting_flake`, not `new_fail`.
+        self._upstream("UP", "T", "pass", dt=2000)
+        self._upstream("UP", "T", "fail", dt=1000)   # upstream flaps
+        # (no BASE run → baseline arm is NULL)
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"], ("preexisting_flake", "n/a"))
+
+    def test_preexisting_flake_via_upstream_fail_without_pass(self):
+        # No baseline, branch fails, upstream has a fail but no pass in
+        # window (so recent_flaky=0) → the `n_fail > 0` arm must still
+        # catch it as a pre-existing flake, not `new_fail`.
+        self._upstream("UP", "T", "fail", dt=1000)
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"][0], "preexisting_flake")
+
+    def test_new_fail_stays_new_fail_when_upstream_solid(self):
+        # No baseline, branch fails, but upstream is SOLID (a pass, no
+        # fails) → genuinely unexplained → still `new_fail`, NOT
+        # `preexisting_flake`. This is the line that keeps `new_fail`
+        # meaningful (worth a look) vs the flake bucket (benign).
+        self._upstream("UP", "T", "pass", dt=1000)
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"], ("new_fail", "low"))
+
+    def test_low_rate_upstream_flake_demotes_hard_to_soft(self):
+        # The headline fix: a baseline pass + single branch fail, where the
+        # test failed on upstream at all in-window (no pass/fail flapping
+        # needed) → `soft_regression`, not a false `hard_regression`.
+        # Baseline pass recorded off the CI worktree so it doesn't itself
+        # add an upstream pass (isolating the `n_fail > 0` demotion: the
+        # CI lineage shows only a fail, recent_flaky=0).
+        self._branch("BASE", "T", "pass")            # baseline pass on /wt
+        self._upstream("UP", "T", "fail", dt=1000)   # one upstream CI fail
+        self._branch("BRANCH", "T", "fail")
+        row = self._classify_rows()["T"]
+        self.assertEqual(row["recent_flaky"], 0)     # not pass/fail flapping
+        self.assertEqual(row["classification"], "soft_regression")
+
+    def test_solid_upstream_single_fail_stays_hard(self):
+        # Guard the other side: a genuinely rock-solid-upstream test (passes,
+        # ZERO upstream fails) that fails once on the branch is still a
+        # `hard_regression` (medium) — only upstream *instability* demotes.
+        for i in range(3):
+            self._upstream("UP", "T", "pass", dt=i * 1000)
+        self._upstream("BASE", "T", "pass")
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"], ("hard_regression", "medium"))
+
 
 if __name__ == "__main__":
     unittest.main()
