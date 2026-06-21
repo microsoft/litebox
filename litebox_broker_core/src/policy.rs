@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use crate::session::ObjectKind;
 use crate::{BrokerError, CallerCredential, ObjectRights};
 
 /// Configured broker policy.
@@ -51,18 +52,22 @@ impl PolicyEngine {
         })
     }
 
-    pub(crate) fn authorize_create_event(
+    pub(crate) fn authorize_create_object(
         &self,
         caller_credential: CallerCredential,
+        object_kind: ObjectKind,
     ) -> Result<ObjectRights, BrokerError> {
-        match self.profile {
-            PolicyProfile::EventOnly {
-                event_reference_rights,
-                ..
-            } if caller_credential == CallerCredential::Unauthenticated => {
+        match (self.profile, object_kind) {
+            (
+                PolicyProfile::EventOnly {
+                    event_reference_rights,
+                    ..
+                },
+                ObjectKind::Event,
+            ) if caller_credential == CallerCredential::Unauthenticated => {
                 Ok(event_reference_rights)
             }
-            PolicyProfile::DefaultDeny | PolicyProfile::EventOnly { .. } => {
+            (PolicyProfile::DefaultDeny | PolicyProfile::EventOnly { .. }, _) => {
                 Err(BrokerError::PolicyDenied)
             }
         }
@@ -111,7 +116,7 @@ mod tests {
         let policy = PolicyEngine::event_only();
 
         assert_eq!(
-            policy.authorize_create_event(CallerCredential::Unauthenticated),
+            policy.authorize_create_object(CallerCredential::Unauthenticated, ObjectKind::Event),
             Ok(ObjectRights::WAIT | ObjectRights::WRITE)
         );
         assert_eq!(
@@ -140,7 +145,7 @@ mod tests {
         let policy = PolicyEngine::event_only_with_reference_rights(ObjectRights::WAIT);
 
         assert_eq!(
-            policy.authorize_create_event(CallerCredential::Unauthenticated),
+            policy.authorize_create_object(CallerCredential::Unauthenticated, ObjectKind::Event),
             Ok(ObjectRights::WAIT)
         );
         assert_eq!(

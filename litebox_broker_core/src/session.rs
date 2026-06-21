@@ -48,6 +48,11 @@ pub(crate) enum ObjectEntry {
     Event(EventObject),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectKind {
+    Event,
+}
+
 /// Broker-owned authority token for one authenticated caller session.
 ///
 /// User mode does not choose this value. The broker entry layer authenticates
@@ -73,6 +78,12 @@ impl BrokerSession {
             session_id,
             caller_credential,
         }
+    }
+
+    pub(crate) fn authorize_create_object(&self, object_kind: ObjectKind) -> Result<ObjectRights> {
+        self.core
+            .policy
+            .authorize_create_object(self.caller_credential, object_kind)
     }
 
     pub(crate) fn create_object_reference(

@@ -3,7 +3,7 @@
 
 //! Broker-owned event object operations.
 
-use crate::session::{ObjectEntry, ObjectRights};
+use crate::session::{ObjectEntry, ObjectKind, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result};
 use litebox_broker_protocol::{
     EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState, WaitOutcome,
@@ -17,12 +17,7 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
         return Err(BrokerError::ResourceExhausted);
     }
 
-    let rights = {
-        session
-            .core
-            .policy
-            .authorize_create_event(session.caller_credential)?
-    };
+    let rights = session.authorize_create_object(ObjectKind::Event)?;
     session.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count)), rights)
 }
 
