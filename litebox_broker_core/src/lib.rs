@@ -44,8 +44,6 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BrokerCoreLimits {
-    /// Maximum live broker objects.
-    pub max_objects: usize,
     /// Maximum live object references.
     pub max_references: usize,
 }
@@ -53,16 +51,12 @@ pub struct BrokerCoreLimits {
 impl BrokerCoreLimits {
     /// Conservative default limits for initial broker deployments.
     pub const DEFAULT: Self = Self {
-        max_objects: 4096,
         max_references: 4096,
     };
 
     /// Creates a broker core limit set.
-    pub const fn new(max_objects: usize, max_references: usize) -> Self {
-        Self {
-            max_objects,
-            max_references,
-        }
+    pub const fn new(max_references: usize) -> Self {
+        Self { max_references }
     }
 }
 
@@ -71,8 +65,6 @@ impl Default for BrokerCoreLimits {
         Self::DEFAULT
     }
 }
-
-const MAX_OBJECTS: usize = u32::MAX as usize - 1;
 
 /// Channel-independent broker authority handle.
 ///
@@ -110,10 +102,6 @@ impl BrokerCore {
 
     /// Creates the broker core with explicit authority-state limits.
     pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Result<Self> {
-        if limits.max_objects > MAX_OBJECTS {
-            return Err(BrokerError::ResourceExhausted);
-        }
-
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;

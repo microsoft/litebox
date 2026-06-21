@@ -81,11 +81,7 @@ impl BrokerSession {
         rights: ObjectRights,
     ) -> Result<ObjectHandle> {
         let mut references = self.core.references.write();
-        // The reference table is the only owning object registry; with the
-        // current API each new object starts with exactly one reference.
-        if references.len() >= self.core.limits.max_objects
-            || references.len() >= self.core.limits.max_references
-        {
+        if references.len() >= self.core.limits.max_references {
             return Err(BrokerError::ResourceExhausted);
         }
         let handle = self.core.allocate_reference_handle()?;
@@ -197,21 +193,10 @@ mod tests {
     use litebox_broker_protocol::{ObjectHandle, WaitOutcome};
 
     #[test]
-    fn oversized_object_limits_are_rejected_before_core_construction() {
-        let too_many_entries = u32::MAX as usize;
-
-        assert!(matches!(
-            BrokerCore::new_with_limits(
-                PolicyEngine::event_only(),
-                BrokerCoreLimits::new(too_many_entries, 1)
-            ),
-            Err(BrokerError::ResourceExhausted)
-        ));
-    }
-
-    #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
-        let broker = BrokerCore::new(PolicyEngine::event_only()).unwrap();
+        let broker =
+            BrokerCore::new_with_limits(PolicyEngine::event_only(), BrokerCoreLimits::new(1))
+                .unwrap();
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -236,6 +221,10 @@ mod tests {
             event::wait(&session, handle),
             Ok(WaitOutcome::WouldBlock(_))
         ));
+        assert_eq!(
+            event::create(&session, 0),
+            Err(BrokerError::ResourceExhausted)
+        );
 
         assert_eq!(session.close_object_reference(handle), Ok(()));
         {
