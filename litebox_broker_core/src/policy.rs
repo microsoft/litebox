@@ -28,7 +28,7 @@ impl PrincipalRights {
     /// Grants all currently supported object rights.
     pub const fn all() -> Self {
         Self {
-            event: ALL_OBJECT_RIGHTS,
+            event: ObjectRights::WAIT.union(ObjectRights::WRITE),
         }
     }
 
@@ -88,9 +88,6 @@ impl Default for PolicyEngine {
         Self::default_deny()
     }
 }
-
-/// Rights currently supported by every broker object kind.
-const ALL_OBJECT_RIGHTS: ObjectRights = ObjectRights::WAIT.union(ObjectRights::WRITE);
 
 #[cfg(test)]
 mod tests {
