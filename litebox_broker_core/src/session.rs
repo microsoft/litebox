@@ -80,17 +80,14 @@ impl BrokerSession {
         }
     }
 
-    pub(crate) fn authorize_create_object(&self, object_kind: ObjectKind) -> Result<ObjectRights> {
-        self.core
+    pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
+        let object_kind = match &object {
+            ObjectEntry::Event(_) => ObjectKind::Event,
+        };
+        let rights = self
+            .core
             .policy
-            .authorize_create_object(self.caller_credential, object_kind)
-    }
-
-    pub(crate) fn create_object_reference(
-        &self,
-        object: ObjectEntry,
-        rights: ObjectRights,
-    ) -> Result<ObjectHandle> {
+            .authorize_create_object(self.caller_credential, object_kind)?;
         let mut references = self.core.references.write();
         if references.len() >= self.core.limits.max_references {
             return Err(BrokerError::ResourceExhausted);
