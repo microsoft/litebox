@@ -85,7 +85,7 @@ impl BrokerSession {
             return Err(BrokerError::ResourceExhausted);
         }
         let handle = self.core.allocate_reference_handle()?;
-        let old_reference = references.insert(
+        references.insert(
             handle,
             ObjectReference {
                 object: Arc::new(RwLock::new(object)),
@@ -93,7 +93,6 @@ impl BrokerSession {
                 rights,
             },
         );
-        debug_assert!(old_reference.is_none());
 
         Ok(handle)
     }
