@@ -715,19 +715,7 @@ impl<FS: ShimFS> EpollFile<FS> {
             if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
                 continue; // already in the ready set
             }
-            if let Some((Some(event), _)) = entry.poll(global, fs, false, false) {
-                {
-                    use litebox::platform::DebugLogProvider as _;
-                    let ev = { event.events };
-                    let dt = { event.data };
-                    let msg = alloc::format!(
-                        "[epoll-diag] rescan_ready type={} events=0x{:x} data={}\n",
-                        entry.desc.type_name(),
-                        ev,
-                        dt,
-                    );
-                    litebox_platform_multiplex::platform().debug_log_print(&msg);
-                }
+            if let Some((Some(_event), _)) = entry.poll(global, fs, false, false) {
                 self.ready.push(&entry);
             }
         }
@@ -976,33 +964,6 @@ impl<FS: ShimFS> EpollFile<FS> {
                 .swap(true, core::sync::atomic::Ordering::Relaxed)
         {
             self.ready.pollee.notify_observers(Events::IN);
-        }
-        {
-            use litebox::platform::DebugLogProvider as _;
-            let fd_type = match file {
-                EpollDescriptor::Eventfd(_) => "Eventfd",
-                EpollDescriptor::Signalfd(_) => "Signalfd",
-                EpollDescriptor::Inotify(_) => "Inotify",
-                EpollDescriptor::BrokerInetListener(_) => "BrokerInetListener",
-                EpollDescriptor::BrokerInetDgram(_) => "BrokerInetDgram",
-                EpollDescriptor::BrokerInetRaw(_) => "BrokerInetRaw",
-                EpollDescriptor::Epoll(_) => "Epoll",
-                EpollDescriptor::File(_) => "File",
-                #[cfg(feature = "worker_local_inet")]
-                EpollDescriptor::Socket(_) => "Socket",
-                EpollDescriptor::Unix(_) => "Unix",
-                EpollDescriptor::HostPassthroughFd(_) => "HostPassthroughFd",
-                EpollDescriptor::BrokerPipe(_) => "BrokerPipe",
-                EpollDescriptor::BrokerPty(_) => "BrokerPty",
-                EpollDescriptor::BrokerSocketPair(_) => "BrokerSocketPair",
-                EpollDescriptor::BrokerTcpConn(_) => "BrokerTcpConn",
-                EpollDescriptor::BrokerUnixStream(_) => "BrokerUnixStream",
-            };
-            let msg = alloc::format!(
-                "[epoll-diag] ADD fd={fd} type={fd_type} mask={mask:?} events={events:?} host_poll={is_host_poll} ready={}\n",
-                !events.is_empty(),
-            );
-            litebox_platform_multiplex::platform().debug_log_print(&msg);
         }
         interests.insert(key, entry);
         drop(interests);
