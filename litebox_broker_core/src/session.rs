@@ -88,11 +88,16 @@ impl BrokerSession {
         }
     }
 
-    pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
-        let rights = self
-            .core
-            .policy
-            .authorize_create_object(self.caller_credential, object.kind())?;
+    pub(crate) fn create_object_reference(
+        &self,
+        object: ObjectEntry,
+        requested_rights: ObjectRights,
+    ) -> Result<ObjectHandle> {
+        self.core.policy.authorize_create_object(
+            self.caller_credential,
+            object.kind(),
+            requested_rights,
+        )?;
         let mut references = self.core.references.write();
         if references.len() >= self.core.limits.max_references {
             return Err(BrokerError::ResourceExhausted);
@@ -103,7 +108,7 @@ impl BrokerSession {
             ObjectReference {
                 object: Arc::new(RwLock::new(object)),
                 session_id: self.session_id,
-                rights,
+                rights: requested_rights,
             },
         );
 
@@ -183,14 +188,19 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, event};
+    use crate::{
+        BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, PrincipalRights,
+        event,
+    };
     use litebox_broker_protocol::{ObjectHandle, WaitOutcome};
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
-        let broker =
-            BrokerCore::new_with_limits(PolicyEngine::allow_objects(), BrokerCoreLimits::new(1))
-                .unwrap();
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(PrincipalRights::all()),
+            BrokerCoreLimits::new(1),
+        )
+        .unwrap();
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();

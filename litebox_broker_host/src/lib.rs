@@ -290,12 +290,15 @@ pub enum ConnectionTermination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_core::PolicyEngine;
+    use litebox_broker_core::{PolicyEngine, PrincipalRights};
     use litebox_broker_protocol::CreateEventRequest;
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
-        let broker = BrokerCore::new(PolicyEngine::allow_objects()).unwrap();
+        let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
+            PrincipalRights::all(),
+        ))
+        .unwrap();
 
         serve_connection_negotiates_routes_one_request_and_returns_peer_closed(&broker);
         serve_connection_closes_after_protocol_violation(&broker);

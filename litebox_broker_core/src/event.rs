@@ -17,7 +17,10 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
         return Err(BrokerError::ResourceExhausted);
     }
 
-    session.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count)))
+    session.create_object_reference(
+        ObjectEntry::Event(EventObject::new(initial_count)),
+        ObjectRights::WAIT | ObjectRights::WRITE,
+    )
 }
 
 /// Checks whether an event wait would complete now.

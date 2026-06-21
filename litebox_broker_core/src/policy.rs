@@ -10,13 +10,33 @@ use crate::{BrokerError, CallerCredential, ObjectRights};
 pub enum PolicyProfile {
     /// Deny every operation.
     DefaultDeny,
-    /// Allow configured broker object operations.
-    AllowObjects {
-        /// Rights to attach to newly created object references.
-        reference_rights: ObjectRights,
-        /// Maximum object rights this policy may authorize for use requests.
-        use_rights: ObjectRights,
+    /// Static rights for known broker principals.
+    Static {
+        /// Rights for the unauthenticated principal used by the initial POC.
+        unauthenticated: PrincipalRights,
     },
+}
+
+/// Rights granted to one broker principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrincipalRights {
+    /// Rights for event objects.
+    pub event: ObjectRights,
+}
+
+impl PrincipalRights {
+    /// Grants all currently supported object rights.
+    pub const fn all() -> Self {
+        Self {
+            event: ALL_OBJECT_RIGHTS,
+        }
+    }
+
+    fn object_rights(self, object_kind: ObjectKind) -> ObjectRights {
+        match object_kind {
+            ObjectKind::Event => self.event,
+        }
+    }
 }
 
 /// Broker policy decision and audit component.
@@ -36,38 +56,31 @@ impl PolicyEngine {
         Self::new(PolicyProfile::DefaultDeny)
     }
 
-    /// Creates a policy engine that allows configured broker object operations.
-    pub const fn allow_objects() -> Self {
-        Self::allow_objects_with_reference_rights(DEFAULT_OBJECT_RIGHTS)
-    }
-
-    /// Creates an object policy engine with explicit initial reference rights.
-    ///
-    /// Use authorization still allows the normal object rights; BrokerCore's
-    /// reference validation enforces the rights on each created reference.
-    pub const fn allow_objects_with_reference_rights(reference_rights: ObjectRights) -> Self {
-        Self::new(PolicyProfile::AllowObjects {
-            reference_rights,
-            use_rights: DEFAULT_OBJECT_RIGHTS,
-        })
+    /// Creates a policy engine with rights for the unauthenticated principal.
+    pub const fn with_unauthenticated_rights(unauthenticated: PrincipalRights) -> Self {
+        Self::new(PolicyProfile::Static { unauthenticated })
     }
 
     pub(crate) fn authorize_create_object(
         &self,
         caller_credential: CallerCredential,
         object_kind: ObjectKind,
-    ) -> Result<ObjectRights, BrokerError> {
-        match (self.profile, object_kind) {
-            (
-                PolicyProfile::AllowObjects {
-                    reference_rights, ..
-                },
-                ObjectKind::Event,
-            ) if caller_credential == CallerCredential::Unauthenticated => Ok(reference_rights),
-            (PolicyProfile::DefaultDeny | PolicyProfile::AllowObjects { .. }, _) => {
-                Err(BrokerError::PolicyDenied)
+        requested_rights: ObjectRights,
+    ) -> Result<(), BrokerError> {
+        let principal_rights = match (self.profile, caller_credential) {
+            (PolicyProfile::Static { unauthenticated }, CallerCredential::Unauthenticated) => {
+                unauthenticated
             }
+            (PolicyProfile::DefaultDeny, _) => return Err(BrokerError::PolicyDenied),
+        };
+        if requested_rights.is_empty()
+            || !principal_rights
+                .object_rights(object_kind)
+                .contains(requested_rights)
+        {
+            return Err(BrokerError::PolicyDenied);
         }
+        Ok(())
     }
 
     pub(crate) fn authorize_use_object(
@@ -76,18 +89,16 @@ impl PolicyEngine {
         object_kind: ObjectKind,
         rights: ObjectRights,
     ) -> Result<(), BrokerError> {
-        match (self.profile, object_kind) {
-            (PolicyProfile::AllowObjects { use_rights, .. }, ObjectKind::Event)
-                if caller_credential == CallerCredential::Unauthenticated
-                    && !rights.is_empty()
-                    && use_rights.contains(rights) =>
-            {
-                Ok(())
+        let principal_rights = match (self.profile, caller_credential) {
+            (PolicyProfile::Static { unauthenticated }, CallerCredential::Unauthenticated) => {
+                unauthenticated
             }
-            (PolicyProfile::DefaultDeny | PolicyProfile::AllowObjects { .. }, _) => {
-                Err(BrokerError::PolicyDenied)
-            }
+            (PolicyProfile::DefaultDeny, _) => return Err(BrokerError::PolicyDenied),
+        };
+        if !rights.is_empty() && principal_rights.object_rights(object_kind).contains(rights) {
+            return Ok(());
         }
+        Err(BrokerError::PolicyDenied)
     }
 }
 
@@ -97,24 +108,24 @@ impl Default for PolicyEngine {
     }
 }
 
-/// Policy profile that allows configured broker object operations.
-///
-/// The default object create operation grants `WAIT | WRITE` on the initial
-/// reference. Use requests may ask for any non-empty subset of configured object
-/// use rights; BrokerCore separately enforces each reference's actual rights.
-const DEFAULT_OBJECT_RIGHTS: ObjectRights = ObjectRights::WAIT.union(ObjectRights::WRITE);
+/// Rights currently supported by every broker object kind.
+const ALL_OBJECT_RIGHTS: ObjectRights = ObjectRights::WAIT.union(ObjectRights::WRITE);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn object_policy_allows_configured_object_surface() {
-        let policy = PolicyEngine::allow_objects();
+    fn static_policy_allows_configured_principal_rights() {
+        let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights::all());
 
         assert_eq!(
-            policy.authorize_create_object(CallerCredential::Unauthenticated, ObjectKind::Event),
-            Ok(ObjectRights::WAIT | ObjectRights::WRITE)
+            policy.authorize_create_object(
+                CallerCredential::Unauthenticated,
+                ObjectKind::Event,
+                ObjectRights::WAIT | ObjectRights::WRITE
+            ),
+            Ok(())
         );
         assert_eq!(
             policy.authorize_use_object(
@@ -148,15 +159,37 @@ mod tests {
             ),
             Err(BrokerError::PolicyDenied)
         );
+        assert_eq!(
+            policy.authorize_create_object(
+                CallerCredential::Unauthenticated,
+                ObjectKind::Event,
+                ObjectRights::empty()
+            ),
+            Err(BrokerError::PolicyDenied)
+        );
     }
 
     #[test]
-    fn explicit_reference_rights_do_not_narrow_object_use_policy() {
-        let policy = PolicyEngine::allow_objects_with_reference_rights(ObjectRights::WAIT);
+    fn requested_reference_rights_must_fit_principal_rights() {
+        let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights {
+            event: ObjectRights::WAIT,
+        });
 
         assert_eq!(
-            policy.authorize_create_object(CallerCredential::Unauthenticated, ObjectKind::Event),
-            Ok(ObjectRights::WAIT)
+            policy.authorize_create_object(
+                CallerCredential::Unauthenticated,
+                ObjectKind::Event,
+                ObjectRights::WAIT
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            policy.authorize_create_object(
+                CallerCredential::Unauthenticated,
+                ObjectKind::Event,
+                ObjectRights::WAIT | ObjectRights::WRITE
+            ),
+            Err(BrokerError::PolicyDenied)
         );
         assert_eq!(
             policy.authorize_use_object(
@@ -164,7 +197,7 @@ mod tests {
                 ObjectKind::Event,
                 ObjectRights::WRITE
             ),
-            Ok(())
+            Err(BrokerError::PolicyDenied)
         );
     }
 }

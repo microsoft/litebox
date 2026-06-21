@@ -422,7 +422,9 @@ fn test_runner_broker_integration_with_rewriter() {
     let socket_path = unique_test_socket_path("runner-broker");
     let broker_thread = spawn_test_broker(
         &socket_path,
-        litebox_broker_core::PolicyEngine::allow_objects(),
+        litebox_broker_core::PolicyEngine::with_unauthenticated_rights(
+            litebox_broker_core::PrincipalRights::all(),
+        ),
         2,
     );
 

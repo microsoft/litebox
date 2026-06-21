@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use litebox_broker_core::{BrokerCore, PolicyEngine};
+use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
 use litebox_broker_host::serve_connection;
 use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
 
@@ -26,7 +26,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (stream, _) = listener.accept()?;
     let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
     channel.set_io_deadline(Some(Instant::now() + SESSION_TIMEOUT))?;
-    let broker = BrokerCore::new(PolicyEngine::allow_objects())?;
+    let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
+        PrincipalRights::all(),
+    ))?;
     serve_connection(&broker, &mut channel)?;
     Ok(())
 }
