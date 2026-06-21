@@ -33,9 +33,8 @@ use litebox::{
 };
 use litebox_common_linux::{
     AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType,
-    SocketOption, SocketOptionName, TcpOption, UnixProtocol,
-    errno::Errno,
-    fd_transfer_frame::{FdTransferFrame, FdTransferReader, FrameError},
+    SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
+    fd_transfer_frame::FdTransferFrame,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -5240,33 +5239,21 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 })
                 .unwrap_or(Err(Errno::EBADF)),
+            // Broker-backed AF_UNIX SOCK_STREAM named socket. Like the
+            // socketpair, SCM_RIGHTS arrive in-band as LBFD frames on a
+            // byte stream; `recv_deframed` keeps a persistent reassembly
+            // reader so coalesced / split frames are each surfaced with
+            // their own fd tokens.
             SocketIoClass::BrokerUnixStream => self
                 .try_with_broker_unix_stream(sockfd, |typed| {
                     if buf.is_empty() {
                         return Ok(0);
                     }
                     let handle = self.broker_unix_stream_handle(typed)?;
-                    let payload =
-                        handle.with_entry(|entry| entry.recv(&self.wait_cx(), buf.len() as u32))?;
-                    // SCM_RIGHTS frames arrive in-band as an LBFD frame (same as
-                    // the broker socketpair); opportunistically de-frame, falling
-                    // back to raw bytes when there is no frame magic.
-                    let mut reader = FdTransferReader::new();
-                    reader.push(&payload);
-                    match reader.take_frame() {
-                        Ok(Some(frame)) => {
-                            received_tokens.extend(frame.tokens);
-                            let n = buf.len().min(frame.data.len());
-                            buf[..n].copy_from_slice(&frame.data[..n]);
-                            Ok(n)
-                        }
-                        Ok(None) | Err(FrameError::BadMagic { .. }) => {
-                            let n = buf.len().min(payload.len());
-                            buf[..n].copy_from_slice(&payload[..n]);
-                            Ok(n)
-                        }
-                        Err(_) => Err(Errno::EPROTO),
-                    }
+                    let (n, tokens) =
+                        handle.with_entry(|entry| entry.recv_deframed(&self.wait_cx(), buf))?;
+                    received_tokens.extend(tokens);
+                    Ok(n)
                 })
                 .unwrap_or(Err(Errno::EBADF)),
             SocketIoClass::BrokerSocketSeqPacket => self

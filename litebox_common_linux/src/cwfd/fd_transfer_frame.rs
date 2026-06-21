@@ -462,6 +462,90 @@ impl FdTransferReader {
     }
 }
 
+/// Per-endpoint receive-side reassembly for the in-band LBFD framing used
+/// to carry `SCM_RIGHTS` fd tokens over a byte-stream transport (the
+/// broker AF_UNIX `SOCK_STREAM` socketpair and named unix-stream).
+///
+/// Framed (fd-bearing) and unframed writes interleave on the stream and
+/// `read(2)` boundaries coalesce or split them arbitrarily, so the reader
+/// must persist across `recvmsg` calls. The pre-fix code rebuilt a fresh
+/// [`FdTransferReader`] per call and decoded only one frame, silently
+/// dropping every coalesced frame after the first — the bug that stalled
+/// VS Code's exthost handle passing.
+///
+/// [`read_unit`](Self::read_unit) returns exactly one stream *unit* per
+/// call (one frame's data + its tokens, or a run of raw bytes), matching
+/// Linux's per-ancillary-boundary `SOCK_STREAM` delivery, and buffers any
+/// payload that overran the caller's buffer.
+#[derive(Default)]
+pub struct StreamScmDeframer {
+    reader: FdTransferReader,
+    /// Decoded data bytes not yet delivered because they overran a
+    /// caller's buffer. Returned (token-less) on subsequent reads.
+    pending: Vec<u8>,
+}
+
+impl StreamScmDeframer {
+    /// 60 KiB staging chunk per `fill`, matching the broker socketpair /
+    /// unix-stream per-RPC read cap.
+    const STAGE: usize = 60 * 1024;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Deframe one stream unit into `buf`, returning `(bytes_copied,
+    /// tokens)`. `fill(staging)` reads up to `staging.len()` raw bytes
+    /// from the underlying transport (returning `0` on EOF) and is called
+    /// only when more bytes are needed to complete the next unit.
+    pub fn read_unit<E>(
+        &mut self,
+        buf: &mut [u8],
+        mut fill: impl FnMut(&mut [u8]) -> Result<usize, E>,
+    ) -> Result<(usize, Vec<PassedToken>), E> {
+        if buf.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        // Deliver any leftover decoded bytes first (token-less tail of a
+        // frame / raw run that overran a prior caller's buffer).
+        if !self.pending.is_empty() {
+            let n = buf.len().min(self.pending.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            return Ok((n, Vec::new()));
+        }
+        loop {
+            match self.reader.take_unit() {
+                ReaderUnit::Frame(frame) => {
+                    let n = buf.len().min(frame.data.len());
+                    buf[..n].copy_from_slice(&frame.data[..n]);
+                    if n < frame.data.len() {
+                        self.pending.extend_from_slice(&frame.data[n..]);
+                    }
+                    return Ok((n, frame.tokens));
+                }
+                ReaderUnit::Raw(bytes) => {
+                    let n = buf.len().min(bytes.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        self.pending.extend_from_slice(&bytes[n..]);
+                    }
+                    return Ok((n, Vec::new()));
+                }
+                ReaderUnit::NeedMore => {
+                    let mut staging = alloc::vec![0u8; Self::STAGE];
+                    let size = fill(&mut staging)?;
+                    if size == 0 {
+                        // EOF / read-shutdown: no further units possible.
+                        return Ok((0, Vec::new()));
+                    }
+                    self.reader.push(&staging[..size]);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod reader_tests {
     use super::*;
@@ -594,6 +678,77 @@ mod reader_tests {
             panic!("expected frame after completion");
         };
         assert_eq!(f.data, b"z");
+    }
+
+    /// A `fill` closure that streams `wire` in `chunk`-sized pieces; used
+    /// to drive `StreamScmDeframer::read_unit` deterministically.
+    fn chunked_fill(wire: Vec<u8>, chunk: usize) -> impl FnMut(&mut [u8]) -> Result<usize, ()> {
+        let mut cursor = 0usize;
+        move |staging: &mut [u8]| {
+            let take = staging.len().min(chunk).min(wire.len() - cursor);
+            staging[..take].copy_from_slice(&wire[cursor..cursor + take]);
+            cursor += take;
+            Ok(take)
+        }
+    }
+
+    #[test]
+    fn deframer_drains_coalesced_frames() {
+        // Two fd-bearing frames delivered in one fill must each surface
+        // with their own token, one per read_unit call.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&encoded_frame(&[pt(1)], b"a"));
+        wire.extend_from_slice(&encoded_frame(&[pt(2)], b"b"));
+        let mut fill = chunked_fill(wire, usize::MAX);
+        let mut d = StreamScmDeframer::new();
+        let mut buf = [0u8; 64];
+        let (n1, t1) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n1], b"a");
+        assert_eq!(t1, vec![pt(1)]);
+        let (n2, t2) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n2], b"b");
+        assert_eq!(t2, vec![pt(2)]);
+    }
+
+    #[test]
+    fn deframer_reassembles_split_frame() {
+        // A frame delivered one byte per fill must still reassemble.
+        let wire = encoded_frame(&[pt(5)], b"trickle");
+        let mut fill = chunked_fill(wire, 1);
+        let mut d = StreamScmDeframer::new();
+        let mut buf = [0u8; 64];
+        let (n, t) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n], b"trickle");
+        assert_eq!(t, vec![pt(5)]);
+    }
+
+    #[test]
+    fn deframer_buffers_overrun_into_pending() {
+        // A caller buffer smaller than the frame data gets the token with
+        // the first chunk; the remainder drains token-less.
+        let wire = encoded_frame(&[pt(7)], b"hello");
+        let mut fill = chunked_fill(wire, usize::MAX);
+        let mut d = StreamScmDeframer::new();
+        let mut buf = [0u8; 2];
+        let (n1, t1) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n1], b"he");
+        assert_eq!(t1, vec![pt(7)]);
+        let (n2, t2) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n2], b"ll");
+        assert!(t2.is_empty());
+        let (n3, t3) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n3], b"o");
+        assert!(t3.is_empty());
+    }
+
+    #[test]
+    fn deframer_eof_returns_zero() {
+        let mut fill = chunked_fill(Vec::new(), usize::MAX);
+        let mut d = StreamScmDeframer::new();
+        let mut buf = [0u8; 16];
+        let (n, t) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(n, 0);
+        assert!(t.is_empty());
     }
 
     #[test]
