@@ -61,31 +61,7 @@ impl PolicyEngine {
         Self::new(PolicyProfile::Static { unauthenticated })
     }
 
-    pub(crate) fn authorize_create_object(
-        &self,
-        caller_credential: CallerCredential,
-        object_kind: ObjectKind,
-        requested_rights: ObjectRights,
-    ) -> Result<(), BrokerError> {
-        let principal_rights = match (self.profile, caller_credential) {
-            (PolicyProfile::Static { unauthenticated }, CallerCredential::Unauthenticated) => {
-                unauthenticated
-            }
-            (PolicyProfile::DefaultDeny, _) => return Err(BrokerError::PolicyDenied),
-        };
-        if requested_rights.is_empty() {
-            return Err(BrokerError::InvalidRights);
-        }
-        if !principal_rights
-            .object_rights(object_kind)
-            .contains(requested_rights)
-        {
-            return Err(BrokerError::PolicyDenied);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn authorize_use_object(
+    pub(crate) fn authorize_object_rights(
         &self,
         caller_credential: CallerCredential,
         object_kind: ObjectKind,
@@ -125,7 +101,7 @@ mod tests {
         let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights::all());
 
         assert_eq!(
-            policy.authorize_create_object(
+            policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
                 ObjectKind::Event,
                 ObjectRights::WAIT | ObjectRights::WRITE
@@ -133,7 +109,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_use_object(
+            policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
                 ObjectKind::Event,
                 ObjectRights::WAIT
@@ -141,7 +117,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_use_object(
+            policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
                 ObjectKind::Event,
                 ObjectRights::WRITE
@@ -149,7 +125,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_use_object(
+            policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
                 ObjectKind::Event,
                 ObjectRights::WAIT | ObjectRights::WRITE
@@ -157,15 +133,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_use_object(
-                CallerCredential::Unauthenticated,
-                ObjectKind::Event,
-                ObjectRights::empty()
-            ),
-            Err(BrokerError::InvalidRights)
-        );
-        assert_eq!(
-            policy.authorize_create_object(
+            policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
                 ObjectKind::Event,
                 ObjectRights::empty()
@@ -175,13 +143,13 @@ mod tests {
     }
 
     #[test]
-    fn requested_reference_rights_must_fit_principal_rights() {
+    fn object_rights_must_fit_principal_rights() {
         let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights {
             event: ObjectRights::WAIT,
         });
 
         assert_eq!(
-            policy.authorize_create_object(
+            policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
                 ObjectKind::Event,
                 ObjectRights::WAIT
@@ -189,7 +157,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_create_object(
+            policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
                 ObjectKind::Event,
                 ObjectRights::WAIT | ObjectRights::WRITE
@@ -197,7 +165,7 @@ mod tests {
             Err(BrokerError::PolicyDenied)
         );
         assert_eq!(
-            policy.authorize_use_object(
+            policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
                 ObjectKind::Event,
                 ObjectRights::WRITE

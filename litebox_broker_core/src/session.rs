@@ -93,7 +93,7 @@ impl BrokerSession {
         object: ObjectEntry,
         requested_rights: ObjectRights,
     ) -> Result<ObjectHandle> {
-        self.core.policy.authorize_create_object(
+        self.core.policy.authorize_object_rights(
             self.caller_credential,
             object.kind(),
             requested_rights,
@@ -158,7 +158,7 @@ impl BrokerSession {
         }
         let object = Arc::clone(&reference.object);
         let object_kind = object.read().kind();
-        self.core.policy.authorize_use_object(
+        self.core.policy.authorize_object_rights(
             self.caller_credential,
             object_kind,
             required_rights,
