@@ -119,28 +119,28 @@ impl BrokerSession {
         &self,
         handle: ObjectHandle,
         required_rights: ObjectRights,
-        f: impl FnOnce(&ObjectEntry) -> Result<T>,
+        f: impl FnOnce(&ObjectEntry, ObjectRights) -> Result<T>,
     ) -> Result<T> {
-        let object = {
+        let (object, reference_rights) = {
             let references = self.core.references.read();
             self.authorize_use_object(&references, handle, required_rights)?
         };
         let object = object.read();
-        f(&object)
+        f(&object, reference_rights)
     }
 
     pub(crate) fn with_authorized_object_mut<T>(
         &self,
         handle: ObjectHandle,
         required_rights: ObjectRights,
-        f: impl FnOnce(&mut ObjectEntry) -> Result<T>,
+        f: impl FnOnce(&mut ObjectEntry, ObjectRights) -> Result<T>,
     ) -> Result<T> {
-        let object = {
+        let (object, reference_rights) = {
             let references = self.core.references.read();
             self.authorize_use_object(&references, handle, required_rights)?
         };
         let mut object = object.write();
-        f(&mut object)
+        f(&mut object, reference_rights)
     }
 
     fn authorize_use_object(
@@ -148,7 +148,7 @@ impl BrokerSession {
         references: &HashMap<ObjectHandle, ObjectReference>,
         handle: ObjectHandle,
         required_rights: ObjectRights,
-    ) -> Result<Arc<RwLock<ObjectEntry>>> {
+    ) -> Result<(Arc<RwLock<ObjectEntry>>, ObjectRights)> {
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
         if reference.session_id != self.session_id {
             return Err(BrokerError::UnknownObject);
@@ -163,7 +163,7 @@ impl BrokerSession {
             object_kind,
             required_rights,
         )?;
-        Ok(object)
+        Ok((object, reference.rights))
     }
 
     /// Closes one object reference owned by this session.
@@ -192,7 +192,9 @@ mod tests {
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, PrincipalRights,
         event,
     };
-    use litebox_broker_protocol::{ObjectHandle, WaitOutcome};
+    use litebox_broker_protocol::{
+        EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState, WaitOutcome,
+    };
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
@@ -221,10 +223,21 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        assert!(matches!(
+        assert_eq!(
             event::wait(&session, handle),
-            Ok(WaitOutcome::WouldBlock(_))
-        ));
+            Ok(WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0)))
+        );
+        assert_eq!(
+            event::add(&session, handle, 1),
+            Ok(ReadinessState::new(true, true, 1))
+        );
+        assert_eq!(
+            event::consume(&session, handle, EventConsumeMode::One),
+            Ok(EventConsumption::new(
+                1,
+                ReadinessState::new(false, true, 2)
+            ))
+        );
         assert_eq!(
             event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
