@@ -73,21 +73,25 @@ impl PolicyEngine {
         }
     }
 
-    pub(crate) fn authorize_use_event(
+    pub(crate) fn authorize_use_object(
         &self,
         caller_credential: CallerCredential,
+        object_kind: ObjectKind,
         rights: ObjectRights,
     ) -> Result<(), BrokerError> {
-        match self.profile {
-            PolicyProfile::EventOnly {
-                event_use_rights, ..
-            } if caller_credential == CallerCredential::Unauthenticated
+        match (self.profile, object_kind) {
+            (
+                PolicyProfile::EventOnly {
+                    event_use_rights, ..
+                },
+                ObjectKind::Event,
+            ) if caller_credential == CallerCredential::Unauthenticated
                 && !rights.is_empty()
                 && event_use_rights.contains(rights) =>
             {
                 Ok(())
             }
-            PolicyProfile::DefaultDeny | PolicyProfile::EventOnly { .. } => {
+            (PolicyProfile::DefaultDeny | PolicyProfile::EventOnly { .. }, _) => {
                 Err(BrokerError::PolicyDenied)
             }
         }
@@ -120,22 +124,35 @@ mod tests {
             Ok(ObjectRights::WAIT | ObjectRights::WRITE)
         );
         assert_eq!(
-            policy.authorize_use_event(CallerCredential::Unauthenticated, ObjectRights::WAIT),
-            Ok(())
-        );
-        assert_eq!(
-            policy.authorize_use_event(CallerCredential::Unauthenticated, ObjectRights::WRITE),
-            Ok(())
-        );
-        assert_eq!(
-            policy.authorize_use_event(
+            policy.authorize_use_object(
                 CallerCredential::Unauthenticated,
+                ObjectKind::Event,
+                ObjectRights::WAIT
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            policy.authorize_use_object(
+                CallerCredential::Unauthenticated,
+                ObjectKind::Event,
+                ObjectRights::WRITE
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            policy.authorize_use_object(
+                CallerCredential::Unauthenticated,
+                ObjectKind::Event,
                 ObjectRights::WAIT | ObjectRights::WRITE
             ),
             Ok(())
         );
         assert_eq!(
-            policy.authorize_use_event(CallerCredential::Unauthenticated, ObjectRights::empty()),
+            policy.authorize_use_object(
+                CallerCredential::Unauthenticated,
+                ObjectKind::Event,
+                ObjectRights::empty()
+            ),
             Err(BrokerError::PolicyDenied)
         );
     }
@@ -149,7 +166,11 @@ mod tests {
             Ok(ObjectRights::WAIT)
         );
         assert_eq!(
-            policy.authorize_use_event(CallerCredential::Unauthenticated, ObjectRights::WRITE),
+            policy.authorize_use_object(
+                CallerCredential::Unauthenticated,
+                ObjectKind::Event,
+                ObjectRights::WRITE
+            ),
             Ok(())
         );
     }
