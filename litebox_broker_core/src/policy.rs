@@ -28,12 +28,9 @@ pub struct PrincipalRights {
 impl PrincipalRights {
     /// Grants all currently supported object rights.
     pub const fn all() -> Self {
-        Self::with_event_rights(ObjectRights::WAIT.union(ObjectRights::WRITE))
-    }
-
-    /// Grants explicit rights for event objects.
-    pub const fn with_event_rights(event: ObjectRights) -> Self {
-        Self { event }
+        Self {
+            event: ObjectRights::WAIT.union(ObjectRights::WRITE),
+        }
     }
 
     fn object_rights(self, object_kind: ObjectKind) -> ObjectRights {
@@ -145,9 +142,9 @@ mod tests {
 
     #[test]
     fn object_rights_must_fit_principal_rights() {
-        let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights::with_event_rights(
-            ObjectRights::WAIT,
-        ));
+        let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights {
+            event: ObjectRights::WAIT,
+        });
 
         assert_eq!(
             policy.authorize_object_rights(
