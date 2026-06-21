@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let broker =
-            BrokerCore::new_with_limits(PolicyEngine::event_only(), BrokerCoreLimits::new(1))
+            BrokerCore::new_with_limits(PolicyEngine::allow_objects(), BrokerCoreLimits::new(1))
                 .unwrap();
         let session = broker
             .create_session(CallerCredential::Unauthenticated)

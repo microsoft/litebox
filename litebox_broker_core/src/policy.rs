@@ -10,12 +10,12 @@ use crate::{BrokerError, CallerCredential, ObjectRights};
 pub enum PolicyProfile {
     /// Deny every operation.
     DefaultDeny,
-    /// Allow the current event-object surface.
-    EventOnly {
-        /// Rights to attach to newly created event references.
-        event_reference_rights: ObjectRights,
-        /// Maximum event rights this policy may authorize for use requests.
-        event_use_rights: ObjectRights,
+    /// Allow configured broker object operations.
+    AllowObjects {
+        /// Rights to attach to newly created object references.
+        reference_rights: ObjectRights,
+        /// Maximum object rights this policy may authorize for use requests.
+        use_rights: ObjectRights,
     },
 }
 
@@ -36,19 +36,19 @@ impl PolicyEngine {
         Self::new(PolicyProfile::DefaultDeny)
     }
 
-    /// Creates a policy engine that allows only the current event-object surface.
-    pub const fn event_only() -> Self {
-        Self::event_only_with_reference_rights(DEFAULT_EVENT_RIGHTS)
+    /// Creates a policy engine that allows configured broker object operations.
+    pub const fn allow_objects() -> Self {
+        Self::allow_objects_with_reference_rights(DEFAULT_OBJECT_RIGHTS)
     }
 
-    /// Creates an event-only policy engine with explicit initial reference rights.
+    /// Creates an object policy engine with explicit initial reference rights.
     ///
-    /// Use authorization still allows the normal event-only rights; BrokerCore's
+    /// Use authorization still allows the normal object rights; BrokerCore's
     /// reference validation enforces the rights on each created reference.
-    pub const fn event_only_with_reference_rights(event_reference_rights: ObjectRights) -> Self {
-        Self::new(PolicyProfile::EventOnly {
-            event_reference_rights,
-            event_use_rights: DEFAULT_EVENT_RIGHTS,
+    pub const fn allow_objects_with_reference_rights(reference_rights: ObjectRights) -> Self {
+        Self::new(PolicyProfile::AllowObjects {
+            reference_rights,
+            use_rights: DEFAULT_OBJECT_RIGHTS,
         })
     }
 
@@ -59,15 +59,12 @@ impl PolicyEngine {
     ) -> Result<ObjectRights, BrokerError> {
         match (self.profile, object_kind) {
             (
-                PolicyProfile::EventOnly {
-                    event_reference_rights,
-                    ..
+                PolicyProfile::AllowObjects {
+                    reference_rights, ..
                 },
                 ObjectKind::Event,
-            ) if caller_credential == CallerCredential::Unauthenticated => {
-                Ok(event_reference_rights)
-            }
-            (PolicyProfile::DefaultDeny | PolicyProfile::EventOnly { .. }, _) => {
+            ) if caller_credential == CallerCredential::Unauthenticated => Ok(reference_rights),
+            (PolicyProfile::DefaultDeny | PolicyProfile::AllowObjects { .. }, _) => {
                 Err(BrokerError::PolicyDenied)
             }
         }
@@ -80,18 +77,14 @@ impl PolicyEngine {
         rights: ObjectRights,
     ) -> Result<(), BrokerError> {
         match (self.profile, object_kind) {
-            (
-                PolicyProfile::EventOnly {
-                    event_use_rights, ..
-                },
-                ObjectKind::Event,
-            ) if caller_credential == CallerCredential::Unauthenticated
-                && !rights.is_empty()
-                && event_use_rights.contains(rights) =>
+            (PolicyProfile::AllowObjects { use_rights, .. }, ObjectKind::Event)
+                if caller_credential == CallerCredential::Unauthenticated
+                    && !rights.is_empty()
+                    && use_rights.contains(rights) =>
             {
                 Ok(())
             }
-            (PolicyProfile::DefaultDeny | PolicyProfile::EventOnly { .. }, _) => {
+            (PolicyProfile::DefaultDeny | PolicyProfile::AllowObjects { .. }, _) => {
                 Err(BrokerError::PolicyDenied)
             }
         }
@@ -104,20 +97,20 @@ impl Default for PolicyEngine {
     }
 }
 
-/// Policy profile that allows only the current event-object surface.
+/// Policy profile that allows configured broker object operations.
 ///
-/// The default event create operation grants `WAIT | WRITE` on the initial
-/// reference. Use requests may ask for any non-empty subset of configured event
+/// The default object create operation grants `WAIT | WRITE` on the initial
+/// reference. Use requests may ask for any non-empty subset of configured object
 /// use rights; BrokerCore separately enforces each reference's actual rights.
-const DEFAULT_EVENT_RIGHTS: ObjectRights = ObjectRights::WAIT.union(ObjectRights::WRITE);
+const DEFAULT_OBJECT_RIGHTS: ObjectRights = ObjectRights::WAIT.union(ObjectRights::WRITE);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn event_only_policy_allows_only_current_event_surface() {
-        let policy = PolicyEngine::event_only();
+    fn object_policy_allows_configured_object_surface() {
+        let policy = PolicyEngine::allow_objects();
 
         assert_eq!(
             policy.authorize_create_object(CallerCredential::Unauthenticated, ObjectKind::Event),
@@ -158,8 +151,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_event_reference_rights_do_not_narrow_event_use_policy() {
-        let policy = PolicyEngine::event_only_with_reference_rights(ObjectRights::WAIT);
+    fn explicit_reference_rights_do_not_narrow_object_use_policy() {
+        let policy = PolicyEngine::allow_objects_with_reference_rights(ObjectRights::WAIT);
 
         assert_eq!(
             policy.authorize_create_object(CallerCredential::Unauthenticated, ObjectKind::Event),
