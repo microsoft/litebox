@@ -75,7 +75,7 @@ impl BrokerSession {
         }
     }
 
-    pub(crate) fn create_object(
+    pub(crate) fn create_object_reference(
         &self,
         object: ObjectEntry,
         rights: ObjectRights,

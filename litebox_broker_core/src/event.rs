@@ -23,7 +23,7 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
             .policy
             .authorize_create_event(session.caller_credential)?
     };
-    session.create_object(ObjectEntry::Event(EventObject::new(initial_count)), rights)
+    session.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count)), rights)
 }
 
 /// Checks whether an event wait would complete now.
