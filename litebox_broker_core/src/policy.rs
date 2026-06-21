@@ -73,10 +73,12 @@ impl PolicyEngine {
             }
             (PolicyProfile::DefaultDeny, _) => return Err(BrokerError::PolicyDenied),
         };
-        if requested_rights.is_empty()
-            || !principal_rights
-                .object_rights(object_kind)
-                .contains(requested_rights)
+        if requested_rights.is_empty() {
+            return Err(BrokerError::InvalidRights);
+        }
+        if !principal_rights
+            .object_rights(object_kind)
+            .contains(requested_rights)
         {
             return Err(BrokerError::PolicyDenied);
         }
@@ -95,10 +97,13 @@ impl PolicyEngine {
             }
             (PolicyProfile::DefaultDeny, _) => return Err(BrokerError::PolicyDenied),
         };
-        if !rights.is_empty() && principal_rights.object_rights(object_kind).contains(rights) {
-            return Ok(());
+        if rights.is_empty() {
+            return Err(BrokerError::InvalidRights);
         }
-        Err(BrokerError::PolicyDenied)
+        if !principal_rights.object_rights(object_kind).contains(rights) {
+            return Err(BrokerError::PolicyDenied);
+        }
+        Ok(())
     }
 }
 
@@ -157,7 +162,7 @@ mod tests {
                 ObjectKind::Event,
                 ObjectRights::empty()
             ),
-            Err(BrokerError::PolicyDenied)
+            Err(BrokerError::InvalidRights)
         );
         assert_eq!(
             policy.authorize_create_object(
@@ -165,7 +170,7 @@ mod tests {
                 ObjectKind::Event,
                 ObjectRights::empty()
             ),
-            Err(BrokerError::PolicyDenied)
+            Err(BrokerError::InvalidRights)
         );
     }
 
