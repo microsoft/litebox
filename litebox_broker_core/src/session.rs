@@ -143,7 +143,7 @@ impl BrokerSession {
     /// The underlying object is released when this was the last live reference.
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
         let mut references = self.core.references.write();
-        reference_for_handle(&references, self.session_id, handle)?;
+        session_reference_for_handle(&references, self.session_id, handle)?;
         references.remove(&handle);
         Ok(())
     }
@@ -166,7 +166,7 @@ fn validate_handle(
     handle: ObjectHandle,
     required_rights: ObjectRights,
 ) -> Result<&ObjectReference> {
-    let reference = reference_for_handle(references, session_id, handle)?;
+    let reference = session_reference_for_handle(references, session_id, handle)?;
     if !reference.rights.contains(required_rights) {
         return Err(BrokerError::InvalidRights);
     }
@@ -174,7 +174,7 @@ fn validate_handle(
     Ok(reference)
 }
 
-fn reference_for_handle(
+fn session_reference_for_handle(
     references: &BTreeMap<ObjectHandle, ObjectReference>,
     session_id: SessionId,
     handle: ObjectHandle,
