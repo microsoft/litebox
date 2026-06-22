@@ -212,11 +212,8 @@ impl BrokerUnixStreamFd<Platform> {
         cx: &WaitContext<'_, Platform>,
         buf: &mut [u8],
     ) -> Result<(usize, alloc::vec::Vec<PassedToken>), Errno> {
-        self.deframer.lock().read_unit(buf, |staging| {
-            let payload = self.recv(cx, staging.len() as u32)?;
-            let n = staging.len().min(payload.len());
-            staging[..n].copy_from_slice(&payload[..n]);
-            Ok::<usize, Errno>(n)
+        self.deframer.lock().read_unit(buf, |max| {
+            self.recv(cx, u32::try_from(max).unwrap_or(u32::MAX))
         })
     }
 

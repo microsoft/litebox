@@ -226,9 +226,12 @@ impl BrokerSocketPairFd<Platform> {
         cx: &WaitContext<'_, Platform>,
         buf: &mut [u8],
     ) -> Result<(usize, alloc::vec::Vec<PassedToken>), Errno> {
-        self.deframer
-            .lock()
-            .read_unit(buf, |staging| self.read(cx, staging))
+        self.deframer.lock().read_unit(buf, |max| {
+            let mut chunk = alloc::vec![0u8; max];
+            let n = self.read(cx, &mut chunk)?;
+            chunk.truncate(n);
+            Ok(chunk)
+        })
     }
 
     pub(crate) fn shutdown(&self, read: bool, write: bool) -> Result<(), Errno> {

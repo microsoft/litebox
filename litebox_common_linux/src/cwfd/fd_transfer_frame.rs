@@ -486,22 +486,24 @@ pub struct StreamScmDeframer {
 }
 
 impl StreamScmDeframer {
-    /// 60 KiB staging chunk per `fill`, matching the broker socketpair /
-    /// unix-stream per-RPC read cap.
-    const STAGE: usize = 60 * 1024;
-
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Deframe one stream unit into `buf`, returning `(bytes_copied,
-    /// tokens)`. `fill(staging)` reads up to `staging.len()` raw bytes
-    /// from the underlying transport (returning `0` on EOF) and is called
-    /// only when more bytes are needed to complete the next unit.
+    /// tokens)`. `fill(max_len)` returns up to `max_len` freshly-read raw
+    /// bytes from the underlying transport (an empty buffer signals EOF)
+    /// and is called only when more bytes are needed to complete the next
+    /// unit.
+    ///
+    /// `max_len` is bounded by the caller's `buf` so the per-`recvmsg`
+    /// broker read request matches the pre-deframer size: a fixed
+    /// oversized request (e.g. 60 KiB for a 64-byte `recv_fd`) needlessly
+    /// swamps the shared broker under concurrency.
     pub fn read_unit<E>(
         &mut self,
         buf: &mut [u8],
-        mut fill: impl FnMut(&mut [u8]) -> Result<usize, E>,
+        mut fill: impl FnMut(usize) -> Result<Vec<u8>, E>,
     ) -> Result<(usize, Vec<PassedToken>), E> {
         if buf.is_empty() {
             return Ok((0, Vec::new()));
@@ -533,13 +535,12 @@ impl StreamScmDeframer {
                     return Ok((n, Vec::new()));
                 }
                 ReaderUnit::NeedMore => {
-                    let mut staging = alloc::vec![0u8; Self::STAGE];
-                    let size = fill(&mut staging)?;
-                    if size == 0 {
+                    let chunk = fill(buf.len())?;
+                    if chunk.is_empty() {
                         // EOF / read-shutdown: no further units possible.
                         return Ok((0, Vec::new()));
                     }
-                    self.reader.push(&staging[..size]);
+                    self.reader.push(&chunk);
                 }
             }
         }
@@ -682,13 +683,13 @@ mod reader_tests {
 
     /// A `fill` closure that streams `wire` in `chunk`-sized pieces; used
     /// to drive `StreamScmDeframer::read_unit` deterministically.
-    fn chunked_fill(wire: Vec<u8>, chunk: usize) -> impl FnMut(&mut [u8]) -> Result<usize, ()> {
+    fn chunked_fill(wire: Vec<u8>, chunk: usize) -> impl FnMut(usize) -> Result<Vec<u8>, ()> {
         let mut cursor = 0usize;
-        move |staging: &mut [u8]| {
-            let take = staging.len().min(chunk).min(wire.len() - cursor);
-            staging[..take].copy_from_slice(&wire[cursor..cursor + take]);
+        move |max: usize| {
+            let take = max.min(chunk).min(wire.len() - cursor);
+            let out = wire[cursor..cursor + take].to_vec();
             cursor += take;
-            Ok(take)
+            Ok(out)
         }
     }
 
