@@ -16,8 +16,8 @@ mod error;
 mod event;
 
 use litebox_broker_protocol::{
-    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse,
-    LocalControlChannel, ProtocolVersion, ReceivedBrokerResponse,
+    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, LocalControlChannel, ProtocolVersion,
+    ReceivedBrokerResponse,
 };
 
 pub use error::{BrokerLocalError, Result};
@@ -116,7 +116,8 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         }
     }
 
-    pub(crate) fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
+    /// Sends one request on an active negotiated connection.
+    pub fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
         if self.state == ConnectionState::AwaitingNegotiation {
             return Err(BrokerLocalError::NotNegotiated);
         }
@@ -138,14 +139,6 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         {
             ReceivedBrokerResponse::Response(response) => Ok(response),
             _ => Err(BrokerLocalError::UnknownResponse),
-        }
-    }
-
-    /// Sends one BrokerCore request on an active connection.
-    pub fn active_core_request(&mut self, request: CoreRequest) -> Result<CoreResponse, T::Error> {
-        match self.request(BrokerRequest::Core(request))? {
-            BrokerResponse::Core(response) => Ok(response),
-            response => Err(BrokerLocalError::UnexpectedResponse(response)),
         }
     }
 }
@@ -224,34 +217,6 @@ mod tests {
             Some(BrokerRequest::Negotiate {
                 protocol_version: BROKER_PROTOCOL_VERSION
             })
-        );
-    }
-
-    #[test]
-    fn active_core_request_wraps_request_and_unwraps_response() {
-        use litebox_broker_protocol::{
-            CoreRequest, CoreResponse, EventRequest, EventResponse, ObjectHandle, ReadinessState,
-            WaitEventRequest, WaitEventResponse, WaitOutcome,
-        };
-
-        let handle = ObjectHandle(7);
-        let request = CoreRequest::Event(EventRequest::Wait(WaitEventRequest::new(handle)));
-        let response = CoreResponse::Event(EventResponse::Wait(WaitEventResponse::new(
-            WaitOutcome::WouldBlock(ReadinessState::new(false, true)),
-        )));
-        let channel = FakeControlChannel::new(Some(BrokerResponse::Core(response.clone())));
-        let mut local = BrokerLocal::new(channel);
-        local.state = ConnectionState::Active {
-            negotiated_protocol_version: BROKER_PROTOCOL_VERSION,
-        };
-
-        assert_eq!(
-            local.active_core_request(request.clone()).unwrap(),
-            response
-        );
-        assert_eq!(
-            local.channel.sent_request,
-            Some(BrokerRequest::Core(request))
         );
     }
 
