@@ -382,7 +382,10 @@ impl SystemPta {
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
 
-        let addr: usize = ((addr_high << 32) | (addr_low & 0xffff_ffff)).trunc();
+        if addr_high & 0xffff_ffff_0000_0000 != 0 || addr_low & 0xffff_ffff_0000_0000 != 0 {
+            return Err(TeeResult::BadParameters);
+        }
+        let addr: usize = ((addr_high << 32) | addr_low).trunc();
         let (mapped, cleanup) = task.sys_map_zi(
             addr,
             num_bytes.trunc(),
@@ -418,7 +421,10 @@ impl SystemPta {
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
 
-        let addr: usize = ((addr_high << 32) | (addr_low & 0xffff_ffff)).trunc();
+        if addr_high & 0xffff_ffff_0000_0000 != 0 || addr_low & 0xffff_ffff_0000_0000 != 0 {
+            return Err(TeeResult::BadParameters);
+        }
+        let addr: usize = ((addr_high << 32) | addr_low).trunc();
         let size: usize = size.trunc();
         let size = size
             .checked_next_multiple_of(PAGE_SIZE)
