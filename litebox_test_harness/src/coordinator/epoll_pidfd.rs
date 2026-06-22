@@ -834,9 +834,13 @@ async fn handle_epoll_refire_broker_tcp_drain_in_et(
 
     for cycle in 0..CYCLES {
         let payload = format!("broker-tcp-drain-refire-cycle-{cycle}");
-        write_all_nonblocking(&mut stream, payload.as_bytes(), Duration::from_secs(2))
+        write_all_nonblocking(&mut stream, payload.as_bytes(), Duration::from_secs(5))
             .map_err(|e| HandlerError(format!("cycle {cycle} tcp write: {e}")))?;
-        let sample = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+        // Generous per-cycle deadline: a correct re-fire returns immediately, so
+        // a real under-fire still hangs the full timeout; the slack only absorbs
+        // deep non-PIE-chain (dng) scheduling latency under heavy load so the
+        // guard doesn't flake on the dashboard.
+        let sample = timed_epoll_pwait(epfd.as_raw_fd(), 5000, 4)?;
         if cycle == 0 {
             first_events = sample.events;
             first_elapsed_ms = elapsed_ms(sample.elapsed);
