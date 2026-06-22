@@ -534,9 +534,9 @@ runs only — so a genuine branch regression isn't mistaken for a flake):
 
 | `classification` | Meaning |
 |---|---|
-| `hard_regression` | Genuinely solid upstream (no flaps **and** no fails in the 30d window) → **fails** on branch. **Really bad.** |
-| `soft_regression` | Fails on branch, but the test is at all unstable upstream (flaps, or any upstream fail in 30d) / flaky at baseline. Discount. |
-| `new_fail` | Fails on branch, no definitive baseline verdict, **and** no upstream flake history — genuinely unexplained, worth a look. |
+| `hard_regression` | A **reproduced** branch failure (full retry budget) of a test that is solid enough upstream (fail-rate below `_SOFT_FLAKE_RATE`, default 15%) to trust → **really bad**, treat as real. |
+| `soft_regression` | Fails on branch but discounted: the test is heavily flaky upstream (≥ rate) **or** the baseline flaked **or** the branch evidence is thin (a single fail). `soft/medium` = the branch *reproduced* it (full budget) → **re-run before dismissing**; `soft/low` = single fail of a flaky test (likely a flake). |
+| `new_fail` | Fails on branch, no definitive baseline verdict, **and** upstream is solid (below the flake rate) — genuinely unexplained, worth a look. |
 | `preexisting_flake` | Fails on branch, no definitive baseline verdict, but the test **already flakes upstream** — a pre-existing flake the thin merge-base didn't cover, **not** a branch regression. |
 | `preexisting_fail` | Failed at baseline too — not a regression. |
 | `fixed` | Failed at the merge-base baseline, now **passes** on the branch — the branch repaired it. |
@@ -544,6 +544,17 @@ runs only — so a genuine branch regression isn't mistaken for a flake):
 | `no_result` | Branch produced only `no_result` (infra non-outcome, ~1% background) — **not** a regression. |
 | `not_run` | In the comparable universe (has a baseline verdict) but **not yet run at the branch sha** — an explicit coverage gap, *not* a pass. |
 | `ok` | Pass, no regression. |
+
+> **Interpreting the verdict (don't over-trust `soft`).** `soft` is *not*
+> an automatic all-clear. The classifier can't tell a real regression from
+> a flake on a chronically-flaky test, so it leans on **branch
+> reproducibility**: a `soft/medium` means the branch failed it the full
+> retry budget — **re-run it before concluding "not my change."** Only
+> `soft/low` (a single fail of a flaky test) is safe to treat as a likely
+> flake. A near-solid test the branch reproduces is `hard` (or `new_fail`
+> if there's no baseline) — never silently softened. This bar was tuned
+> after a 98%-solid eventfd/epoll test that a branch failed 3/3 was being
+> mislabeled `soft/low` and dismissed.
 
 The view drives off the **comparable universe** (every test with a
 definitive verdict at the merge-base baseline, plus everything covered
@@ -569,19 +580,28 @@ can hit under the shadow's build load while upstream passes it) stays
 `medium`, not high. `low` flags thin evidence — the explicit "not enough
 data to judge yet" signal.
 
-**`hard_regression` is deliberately hard to earn.** A test only qualifies
-when it is genuinely solid on the upstream lineage — *no* pass/fail
-flapping **and** zero upstream fails in the **30d** `_RECENT_FLAKE_WINDOW_MS`.
-Any upstream instability demotes it to `soft_regression`. The window was
-widened from 7d after low-rate flakes (a test that fails on upstream
-roughly every ~10 days) slipped outside a tighter window and made a
-single branch fail of an occasionally-flaky test — against a thin,
-often single-pass merge-base baseline — read as a false `hard`. The same
-upstream-flake signal splits the no-baseline case: a branch fail with no
-merge-base verdict is `new_fail` only when upstream is *also* clean;
-if the test already flakes upstream it's `preexisting_flake` (benign),
-which `dashboard.py regressions` reports as its own bucket rather than
-making you re-derive it from cross-branch history.
+**`hard_regression` is gated on reproducibility × upstream fail-rate.**
+A `hard` is a **reproduced** branch failure (the full
+`_HIGH_CONF_MIN_FAILS` retry budget) of a test that is solid enough
+upstream — fail-rate over the 30d window **below** `_SOFT_FLAKE_RATE`
+(default 15%, volume-robust: 50 fails in 1000 = 5% is *not* heavily
+flaky). Demote to `soft` when the test is heavily flaky (≥ rate), the
+baseline sha itself flaked, **or** the branch evidence is thin (fewer
+than the full budget) and upstream flaked at all. So a 3/3 fail of a
+98%-solid test is `hard` *even if it flaked once weeks ago*, while a
+1-off fail of an occasionally-flaky test softens. The same rate signal
+splits the no-baseline case: a branch fail with no merge-base verdict is
+`new_fail` when upstream is solid (or the branch reproduced it),
+`preexisting_flake` when the test is genuinely flaky upstream — reported
+as its own bucket rather than making you re-derive it from cross-branch
+history.
+
+This bar replaced an earlier "*any* upstream fail in 30d → soft" rule
+that overcorrected into a **false negative**: a 98%-solid eventfd/epoll
+test that a branch failed 3/3 was demoted to `soft/low` and dismissed.
+The reproducibility gate (and `soft/medium` for any reproduced soft)
+keeps that from happening — false negatives in the arbiter are the
+dangerous kind.
 
 A regression is **inherited** when the `tip_verdict` column (the same
 test's freshest definitive verdict at the baseline ref's *current* HEAD,

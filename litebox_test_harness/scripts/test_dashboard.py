@@ -1000,9 +1000,9 @@ class RegressionClassTests(unittest.TestCase):
         self.assertEqual(self._classify()["T"], ("preexisting_flake", "n/a"))
 
     def test_preexisting_flake_via_upstream_fail_without_pass(self):
-        # No baseline, branch fails, upstream has a fail but no pass in
-        # window (so recent_flaky=0) → the `n_fail > 0` arm must still
-        # catch it as a pre-existing flake, not `new_fail`.
+        # No baseline, branch fails, upstream has only a fail (no pass) →
+        # 100% upstream fail-rate is `heavily_flaky`, so it's a
+        # pre-existing flake, not `new_fail`.
         self._upstream("UP", "T", "fail", dt=1000)
         self._branch("BRANCH", "T", "fail")
         self.assertEqual(self._classify()["T"][0], "preexisting_flake")
@@ -1016,19 +1016,69 @@ class RegressionClassTests(unittest.TestCase):
         self._branch("BRANCH", "T", "fail")
         self.assertEqual(self._classify()["T"], ("new_fail", "low"))
 
-    def test_low_rate_upstream_flake_demotes_hard_to_soft(self):
-        # The headline fix: a baseline pass + single branch fail, where the
-        # test failed on upstream at all in-window (no pass/fail flapping
-        # needed) → `soft_regression`, not a false `hard_regression`.
-        # Baseline pass recorded off the CI worktree so it doesn't itself
-        # add an upstream pass (isolating the `n_fail > 0` demotion: the
-        # CI lineage shows only a fail, recent_flaky=0).
-        self._branch("BASE", "T", "pass")            # baseline pass on /wt
-        self._upstream("UP", "T", "fail", dt=1000)   # one upstream CI fail
-        self._branch("BRANCH", "T", "fail")
+    def test_low_rate_flake_single_branch_fail_is_soft(self):
+        # The original false-positive shape (CF.pipe4): occasionally-flaky
+        # upstream (LOW rate, below the heavy-flake threshold) + a SINGLE
+        # (thin) branch fail → soft, not a false hard. The thin branch
+        # evidence didn't reproduce, so we discount.
+        for i in range(20):
+            self._upstream("UP", "T", "pass", dt=i * 1000)
+        self._upstream("UP", "T", "fail", dt=100000)   # ~5% upstream rate
+        self._upstream("BASE", "T", "pass")
+        self._branch("BRANCH", "T", "fail")            # single (thin) fail
         row = self._classify_rows()["T"]
-        self.assertEqual(row["recent_flaky"], 0)     # not pass/fail flapping
+        self.assertEqual(row["upstream_heavily_flaky"], 0)  # below the rate
         self.assertEqual(row["classification"], "soft_regression")
+
+    def test_reproducible_branch_fail_low_rate_flake_stays_hard(self):
+        # The false-NEGATIVE fix (SCM.pass_eventfd_poll_wake): near-solid
+        # upstream (one old flake → ~5%, below threshold), baseline pass,
+        # branch fails the FULL retry budget → a real regression,
+        # hard/high — NOT discounted to soft just because upstream flaked
+        # once weeks ago.
+        for i in range(20):
+            self._upstream("UP", "T", "pass", dt=i * 1000)
+        self._upstream("UP", "T", "fail", dt=100000)   # ~5% upstream rate
+        self._upstream("BASE", "T", "pass")
+        for i in range(3):
+            self._branch("BRANCH", "T", "fail", dt=i * 10)   # full budget
+        self.assertEqual(self._classify()["T"], ("hard_regression", "high"))
+
+    def test_heavily_flaky_reproduced_is_soft_medium(self):
+        # dropbear_bash shape: chronically-flaky upstream (fail-rate above
+        # the threshold), baseline pass, branch fails the full budget →
+        # `soft` (genuinely unreliable test) but `medium`: the branch DID
+        # reproduce it, so it's flagged for a re-run, not dismissed.
+        for i in range(10):
+            self._upstream("UP", "T", "pass", dt=i * 1000)
+        for i in range(5):
+            self._upstream("UP", "T", "fail", dt=(i + 20) * 1000)   # ~33%
+        self._upstream("BASE", "T", "pass")
+        for i in range(3):
+            self._branch("BRANCH", "T", "fail", dt=i * 10)
+        self.assertEqual(self._classify()["T"], ("soft_regression", "medium"))
+
+    def test_heavily_flaky_single_fail_is_soft_low(self):
+        # Same chronically-flaky test, single branch fail → soft/low (no
+        # reproduction; most likely just another flake).
+        for i in range(10):
+            self._upstream("UP", "T", "pass", dt=i * 1000)
+        for i in range(5):
+            self._upstream("UP", "T", "fail", dt=(i + 20) * 1000)
+        self._upstream("BASE", "T", "pass")
+        self._branch("BRANCH", "T", "fail")
+        self.assertEqual(self._classify()["T"], ("soft_regression", "low"))
+
+    def test_no_baseline_reproducible_low_rate_is_new_fail(self):
+        # No baseline, near-solid upstream (low rate), branch reproduces
+        # the fail full-budget → `new_fail` (unexplained, worth a look),
+        # NOT `preexisting_flake` (which would wrongly mark it benign).
+        for i in range(20):
+            self._upstream("UP", "T", "pass", dt=i * 1000)
+        self._upstream("UP", "T", "fail", dt=100000)   # ~5%
+        for i in range(3):
+            self._branch("BRANCH", "T", "fail", dt=i * 10)
+        self.assertEqual(self._classify()["T"][0], "new_fail")
 
     def test_solid_upstream_single_fail_stays_hard(self):
         # Guard the other side: a genuinely rock-solid-upstream test (passes,
