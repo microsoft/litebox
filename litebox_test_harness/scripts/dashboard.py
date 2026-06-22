@@ -267,15 +267,12 @@ def _ensure_views(conn: sqlite3.Connection) -> None:
 # meta-keyed definition version) — no SCHEMA_VERSION bump, no producer
 # change, no data migration.
 
-_CLASSIFICATION_SCHEMA_VERSION = 7
+_CLASSIFICATION_SCHEMA_VERSION = 8
 
-# Upstream flake lookback. Widened 7d → 30d: low-rate flakes (a test that
-# fails on the upstream lineage roughly every ~10 days) slipped outside a
-# 7d window, so a single branch fail of an occasionally-flaky test read as
-# a `hard_regression` off a thin (often single-pass) merge-base baseline.
-# 30d catches monthly-ish flakes. Feeds the soft-regression discount (any
-# upstream fail in-window, not just pass+fail flapping), the
-# `preexisting_flake` split, and the high-confidence gate.
+# Upstream flake lookback. Widened 7d → 30d so a low-rate flake (a test
+# that fails on the upstream lineage roughly every ~10 days) is visible
+# at all. 30d catches monthly-ish flakes. Feeds the `heavily_flaky`
+# fail-rate signal and the high-confidence gate.
 _RECENT_FLAKE_WINDOW_MS = 30 * 24 * 3600 * 1000
 
 # A hard_regression is `high` confidence only when the branch failed at
@@ -286,6 +283,21 @@ _RECENT_FLAKE_WINDOW_MS = 30 * 24 * 3600 * 1000
 # a couple of times under the agent-coverage shadow's build load while
 # upstream CI passes it — that should read as provisional, not high.
 _HIGH_CONF_MIN_FAILS = 3
+
+# A regression on a test that flakes on the upstream lineage at or above
+# this fail-rate is `soft` (a genuinely unreliable signal — discount).
+# BELOW this rate the test is solid enough that a *reproducible* branch
+# failure (the full `_HIGH_CONF_MIN_FAILS` retry budget) is a real
+# `hard_regression`, NOT discounted away just because upstream flaked
+# once weeks ago. Chosen to sit between observed near-solid tests (≈2% —
+# a stray old flake, e.g. SCM.pass_eventfd_poll_wake at p78/f2) and
+# chronically-flaky families (≈17–32%, e.g. the dropbear PTY tests). A
+# single *thin* branch fail of any occasionally-flaky test still softens
+# regardless of rate; only a full-budget reproduction earns `hard` below
+# the threshold. The previous "any upstream fail in-window → soft" rule
+# overcorrected: it demoted a 3/3-reproduced fail of a 98%-solid test to
+# soft/low, hiding a real regression (the false-negative this fixes).
+_SOFT_FLAKE_RATE = 0.15
 
 _CLASSIFICATION_DDL = f"""
 -- (regression_class + test_flake_stats are dropped by actual type in
@@ -298,10 +310,11 @@ _CLASSIFICATION_DDL = f"""
 -- failed on some in-flight branch — otherwise a genuine branch
 -- regression (pass upstream, fail on branch) would look "flaky" and be
 -- wrongly softened. `no_result` (an infra non-outcome, ~1% background
--- rate) is NOT counted as a fail, so it never inflates the signal. Both
--- `recent_flaky` (pass+fail flapping) and `n_fail` (any upstream fail
--- in-window) feed the classifier's soft-vs-hard call. A pure live
--- derivation; kept cheap by `idx_runs_worktree`.
+-- rate) is NOT counted as a fail, so it never inflates the signal.
+-- `heavily_flaky` (fail-rate over definitive runs ≥ _SOFT_FLAKE_RATE) is
+-- the classifier's "this test is a genuinely unreliable signal" gate —
+-- volume-robust (50 fails in 1000 = 5% is NOT heavily flaky). A pure
+-- live derivation; kept cheap by `idx_runs_worktree`.
 CREATE VIEW test_flake_stats AS
 SELECT rr.mode, rr.test_id,
        COUNT(*) AS n_recent,
@@ -309,7 +322,16 @@ SELECT rr.mode, rr.test_id,
        SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END) AS n_fail,
        CASE WHEN SUM(CASE WHEN rr.verdict = 'pass' THEN 1 ELSE 0 END) > 0
              AND SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END) > 0
-            THEN 1 ELSE 0 END AS recent_flaky
+            THEN 1 ELSE 0 END AS recent_flaky,
+       -- fail-rate ≥ threshold, cross-multiplied to avoid division and
+       -- guarded so n_fail=0 is never "flaky". Compares fails against the
+       -- definitive (pass+fail) count, ignoring no_result.
+       CASE WHEN SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END) > 0
+             AND SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END)
+                 >= {_SOFT_FLAKE_RATE}
+                    * SUM(CASE WHEN rr.verdict IN ('pass','fail')
+                               THEN 1 ELSE 0 END)
+            THEN 1 ELSE 0 END AS heavily_flaky
   FROM run_results rr
   JOIN runs r ON r.run_id = rr.run_id
  WHERE r.dirty_hash IS NULL
@@ -326,16 +348,20 @@ SELECT rr.mode, rr.test_id,
 -- definitive `pass` at the merge-base baseline and a definitive `fail`
 -- on the branch. The inverse (baseline `fail` → branch `pass`) is
 -- `fixed`. A branch `fail` with NO definitive baseline verdict is
--- `new_fail` — unless the test is already unstable upstream, in which
+-- `new_fail` — unless the test is a genuine upstream flake, in which
 -- case it's `preexisting_flake` (a flake the thin merge-base just didn't
--- cover, not a branch regression). `hard_regression` is reserved for a
--- test that is genuinely solid upstream (no flaps AND no fails in the
--- 30d window): any upstream instability demotes to `soft_regression`,
--- so a single branch fail of an occasionally-flaky test against a
--- single-pass baseline can't read as a hard break. `tip_verdict`
--- reports the same test's freshest definitive verdict at the baseline
--- ref's *current* HEAD (tip_sha), letting a consumer tell a
--- branch-introduced regression (tip passes) from one merely inherited
+-- cover, not a branch regression). `hard_regression` vs `soft_regression`
+-- is gated on **branch reproducibility × upstream fail-rate**: a `hard`
+-- is a *reproduced* failure (the full retry budget) of a test that is
+-- solid enough upstream (fail-rate below `_SOFT_FLAKE_RATE`) to trust —
+-- so a 3/3 fail of a 98%-solid test is `hard` even if it flaked once
+-- weeks ago, while a heavily-flaky test (≥ rate) or a thin (1-off) fail
+-- of an occasionally-flaky test softens. A `soft` the branch nonetheless
+-- *reproduced* full-budget is `soft/medium` (re-run before dismissing),
+-- vs `soft/low` for a likely flake. `tip_verdict` reports the same
+-- test's freshest definitive verdict at the baseline ref's *current*
+-- HEAD (tip_sha), letting a consumer tell a branch-introduced regression
+-- (tip passes) from one merely inherited
 -- from an already-broken upstream tip (tip fails too).
 CREATE VIEW regression_class AS
 WITH relevant(sha) AS (
@@ -405,9 +431,10 @@ SELECT
     a.n_other      AS branch_n_noresult,
     a.flaky_atsha  AS branch_atsha_flaky,
     t.freshest_def AS tip_verdict,
-    COALESCE(f.recent_flaky, 0) AS recent_flaky,
-    COALESCE(f.n_pass, 0)       AS recent_pass,
-    COALESCE(f.n_fail, 0)       AS recent_fail,
+    COALESCE(f.recent_flaky, 0)   AS recent_flaky,
+    COALESCE(f.heavily_flaky, 0)  AS upstream_heavily_flaky,
+    COALESCE(f.n_pass, 0)         AS recent_pass,
+    COALESCE(f.n_fail, 0)         AS recent_fail,
     CASE
       WHEN a.n IS NULL                                   THEN 'not_run'
       WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 0
@@ -415,39 +442,51 @@ SELECT
       WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 0 THEN 'ok'
       WHEN a.freshest_def = 'pass' AND a.flaky_atsha = 1 THEN 'flaky_pass'
       WHEN a.freshest_def IS NULL                        THEN 'no_result'
-      -- No definitive baseline verdict, but the test is *already* unstable
-      -- on the upstream lineage (flaps pass/fail, or has failed in-window)
-      -- → a pre-existing flake the merge-base just didn't happen to cover,
-      -- NOT a failure the branch introduced. Split out of `new_fail` so a
-      -- consumer needn't re-derive it from cross-branch history by hand.
+      -- No definitive baseline verdict. If the test is a genuine upstream
+      -- flake (`heavily_flaky`) OR a *thin* branch fail of an
+      -- occasionally-flaky test, it's a pre-existing flake the merge-base
+      -- didn't cover. A near-solid test the branch *reproduced* (full
+      -- retry budget) stays `new_fail` — unexplained, worth a look.
       WHEN b.freshest_def IS NULL
-       AND (COALESCE(f.recent_flaky, 0) = 1
-            OR COALESCE(f.n_fail, 0) > 0)                THEN 'preexisting_flake'
+       AND (COALESCE(f.heavily_flaky, 0) = 1
+            OR (a.n_fail < {_HIGH_CONF_MIN_FAILS}
+                AND COALESCE(f.n_fail, 0) > 0))          THEN 'preexisting_flake'
       WHEN b.freshest_def IS NULL                        THEN 'new_fail'
       WHEN b.freshest_def = 'fail'                       THEN 'preexisting_fail'
-      -- Demote to soft when the test is at all unstable upstream: it
-      -- flapped pass/fail in-window (`recent_flaky`), OR it failed on
-      -- upstream at all in the 30d window (`n_fail > 0` — a low-rate flake
-      -- whose fails were just outside a tighter window), OR the baseline
-      -- sha itself flaked. A `hard_regression` therefore requires the test
-      -- to be genuinely solid upstream, not merely solid in the last few
-      -- days against a single-pass baseline.
-      WHEN COALESCE(f.recent_flaky, 0) = 1
-        OR COALESCE(f.n_fail, 0) > 0
-        OR b.flaky_atsha = 1                             THEN 'soft_regression'
+      -- Regression (baseline pass → branch fail). Discount to `soft` when:
+      -- the baseline sha itself flaked; OR the test is heavily flaky
+      -- upstream (≥ _SOFT_FLAKE_RATE — a genuinely unreliable signal); OR
+      -- the branch evidence is *thin* (fewer than the full retry budget)
+      -- AND upstream flaked at all. A `hard_regression` is therefore a
+      -- *reproduced* (full-budget) branch failure of a test solid enough
+      -- upstream (below the flake rate) to trust — so a 3/3 fail of a
+      -- 98%-solid test is hard even if it flaked once weeks ago, while a
+      -- 1-off fail of an occasionally-flaky test softens. (This is the
+      -- false-negative fix: "any upstream fail → soft" was too eager.)
+      WHEN b.flaky_atsha = 1
+        OR COALESCE(f.heavily_flaky, 0) = 1
+        OR (a.n_fail < {_HIGH_CONF_MIN_FAILS}
+            AND COALESCE(f.n_fail, 0) > 0)               THEN 'soft_regression'
       ELSE 'hard_regression'
     END AS classification,
     CASE
       WHEN a.n IS NULL                                       THEN 'n/a'
       WHEN a.freshest_def = 'pass' OR a.freshest_def IS NULL THEN 'n/a'
       WHEN b.freshest_def IS NULL
-       AND (COALESCE(f.recent_flaky, 0) = 1
-            OR COALESCE(f.n_fail, 0) > 0)                     THEN 'n/a'
+       AND (COALESCE(f.heavily_flaky, 0) = 1
+            OR (a.n_fail < {_HIGH_CONF_MIN_FAILS}
+                AND COALESCE(f.n_fail, 0) > 0))               THEN 'n/a'
       WHEN b.freshest_def IS NULL                            THEN 'low'
       WHEN b.freshest_def = 'fail'                           THEN 'n/a'
-      WHEN COALESCE(f.recent_flaky, 0) = 1
-        OR COALESCE(f.n_fail, 0) > 0
-        OR b.flaky_atsha = 1                                 THEN 'low'
+      -- soft_regression: `medium` when the branch *reproduced* the failure
+      -- (full retry budget) — a flaky test the branch still failed N/N is
+      -- worth a re-run, not a dismissal — else `low` (likely a flake).
+      WHEN b.flaky_atsha = 1
+        OR COALESCE(f.heavily_flaky, 0) = 1
+        OR (a.n_fail < {_HIGH_CONF_MIN_FAILS}
+            AND COALESCE(f.n_fail, 0) > 0)                    THEN
+           CASE WHEN a.n_fail >= {_HIGH_CONF_MIN_FAILS}
+                THEN 'medium' ELSE 'low' END
       WHEN a.n_fail >= {_HIGH_CONF_MIN_FAILS} AND a.n_pass = 0
        AND COALESCE(f.n_pass, 0) >= 3                        THEN 'high'
       WHEN COALESCE(f.n_pass, 0) >= 1                        THEN 'medium'
@@ -2479,6 +2518,21 @@ def cmd_regressions(args: argparse.Namespace) -> int:
                 print(f"  … and {len(ids) - args.limit} more "
                       f"(use --limit or --format sql)")
             print()
+    print(
+        "_How to read this — soft is NOT an automatic all-clear:_\n"
+        "_• `hard` = a reproduced break of an upstream-solid test → treat "
+        "as real._\n"
+        "_• `soft/medium` = the branch reproduced the fail (full retry "
+        "budget) but the test is flaky upstream → **re-run before "
+        "dismissing**; don't assume it isn't your change._\n"
+        "_• `soft/low` = a single fail of a flaky test → most likely a "
+        "flake._\n"
+        "_• `new_fail` = no baseline to compare AND upstream is solid → "
+        "unexplained, worth a look._\n"
+        "_• `preexisting_flake` = no baseline + flaky upstream → benign._\n"
+        "_• `inherited` = the baseline ref's current tip fails it too → "
+        "not introduced by your branch._"
+    )
     conn.close()
     return 0
 
