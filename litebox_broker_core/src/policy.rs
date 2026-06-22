@@ -79,22 +79,6 @@ impl PolicyEngine {
         }
         Ok(rights)
     }
-
-    pub(crate) fn authorize_object_rights(
-        &self,
-        caller_credential: CallerCredential,
-        object_kind: ObjectKind,
-        rights: ObjectRights,
-    ) -> Result<(), BrokerError> {
-        let principal_rights = self.principal_object_rights(caller_credential, object_kind)?;
-        if rights.is_empty() {
-            return Err(BrokerError::InvalidRights);
-        }
-        if !principal_rights.contains(rights) {
-            return Err(BrokerError::PolicyDenied);
-        }
-        Ok(())
-    }
 }
 
 impl Default for PolicyEngine {
@@ -115,50 +99,10 @@ mod tests {
             policy.principal_object_rights(CallerCredential::Unauthenticated, ObjectKind::Event),
             Ok(ObjectRights::WAIT | ObjectRights::WRITE)
         );
-        assert_eq!(
-            policy.authorize_object_rights(
-                CallerCredential::Unauthenticated,
-                ObjectKind::Event,
-                ObjectRights::WAIT | ObjectRights::WRITE
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            policy.authorize_object_rights(
-                CallerCredential::Unauthenticated,
-                ObjectKind::Event,
-                ObjectRights::WAIT
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            policy.authorize_object_rights(
-                CallerCredential::Unauthenticated,
-                ObjectKind::Event,
-                ObjectRights::WRITE
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            policy.authorize_object_rights(
-                CallerCredential::Unauthenticated,
-                ObjectKind::Event,
-                ObjectRights::WAIT | ObjectRights::WRITE
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            policy.authorize_object_rights(
-                CallerCredential::Unauthenticated,
-                ObjectKind::Event,
-                ObjectRights::empty()
-            ),
-            Err(BrokerError::InvalidRights)
-        );
     }
 
     #[test]
-    fn object_rights_must_fit_principal_rights() {
+    fn static_policy_returns_configured_principal_rights() {
         let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights {
             event: ObjectRights::WAIT,
         });
@@ -166,30 +110,6 @@ mod tests {
         assert_eq!(
             policy.principal_object_rights(CallerCredential::Unauthenticated, ObjectKind::Event),
             Ok(ObjectRights::WAIT)
-        );
-        assert_eq!(
-            policy.authorize_object_rights(
-                CallerCredential::Unauthenticated,
-                ObjectKind::Event,
-                ObjectRights::WAIT
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            policy.authorize_object_rights(
-                CallerCredential::Unauthenticated,
-                ObjectKind::Event,
-                ObjectRights::WAIT | ObjectRights::WRITE
-            ),
-            Err(BrokerError::PolicyDenied)
-        );
-        assert_eq!(
-            policy.authorize_object_rights(
-                CallerCredential::Unauthenticated,
-                ObjectKind::Event,
-                ObjectRights::WRITE
-            ),
-            Err(BrokerError::PolicyDenied)
         );
     }
 

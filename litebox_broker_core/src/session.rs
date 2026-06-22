@@ -152,12 +152,6 @@ impl BrokerSession {
             return Err(BrokerError::InvalidRights);
         }
         let object = Arc::clone(&reference.object);
-        let object_kind = object.read().kind();
-        self.core.policy.authorize_object_rights(
-            self.caller_credential,
-            object_kind,
-            required_rights,
-        )?;
         Ok((object, reference.rights))
     }
 
