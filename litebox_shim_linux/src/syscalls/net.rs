@@ -4022,9 +4022,35 @@ impl<FS: ShimFS> Task<FS> {
                             );
                             Ok(true)
                         }
-                        crate::RawFdRef::BrokerSocketPair(_) => {
-                            // Broker socketpairs are not broker-token-transferable over SCM yet.
-                            Ok(false)
+                        crate::RawFdRef::BrokerSocketPair(typed) => {
+                            let Some(provider) =
+                                super::broker_socketpair::broker_socketpair_provider()
+                            else {
+                                return Ok(false);
+                            };
+                            let entry_handle = dt
+                                .entry_handle::<super::broker_socketpair::BrokerSocketPairSubsystem>(
+                                    typed,
+                                )
+                                .ok_or(Errno::EBADF)?;
+                            let (handle_id, endpoint) =
+                                entry_handle.with_entry(|e| (e.handle(), e.endpoint()));
+                            provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                            let tag = match endpoint {
+                                litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::A => {
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::SocketPairA
+                                }
+                                litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::B => {
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::SocketPairB
+                                }
+                            };
+                            passed_tokens.push(
+                                litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                    tag, handle_id,
+                                )
+                                .map_err(|_| Errno::EINVAL)?,
+                            );
+                            Ok(true)
                         }
                         crate::RawFdRef::BrokerTcpConn(typed) => {
                             let entry_handle = dt
@@ -4071,11 +4097,32 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         crate::RawFdRef::BrokerInetDgram(_) => Ok(false),
                         crate::RawFdRef::BrokerSocketDgram(_)
-                        | crate::RawFdRef::BrokerSocketSeqPacket(_)
-                        | crate::RawFdRef::BrokerUnixStream(_) => {
+                        | crate::RawFdRef::BrokerSocketSeqPacket(_) => {
                             // Broker socket dgram/seqpacket are not broker-token-
-                            // transferable over SCM yet (same status as BrokerSocketPair).
+                            // transferable over SCM yet.
                             Ok(false)
+                        }
+                        crate::RawFdRef::BrokerUnixStream(typed) => {
+                            let Some(provider) =
+                                super::broker_unix_stream::broker_unix_stream_provider()
+                            else {
+                                return Ok(false);
+                            };
+                            let entry_handle = dt
+                                .entry_handle::<super::broker_unix_stream::BrokerUnixStreamSubsystem>(
+                                    typed,
+                                )
+                                .ok_or(Errno::EBADF)?;
+                            let handle_id = entry_handle.with_entry(|e| e.handle());
+                            provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                            passed_tokens.push(
+                                litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::UnixStream,
+                                    handle_id,
+                                )
+                                .map_err(|_| Errno::EINVAL)?,
+                            );
+                            Ok(true)
                         }
                         crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Ok(false),
                     }
@@ -4860,6 +4907,111 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                     }
+                    SubsystemTag::SocketPairA | SubsystemTag::SocketPairB => {
+                        let Some(provider) = super::broker_socketpair::broker_socketpair_provider()
+                        else {
+                            continue;
+                        };
+                        let handle_id = token.id();
+                        if provider.dup_handle(handle_id).is_err() {
+                            continue;
+                        }
+                        let endpoint = match token.tag() {
+                            SubsystemTag::SocketPairA => {
+                                litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::A
+                            }
+                            SubsystemTag::SocketPairB => {
+                                litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::B
+                            }
+                            SubsystemTag::Eventfd
+                            | SubsystemTag::TcpSocket
+                            | SubsystemTag::Pidfd
+                            | SubsystemTag::UnixSocket
+                            | SubsystemTag::Signalfd
+                            | SubsystemTag::Timerfd
+                            | SubsystemTag::Inotify
+                            | SubsystemTag::Process
+                            | SubsystemTag::Pipe
+                            | SubsystemTag::PipeRead
+                            | SubsystemTag::PipeWrite
+                            | SubsystemTag::Pty
+                            | SubsystemTag::InetListener
+                            | SubsystemTag::InetDgram
+                            | SubsystemTag::InetRaw
+                            | SubsystemTag::HostFd
+                            | SubsystemTag::File
+                            | SubsystemTag::UnixStream
+                            | SubsystemTag::Unknown(_) => unreachable!(),
+                        };
+                        let socket = super::broker_socketpair::BrokerSocketPairFd::<Platform>::new(
+                            provider,
+                            handle_id,
+                            endpoint,
+                            litebox::fs::OFlags::empty(),
+                        );
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt
+                            .insert::<super::broker_socketpair::BrokerSocketPairSubsystem>(socket);
+                        if cloexec {
+                            let _ = dt.set_fd_metadata(
+                                &typed,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
+                        drop(dt);
+                        let files = self.files.borrow();
+                        match files.insert_raw_fd(typed) {
+                            Ok(raw_fd) => {
+                                installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                            }
+                            Err(typed) => {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .remove(&typed)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    SubsystemTag::UnixStream => {
+                        let Some(provider) =
+                            super::broker_unix_stream::broker_unix_stream_provider()
+                        else {
+                            continue;
+                        };
+                        let handle_id = token.id();
+                        if provider.dup_handle(handle_id).is_err() {
+                            continue;
+                        }
+                        let stream = super::broker_unix_stream::BrokerUnixStreamFd::<Platform>::new(
+                            provider,
+                            handle_id,
+                            litebox::fs::OFlags::empty(),
+                        );
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt
+                            .insert::<super::broker_unix_stream::BrokerUnixStreamSubsystem>(stream);
+                        if cloexec {
+                            let _ = dt.set_fd_metadata(
+                                &typed,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
+                        drop(dt);
+                        let files = self.files.borrow();
+                        match files.insert_raw_fd(typed) {
+                            Ok(raw_fd) => {
+                                installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                            }
+                            Err(typed) => {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .remove(&typed)
+                                    .unwrap();
+                            }
+                        }
+                    }
                     SubsystemTag::Eventfd => {
                         let Some(provider) = super::eventfd::broker_eventfd_provider() else {
                             // No provider on this worker — drop the
@@ -5064,6 +5216,9 @@ impl<FS: ShimFS> Task<FS> {
                             | SubsystemTag::InetRaw
                             | SubsystemTag::HostFd
                             | SubsystemTag::File
+                            | SubsystemTag::SocketPairA
+                            | SubsystemTag::SocketPairB
+                            | SubsystemTag::UnixStream
                             | SubsystemTag::Unknown(_) => unreachable!(),
                         };
                         let pipe = super::broker_pipe::BrokerPipeFd::<Platform>::new(
