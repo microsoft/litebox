@@ -38,23 +38,21 @@ pub use message::{
 pub struct ObjectHandle(pub u64);
 
 /// Broker protocol version.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProtocolVersion {
-    /// Protocol version number.
-    pub version: u16,
-}
+pub struct ProtocolVersion(pub u16);
 
 impl ProtocolVersion {
     /// Creates a protocol version.
     pub const fn new(version: u16) -> Self {
-        Self { version }
+        Self(version)
     }
 
     /// Returns whether this requested version is supported by the broker.
     ///
     /// The broker protocol requires both peers to speak the same version.
     pub const fn is_supported_by(self, broker: Self) -> bool {
-        self.version == broker.version
+        self.0 == broker.0
     }
 }
 

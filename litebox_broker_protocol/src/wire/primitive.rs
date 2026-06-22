@@ -34,7 +34,7 @@ impl Encoder {
     }
 
     pub(super) fn protocol_version(&mut self, version: ProtocolVersion) {
-        self.u16(version.version);
+        self.u16(version.0);
     }
 
     pub(super) fn handle(&mut self, handle: ObjectHandle) {
