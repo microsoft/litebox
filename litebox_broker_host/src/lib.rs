@@ -185,7 +185,7 @@ fn handle_unknown_request(state: ConnectionState) -> BrokerDispatch {
 }
 
 fn negotiate_version(state: &mut ConnectionState, requested: ProtocolVersion) -> BrokerDispatch {
-    if requested.is_supported_by(HOST_PROTOCOL_VERSION) {
+    if requested == HOST_PROTOCOL_VERSION {
         *state = ConnectionState::Active {
             negotiated_protocol_version: requested,
         };

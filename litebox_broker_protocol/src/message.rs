@@ -59,8 +59,7 @@ pub enum BrokerResponse {
         /// Broker protocol version supported by this endpoint.
         ///
         /// The broker returns its supported version after validating that the
-        /// requested version is supported according to
-        /// [`ProtocolVersion::is_supported_by`](crate::ProtocolVersion::is_supported_by).
+        /// requested version matches it.
         broker_protocol_version: ProtocolVersion,
     },
     /// Negotiation failed because the requested version is unsupported.

@@ -83,7 +83,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
             BrokerResponse::Negotiated {
                 broker_protocol_version,
             } => {
-                if !requested.is_supported_by(broker_protocol_version) {
+                if requested != broker_protocol_version {
                     return Err(BrokerLocalError::IncompatibleNegotiation {
                         requested,
                         broker_protocol_version,

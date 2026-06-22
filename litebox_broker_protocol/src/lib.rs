@@ -47,27 +47,7 @@ impl ProtocolVersion {
     pub const fn new(version: u16) -> Self {
         Self(version)
     }
-
-    /// Returns whether this requested version is supported by the broker.
-    ///
-    /// The broker protocol requires both peers to speak the same version.
-    pub const fn is_supported_by(self, broker: Self) -> bool {
-        self.0 == broker.0
-    }
 }
 
 /// Current broker protocol version.
 pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn protocol_version_support_requires_exact_match() {
-        let version = ProtocolVersion::new(1);
-
-        assert!(version.is_supported_by(version));
-        assert!(!version.is_supported_by(ProtocolVersion::new(2)));
-    }
-}
