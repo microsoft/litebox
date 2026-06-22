@@ -2,15 +2,15 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::{
-    AddEventRequest, BrokerRequest, BrokerResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CoreRequest, CoreResponse, CreateEventRequest, EventConsumeMode, EventRequest, EventResponse,
-    INITIAL_PROTOCOL_VERSION, LocalControlChannel, ObjectHandle, ProtocolVersion, ReadinessState,
-    WaitEventRequest, WaitOutcome,
+    AddEventRequest, BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, ConsumeEventRequest,
+    ConsumeEventResponse, CoreRequest, CoreResponse, CreateEventRequest, EventConsumeMode,
+    EventRequest, EventResponse, LocalControlChannel, ObjectHandle, ProtocolVersion,
+    ReadinessState, WaitEventRequest, WaitOutcome,
 };
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
-const EVENT_PROTOCOL_VERSION: ProtocolVersion = INITIAL_PROTOCOL_VERSION;
+const EVENT_PROTOCOL_VERSION: ProtocolVersion = BROKER_PROTOCOL_VERSION;
 
 impl<T: LocalControlChannel> BrokerLocal<T> {
     /// Creates a broker-owned event object.

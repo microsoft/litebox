@@ -52,14 +52,14 @@ impl ProtocolVersion {
 
     /// Returns whether this requested version is supported by the broker.
     ///
-    /// The initial broker protocol requires both peers to speak the same version.
+    /// The broker protocol requires both peers to speak the same version.
     pub const fn is_supported_by(self, broker: Self) -> bool {
         self.version == broker.version
     }
 }
 
-/// Initial broker protocol version.
-pub const INITIAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1);
+/// Current broker protocol version.
+pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1);
 
 #[cfg(test)]
 mod tests {

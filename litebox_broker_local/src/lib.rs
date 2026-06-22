@@ -16,14 +16,14 @@ mod error;
 mod event;
 
 use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, INITIAL_PROTOCOL_VERSION,
+    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse,
     LocalControlChannel, ProtocolVersion, ReceivedBrokerResponse,
 };
 
 pub use error::{BrokerLocalError, Result};
 
 /// Protocol version this broker-local implementation requests by default.
-pub const LOCAL_PROTOCOL_VERSION: ProtocolVersion = INITIAL_PROTOCOL_VERSION;
+pub const LOCAL_PROTOCOL_VERSION: ProtocolVersion = BROKER_PROTOCOL_VERSION;
 
 /// Typed broker-local control adapter for broker operations.
 pub struct BrokerLocal<T> {

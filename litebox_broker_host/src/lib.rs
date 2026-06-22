@@ -16,10 +16,9 @@ use core::fmt;
 
 use litebox_broker_core::{BrokerCore, BrokerError, BrokerSession, CallerCredential, event};
 use litebox_broker_protocol::{
-    AddEventResponse, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse,
-    CreateEventResponse, ErrorCode, EventRequest, EventResponse, HostControlChannel,
-    INITIAL_PROTOCOL_VERSION, PeerCredential, ProtocolVersion, ReceivedBrokerRequest,
-    WaitEventResponse,
+    AddEventResponse, BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest,
+    CoreResponse, CreateEventResponse, ErrorCode, EventRequest, EventResponse, HostControlChannel,
+    PeerCredential, ProtocolVersion, ReceivedBrokerRequest, WaitEventResponse,
 };
 
 mod error;
@@ -27,7 +26,7 @@ mod error;
 pub use error::{BrokerHostError, Result};
 
 /// Protocol version this broker host implementation supports.
-pub const HOST_PROTOCOL_VERSION: ProtocolVersion = INITIAL_PROTOCOL_VERSION;
+pub const HOST_PROTOCOL_VERSION: ProtocolVersion = BROKER_PROTOCOL_VERSION;
 
 /// Serves one broker connection over the provided connected control channel.
 pub fn serve_connection<T>(
