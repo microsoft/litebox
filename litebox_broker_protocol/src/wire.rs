@@ -159,7 +159,7 @@ mod tests {
         let handle = sample_handle();
         let requests = [
             BrokerRequest::Negotiate {
-                protocol_version: ProtocolVersion::new(1, 0),
+                protocol_version: ProtocolVersion::new(1),
             },
             event_request(EventRequest::Create(CreateEventRequest::new(0))),
             event_request(EventRequest::Create(CreateEventRequest::new(7))),
@@ -188,10 +188,10 @@ mod tests {
         let handle = sample_handle();
         let responses = [
             BrokerResponse::Negotiated {
-                broker_protocol_version: ProtocolVersion::new(1, 0),
+                broker_protocol_version: ProtocolVersion::new(1),
             },
             BrokerResponse::VersionMismatch {
-                broker_protocol_version: ProtocolVersion::new(1, 0),
+                broker_protocol_version: ProtocolVersion::new(1),
             },
             event_response(EventResponse::Create(CreateEventResponse::new(handle))),
             event_response(EventResponse::Wait(WaitEventResponse::new(

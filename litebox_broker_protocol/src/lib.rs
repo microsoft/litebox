@@ -37,33 +37,29 @@ pub use message::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectHandle(pub u64);
 
-/// Major/minor broker protocol version.
+/// Broker protocol version.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion {
-    /// Incompatible protocol version.
-    pub major: u16,
-    /// Protocol revision within a major version.
-    pub minor: u16,
+    /// Protocol version number.
+    pub version: u16,
 }
 
 impl ProtocolVersion {
     /// Creates a protocol version.
-    pub const fn new(major: u16, minor: u16) -> Self {
-        Self { major, minor }
+    pub const fn new(version: u16) -> Self {
+        Self { version }
     }
 
     /// Returns whether this requested version is supported by the broker.
     ///
-    /// The initial broker protocol requires both peers to speak the same
-    /// major/minor version. Future compatible protocol evolution can loosen this
-    /// check when there is a concrete compatibility rule to enforce.
+    /// The initial broker protocol requires both peers to speak the same version.
     pub const fn is_supported_by(self, broker: Self) -> bool {
-        self.major == broker.major && self.minor == broker.minor
+        self.version == broker.version
     }
 }
 
 /// Initial broker protocol version.
-pub const INITIAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);
+pub const INITIAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1);
 
 #[cfg(test)]
 mod tests {
@@ -71,11 +67,9 @@ mod tests {
 
     #[test]
     fn protocol_version_support_requires_exact_match() {
-        let version = ProtocolVersion::new(1, 2);
+        let version = ProtocolVersion::new(1);
 
         assert!(version.is_supported_by(version));
-        assert!(!version.is_supported_by(ProtocolVersion::new(1, 3)));
-        assert!(!version.is_supported_by(ProtocolVersion::new(1, 1)));
-        assert!(!version.is_supported_by(ProtocolVersion::new(2, 2)));
+        assert!(!version.is_supported_by(ProtocolVersion::new(2)));
     }
 }

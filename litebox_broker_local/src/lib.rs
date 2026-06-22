@@ -198,10 +198,7 @@ mod tests {
 
     #[test]
     fn negotiate_version_rejects_locally_unsupported_version_without_sending() {
-        let too_new = ProtocolVersion::new(
-            LOCAL_PROTOCOL_VERSION.major,
-            LOCAL_PROTOCOL_VERSION.minor + 1,
-        );
+        let too_new = ProtocolVersion::new(LOCAL_PROTOCOL_VERSION.version + 1);
         let channel = FakeControlChannel::new(None);
         let mut local = BrokerLocal::new(channel);
 
@@ -217,11 +214,8 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_rejects_broker_newer_minor_response() {
-        let broker_protocol_version = ProtocolVersion::new(
-            LOCAL_PROTOCOL_VERSION.major,
-            LOCAL_PROTOCOL_VERSION.minor + 1,
-        );
+    fn negotiate_rejects_broker_different_version_response() {
+        let broker_protocol_version = ProtocolVersion::new(LOCAL_PROTOCOL_VERSION.version + 1);
         let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version,
         }));

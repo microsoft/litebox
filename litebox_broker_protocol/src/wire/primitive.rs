@@ -34,8 +34,7 @@ impl Encoder {
     }
 
     pub(super) fn protocol_version(&mut self, version: ProtocolVersion) {
-        self.u16(version.major);
-        self.u16(version.minor);
+        self.u16(version.version);
     }
 
     pub(super) fn handle(&mut self, handle: ObjectHandle) {
@@ -87,7 +86,7 @@ impl<'a> Decoder<'a> {
     }
 
     pub(super) fn protocol_version(&mut self) -> Result<ProtocolVersion, WireError> {
-        Ok(ProtocolVersion::new(self.u16()?, self.u16()?))
+        Ok(ProtocolVersion::new(self.u16()?))
     }
 
     pub(super) fn handle(&mut self) -> Result<ObjectHandle, WireError> {
