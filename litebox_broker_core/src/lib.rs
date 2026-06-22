@@ -80,18 +80,6 @@ pub struct BrokerCore {
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
 }
 
-impl BrokerCore {
-    pub(crate) fn allocate_reference_handle(&self) -> Result<ObjectHandle> {
-        let mut next_reference_handle = self.next_reference_handle.write();
-        let handle = ObjectHandle(*next_reference_handle);
-        *next_reference_handle = handle
-            .0
-            .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)?;
-        Ok(handle)
-    }
-}
-
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
@@ -113,6 +101,16 @@ impl BrokerCore {
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    pub(crate) fn allocate_reference_handle(&self) -> Result<ObjectHandle> {
+        let mut next_reference_handle = self.next_reference_handle.write();
+        let handle = ObjectHandle(*next_reference_handle);
+        *next_reference_handle = handle
+            .0
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        Ok(handle)
     }
 
     /// Allocates broker authority state for one authenticated caller session.
