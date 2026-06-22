@@ -4,6 +4,7 @@
 //! Implementation of pseudo TAs (PTAs) which export system services as
 //! the functions of built-in TAs.
 
+use crate::syscalls::Cleanup;
 use crate::{Task, UserConstPtr, UserMutPtr};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -51,7 +52,7 @@ impl PseudoTa {
         task: &Task,
         cmd_id: u32,
         params: &mut UteeParams,
-    ) -> Result<(), TeeResult> {
+    ) -> Result<Cleanup, TeeResult> {
         let _busy = task.try_set_busy(self)?;
         match self {
             Self::System => SystemPta::invoke_command(task, cmd_id, params),
@@ -237,11 +238,19 @@ impl SystemPta {
     }
 
     /// Handle a command of the system PTA.
-    fn invoke_command(task: &Task, cmd_id: u32, params: &mut UteeParams) -> Result<(), TeeResult> {
+    ///
+    /// See `Cleanup` for the returned rollback; most commands have no cleanup.
+    fn invoke_command(
+        task: &Task,
+        cmd_id: u32,
+        params: &mut UteeParams,
+    ) -> Result<Cleanup, TeeResult> {
         match PtaSystemCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
-            PtaSystemCommandId::DeriveTaUniqueKey => Self::derive_ta_unique_key(task, params),
+            PtaSystemCommandId::DeriveTaUniqueKey => {
+                Self::derive_ta_unique_key(task, params).map(|()| Cleanup::None)
+            }
             PtaSystemCommandId::MapZi => Self::map_zi(task, params),
-            PtaSystemCommandId::Unmap => Self::unmap(task, params),
+            PtaSystemCommandId::Unmap => Self::unmap(task, params).map(|()| Cleanup::None),
             _ => {
                 #[cfg(debug_assertions)]
                 todo!("support other system PTA commands {cmd_id}");
@@ -350,7 +359,7 @@ impl SystemPta {
         Ok(())
     }
 
-    fn map_zi(task: &Task, params: &mut UteeParams) -> Result<(), TeeResult> {
+    fn map_zi(task: &Task, params: &mut UteeParams) -> Result<Cleanup, TeeResult> {
         use TeeParamType::{None, ValueInout, ValueInput};
 
         if !params.has_types([ValueInput, ValueInout, ValueInput, None]) {
@@ -373,20 +382,22 @@ impl SystemPta {
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
 
-        let addr: usize = ((addr_high << 32) | addr_low).trunc();
-        let mapped = task.sys_map_zi(
+        let num_bytes: usize = num_bytes.trunc();
+        let addr: usize = ((addr_high << 32) | (addr_low & 0xffff_ffff)).trunc();
+        let (mapped, cleanup) = task.sys_map_zi(
             addr,
-            num_bytes.trunc(),
+            num_bytes,
             pad_begin.trunc(),
             pad_end.trunc(),
             LdelfMapFlags::from_bits_retain(flags.trunc()),
         )?;
 
         // Return the mapped address to the caller via the inout value param.
-        // This `set_values` cannot fail because the index is fixed.
-        params
-            .set_values(1, (mapped as u64) >> 32, (mapped as u64) & 0xffff_ffff)
-            .map_err(|_| TeeResult::BadParameters)
+        // This `set_values` cannot fail because the index is fixed/known.
+        let _ = params.set_values(1, (mapped as u64) >> 32, (mapped as u64) & 0xffff_ffff);
+
+        // The caller runs `cleanup` (unmap) if it encounters an error.
+        Ok(cleanup)
     }
 
     fn unmap(task: &Task, params: &UteeParams) -> Result<(), TeeResult> {
@@ -408,7 +419,7 @@ impl SystemPta {
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
 
-        let addr: usize = ((addr_high << 32) | addr_low).trunc();
+        let addr: usize = ((addr_high << 32) | (addr_low & 0xffff_ffff)).trunc();
         let size: usize = size.trunc();
         let size = size
             .checked_next_multiple_of(PAGE_SIZE)

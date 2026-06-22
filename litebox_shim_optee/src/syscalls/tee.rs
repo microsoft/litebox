@@ -15,7 +15,10 @@ use litebox_common_optee::{
 use num_enum::TryFromPrimitive;
 use zerocopy::IntoBytes;
 
-use crate::{Task, UserConstPtr, UserMutPtr, syscalls::pta::PseudoTa};
+use crate::{
+    Task, UserConstPtr, UserMutPtr,
+    syscalls::{Cleanup, pta::PseudoTa},
+};
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> Option<usize> {
@@ -211,6 +214,9 @@ impl Task {
     }
 
     /// A system call to invoke a command on a TA.
+    ///
+    /// Returns `Cleanup` that the caller must run if the surrounding
+    /// dispatch then fails.
     pub fn sys_invoke_ta_command(
         &self,
         ta_sess_id: u32,
@@ -218,7 +224,7 @@ impl Task {
         cmd_id: u32,
         params: &mut UteeParams,
         ret_orig: UserMutPtr<TeeOrigin>,
-    ) -> Result<(), TeeResult> {
+    ) -> Result<Cleanup, TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
         if ret_orig.as_usize() == 0 {
             return Err(TeeResult::BadParameters);

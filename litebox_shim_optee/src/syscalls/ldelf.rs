@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use crate::syscalls::Cleanup;
 use crate::{Task, UserMutPtr};
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::{RawConstPointer, RawMutPointer, SystemInfoProvider as _};
@@ -68,18 +69,16 @@ impl Task {
     }
 
     /// OP-TEE's syscall to map zero-initialized memory with padding.
-    /// This function pads `pad_begin` bytes before and `pad_end` bytes after the
-    /// zero-initialized `num_bytes` bytes. `va` is a hint address which is
-    /// `pad_begin` bytes lower than the starting address of the memory region
-    /// (`0` means no hint).
-    /// (`start - pad_begin`, ...,  `start`, ..., `start + num_bytes`, ..., `start + num_bytes + pad_end`)
-    /// Memory regions between `start - pad_begin` and `start` and between
-    /// `start + num_bytes` and `start + num_bytes + pad_end` are reserved and must not be used.
     ///
-    /// On success, returns the page-aligned starting address of the usable region
-    /// (`start`, i.e., `pad_begin` bytes above the page-aligned base of the mapping).
-    /// The caller decides how to communicate this back to userspace (writing it to
-    /// a non-zero `va` pointer, into utee params, etc.).
+    /// Maps `pad_begin + num_bytes + pad_end` bytes (rounded up to a page) and
+    /// zero-initializes the `num_bytes` usable region. `va` is a page-aligned
+    /// hint for the *base of the whole mapping* (`0` means no hint). The usable
+    /// region thus starts at `start = va + pad_begin`; the `pad_begin`/`pad_end`
+    /// regions are reserved and must not be accessed.
+    ///
+    /// On success, returns `start` plus a `Cleanup` that unmaps the usable
+    /// region. The caller communicates the address back to userspace and must
+    /// run the cleanup if that write-back fails.
     pub fn sys_map_zi(
         &self,
         va: usize,
@@ -87,7 +86,7 @@ impl Task {
         pad_begin: usize,
         pad_end: usize,
         flags: LdelfMapFlags,
-    ) -> Result<usize, TeeResult> {
+    ) -> Result<(usize, Cleanup), TeeResult> {
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(
             va:% = format_args!("{:#x}", va),
@@ -153,7 +152,11 @@ impl Task {
         }
 
         guard.disarm();
-        Ok(padded_start)
+        let cleanup = Cleanup::Unmap {
+            addr: padded_start,
+            len: pad_end_start - padded_start,
+        };
+        Ok((padded_start, cleanup))
     }
 
     /// OP-TEE's syscall to open a TA binary.

@@ -477,10 +477,13 @@ impl Task {
                         &mut params_copied,
                         ret_orig,
                     )
-                    .and_then(|()| {
-                        params
-                            .write_at_offset(0, params_copied)
-                            .ok_or(TeeResult::AccessDenied)
+                    .and_then(|cleanup| {
+                        if params.write_at_offset(0, params_copied).is_some() {
+                            Ok(())
+                        } else {
+                            cleanup.run(self);
+                            Err(TeeResult::AccessDenied)
+                        }
                     })
                 } else {
                     Err(TeeResult::BadParameters)
@@ -678,11 +681,11 @@ impl Task {
             } => match va.read_at_offset(0) {
                 Some(hint) => self
                     .sys_map_zi(hint, num_bytes, pad_begin, pad_end, flags)
-                    .and_then(|mapped| {
+                    .and_then(|(mapped, cleanup)| {
                         if va.write_at_offset(0, mapped).is_some() {
                             Ok(())
                         } else {
-                            let _ = self.sys_munmap(UserMutPtr::from_usize(mapped), num_bytes);
+                            cleanup.run(self);
                             Err(TeeResult::AccessDenied)
                         }
                     }),
