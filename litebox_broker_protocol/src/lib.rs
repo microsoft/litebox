@@ -54,7 +54,7 @@ impl ProtocolVersion {
 
     /// Returns whether this requested version is supported by the broker.
     ///
-    /// The initial split-broker protocol requires both peers to speak the same
+    /// The initial broker protocol requires both peers to speak the same
     /// major/minor version. Future compatible protocol evolution can loosen this
     /// check when there is a concrete compatibility rule to enforce.
     pub const fn is_supported_by(self, broker: Self) -> bool {
@@ -62,7 +62,7 @@ impl ProtocolVersion {
     }
 }
 
-/// Initial broker protocol version implemented by the split-broker POC.
+/// Initial broker protocol version.
 pub const INITIAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);
 
 #[cfg(test)]
