@@ -79,7 +79,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
             });
         }
 
-        let response = self.request(BrokerRequest::Negotiate {
+        let response = self.raw_request(BrokerRequest::Negotiate {
             protocol_version: requested,
         })?;
         match response {
@@ -129,6 +129,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     }
 
     pub(crate) fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
+        self.ensure_negotiated()?;
         match self.raw_request(request)? {
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => Ok(response),

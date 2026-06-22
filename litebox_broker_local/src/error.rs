@@ -37,15 +37,6 @@ pub enum BrokerLocalError<E> {
         local_protocol_version: ProtocolVersion,
     },
     #[error(
-        "broker session protocol version {negotiated_protocol_version:?} does not support required version {required:?}"
-    )]
-    UnsupportedNegotiatedVersion {
-        /// Protocol version required by the operation.
-        required: ProtocolVersion,
-        /// Effective protocol version negotiated for this connection.
-        negotiated_protocol_version: ProtocolVersion,
-    },
-    #[error(
         "broker does not support requested protocol version {requested:?}; broker supports {broker_protocol_version:?}"
     )]
     UnsupportedVersion {
