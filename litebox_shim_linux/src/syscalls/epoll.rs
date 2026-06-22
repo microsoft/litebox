@@ -288,6 +288,37 @@ impl<FS: ShimFS> DescriptorRef<FS> {
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
+    fn edge_reset_generations(&self, global: &GlobalState<FS>) -> EdgeResetGenerations {
+        match self {
+            EpollDescriptor::BrokerTcpConn(fd) => global
+                .litebox
+                .descriptor_table()
+                .entry_handle(fd)
+                .map_or_else(EdgeResetGenerations::default, |handle| {
+                    handle.with_entry(|entry| EdgeResetGenerations {
+                        read: entry.read_edge_reset_generation(),
+                        write: entry.write_edge_reset_generation(),
+                    })
+                }),
+            EpollDescriptor::Eventfd(_)
+            | EpollDescriptor::Signalfd(_)
+            | EpollDescriptor::Inotify(_)
+            | EpollDescriptor::BrokerInetListener(_)
+            | EpollDescriptor::BrokerInetDgram(_)
+            | EpollDescriptor::BrokerInetRaw(_)
+            | EpollDescriptor::Epoll(_)
+            | EpollDescriptor::File(_)
+            | EpollDescriptor::Unix(_)
+            | EpollDescriptor::HostPassthroughFd(_)
+            | EpollDescriptor::BrokerPipe(_)
+            | EpollDescriptor::BrokerPty(_)
+            | EpollDescriptor::BrokerSocketPair(_)
+            | EpollDescriptor::BrokerUnixStream(_) => EdgeResetGenerations::default(),
+            #[cfg(feature = "worker_local_inet")]
+            EpollDescriptor::Socket(_) => EdgeResetGenerations::default(),
+        }
+    }
+
     /// Returns the interesting events now and monitors their occurrence in the future if the
     /// observer is provided.
     fn poll(
@@ -941,12 +972,14 @@ impl<FS: ShimFS> EpollFile<FS> {
         let events = file
             .poll(global, fs, mask, Some(entry.weak_self.clone() as _))
             .ok_or(Errno::EBADF)?;
+        let edge_reset_generations = file.edge_reset_generations(global);
         // Add the new entry to the ready list if the file is ready
         let initial_event = {
             let mut inner = entry.inner.lock();
             EpollEntry::<FS>::event_from_polled_events(
                 &mut inner,
                 events,
+                edge_reset_generations,
                 false,
                 false,
                 entry.edge_dedup_mask,
@@ -1075,6 +1108,13 @@ struct EpollEntryInner {
     flags: EpollFlags,
     data: u64,
     last_delivered_events: Events,
+    last_edge_reset_generations: EdgeResetGenerations,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct EdgeResetGenerations {
+    read: u64,
+    write: u64,
 }
 
 impl<FS: ShimFS> EpollEntry<FS> {
@@ -1093,6 +1133,7 @@ impl<FS: ShimFS> EpollEntry<FS> {
                 flags,
                 data,
                 last_delivered_events: Events::empty(),
+                last_edge_reset_generations: EdgeResetGenerations::default(),
             }),
             ready,
             is_ready: AtomicBool::new(false),
@@ -1131,9 +1172,11 @@ impl<FS: ShimFS> EpollEntry<FS> {
         }
 
         let events = file.poll(global, fs, inner.mask, None)?;
+        let edge_reset_generations = file.edge_reset_generations(global);
         Self::event_from_polled_events(
             &mut inner,
             events,
+            edge_reset_generations,
             disable_oneshot,
             deliver,
             self.edge_dedup_mask,
@@ -1144,6 +1187,7 @@ impl<FS: ShimFS> EpollEntry<FS> {
     fn event_from_polled_events(
         inner: &mut EpollEntryInner,
         events: Events,
+        edge_reset_generations: EdgeResetGenerations,
         disable_oneshot: bool,
         deliver: bool,
         edge_dedup_mask: Events,
@@ -1152,11 +1196,23 @@ impl<FS: ShimFS> EpollEntry<FS> {
         if events.is_empty() {
             if inner.flags.contains(EpollFlags::EDGE_TRIGGER) && !edge_dedup_mask.is_empty() {
                 inner.last_delivered_events = Events::empty();
+                inner.last_edge_reset_generations = edge_reset_generations;
             }
             return Some((None, false));
         }
 
         if inner.flags.contains(EpollFlags::EDGE_TRIGGER) && !edge_dedup_mask.is_empty() {
+            if edge_reset_generations != inner.last_edge_reset_generations {
+                let mut reset_events = Events::empty();
+                if edge_reset_generations.read != inner.last_edge_reset_generations.read {
+                    reset_events |= Events::IN | Events::PRI;
+                }
+                if edge_reset_generations.write != inner.last_edge_reset_generations.write {
+                    reset_events |= Events::OUT;
+                }
+                inner.last_delivered_events &= !reset_events;
+                inner.last_edge_reset_generations = edge_reset_generations;
+            }
             let dedup_events = events & edge_dedup_mask;
             let newly_ready = dedup_events & !inner.last_delivered_events;
             if newly_ready.is_empty() {
