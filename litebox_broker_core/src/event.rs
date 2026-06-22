@@ -27,32 +27,23 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
 /// wait primitives after BrokerCore authorizes and reports readiness state.
 pub fn wait(session: &BrokerSession, handle: ObjectHandle) -> Result<WaitOutcome> {
     let required_rights = ObjectRights::WAIT;
-    session.with_authorized_object(
-        handle,
-        required_rights,
-        |object, reference_rights| match object {
-            ObjectEntry::Event(event) => {
-                let readiness =
-                    filter_readiness_for_rights(event.readiness_state(), reference_rights);
-                Ok(if readiness.read_ready {
-                    WaitOutcome::Ready(readiness)
-                } else {
-                    WaitOutcome::WouldBlock(readiness)
-                })
-            }
-        },
-    )
+    session.with_authorized_object(handle, required_rights, |object| match object {
+        ObjectEntry::Event(event) => {
+            let readiness = event.readiness_state();
+            Ok(if readiness.read_ready {
+                WaitOutcome::Ready(readiness)
+            } else {
+                WaitOutcome::WouldBlock(readiness)
+            })
+        }
+    })
 }
 
 /// Adds readiness credits to a broker-owned event object.
 pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<ReadinessState> {
     let required_rights = ObjectRights::WRITE;
-    session.with_authorized_object_mut(handle, required_rights, |object, reference_rights| {
-        match object {
-            ObjectEntry::Event(event) => event
-                .add(value)
-                .map(|state| filter_readiness_for_rights(state, reference_rights)),
-        }
+    session.with_authorized_object_mut(handle, required_rights, |object| match object {
+        ObjectEntry::Event(event) => event.add(value),
     })
 }
 
@@ -63,23 +54,9 @@ pub fn consume(
     mode: EventConsumeMode,
 ) -> Result<EventConsumption> {
     let required_rights = ObjectRights::WAIT;
-    session.with_authorized_object_mut(handle, required_rights, |object, reference_rights| {
-        match object {
-            ObjectEntry::Event(event) => event.consume(mode).map(|response| {
-                EventConsumption::new(
-                    response.value,
-                    filter_readiness_for_rights(response.readiness, reference_rights),
-                )
-            }),
-        }
+    session.with_authorized_object_mut(handle, required_rights, |object| match object {
+        ObjectEntry::Event(event) => event.consume(mode),
     })
-}
-
-fn filter_readiness_for_rights(state: ReadinessState, rights: ObjectRights) -> ReadinessState {
-    ReadinessState::new(
-        rights.contains(ObjectRights::WAIT) && state.read_ready,
-        rights.contains(ObjectRights::WRITE) && state.write_ready,
-    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,25 +94,5 @@ impl EventObject {
         };
         self.count -= value;
         Ok(EventConsumption::new(value, self.readiness_state()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ObjectRights;
-
-    #[test]
-    fn event_readiness_state_only_reports_authorized_directions() {
-        let readiness = ReadinessState::new(true, true);
-
-        assert_eq!(
-            filter_readiness_for_rights(readiness, ObjectRights::WAIT),
-            ReadinessState::new(true, false)
-        );
-        assert_eq!(
-            filter_readiness_for_rights(readiness, ObjectRights::WRITE),
-            ReadinessState::new(false, true)
-        );
     }
 }

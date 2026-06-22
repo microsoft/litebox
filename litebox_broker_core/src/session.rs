@@ -114,28 +114,28 @@ impl BrokerSession {
         &self,
         handle: ObjectHandle,
         required_rights: ObjectRights,
-        f: impl FnOnce(&ObjectEntry, ObjectRights) -> Result<T>,
+        f: impl FnOnce(&ObjectEntry) -> Result<T>,
     ) -> Result<T> {
-        let (object, reference_rights) = {
+        let object = {
             let references = self.core.references.read();
             self.authorize_use_object(&references, handle, required_rights)?
         };
         let object = object.read();
-        f(&object, reference_rights)
+        f(&object)
     }
 
     pub(crate) fn with_authorized_object_mut<T>(
         &self,
         handle: ObjectHandle,
         required_rights: ObjectRights,
-        f: impl FnOnce(&mut ObjectEntry, ObjectRights) -> Result<T>,
+        f: impl FnOnce(&mut ObjectEntry) -> Result<T>,
     ) -> Result<T> {
-        let (object, reference_rights) = {
+        let object = {
             let references = self.core.references.read();
             self.authorize_use_object(&references, handle, required_rights)?
         };
         let mut object = object.write();
-        f(&mut object, reference_rights)
+        f(&mut object)
     }
 
     fn authorize_use_object(
@@ -143,7 +143,7 @@ impl BrokerSession {
         references: &HashMap<ObjectHandle, ObjectReference>,
         handle: ObjectHandle,
         required_rights: ObjectRights,
-    ) -> Result<(Arc<RwLock<ObjectEntry>>, ObjectRights)> {
+    ) -> Result<Arc<RwLock<ObjectEntry>>> {
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
         if reference.session_id != self.session_id {
             return Err(BrokerError::UnknownObject);
@@ -152,7 +152,7 @@ impl BrokerSession {
             return Err(BrokerError::InvalidRights);
         }
         let object = Arc::clone(&reference.object);
-        Ok((object, reference.rights))
+        Ok(object)
     }
 
     /// Closes one object reference owned by this session.
