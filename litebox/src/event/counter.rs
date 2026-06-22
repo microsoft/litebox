@@ -134,18 +134,6 @@ where
         Ok(response.readiness)
     }
 
-    fn readiness_state(&self) -> Result<ReadinessState, BrokerObjectError> {
-        let response =
-            self.request_event(EventRequest::Wait(WaitEventRequest::new(self.handle)))?;
-        let EventResponse::Wait(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse);
-        };
-        Ok(match response.outcome {
-            WaitOutcome::Ready(readiness) | WaitOutcome::WouldBlock(readiness) => readiness,
-            _ => return Err(BrokerObjectError::UnexpectedResponse),
-        })
-    }
-
     fn request_event(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
         self.broker
             .request(CoreRequest::Event(request))
@@ -163,7 +151,16 @@ where
     }
 
     fn check_io_events(&self) -> Events {
-        let Ok(readiness) = self.readiness_state() else {
+        let Ok(response) =
+            self.request_event(EventRequest::Wait(WaitEventRequest::new(self.handle)))
+        else {
+            return Events::empty();
+        };
+        let EventResponse::Wait(response) = response else {
+            return Events::empty();
+        };
+        let (WaitOutcome::Ready(readiness) | WaitOutcome::WouldBlock(readiness)) = response.outcome
+        else {
             return Events::empty();
         };
         let mut events = Events::empty();
