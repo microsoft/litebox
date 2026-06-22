@@ -16,7 +16,7 @@ mod error;
 mod event;
 
 use litebox_broker_protocol::{
-    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, LocalControlChannel, ProtocolVersion,
+    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, LocalControlChannel,
     ReceivedBrokerResponse,
 };
 
@@ -31,9 +31,7 @@ pub struct BrokerLocal<T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionState {
     AwaitingNegotiation,
-    Active {
-        negotiated_protocol_version: ProtocolVersion,
-    },
+    Active,
 }
 
 impl<T> BrokerLocal<T> {
@@ -52,78 +50,54 @@ impl<T> BrokerLocal<T> {
 }
 
 impl<T: LocalControlChannel> BrokerLocal<T> {
-    /// Negotiates the default broker-local protocol version.
+    /// Sends one broker request.
     ///
-    /// Returns the effective protocol version this connection will speak.
-    pub fn negotiate(&mut self) -> Result<ProtocolVersion, T::Error> {
-        self.negotiate_version(BROKER_PROTOCOL_VERSION)
-    }
-
-    /// Negotiates a caller-selected protocol version.
-    ///
-    /// Returns the effective protocol version this connection will speak.
-    pub fn negotiate_version(
-        &mut self,
-        requested: ProtocolVersion,
-    ) -> Result<ProtocolVersion, T::Error> {
-        if self.state != ConnectionState::AwaitingNegotiation {
-            return Err(BrokerLocalError::AlreadyNegotiated);
-        }
-        if requested != BROKER_PROTOCOL_VERSION {
-            return Err(BrokerLocalError::UnsupportedLocalVersion {
-                requested,
-                local_protocol_version: BROKER_PROTOCOL_VERSION,
-            });
-        }
-
-        let response = self.raw_request(BrokerRequest::Negotiate {
-            protocol_version: requested,
-        })?;
-        match response {
-            BrokerResponse::Negotiated {
-                broker_protocol_version,
-            } => {
-                if requested != broker_protocol_version {
-                    return Err(BrokerLocalError::IncompatibleNegotiation {
-                        requested,
-                        broker_protocol_version,
-                    });
-                }
-                self.state = ConnectionState::Active {
-                    negotiated_protocol_version: requested,
-                };
-                Ok(requested)
-            }
-            BrokerResponse::VersionMismatch {
-                broker_protocol_version,
-            } => Err(BrokerLocalError::UnsupportedVersion {
-                requested,
-                broker_protocol_version,
-            }),
-            response => Err(BrokerLocalError::UnexpectedResponse(response)),
-        }
-    }
-
-    /// Returns the effective protocol version this connection negotiated.
-    ///
-    /// Feature gating must use this effective version.
-    pub fn negotiated_protocol_version(&self) -> Option<ProtocolVersion> {
-        match self.state {
-            ConnectionState::AwaitingNegotiation => None,
-            ConnectionState::Active {
-                negotiated_protocol_version,
-            } => Some(negotiated_protocol_version),
-        }
-    }
-
-    /// Sends one request on an active negotiated connection.
+    /// Negotiation is the only request allowed before the connection is active.
     pub fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
-        if self.state == ConnectionState::AwaitingNegotiation {
-            return Err(BrokerLocalError::NotNegotiated);
-        }
-        match self.raw_request(request)? {
-            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => Ok(response),
+        match self.state {
+            ConnectionState::AwaitingNegotiation => match request {
+                BrokerRequest::Negotiate { protocol_version } => {
+                    if protocol_version != BROKER_PROTOCOL_VERSION {
+                        return Err(BrokerLocalError::UnsupportedLocalVersion {
+                            requested: protocol_version,
+                            local_protocol_version: BROKER_PROTOCOL_VERSION,
+                        });
+                    }
+
+                    match self.raw_request(BrokerRequest::Negotiate { protocol_version })? {
+                        BrokerResponse::Negotiated {
+                            broker_protocol_version,
+                        } => {
+                            if protocol_version != broker_protocol_version {
+                                return Err(BrokerLocalError::IncompatibleNegotiation {
+                                    requested: protocol_version,
+                                    broker_protocol_version,
+                                });
+                            }
+                            self.state = ConnectionState::Active;
+                            Ok(BrokerResponse::Negotiated {
+                                broker_protocol_version,
+                            })
+                        }
+                        BrokerResponse::VersionMismatch {
+                            broker_protocol_version,
+                        } => Err(BrokerLocalError::UnsupportedVersion {
+                            requested: protocol_version,
+                            broker_protocol_version,
+                        }),
+                        BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
+                        response => Err(BrokerLocalError::UnexpectedResponse(response)),
+                    }
+                }
+                _ => Err(BrokerLocalError::NotNegotiated),
+            },
+            ConnectionState::Active => match request {
+                BrokerRequest::Negotiate { .. } => Err(BrokerLocalError::AlreadyNegotiated),
+                request => match self.raw_request(request)? {
+                    BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
+                    response => Ok(response),
+                },
+            },
         }
     }
 
@@ -162,42 +136,53 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_sends_default_version_and_activates_local_connection() {
+    fn negotiation_request_activates_local_connection() {
         let requested = BROKER_PROTOCOL_VERSION;
         let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
         }));
         let mut local = BrokerLocal::new(channel);
 
-        assert_eq!(local.negotiate().unwrap(), requested);
+        assert_eq!(
+            local
+                .request(BrokerRequest::Negotiate {
+                    protocol_version: requested
+                })
+                .unwrap(),
+            BrokerResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION
+            }
+        );
         assert_eq!(
             local.channel.sent_request,
             Some(BrokerRequest::Negotiate {
                 protocol_version: requested
             })
         );
-        assert_eq!(local.negotiated_protocol_version(), Some(requested));
+        assert_eq!(local.state, ConnectionState::Active);
     }
 
     #[test]
-    fn negotiate_version_rejects_locally_unsupported_version_without_sending() {
+    fn negotiation_request_rejects_locally_unsupported_version_without_sending() {
         let too_new = ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1);
         let channel = FakeControlChannel::new(None);
         let mut local = BrokerLocal::new(channel);
 
         assert!(matches!(
-            local.negotiate_version(too_new),
+            local.request(BrokerRequest::Negotiate {
+                protocol_version: too_new
+            }),
             Err(BrokerLocalError::UnsupportedLocalVersion {
                 requested,
                 local_protocol_version
             }) if requested == too_new && local_protocol_version == BROKER_PROTOCOL_VERSION
         ));
-        assert_eq!(local.negotiated_protocol_version(), None);
+        assert_eq!(local.state, ConnectionState::AwaitingNegotiation);
         assert_eq!(local.channel.sent_request, None);
     }
 
     #[test]
-    fn negotiate_rejects_broker_different_version_response() {
+    fn negotiation_request_rejects_broker_different_version_response() {
         let broker_protocol_version = ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1);
         let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version,
@@ -205,19 +190,36 @@ mod tests {
         let mut local = BrokerLocal::new(channel);
 
         assert!(matches!(
-            local.negotiate(),
+            local.request(BrokerRequest::Negotiate {
+                protocol_version: BROKER_PROTOCOL_VERSION
+            }),
             Err(BrokerLocalError::IncompatibleNegotiation {
                 requested,
                 broker_protocol_version: broker
             }) if requested == BROKER_PROTOCOL_VERSION && broker == broker_protocol_version
         ));
-        assert_eq!(local.negotiated_protocol_version(), None);
+        assert_eq!(local.state, ConnectionState::AwaitingNegotiation);
         assert_eq!(
             local.channel.sent_request,
             Some(BrokerRequest::Negotiate {
                 protocol_version: BROKER_PROTOCOL_VERSION
             })
         );
+    }
+
+    #[test]
+    fn active_connection_rejects_negotiation_without_sending() {
+        let channel = FakeControlChannel::new(None);
+        let mut local = BrokerLocal::new(channel);
+        local.state = ConnectionState::Active;
+
+        assert!(matches!(
+            local.request(BrokerRequest::Negotiate {
+                protocol_version: BROKER_PROTOCOL_VERSION
+            }),
+            Err(BrokerLocalError::AlreadyNegotiated)
+        ));
+        assert_eq!(local.channel.sent_request, None);
     }
 
     struct FakeControlChannel {

@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, BrokerRequest};
 use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,7 +53,11 @@ fn connect_with_retry(socket_path: &Path, setup_deadline: Instant) -> Result<Loc
                     .set_io_deadline(Some(setup_deadline))
                     .context("failed to configure broker setup deadline")?;
                 let mut local = BrokerLocal::new(channel);
-                local.negotiate().context("broker negotiation failed")?;
+                local
+                    .request(BrokerRequest::Negotiate {
+                        protocol_version: BROKER_PROTOCOL_VERSION,
+                    })
+                    .context("broker negotiation failed")?;
                 return Ok(local);
             }
             Err(error) => {

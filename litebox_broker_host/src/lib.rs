@@ -18,7 +18,7 @@ use litebox_broker_core::{BrokerCore, BrokerError, BrokerSession, CallerCredenti
 use litebox_broker_protocol::{
     AddEventResponse, BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest,
     CoreResponse, CreateEventResponse, ErrorCode, EventRequest, EventResponse, HostControlChannel,
-    PeerCredential, ProtocolVersion, ReceivedBrokerRequest, WaitEventResponse,
+    PeerCredential, ReceivedBrokerRequest, WaitEventResponse,
 };
 
 mod error;
@@ -99,24 +99,27 @@ fn handle_request(
     match *state {
         ConnectionState::AwaitingNegotiation => match request {
             BrokerRequest::Negotiate { protocol_version } => {
-                negotiate_version(state, protocol_version)
+                if protocol_version == BROKER_PROTOCOL_VERSION {
+                    *state = ConnectionState::Active;
+                    BrokerDispatch::continue_after(BrokerResponse::Negotiated {
+                        broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                    })
+                } else {
+                    BrokerDispatch::continue_after(BrokerResponse::VersionMismatch {
+                        broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                    })
+                }
             }
             _ => BrokerDispatch::close_after(
                 BrokerResponse::Error(ErrorCode::ProtocolState),
                 CloseReason::ProtocolViolation,
             ),
         },
-        ConnectionState::Active {
-            negotiated_protocol_version,
-        } => handle_active_request(session, negotiated_protocol_version, request),
+        ConnectionState::Active => handle_active_request(session, request),
     }
 }
 
-fn handle_active_request(
-    session: &BrokerSession,
-    _negotiated_protocol_version: ProtocolVersion,
-    request: BrokerRequest,
-) -> BrokerDispatch {
+fn handle_active_request(session: &BrokerSession, request: BrokerRequest) -> BrokerDispatch {
     match request {
         BrokerRequest::Negotiate { .. } => BrokerDispatch::close_after(
             BrokerResponse::Error(ErrorCode::ProtocolState),
@@ -181,21 +184,6 @@ fn handle_unknown_request(state: ConnectionState) -> BrokerDispatch {
     }
 }
 
-fn negotiate_version(state: &mut ConnectionState, requested: ProtocolVersion) -> BrokerDispatch {
-    if requested == BROKER_PROTOCOL_VERSION {
-        *state = ConnectionState::Active {
-            negotiated_protocol_version: requested,
-        };
-        BrokerDispatch::continue_after(BrokerResponse::Negotiated {
-            broker_protocol_version: BROKER_PROTOCOL_VERSION,
-        })
-    } else {
-        BrokerDispatch::continue_after(BrokerResponse::VersionMismatch {
-            broker_protocol_version: BROKER_PROTOCOL_VERSION,
-        })
-    }
-}
-
 fn handle_core_result<T>(
     result: litebox_broker_core::Result<T>,
     into_response: impl FnOnce(T) -> BrokerResponse,
@@ -221,9 +209,7 @@ fn to_protocol_error(error: BrokerError) -> ErrorCode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionState {
     AwaitingNegotiation,
-    Active {
-        negotiated_protocol_version: ProtocolVersion,
-    },
+    Active,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
