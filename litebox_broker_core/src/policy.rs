@@ -62,22 +62,35 @@ impl PolicyEngine {
         Self::new(PolicyProfile::Static { unauthenticated })
     }
 
-    pub(crate) fn authorize_object_rights(
+    pub(crate) fn principal_object_rights(
         &self,
         caller_credential: CallerCredential,
         object_kind: ObjectKind,
-        rights: ObjectRights,
-    ) -> Result<(), BrokerError> {
+    ) -> Result<ObjectRights, BrokerError> {
         let principal_rights = match (self.profile, caller_credential) {
             (PolicyProfile::Static { unauthenticated }, CallerCredential::Unauthenticated) => {
                 unauthenticated
             }
             (PolicyProfile::DefaultDeny, _) => return Err(BrokerError::PolicyDenied),
         };
+        let rights = principal_rights.object_rights(object_kind);
+        if rights.is_empty() {
+            return Err(BrokerError::PolicyDenied);
+        }
+        Ok(rights)
+    }
+
+    pub(crate) fn authorize_object_rights(
+        &self,
+        caller_credential: CallerCredential,
+        object_kind: ObjectKind,
+        rights: ObjectRights,
+    ) -> Result<(), BrokerError> {
+        let principal_rights = self.principal_object_rights(caller_credential, object_kind)?;
         if rights.is_empty() {
             return Err(BrokerError::InvalidRights);
         }
-        if !principal_rights.object_rights(object_kind).contains(rights) {
+        if !principal_rights.contains(rights) {
             return Err(BrokerError::PolicyDenied);
         }
         Ok(())
@@ -98,6 +111,10 @@ mod tests {
     fn static_policy_allows_configured_principal_rights() {
         let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights::all());
 
+        assert_eq!(
+            policy.principal_object_rights(CallerCredential::Unauthenticated, ObjectKind::Event),
+            Ok(ObjectRights::WAIT | ObjectRights::WRITE)
+        );
         assert_eq!(
             policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
@@ -147,6 +164,10 @@ mod tests {
         });
 
         assert_eq!(
+            policy.principal_object_rights(CallerCredential::Unauthenticated, ObjectKind::Event),
+            Ok(ObjectRights::WAIT)
+        );
+        assert_eq!(
             policy.authorize_object_rights(
                 CallerCredential::Unauthenticated,
                 ObjectKind::Event,
@@ -168,6 +189,18 @@ mod tests {
                 ObjectKind::Event,
                 ObjectRights::WRITE
             ),
+            Err(BrokerError::PolicyDenied)
+        );
+    }
+
+    #[test]
+    fn empty_principal_rights_deny_object_authorization() {
+        let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights {
+            event: ObjectRights::empty(),
+        });
+
+        assert_eq!(
+            policy.principal_object_rights(CallerCredential::Unauthenticated, ObjectKind::Event),
             Err(BrokerError::PolicyDenied)
         );
     }

@@ -88,16 +88,11 @@ impl BrokerSession {
         }
     }
 
-    pub(crate) fn create_object_reference(
-        &self,
-        object: ObjectEntry,
-        requested_rights: ObjectRights,
-    ) -> Result<ObjectHandle> {
-        self.core.policy.authorize_object_rights(
-            self.caller_credential,
-            object.kind(),
-            requested_rights,
-        )?;
+    pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
+        let rights = self
+            .core
+            .policy
+            .principal_object_rights(self.caller_credential, object.kind())?;
         let mut references = self.core.references.write();
         if references.len() >= self.core.limits.max_references {
             return Err(BrokerError::ResourceExhausted);
@@ -108,7 +103,7 @@ impl BrokerSession {
             ObjectReference {
                 object: Arc::new(RwLock::new(object)),
                 session_id: self.session_id,
-                rights: requested_rights,
+                rights,
             },
         );
 
