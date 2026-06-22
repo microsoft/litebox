@@ -155,6 +155,12 @@ pub enum SubsystemTag {
     /// AF_UNIX datagram SCM_RIGHTS to reconstruct a 9P file fid that shares the
     /// sender's open file description.
     File,
+    /// Broker-backed AF_UNIX `SOCK_STREAM` socketpair endpoint A. Wire value `18`.
+    SocketPairA,
+    /// Broker-backed AF_UNIX `SOCK_STREAM` socketpair endpoint B. Wire value `19`.
+    SocketPairB,
+    /// Broker-backed connected AF_UNIX named `SOCK_STREAM` endpoint. Wire value `20`.
+    UnixStream,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
     /// the specific fd while continuing to deliver the rest of the
@@ -183,6 +189,9 @@ impl SubsystemTag {
             SubsystemTag::PipeWrite => 15,
             SubsystemTag::HostFd => 16,
             SubsystemTag::File => 17,
+            SubsystemTag::SocketPairA => 18,
+            SubsystemTag::SocketPairB => 19,
+            SubsystemTag::UnixStream => 20,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -209,6 +218,9 @@ impl SubsystemTag {
             15 => SubsystemTag::PipeWrite,
             16 => SubsystemTag::HostFd,
             17 => SubsystemTag::File,
+            18 => SubsystemTag::SocketPairA,
+            19 => SubsystemTag::SocketPairB,
+            20 => SubsystemTag::UnixStream,
             other => SubsystemTag::Unknown(other),
         }
     }
@@ -1238,7 +1250,10 @@ mod tests {
                 | SubsystemTag::InetDgram
                 | SubsystemTag::InetRaw
                 | SubsystemTag::HostFd
-                | SubsystemTag::File => panic!("expected Unknown({raw:#x}), got {tag:?}"),
+                | SubsystemTag::File
+                | SubsystemTag::SocketPairA
+                | SubsystemTag::SocketPairB
+                | SubsystemTag::UnixStream => panic!("expected Unknown({raw:#x}), got {tag:?}"),
             }
         }
     }
@@ -1257,6 +1272,9 @@ mod tests {
         assert_eq!(SubsystemTag::PipeWrite.as_u8(), 15);
         assert_eq!(SubsystemTag::HostFd.as_u8(), 16);
         assert_eq!(SubsystemTag::File.as_u8(), 17);
+        assert_eq!(SubsystemTag::SocketPairA.as_u8(), 18);
+        assert_eq!(SubsystemTag::SocketPairB.as_u8(), 19);
+        assert_eq!(SubsystemTag::UnixStream.as_u8(), 20);
         for tag in [
             SubsystemTag::Eventfd,
             SubsystemTag::TcpSocket,
@@ -1275,6 +1293,9 @@ mod tests {
             SubsystemTag::PipeWrite,
             SubsystemTag::HostFd,
             SubsystemTag::File,
+            SubsystemTag::SocketPairA,
+            SubsystemTag::SocketPairB,
+            SubsystemTag::UnixStream,
         ] {
             assert!(tag.is_known(), "{tag:?} should be known");
             assert_eq!(SubsystemTag::from_u8(tag.as_u8()), tag);

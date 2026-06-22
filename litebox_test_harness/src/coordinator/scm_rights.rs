@@ -110,6 +110,7 @@ enum ScmKind {
     PassEventfd,
     PassEventfdPollWake,
     PassTcpSocket,
+    PassUnixSocketpair,
     PassThenCloseSender,
     PassTwoFdsOneMsg,
     /// Originally designed as a HypB probe for the broker
@@ -161,6 +162,10 @@ const SCM_SCENARIOS: &[ScmScenario] = &[
     ScmScenario {
         name: "pass_tcp_socket",
         kind: ScmKind::PassTcpSocket,
+    },
+    ScmScenario {
+        name: "pass_unix_socketpair",
+        kind: ScmKind::PassUnixSocketpair,
     },
     ScmScenario {
         name: "pass_then_close_sender",
@@ -386,6 +391,7 @@ fn accept_and_validate(kind: ScmKind, listener: UnixListener) -> Result<ScmOut, 
         ScmKind::PassEventfd => receive_eventfd(stream, 7, false, "eventfd"),
         ScmKind::PassEventfdPollWake => receive_eventfd_poll_wake(stream),
         ScmKind::PassTcpSocket => receive_tcp(stream),
+        ScmKind::PassUnixSocketpair => receive_unix_socketpair(stream),
         ScmKind::PassThenCloseSender => receive_eventfd(stream, 5, true, "close_sender"),
         ScmKind::PassTwoFdsOneMsg => receive_two_eventfds(stream),
         ScmKind::PassPipeDoubleWake => receive_pipe_double_wake(stream),
@@ -421,6 +427,7 @@ fn send_for_scenario(kind: ScmKind, socket_path: &str) -> Result<(), String> {
             Ok(())
         }
         ScmKind::PassTcpSocket => send_tcp(socket_path),
+        ScmKind::PassUnixSocketpair => send_unix_socketpair(socket_path),
         ScmKind::PassThenCloseSender => {
             let ev = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
             let source_fd = ev.as_raw_fd();
@@ -686,6 +693,61 @@ fn receive_pipe_double_wake(stream: UnixStream) -> Result<ScmOut, String> {
              evs1={evs_1:?} evs2={evs_2:?}"
         ),
     })
+}
+
+fn send_unix_socketpair(socket_path: &str) -> Result<(), String> {
+    let (passed_end, peer_end) = unix_socketpair()?;
+    let stream = UnixStream::connect(socket_path)?;
+    stream.send_fd(passed_end.as_fd(), b"unix_socketpair")?;
+    drop(passed_end);
+
+    let ping = read_exact(peer_end.as_raw_fd(), b"SCM_USP_PING".len())?;
+    if ping != b"SCM_USP_PING" {
+        return Err(format!(
+            "unix socketpair peer read mismatch: {:?}",
+            String::from_utf8_lossy(&ping)
+        ));
+    }
+    write_all(peer_end.as_raw_fd(), b"SCM_USP_PONG")?;
+    Ok(())
+}
+
+fn receive_unix_socketpair(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, "unix_socketpair")?;
+    let raw = fd.as_raw_fd();
+    write_all(raw, b"SCM_USP_PING")?;
+    let pong = read_exact(raw, b"SCM_USP_PONG".len())?;
+    if pong != b"SCM_USP_PONG" {
+        return Err(format!(
+            "unix socketpair echo mismatch: {:?}",
+            String::from_utf8_lossy(&pong)
+        ));
+    }
+    Ok(ScmOut {
+        detail: format!("received_unix_socketpair_fd={raw} bidi=ok"),
+    })
+}
+
+fn unix_socketpair() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut fds = [0i32; 2];
+    // SAFETY: fds points to space for two raw fds; socketpair initializes both on success.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!("socketpair: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: socketpair returned two fresh, uniquely-owned fds.
+    let first = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: socketpair returned two fresh, uniquely-owned fds.
+    let second = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((first, second))
 }
 
 fn send_tcp(socket_path: &str) -> Result<(), String> {
