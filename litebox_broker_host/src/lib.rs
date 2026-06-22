@@ -25,9 +25,6 @@ mod error;
 
 pub use error::{BrokerHostError, Result};
 
-/// Protocol version this broker host implementation supports.
-pub const HOST_PROTOCOL_VERSION: ProtocolVersion = BROKER_PROTOCOL_VERSION;
-
 /// Serves one broker connection over the provided connected control channel.
 pub fn serve_connection<T>(
     core: &BrokerCore,
@@ -185,16 +182,16 @@ fn handle_unknown_request(state: ConnectionState) -> BrokerDispatch {
 }
 
 fn negotiate_version(state: &mut ConnectionState, requested: ProtocolVersion) -> BrokerDispatch {
-    if requested == HOST_PROTOCOL_VERSION {
+    if requested == BROKER_PROTOCOL_VERSION {
         *state = ConnectionState::Active {
             negotiated_protocol_version: requested,
         };
         BrokerDispatch::continue_after(BrokerResponse::Negotiated {
-            broker_protocol_version: HOST_PROTOCOL_VERSION,
+            broker_protocol_version: BROKER_PROTOCOL_VERSION,
         })
     } else {
         BrokerDispatch::continue_after(BrokerResponse::VersionMismatch {
-            broker_protocol_version: HOST_PROTOCOL_VERSION,
+            broker_protocol_version: BROKER_PROTOCOL_VERSION,
         })
     }
 }
@@ -305,7 +302,7 @@ mod tests {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([
             Ok(Some(ReceivedBrokerRequest::Request(
                 BrokerRequest::Negotiate {
-                    protocol_version: HOST_PROTOCOL_VERSION,
+                    protocol_version: BROKER_PROTOCOL_VERSION,
                 },
             ))),
             Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
@@ -321,7 +318,7 @@ mod tests {
         assert_eq!(
             channel.responses[0],
             BrokerResponse::Negotiated {
-                broker_protocol_version: HOST_PROTOCOL_VERSION
+                broker_protocol_version: BROKER_PROTOCOL_VERSION
             }
         );
         let handle = match &channel.responses[1] {
@@ -340,7 +337,7 @@ mod tests {
             )))),
             Ok(Some(ReceivedBrokerRequest::Request(
                 BrokerRequest::Negotiate {
-                    protocol_version: HOST_PROTOCOL_VERSION,
+                    protocol_version: BROKER_PROTOCOL_VERSION,
                 },
             ))),
         ]));
@@ -359,7 +356,7 @@ mod tests {
     fn serve_connection_returns_channel_error_when_response_send_fails(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([Ok(Some(
             ReceivedBrokerRequest::Request(BrokerRequest::Negotiate {
-                protocol_version: HOST_PROTOCOL_VERSION,
+                protocol_version: BROKER_PROTOCOL_VERSION,
             }),
         ))]));
         channel.send_error = true;
