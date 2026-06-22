@@ -22,9 +22,6 @@ use litebox_broker_protocol::{
 
 pub use error::{BrokerLocalError, Result};
 
-/// Protocol version this broker-local implementation requests by default.
-pub const LOCAL_PROTOCOL_VERSION: ProtocolVersion = BROKER_PROTOCOL_VERSION;
-
 /// Typed broker-local control adapter for broker operations.
 pub struct BrokerLocal<T> {
     channel: T,
@@ -59,7 +56,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     ///
     /// Returns the effective protocol version this connection will speak.
     pub fn negotiate(&mut self) -> Result<ProtocolVersion, T::Error> {
-        self.negotiate_version(LOCAL_PROTOCOL_VERSION)
+        self.negotiate_version(BROKER_PROTOCOL_VERSION)
     }
 
     /// Negotiates a caller-selected protocol version.
@@ -72,10 +69,10 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         if self.state != ConnectionState::AwaitingNegotiation {
             return Err(BrokerLocalError::AlreadyNegotiated);
         }
-        if requested != LOCAL_PROTOCOL_VERSION {
+        if requested != BROKER_PROTOCOL_VERSION {
             return Err(BrokerLocalError::UnsupportedLocalVersion {
                 requested,
-                local_protocol_version: LOCAL_PROTOCOL_VERSION,
+                local_protocol_version: BROKER_PROTOCOL_VERSION,
             });
         }
 
@@ -173,9 +170,9 @@ mod tests {
 
     #[test]
     fn negotiate_sends_default_version_and_activates_local_connection() {
-        let requested = LOCAL_PROTOCOL_VERSION;
+        let requested = BROKER_PROTOCOL_VERSION;
         let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
-            broker_protocol_version: LOCAL_PROTOCOL_VERSION,
+            broker_protocol_version: BROKER_PROTOCOL_VERSION,
         }));
         let mut local = BrokerLocal::new(channel);
 
@@ -191,7 +188,7 @@ mod tests {
 
     #[test]
     fn negotiate_version_rejects_locally_unsupported_version_without_sending() {
-        let too_new = ProtocolVersion(LOCAL_PROTOCOL_VERSION.0 + 1);
+        let too_new = ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1);
         let channel = FakeControlChannel::new(None);
         let mut local = BrokerLocal::new(channel);
 
@@ -200,7 +197,7 @@ mod tests {
             Err(BrokerLocalError::UnsupportedLocalVersion {
                 requested,
                 local_protocol_version
-            }) if requested == too_new && local_protocol_version == LOCAL_PROTOCOL_VERSION
+            }) if requested == too_new && local_protocol_version == BROKER_PROTOCOL_VERSION
         ));
         assert_eq!(local.negotiated_protocol_version(), None);
         assert_eq!(local.channel.sent_request, None);
@@ -208,7 +205,7 @@ mod tests {
 
     #[test]
     fn negotiate_rejects_broker_different_version_response() {
-        let broker_protocol_version = ProtocolVersion(LOCAL_PROTOCOL_VERSION.0 + 1);
+        let broker_protocol_version = ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1);
         let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version,
         }));
@@ -219,13 +216,13 @@ mod tests {
             Err(BrokerLocalError::IncompatibleNegotiation {
                 requested,
                 broker_protocol_version: broker
-            }) if requested == LOCAL_PROTOCOL_VERSION && broker == broker_protocol_version
+            }) if requested == BROKER_PROTOCOL_VERSION && broker == broker_protocol_version
         ));
         assert_eq!(local.negotiated_protocol_version(), None);
         assert_eq!(
             local.channel.sent_request,
             Some(BrokerRequest::Negotiate {
-                protocol_version: LOCAL_PROTOCOL_VERSION
+                protocol_version: BROKER_PROTOCOL_VERSION
             })
         );
     }
@@ -245,7 +242,7 @@ mod tests {
         let channel = FakeControlChannel::new(Some(BrokerResponse::Core(response.clone())));
         let mut local = BrokerLocal::new(channel);
         local.state = ConnectionState::Active {
-            negotiated_protocol_version: LOCAL_PROTOCOL_VERSION,
+            negotiated_protocol_version: BROKER_PROTOCOL_VERSION,
         };
 
         assert_eq!(
