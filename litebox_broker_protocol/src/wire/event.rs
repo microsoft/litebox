@@ -146,15 +146,10 @@ fn decode_wait_outcome(decoder: &mut Decoder<'_>) -> Result<Option<WaitOutcome>,
 fn encode_readiness(encoder: &mut Encoder, readiness: ReadinessState) {
     encoder.bool(readiness.read_ready);
     encoder.bool(readiness.write_ready);
-    encoder.u64(readiness.generation);
 }
 
 fn decode_readiness(decoder: &mut Decoder<'_>) -> Result<ReadinessState, WireError> {
-    Ok(ReadinessState::new(
-        decoder.bool()?,
-        decoder.bool()?,
-        decoder.u64()?,
-    ))
+    Ok(ReadinessState::new(decoder.bool()?, decoder.bool()?))
 }
 
 fn encode_consume_mode(encoder: &mut Encoder, mode: EventConsumeMode) {

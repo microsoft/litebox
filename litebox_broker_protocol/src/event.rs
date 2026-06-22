@@ -10,17 +10,14 @@ pub struct ReadinessState {
     pub read_ready: bool,
     /// Whether an event write/add operation can complete without blocking.
     pub write_ready: bool,
-    /// Monotonic readiness generation used to invalidate user-side readiness caches.
-    pub generation: u64,
 }
 
 impl ReadinessState {
     /// Creates a readiness state.
-    pub const fn new(read_ready: bool, write_ready: bool, generation: u64) -> Self {
+    pub const fn new(read_ready: bool, write_ready: bool) -> Self {
         Self {
             read_ready,
             write_ready,
-            generation,
         }
     }
 }

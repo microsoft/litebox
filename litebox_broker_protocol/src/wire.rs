@@ -195,17 +195,17 @@ mod tests {
             },
             event_response(EventResponse::Create(CreateEventResponse::new(handle))),
             event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::Ready(ReadinessState::new(true, false, 8)),
+                WaitOutcome::Ready(ReadinessState::new(true, false)),
             ))),
             event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::WouldBlock(ReadinessState::new(false, true, 9)),
+                WaitOutcome::WouldBlock(ReadinessState::new(false, true)),
             ))),
             event_response(EventResponse::Add(AddEventResponse::new(
-                ReadinessState::new(true, true, 10),
+                ReadinessState::new(true, true),
             ))),
             event_response(EventResponse::Consume(ConsumeEventResponse::new(
                 3,
-                ReadinessState::new(false, true, 11),
+                ReadinessState::new(false, true),
             ))),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
             BrokerResponse::Error(ErrorCode::WouldBlock),
@@ -259,7 +259,7 @@ mod tests {
             )))
         );
 
-        let mut invalid_bool = [1, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut invalid_bool = [1, 0, 2, 2, 0];
         assert_eq!(
             decode_response(&invalid_bool),
             Err(WireError::InvalidBoolean)
@@ -267,7 +267,6 @@ mod tests {
 
         invalid_bool[3] = 1;
         invalid_bool[4] = 1;
-        invalid_bool[12] = 1;
         let mut frame = invalid_bool.to_vec();
         frame.push(0xff);
         assert_eq!(decode_response(&frame), Err(WireError::TrailingBytes));
@@ -277,9 +276,9 @@ mod tests {
     fn event_add_response_wire_shape_is_pinned() {
         assert_eq!(
             encode_response(event_response(EventResponse::Add(AddEventResponse::new(
-                ReadinessState::new(true, false, 0x0102_0304_0506_0708)
+                ReadinessState::new(true, false)
             )))),
-            [1, 0, 2, 1, 0, 8, 7, 6, 5, 4, 3, 2, 1]
+            [1, 0, 2, 1, 0]
         );
     }
 

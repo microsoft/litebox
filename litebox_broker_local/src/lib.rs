@@ -227,7 +227,7 @@ mod tests {
         let handle = ObjectHandle(7);
         let request = CoreRequest::Event(EventRequest::Wait(WaitEventRequest::new(handle)));
         let response = CoreResponse::Event(EventResponse::Wait(WaitEventResponse::new(
-            WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0)),
+            WaitOutcome::WouldBlock(ReadinessState::new(false, true)),
         )));
         let channel = FakeControlChannel::new(Some(BrokerResponse::Core(response.clone())));
         let mut local = BrokerLocal::new(channel);

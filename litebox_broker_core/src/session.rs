@@ -54,7 +54,7 @@ pub(crate) enum ObjectKind {
 }
 
 impl ObjectEntry {
-    fn kind(&self) -> ObjectKind {
+    fn kind(self) -> ObjectKind {
         match self {
             Self::Event(_) => ObjectKind::Event,
         }
@@ -220,18 +220,15 @@ mod tests {
 
         assert_eq!(
             event::wait(&session, handle),
-            Ok(WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0)))
+            Ok(WaitOutcome::WouldBlock(ReadinessState::new(false, true)))
         );
         assert_eq!(
             event::add(&session, handle, 1),
-            Ok(ReadinessState::new(true, true, 1))
+            Ok(ReadinessState::new(true, true))
         );
         assert_eq!(
             event::consume(&session, handle, EventConsumeMode::One),
-            Ok(EventConsumption::new(
-                1,
-                ReadinessState::new(false, true, 2)
-            ))
+            Ok(EventConsumption::new(1, ReadinessState::new(false, true)))
         );
         assert_eq!(
             event::create(&session, 0),

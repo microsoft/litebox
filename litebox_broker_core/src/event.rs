@@ -79,41 +79,29 @@ fn filter_readiness_for_rights(state: ReadinessState, rights: ObjectRights) -> R
     ReadinessState::new(
         rights.contains(ObjectRights::WAIT) && state.read_ready,
         rights.contains(ObjectRights::WRITE) && state.write_ready,
-        state.generation,
     )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EventObject {
     count: u64,
-    readiness_generation: u64,
 }
 
 impl EventObject {
     const fn new(count: u64) -> Self {
-        Self {
-            count,
-            readiness_generation: 0,
-        }
+        Self { count }
     }
 
     const fn readiness_state(self) -> ReadinessState {
-        ReadinessState::new(
-            self.count > 0,
-            self.count < MAX_EVENT_COUNT,
-            self.readiness_generation,
-        )
+        ReadinessState::new(self.count > 0, self.count < MAX_EVENT_COUNT)
     }
 
     fn add(&mut self, value: u64) -> Result<ReadinessState> {
-        let new_count = self
+        self.count = self
             .count
             .checked_add(value)
             .filter(|count| *count <= MAX_EVENT_COUNT)
             .ok_or(BrokerError::WouldBlock)?;
-        let next_generation = self.next_generation()?;
-        self.count = new_count;
-        self.readiness_generation = next_generation;
         Ok(self.readiness_state())
     }
 
@@ -127,16 +115,8 @@ impl EventObject {
             EventConsumeMode::One => 1,
             _ => return Err(BrokerError::UnsupportedOperation),
         };
-        let next_generation = self.next_generation()?;
         self.count -= value;
-        self.readiness_generation = next_generation;
         Ok(EventConsumption::new(value, self.readiness_state()))
-    }
-
-    fn next_generation(&self) -> Result<u64> {
-        self.readiness_generation
-            .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)
     }
 }
 
@@ -147,42 +127,15 @@ mod tests {
 
     #[test]
     fn event_readiness_state_only_reports_authorized_directions() {
-        let readiness = ReadinessState::new(true, true, 7);
+        let readiness = ReadinessState::new(true, true);
 
         assert_eq!(
             filter_readiness_for_rights(readiness, ObjectRights::WAIT),
-            ReadinessState::new(true, false, 7)
+            ReadinessState::new(true, false)
         );
         assert_eq!(
             filter_readiness_for_rights(readiness, ObjectRights::WRITE),
-            ReadinessState::new(false, true, 7)
+            ReadinessState::new(false, true)
         );
-    }
-
-    #[test]
-    fn add_event_does_not_mutate_count_when_generation_is_exhausted() {
-        let mut event = EventObject {
-            count: 1,
-            readiness_generation: u64::MAX,
-        };
-
-        assert_eq!(event.add(1), Err(BrokerError::ResourceExhausted));
-        assert_eq!(event.count, 1);
-        assert_eq!(event.readiness_generation, u64::MAX);
-    }
-
-    #[test]
-    fn consume_event_does_not_mutate_count_when_generation_is_exhausted() {
-        let mut event = EventObject {
-            count: 1,
-            readiness_generation: u64::MAX,
-        };
-
-        assert_eq!(
-            event.consume(EventConsumeMode::One),
-            Err(BrokerError::ResourceExhausted)
-        );
-        assert_eq!(event.count, 1);
-        assert_eq!(event.readiness_generation, u64::MAX);
     }
 }

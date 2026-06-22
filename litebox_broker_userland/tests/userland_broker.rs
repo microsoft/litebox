@@ -29,17 +29,17 @@ fn separate_process_broker_serves_event_object_requests() {
     let handle = local.create_event().unwrap();
     assert_eq!(
         local.wait_event(handle).unwrap(),
-        WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0))
+        WaitOutcome::WouldBlock(ReadinessState::new(false, true))
     );
 
     assert_eq!(
         local.add_event(handle, 1).unwrap(),
-        ReadinessState::new(true, true, 1)
+        ReadinessState::new(true, true)
     );
 
     assert_eq!(
         local.wait_event(handle).unwrap(),
-        WaitOutcome::Ready(ReadinessState::new(true, true, 1))
+        WaitOutcome::Ready(ReadinessState::new(true, true))
     );
     drop(local);
     assert!(child.wait().unwrap().success());
