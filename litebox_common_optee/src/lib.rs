@@ -510,6 +510,18 @@ impl UteeParams {
         (0..Self::TEE_NUM_PARAMS).all(|i| self.get_type(i).is_ok_and(|t| t == expected[i]))
     }
 
+    /// Return `true` if any parameter is an output or inout type, i.e., the
+    /// command may write results that must be copied back to the caller.
+    pub fn needs_copy_back(&self) -> bool {
+        use TeeParamType::{MemrefInout, MemrefOutput, ValueInout, ValueOutput};
+        (0..Self::TEE_NUM_PARAMS).any(|i| {
+            matches!(
+                self.get_type(i),
+                Ok(ValueOutput | ValueInout | MemrefOutput | MemrefInout)
+            )
+        })
+    }
+
     pub fn get_type(&self, index: usize) -> Result<TeeParamType, Errno> {
         let type_byte = match index {
             0 => self.types.type_0(),

@@ -382,11 +382,10 @@ impl SystemPta {
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
 
-        let num_bytes: usize = num_bytes.trunc();
         let addr: usize = ((addr_high << 32) | (addr_low & 0xffff_ffff)).trunc();
         let (mapped, cleanup) = task.sys_map_zi(
             addr,
-            num_bytes,
+            num_bytes.trunc(),
             pad_begin.trunc(),
             pad_end.trunc(),
             LdelfMapFlags::from_bits_retain(flags.trunc()),

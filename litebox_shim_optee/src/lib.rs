@@ -478,7 +478,9 @@ impl Task {
                         ret_orig,
                     )
                     .and_then(|cleanup| {
-                        if params.write_at_offset(0, params_copied).is_some() {
+                        if !params_copied.needs_copy_back()
+                            || params.write_at_offset(0, params_copied).is_some()
+                        {
                             Ok(())
                         } else {
                             cleanup.run(self);
