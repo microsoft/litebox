@@ -64,43 +64,43 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
 
     /// Negotiates a caller-selected protocol version.
     ///
-    /// Returns the effective protocol version this connection will speak. Feature
-    /// gating must use this effective version, not the broker's max-supported
-    /// version returned by the wire negotiation response.
+    /// Returns the effective protocol version this connection will speak.
     pub fn negotiate_version(
         &mut self,
-        protocol_version: ProtocolVersion,
+        requested: ProtocolVersion,
     ) -> Result<ProtocolVersion, T::Error> {
         if self.state != ConnectionState::AwaitingNegotiation {
             return Err(BrokerLocalError::AlreadyNegotiated);
         }
-        if !protocol_version.is_supported_by(LOCAL_PROTOCOL_VERSION) {
+        if requested != LOCAL_PROTOCOL_VERSION {
             return Err(BrokerLocalError::UnsupportedLocalVersion {
-                requested: protocol_version,
+                requested,
                 local_protocol_version: LOCAL_PROTOCOL_VERSION,
             });
         }
 
-        let response = self.request(BrokerRequest::Negotiate { protocol_version })?;
+        let response = self.request(BrokerRequest::Negotiate {
+            protocol_version: requested,
+        })?;
         match response {
             BrokerResponse::Negotiated {
                 broker_protocol_version,
             } => {
-                if !protocol_version.is_supported_by(broker_protocol_version) {
+                if !requested.is_supported_by(broker_protocol_version) {
                     return Err(BrokerLocalError::IncompatibleNegotiation {
-                        requested: protocol_version,
+                        requested,
                         broker_protocol_version,
                     });
                 }
                 self.state = ConnectionState::Active {
-                    negotiated_protocol_version: protocol_version,
+                    negotiated_protocol_version: requested,
                 };
-                Ok(protocol_version)
+                Ok(requested)
             }
             BrokerResponse::VersionMismatch {
                 broker_protocol_version,
             } => Err(BrokerLocalError::UnsupportedVersion {
-                requested: protocol_version,
+                requested,
                 broker_protocol_version,
             }),
             response => Err(BrokerLocalError::UnexpectedResponse(response)),
@@ -109,8 +109,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
 
     /// Returns the effective protocol version this connection negotiated.
     ///
-    /// Feature gating must use this effective version because the broker may
-    /// support a newer minor version than this local adapter requested.
+    /// Feature gating must use this effective version.
     pub fn negotiated_protocol_version(&self) -> Option<ProtocolVersion> {
         match self.state {
             ConnectionState::AwaitingNegotiation => None,
@@ -215,6 +214,33 @@ mod tests {
         ));
         assert_eq!(local.negotiated_protocol_version(), None);
         assert_eq!(local.channel.sent_request, None);
+    }
+
+    #[test]
+    fn negotiate_rejects_broker_newer_minor_response() {
+        let broker_protocol_version = ProtocolVersion::new(
+            LOCAL_PROTOCOL_VERSION.major,
+            LOCAL_PROTOCOL_VERSION.minor + 1,
+        );
+        let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
+            broker_protocol_version,
+        }));
+        let mut local = BrokerLocal::new(channel);
+
+        assert!(matches!(
+            local.negotiate(),
+            Err(BrokerLocalError::IncompatibleNegotiation {
+                requested,
+                broker_protocol_version: broker
+            }) if requested == LOCAL_PROTOCOL_VERSION && broker == broker_protocol_version
+        ));
+        assert_eq!(local.negotiated_protocol_version(), None);
+        assert_eq!(
+            local.channel.sent_request,
+            Some(BrokerRequest::Negotiate {
+                protocol_version: LOCAL_PROTOCOL_VERSION
+            })
+        );
     }
 
     #[test]

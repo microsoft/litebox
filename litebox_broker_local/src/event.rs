@@ -89,7 +89,7 @@ const fn event_request(request: EventRequest) -> BrokerRequest {
 impl<T: LocalControlChannel> BrokerLocal<T> {
     fn ensure_event_protocol(&self) -> Result<(), T::Error> {
         let negotiated = self.ensure_negotiated()?;
-        if EVENT_PROTOCOL_VERSION.is_supported_by(negotiated) {
+        if EVENT_PROTOCOL_VERSION == negotiated {
             Ok(())
         } else {
             Err(BrokerLocalError::UnsupportedNegotiatedVersion {

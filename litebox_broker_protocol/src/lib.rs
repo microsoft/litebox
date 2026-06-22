@@ -42,7 +42,7 @@ pub struct ObjectHandle(pub u64);
 pub struct ProtocolVersion {
     /// Incompatible protocol version.
     pub major: u16,
-    /// Backward-compatible protocol revision within a major version.
+    /// Protocol revision within a major version.
     pub minor: u16,
 }
 
@@ -52,15 +52,30 @@ impl ProtocolVersion {
         Self { major, minor }
     }
 
-    /// Returns whether this requested version is supported by `supported`.
+    /// Returns whether this requested version is supported by the broker.
     ///
-    /// Minor revisions are backward-compatible within a major version, so a
-    /// broker can serve a peer requesting the same major version and a minor
-    /// version no newer than the broker supports.
-    pub const fn is_supported_by(self, supported: Self) -> bool {
-        self.major == supported.major && self.minor <= supported.minor
+    /// The initial split-broker protocol requires both peers to speak the same
+    /// major/minor version. Future compatible protocol evolution can loosen this
+    /// check when there is a concrete compatibility rule to enforce.
+    pub const fn is_supported_by(self, broker: Self) -> bool {
+        self.major == broker.major && self.minor == broker.minor
     }
 }
 
 /// Initial broker protocol version implemented by the split-broker POC.
 pub const INITIAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_version_support_requires_exact_match() {
+        let version = ProtocolVersion::new(1, 2);
+
+        assert!(version.is_supported_by(version));
+        assert!(!version.is_supported_by(ProtocolVersion::new(1, 3)));
+        assert!(!version.is_supported_by(ProtocolVersion::new(1, 1)));
+        assert!(!version.is_supported_by(ProtocolVersion::new(2, 2)));
+    }
+}
