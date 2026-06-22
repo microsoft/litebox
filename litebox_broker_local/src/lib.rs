@@ -119,17 +119,10 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         }
     }
 
-    pub(crate) fn ensure_negotiated(&self) -> Result<ProtocolVersion, T::Error> {
-        match self.state {
-            ConnectionState::AwaitingNegotiation => Err(BrokerLocalError::NotNegotiated),
-            ConnectionState::Active {
-                negotiated_protocol_version,
-            } => Ok(negotiated_protocol_version),
-        }
-    }
-
     pub(crate) fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
-        self.ensure_negotiated()?;
+        if self.state == ConnectionState::AwaitingNegotiation {
+            return Err(BrokerLocalError::NotNegotiated);
+        }
         match self.raw_request(request)? {
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => Ok(response),
@@ -153,7 +146,6 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
 
     /// Sends one BrokerCore request on an active connection.
     pub fn active_core_request(&mut self, request: CoreRequest) -> Result<CoreResponse, T::Error> {
-        self.ensure_negotiated()?;
         match self.request(BrokerRequest::Core(request))? {
             BrokerResponse::Core(response) => Ok(response),
             response => Err(BrokerLocalError::UnexpectedResponse(response)),
