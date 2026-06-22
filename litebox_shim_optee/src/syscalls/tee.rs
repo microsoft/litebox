@@ -173,12 +173,6 @@ impl Task {
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
-        if ret_orig.as_usize() == 0 {
-            return Err(TeeResult::BadParameters);
-        }
-        ret_orig
-            .write_at_offset(0, TeeOrigin::Tee)
-            .ok_or(TeeResult::AccessDenied)?;
         if let Some(pta) = PseudoTa::from_uuid(&ta_uuid) {
             // `open_ta_session` syscall lets a user-mode TA open a session to a PTA which provides
             // several import services (it works as a proxy for extra system calls).
@@ -187,6 +181,9 @@ impl Task {
                 self.close_pta_session(session_id);
                 return Err(TeeResult::AccessDenied);
             }
+            // Best-effort write-back of the return origin, matching OP-TEE OS
+            // (`syscall_open_ta_session`): the copy result is ignored.
+            let _ = ret_orig.write_at_offset(0, TeeOrigin::Tee);
             Ok(())
         } else {
             // `open_ta_session` syscall lets a user-mode TA open a session to another user-mode TA
@@ -226,14 +223,12 @@ impl Task {
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<Cleanup, TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
-        if ret_orig.as_usize() == 0 {
-            return Err(TeeResult::BadParameters);
-        }
-        ret_orig
-            .write_at_offset(0, TeeOrigin::Tee)
-            .ok_or(TeeResult::AccessDenied)?;
         if let Some(pta) = self.pta_for_session(ta_sess_id) {
-            pta.invoke_command(self, cmd_id, params)
+            let cleanup = pta.invoke_command(self, cmd_id, params)?;
+            // Best-effort write-back of the return origin, matching OP-TEE OS
+            // (`syscall_invoke_ta_command`): the copy result is ignored.
+            let _ = ret_orig.write_at_offset(0, TeeOrigin::Tee);
+            Ok(cleanup)
         } else {
             #[cfg(debug_assertions)]
             todo!("support inter TA interaction");
