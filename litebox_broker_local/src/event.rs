@@ -4,7 +4,7 @@
 use litebox_broker_protocol::{
     AddEventRequest, BrokerRequest, BrokerResponse, ConsumeEventRequest, ConsumeEventResponse,
     CoreRequest, CoreResponse, CreateEventRequest, EventConsumeMode, EventRequest, EventResponse,
-    LocalControlChannel, ObjectHandle, ReadinessState, WaitEventRequest, WaitOutcome,
+    LocalControlChannel, ObjectHandle, ReadinessState, WaitEventRequest,
 };
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -31,12 +31,12 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     }
 
     /// Checks whether an event wait would complete now.
-    pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<WaitOutcome, T::Error> {
+    pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<ReadinessState, T::Error> {
         match self.request(event_request(EventRequest::Wait(WaitEventRequest {
             handle,
         })))? {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(response))) => {
-                Ok(response.outcome)
+                Ok(response.readiness)
             }
             response => Err(BrokerLocalError::UnexpectedResponse(response)),
         }

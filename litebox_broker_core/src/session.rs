@@ -182,7 +182,7 @@ mod tests {
         event,
     };
     use litebox_broker_protocol::{
-        EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState, WaitOutcome,
+        EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState,
     };
 
     #[test]
@@ -214,10 +214,10 @@ mod tests {
 
         assert_eq!(
             event::wait(&session, handle),
-            Ok(WaitOutcome::WouldBlock(ReadinessState {
+            Ok(ReadinessState {
                 read_ready: false,
                 write_ready: true,
-            }))
+            })
         );
         assert_eq!(
             event::add(&session, handle, 1),

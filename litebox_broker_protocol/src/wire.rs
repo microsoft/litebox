@@ -149,7 +149,7 @@ mod tests {
         AddEventRequest, AddEventResponse, ConsumeEventRequest, CoreRequest, CoreResponse,
         CreateEventRequest, CreateEventResponse, EventConsumeMode, EventConsumption, EventRequest,
         EventResponse, ObjectHandle, ProtocolVersion, ReadinessState, WaitEventRequest,
-        WaitEventResponse, WaitOutcome,
+        WaitEventResponse,
     };
 
     #[test]
@@ -197,16 +197,16 @@ mod tests {
             },
             event_response(EventResponse::Create(CreateEventResponse { handle })),
             event_response(EventResponse::Wait(WaitEventResponse {
-                outcome: WaitOutcome::Ready(ReadinessState {
+                readiness: ReadinessState {
                     read_ready: true,
                     write_ready: false,
-                }),
+                },
             })),
             event_response(EventResponse::Wait(WaitEventResponse {
-                outcome: WaitOutcome::WouldBlock(ReadinessState {
+                readiness: ReadinessState {
                     read_ready: false,
                     write_ready: true,
-                }),
+                },
             })),
             event_response(EventResponse::Add(AddEventResponse {
                 readiness: ReadinessState {
@@ -263,7 +263,7 @@ mod tests {
         );
         assert_eq!(
             decode_response(&[1, 0, 1, 0xff]),
-            Err(WireError::InvalidTag)
+            Err(WireError::InvalidBoolean)
         );
         assert_eq!(
             decode_response(&[2, 0xff, 0xff]),

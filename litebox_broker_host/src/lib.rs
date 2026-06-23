@@ -138,9 +138,9 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
             })
         }
         EventRequest::Wait(request) => {
-            handle_core_result(event::wait(session, request.handle), |outcome| {
+            handle_core_result(event::wait(session, request.handle), |readiness| {
                 BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
-                    WaitEventResponse { outcome },
+                    WaitEventResponse { readiness },
                 )))
             })
         }

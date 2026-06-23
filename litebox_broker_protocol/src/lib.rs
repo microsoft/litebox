@@ -23,7 +23,7 @@ pub use error::ErrorCode;
 pub use event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
     CreateEventRequest, CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState,
-    WaitEventRequest, WaitEventResponse, WaitOutcome,
+    WaitEventRequest, WaitEventResponse,
 };
 pub use message::{
     BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,

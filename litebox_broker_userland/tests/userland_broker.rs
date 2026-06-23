@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::{
-    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, ReadinessState, WaitOutcome,
+    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, ReadinessState,
 };
 use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
@@ -39,10 +39,10 @@ fn separate_process_broker_serves_event_object_requests() {
     let handle = local.create_event().unwrap();
     assert_eq!(
         local.wait_event(handle).unwrap(),
-        WaitOutcome::WouldBlock(ReadinessState {
+        ReadinessState {
             read_ready: false,
             write_ready: true,
-        })
+        }
     );
 
     assert_eq!(
@@ -55,10 +55,10 @@ fn separate_process_broker_serves_event_object_requests() {
 
     assert_eq!(
         local.wait_event(handle).unwrap(),
-        WaitOutcome::Ready(ReadinessState {
+        ReadinessState {
             read_ready: true,
             write_ready: true,
-        })
+        }
     );
     drop(local);
     assert!(child.wait().unwrap().success());

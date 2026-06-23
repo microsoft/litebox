@@ -7,7 +7,7 @@ pub use litebox_broker_protocol::EventConsumeMode as EventCounterReadMode;
 use litebox_broker_protocol::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CoreRequest, CoreResponse,
     CreateEventRequest, EventRequest, EventResponse, ObjectHandle, ReadinessState,
-    WaitEventRequest, WaitOutcome,
+    WaitEventRequest,
 };
 use thiserror::Error;
 
@@ -161,9 +161,7 @@ where
         let EventResponse::Wait(response) = response else {
             return Events::empty();
         };
-        let readiness = match response.outcome {
-            WaitOutcome::Ready(readiness) | WaitOutcome::WouldBlock(readiness) => readiness,
-        };
+        let readiness = response.readiness;
         let mut events = Events::empty();
         if readiness.read_ready {
             events |= Events::IN;
