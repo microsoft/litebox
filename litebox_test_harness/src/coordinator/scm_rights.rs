@@ -110,6 +110,7 @@ enum ScmKind {
     PassEventfd,
     PassEventfdPollWake,
     PassTcpSocket,
+    PassTcpAccepted,
     PassUnixSocketpair,
     PassThenCloseSender,
     PassTwoFdsOneMsg,
@@ -162,6 +163,10 @@ const SCM_SCENARIOS: &[ScmScenario] = &[
     ScmScenario {
         name: "pass_tcp_socket",
         kind: ScmKind::PassTcpSocket,
+    },
+    ScmScenario {
+        name: "pass_tcp_accepted",
+        kind: ScmKind::PassTcpAccepted,
     },
     ScmScenario {
         name: "pass_unix_socketpair",
@@ -391,6 +396,7 @@ fn accept_and_validate(kind: ScmKind, listener: UnixListener) -> Result<ScmOut, 
         ScmKind::PassEventfd => receive_eventfd(stream, 7, false, "eventfd"),
         ScmKind::PassEventfdPollWake => receive_eventfd_poll_wake(stream),
         ScmKind::PassTcpSocket => receive_tcp(stream),
+        ScmKind::PassTcpAccepted => receive_tcp_accepted(stream),
         ScmKind::PassUnixSocketpair => receive_unix_socketpair(stream),
         ScmKind::PassThenCloseSender => receive_eventfd(stream, 5, true, "close_sender"),
         ScmKind::PassTwoFdsOneMsg => receive_two_eventfds(stream),
@@ -427,6 +433,7 @@ fn send_for_scenario(kind: ScmKind, socket_path: &str) -> Result<(), String> {
             Ok(())
         }
         ScmKind::PassTcpSocket => send_tcp(socket_path),
+        ScmKind::PassTcpAccepted => send_tcp_accepted(socket_path),
         ScmKind::PassUnixSocketpair => send_unix_socketpair(socket_path),
         ScmKind::PassThenCloseSender => {
             let ev = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
@@ -778,6 +785,78 @@ fn receive_tcp(stream: UnixStream) -> Result<ScmOut, String> {
     Ok(ScmOut {
         detail: format!("received_tcp_fd={raw} echo=ok"),
     })
+}
+
+fn send_tcp_accepted(socket_path: &str) -> Result<(), String> {
+    // Mirror the VS Code code-server: listen, let a client connect, accept,
+    // SCM-pass the ACCEPTED (server) side, then close our copy. The receiver
+    // must be able to write data that reaches the still-open client side.
+    let listener = tcp_listener()?;
+    let port = listener_port(listener.as_raw_fd())?;
+    let client = tcp_connect(port)?;
+    let accepted = tcp_accept(listener.as_raw_fd())?;
+    let stream = UnixStream::connect(socket_path)?;
+    stream.send_fd(accepted.as_fd(), b"tcp_accepted")?;
+    drop(accepted);
+
+    // Server->client (the exthost->client keepalive direction): the receiver
+    // writes to the accepted socket; we must receive it on the client side.
+    let s2c = read_exact(client.as_raw_fd(), b"SCM_ACC_S2C".len())?;
+    if s2c != b"SCM_ACC_S2C" {
+        return Err(format!(
+            "accepted->client delivery failed: {:?}",
+            String::from_utf8_lossy(&s2c)
+        ));
+    }
+    // Client->server, for symmetry.
+    write_all(client.as_raw_fd(), b"SCM_ACC_C2S")?;
+    Ok(())
+}
+
+fn receive_tcp_accepted(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, "tcp_accepted")?;
+    let raw = fd.as_raw_fd();
+    write_all(raw, b"SCM_ACC_S2C")?;
+    let c2s = read_exact(raw, b"SCM_ACC_C2S".len())?;
+    if c2s != b"SCM_ACC_C2S" {
+        return Err(format!(
+            "client->accepted mismatch: {:?}",
+            String::from_utf8_lossy(&c2s)
+        ));
+    }
+    Ok(ScmOut {
+        detail: format!("received_accepted_fd={raw} bidi=ok"),
+    })
+}
+
+fn tcp_accept(listener: i32) -> Result<OwnedFd, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: accept4 operates on the live listener fd and returns a fresh fd.
+        let raw = unsafe {
+            libc::accept4(
+                listener,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
+        if raw >= 0 {
+            // SAFETY: raw was just returned by accept4 and is uniquely owned here.
+            return Ok(unsafe { OwnedFd::from_raw_fd(raw) });
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK)
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => return Err(format!("tcp accept: {err}")),
+        }
+    }
 }
 
 fn tcp_listener() -> Result<OwnedFd, String> {
