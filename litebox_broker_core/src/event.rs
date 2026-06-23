@@ -92,7 +92,6 @@ impl EventObject {
         let value = match mode {
             EventConsumeMode::All => self.count,
             EventConsumeMode::One => 1,
-            _ => return Err(BrokerError::UnsupportedOperation),
         };
         self.count -= value;
         Ok(EventConsumption {

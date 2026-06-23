@@ -161,9 +161,8 @@ where
         let EventResponse::Wait(response) = response else {
             return Events::empty();
         };
-        let (WaitOutcome::Ready(readiness) | WaitOutcome::WouldBlock(readiness)) = response.outcome
-        else {
-            return Events::empty();
+        let readiness = match response.outcome {
+            WaitOutcome::Ready(readiness) | WaitOutcome::WouldBlock(readiness) => readiness,
         };
         let mut events = Events::empty();
         if readiness.read_ready {

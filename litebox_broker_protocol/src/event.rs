@@ -14,7 +14,6 @@ pub struct ReadinessState {
 
 /// Result of checking whether a broker event read wait would complete now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum WaitOutcome {
     /// The object is read-ready now.
     Ready(ReadinessState),
@@ -24,7 +23,6 @@ pub enum WaitOutcome {
 
 /// How a broker event consume operation should remove readiness credits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum EventConsumeMode {
     /// Consume all currently available credits.
     All,

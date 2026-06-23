@@ -27,12 +27,6 @@ pub enum ErrorCode {
     ResourceExhausted,
     #[error("broker operation would block")]
     WouldBlock,
-    /// Error code emitted by a newer broker and not understood by this local peer.
-    ///
-    /// This variant is reserved for raw codes not assigned by this protocol
-    /// version.
-    #[error("unknown broker error code {0}")]
-    Unknown(u16),
 }
 
 impl ErrorCode {
@@ -42,19 +36,19 @@ impl ErrorCode {
     /// concrete broker errors.
     ///
     /// Converts a raw protocol error code to an error category.
-    pub const fn from_raw(raw: u16) -> Self {
+    pub const fn from_raw(raw: u16) -> Option<Self> {
         match raw {
-            1 => Self::UnsupportedVersion,
-            2 => Self::MalformedRequest,
-            3 => Self::ProtocolState,
-            4 => Self::UnsupportedOperation,
-            5 => Self::Internal,
-            6 => Self::PolicyDenied,
-            7 => Self::UnknownObject,
-            8 => Self::InvalidRights,
-            9 => Self::ResourceExhausted,
-            10 => Self::WouldBlock,
-            raw => Self::Unknown(raw),
+            1 => Some(Self::UnsupportedVersion),
+            2 => Some(Self::MalformedRequest),
+            3 => Some(Self::ProtocolState),
+            4 => Some(Self::UnsupportedOperation),
+            5 => Some(Self::Internal),
+            6 => Some(Self::PolicyDenied),
+            7 => Some(Self::UnknownObject),
+            8 => Some(Self::InvalidRights),
+            9 => Some(Self::ResourceExhausted),
+            10 => Some(Self::WouldBlock),
+            _ => None,
         }
     }
 
@@ -71,7 +65,6 @@ impl ErrorCode {
             Self::InvalidRights => 8,
             Self::ResourceExhausted => 9,
             Self::WouldBlock => 10,
-            Self::Unknown(raw) => raw,
         }
     }
 }
