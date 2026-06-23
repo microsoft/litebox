@@ -3,6 +3,7 @@
 
 //! SCM_RIGHTS fd-passing tests over Unix domain sockets.
 
+use std::ffi::CStr;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
@@ -112,6 +113,7 @@ enum ScmKind {
     PassTcpSocket,
     PassTcpAccepted,
     PassUnixSocketpair,
+    PassPty,
     PassThenCloseSender,
     PassTwoFdsOneMsg,
     /// Originally designed as a HypB probe for the broker
@@ -171,6 +173,10 @@ const SCM_SCENARIOS: &[ScmScenario] = &[
     ScmScenario {
         name: "pass_unix_socketpair",
         kind: ScmKind::PassUnixSocketpair,
+    },
+    ScmScenario {
+        name: "pass_pty",
+        kind: ScmKind::PassPty,
     },
     ScmScenario {
         name: "pass_then_close_sender",
@@ -398,6 +404,7 @@ fn accept_and_validate(kind: ScmKind, listener: UnixListener) -> Result<ScmOut, 
         ScmKind::PassTcpSocket => receive_tcp(stream),
         ScmKind::PassTcpAccepted => receive_tcp_accepted(stream),
         ScmKind::PassUnixSocketpair => receive_unix_socketpair(stream),
+        ScmKind::PassPty => receive_pty(stream),
         ScmKind::PassThenCloseSender => receive_eventfd(stream, 5, true, "close_sender"),
         ScmKind::PassTwoFdsOneMsg => receive_two_eventfds(stream),
         ScmKind::PassPipeDoubleWake => receive_pipe_double_wake(stream),
@@ -435,6 +442,7 @@ fn send_for_scenario(kind: ScmKind, socket_path: &str) -> Result<(), String> {
         ScmKind::PassTcpSocket => send_tcp(socket_path),
         ScmKind::PassTcpAccepted => send_tcp_accepted(socket_path),
         ScmKind::PassUnixSocketpair => send_unix_socketpair(socket_path),
+        ScmKind::PassPty => send_pty(socket_path),
         ScmKind::PassThenCloseSender => {
             let ev = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
             let source_fd = ev.as_raw_fd();
@@ -755,6 +763,108 @@ fn unix_socketpair() -> Result<(OwnedFd, OwnedFd), String> {
     // SAFETY: socketpair returned two fresh, uniquely-owned fds.
     let second = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     Ok((first, second))
+}
+
+fn send_pty(socket_path: &str) -> Result<(), String> {
+    let (master, slave) = open_pty_pair()?;
+    make_raw(slave.as_raw_fd())?;
+    let stream = UnixStream::connect(socket_path)?;
+    stream.send_fd(master.as_fd(), b"pty")?;
+
+    let ping = read_exact(slave.as_raw_fd(), b"SCM_PTY_PING".len())?;
+    if ping != b"SCM_PTY_PING" {
+        return Err(format!(
+            "pty slave read mismatch: {:?}",
+            String::from_utf8_lossy(&ping)
+        ));
+    }
+    write_all(slave.as_raw_fd(), b"SCM_PTY_PONG")?;
+    Ok(())
+}
+
+fn receive_pty(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, "pty")?;
+    let raw = fd.as_raw_fd();
+    let mut pty_num = 0u32;
+    // SAFETY: TIOCGPTN writes a u32 to the provided pointer for a PTY master fd.
+    let rc = unsafe { libc::ioctl(raw, libc::TIOCGPTN, std::ptr::addr_of_mut!(pty_num)) };
+    if rc != 0 {
+        return Err(format!(
+            "received pty TIOCGPTN: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    write_all(raw, b"SCM_PTY_PING")?;
+    let pong = read_exact(raw, b"SCM_PTY_PONG".len())?;
+    if pong != b"SCM_PTY_PONG" {
+        return Err(format!(
+            "pty master read mismatch: {:?}",
+            String::from_utf8_lossy(&pong)
+        ));
+    }
+    Ok(ScmOut {
+        detail: format!("received_pty_master_fd={raw} pty_num={pty_num} bidi=ok"),
+    })
+}
+
+fn open_pty_pair() -> Result<(OwnedFd, OwnedFd), String> {
+    // SAFETY: posix_openpt returns a fresh fd on success.
+    let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if master_raw < 0 {
+        return Err(format!("posix_openpt: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: master_raw was just returned by posix_openpt and is uniquely owned.
+    let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
+    // SAFETY: grantpt/unlockpt operate on a live PTY master fd.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
+        return Err(format!("grantpt: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: grantpt/unlockpt operate on a live PTY master fd.
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+        return Err(format!("unlockpt: {}", std::io::Error::last_os_error()));
+    }
+
+    let mut name = [0i8; 128];
+    // SAFETY: name is a valid writable buffer and master is a live PTY master fd.
+    let pts_rc = unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    if pts_rc != 0 {
+        return Err(format!(
+            "ptsname_r: {}",
+            std::io::Error::from_raw_os_error(pts_rc)
+        ));
+    }
+    // SAFETY: ptsname_r wrote a NUL-terminated C string into name on success.
+    let slave_path = unsafe { CStr::from_ptr(name.as_ptr()) };
+    // SAFETY: open creates a fresh fd on success and does not retain slave_path.
+    let slave_raw = unsafe {
+        libc::open(
+            slave_path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if slave_raw < 0 {
+        return Err(format!("open slave: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: slave_raw was just returned by open and is uniquely owned.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+    Ok((master, slave))
+}
+
+fn make_raw(fd: i32) -> Result<(), String> {
+    // SAFETY: zeroed termios is immediately overwritten by tcgetattr on success.
+    let mut tio = unsafe { std::mem::zeroed::<libc::termios>() };
+    // SAFETY: tcgetattr writes termios for a live terminal fd.
+    if unsafe { libc::tcgetattr(fd, std::ptr::addr_of_mut!(tio)) } != 0 {
+        return Err(format!("tcgetattr: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: cfmakeraw mutates the initialized termios struct in place.
+    unsafe { libc::cfmakeraw(std::ptr::addr_of_mut!(tio)) };
+    // SAFETY: tcsetattr reads the initialized termios struct.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, std::ptr::addr_of!(tio)) } != 0 {
+        return Err(format!("tcsetattr: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 fn send_tcp(socket_path: &str) -> Result<(), String> {

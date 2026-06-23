@@ -4075,8 +4075,33 @@ impl<FS: ShimFS> Task<FS> {
                             );
                             Ok(true)
                         }
-                        crate::RawFdRef::BrokerPty(_) | crate::RawFdRef::BrokerInetRaw(_) => {
-                            // Broker ptys/raw sockets are not broker-token-transferable over SCM yet.
+                        crate::RawFdRef::BrokerPty(typed) => {
+                            let Some(provider) = super::broker_pty::broker_pty_provider() else {
+                                return Ok(false);
+                            };
+                            let entry_handle = dt
+                                .entry_handle::<super::broker_pty::BrokerPtySubsystem>(typed)
+                                .ok_or(Errno::EBADF)?;
+                            let (handle_id, is_master) =
+                                entry_handle.with_entry(|e| (e.handle(), e.is_master()));
+                            if !is_master {
+                                // The LBFD Pty tag currently carries only the broker handle id.
+                                // Master role can be recovered via TIOCGPTN; slave role cannot
+                                // be reconstructed without extending the wire payload.
+                                return Ok(false);
+                            }
+                            provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                            passed_tokens.push(
+                                litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::Pty,
+                                    handle_id,
+                                )
+                                .map_err(|_| Errno::EINVAL)?,
+                            );
+                            Ok(true)
+                        }
+                        crate::RawFdRef::BrokerInetRaw(_) => {
+                            // Broker raw sockets are not broker-token-transferable over SCM yet.
                             Ok(false)
                         }
                         crate::RawFdRef::BrokerInetListener(typed) => {
@@ -5251,6 +5276,45 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                     }
+                    SubsystemTag::Pty => {
+                        use super::broker_pty::BrokerPtyProviderReacquireExt as _;
+
+                        let Some(provider) = super::broker_pty::broker_pty_provider() else {
+                            continue;
+                        };
+                        let handle_id = token.id();
+                        let pty = match provider.reacquire(
+                            handle_id,
+                            litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master,
+                            None,
+                        ) {
+                            Ok(pty) => pty,
+                            Err(_) => continue,
+                        };
+                        pty.ensure_subscribed_eager();
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt.insert::<super::broker_pty::BrokerPtySubsystem>(pty);
+                        if cloexec {
+                            let _ = dt.set_fd_metadata(
+                                &typed,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
+                        drop(dt);
+                        let files = self.files.borrow();
+                        match files.insert_raw_fd(typed) {
+                            Ok(raw_fd) => {
+                                installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                            }
+                            Err(typed) => {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .remove(&typed)
+                                    .unwrap();
+                            }
+                        }
+                    }
                     SubsystemTag::Process | SubsystemTag::Unknown(_) => {
                         // Unsupported token kind on this worker; drop.
                     }
@@ -5259,7 +5323,6 @@ impl<FS: ShimFS> Task<FS> {
                     | SubsystemTag::Timerfd
                     | SubsystemTag::Inotify
                     | SubsystemTag::Pipe
-                    | SubsystemTag::Pty
                     | SubsystemTag::InetRaw
                     | SubsystemTag::HostFd => {
                         // Reserved for P2.A/B/C and later phases.
