@@ -119,6 +119,10 @@ pub struct HostFdState {
     /// only after the last `Arc` is gone — this flag short-circuits
     /// faster).
     closed: AtomicBool,
+    /// Set by a `read` that finds the host fd not readable (drained); consumed
+    /// by the poll thread to re-notify a still-asserted readable level exactly
+    /// once per drain instead of on every tick (see [`Self::spawn_poll_thread`]).
+    read_drained: AtomicBool,
 }
 
 impl HostFdState {
@@ -154,6 +158,7 @@ impl HostFdState {
             direction,
             subject: SubscriptionList::new(),
             closed: AtomicBool::new(false),
+            read_drained: AtomicBool::new(false),
         });
         Self::spawn_poll_thread(Arc::downgrade(&state));
         state
@@ -183,6 +188,9 @@ impl HostFdState {
         }
         let revents = poll_fd_events(self.fd.as_raw_fd());
         if revents & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR) == 0 {
+            // Drained: arm a one-shot re-notify so the poll thread re-signals
+            // the next arrival even if the level mask looks unchanged.
+            self.read_drained.store(true, Ordering::Release);
             return Err(HostFdError::WouldBlock);
         }
         let mut buf = vec![0u8; max_len];
@@ -282,10 +290,16 @@ impl HostFdState {
                         break;
                     }
                     let now = state.current_events_internal();
-                    // Repeat level-triggered bits so a worker that
-                    // drained between samples sees the next arrival.
-                    let level = now & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR) != 0;
-                    if now != 0 && (now != last || level) {
+                    // Edge-correct re-notification: resend a still-asserted
+                    // readable level only once per drain (a read that found the
+                    // fd not readable arms read_drained), not on every 10ms tick,
+                    // which converts a persistent level into an edge storm that
+                    // livelocks a fast level-triggered subscriber.
+                    let readable =
+                        now & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR) != 0;
+                    let drained_resend =
+                        readable && state.read_drained.swap(false, Ordering::AcqRel);
+                    if now != 0 && (now != last || drained_resend) {
                         state.subject.notify(now);
                     }
                     last = now;
