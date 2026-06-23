@@ -12,16 +12,6 @@ pub struct ReadinessState {
     pub write_ready: bool,
 }
 
-impl ReadinessState {
-    /// Creates a readiness state.
-    pub const fn new(read_ready: bool, write_ready: bool) -> Self {
-        Self {
-            read_ready,
-            write_ready,
-        }
-    }
-}
-
 /// Result of checking whether a broker event read wait would complete now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]

@@ -137,7 +137,10 @@ fn encode_readiness(encoder: &mut Encoder, readiness: ReadinessState) {
 }
 
 fn decode_readiness(decoder: &mut Decoder<'_>) -> Result<ReadinessState, WireError> {
-    Ok(ReadinessState::new(decoder.bool()?, decoder.bool()?))
+    Ok(ReadinessState {
+        read_ready: decoder.bool()?,
+        write_ready: decoder.bool()?,
+    })
 }
 
 fn encode_consume_mode(encoder: &mut Encoder, mode: EventConsumeMode) {

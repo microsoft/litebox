@@ -214,15 +214,27 @@ mod tests {
 
         assert_eq!(
             event::wait(&session, handle),
-            Ok(WaitOutcome::WouldBlock(ReadinessState::new(false, true)))
+            Ok(WaitOutcome::WouldBlock(ReadinessState {
+                read_ready: false,
+                write_ready: true,
+            }))
         );
         assert_eq!(
             event::add(&session, handle, 1),
-            Ok(ReadinessState::new(true, true))
+            Ok(ReadinessState {
+                read_ready: true,
+                write_ready: true,
+            })
         );
         assert_eq!(
             event::consume(&session, handle, EventConsumeMode::One),
-            Ok(EventConsumption::new(1, ReadinessState::new(false, true)))
+            Ok(EventConsumption::new(
+                1,
+                ReadinessState {
+                    read_ready: false,
+                    write_ready: true,
+                }
+            ))
         );
         assert_eq!(
             event::create(&session, 0),

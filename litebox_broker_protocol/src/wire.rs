@@ -191,17 +191,27 @@ mod tests {
             },
             event_response(EventResponse::Create(CreateEventResponse::new(handle))),
             event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::Ready(ReadinessState::new(true, false)),
+                WaitOutcome::Ready(ReadinessState {
+                    read_ready: true,
+                    write_ready: false,
+                }),
             ))),
             event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::WouldBlock(ReadinessState::new(false, true)),
+                WaitOutcome::WouldBlock(ReadinessState {
+                    read_ready: false,
+                    write_ready: true,
+                }),
             ))),
-            event_response(EventResponse::Add(AddEventResponse::new(
-                ReadinessState::new(true, true),
-            ))),
+            event_response(EventResponse::Add(AddEventResponse::new(ReadinessState {
+                read_ready: true,
+                write_ready: true,
+            }))),
             event_response(EventResponse::Consume(ConsumeEventResponse::new(
                 3,
-                ReadinessState::new(false, true),
+                ReadinessState {
+                    read_ready: false,
+                    write_ready: true,
+                },
             ))),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
             BrokerResponse::Error(ErrorCode::WouldBlock),
@@ -267,7 +277,10 @@ mod tests {
     fn event_add_response_wire_shape_is_pinned() {
         assert_eq!(
             encode_response(event_response(EventResponse::Add(AddEventResponse::new(
-                ReadinessState::new(true, false)
+                ReadinessState {
+                    read_ready: true,
+                    write_ready: false,
+                }
             )))),
             [1, 0, 2, 1, 0]
         );

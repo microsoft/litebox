@@ -29,7 +29,10 @@ pub fn wait(session: &BrokerSession, handle: ObjectHandle) -> Result<WaitOutcome
     let required_rights = ObjectRights::WAIT;
     session.with_authorized_object(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => {
-            let readiness = ReadinessState::new(event.count > 0, event.count < MAX_EVENT_COUNT);
+            let readiness = ReadinessState {
+                read_ready: event.count > 0,
+                write_ready: event.count < MAX_EVENT_COUNT,
+            };
             Ok(if readiness.read_ready {
                 WaitOutcome::Ready(readiness)
             } else {
@@ -75,10 +78,10 @@ impl EventObject {
             .checked_add(value)
             .filter(|count| *count <= MAX_EVENT_COUNT)
             .ok_or(BrokerError::WouldBlock)?;
-        Ok(ReadinessState::new(
-            self.count > 0,
-            self.count < MAX_EVENT_COUNT,
-        ))
+        Ok(ReadinessState {
+            read_ready: self.count > 0,
+            write_ready: self.count < MAX_EVENT_COUNT,
+        })
     }
 
     fn consume(&mut self, mode: EventConsumeMode) -> Result<EventConsumption> {
@@ -94,7 +97,10 @@ impl EventObject {
         self.count -= value;
         Ok(EventConsumption::new(
             value,
-            ReadinessState::new(self.count > 0, self.count < MAX_EVENT_COUNT),
+            ReadinessState {
+                read_ready: self.count > 0,
+                write_ready: self.count < MAX_EVENT_COUNT,
+            },
         ))
     }
 }
