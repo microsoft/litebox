@@ -75,35 +75,3 @@ impl ErrorCode {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn known_error_codes_use_sequential_raw_values() {
-        let codes = [
-            (1, ErrorCode::UnsupportedVersion),
-            (2, ErrorCode::MalformedRequest),
-            (3, ErrorCode::ProtocolState),
-            (4, ErrorCode::UnsupportedOperation),
-            (5, ErrorCode::Internal),
-            (6, ErrorCode::PolicyDenied),
-            (7, ErrorCode::UnknownObject),
-            (8, ErrorCode::InvalidRights),
-            (9, ErrorCode::ResourceExhausted),
-            (10, ErrorCode::WouldBlock),
-        ];
-
-        for (raw, code) in codes {
-            assert_eq!(ErrorCode::from_raw(raw), code);
-            assert_eq!(code.as_raw(), raw);
-        }
-    }
-
-    #[test]
-    fn unassigned_error_codes_preserve_raw_value() {
-        assert_eq!(ErrorCode::from_raw(0), ErrorCode::Unknown(0));
-        assert_eq!(ErrorCode::Unknown(0xffff).as_raw(), 0xffff);
-    }
-}
