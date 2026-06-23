@@ -212,6 +212,10 @@ impl HostFdState {
         if n == 0 {
             // EOF: writer closed. Wake any pollers.
             self.subject.notify(NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP);
+        } else {
+            // Consumed a unit; arm the one-shot re-notify (see read() in
+            // tcp_conn_state for the whole-unit-reader rationale).
+            self.read_drained.store(true, Ordering::Release);
         }
         Ok(buf)
     }

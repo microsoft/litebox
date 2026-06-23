@@ -249,6 +249,15 @@ impl TcpConnState {
                 self.notify_current();
                 if n == 0 {
                     self.subject.notify(NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP);
+                } else {
+                    // The reader consumed a unit of data. Arm a one-shot re-send
+                    // so the poll thread re-notifies subsequently-arriving data
+                    // even when the readable level looks unchanged — a whole-unit
+                    // reader (e.g. dropbear reading one SSH packet) never hits the
+                    // WouldBlock arm below, so without this the next packet that
+                    // lands inside a 10ms poll window is never signalled and the
+                    // subscriber blocks forever.
+                    self.read_drained.store(true, Ordering::Release);
                 }
                 Ok(buf)
             }
@@ -1022,6 +1031,56 @@ mod tests {
             after > before,
             "no re-notification after drain + new data (before={before}, after={after}): \
              the missed-wakeup recovery regressed"
+        );
+    }
+
+    /// Regression for the whole-unit-reader hang (broke the VS Code SSH
+    /// handshake): a subscriber that reads a complete unit successfully —
+    /// never hitting WouldBlock — must still be re-notified when the next unit
+    /// arrives. dropbear reads one SSH packet at a time; an earlier version of
+    /// this fix armed the re-notify only on the WouldBlock path, so the next
+    /// packet landing inside a 10ms poll window was never signalled and
+    /// `pselect6` blocked forever.
+    #[test]
+    fn poll_thread_renotifies_after_whole_unit_read_then_next_unit() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(target).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let state = TcpConnState::new(server);
+
+        let (sender, receiver) = make_notification_pair();
+        state.subscribe(1, NOTIFY_EVENT_IN, sender).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_thread = count.clone();
+        let drainer = std::thread::spawn(move || {
+            let mut receiver = receiver;
+            while receiver.recv().is_ok() {
+                count_thread.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Let the first unit settle so the read takes it whole in one Ok(n)
+        // without ever hitting WouldBlock (the dropbear single-packet pattern).
+        client.write_all(b"unit-1").unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(read_wait(&state, 6), b"unit-1");
+        std::thread::sleep(Duration::from_millis(40));
+        let before = count.load(Ordering::Relaxed);
+
+        // Next unit must produce a fresh readiness notification.
+        client.write_all(b"unit-2").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let after = count.load(Ordering::Relaxed);
+
+        drop(state);
+        let _ = drainer.join();
+
+        assert!(
+            after > before,
+            "whole-unit reader was not re-notified for the next unit (before={before}, \
+             after={after}): the SSH-handshake hang regressed"
         );
     }
 }
