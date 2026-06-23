@@ -39,12 +39,5 @@ pub struct ObjectHandle(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolVersion(pub u16);
 
-impl ProtocolVersion {
-    /// Creates a protocol version.
-    pub const fn new(version: u16) -> Self {
-        Self(version)
-    }
-}
-
 /// Current broker protocol version.
-pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1);
+pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);

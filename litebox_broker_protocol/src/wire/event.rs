@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 use crate::{
-    AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CreateEventRequest, CreateEventResponse, EventConsumeMode, EventRequest, EventResponse,
+    AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
+    CreateEventResponse, EventConsumeMode, EventConsumption, EventRequest, EventResponse,
     ReadinessState, WaitEventRequest, WaitEventResponse, WaitOutcome,
 };
 
@@ -52,15 +52,20 @@ pub(super) fn encode_event_request(encoder: &mut Encoder, request: EventRequest)
 
 pub(super) fn decode_event_request(decoder: &mut Decoder<'_>) -> Result<EventRequest, WireError> {
     let request = match decoder.u8()? {
-        EVENT_REQUEST_TAG_CREATE => EventRequest::Create(CreateEventRequest::new(decoder.u64()?)),
-        EVENT_REQUEST_TAG_WAIT => EventRequest::Wait(WaitEventRequest::new(decoder.handle()?)),
-        EVENT_REQUEST_TAG_ADD => {
-            EventRequest::Add(AddEventRequest::new(decoder.handle()?, decoder.u64()?))
-        }
-        EVENT_REQUEST_TAG_CONSUME => EventRequest::Consume(ConsumeEventRequest::new(
-            decoder.handle()?,
-            decode_consume_mode(decoder)?,
-        )),
+        EVENT_REQUEST_TAG_CREATE => EventRequest::Create(CreateEventRequest {
+            initial_count: decoder.u64()?,
+        }),
+        EVENT_REQUEST_TAG_WAIT => EventRequest::Wait(WaitEventRequest {
+            handle: decoder.handle()?,
+        }),
+        EVENT_REQUEST_TAG_ADD => EventRequest::Add(AddEventRequest {
+            handle: decoder.handle()?,
+            value: decoder.u64()?,
+        }),
+        EVENT_REQUEST_TAG_CONSUME => EventRequest::Consume(ConsumeEventRequest {
+            handle: decoder.handle()?,
+            mode: decode_consume_mode(decoder)?,
+        }),
         _ => return Err(WireError::InvalidTag),
     };
 
@@ -91,19 +96,19 @@ pub(super) fn encode_event_response(encoder: &mut Encoder, response: EventRespon
 
 pub(super) fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<EventResponse, WireError> {
     let response = match decoder.u8()? {
-        EVENT_RESPONSE_TAG_CREATED => {
-            EventResponse::Create(CreateEventResponse::new(decoder.handle()?))
-        }
-        EVENT_RESPONSE_TAG_WAITED => {
-            EventResponse::Wait(WaitEventResponse::new(decode_wait_outcome(decoder)?))
-        }
-        EVENT_RESPONSE_TAG_ADDED => {
-            EventResponse::Add(AddEventResponse::new(decode_readiness(decoder)?))
-        }
-        EVENT_RESPONSE_TAG_CONSUMED => EventResponse::Consume(ConsumeEventResponse::new(
-            decoder.u64()?,
-            decode_readiness(decoder)?,
-        )),
+        EVENT_RESPONSE_TAG_CREATED => EventResponse::Create(CreateEventResponse {
+            handle: decoder.handle()?,
+        }),
+        EVENT_RESPONSE_TAG_WAITED => EventResponse::Wait(WaitEventResponse {
+            outcome: decode_wait_outcome(decoder)?,
+        }),
+        EVENT_RESPONSE_TAG_ADDED => EventResponse::Add(AddEventResponse {
+            readiness: decode_readiness(decoder)?,
+        }),
+        EVENT_RESPONSE_TAG_CONSUMED => EventResponse::Consume(EventConsumption {
+            value: decoder.u64()?,
+            readiness: decode_readiness(decoder)?,
+        }),
         _ => return Err(WireError::InvalidTag),
     };
 

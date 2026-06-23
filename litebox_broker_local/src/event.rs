@@ -20,9 +20,9 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         &mut self,
         initial_count: u64,
     ) -> Result<ObjectHandle, T::Error> {
-        match self.request(event_request(EventRequest::Create(
-            CreateEventRequest::new(initial_count),
-        )))? {
+        match self.request(event_request(EventRequest::Create(CreateEventRequest {
+            initial_count,
+        })))? {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(response))) => {
                 Ok(response.handle)
             }
@@ -32,9 +32,9 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
 
     /// Checks whether an event wait would complete now.
     pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<WaitOutcome, T::Error> {
-        match self.request(event_request(EventRequest::Wait(WaitEventRequest::new(
+        match self.request(event_request(EventRequest::Wait(WaitEventRequest {
             handle,
-        ))))? {
+        })))? {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(response))) => {
                 Ok(response.outcome)
             }
@@ -48,9 +48,10 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         handle: ObjectHandle,
         value: u64,
     ) -> Result<ReadinessState, T::Error> {
-        match self.request(event_request(EventRequest::Add(AddEventRequest::new(
-            handle, value,
-        ))))? {
+        match self.request(event_request(EventRequest::Add(AddEventRequest {
+            handle,
+            value,
+        })))? {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(response))) => {
                 Ok(response.readiness)
             }
@@ -64,9 +65,10 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> Result<ConsumeEventResponse, T::Error> {
-        match self.request(event_request(EventRequest::Consume(
-            ConsumeEventRequest::new(handle, mode),
-        )))? {
+        match self.request(event_request(EventRequest::Consume(ConsumeEventRequest {
+            handle,
+            mode,
+        })))? {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(response))) => {
                 Ok(response)
             }

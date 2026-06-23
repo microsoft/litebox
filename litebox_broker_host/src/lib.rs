@@ -133,23 +133,23 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
         EventRequest::Create(request) => {
             handle_core_result(event::create(session, request.initial_count), |handle| {
                 BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(
-                    CreateEventResponse::new(handle),
+                    CreateEventResponse { handle },
                 )))
             })
         }
         EventRequest::Wait(request) => {
             handle_core_result(event::wait(session, request.handle), |outcome| {
                 BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
-                    WaitEventResponse::new(outcome),
+                    WaitEventResponse { outcome },
                 )))
             })
         }
         EventRequest::Add(request) => handle_core_result(
             event::add(session, request.handle, request.value),
             |readiness| {
-                BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(
-                    AddEventResponse::new(readiness),
-                )))
+                BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(AddEventResponse {
+                    readiness,
+                })))
             },
         ),
         EventRequest::Consume(request) => handle_core_result(
@@ -329,7 +329,7 @@ mod tests {
     }
 
     const fn event_create_request(initial_count: u64) -> BrokerRequest {
-        event_request(EventRequest::Create(CreateEventRequest::new(initial_count)))
+        event_request(EventRequest::Create(CreateEventRequest { initial_count }))
     }
 
     struct FakeHostControlChannel {

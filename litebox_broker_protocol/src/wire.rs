@@ -144,8 +144,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
 mod tests {
     use super::*;
     use crate::{
-        AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse, CoreRequest,
-        CoreResponse, CreateEventRequest, CreateEventResponse, EventConsumeMode, EventRequest,
+        AddEventRequest, AddEventResponse, ConsumeEventRequest, CoreRequest, CoreResponse,
+        CreateEventRequest, CreateEventResponse, EventConsumeMode, EventConsumption, EventRequest,
         EventResponse, ObjectHandle, ProtocolVersion, ReadinessState, WaitEventRequest,
         WaitEventResponse, WaitOutcome,
     };
@@ -155,20 +155,24 @@ mod tests {
         let handle = sample_handle();
         let requests = [
             BrokerRequest::Negotiate {
-                protocol_version: ProtocolVersion::new(1),
+                protocol_version: ProtocolVersion(1),
             },
-            event_request(EventRequest::Create(CreateEventRequest::new(0))),
-            event_request(EventRequest::Create(CreateEventRequest::new(7))),
-            event_request(EventRequest::Wait(WaitEventRequest::new(handle))),
-            event_request(EventRequest::Add(AddEventRequest::new(handle, 3))),
-            event_request(EventRequest::Consume(ConsumeEventRequest::new(
+            event_request(EventRequest::Create(CreateEventRequest {
+                initial_count: 0,
+            })),
+            event_request(EventRequest::Create(CreateEventRequest {
+                initial_count: 7,
+            })),
+            event_request(EventRequest::Wait(WaitEventRequest { handle })),
+            event_request(EventRequest::Add(AddEventRequest { handle, value: 3 })),
+            event_request(EventRequest::Consume(ConsumeEventRequest {
                 handle,
-                EventConsumeMode::All,
-            ))),
-            event_request(EventRequest::Consume(ConsumeEventRequest::new(
+                mode: EventConsumeMode::All,
+            })),
+            event_request(EventRequest::Consume(ConsumeEventRequest {
                 handle,
-                EventConsumeMode::One,
-            ))),
+                mode: EventConsumeMode::One,
+            })),
         ];
 
         for request in requests {
@@ -184,35 +188,37 @@ mod tests {
         let handle = sample_handle();
         let responses = [
             BrokerResponse::Negotiated {
-                broker_protocol_version: ProtocolVersion::new(1),
+                broker_protocol_version: ProtocolVersion(1),
             },
             BrokerResponse::VersionMismatch {
-                broker_protocol_version: ProtocolVersion::new(1),
+                broker_protocol_version: ProtocolVersion(1),
             },
-            event_response(EventResponse::Create(CreateEventResponse::new(handle))),
-            event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::Ready(ReadinessState {
+            event_response(EventResponse::Create(CreateEventResponse { handle })),
+            event_response(EventResponse::Wait(WaitEventResponse {
+                outcome: WaitOutcome::Ready(ReadinessState {
                     read_ready: true,
                     write_ready: false,
                 }),
-            ))),
-            event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::WouldBlock(ReadinessState {
+            })),
+            event_response(EventResponse::Wait(WaitEventResponse {
+                outcome: WaitOutcome::WouldBlock(ReadinessState {
                     read_ready: false,
                     write_ready: true,
                 }),
-            ))),
-            event_response(EventResponse::Add(AddEventResponse::new(ReadinessState {
-                read_ready: true,
-                write_ready: true,
-            }))),
-            event_response(EventResponse::Consume(ConsumeEventResponse::new(
-                3,
-                ReadinessState {
+            })),
+            event_response(EventResponse::Add(AddEventResponse {
+                readiness: ReadinessState {
+                    read_ready: true,
+                    write_ready: true,
+                },
+            })),
+            event_response(EventResponse::Consume(EventConsumption {
+                value: 3,
+                readiness: ReadinessState {
                     read_ready: false,
                     write_ready: true,
                 },
-            ))),
+            })),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
             BrokerResponse::Error(ErrorCode::WouldBlock),
             BrokerResponse::Error(ErrorCode::Internal),
@@ -229,18 +235,20 @@ mod tests {
     #[test]
     fn decode_rejects_malformed_request_frames() {
         assert_eq!(decode_request(&[0xff, 1, 2, 3]), Err(WireError::InvalidTag));
-        let mut unknown_consume_mode = encode_request(event_request(EventRequest::Consume(
-            ConsumeEventRequest::new(sample_handle(), EventConsumeMode::All),
-        )));
+        let mut unknown_consume_mode =
+            encode_request(event_request(EventRequest::Consume(ConsumeEventRequest {
+                handle: sample_handle(),
+                mode: EventConsumeMode::All,
+            })));
         *unknown_consume_mode.last_mut().unwrap() = 0xff;
         assert_eq!(
             decode_request(&unknown_consume_mode),
             Err(WireError::InvalidTag)
         );
         assert_eq!(decode_request(&[0, 1]), Err(WireError::TruncatedFrame));
-        let mut frame = encode_request(event_request(EventRequest::Create(
-            CreateEventRequest::new(0),
-        )));
+        let mut frame = encode_request(event_request(EventRequest::Create(CreateEventRequest {
+            initial_count: 0,
+        })));
         frame.push(0xff);
         assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
     }
@@ -276,12 +284,12 @@ mod tests {
     #[test]
     fn event_add_response_wire_shape_is_pinned() {
         assert_eq!(
-            encode_response(event_response(EventResponse::Add(AddEventResponse::new(
-                ReadinessState {
+            encode_response(event_response(EventResponse::Add(AddEventResponse {
+                readiness: ReadinessState {
                     read_ready: true,
                     write_ready: false,
-                }
-            )))),
+                },
+            }))),
             [1, 0, 2, 1, 0]
         );
     }

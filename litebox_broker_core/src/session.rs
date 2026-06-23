@@ -228,13 +228,13 @@ mod tests {
         );
         assert_eq!(
             event::consume(&session, handle, EventConsumeMode::One),
-            Ok(EventConsumption::new(
-                1,
-                ReadinessState {
+            Ok(EventConsumption {
+                value: 1,
+                readiness: ReadinessState {
                     read_ready: false,
                     write_ready: true,
-                }
-            ))
+                },
+            })
         );
         assert_eq!(
             event::create(&session, 0),

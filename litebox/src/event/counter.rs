@@ -61,7 +61,7 @@ where
         };
         let response = broker
             .request(CoreRequest::Event(EventRequest::Create(
-                CreateEventRequest::new(initial_count),
+                CreateEventRequest { initial_count },
             )))
             .map_err(BrokerObjectError::from)
             .and_then(event_response_from_core)
@@ -115,10 +115,10 @@ where
         &self,
         mode: EventCounterReadMode,
     ) -> Result<ConsumeEventResponse, BrokerObjectError> {
-        let response = self.request_event(EventRequest::Consume(ConsumeEventRequest::new(
-            self.handle,
+        let response = self.request_event(EventRequest::Consume(ConsumeEventRequest {
+            handle: self.handle,
             mode,
-        )))?;
+        }))?;
         let EventResponse::Consume(response) = response else {
             return Err(BrokerObjectError::UnexpectedResponse);
         };
@@ -126,8 +126,10 @@ where
     }
 
     fn add(&self, value: u64) -> Result<ReadinessState, BrokerObjectError> {
-        let response =
-            self.request_event(EventRequest::Add(AddEventRequest::new(self.handle, value)))?;
+        let response = self.request_event(EventRequest::Add(AddEventRequest {
+            handle: self.handle,
+            value,
+        }))?;
         let EventResponse::Add(response) = response else {
             return Err(BrokerObjectError::UnexpectedResponse);
         };
@@ -151,9 +153,9 @@ where
     }
 
     fn check_io_events(&self) -> Events {
-        let Ok(response) =
-            self.request_event(EventRequest::Wait(WaitEventRequest::new(self.handle)))
-        else {
+        let Ok(response) = self.request_event(EventRequest::Wait(WaitEventRequest {
+            handle: self.handle,
+        })) else {
             return Events::empty();
         };
         let EventResponse::Wait(response) = response else {

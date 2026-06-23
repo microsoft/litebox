@@ -95,12 +95,12 @@ impl EventObject {
             _ => return Err(BrokerError::UnsupportedOperation),
         };
         self.count -= value;
-        Ok(EventConsumption::new(
+        Ok(EventConsumption {
             value,
-            ReadinessState {
+            readiness: ReadinessState {
                 read_ready: self.count > 0,
                 write_ready: self.count < MAX_EVENT_COUNT,
             },
-        ))
+        })
     }
 }
