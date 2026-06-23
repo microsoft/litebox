@@ -18,7 +18,7 @@ use litebox_broker_core::{BrokerCore, BrokerError, BrokerSession, CallerCredenti
 use litebox_broker_protocol::{
     AddEventResponse, BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest,
     CoreResponse, CreateEventResponse, ErrorCode, EventRequest, EventResponse, HostControlChannel,
-    PeerCredential, ReceivedBrokerRequest, WaitEventResponse,
+    PeerCredential, WaitEventResponse,
 };
 
 mod error;
@@ -54,11 +54,11 @@ where
 {
     let mut state = ConnectionState::AwaitingNegotiation;
     loop {
-        let Some(received) = channel.recv_request().map_err(BrokerHostError::Channel)? else {
+        let Some(request) = channel.recv_request().map_err(BrokerHostError::Channel)? else {
             break;
         };
 
-        let dispatch = handle_received_request(session, &mut state, received);
+        let dispatch = handle_request(session, &mut state, request);
         channel
             .send_response(&dispatch.response)
             .map_err(BrokerHostError::Channel)?;
@@ -77,17 +77,6 @@ fn caller_credential_from_peer(
         Ok(CallerCredential::Unauthenticated)
     } else {
         Err(())
-    }
-}
-
-fn handle_received_request(
-    session: &BrokerSession,
-    state: &mut ConnectionState,
-    received: ReceivedBrokerRequest,
-) -> BrokerDispatch {
-    match received {
-        ReceivedBrokerRequest::Request(request) => handle_request(session, state, request),
-        _ => handle_unknown_request(*state),
     }
 }
 
@@ -170,17 +159,6 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
             },
         ),
         _ => BrokerResponse::Error(ErrorCode::UnsupportedOperation),
-    }
-}
-
-fn handle_unknown_request(state: ConnectionState) -> BrokerDispatch {
-    if state == ConnectionState::AwaitingNegotiation {
-        BrokerDispatch::close_after(
-            BrokerResponse::Error(ErrorCode::ProtocolState),
-            CloseReason::ProtocolViolation,
-        )
-    } else {
-        BrokerDispatch::continue_after(BrokerResponse::Error(ErrorCode::UnsupportedOperation))
     }
 }
 
@@ -286,14 +264,10 @@ mod tests {
 
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([
-            Ok(Some(ReceivedBrokerRequest::Request(
-                BrokerRequest::Negotiate {
-                    protocol_version: BROKER_PROTOCOL_VERSION,
-                },
-            ))),
-            Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
-                0,
-            )))),
+            Ok(Some(BrokerRequest::Negotiate {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            })),
+            Ok(Some(event_create_request(0))),
             Ok(None),
         ]));
 
@@ -318,14 +292,10 @@ mod tests {
 
     fn serve_connection_closes_after_protocol_violation(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([
-            Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
-                0,
-            )))),
-            Ok(Some(ReceivedBrokerRequest::Request(
-                BrokerRequest::Negotiate {
-                    protocol_version: BROKER_PROTOCOL_VERSION,
-                },
-            ))),
+            Ok(Some(event_create_request(0))),
+            Ok(Some(BrokerRequest::Negotiate {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            })),
         ]));
 
         assert_eq!(
@@ -341,9 +311,9 @@ mod tests {
 
     fn serve_connection_returns_channel_error_when_response_send_fails(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([Ok(Some(
-            ReceivedBrokerRequest::Request(BrokerRequest::Negotiate {
+            BrokerRequest::Negotiate {
                 protocol_version: BROKER_PROTOCOL_VERSION,
-            }),
+            },
         ))]));
         channel.send_error = true;
 
@@ -363,15 +333,13 @@ mod tests {
     }
 
     struct FakeHostControlChannel {
-        requests: std::vec::Vec<core::result::Result<Option<ReceivedBrokerRequest>, ()>>,
+        requests: std::vec::Vec<core::result::Result<Option<BrokerRequest>, ()>>,
         responses: std::vec::Vec<BrokerResponse>,
         send_error: bool,
     }
 
     impl FakeHostControlChannel {
-        fn new(
-            requests: std::vec::Vec<core::result::Result<Option<ReceivedBrokerRequest>, ()>>,
-        ) -> Self {
+        fn new(requests: std::vec::Vec<core::result::Result<Option<BrokerRequest>, ()>>) -> Self {
             Self {
                 requests,
                 responses: std::vec::Vec::new(),
@@ -387,9 +355,7 @@ mod tests {
             Ok(PeerCredential::Unauthenticated)
         }
 
-        fn recv_request(
-            &mut self,
-        ) -> core::result::Result<Option<ReceivedBrokerRequest>, Self::Error> {
+        fn recv_request(&mut self) -> core::result::Result<Option<BrokerRequest>, Self::Error> {
             if self.requests.is_empty() {
                 Ok(None)
             } else {

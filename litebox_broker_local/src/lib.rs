@@ -17,7 +17,6 @@ mod event;
 
 use litebox_broker_protocol::{
     BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, LocalControlChannel,
-    ReceivedBrokerResponse,
 };
 
 pub use error::{BrokerLocalError, Result};
@@ -105,15 +104,10 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         self.channel
             .send_request(&request)
             .map_err(BrokerLocalError::Channel)?;
-        match self
-            .channel
+        self.channel
             .recv_response()
             .map_err(BrokerLocalError::Channel)?
-            .ok_or(BrokerLocalError::ChannelClosed)?
-        {
-            ReceivedBrokerResponse::Response(response) => Ok(response),
-            _ => Err(BrokerLocalError::UnknownResponse),
-        }
+            .ok_or(BrokerLocalError::ChannelClosed)
     }
 }
 
@@ -247,10 +241,8 @@ mod tests {
             Ok(())
         }
 
-        fn recv_response(
-            &mut self,
-        ) -> core::result::Result<Option<ReceivedBrokerResponse>, Self::Error> {
-            Ok(self.response.take().map(ReceivedBrokerResponse::Response))
+        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
+            Ok(self.response.take())
         }
     }
 }

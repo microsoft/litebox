@@ -20,38 +20,6 @@ pub enum PeerCredential {
     Unauthenticated,
 }
 
-/// Broker authority request received from a control channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ReceivedBrokerRequest {
-    /// A request understood by the current protocol crate.
-    Request(BrokerRequest),
-    /// A request emitted by a newer peer and not understood by this process.
-    Unknown,
-}
-
-impl From<BrokerRequest> for ReceivedBrokerRequest {
-    fn from(request: BrokerRequest) -> Self {
-        Self::Request(request)
-    }
-}
-
-/// Broker authority response received from a control channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ReceivedBrokerResponse {
-    /// A response understood by the current protocol crate.
-    Response(BrokerResponse),
-    /// A response emitted by a newer broker and not understood by this process.
-    Unknown,
-}
-
-impl From<BrokerResponse> for ReceivedBrokerResponse {
-    fn from(response: BrokerResponse) -> Self {
-        Self::Response(response)
-    }
-}
-
 /// Local-side control channel for broker authority calls.
 pub trait LocalControlChannel {
     /// Channel-specific error type.
@@ -64,7 +32,7 @@ pub trait LocalControlChannel {
     ///
     /// Returns `Ok(None)` when the broker closed the channel cleanly before
     /// starting another response frame.
-    fn recv_response(&mut self) -> Result<Option<ReceivedBrokerResponse>, Self::Error>;
+    fn recv_response(&mut self) -> Result<Option<BrokerResponse>, Self::Error>;
 }
 
 /// Host-side control channel for broker authority calls.
@@ -79,7 +47,7 @@ pub trait HostControlChannel {
     ///
     /// Returns `Ok(None)` when the peer closed the channel cleanly before
     /// starting another request frame.
-    fn recv_request(&mut self) -> Result<Option<ReceivedBrokerRequest>, Self::Error>;
+    fn recv_request(&mut self) -> Result<Option<BrokerRequest>, Self::Error>;
 
     /// Sends one broker response.
     fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;

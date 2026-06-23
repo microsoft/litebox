@@ -17,7 +17,6 @@ use litebox_broker_protocol::wire::{
 };
 use litebox_broker_protocol::{
     BrokerRequest, BrokerResponse, HostControlChannel, LocalControlChannel, PeerCredential,
-    ReceivedBrokerRequest, ReceivedBrokerResponse,
 };
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
@@ -135,7 +134,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
         result
     }
 
-    fn recv_response(&mut self) -> io::Result<Option<ReceivedBrokerResponse>> {
+    fn recv_response(&mut self) -> io::Result<Option<BrokerResponse>> {
         let deadline = self.current_deadline()?;
         let result = match read_frame_with_deadline(&mut self.stream, deadline)? {
             Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
@@ -155,7 +154,7 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         Ok(PeerCredential::Unauthenticated)
     }
 
-    fn recv_request(&mut self) -> io::Result<Option<ReceivedBrokerRequest>> {
+    fn recv_request(&mut self) -> io::Result<Option<BrokerRequest>> {
         let Some(frame) = read_frame_with_deadline(&mut self.stream, self.io_deadline)? else {
             return Ok(None);
         };

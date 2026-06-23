@@ -19,9 +19,7 @@
 use alloc::vec::Vec;
 use thiserror::Error;
 
-use crate::{
-    BrokerRequest, BrokerResponse, ErrorCode, ReceivedBrokerRequest, ReceivedBrokerResponse,
-};
+use crate::{BrokerRequest, BrokerResponse, ErrorCode};
 
 use primitive::{Decoder, Encoder};
 
@@ -47,6 +45,8 @@ pub enum WireError {
     TrailingBytes,
     #[error("invalid broker wire boolean")]
     InvalidBoolean,
+    #[error("invalid broker wire tag")]
+    InvalidTag,
     #[error("broker wire offset overflow")]
     OffsetOverflow,
 }
@@ -71,21 +71,18 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
 }
 
 /// Decodes a broker request body.
-pub fn decode_request(frame: &[u8]) -> Result<ReceivedBrokerRequest, WireError> {
+pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     let request = match tag {
         REQUEST_TAG_NEGOTIATE => BrokerRequest::Negotiate {
             protocol_version: decoder.protocol_version()?,
         },
-        REQUEST_TAG_CORE => match core_message::decode_core_request(&mut decoder)? {
-            Some(request) => BrokerRequest::Core(request),
-            None => return Ok(ReceivedBrokerRequest::Unknown),
-        },
-        _ => return Ok(ReceivedBrokerRequest::Unknown),
+        REQUEST_TAG_CORE => BrokerRequest::Core(core_message::decode_core_request(&mut decoder)?),
+        _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
-    Ok(ReceivedBrokerRequest::Request(request))
+    Ok(request)
 }
 
 /// Encodes a broker response body.
@@ -120,7 +117,7 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
 }
 
 /// Decodes a broker response body.
-pub fn decode_response(frame: &[u8]) -> Result<ReceivedBrokerResponse, WireError> {
+pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     let response = match tag {
@@ -130,18 +127,17 @@ pub fn decode_response(frame: &[u8]) -> Result<ReceivedBrokerResponse, WireError
         RESPONSE_TAG_VERSION_MISMATCH => BrokerResponse::VersionMismatch {
             broker_protocol_version: decoder.protocol_version()?,
         },
-        RESPONSE_TAG_CORE => match core_message::decode_core_response(&mut decoder)? {
-            Some(response) => BrokerResponse::Core(response),
-            None => return Ok(ReceivedBrokerResponse::Unknown),
-        },
+        RESPONSE_TAG_CORE => {
+            BrokerResponse::Core(core_message::decode_core_response(&mut decoder)?)
+        }
         RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?);
             BrokerResponse::Error(error)
         }
-        _ => return Ok(ReceivedBrokerResponse::Unknown),
+        _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
-    Ok(ReceivedBrokerResponse::Response(response))
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -178,7 +174,7 @@ mod tests {
         for request in requests {
             assert_eq!(
                 decode_request(&encode_request(request.clone())).unwrap(),
-                ReceivedBrokerRequest::Request(request)
+                request
             );
         }
     }
@@ -215,24 +211,21 @@ mod tests {
         for response in responses {
             assert_eq!(
                 decode_response(&encode_response(response.clone())).unwrap(),
-                ReceivedBrokerResponse::Response(response)
+                response
             );
         }
     }
 
     #[test]
     fn decode_rejects_malformed_request_frames() {
-        assert_eq!(
-            decode_request(&[0xff, 1, 2, 3]),
-            Ok(ReceivedBrokerRequest::Unknown)
-        );
+        assert_eq!(decode_request(&[0xff, 1, 2, 3]), Err(WireError::InvalidTag));
         let mut unknown_consume_mode = encode_request(event_request(EventRequest::Consume(
             ConsumeEventRequest::new(sample_handle(), EventConsumeMode::All),
         )));
         *unknown_consume_mode.last_mut().unwrap() = 0xff;
         assert_eq!(
             decode_request(&unknown_consume_mode),
-            Ok(ReceivedBrokerRequest::Unknown)
+            Err(WireError::InvalidTag)
         );
         assert_eq!(decode_request(&[0, 1]), Err(WireError::TruncatedFrame));
         let mut frame = encode_request(event_request(EventRequest::Create(
@@ -246,17 +239,15 @@ mod tests {
     fn decode_rejects_malformed_response_frames() {
         assert_eq!(
             decode_response(&[0xff, 1, 2, 3]),
-            Ok(ReceivedBrokerResponse::Unknown)
+            Err(WireError::InvalidTag)
         );
         assert_eq!(
             decode_response(&[1, 0, 1, 0xff]),
-            Ok(ReceivedBrokerResponse::Unknown)
+            Err(WireError::InvalidTag)
         );
         assert_eq!(
             decode_response(&[2, 0xff, 0xff]),
-            Ok(ReceivedBrokerResponse::Response(BrokerResponse::Error(
-                ErrorCode::Unknown(0xffff)
-            )))
+            Ok(BrokerResponse::Error(ErrorCode::Unknown(0xffff)))
         );
 
         let mut invalid_bool = [1, 0, 2, 2, 0];

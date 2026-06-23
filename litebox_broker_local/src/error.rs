@@ -16,8 +16,6 @@ pub enum BrokerLocalError<E> {
     AlreadyNegotiated,
     #[error("broker closed the channel")]
     ChannelClosed,
-    #[error("unknown broker response")]
-    UnknownResponse,
     #[error(
         "broker accepted incompatible protocol negotiation: requested {requested:?}, broker supports {broker_protocol_version:?}"
     )]

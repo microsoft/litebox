@@ -18,10 +18,7 @@ pub mod event;
 pub mod message;
 pub mod wire;
 
-pub use channel::{
-    HostControlChannel, LocalControlChannel, PeerCredential, ReceivedBrokerRequest,
-    ReceivedBrokerResponse,
-};
+pub use channel::{HostControlChannel, LocalControlChannel, PeerCredential};
 pub use error::ErrorCode;
 pub use event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,

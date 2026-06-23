@@ -391,19 +391,17 @@ where
 
     fn recv_request(
         &mut self,
-    ) -> Result<Option<litebox_broker_protocol::ReceivedBrokerRequest>, Self::Error> {
-        let received = self.inner.recv_request()?;
+    ) -> Result<Option<litebox_broker_protocol::BrokerRequest>, Self::Error> {
+        let request = self.inner.recv_request()?;
         if matches!(
-            received,
-            Some(litebox_broker_protocol::ReceivedBrokerRequest::Request(
-                litebox_broker_protocol::BrokerRequest::Core(
-                    litebox_broker_protocol::CoreRequest::Event(_)
-                )
+            request,
+            Some(litebox_broker_protocol::BrokerRequest::Core(
+                litebox_broker_protocol::CoreRequest::Event(_)
             ))
         ) {
             self.event_request_count += 1;
         }
-        Ok(received)
+        Ok(request)
     }
 
     fn send_response(

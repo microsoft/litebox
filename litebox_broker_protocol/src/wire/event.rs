@@ -50,9 +50,7 @@ pub(super) fn encode_event_request(encoder: &mut Encoder, request: EventRequest)
     }
 }
 
-pub(super) fn decode_event_request(
-    decoder: &mut Decoder<'_>,
-) -> Result<Option<EventRequest>, WireError> {
+pub(super) fn decode_event_request(decoder: &mut Decoder<'_>) -> Result<EventRequest, WireError> {
     let request = match decoder.u8()? {
         EVENT_REQUEST_TAG_CREATE => EventRequest::Create(CreateEventRequest::new(decoder.u64()?)),
         EVENT_REQUEST_TAG_WAIT => EventRequest::Wait(WaitEventRequest::new(decoder.handle()?)),
@@ -61,15 +59,12 @@ pub(super) fn decode_event_request(
         }
         EVENT_REQUEST_TAG_CONSUME => EventRequest::Consume(ConsumeEventRequest::new(
             decoder.handle()?,
-            match decode_consume_mode(decoder)? {
-                Some(mode) => mode,
-                None => return Ok(None),
-            },
+            decode_consume_mode(decoder)?,
         )),
-        _ => return Ok(None),
+        _ => return Err(WireError::InvalidTag),
     };
 
-    Ok(Some(request))
+    Ok(request)
 }
 
 pub(super) fn encode_event_response(encoder: &mut Encoder, response: EventResponse) {
@@ -94,19 +89,14 @@ pub(super) fn encode_event_response(encoder: &mut Encoder, response: EventRespon
     }
 }
 
-pub(super) fn decode_event_response(
-    decoder: &mut Decoder<'_>,
-) -> Result<Option<EventResponse>, WireError> {
+pub(super) fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<EventResponse, WireError> {
     let response = match decoder.u8()? {
         EVENT_RESPONSE_TAG_CREATED => {
             EventResponse::Create(CreateEventResponse::new(decoder.handle()?))
         }
-        EVENT_RESPONSE_TAG_WAITED => EventResponse::Wait(WaitEventResponse::new(
-            match decode_wait_outcome(decoder)? {
-                Some(outcome) => outcome,
-                None => return Ok(None),
-            },
-        )),
+        EVENT_RESPONSE_TAG_WAITED => {
+            EventResponse::Wait(WaitEventResponse::new(decode_wait_outcome(decoder)?))
+        }
         EVENT_RESPONSE_TAG_ADDED => {
             EventResponse::Add(AddEventResponse::new(decode_readiness(decoder)?))
         }
@@ -114,10 +104,10 @@ pub(super) fn decode_event_response(
             decoder.u64()?,
             decode_readiness(decoder)?,
         )),
-        _ => return Ok(None),
+        _ => return Err(WireError::InvalidTag),
     };
 
-    Ok(Some(response))
+    Ok(response)
 }
 
 fn encode_wait_outcome(encoder: &mut Encoder, outcome: WaitOutcome) {
@@ -133,13 +123,11 @@ fn encode_wait_outcome(encoder: &mut Encoder, outcome: WaitOutcome) {
     }
 }
 
-fn decode_wait_outcome(decoder: &mut Decoder<'_>) -> Result<Option<WaitOutcome>, WireError> {
+fn decode_wait_outcome(decoder: &mut Decoder<'_>) -> Result<WaitOutcome, WireError> {
     match decoder.u8()? {
-        WAIT_OUTCOME_TAG_READY => Ok(Some(WaitOutcome::Ready(decode_readiness(decoder)?))),
-        WAIT_OUTCOME_TAG_WOULD_BLOCK => {
-            Ok(Some(WaitOutcome::WouldBlock(decode_readiness(decoder)?)))
-        }
-        _ => Ok(None),
+        WAIT_OUTCOME_TAG_READY => Ok(WaitOutcome::Ready(decode_readiness(decoder)?)),
+        WAIT_OUTCOME_TAG_WOULD_BLOCK => Ok(WaitOutcome::WouldBlock(decode_readiness(decoder)?)),
+        _ => Err(WireError::InvalidTag),
     }
 }
 
@@ -163,10 +151,10 @@ fn encode_consume_mode(encoder: &mut Encoder, mode: EventConsumeMode) {
     }
 }
 
-fn decode_consume_mode(decoder: &mut Decoder<'_>) -> Result<Option<EventConsumeMode>, WireError> {
+fn decode_consume_mode(decoder: &mut Decoder<'_>) -> Result<EventConsumeMode, WireError> {
     match decoder.u8()? {
-        EVENT_CONSUME_MODE_TAG_ALL => Ok(Some(EventConsumeMode::All)),
-        EVENT_CONSUME_MODE_TAG_ONE => Ok(Some(EventConsumeMode::One)),
-        _ => Ok(None),
+        EVENT_CONSUME_MODE_TAG_ALL => Ok(EventConsumeMode::All),
+        EVENT_CONSUME_MODE_TAG_ONE => Ok(EventConsumeMode::One),
+        _ => Err(WireError::InvalidTag),
     }
 }

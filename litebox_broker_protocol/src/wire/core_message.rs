@@ -21,18 +21,13 @@ pub(super) fn encode_core_request(encoder: &mut Encoder, request: CoreRequest) {
     }
 }
 
-pub(super) fn decode_core_request(
-    decoder: &mut Decoder<'_>,
-) -> Result<Option<CoreRequest>, WireError> {
+pub(super) fn decode_core_request(decoder: &mut Decoder<'_>) -> Result<CoreRequest, WireError> {
     let request = match decoder.u8()? {
-        CORE_REQUEST_TAG_EVENT => match event::decode_event_request(decoder)? {
-            Some(request) => CoreRequest::Event(request),
-            None => return Ok(None),
-        },
-        _ => return Ok(None),
+        CORE_REQUEST_TAG_EVENT => CoreRequest::Event(event::decode_event_request(decoder)?),
+        _ => return Err(WireError::InvalidTag),
     };
 
-    Ok(Some(request))
+    Ok(request)
 }
 
 pub(super) fn encode_core_response(encoder: &mut Encoder, response: CoreResponse) {
@@ -44,16 +39,11 @@ pub(super) fn encode_core_response(encoder: &mut Encoder, response: CoreResponse
     }
 }
 
-pub(super) fn decode_core_response(
-    decoder: &mut Decoder<'_>,
-) -> Result<Option<CoreResponse>, WireError> {
+pub(super) fn decode_core_response(decoder: &mut Decoder<'_>) -> Result<CoreResponse, WireError> {
     let response = match decoder.u8()? {
-        CORE_RESPONSE_TAG_EVENT => match event::decode_event_response(decoder)? {
-            Some(response) => CoreResponse::Event(response),
-            None => return Ok(None),
-        },
-        _ => return Ok(None),
+        CORE_RESPONSE_TAG_EVENT => CoreResponse::Event(event::decode_event_response(decoder)?),
+        _ => return Err(WireError::InvalidTag),
     };
 
-    Ok(Some(response))
+    Ok(response)
 }
