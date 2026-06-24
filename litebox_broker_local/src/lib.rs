@@ -43,8 +43,6 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
             BrokerRequest::Negotiate {
                 protocol_version: requested,
             },
-            BrokerLocalNegotiationError::Channel,
-            BrokerLocalNegotiationError::ChannelClosed,
         )? {
             BrokerResponse::Negotiated {
                 broker_protocol_version,
@@ -63,21 +61,16 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
                 requested,
                 broker_protocol_version,
             }),
-            BrokerResponse::Error(error) => Err(BrokerLocalNegotiationError::Broker(error)),
+            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error).into()),
             response @ BrokerResponse::Core(_) => {
-                Err(BrokerLocalNegotiationError::UnexpectedResponse(response))
+                Err(BrokerLocalError::UnexpectedResponse(response).into())
             }
         }
     }
 
     /// Sends one active BrokerCore request.
     pub fn request(&mut self, request: CoreRequest) -> Result<CoreResponse, T::Error> {
-        match raw_request(
-            &mut self.channel,
-            BrokerRequest::Core(request),
-            BrokerLocalError::Channel,
-            BrokerLocalError::ChannelClosed,
-        )? {
+        match raw_request(&mut self.channel, BrokerRequest::Core(request))? {
             BrokerResponse::Core(response) => Ok(response),
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => Err(BrokerLocalError::UnexpectedResponse(response)),
@@ -85,17 +78,17 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     }
 }
 
-fn raw_request<T: LocalControlChannel, E>(
+fn raw_request<T: LocalControlChannel>(
     channel: &mut T,
     request: BrokerRequest,
-    channel_error: impl Fn(T::Error) -> E,
-    channel_closed: E,
-) -> core::result::Result<BrokerResponse, E> {
-    channel.send_request(&request).map_err(&channel_error)?;
+) -> Result<BrokerResponse, T::Error> {
+    channel
+        .send_request(&request)
+        .map_err(BrokerLocalError::Channel)?;
     channel
         .recv_response()
-        .map_err(&channel_error)?
-        .ok_or(channel_closed)
+        .map_err(BrokerLocalError::Channel)?
+        .ok_or(BrokerLocalError::ChannelClosed)
 }
 
 #[cfg(test)]
