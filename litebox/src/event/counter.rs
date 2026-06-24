@@ -13,10 +13,7 @@ use thiserror::Error;
 
 use crate::{
     LiteBox,
-    broker::{
-        BrokerControl,
-        error::{BrokerObjectError, map_broker_object_result},
-    },
+    broker::{BrokerControl, error::BrokerObjectError},
     event::{
         Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
         wait::WaitContext,
@@ -84,7 +81,7 @@ where
         mode: EventCounterReadMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
         self.pollee.wait(cx, nonblock, Events::IN, || {
-            let response = map_broker_object_result(self.consume(mode))?;
+            let response = self.consume(mode)?;
             if response.readiness.write_ready {
                 self.pollee.notify_observers(Events::OUT);
             }
@@ -103,7 +100,7 @@ where
             return Err(TryOpError::Other(EventCounterError::InvalidInput));
         }
         self.pollee.wait(cx, nonblock, Events::OUT, || {
-            let readiness = map_broker_object_result(self.add(value))?;
+            let readiness = self.add(value)?;
             if value != 0 && readiness.read_ready {
                 self.pollee.notify_observers(Events::IN);
             }

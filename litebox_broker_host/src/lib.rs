@@ -36,11 +36,8 @@ where
     let peer_credential = channel
         .peer_credential()
         .map_err(BrokerHostError::Channel)?;
-    let caller_credential = caller_credential_from_peer(peer_credential)
-        .map_err(|()| BrokerHostError::AssociationSetup)?;
-    let session = core
-        .create_session(caller_credential)
-        .map_err(|_error| BrokerHostError::AssociationSetup)?;
+    let caller_credential = caller_credential_from_peer(peer_credential);
+    let session = core.create_session(caller_credential)?;
 
     serve_request_loop(channel, &session)
 }
@@ -70,13 +67,11 @@ where
     Ok(ConnectionTermination::PeerClosed)
 }
 
-fn caller_credential_from_peer(
-    peer_credential: PeerCredential,
-) -> core::result::Result<CallerCredential, ()> {
+fn caller_credential_from_peer(peer_credential: PeerCredential) -> CallerCredential {
     if peer_credential == PeerCredential::Unauthenticated {
-        Ok(CallerCredential::Unauthenticated)
+        CallerCredential::Unauthenticated
     } else {
-        Err(())
+        panic!("channel returned an unsupported broker peer credential")
     }
 }
 

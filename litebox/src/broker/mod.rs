@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_local::{BrokerLocal, BrokerLocalError};
+use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::{CoreRequest, CoreResponse, LocalControlChannel};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
@@ -46,17 +46,6 @@ where
         &self,
         request: CoreRequest,
     ) -> core::result::Result<CoreResponse, BrokerControlError> {
-        let response = self
-            .local
-            .lock()
-            .request(request)
-            .map_err(|error| match error {
-                BrokerLocalError::Channel(_) | BrokerLocalError::ChannelClosed => {
-                    BrokerControlError::Transport
-                }
-                BrokerLocalError::Broker(error) => BrokerControlError::Broker(error),
-                BrokerLocalError::UnexpectedResponse(_) => BrokerControlError::UnexpectedResponse,
-            })?;
-        Ok(response)
+        Ok(self.local.lock().request(request)?)
     }
 }

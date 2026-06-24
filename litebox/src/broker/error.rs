@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use litebox_broker_local::BrokerLocalError;
 use litebox_broker_protocol::ErrorCode;
 use thiserror::Error;
 
@@ -58,13 +59,22 @@ impl From<ErrorCode> for BrokerObjectError {
     }
 }
 
-pub(crate) fn map_broker_object_result<T>(
-    result: Result<T, BrokerObjectError>,
-) -> Result<T, TryOpError<EventCounterError>> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(BrokerObjectError::WouldBlock) => Err(TryOpError::TryAgain),
-        Err(error) => Err(TryOpError::Other(error.into())),
+impl<E> From<BrokerLocalError<E>> for BrokerControlError {
+    fn from(error: BrokerLocalError<E>) -> Self {
+        match error {
+            BrokerLocalError::Channel(_) | BrokerLocalError::ChannelClosed => Self::Transport,
+            BrokerLocalError::Broker(error) => Self::Broker(error),
+            BrokerLocalError::UnexpectedResponse(_) => Self::UnexpectedResponse,
+        }
+    }
+}
+
+impl From<BrokerObjectError> for TryOpError<EventCounterError> {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::WouldBlock => Self::TryAgain,
+            error => Self::Other(error.into()),
+        }
     }
 }
 
