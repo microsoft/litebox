@@ -5,10 +5,10 @@
 
 #[cfg(not(test))]
 use crate::mshv::{
-    HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES, HV_FLUSH_EX_VP_SET_BANKS, HV_GENERIC_SET_SPARSE_4K,
-    HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX, HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX,
-    HvInputFlushVirtualAddressListEx, HvInputFlushVirtualAddressSpaceEx,
-    hvcall::hv_do_hypercall,
+    HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES, HV_FLUSH_EX_ALL_BANKS_VALID,
+    HV_FLUSH_EX_VP_SET_QWORD_COUNT, HV_GENERIC_SET_SPARSE_4K, HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX,
+    HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX, HvInputFlushVirtualAddressListEx,
+    HvInputFlushVirtualAddressSpaceEx,
     vtl_switch::{is_only_vp_in_vtl1, vtl1_vp_mask},
 };
 use crate::{
@@ -21,27 +21,6 @@ use crate::{
     },
 };
 use litebox::utils::TruncateExt;
-
-/// Compute the valid-bank bitmask for a sparse VP set
-/// (<https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/datatypes/hv_vp_set>).
-///
-/// Returns a `u64` where bit *i* is set if `vp_set_bank_contents[i]` is
-/// non-zero, indicating that the corresponding bank carries at least one
-/// target VP. The hypervisor uses this mask to skip empty banks.
-#[cfg(not(test))]
-#[inline]
-fn vp_set_valid_bank_mask(vp_set_bank_contents: [u64; HV_FLUSH_EX_VP_SET_BANKS]) -> u64 {
-    vp_set_bank_contents
-        .iter()
-        .enumerate()
-        .fold(0u64, |mask, (bank, contents)| {
-            if *contents != 0 {
-                mask | (1u64 << bank)
-            } else {
-                mask
-            }
-        })
-}
 
 /// Hyper-V Hypercall to prevent lower VTLs (i.e., VTL0) from accessing a specified range of
 /// guest physical memory pages with a given protection flag.
@@ -103,9 +82,8 @@ pub(crate) fn hv_flush_virtual_address_space() -> Result<(), HypervCallError> {
     }
 
     let vp_mask = vtl1_vp_mask();
-    let valid_bank_mask = vp_set_valid_bank_mask(vp_mask);
     debug_assert!(
-        valid_bank_mask != 0,
+        vp_mask.iter().any(|&bank| bank != 0),
         "caller is in VTL1 but VP mask is empty"
     );
 
@@ -115,12 +93,17 @@ pub(crate) fn hv_flush_virtual_address_space() -> Result<(), HypervCallError> {
                 address_space: 0,
                 flags: HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES,
                 vp_set_format: HV_GENERIC_SET_SPARSE_4K,
-                vp_set_valid_bank_mask: valid_bank_mask,
+                vp_set_valid_bank_mask: HV_FLUSH_EX_ALL_BANKS_VALID,
                 vp_set_bank_contents: vp_mask,
             };
 
-            hv_do_hypercall(
-                u64::from(HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX),
+            // The VP set is this hypercall's variable header, so it must be
+            // issued as a rep hypercall (with zero rep elements) that declares
+            // the bank count via `varhead`.
+            hv_do_rep_hypercall(
+                HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX,
+                0,
+                HV_FLUSH_EX_VP_SET_QWORD_COUNT,
                 (&raw const *input).cast::<core::ffi::c_void>(),
                 core::ptr::null_mut(),
             )?;
@@ -159,9 +142,8 @@ pub(crate) fn hv_flush_virtual_address_list(
     }
 
     let vp_mask = vtl1_vp_mask();
-    let valid_bank_mask = vp_set_valid_bank_mask(vp_mask);
     debug_assert!(
-        valid_bank_mask != 0,
+        vp_mask.iter().any(|&bank| bank != 0),
         "caller is in VTL1 but VP mask is empty"
     );
 
@@ -170,7 +152,7 @@ pub(crate) fn hv_flush_virtual_address_list(
             input.address_space = 0;
             input.flags = HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES;
             input.vp_set_format = HV_GENERIC_SET_SPARSE_4K;
-            input.vp_set_valid_bank_mask = valid_bank_mask;
+            input.vp_set_valid_bank_mask = HV_FLUSH_EX_ALL_BANKS_VALID;
             input.vp_set_bank_contents = vp_mask;
 
             let mut remaining = page_count;
@@ -199,7 +181,7 @@ pub(crate) fn hv_flush_virtual_address_list(
                 hv_do_rep_hypercall(
                     HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX,
                     gva_count,
-                    HvInputFlushVirtualAddressListEx::VP_SET_QWORD_COUNT,
+                    HV_FLUSH_EX_VP_SET_QWORD_COUNT,
                     (&raw const *input).cast::<core::ffi::c_void>(),
                     core::ptr::null_mut(),
                 )?;
