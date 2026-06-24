@@ -1528,6 +1528,7 @@ dependencies = [
  "litebox_broker_local",
  "litebox_broker_protocol",
  "litebox_broker_transport",
+ "tempfile",
 ]
 
 [[package]]

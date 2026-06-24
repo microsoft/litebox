@@ -3,14 +3,12 @@
 
 use std::error::Error;
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
@@ -33,7 +31,9 @@ struct CliArgs {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = CliArgs::parse();
-    let socket_dir = SocketDir::new()?;
+    let socket_dir = tempfile::Builder::new()
+        .prefix("litebox-broker-userland-")
+        .tempdir()?;
     let socket_path = socket_dir.path().join("broker.sock");
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
@@ -145,43 +145,5 @@ impl Drop for RunnerChild {
                 }
             }
         }
-    }
-}
-
-struct SocketDir {
-    path: PathBuf,
-}
-
-impl SocketDir {
-    fn new() -> io::Result<Self> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos();
-        for attempt in 0..100 {
-            let path = std::env::temp_dir().join(format!(
-                "litebox-broker-userland-{}-{now}-{attempt}",
-                std::process::id()
-            ));
-            match DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "failed to create unique broker socket directory",
-        ))
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for SocketDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }

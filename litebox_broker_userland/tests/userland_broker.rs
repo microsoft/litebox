@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ReadinessState;
@@ -107,14 +107,17 @@ impl Drop for ChildGuard {
 }
 
 struct TestRunnerScript {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl TestRunnerScript {
     fn new() -> Self {
-        let dir = unique_temp_dir();
-        fs::create_dir(&dir).unwrap();
-        let path = dir.join("test-runner.sh");
+        let dir = tempfile::Builder::new()
+            .prefix("litebox-broker-userland-test-")
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("test-runner.sh");
         fs::write(
             &path,
             b"#!/bin/sh
@@ -140,19 +143,11 @@ LITEBOX_BROKER_TEST_SOCKET=\"$socket\" exec \"$LITEBOX_BROKER_TEST_EXE\" broker_
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&path, permissions).unwrap();
-        Self { path }
+        Self { _dir: dir, path }
     }
 
     fn path(&self) -> &Path {
         &self.path
-    }
-}
-
-impl Drop for TestRunnerScript {
-    fn drop(&mut self) {
-        if let Some(dir) = self.path.parent() {
-            let _ = fs::remove_dir_all(dir);
-        }
     }
 }
 
@@ -172,15 +167,4 @@ fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamLocalControlCh
             Err(error) => return Err(error),
         }
     }
-}
-
-fn unique_temp_dir() -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    env::temp_dir().join(format!(
-        "litebox-broker-userland-test-{}-{now}",
-        std::process::id()
-    ))
 }
