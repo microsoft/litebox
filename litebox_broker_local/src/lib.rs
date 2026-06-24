@@ -52,6 +52,10 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     /// Sends one broker request.
     ///
     /// Negotiation is the only request allowed before the connection is active.
+    #[expect(
+        clippy::match_wildcard_for_single_variants,
+        reason = "wildcards keep state-machine fallbacks grouped by behavior"
+    )]
     pub fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
         match self.state {
             ConnectionState::AwaitingNegotiation => match request {
@@ -85,16 +89,14 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
                             broker_protocol_version,
                         }),
                         BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-                        response @ BrokerResponse::Core(_) => {
-                            Err(BrokerLocalError::UnexpectedResponse(response))
-                        }
+                        response => Err(BrokerLocalError::UnexpectedResponse(response)),
                     }
                 }
-                BrokerRequest::Core(_) => Err(BrokerLocalError::NotNegotiated),
+                _ => Err(BrokerLocalError::NotNegotiated),
             },
             ConnectionState::Active => match request {
                 BrokerRequest::Negotiate { .. } => Err(BrokerLocalError::AlreadyNegotiated),
-                request @ BrokerRequest::Core(_) => match self.raw_request(request)? {
+                request => match self.raw_request(request)? {
                     BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
                     response => Ok(response),
                 },
