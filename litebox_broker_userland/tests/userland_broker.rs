@@ -19,7 +19,19 @@ fn separate_process_broker_spawns_runner_and_serves_until_stopped() {
     let runner = TestRunnerScript::new();
     let mut broker = ChildGuard::new(spawn_broker(&runner));
 
-    wait_for_runner_status(&runner.status_path, &mut broker);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if runner.status_path.exists() {
+            let status = fs::read_to_string(&runner.status_path).unwrap();
+            assert_eq!(status.trim(), "0");
+            return;
+        }
+        if let Some(status) = broker.try_wait().unwrap() {
+            panic!("broker exited before runner completed: {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for test runner to complete");
 }
 
 #[test]
@@ -152,22 +164,6 @@ echo \"$?\" > \"$LITEBOX_BROKER_TEST_STATUS\"
             status_path,
         }
     }
-}
-
-fn wait_for_runner_status(status_path: &Path, broker: &mut ChildGuard) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if status_path.exists() {
-            let status = fs::read_to_string(status_path).unwrap();
-            assert_eq!(status.trim(), "0");
-            return;
-        }
-        if let Some(status) = broker.try_wait().unwrap() {
-            panic!("broker exited before runner completed: {status}");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for test runner to complete");
 }
 
 fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamLocalControlChannel> {
