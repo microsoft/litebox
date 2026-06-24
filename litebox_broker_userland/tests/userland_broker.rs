@@ -15,11 +15,11 @@ use litebox_broker_protocol::ReadinessState;
 use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 #[test]
-fn separate_process_broker_spawns_runner_and_serves_event_object_requests() {
+fn separate_process_broker_spawns_runner_and_serves_until_stopped() {
     let runner = TestRunnerScript::new();
-    let mut child = ChildGuard::new(spawn_broker(runner.path()));
+    let mut broker = ChildGuard::new(spawn_broker(&runner));
 
-    assert!(child.wait().unwrap().success());
+    wait_for_runner_status(&runner.status_path, &mut broker);
 }
 
 #[test]
@@ -60,12 +60,13 @@ fn broker_test_runner_child() {
     drop(local);
 }
 
-fn spawn_broker(runner: &Path) -> Child {
+fn spawn_broker(runner: &TestRunnerScript) -> Child {
     Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
         .arg("--runner")
-        .arg(runner)
+        .arg(&runner.path)
         .arg("broker-test-runner-child")
         .env("LITEBOX_BROKER_TEST_EXE", env::current_exe().unwrap())
+        .env("LITEBOX_BROKER_TEST_STATUS", &runner.status_path)
         .spawn()
         .unwrap()
 }
@@ -79,12 +80,11 @@ impl ChildGuard {
         Self { child: Some(child) }
     }
 
-    fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child.as_mut().expect("child process missing").wait();
-        if status.is_ok() {
-            self.child = None;
-        }
-        status
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .expect("child process missing")
+            .try_wait()
     }
 }
 
@@ -109,6 +109,7 @@ impl Drop for ChildGuard {
 struct TestRunnerScript {
     _dir: tempfile::TempDir,
     path: PathBuf,
+    status_path: PathBuf,
 }
 
 impl TestRunnerScript {
@@ -118,6 +119,7 @@ impl TestRunnerScript {
             .tempdir()
             .unwrap();
         let path = dir.path().join("test-runner.sh");
+        let status_path = dir.path().join("test-runner.status");
         fs::write(
             &path,
             b"#!/bin/sh
@@ -136,19 +138,36 @@ while [ \"$#\" -gt 0 ]; do
             ;;
     esac
 done
-LITEBOX_BROKER_TEST_SOCKET=\"$socket\" exec \"$LITEBOX_BROKER_TEST_EXE\" broker_test_runner_child --exact --nocapture
+LITEBOX_BROKER_TEST_SOCKET=\"$socket\" \"$LITEBOX_BROKER_TEST_EXE\" broker_test_runner_child --exact --nocapture
+echo \"$?\" > \"$LITEBOX_BROKER_TEST_STATUS\"
 ",
         )
         .unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&path, permissions).unwrap();
-        Self { _dir: dir, path }
+        Self {
+            _dir: dir,
+            path,
+            status_path,
+        }
     }
+}
 
-    fn path(&self) -> &Path {
-        &self.path
+fn wait_for_runner_status(status_path: &Path, broker: &mut ChildGuard) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if status_path.exists() {
+            let status = fs::read_to_string(status_path).unwrap();
+            assert_eq!(status.trim(), "0");
+            return;
+        }
+        if let Some(status) = broker.try_wait().unwrap() {
+            panic!("broker exited before runner completed: {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
     }
+    panic!("timed out waiting for test runner to complete");
 }
 
 fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamLocalControlChannel> {

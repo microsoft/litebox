@@ -6,17 +6,12 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Child, Command};
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
 use litebox_broker_host::serve_connection;
 use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
-
-const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Parser, Debug)]
 struct CliArgs {
@@ -35,27 +30,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         .tempdir()?;
     let socket_path = socket_dir.path().join("broker.sock");
     let listener = UnixListener::bind(&socket_path)?;
-    listener.set_nonblocking(true)?;
+    let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
+        PrincipalRights::all(),
+    ))?;
 
-    let mut runner = RunnerChild::new(spawn_runner(
+    let _runner = RunnerChild::new(spawn_runner(
         &args.runner,
         &socket_path,
         &args.runner_arguments,
     )?);
-    let (stream, _) = accept_runner_connection(&listener, runner.child_mut())?;
-    let runner_status = {
+
+    loop {
+        let (stream, _) = listener.accept()?;
         let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
-        channel.set_io_deadline(Some(Instant::now() + SESSION_TIMEOUT))?;
-        let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
-            PrincipalRights::all(),
-        ))?;
         serve_connection(&broker, &mut channel)?;
-        runner.wait()?
-    };
-    if !runner_status.success() {
-        return Err(io::Error::other(format!("local runner exited with {runner_status}")).into());
     }
-    Ok(())
 }
 
 fn spawn_runner(
@@ -71,40 +60,6 @@ fn spawn_runner(
         .spawn()
 }
 
-fn accept_runner_connection(
-    listener: &UnixListener,
-    runner: &mut Child,
-) -> io::Result<(
-    std::os::unix::net::UnixStream,
-    std::os::unix::net::SocketAddr,
-)> {
-    let deadline = Instant::now() + SESSION_TIMEOUT;
-    loop {
-        match listener.accept() {
-            Ok(accepted) => return Ok(accepted),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if let Some(status) = runner.try_wait()? {
-                    return Err(runner_exited_before_connecting(status));
-                }
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "timed out waiting for local runner broker connection",
-                    ));
-                }
-                thread::sleep(ACCEPT_RETRY_DELAY);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn runner_exited_before_connecting(status: ExitStatus) -> io::Error {
-    io::Error::other(format!(
-        "local runner exited before connecting to broker: {status}"
-    ))
-}
-
 struct RunnerChild {
     child: Option<Child>,
 }
@@ -112,18 +67,6 @@ struct RunnerChild {
 impl RunnerChild {
     const fn new(child: Child) -> Self {
         Self { child: Some(child) }
-    }
-
-    fn child_mut(&mut self) -> &mut Child {
-        self.child.as_mut().expect("local runner process missing")
-    }
-
-    fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child_mut().wait();
-        if status.is_ok() {
-            self.child = None;
-        }
-        status
     }
 }
 
