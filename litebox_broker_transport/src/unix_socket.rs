@@ -82,13 +82,6 @@ impl UnixStreamLocalControlChannel {
         self.active_request_deadline = Some(deadline);
         Ok(Some(deadline))
     }
-
-    fn clear_active_request_deadline(&mut self) -> IoResult<()> {
-        if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
-            self.set_stream_io_timeout(self.io_timeout)?;
-        }
-        Ok(())
-    }
 }
 
 /// Host-side Unix-domain-socket control channel for the hosted userland POC.
@@ -139,7 +132,9 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
             Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
             None => Ok(None),
         };
-        self.clear_active_request_deadline()?;
+        if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
+            self.set_stream_io_timeout(self.io_timeout)?;
+        }
         result
     }
 }
