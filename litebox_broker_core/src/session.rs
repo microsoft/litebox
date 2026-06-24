@@ -179,7 +179,6 @@ impl Drop for BrokerSession {
 mod tests {
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, PrincipalRights,
-        event,
     };
     use litebox_broker_protocol::{
         EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState,
@@ -198,12 +197,12 @@ mod tests {
         let other = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let handle = event::create(&session, 0).unwrap();
+        let handle = crate::event::create(&session, 0).unwrap();
         let unknown_handle = ObjectHandle(handle.0 + 1);
 
         assert_ne!(unknown_handle, handle);
         assert_eq!(
-            event::wait(&session, unknown_handle),
+            crate::event::wait(&session, unknown_handle),
             Err(BrokerError::UnknownObject)
         );
 
@@ -213,21 +212,21 @@ mod tests {
         );
 
         assert_eq!(
-            event::wait(&session, handle),
+            crate::event::wait(&session, handle),
             Ok(ReadinessState {
                 read_ready: false,
                 write_ready: true,
             })
         );
         assert_eq!(
-            event::add(&session, handle, 1),
+            crate::event::add(&session, handle, 1),
             Ok(ReadinessState {
                 read_ready: true,
                 write_ready: true,
             })
         );
         assert_eq!(
-            event::consume(&session, handle, EventConsumeMode::One),
+            crate::event::consume(&session, handle, EventConsumeMode::One),
             Ok(EventConsumption {
                 value: 1,
                 readiness: ReadinessState {
@@ -237,7 +236,7 @@ mod tests {
             })
         );
         assert_eq!(
-            event::create(&session, 0),
+            crate::event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
         );
 
@@ -254,7 +253,7 @@ mod tests {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let _handle = event::create(&session, 0).unwrap();
+        let _handle = crate::event::create(&session, 0).unwrap();
         {
             let references = broker.references.read();
             assert_eq!(references.len(), 1);
@@ -275,7 +274,7 @@ mod tests {
             *next_reference_handle = u64::MAX;
         }
         assert_eq!(
-            event::create(&session, 0),
+            crate::event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
         );
         let references = broker.references.read();

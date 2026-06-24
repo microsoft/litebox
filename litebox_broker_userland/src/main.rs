@@ -6,7 +6,6 @@ use std::ffi::OsString;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
-use std::thread;
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
@@ -41,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .arg(&socket_path)
         .args(&args.runner_arguments);
     let mut runner = runner_command.spawn()?;
-    let _runner_waiter = thread::spawn(move || {
+    let _runner_waiter = std::thread::spawn(move || {
         if let Err(error) = runner.wait() {
             eprintln!("failed to wait for local runner: {error}");
         }

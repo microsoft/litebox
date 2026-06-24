@@ -3,7 +3,6 @@
 
 use std::{
     path::Path,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -61,6 +60,6 @@ fn connect_with_retry(socket_path: &Path, setup_deadline: Instant) -> Result<Loc
             }
         }
         let remaining = setup_deadline.saturating_duration_since(Instant::now());
-        thread::sleep(RETRY_DELAY.min(remaining));
+        std::thread::sleep(RETRY_DELAY.min(remaining));
     }
 }

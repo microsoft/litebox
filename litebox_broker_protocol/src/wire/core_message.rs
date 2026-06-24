@@ -4,7 +4,6 @@
 use crate::{CoreRequest, CoreResponse};
 
 use super::WireError;
-use super::event;
 use super::primitive::{Decoder, Encoder};
 
 // Core tags select object-family codecs. Add new object families here, then
@@ -16,14 +15,14 @@ pub(super) fn encode_core_request(encoder: &mut Encoder, request: CoreRequest) {
     match request {
         CoreRequest::Event(request) => {
             encoder.u8(CORE_REQUEST_TAG_EVENT);
-            event::encode_event_request(encoder, request);
+            super::event::encode_event_request(encoder, request);
         }
     }
 }
 
 pub(super) fn decode_core_request(decoder: &mut Decoder<'_>) -> Result<CoreRequest, WireError> {
     let request = match decoder.u8()? {
-        CORE_REQUEST_TAG_EVENT => CoreRequest::Event(event::decode_event_request(decoder)?),
+        CORE_REQUEST_TAG_EVENT => CoreRequest::Event(super::event::decode_event_request(decoder)?),
         _ => return Err(WireError::InvalidTag),
     };
 
@@ -34,14 +33,16 @@ pub(super) fn encode_core_response(encoder: &mut Encoder, response: CoreResponse
     match response {
         CoreResponse::Event(response) => {
             encoder.u8(CORE_RESPONSE_TAG_EVENT);
-            event::encode_event_response(encoder, response);
+            super::event::encode_event_response(encoder, response);
         }
     }
 }
 
 pub(super) fn decode_core_response(decoder: &mut Decoder<'_>) -> Result<CoreResponse, WireError> {
     let response = match decoder.u8()? {
-        CORE_RESPONSE_TAG_EVENT => CoreResponse::Event(event::decode_event_response(decoder)?),
+        CORE_RESPONSE_TAG_EVENT => {
+            CoreResponse::Event(super::event::decode_event_response(decoder)?)
+        }
         _ => return Err(WireError::InvalidTag),
     };
 

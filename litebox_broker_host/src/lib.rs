@@ -12,9 +12,9 @@
 #[cfg(test)]
 extern crate std;
 
-use core::fmt;
+use core::fmt::{Display, Formatter, Result as FmtResult};
 
-use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential, event};
+use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::{
     AddEventResponse, BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest,
     CoreResponse, CreateEventResponse, ErrorCode, EventRequest, EventResponse, HostControlChannel,
@@ -119,20 +119,24 @@ fn handle_active_request(session: &BrokerSession, request: BrokerRequest) -> Bro
 
 fn handle_event_request(session: &BrokerSession, request: EventRequest) -> BrokerResponse {
     match request {
-        EventRequest::Create(request) => match event::create(session, request.initial_count) {
-            Ok(handle) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(
-                CreateEventResponse { handle },
-            ))),
-            Err(error) => BrokerResponse::Error(error.into()),
-        },
-        EventRequest::Wait(request) => match event::wait(session, request.handle) {
-            Ok(readiness) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
-                WaitEventResponse { readiness },
-            ))),
-            Err(error) => BrokerResponse::Error(error.into()),
-        },
+        EventRequest::Create(request) => {
+            match litebox_broker_core::event::create(session, request.initial_count) {
+                Ok(handle) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(
+                    CreateEventResponse { handle },
+                ))),
+                Err(error) => BrokerResponse::Error(error.into()),
+            }
+        }
+        EventRequest::Wait(request) => {
+            match litebox_broker_core::event::wait(session, request.handle) {
+                Ok(readiness) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
+                    WaitEventResponse { readiness },
+                ))),
+                Err(error) => BrokerResponse::Error(error.into()),
+            }
+        }
         EventRequest::Add(request) => {
-            match event::add(session, request.handle, request.value) {
+            match litebox_broker_core::event::add(session, request.handle, request.value) {
                 Ok(readiness) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(
                     AddEventResponse { readiness },
                 ))),
@@ -140,7 +144,7 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
             }
         }
         EventRequest::Consume(request) => {
-            match event::consume(session, request.handle, request.mode) {
+            match litebox_broker_core::event::consume(session, request.handle, request.mode) {
                 Ok(consumption) => {
                     BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(consumption)))
                 }
@@ -176,8 +180,8 @@ pub enum CloseReason {
     ProtocolViolation,
 }
 
-impl fmt::Display for CloseReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for CloseReason {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::ProtocolViolation => f.write_str("protocol violation"),
         }
