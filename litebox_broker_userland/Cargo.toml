@@ -14,6 +14,11 @@ tempfile = { version = "3", default-features = false }
 name = "litebox-broker-userland"
 path = "src/main.rs"
 
+[[test]]
+name = "userland_broker"
+path = "tests/userland_broker.rs"
+harness = false
+
 [dev-dependencies]
 libc = { version = "0.2.169", default-features = false }
 litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
