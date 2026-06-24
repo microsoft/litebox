@@ -1,13 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{Error, ErrorKind, Result};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
@@ -17,7 +15,7 @@ use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 
 fn main() {
-    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     if args
         .first()
         .is_some_and(|arg| arg == OsStr::new("--unstable"))
@@ -39,7 +37,7 @@ fn run_parent_test() {
     let mut broker = ChildGuard {
         child: Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
             .arg("--runner")
-            .arg(env::current_exe().unwrap())
+            .arg(std::env::current_exe().unwrap())
             .arg(RUNNER_ARGUMENT)
             .spawn()
             .unwrap(),
@@ -51,7 +49,7 @@ fn run_parent_test() {
             assert_eq!(status.signal(), Some(libc::SIGTERM));
             return;
         }
-        thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for broker to stop");
 }
@@ -112,7 +110,7 @@ fn run_fake_runner(args: &[OsString]) {
         kill_result,
         0,
         "failed to stop broker: {}",
-        io::Error::last_os_error()
+        Error::last_os_error()
     );
 }
 
@@ -129,18 +127,18 @@ impl Drop for ChildGuard {
     }
 }
 
-fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamLocalControlChannel> {
+fn connect_with_retry(socket_path: &Path) -> Result<UnixStreamLocalControlChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match UnixStreamLocalControlChannel::connect(socket_path) {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
-                if error.kind() != io::ErrorKind::NotFound
-                    && error.kind() != io::ErrorKind::ConnectionRefused
+                if error.kind() != ErrorKind::NotFound
+                    && error.kind() != ErrorKind::ConnectionRefused
                 {
                     return Err(error);
                 }
-                thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(10));
             }
             Err(error) => return Err(error),
         }
