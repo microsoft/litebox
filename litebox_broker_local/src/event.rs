@@ -11,11 +11,6 @@ use crate::{BrokerLocal, Result};
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned event object.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a protocol response that does not match the
-    /// issued event request.
     pub fn create_event(&mut self) -> Result<ObjectHandle, Channel::Error> {
         self.create_event_with_count(0)
     }
