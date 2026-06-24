@@ -4,6 +4,7 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
@@ -14,10 +15,19 @@ use litebox_broker_protocol::ReadinessState;
 use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 #[test]
-fn separate_process_broker_serves_event_object_requests() {
-    let socket_path = SocketPathGuard::new(unique_socket_path());
-    let mut child = ChildGuard::new(spawn_broker(socket_path.path()));
-    let mut channel = connect_with_retry(socket_path.path()).unwrap();
+fn separate_process_broker_spawns_runner_and_serves_event_object_requests() {
+    let runner = TestRunnerScript::new();
+    let mut child = ChildGuard::new(spawn_broker(runner.path()));
+
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn broker_test_runner_child() {
+    let Ok(socket_path) = env::var("LITEBOX_BROKER_TEST_SOCKET") else {
+        return;
+    };
+    let mut channel = connect_with_retry(Path::new(&socket_path)).unwrap();
     channel
         .set_io_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -48,13 +58,14 @@ fn separate_process_broker_serves_event_object_requests() {
         }
     );
     drop(local);
-    assert!(child.wait().unwrap().success());
 }
 
-fn spawn_broker(socket_path: &Path) -> Child {
+fn spawn_broker(runner: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
-        .arg("--socket")
-        .arg(socket_path)
+        .arg("--runner")
+        .arg(runner)
+        .arg("broker-test-runner-child")
+        .env("LITEBOX_BROKER_TEST_EXE", env::current_exe().unwrap())
         .spawn()
         .unwrap()
 }
@@ -95,12 +106,40 @@ impl Drop for ChildGuard {
     }
 }
 
-struct SocketPathGuard {
+struct TestRunnerScript {
     path: PathBuf,
 }
 
-impl SocketPathGuard {
-    fn new(path: PathBuf) -> Self {
+impl TestRunnerScript {
+    fn new() -> Self {
+        let dir = unique_temp_dir();
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("test-runner.sh");
+        fs::write(
+            &path,
+            b"#!/bin/sh
+socket=
+while [ \"$#\" -gt 0 ]; do
+    case \"$1\" in
+        --broker-socket)
+            socket=$2
+            shift 2
+            ;;
+        --unstable)
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+LITEBOX_BROKER_TEST_SOCKET=\"$socket\" exec \"$LITEBOX_BROKER_TEST_EXE\" broker_test_runner_child --exact --nocapture
+",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
         Self { path }
     }
 
@@ -109,9 +148,11 @@ impl SocketPathGuard {
     }
 }
 
-impl Drop for SocketPathGuard {
+impl Drop for TestRunnerScript {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if let Some(dir) = self.path.parent() {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -133,13 +174,13 @@ fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamLocalControlCh
     }
 }
 
-fn unique_socket_path() -> PathBuf {
+fn unique_temp_dir() -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     env::temp_dir().join(format!(
-        "litebox-broker-userland-{}-{now}.sock",
+        "litebox-broker-userland-test-{}-{now}",
         std::process::id()
     ))
 }

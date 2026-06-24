@@ -79,11 +79,12 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
-    /// Connect to an already-running broker Unix socket and verify the control path.
+    /// Broker-supplied Unix socket path for the local control channel.
     #[arg(
         long = "broker-socket",
         value_name = "PATH",
         value_hint = clap::ValueHint::FilePath,
+        hide = true,
         requires = "unstable",
         help_heading = "Unstable Options"
     )]
