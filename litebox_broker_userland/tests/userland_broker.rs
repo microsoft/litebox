@@ -15,6 +15,13 @@ use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 #[test]
 fn separate_process_broker_spawns_runner_and_serves_until_stopped() {
+    // This test uses the current test binary as the broker's runner. The parent test
+    // starts the broker with `broker_test_runner_child` as the runner command; the
+    // broker creates the socket, passes it through `LITEBOX_BROKER_SOCKET`, and
+    // launches that child test. Once the child test has connected and completed its
+    // broker requests, it terminates the broker parent process. The parent test only
+    // waits for that broker exit so the long-running broker does not need a
+    // test-only shutdown path.
     let mut broker = ChildGuard::new(
         Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
             .arg("--runner")
