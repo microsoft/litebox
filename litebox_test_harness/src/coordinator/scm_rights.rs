@@ -883,6 +883,7 @@ fn receive_tcp(stream: UnixStream) -> Result<ScmOut, String> {
     let (fd, payload) = stream.recv_fd(64)?;
     expect_payload(&payload, "tcp")?;
     let raw = fd.as_raw_fd();
+    assert_so_type(raw, libc::SOCK_STREAM, "received tcp")?;
     let payload = b"SCM_TCP_PAYLOAD";
     write_all(raw, payload)?;
     let echoed = read_exact(raw, payload.len())?;
@@ -893,7 +894,7 @@ fn receive_tcp(stream: UnixStream) -> Result<ScmOut, String> {
         ));
     }
     Ok(ScmOut {
-        detail: format!("received_tcp_fd={raw} echo=ok"),
+        detail: format!("received_tcp_fd={raw} so_type=stream echo=ok"),
     })
 }
 
@@ -927,6 +928,7 @@ fn receive_tcp_accepted(stream: UnixStream) -> Result<ScmOut, String> {
     let (fd, payload) = stream.recv_fd(64)?;
     expect_payload(&payload, "tcp_accepted")?;
     let raw = fd.as_raw_fd();
+    assert_so_type(raw, libc::SOCK_STREAM, "received accepted tcp")?;
     write_all(raw, b"SCM_ACC_S2C")?;
     let c2s = read_exact(raw, b"SCM_ACC_C2S".len())?;
     if c2s != b"SCM_ACC_C2S" {
@@ -936,8 +938,41 @@ fn receive_tcp_accepted(stream: UnixStream) -> Result<ScmOut, String> {
         ));
     }
     Ok(ScmOut {
-        detail: format!("received_accepted_fd={raw} bidi=ok"),
+        detail: format!("received_accepted_fd={raw} so_type=stream bidi=ok"),
     })
+}
+
+/// Mirror libuv's `uv_guess_handle`: a passed socket is only usable by
+/// node/libuv if `getsockopt(SOL_SOCKET, SO_TYPE)` succeeds and reports the
+/// expected type. On failure libuv returns `UV_UNKNOWN_HANDLE` and node
+/// refuses to adopt the fd — the exact failure that stalled the VS Code
+/// exthost when a BrokerTcpConn was SCM-passed (the broker rejected SO_TYPE
+/// with EOPNOTSUPP).
+fn assert_so_type(raw: i32, expected: libc::c_int, label: &str) -> Result<(), String> {
+    let mut sotype: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes up to `len` bytes into `sotype`; `len` is set
+    // to its size and updated in place by the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            raw,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(sotype).cast(),
+            std::ptr::addr_of_mut!(len),
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "{label}: getsockopt(SO_TYPE) failed (libuv uv_guess_handle would \
+             return UV_UNKNOWN_HANDLE): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if sotype != expected {
+        return Err(format!("{label}: SO_TYPE={sotype}, expected {expected}"));
+    }
+    Ok(())
 }
 
 fn tcp_accept(listener: i32) -> Result<OwnedFd, String> {
