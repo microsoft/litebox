@@ -4,7 +4,6 @@
 use std::env;
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
@@ -20,30 +19,15 @@ fn separate_process_broker_spawns_runner_and_serves_until_stopped() {
         .prefix("litebox-broker-userland-test-")
         .tempdir()
         .unwrap();
-    let runner_path = dir.path().join("test-runner.sh");
     let status_path = dir.path().join("test-runner.status");
-    fs::write(
-        &runner_path,
-        b"#!/bin/sh
-[ \"$1\" = \"--unstable\" ] || exit 1
-[ \"$2\" = \"--broker-socket\" ] || exit 1
-socket=$3
-shift 3
-LITEBOX_BROKER_TEST_SOCKET=\"$socket\" \"$LITEBOX_BROKER_TEST_EXE\" \"$@\" --exact --nocapture
-echo \"$?\" > \"$LITEBOX_BROKER_TEST_STATUS\"
-",
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&runner_path).unwrap().permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&runner_path, permissions).unwrap();
 
     let mut broker = ChildGuard::new(
         Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
             .arg("--runner")
-            .arg(&runner_path)
+            .arg(env::current_exe().unwrap())
             .arg("broker_test_runner_child")
-            .env("LITEBOX_BROKER_TEST_EXE", env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("--nocapture")
             .env("LITEBOX_BROKER_TEST_STATUS", &status_path)
             .spawn()
             .unwrap(),
@@ -66,40 +50,46 @@ echo \"$?\" > \"$LITEBOX_BROKER_TEST_STATUS\"
 
 #[test]
 fn broker_test_runner_child() {
-    let Ok(socket_path) = env::var("LITEBOX_BROKER_TEST_SOCKET") else {
+    let Some(status_path) = env::var_os("LITEBOX_BROKER_TEST_STATUS") else {
         return;
     };
-    let mut channel = connect_with_retry(Path::new(&socket_path)).unwrap();
-    channel
-        .set_io_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut local = BrokerLocal::negotiate(channel).unwrap();
+    let result = std::panic::catch_unwind(|| {
+        let socket_path = env::var("LITEBOX_BROKER_SOCKET").unwrap();
+        let mut channel = connect_with_retry(Path::new(&socket_path)).unwrap();
+        channel
+            .set_io_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut local = BrokerLocal::negotiate(channel).unwrap();
 
-    let handle = local.create_event().unwrap();
-    assert_eq!(
-        local.wait_event(handle).unwrap(),
-        ReadinessState {
-            read_ready: false,
-            write_ready: true,
-        }
-    );
+        let handle = local.create_event().unwrap();
+        assert_eq!(
+            local.wait_event(handle).unwrap(),
+            ReadinessState {
+                read_ready: false,
+                write_ready: true,
+            }
+        );
 
-    assert_eq!(
-        local.add_event(handle, 1).unwrap(),
-        ReadinessState {
-            read_ready: true,
-            write_ready: true,
-        }
-    );
+        assert_eq!(
+            local.add_event(handle, 1).unwrap(),
+            ReadinessState {
+                read_ready: true,
+                write_ready: true,
+            }
+        );
 
-    assert_eq!(
-        local.wait_event(handle).unwrap(),
-        ReadinessState {
-            read_ready: true,
-            write_ready: true,
-        }
-    );
-    drop(local);
+        assert_eq!(
+            local.wait_event(handle).unwrap(),
+            ReadinessState {
+                read_ready: true,
+                write_ready: true,
+            }
+        );
+    });
+    fs::write(&status_path, if result.is_ok() { "0" } else { "101" }).unwrap();
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 struct ChildGuard {
