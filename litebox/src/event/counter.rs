@@ -32,6 +32,8 @@ pub enum EventCounterError {
     WouldBlock,
     #[error("event counter resource exhausted")]
     ResourceExhausted,
+    #[error("event counter permission denied")]
+    PermissionDenied,
     #[error("event counter I/O failed")]
     Io,
     #[error("event counter backing authority unavailable")]

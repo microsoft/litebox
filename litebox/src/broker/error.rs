@@ -30,8 +30,8 @@ pub(crate) enum BrokerObjectError {
     WouldBlock,
     #[error("broker object resource exhausted")]
     ResourceExhausted,
-    #[error("internal broker object error")]
-    Internal,
+    #[error("broker object permission denied")]
+    PermissionDenied,
 }
 
 impl From<BrokerControlError> for BrokerObjectError {
@@ -49,7 +49,13 @@ impl From<ErrorCode> for BrokerObjectError {
             ErrorCode::InvalidRights | ErrorCode::UnknownObject => Self::InvalidObject,
             ErrorCode::WouldBlock => Self::WouldBlock,
             ErrorCode::ResourceExhausted => Self::ResourceExhausted,
-            _ => Self::Internal,
+            ErrorCode::PolicyDenied => Self::PermissionDenied,
+            ErrorCode::UnsupportedVersion
+            | ErrorCode::MalformedRequest
+            | ErrorCode::ProtocolState
+            | ErrorCode::UnsupportedOperation
+            | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
+            _ => panic!("broker returned unsupported error: {error}"),
         }
     }
 }
@@ -77,9 +83,8 @@ impl From<BrokerObjectError> for EventCounterError {
         match error {
             BrokerObjectError::WouldBlock => Self::WouldBlock,
             BrokerObjectError::ResourceExhausted => Self::ResourceExhausted,
-            BrokerObjectError::Control
-            | BrokerObjectError::InvalidObject
-            | BrokerObjectError::Internal => Self::Io,
+            BrokerObjectError::PermissionDenied => Self::PermissionDenied,
+            BrokerObjectError::Control | BrokerObjectError::InvalidObject => Self::Io,
         }
     }
 }
