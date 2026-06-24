@@ -76,7 +76,7 @@ fn spawn_broker(runner: &TestRunnerScript) -> Child {
     Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
         .arg("--runner")
         .arg(&runner.path)
-        .arg("broker-test-runner-child")
+        .arg("broker_test_runner_child")
         .env("LITEBOX_BROKER_TEST_EXE", env::current_exe().unwrap())
         .env("LITEBOX_BROKER_TEST_STATUS", &runner.status_path)
         .spawn()
@@ -84,36 +84,24 @@ fn spawn_broker(runner: &TestRunnerScript) -> Child {
 }
 
 struct ChildGuard {
-    child: Option<Child>,
+    child: Child,
 }
 
 impl ChildGuard {
     fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+        Self { child }
     }
 
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child
-            .as_mut()
-            .expect("child process missing")
-            .try_wait()
+        self.child.try_wait()
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            match child.try_wait() {
-                Ok(Some(_status)) => {}
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(_error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
+        if !matches!(self.child.try_wait(), Ok(Some(_status))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 }
@@ -135,22 +123,11 @@ impl TestRunnerScript {
         fs::write(
             &path,
             b"#!/bin/sh
-socket=
-while [ \"$#\" -gt 0 ]; do
-    case \"$1\" in
-        --broker-socket)
-            socket=$2
-            shift 2
-            ;;
-        --unstable)
-            shift
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
-LITEBOX_BROKER_TEST_SOCKET=\"$socket\" \"$LITEBOX_BROKER_TEST_EXE\" broker_test_runner_child --exact --nocapture
+[ \"$1\" = \"--unstable\" ] || exit 1
+[ \"$2\" = \"--broker-socket\" ] || exit 1
+socket=$3
+shift 3
+LITEBOX_BROKER_TEST_SOCKET=\"$socket\" \"$LITEBOX_BROKER_TEST_EXE\" \"$@\" --exact --nocapture
 echo \"$?\" > \"$LITEBOX_BROKER_TEST_STATUS\"
 ",
         )
