@@ -34,7 +34,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     ))?;
 
     Command::new(&args.runner)
-        .env("LITEBOX_BROKER_SOCKET", &socket_path)
+        .arg("--unstable")
+        .arg("--broker-socket")
+        .arg(&socket_path)
         .args(&args.runner_arguments)
         .spawn()?;
 

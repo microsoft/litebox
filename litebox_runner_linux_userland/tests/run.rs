@@ -124,7 +124,7 @@ impl Runner {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn broker_socket(&mut self, socket_path: &Path) -> &mut Self {
-        self.command.env("LITEBOX_BROKER_SOCKET", socket_path);
+        self.command.arg("--broker-socket").arg(socket_path);
         self
     }
 

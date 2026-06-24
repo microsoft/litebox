@@ -79,6 +79,16 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Broker-supplied Unix socket path for the local control channel.
+    #[arg(
+        long = "broker-socket",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath,
+        hide = true,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_socket: Option<PathBuf>,
 }
 
 struct MmappedFile {
@@ -203,7 +213,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
-    let broker_connection = broker::connect()?;
+    let broker_connection = broker::connect(cli_args.broker_socket.as_deref())?;
 
     let shim_builder = if let Some(broker_connection) = broker_connection {
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(
@@ -380,19 +390,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .collect();
     let envp = if cli_args.forward_environment_variables {
         envp.into_iter()
-            .chain(
-                std::env::vars()
-                    .filter(|(k, _)| k != broker::BROKER_SOCKET_ENV)
-                    .map(|(k, v)| {
-                        std::ffi::CString::new(
-                            k.bytes()
-                                .chain([b'='])
-                                .chain(v.bytes())
-                                .collect::<Vec<u8>>(),
-                        )
-                        .unwrap()
-                    }),
-            )
+            .chain(std::env::vars().map(|(k, v)| {
+                std::ffi::CString::new(
+                    k.bytes()
+                        .chain([b'='])
+                        .chain(v.bytes())
+                        .collect::<Vec<u8>>(),
+                )
+                .unwrap()
+            }))
             .collect()
     } else {
         envp

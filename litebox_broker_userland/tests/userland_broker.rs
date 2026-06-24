@@ -2,7 +2,9 @@
 // Licensed under the MIT license.
 
 use std::env;
+use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
@@ -15,20 +17,40 @@ use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 #[test]
 fn separate_process_broker_spawns_runner_and_serves_until_stopped() {
-    // This test uses the current test binary as the broker's runner. The parent test
-    // starts the broker with `broker_test_runner_child` as the runner command; the
-    // broker creates the socket, passes it through `LITEBOX_BROKER_SOCKET`, and
-    // launches that child test. Once the child test has connected and completed its
-    // broker requests, it terminates the broker parent process. The parent test only
-    // waits for that broker exit so the long-running broker does not need a
-    // test-only shutdown path.
+    // This test uses a shell adapter as the broker's runner because the real broker
+    // passes the socket path with runner CLI flags, while the Rust test binary only
+    // understands libtest arguments. The adapter validates the broker-supplied
+    // `--broker-socket` argv, converts it to a test-only environment variable, and
+    // execs this same test binary's `broker_test_runner_child` test. Once the child
+    // test has connected and completed its broker requests, it terminates the broker
+    // parent process. The parent test only waits for that broker exit so the
+    // long-running broker does not need a test-only shutdown path.
+    let dir = tempfile::Builder::new()
+        .prefix("litebox-broker-userland-test-")
+        .tempdir()
+        .unwrap();
+    let runner_path = dir.path().join("test-runner.sh");
+    fs::write(
+        &runner_path,
+        b"#!/bin/sh
+[ \"$1\" = \"--unstable\" ] || exit 1
+[ \"$2\" = \"--broker-socket\" ] || exit 1
+socket=$3
+shift 3
+LITEBOX_BROKER_USERLAND_TEST_SOCKET=\"$socket\" exec \"$@\" --exact --nocapture
+",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&runner_path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&runner_path, permissions).unwrap();
+
     let mut broker = ChildGuard::new(
         Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
             .arg("--runner")
+            .arg(&runner_path)
             .arg(env::current_exe().unwrap())
             .arg("broker_test_runner_child")
-            .arg("--exact")
-            .arg("--nocapture")
             .env("LITEBOX_BROKER_USERLAND_TEST_RUNNER", "1")
             .spawn()
             .unwrap(),
@@ -50,7 +72,7 @@ fn broker_test_runner_child() {
     if env::var_os("LITEBOX_BROKER_USERLAND_TEST_RUNNER").is_none() {
         return;
     }
-    let socket_path = env::var("LITEBOX_BROKER_SOCKET").unwrap();
+    let socket_path = env::var("LITEBOX_BROKER_USERLAND_TEST_SOCKET").unwrap();
     let mut channel = connect_with_retry(Path::new(&socket_path)).unwrap();
     channel
         .set_io_timeout(Some(Duration::from_secs(5)))

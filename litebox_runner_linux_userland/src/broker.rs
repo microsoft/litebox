@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     thread,
     time::{Duration, Instant},
 };
@@ -14,16 +14,15 @@ use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
-pub(crate) const BROKER_SOCKET_ENV: &str = "LITEBOX_BROKER_SOCKET";
 type Local = BrokerLocal<UnixStreamLocalControlChannel>;
 
 pub(crate) struct BrokerConnection {
     local: Local,
 }
 
-pub(crate) fn connect() -> Result<Option<BrokerConnection>> {
-    match std::env::var_os(BROKER_SOCKET_ENV) {
-        Some(socket_path) => connect_to_endpoint(&PathBuf::from(socket_path)).map(Some),
+pub(crate) fn connect(socket_path: Option<&Path>) -> Result<Option<BrokerConnection>> {
+    match socket_path {
+        Some(path) => connect_to_endpoint(path).map(Some),
         None => Ok(None),
     }
 }
