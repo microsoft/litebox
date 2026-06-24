@@ -1458,6 +1458,62 @@ pub(super) fn socket_io_class<FS: ShimFS>(r: &crate::RawFdRef<'_, FS>) -> Socket
     }
 }
 
+/// Why an fd reached the raw [`PassedFd`] fallthrough on the `SCM_RIGHTS`
+/// send path — i.e. the send match above did not emit a broker token for it.
+///
+/// Duplicating the raw host fd into the receiver is only correct for a
+/// genuinely kernel-/host-backed descriptor. A *broker*-backed descriptor
+/// has no meaningful host fd to hand over: the duplicated fd is not
+/// registered with the broker in the receiving process, so it behaves as a
+/// dead handle — the node `SentHandleNotReceivedWarning` /
+/// "Could not find pty N on pty host" signature. Such a type must instead be
+/// made SCM-tokenizable in the send/receive match (add a `SubsystemTag` and
+/// reacquire it on the receive side), not silently passed as a raw fd.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScmPassedFdKind {
+    /// Kernel-/host-backed; duplicating the raw host fd is the correct
+    /// transfer (kernel inet socket, shim AF_UNIX socket, host-passthrough
+    /// fd, kernel eventfd, regular file).
+    KernelOrHostBacked,
+    /// Broker-backed but not (yet) SCM-tokenizable. Carries the variant name
+    /// so the gap is loud in the diag log instead of a silent dead handle.
+    UnsupportedBrokerFd(&'static str),
+}
+
+/// Exhaustive classifier over `RawFdRef` for the `SCM_RIGHTS` send
+/// fallthrough; no wildcard arm (the workspace denies
+/// `clippy::wildcard_enum_match_arm`) so adding a `RawFdRef` variant trips
+/// E0004 here and forces a deliberate SCM-transfer decision. See
+/// [`ScmPassedFdKind`]. The broker arms that are normally tokenized in the
+/// send match (pipe/socketpair/unix-stream/tcp/pty-master/inet-listener)
+/// only reach this classifier on a provider-missing anomaly, which is itself
+/// worth naming loudly.
+fn scm_passed_fd_kind<FS: ShimFS>(r: &crate::RawFdRef<'_, FS>) -> ScmPassedFdKind {
+    use crate::RawFdRef;
+    use ScmPassedFdKind::{KernelOrHostBacked, UnsupportedBrokerFd};
+    match r {
+        RawFdRef::Fs(_) => KernelOrHostBacked,
+        #[cfg(feature = "worker_local_inet")]
+        RawFdRef::Net(_) => KernelOrHostBacked,
+        RawFdRef::Eventfd(_) => KernelOrHostBacked,
+        RawFdRef::Unix(_) => KernelOrHostBacked,
+        RawFdRef::HostPassthroughFd(_) => KernelOrHostBacked,
+        RawFdRef::Epoll(_) => UnsupportedBrokerFd("epoll"),
+        RawFdRef::BrokerPipe(_) => UnsupportedBrokerFd("broker_pipe"),
+        RawFdRef::BrokerSocketPair(_) => UnsupportedBrokerFd("broker_socketpair"),
+        RawFdRef::BrokerSocketDgram(_) => UnsupportedBrokerFd("broker_socket_dgram"),
+        RawFdRef::BrokerSocketSeqPacket(_) => UnsupportedBrokerFd("broker_socket_seqpacket"),
+        RawFdRef::BrokerUnixStream(_) => UnsupportedBrokerFd("broker_unix_stream"),
+        RawFdRef::BrokerTcpConn(_) => UnsupportedBrokerFd("broker_tcp_conn"),
+        RawFdRef::BrokerPty(_) => UnsupportedBrokerFd("broker_pty"),
+        RawFdRef::Signalfd(_) => UnsupportedBrokerFd("signalfd"),
+        RawFdRef::Inotify(_) => UnsupportedBrokerFd("inotify"),
+        RawFdRef::BrokerInetListener(_) => UnsupportedBrokerFd("broker_inet_listener"),
+        RawFdRef::BrokerInetDgram(_) => UnsupportedBrokerFd("broker_inet_dgram"),
+        RawFdRef::BrokerInetRaw(_) => UnsupportedBrokerFd("broker_inet_raw"),
+    }
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Classify `sockfd` for socket-I/O dispatch via the exhaustive
     /// [`socket_io_class`] gate, or `EBADF` if the fd is unknown.
@@ -4075,8 +4131,33 @@ impl<FS: ShimFS> Task<FS> {
                             );
                             Ok(true)
                         }
-                        crate::RawFdRef::BrokerPty(_) | crate::RawFdRef::BrokerInetRaw(_) => {
-                            // Broker ptys/raw sockets are not broker-token-transferable over SCM yet.
+                        crate::RawFdRef::BrokerPty(typed) => {
+                            let Some(provider) = super::broker_pty::broker_pty_provider() else {
+                                return Ok(false);
+                            };
+                            let entry_handle = dt
+                                .entry_handle::<super::broker_pty::BrokerPtySubsystem>(typed)
+                                .ok_or(Errno::EBADF)?;
+                            let (handle_id, is_master) =
+                                entry_handle.with_entry(|e| (e.handle(), e.is_master()));
+                            if !is_master {
+                                // The LBFD Pty tag currently carries only the broker handle id.
+                                // Master role can be recovered via TIOCGPTN; slave role cannot
+                                // be reconstructed without extending the wire payload.
+                                return Ok(false);
+                            }
+                            provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                            passed_tokens.push(
+                                litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::Pty,
+                                    handle_id,
+                                )
+                                .map_err(|_| Errno::EINVAL)?,
+                            );
+                            Ok(true)
+                        }
+                        crate::RawFdRef::BrokerInetRaw(_) => {
+                            // Broker raw sockets are not broker-token-transferable over SCM yet.
                             Ok(false)
                         }
                         crate::RawFdRef::BrokerInetListener(typed) => {
@@ -4130,6 +4211,24 @@ impl<FS: ShimFS> Task<FS> {
                 drop(files);
 
                 if !sent_broker_token {
+                    // Compile-time-exhaustive diagnosis (see `scm_passed_fd_kind`):
+                    // a broker-backed fd that reaches this raw-`PassedFd`
+                    // fallthrough was NOT tokenized, so the receiver gets a dead
+                    // handle (node `SentHandleNotReceivedWarning` /
+                    // "Could not find pty N"). Name the offending type loudly in
+                    // the diag log instead of dropping it silently.
+                    let kind = {
+                        let files = self.files.borrow();
+                        files
+                            .run_on_raw_fd(raw_fd, |r| scm_passed_fd_kind(&r))
+                            .unwrap_or(ScmPassedFdKind::KernelOrHostBacked)
+                    };
+                    if let ScmPassedFdKind::UnsupportedBrokerFd(name) = kind {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "SCM_RIGHTS SEND: untokenized broker fd type '{name}' (raw={raw_fd}) passed as raw host fd; receiver will see a dead handle\n"
+                        ));
+                    }
                     passed_fds.push(passed);
                 }
             }
@@ -5251,6 +5350,45 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                     }
+                    SubsystemTag::Pty => {
+                        use super::broker_pty::BrokerPtyProviderReacquireExt as _;
+
+                        let Some(provider) = super::broker_pty::broker_pty_provider() else {
+                            continue;
+                        };
+                        let handle_id = token.id();
+                        let pty = match provider.reacquire(
+                            handle_id,
+                            litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master,
+                            None,
+                        ) {
+                            Ok(pty) => pty,
+                            Err(_) => continue,
+                        };
+                        pty.ensure_subscribed_eager();
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt.insert::<super::broker_pty::BrokerPtySubsystem>(pty);
+                        if cloexec {
+                            let _ = dt.set_fd_metadata(
+                                &typed,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
+                        drop(dt);
+                        let files = self.files.borrow();
+                        match files.insert_raw_fd(typed) {
+                            Ok(raw_fd) => {
+                                installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                            }
+                            Err(typed) => {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .remove(&typed)
+                                    .unwrap();
+                            }
+                        }
+                    }
                     SubsystemTag::Process | SubsystemTag::Unknown(_) => {
                         // Unsupported token kind on this worker; drop.
                     }
@@ -5259,7 +5397,6 @@ impl<FS: ShimFS> Task<FS> {
                     | SubsystemTag::Timerfd
                     | SubsystemTag::Inotify
                     | SubsystemTag::Pipe
-                    | SubsystemTag::Pty
                     | SubsystemTag::InetRaw
                     | SubsystemTag::HostFd => {
                         // Reserved for P2.A/B/C and later phases.
@@ -5749,6 +5886,35 @@ impl<FS: ShimFS> Task<FS> {
             _ => Err(Errno::ENOPROTOOPT),
         };
         let class = self.socket_io_class_of(sockfd)?;
+        // SO_TYPE is fixed by the socket's class, not by broker per-fd state.
+        // BrokerTcpConn/InetListener/InetDgram/InetRaw otherwise delegate
+        // getsockopt to the broker, whose `ensure_supported_sockopt` rejects
+        // SO_TYPE with EOPNOTSUPP; the dgram/seqpacket/raw shim arms route to
+        // `with_socket`, which returns ENOTSOCK without `worker_local_inet`.
+        // Either way libuv's `uv_guess_handle` on an SCM-passed socket then
+        // gets an error, returns UV_UNKNOWN_HANDLE, and node refuses to adopt
+        // the fd — stalling the VS Code exthost connection. Answer SO_TYPE
+        // locally from the socket class. Exhaustive over `SocketIoClass` (no
+        // wildcard) so a new class forces a deliberate decision here.
+        if matches!(optname, SocketOptionName::Socket(SocketOption::TYPE)) {
+            let sock_type = match class {
+                SocketIoClass::BrokerSocketDgram | SocketIoClass::BrokerInetDgram => {
+                    Some(SockType::Datagram)
+                }
+                SocketIoClass::BrokerSocketSeqPacket => Some(SockType::SeqPacket),
+                SocketIoClass::BrokerInetRaw => Some(SockType::Raw),
+                SocketIoClass::BrokerSocketPair
+                | SocketIoClass::BrokerUnixStream
+                | SocketIoClass::BrokerTcpConn
+                | SocketIoClass::BrokerInetListener => Some(SockType::Stream),
+                // Shim-local sockets resolve SO_TYPE through their own
+                // getsockopt below; non-sockets fall through to ENOTSOCK.
+                SocketIoClass::WithSocket | SocketIoClass::NotASocket => None,
+            };
+            if let Some(sock_type) = sock_type {
+                return super::write_to_user(sock_type as u32, optval, len);
+            }
+        }
         match class {
             SocketIoClass::BrokerInetDgram => self
                 .try_with_broker_inet_dgram(sockfd, |typed| {

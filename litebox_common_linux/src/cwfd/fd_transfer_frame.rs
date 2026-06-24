@@ -135,8 +135,8 @@ pub enum SubsystemTag {
     /// Broker-hosted pipe write end for SCM_RIGHTS token transfer. Wire value `15`.
     PipeWrite,
     /// Broker-hosted pseudo-terminal endpoint. Wire value `10`.
-    /// Phase E reserves this tag for PTY master/slave identity that
-    /// must survive cross-worker `exec_on_remote_host`.
+    /// Used for PTY master identity that must survive cross-worker
+    /// `exec_on_remote_host` and `SCM_RIGHTS` transfer.
     Pty,
     /// Broker-hosted TCP listener. Wire value `11`. Phase A.
     InetListener,

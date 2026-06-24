@@ -6326,10 +6326,10 @@ impl<FS: ShimFS> Task<FS> {
                 0
             };
 
-            // Phase 2.F: for EventFd fds, mint/extract a broker
+            // Phase 2.F: for EventfdSubsystem fds, extract the broker
             // handle so the child can reattach to shared state across
-            // the cross-binary-type fork boundary. Falls back to
-            // None on failure (child gets a fresh local eventfd).
+            // the cross-binary-type fork boundary. Returns None when
+            // no bridge is needed.
             let broker_handle_meta: Option<FdKind> = if matches!(
                 subsystem_kind,
                 FdKind::Timerfd { .. }
@@ -6338,14 +6338,10 @@ impl<FS: ShimFS> Task<FS> {
                     rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
                 {
                     let eventfd_provider = super::eventfd::broker_eventfd_provider();
-                    let pidfd_provider = super::eventfd::broker_pidfd_provider();
                     let timerfd_provider = super::eventfd::broker_timerfd_provider();
                     let result =
                         dt.with_entry(&typed, |ef: &super::eventfd::EventFile<crate::Platform>| {
-                            ef.ensure_broker_backed_for_fork(
-                                eventfd_provider.as_ref(),
-                                pidfd_provider.as_ref(),
-                            )
+                            ef.ensure_broker_backed_for_fork(eventfd_provider.as_ref(), None)
                         });
                     match result {
                         Some(Ok(Some(snapshot))) => {
@@ -6367,9 +6363,7 @@ impl<FS: ShimFS> Task<FS> {
                                 FdKind::Eventfd { .. } => eventfd_provider
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                                FdKind::Pidfd { .. } => pidfd_provider
-                                    .as_ref()
-                                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                                FdKind::Pidfd { .. } => None,
                                 FdKind::Timerfd { .. } => timerfd_provider
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
@@ -8804,9 +8798,9 @@ impl<FS: ShimFS> Task<FS> {
         let extra_fds: Vec<(usize, i32)> = Vec::new();
         // Phase 2.F follow-up: broker-backed EventFile bridges
         // (guest_fd:kind:handle_id strings) for inherited eventfd /
-        // pidfd state. Each entry corresponds to one fd whose
-        // EventFile was promoted to broker-backed and a transit ref
-        // was dup'd. The worker reattaches via --broker-eventfd-bridge.
+        // pidfd state. Each entry corresponds to one broker-backed fd
+        // whose transit ref was dup'd. The worker reattaches via
+        // --broker-eventfd-bridge.
         let mut broker_eventfd_specs: alloc::vec::Vec<alloc::string::String> =
             alloc::vec::Vec::new();
         let mut broker_eventfd_transit_release: alloc::vec::Vec<(
@@ -8928,7 +8922,6 @@ impl<FS: ShimFS> Task<FS> {
             );
             #[cfg(feature = "worker_local_inet")]
             emit_network_bridge_specs(self, &collected.network, &mut broker_eventfd_specs);
-            emit_timerfd_bridge_specs(self, &collected.eventfd, &mut broker_eventfd_specs);
             emit_inotify_bridge_specs(
                 self,
                 &collected.inotify,
@@ -10031,13 +10024,9 @@ type BrokerTransitReleaseEntry = (
 
 /// Emit `--broker-fd-bridge` specs for `EventfdSubsystem` fds, dispatching
 /// each fd to its current backing broker handle via
-/// `EventFile::ensure_broker_backed_for_fork` (which promotes a host
-/// eventfd to broker-backed if needed and returns the
-/// `FdKind`).
+/// `EventFile::ensure_broker_backed_for_fork`.
 ///
-/// Skips stdio (fds 0/1/2). Pairs with `emit_timerfd_bridge_specs`,
-/// which iterates the same bucket and handles the timerfd subset
-/// (filtered via `EventFile::is_timerfd`).
+/// Skips stdio (fds 0/1/2).
 ///
 /// For most kinds, dup_handle's transit ref lifetime matches
 /// `eventfd`/`signalfd`/`pty` (released only on spawn failure; worker's
@@ -10062,12 +10051,11 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
             continue;
         }
         let eventfd_provider = super::eventfd::broker_eventfd_provider();
-        let pidfd_provider = super::eventfd::broker_pidfd_provider();
         let timerfd_provider = super::eventfd::broker_timerfd_provider();
         let dt_local = task.global.litebox.descriptor_table();
         let result =
             dt_local.with_entry(typed, |ef: &super::eventfd::EventFile<crate::Platform>| {
-                ef.ensure_broker_backed_for_fork(eventfd_provider.as_ref(), pidfd_provider.as_ref())
+                ef.ensure_broker_backed_for_fork(eventfd_provider.as_ref(), None)
             });
         drop(dt_local);
         if let Some(Ok(Some(snapshot))) = result {
@@ -10084,9 +10072,7 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
                 FdKind::Eventfd { .. } => eventfd_provider
                     .as_ref()
                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                FdKind::Pidfd { .. } => pidfd_provider
-                    .as_ref()
-                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                FdKind::Pidfd { .. } => None,
                 FdKind::Timerfd { .. } => timerfd_provider
                     .as_ref()
                     .map(|p| alloc::sync::Arc::clone(p) as _),
@@ -10536,58 +10522,6 @@ fn emit_network_bridge_specs<FS: ShimFS>(
     for raw_fd in bucket {
         if let Some(spec) = task.tcp_listen_worker_exec_bridge_spec(*raw_fd) {
             specs.push(spec);
-        }
-    }
-}
-
-/// Emit `--broker-fd-bridge` specs for the timerfd subset of the
-/// eventfd bucket (`EventFile::is_timerfd` returning true). Snapshots
-/// timer state for reconstruction in the child worker.
-///
-/// Pairs with `emit_eventfd_bridge_specs`, which iterates the same
-/// bucket and handles the non-timerfd entries. Both helpers walk
-/// the full `eventfd` bucket; the per-entry filter (`is_timerfd`
-/// here, broker promotion in the eventfd helper) determines which
-/// subset is emitted.
-fn emit_timerfd_bridge_specs<FS: ShimFS>(
-    task: &Task<FS>,
-    bucket: &[(
-        usize,
-        alloc::sync::Arc<litebox::fd::TypedFd<super::eventfd::EventfdSubsystem>>,
-    )],
-    specs: &mut alloc::vec::Vec<alloc::string::String>,
-) {
-    for (raw_fd, typed) in bucket {
-        let raw_fd = *raw_fd;
-        let dt_local = task.global.litebox.descriptor_table();
-        let is_timer = dt_local
-            .with_entry(typed, |evf: &super::eventfd::EventFile<crate::Platform>| {
-                evf.is_timerfd()
-            })
-            .unwrap_or(false);
-        drop(dt_local);
-        if !is_timer {
-            continue;
-        }
-        let dt_local = task.global.litebox.descriptor_table();
-        let snapshot = dt_local
-            .with_entry(typed, |evf: &super::eventfd::EventFile<crate::Platform>| {
-                evf.timerfd_worker_exec_bridge_snapshot()
-            })
-            .flatten();
-        drop(dt_local);
-        if let Some((clockid, nonblock, spec, pending, snapshot_now_ns)) = snapshot {
-            specs.push(alloc::format!(
-                "{raw_fd}:timerfd:{}:{}:{}:{}:{}:{}:{}:{}",
-                clockid as u32,
-                u8::from(nonblock),
-                spec.value.tv_sec,
-                spec.value.tv_nsec,
-                spec.interval.tv_sec,
-                spec.interval.tv_nsec,
-                pending,
-                snapshot_now_ns,
-            ));
         }
     }
 }

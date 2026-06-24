@@ -31,18 +31,14 @@ memory.
 handle when migrating across workers:
 
 1. At `commit_delayed_fork` snapshot time, iterate the parent's
-   fd table. For each local pidfd entry that must survive a
-   cross-worker migration, get the target's host PID from
-   `global.fork_child_host_pids` and call
-   `broker_pidfd_provider().create_pidfd(host_pid)` to mint a
-   broker handle. Emit that descriptor as
-   `FdKind::Pidfd { handle_id }` in `FdEntrySnapshot.kind`.
+   fd table. For each broker-backed pidfd entry that must survive a
+   cross-worker migration, duplicate the existing broker handle and
+   emit that descriptor as `FdKind::Pidfd { handle_id }` in
+   `FdEntrySnapshot.kind`.
 
 2. At restore time, the single exhaustive `match entry.kind` handles
-   `FdKind::Pidfd { handle_id }` by constructing an
-   `EventFileInner::PidfdBrokerBacked { provider, handle, common }`
-   using the worker-side `broker_pidfd_provider()` and the matched
-   handle id.
+   `FdKind::Pidfd { handle_id }` by constructing a pidfd `EventFile`
+   with the worker-side process-exit broker subscription.
 
 **Subtleties** (must be designed before implementing):
 - Refcounting: parent's broker handle creation increments the

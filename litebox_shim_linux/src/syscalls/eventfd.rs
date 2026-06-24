@@ -5,7 +5,6 @@
 
 use alloc::sync::Arc;
 use core::{
-    convert::Infallible,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
     time::Duration,
 };
@@ -16,7 +15,7 @@ use litebox::{
         observer::Observer,
         observer::Subject,
         polling::{Pollee, TryOpError},
-        wait::{WaitContext, WaitError},
+        wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::OFlags,
@@ -27,7 +26,6 @@ use litebox_common_linux::{
     ClockId, EfdFlags, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
     broker_eventfd_provider::{BrokerEventfdProvider, BrokerOpError},
     broker_pgrp_signal_provider::BrokerPgrpSignalProvider,
-    broker_pidfd_provider::BrokerPidfdProvider,
     broker_pty_provider::BrokerPtyProvider,
     cwfd::broker_timerfd_provider::{BrokerTimerfdProvider, BrokerTimerfdSpec},
     errno::Errno,
@@ -50,8 +48,6 @@ impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 /// eagerly at creation time. If unset, `sys_eventfd2` returns
 /// ENODEV.
 static BROKER_EVENTFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerEventfdProvider>> =
-    once_cell::race::OnceBox::new();
-static BROKER_PIDFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPidfdProvider>> =
     once_cell::race::OnceBox::new();
 static BROKER_PGRP_SIGNAL_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPgrpSignalProvider>> =
     once_cell::race::OnceBox::new();
@@ -76,19 +72,6 @@ pub fn set_broker_eventfd_provider(
 /// Returns the broker eventfd provider if one has been set.
 pub fn broker_eventfd_provider() -> Option<Arc<dyn BrokerEventfdProvider>> {
     BROKER_EVENTFD_PROVIDER.get().cloned()
-}
-
-/// Sets the process-global broker pidfd provider.
-#[allow(dead_code)]
-pub fn set_broker_pidfd_provider(
-    provider: Arc<dyn BrokerPidfdProvider>,
-) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerPidfdProvider>>> {
-    BROKER_PIDFD_PROVIDER.set(alloc::boxed::Box::new(provider))
-}
-
-/// Returns the broker pidfd provider if one has been set.
-pub fn broker_pidfd_provider() -> Option<Arc<dyn BrokerPidfdProvider>> {
-    BROKER_PIDFD_PROVIDER.get().cloned()
 }
 
 /// Sets the process-global broker pgrp signal provider.
@@ -146,8 +129,6 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
         /// on it because Phase B.2 exports the broker process token instead.
         host_pid: Option<u32>,
     },
-    #[allow(dead_code)]
-    Timerfd(TimerFileState<Platform>),
     /// Broker-hosted eventfd (Phase B-Step7b + P2.0 refactor). State
     /// lives in the broker; this worker holds only the canonical
     /// handle id + provider for kind-specific RPCs, alongside a
@@ -163,23 +144,10 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
         common: super::broker_backed::BrokerBackedCommon<Platform>,
         semaphore: bool,
     },
-    PidfdBrokerBacked {
-        provider: Arc<dyn BrokerPidfdProvider>,
-        common: super::broker_backed::BrokerBackedCommon<Platform>,
-    },
     TimerfdBrokerBacked {
         provider: Arc<dyn BrokerTimerfdProvider>,
         common: super::broker_backed::BrokerBackedCommon<Platform>,
     },
-}
-
-struct TimerFileState<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    platform: &'static Platform,
-    clockid: ClockId,
-    boot_time: Platform::Instant,
-    interval: Duration,
-    next_deadline: Option<Platform::Instant>,
-    pending_expirations: u64,
 }
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -240,56 +208,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         }
     }
 
-    pub(crate) fn new_pidfd_broker_backed(
-        provider: Arc<dyn BrokerPidfdProvider>,
-        handle: u64,
-        nonblock: bool,
-    ) -> Self {
-        use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN};
-        let mut status = OFlags::RDWR;
-        status.set(OFlags::NONBLOCK, nonblock);
-        let subscribable: Arc<
-            dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-        > = Arc::clone(&provider) as _;
-        let common = super::broker_backed::BrokerBackedCommon::new(
-            subscribable,
-            handle,
-            NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP,
-        );
-        Self {
-            inner: litebox::sync::Mutex::new(EventFileInner::PidfdBrokerBacked {
-                provider,
-                common,
-            }),
-            status: AtomicU32::new(status.bits()),
-            pollee: Arc::new(Pollee::new()),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn new_timer(
-        platform: &'static Platform,
-        boot_time: Platform::Instant,
-        clockid: ClockId,
-        flags: TimerfdFlags,
-    ) -> Self {
-        let mut status = OFlags::RDWR;
-        status.set(OFlags::NONBLOCK, flags.contains(TimerfdFlags::NONBLOCK));
-
-        Self {
-            inner: litebox::sync::Mutex::new(EventFileInner::Timerfd(TimerFileState {
-                platform,
-                clockid,
-                boot_time,
-                interval: Duration::ZERO,
-                next_deadline: None,
-                pending_expirations: 0,
-            })),
-            status: AtomicU32::new(status.bits()),
-            pollee: Arc::new(Pollee::new()),
-        }
-    }
-
     pub(crate) fn new_timer_broker_backed(
         provider: Arc<dyn BrokerTimerfdProvider>,
         handle: u64,
@@ -339,12 +257,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     pub(crate) fn is_timerfd(&self) -> bool {
         matches!(
             *self.inner.lock(),
-            EventFileInner::Timerfd(_) | EventFileInner::TimerfdBrokerBacked { .. }
+            EventFileInner::TimerfdBrokerBacked { .. }
         )
-    }
-
-    fn is_local_timerfd(&self) -> bool {
-        matches!(*self.inner.lock(), EventFileInner::Timerfd(_))
     }
 
     /// Returns the broker handle id if this is a broker-backed
@@ -356,7 +270,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         #[allow(clippy::wildcard_enum_match_arm)]
         match &*self.inner.lock() {
             EventFileInner::BrokerBacked { common, .. }
-            | EventFileInner::PidfdBrokerBacked { common, .. }
             | EventFileInner::TimerfdBrokerBacked { common, .. } => Some(common.handle()),
             _ => None,
         }
@@ -370,18 +283,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         #[allow(clippy::wildcard_enum_match_arm)]
         match &*self.inner.lock() {
             EventFileInner::BrokerBacked { provider, .. } => Some(Arc::clone(provider)),
-            _ => None,
-        }
-    }
-
-    /// Returns the broker pidfd provider if this is a broker-backed
-    /// pidfd. Used by the fork-snapshot rollback path to call
-    /// `release` on a dup'd transit handle.
-    pub(crate) fn broker_backed_pidfd_provider(&self) -> Option<Arc<dyn BrokerPidfdProvider>> {
-        // reason: unsupported variants intentionally share this fallback path.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match &*self.inner.lock() {
-            EventFileInner::PidfdBrokerBacked { provider, .. } => Some(Arc::clone(provider)),
             _ => None,
         }
     }
@@ -404,19 +305,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     /// the cross-binary-type fork boundary.
     ///
     /// Behavior by variant:
-    /// - `BrokerBacked` / `PidfdBrokerBacked` / `TimerfdBrokerBacked`: returns the existing handle.
+    /// - `BrokerBacked` / `TimerfdBrokerBacked`: returns the existing handle.
     /// - `Pidfd { broker_subscription: Some(_), .. }`: Phase B.2 pidfds are
     ///   already broker-backed by process-exit subscription, so this is a
     ///   no-op that exports the target ProcessId as the child restore token.
-    /// - legacy `Pidfd` without a broker subscription: returns `Ok(None)`.
-    /// - legacy local `Timerfd`: returns `Ok(None)`.
     /// For handle-backed kinds, the caller MUST `dup_handle` the returned
     /// handle and arrange rollback `release`. For Phase B.2 pidfds, the
     /// returned value is a broker process token and needs no fd-handle dup.
     pub(crate) fn ensure_broker_backed_for_fork(
         &self,
         _eventfd_provider: Option<&Arc<dyn BrokerEventfdProvider>>,
-        _pidfd_provider: Option<&Arc<dyn BrokerPidfdProvider>>,
+        _pidfd_provider: Option<
+            &Arc<dyn litebox_common_linux::broker_pidfd_provider::BrokerPidfdProvider>,
+        >,
     ) -> Result<Option<super::fork_snapshot::FdKind>, BrokerOpError> {
         use super::fork_snapshot::FdKind;
         let guard = self.inner.lock();
@@ -424,25 +325,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             EventFileInner::BrokerBacked { common, .. } => Ok(Some(FdKind::Eventfd {
                 handle_id: common.handle(),
             })),
-            EventFileInner::PidfdBrokerBacked { common, .. } => Ok(Some(FdKind::Pidfd {
-                handle_id: common.handle(),
-            })),
             EventFileInner::TimerfdBrokerBacked { common, .. } => Ok(Some(FdKind::Timerfd {
                 handle_id: common.handle(),
             })),
-            EventFileInner::Timerfd(_) => Ok(None),
             EventFileInner::Pidfd {
                 target_pid,
                 broker_subscription,
                 ..
             } => {
-                if broker_subscription.is_some() {
-                    Ok(Some(FdKind::Pidfd {
-                        handle_id: u64::from(target_pid.0),
-                    }))
-                } else {
-                    Ok(None)
-                }
+                let Some(_) = broker_subscription else {
+                    unreachable!("pidfd without broker subscription cannot be fork-bridged")
+                };
+                Ok(Some(FdKind::Pidfd {
+                    handle_id: u64::from(target_pid.0),
+                }))
             }
         }
     }
@@ -451,9 +347,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     pub(crate) fn kind_name(&self) -> &'static str {
         match &*self.inner.lock() {
             EventFileInner::Pidfd { .. } => "pidfd",
-            EventFileInner::Timerfd(_) => "timerfd",
             EventFileInner::BrokerBacked { .. } => "broker_eventfd",
-            EventFileInner::PidfdBrokerBacked { .. } => "broker_pidfd",
             EventFileInner::TimerfdBrokerBacked { .. } => "broker_timerfd",
         }
     }
@@ -461,7 +355,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     pub(crate) fn needs_host_poll(&self) -> bool {
         matches!(
             *self.inner.lock(),
-            EventFileInner::Timerfd(_) | EventFileInner::PidfdBrokerBacked { .. }
+            EventFileInner::TimerfdBrokerBacked { .. }
         )
     }
 
@@ -497,23 +391,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                     Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
                 }
             }
-            EventFileInner::Pidfd { .. }
-            | EventFileInner::Timerfd(_)
-            | EventFileInner::PidfdBrokerBacked { .. }
-            | EventFileInner::TimerfdBrokerBacked { .. } => Err(TryOpError::Other(Errno::EINVAL)),
+            EventFileInner::Pidfd { .. } | EventFileInner::TimerfdBrokerBacked { .. } => {
+                Err(TryOpError::Other(Errno::EINVAL))
+            }
         }
     }
 
     fn try_read_timerfd(&self) -> Result<u64, Errno> {
         let mut inner = self.inner.lock();
         match &mut *inner {
-            EventFileInner::Timerfd(timer) => {
-                timer.update();
-                if timer.pending_expirations == 0 {
-                    return Err(Errno::EAGAIN);
-                }
-                Ok(core::mem::take(&mut timer.pending_expirations))
-            }
             EventFileInner::TimerfdBrokerBacked { provider, common } => {
                 let provider = Arc::clone(provider);
                 let handle = common.handle();
@@ -522,9 +408,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                     .read_timerfd(handle)
                     .map_err(super::broker_backed::broker_err_to_errno)
             }
-            EventFileInner::Pidfd { .. }
-            | EventFileInner::BrokerBacked { .. }
-            | EventFileInner::PidfdBrokerBacked { .. } => Err(Errno::EINVAL),
+            EventFileInner::Pidfd { .. } | EventFileInner::BrokerBacked { .. } => {
+                Err(Errno::EINVAL)
+            }
         }
     }
 
@@ -545,44 +431,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                     }
                 })
             }
-            EventFileInner::Pidfd { .. }
-            | EventFileInner::PidfdBrokerBacked { .. }
-            | EventFileInner::Timerfd(_) => Err(TryOpError::Other(Errno::EINVAL)),
+            EventFileInner::Pidfd { .. } => Err(TryOpError::Other(Errno::EINVAL)),
         }
     }
 
     pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
-        if self.is_local_timerfd() {
-            if self.get_status().contains(OFlags::NONBLOCK) {
-                return self.try_read_timerfd();
-            }
-            loop {
-                match self.try_read_timerfd() {
-                    Ok(v) => return Ok(v),
-                    Err(Errno::EAGAIN) => {}
-                    Err(e) => return Err(e),
-                }
-
-                let deadline = {
-                    let mut inner = self.inner.lock();
-                    let EventFileInner::Timerfd(timer) = &mut *inner else {
-                        unreachable!();
-                    };
-                    timer.next_deadline
-                };
-                let wait_cx = cx.with_deadline(deadline);
-                match self.pollee.wait(&wait_cx, false, Events::IN, || {
-                    Result::<(), TryOpError<Infallible>>::Err(TryOpError::TryAgain)
-                }) {
-                    Ok(())
-                    | Err(TryOpError::TryAgain | TryOpError::WaitError(WaitError::TimedOut)) => {}
-                    Err(TryOpError::WaitError(WaitError::Interrupted)) => {
-                        return Err(Errno::EINTR);
-                    }
-                    Err(TryOpError::Other(never)) => match never {},
-                }
-            }
-        }
         self.pollee
             .wait(
                 cx,
@@ -624,10 +477,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                     Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
                 }
             }
-            EventFileInner::Pidfd { .. }
-            | EventFileInner::Timerfd(_)
-            | EventFileInner::PidfdBrokerBacked { .. }
-            | EventFileInner::TimerfdBrokerBacked { .. } => Err(TryOpError::Other(Errno::EINVAL)),
+            EventFileInner::Pidfd { .. } | EventFileInner::TimerfdBrokerBacked { .. } => {
+                Err(TryOpError::Other(Errno::EINVAL))
+            }
         }
     }
 
@@ -654,13 +506,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     ) -> Result<ItimerSpec, Errno> {
         let mut inner = self.inner.lock();
         match &mut *inner {
-            EventFileInner::Timerfd(timer) => {
-                let old_value = timer.current_spec();
-                timer.set_time(flags, new_value)?;
-                drop(inner);
-                self.pollee.notify_observers(Events::IN);
-                Ok(old_value)
-            }
             EventFileInner::TimerfdBrokerBacked { provider, common } => {
                 let provider = Arc::clone(provider);
                 let handle = common.handle();
@@ -675,16 +520,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                     .map_err(super::broker_backed::broker_err_to_errno)?;
                 Ok(old_value)
             }
-            EventFileInner::Pidfd { .. }
-            | EventFileInner::BrokerBacked { .. }
-            | EventFileInner::PidfdBrokerBacked { .. } => Err(Errno::EINVAL),
+            EventFileInner::Pidfd { .. } | EventFileInner::BrokerBacked { .. } => {
+                Err(Errno::EINVAL)
+            }
         }
     }
 
     pub(crate) fn get_timer(&self) -> Result<ItimerSpec, Errno> {
         let mut inner = self.inner.lock();
         match &mut *inner {
-            EventFileInner::Timerfd(timer) => Ok(timer.current_spec()),
             EventFileInner::TimerfdBrokerBacked { provider, common } => {
                 let provider = Arc::clone(provider);
                 let handle = common.handle();
@@ -695,56 +539,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                         .map_err(super::broker_backed::broker_err_to_errno)?,
                 )
             }
-            EventFileInner::Pidfd { .. }
-            | EventFileInner::BrokerBacked { .. }
-            | EventFileInner::PidfdBrokerBacked { .. } => Err(Errno::EINVAL),
+            EventFileInner::Pidfd { .. } | EventFileInner::BrokerBacked { .. } => {
+                Err(Errno::EINVAL)
+            }
         }
-    }
-
-    /// Snapshot the timerfd state for the non-PIE worker-exec bridge.
-    ///
-    /// Returns `None` if this `EventFile` is not a timerfd. Otherwise
-    /// returns the data needed to reconstruct an equivalent timerfd on
-    /// the receiving side: clock id, NONBLOCK flag, the current
-    /// `ItimerSpec` (after running `update()` so already-elapsed
-    /// expirations are reflected in `pending_expirations` rather than
-    /// in `value`), and the monotonic timestamp used to age the
-    /// relative `value` while the bridge is in transit.
-    pub(crate) fn timerfd_worker_exec_bridge_snapshot(
-        &self,
-    ) -> Option<(ClockId, bool, ItimerSpec, u64, u64)> {
-        let mut inner = self.inner.lock();
-        let EventFileInner::Timerfd(timer) = &mut *inner else {
-            return None;
-        };
-        // Force materialization of already-expired expirations.
-        timer.update();
-        let pending = timer.pending_expirations;
-        let spec = timer.current_spec();
-        let snapshot_now_ns = timer
-            .platform
-            .monotonic_timestamp()?
-            .as_nanos()
-            .try_into()
-            .ok()?;
-        // Read clockid via i32-as-IntEnum: ClockId is `#[repr(i32)] non_exhaustive` and
-        // doesn't derive Copy, so reconstruct from the discriminant.
-        let clockid_disc = match &timer.clockid {
-            ClockId::RealTime => 0,
-            ClockId::Monotonic => 1,
-            ClockId::ProcessCputimeId => 2,
-            ClockId::ThreadCputimeId => 3,
-            ClockId::MonotonicRaw => 4,
-            ClockId::RealtimeCoarse => 5,
-            ClockId::MonotonicCoarse => 6,
-            ClockId::Boottime => 7,
-            _ => return None,
-        };
-        drop(inner);
-        let clockid = ClockId::try_from(clockid_disc as i32).ok()?;
-        let status = OFlags::from_bits_retain(self.status.load(Ordering::Relaxed));
-        let nonblock = status.contains(OFlags::NONBLOCK);
-        Some((clockid, nonblock, spec, pending, snapshot_now_ns))
     }
 
     super::common_functions_for_file_status!();
@@ -761,12 +559,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
         let mut inner = self.inner.lock();
         let mut events = Events::empty();
         match &mut *inner {
-            EventFileInner::Timerfd(timer) => {
-                timer.update();
-                if timer.pending_expirations != 0 {
-                    events |= Events::IN;
-                }
-            }
             EventFileInner::TimerfdBrokerBacked { common, .. } => {
                 events |= common.check_io_events();
             }
@@ -825,11 +617,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 // `QueryEvents` RPC so we never report stale state.
                 events |= common.check_io_events();
             }
-            EventFileInner::PidfdBrokerBacked { provider, common } => {
-                if provider.pidfd_exited(common.handle()).unwrap_or(false) {
-                    events |= Events::IN | Events::HUP;
-                }
-            }
         }
 
         events
@@ -851,10 +638,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                         .register_observer(observer, observer_mask);
                 }
             }
-            EventFileInner::Timerfd(_) => {
-                drop(inner);
-                self.pollee.register_observer(observer, mask);
-            }
             EventFileInner::TimerfdBrokerBacked { common, .. } => {
                 common.ensure_subscribed(&self.pollee);
                 drop(inner);
@@ -865,11 +648,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 // cross-worker writes get pushed to our pollee via the
                 // notification dispatcher. Idempotent on the inner
                 // mutex inside BrokerBackedCommon.
-                common.ensure_subscribed(&self.pollee);
-                drop(inner);
-                self.pollee.register_observer(observer, mask);
-            }
-            EventFileInner::PidfdBrokerBacked { common, .. } => {
                 common.ensure_subscribed(&self.pollee);
                 drop(inner);
                 self.pollee.register_observer(observer, mask);
@@ -898,11 +676,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
         #[allow(clippy::wildcard_enum_match_arm)]
         match &*inner {
             EventFileInner::BrokerBacked { common, .. }
-            | EventFileInner::PidfdBrokerBacked { common, .. }
             | EventFileInner::TimerfdBrokerBacked { common, .. } => {
                 common.ensure_subscribed(&self.pollee);
             }
-            EventFileInner::Pidfd { .. } | EventFileInner::Timerfd(_) => {}
+            EventFileInner::Pidfd { .. } => {}
         }
     }
 }
@@ -968,119 +745,6 @@ impl EventFile<Platform> {
             Some(subscription),
         )
     }
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> TimerFileState<Platform> {
-    fn current_time(&self) -> Result<Duration, Errno> {
-        // reason: unsupported variants intentionally share this fallback path.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match self.clockid {
-            ClockId::Monotonic | ClockId::MonotonicCoarse | ClockId::MonotonicRaw | ClockId::Boottime => {
-                Ok(self.platform.now().duration_since(&self.boot_time))
-            }
-            ClockId::RealTime | ClockId::RealtimeCoarse => self
-                .platform
-                .current_time()
-                .duration_since(
-                    &<<Platform as TimeProvider>::SystemTime as litebox::platform::SystemTime>::UNIX_EPOCH,
-                )
-                .map_err(|_| Errno::EINVAL),
-            _ => Err(Errno::EINVAL),
-        }
-    }
-
-    fn deadline_from_duration_since_epoch(
-        &self,
-        duration: Duration,
-    ) -> Result<Option<Platform::Instant>, Errno> {
-        // reason: unsupported variants intentionally share this fallback path.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match self.clockid {
-            ClockId::Monotonic
-            | ClockId::MonotonicCoarse
-            | ClockId::MonotonicRaw
-            | ClockId::Boottime => Ok(self.boot_time.checked_add(duration)),
-            ClockId::RealTime | ClockId::RealtimeCoarse => {
-                let current_time = self.current_time()?;
-                Ok(self
-                    .platform
-                    .now()
-                    .checked_add(duration.checked_sub(current_time).unwrap_or(Duration::ZERO)))
-            }
-            _ => Err(Errno::EINVAL),
-        }
-    }
-
-    fn update(&mut self) {
-        let Some(deadline) = self.next_deadline else {
-            return;
-        };
-        let now = self.platform.now();
-        if now < deadline {
-            return;
-        }
-
-        if self.interval.is_zero() {
-            self.pending_expirations = self.pending_expirations.saturating_add(1);
-            self.next_deadline = None;
-            return;
-        }
-
-        let elapsed_ns = now.duration_since(&deadline).as_nanos();
-        let interval_ns = self.interval.as_nanos();
-        let expirations = elapsed_ns / interval_ns + 1;
-        // `.min(u128::from(u64::MAX))` guarantees the value fits in u64.
-        #[allow(clippy::cast_possible_truncation)]
-        let clamped = expirations.min(u128::from(u64::MAX)) as u64;
-        self.pending_expirations = self.pending_expirations.saturating_add(clamped);
-
-        let remaining = if elapsed_ns % interval_ns == 0 {
-            self.interval
-        } else {
-            nanos_to_duration(interval_ns - (elapsed_ns % interval_ns))
-                .expect("interval remainder is always representable")
-        };
-        self.next_deadline = now.checked_add(remaining);
-    }
-
-    fn current_spec(&mut self) -> ItimerSpec {
-        self.update();
-        let remaining = self.next_deadline.map_or(Duration::ZERO, |deadline| {
-            deadline.duration_since(&self.platform.now())
-        });
-        ItimerSpec {
-            interval: self.interval.into(),
-            value: remaining.into(),
-        }
-    }
-
-    fn set_time(&mut self, flags: TimerfdTimerFlags, new_value: ItimerSpec) -> Result<(), Errno> {
-        let interval = Duration::try_from(new_value.interval)?;
-        let value = Duration::try_from(new_value.value)?;
-        let next_deadline = if value.is_zero() {
-            None
-        } else if flags.contains(TimerfdTimerFlags::ABSTIME) {
-            self.deadline_from_duration_since_epoch(value)?
-        } else {
-            self.platform.now().checked_add(value)
-        };
-        if !value.is_zero() && next_deadline.is_none() {
-            return Err(Errno::EINVAL);
-        }
-        self.interval = interval;
-        self.next_deadline = next_deadline;
-        self.pending_expirations = 0;
-        Ok(())
-    }
-}
-
-fn nanos_to_duration(nanos: u128) -> Option<Duration> {
-    let secs = nanos / 1_000_000_000;
-    let subsec_nanos = nanos % 1_000_000_000;
-    Some(Duration::new(
-        u64::try_from(secs).ok()?,
-        u32::try_from(subsec_nanos).ok()?,
-    ))
 }
 
 #[cfg(test)]
@@ -1894,55 +1558,5 @@ mod tests {
         assert_eq!(err, Errno::EAGAIN);
 
         task.sys_close(efd).expect("close eventfd");
-    }
-
-    /// Phase 2.F.2 unit test: `ensure_broker_backed_for_fork` on a
-    /// Pidfd with `host_pid = None` returns `Ok(None)` — graceful
-    /// fallback case for pidfds whose target host pid wasn't
-    /// captured (e.g. pidfd_getfd inheritance chains, or virtual
-    /// process ids without a corresponding host pid). The variant
-    /// is left unchanged (no in-place mutation on the failure
-    /// path), confirmed by a second call also returning `Ok(None)`.
-    #[test]
-    fn promote_local_pidfd_without_host_pid_returns_none() {
-        use alloc::sync::Arc;
-        use core::sync::atomic::AtomicBool;
-        use litebox::event::observer::Subject;
-
-        let _task = crate::syscalls::tests::init_platform(None);
-
-        let exited = Arc::new(AtomicBool::new(false));
-        let subject: Arc<
-            Subject<
-                litebox::event::Events,
-                litebox::event::Events,
-                litebox_platform_multiplex::Platform,
-            >,
-        > = Arc::new(Subject::new());
-        let pidfd = super::EventFile::<litebox_platform_multiplex::Platform>::new_pidfd(
-            litebox::process::ProcessId(123),
-            exited,
-            subject,
-            false,
-            None,
-            None,
-        );
-
-        // No providers: should be Ok(None), not Err.
-        let result = pidfd
-            .ensure_broker_backed_for_fork(None, None)
-            .expect("no providers + host_pid=None should be Ok(None), not Err");
-        assert!(
-            result.is_none(),
-            "Pidfd with no host_pid must return Ok(None) — got {:?}",
-            result
-        );
-
-        // Calling a second time still returns Ok(None) (variant
-        // unchanged on the failure path).
-        let again = pidfd
-            .ensure_broker_backed_for_fork(None, None)
-            .expect("second call should also be Ok(None)");
-        assert!(again.is_none());
     }
 }

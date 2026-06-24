@@ -18,7 +18,6 @@ pub mod broker_inet_listener_provider;
 pub mod broker_inet_raw_provider;
 pub mod broker_inotify_provider;
 pub mod broker_pgrp_signal_provider;
-pub mod broker_pidfd_provider;
 pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
 pub mod broker_signalfd_provider;
@@ -129,8 +128,8 @@ pub struct CliArgs {
 
     /// Connect to a broker fd-token control socket at this Unix-domain
     /// path. When set, broker-hosted eventfds (and other broker state
-    /// objects) become available; otherwise the worker uses purely-local
-    /// shim-emulated state. The broker must be running with
+    /// objects) become available; otherwise syscalls that require a broker
+    /// provider return errors. The broker must be running with
     /// `--fd-token-broker-listen <path>` set to the same path.
     ///
     /// Phase B-Step8c: enables the cross-worker eventfd path.
@@ -969,14 +968,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // the broker's fd-token control socket and register a
     // BrokerEventfdProvider so subsequent sys_eventfd2 calls produce
     // broker-hosted eventfds. Best-effort: failures are logged via
-    // anyhow context but do not abort the worker — the worker
-    // gracefully falls back to local EventFile.
+    // anyhow context but do not abort the worker; syscalls that need
+    // the missing provider return errors.
     if let Some(ref broker_path) = cli_args.fd_token_broker {
         if let Err(e) = setup_broker_eventfd_provider(broker_path) {
             tracing::warn!(
                 error = %e,
                 path = broker_path.as_str(),
-                "fd-token-broker setup failed; falling back to local EventFile",
+                "fd-token-broker setup failed; broker-backed fd syscalls may return errors",
             );
         } else if !cli_args.worker_exec && !cli_args.fork_restore && cli_args.guest_pid.is_none() {
             // Root worker (not a migrated worker / fork-restore worker, and no
@@ -3297,15 +3296,6 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_timerfd_provider(timerfd_provider)
         .map_err(|_| anyhow!("timerfd provider already set"))?;
-
-    let pidfd_provider = Arc::new(
-        crate::broker_pidfd_provider::RunnerBrokerPidfdProvider::new(
-            Arc::clone(&client),
-            Arc::clone(&dispatcher),
-        ),
-    );
-    litebox_shim_linux::syscalls::set_broker_pidfd_provider(pidfd_provider)
-        .map_err(|_| anyhow!("pidfd provider already set"))?;
 
     let pipe_provider = Arc::new(crate::broker_pipe_provider::RunnerBrokerPipeProvider::new(
         Arc::clone(&client),
