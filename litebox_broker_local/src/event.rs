@@ -1,11 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::{
-    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CoreRequest, CoreResponse,
-    CreateEventRequest, EventConsumeMode, EventRequest, EventResponse, LocalControlChannel,
-    ObjectHandle, ReadinessState, WaitEventRequest,
+use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::event::{
+    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
+    EventConsumeMode, ReadinessState, WaitEventRequest,
 };
+use litebox_broker_protocol::message::{CoreRequest, CoreResponse, EventRequest, EventResponse};
 
 use crate::{BrokerLocal, Result};
 

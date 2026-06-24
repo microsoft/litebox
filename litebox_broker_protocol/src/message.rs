@@ -2,9 +2,10 @@
 // Licensed under the MIT license.
 
 use crate::ProtocolVersion;
-use crate::{
+use crate::error::ErrorCode;
+use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CreateEventRequest, CreateEventResponse, ErrorCode, WaitEventRequest, WaitEventResponse,
+    CreateEventRequest, CreateEventResponse, WaitEventRequest, WaitEventResponse,
 };
 
 /// Broker request sent over the control channel.

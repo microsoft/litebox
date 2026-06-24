@@ -19,7 +19,8 @@
 use alloc::vec::Vec;
 use thiserror::Error;
 
-use crate::{BrokerRequest, BrokerResponse, ErrorCode};
+use crate::error::ErrorCode;
+use crate::message::{BrokerRequest, BrokerResponse};
 
 use primitive::{Decoder, Encoder};
 
@@ -143,12 +144,13 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AddEventRequest, AddEventResponse, ConsumeEventRequest, CoreRequest, CoreResponse,
-        CreateEventRequest, CreateEventResponse, EventConsumeMode, EventConsumption, EventRequest,
-        EventResponse, ObjectHandle, ProtocolVersion, ReadinessState, WaitEventRequest,
+    use crate::event::{
+        AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
+        CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState, WaitEventRequest,
         WaitEventResponse,
     };
+    use crate::message::{CoreRequest, CoreResponse, EventRequest, EventResponse};
+    use crate::{ObjectHandle, ProtocolVersion};
 
     #[test]
     fn request_codec_round_trips_all_variants() {

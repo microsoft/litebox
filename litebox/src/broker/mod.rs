@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::{CoreRequest, CoreResponse, LocalControlChannel};
+use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::message::{CoreRequest, CoreResponse};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 

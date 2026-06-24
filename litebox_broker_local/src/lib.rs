@@ -5,7 +5,7 @@
 //!
 //! The local control adapter owns request/response sequencing but does not own a channel.
 //! Userland, kernel, or ring-buffer deployments can provide channels by
-//! implementing [`litebox_broker_protocol::LocalControlChannel`].
+//! implementing [`litebox_broker_protocol::channel::LocalControlChannel`].
 
 #![no_std]
 
@@ -15,10 +15,10 @@ extern crate std;
 mod error;
 mod event;
 
-use litebox_broker_protocol::{
-    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, ErrorCode,
-    LocalControlChannel,
-};
+use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
+use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse, CoreRequest, CoreResponse};
 
 pub use error::{BrokerLocalError, Result};
 
@@ -119,10 +119,10 @@ fn raw_request<Channel: LocalControlChannel>(
 mod tests {
     use super::*;
     use core::convert::Infallible;
-    use litebox_broker_protocol::{
-        CreateEventRequest, CreateEventResponse, EventRequest, EventResponse, ObjectHandle,
-        ProtocolVersion,
-    };
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::ProtocolVersion;
+    use litebox_broker_protocol::event::{CreateEventRequest, CreateEventResponse};
+    use litebox_broker_protocol::message::{EventRequest, EventResponse};
 
     #[test]
     fn negotiate_returns_active_local_connection() {

@@ -3,12 +3,13 @@
 
 use alloc::sync::Arc;
 
-pub use litebox_broker_protocol::EventConsumeMode as EventCounterReadMode;
-use litebox_broker_protocol::{
-    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CoreRequest, CoreResponse,
-    CreateEventRequest, EventRequest, EventResponse, ObjectHandle, ReadinessState,
+use litebox_broker_protocol::ObjectHandle;
+pub use litebox_broker_protocol::event::EventConsumeMode as EventCounterReadMode;
+use litebox_broker_protocol::event::{
+    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest, ReadinessState,
     WaitEventRequest,
 };
+use litebox_broker_protocol::message::{CoreRequest, CoreResponse, EventRequest, EventResponse};
 use thiserror::Error;
 
 use crate::{

@@ -15,10 +15,12 @@ extern crate std;
 use core::fmt::{Display, Formatter, Result as FmtResult};
 
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
-use litebox_broker_protocol::{
-    AddEventResponse, BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest,
-    CoreResponse, CreateEventResponse, ErrorCode, EventRequest, EventResponse, HostControlChannel,
-    PeerCredential, WaitEventResponse,
+use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
+use litebox_broker_protocol::channel::{HostControlChannel, PeerCredential};
+use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse, WaitEventResponse};
+use litebox_broker_protocol::message::{
+    BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,
 };
 
 mod error;
@@ -202,7 +204,7 @@ pub enum ConnectionTermination {
 mod tests {
     use super::*;
     use litebox_broker_core::{PolicyEngine, PrincipalRights};
-    use litebox_broker_protocol::CreateEventRequest;
+    use litebox_broker_protocol::event::CreateEventRequest;
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {

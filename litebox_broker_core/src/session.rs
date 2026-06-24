@@ -180,9 +180,8 @@ mod tests {
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, PrincipalRights,
     };
-    use litebox_broker_protocol::{
-        EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState,
-    };
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption, ReadinessState};
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {

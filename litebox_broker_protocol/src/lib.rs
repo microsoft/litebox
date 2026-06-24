@@ -18,17 +18,6 @@ pub mod event;
 pub mod message;
 pub mod wire;
 
-pub use channel::{HostControlChannel, LocalControlChannel, PeerCredential};
-pub use error::ErrorCode;
-pub use event::{
-    AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CreateEventRequest, CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState,
-    WaitEventRequest, WaitEventResponse,
-};
-pub use message::{
-    BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,
-};
-
 /// Opaque broker object reference handle.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

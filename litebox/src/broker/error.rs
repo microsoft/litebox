@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use litebox_broker_local::BrokerLocalError;
-use litebox_broker_protocol::ErrorCode;
+use litebox_broker_protocol::error::ErrorCode;
 use thiserror::Error;
 
 use crate::event::{counter::EventCounterError, polling::TryOpError};

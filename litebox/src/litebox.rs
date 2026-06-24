@@ -6,7 +6,7 @@
 use alloc::sync::Arc;
 
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::LocalControlChannel;
+use litebox_broker_protocol::channel::LocalControlChannel;
 
 use crate::{
     broker,

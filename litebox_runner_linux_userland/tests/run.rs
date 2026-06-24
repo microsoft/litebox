@@ -9,6 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use litebox_broker_protocol::channel::{HostControlChannel, PeerCredential};
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse, CoreRequest};
+
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c"];
 
@@ -359,13 +364,13 @@ fn spawn_test_broker(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-struct CountingHostControlChannel<Channel: litebox_broker_protocol::HostControlChannel> {
+struct CountingHostControlChannel<Channel: HostControlChannel> {
     inner: Channel,
     event_request_count: usize,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<Channel: litebox_broker_protocol::HostControlChannel> CountingHostControlChannel<Channel> {
+impl<Channel: HostControlChannel> CountingHostControlChannel<Channel> {
     const fn new(inner: Channel) -> Self {
         Self {
             inner,
@@ -379,34 +384,22 @@ impl<Channel: litebox_broker_protocol::HostControlChannel> CountingHostControlCh
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<Channel: litebox_broker_protocol::HostControlChannel>
-    litebox_broker_protocol::HostControlChannel for CountingHostControlChannel<Channel>
-{
+impl<Channel: HostControlChannel> HostControlChannel for CountingHostControlChannel<Channel> {
     type Error = Channel::Error;
 
-    fn peer_credential(&self) -> Result<litebox_broker_protocol::PeerCredential, Self::Error> {
+    fn peer_credential(&self) -> Result<PeerCredential, Self::Error> {
         self.inner.peer_credential()
     }
 
-    fn recv_request(
-        &mut self,
-    ) -> Result<Option<litebox_broker_protocol::BrokerRequest>, Self::Error> {
+    fn recv_request(&mut self) -> Result<Option<BrokerRequest>, Self::Error> {
         let request = self.inner.recv_request()?;
-        if matches!(
-            request,
-            Some(litebox_broker_protocol::BrokerRequest::Core(
-                litebox_broker_protocol::CoreRequest::Event(_)
-            ))
-        ) {
+        if matches!(request, Some(BrokerRequest::Core(CoreRequest::Event(_)))) {
             self.event_request_count += 1;
         }
         Ok(request)
     }
 
-    fn send_response(
-        &mut self,
-        response: &litebox_broker_protocol::BrokerResponse,
-    ) -> Result<(), Self::Error> {
+    fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error> {
         self.inner.send_response(response)
     }
 }

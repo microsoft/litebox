@@ -12,11 +12,10 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use litebox_broker_protocol::channel::{HostControlChannel, LocalControlChannel, PeerCredential};
+use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::wire::{
     WireError, decode_request, decode_response, encode_request, encode_response,
-};
-use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, HostControlChannel, LocalControlChannel, PeerCredential,
 };
 
 const MAX_FRAME_LEN: usize = 64 * 1024;

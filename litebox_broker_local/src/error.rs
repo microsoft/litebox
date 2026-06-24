@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::ErrorCode;
+use litebox_broker_protocol::error::ErrorCode;
 use thiserror::Error;
 
 /// Errors returned by active broker-local control requests.

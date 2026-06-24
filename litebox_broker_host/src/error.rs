@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use litebox_broker_core::BrokerError;
-use litebox_broker_protocol::ErrorCode;
+use litebox_broker_protocol::error::ErrorCode;
 use thiserror::Error;
 
 /// Errors returned by a broker-host receive/send loop.

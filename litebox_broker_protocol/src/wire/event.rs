@@ -1,11 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{
+use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
-    CreateEventResponse, EventConsumeMode, EventConsumption, EventRequest, EventResponse,
-    ReadinessState, WaitEventRequest, WaitEventResponse,
+    CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState, WaitEventRequest,
+    WaitEventResponse,
 };
+use crate::message::{EventRequest, EventResponse};
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};

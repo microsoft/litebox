@@ -3,7 +3,7 @@
 
 use thiserror::Error;
 
-use litebox_broker_protocol::ErrorCode;
+use litebox_broker_protocol::error::ErrorCode;
 
 /// Broker authority error category.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{BrokerRequest, BrokerResponse};
+use crate::message::{BrokerRequest, BrokerResponse};
 
 /// Peer identity information supplied by the channel or host layer.
 ///

@@ -5,7 +5,8 @@
 
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result};
-use litebox_broker_protocol::{EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState};
+use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption, ReadinessState};
 
 pub(crate) const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
 

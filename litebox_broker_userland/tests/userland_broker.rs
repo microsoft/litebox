@@ -9,7 +9,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::ReadinessState;
+use litebox_broker_protocol::event::ReadinessState;
 use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";

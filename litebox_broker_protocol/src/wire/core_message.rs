@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{CoreRequest, CoreResponse};
+use crate::message::{CoreRequest, CoreResponse};
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
