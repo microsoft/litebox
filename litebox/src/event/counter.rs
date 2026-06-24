@@ -79,11 +79,6 @@ where
     }
 
     /// Reads the event counter.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a protocol response that does not match the
-    /// issued event request.
     pub fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -100,11 +95,6 @@ where
     }
 
     /// Writes readiness credits to the event counter.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a protocol response that does not match the
-    /// issued event request.
     pub fn write(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -165,10 +155,6 @@ where
         self.pollee.register_observer(observer, mask);
     }
 
-    /// # Panics
-    ///
-    /// Panics if the broker returns a protocol response that does not match the
-    /// issued event request.
     fn check_io_events(&self) -> Events {
         let Ok(response) = self.request_event(EventRequest::Wait(WaitEventRequest {
             handle: self.handle,
