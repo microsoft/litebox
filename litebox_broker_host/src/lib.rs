@@ -118,44 +118,34 @@ fn handle_core_request(session: &BrokerSession, request: CoreRequest) -> BrokerR
 
 fn handle_event_request(session: &BrokerSession, request: EventRequest) -> BrokerResponse {
     match request {
-        EventRequest::Create(request) => {
-            handle_core_result(event::create(session, request.initial_count), |handle| {
-                BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(
-                    CreateEventResponse { handle },
-                )))
-            })
+        EventRequest::Create(request) => match event::create(session, request.initial_count) {
+            Ok(handle) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(
+                CreateEventResponse { handle },
+            ))),
+            Err(error) => BrokerResponse::Error(error.into()),
+        },
+        EventRequest::Wait(request) => match event::wait(session, request.handle) {
+            Ok(readiness) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
+                WaitEventResponse { readiness },
+            ))),
+            Err(error) => BrokerResponse::Error(error.into()),
+        },
+        EventRequest::Add(request) => {
+            match event::add(session, request.handle, request.value) {
+                Ok(readiness) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(
+                    AddEventResponse { readiness },
+                ))),
+                Err(error) => BrokerResponse::Error(error.into()),
+            }
         }
-        EventRequest::Wait(request) => {
-            handle_core_result(event::wait(session, request.handle), |readiness| {
-                BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
-                    WaitEventResponse { readiness },
-                )))
-            })
+        EventRequest::Consume(request) => {
+            match event::consume(session, request.handle, request.mode) {
+                Ok(consumption) => {
+                    BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(consumption)))
+                }
+                Err(error) => BrokerResponse::Error(error.into()),
+            }
         }
-        EventRequest::Add(request) => handle_core_result(
-            event::add(session, request.handle, request.value),
-            |readiness| {
-                BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(AddEventResponse {
-                    readiness,
-                })))
-            },
-        ),
-        EventRequest::Consume(request) => handle_core_result(
-            event::consume(session, request.handle, request.mode),
-            |consumption| {
-                BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(consumption)))
-            },
-        ),
-    }
-}
-
-fn handle_core_result<T>(
-    result: litebox_broker_core::Result<T>,
-    into_response: impl FnOnce(T) -> BrokerResponse,
-) -> BrokerResponse {
-    match result {
-        Ok(value) => into_response(value),
-        Err(error) => BrokerResponse::Error(error.into()),
     }
 }
 
