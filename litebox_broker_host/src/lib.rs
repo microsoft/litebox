@@ -14,7 +14,7 @@ extern crate std;
 
 use core::fmt;
 
-use litebox_broker_core::{BrokerCore, BrokerError, BrokerSession, CallerCredential, event};
+use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential, event};
 use litebox_broker_protocol::{
     AddEventResponse, BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest,
     CoreResponse, CreateEventResponse, ErrorCode, EventRequest, EventResponse, HostControlChannel,
@@ -165,19 +165,7 @@ fn handle_core_result<T>(
 ) -> BrokerResponse {
     match result {
         Ok(value) => into_response(value),
-        Err(error) => BrokerResponse::Error(to_protocol_error(error)),
-    }
-}
-
-fn to_protocol_error(error: BrokerError) -> ErrorCode {
-    match error {
-        BrokerError::PolicyDenied => ErrorCode::PolicyDenied,
-        BrokerError::UnknownObject => ErrorCode::UnknownObject,
-        BrokerError::InvalidRights => ErrorCode::InvalidRights,
-        BrokerError::ResourceExhausted => ErrorCode::ResourceExhausted,
-        BrokerError::WouldBlock => ErrorCode::WouldBlock,
-        BrokerError::UnsupportedOperation => ErrorCode::UnsupportedOperation,
-        _ => ErrorCode::Internal,
+        Err(error) => BrokerResponse::Error(error.into()),
     }
 }
 
