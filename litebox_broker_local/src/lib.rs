@@ -20,7 +20,7 @@ use litebox_broker_protocol::{
     LocalControlChannel,
 };
 
-pub use error::{BrokerLocalError, Result};
+pub use error::{BrokerLocalError, BrokerLocalNegotiationError, NegotiationResult, Result};
 
 /// Typed broker-local control adapter for broker operations.
 pub struct BrokerLocal<T> {
@@ -36,19 +36,21 @@ impl<T> BrokerLocal<T> {
 
 impl<T: LocalControlChannel> BrokerLocal<T> {
     /// Negotiates the broker protocol over an already-connected control channel.
-    pub fn negotiate(mut channel: T) -> Result<Self, T::Error> {
+    pub fn negotiate(mut channel: T) -> NegotiationResult<Self, T::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         match raw_request(
             &mut channel,
             BrokerRequest::Negotiate {
                 protocol_version: requested,
             },
+            BrokerLocalNegotiationError::Channel,
+            BrokerLocalNegotiationError::ChannelClosed,
         )? {
             BrokerResponse::Negotiated {
                 broker_protocol_version,
             } => {
                 if requested != broker_protocol_version {
-                    return Err(BrokerLocalError::IncompatibleNegotiation {
+                    return Err(BrokerLocalNegotiationError::IncompatibleNegotiation {
                         requested,
                         broker_protocol_version,
                     });
@@ -57,20 +59,25 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
             }
             BrokerResponse::VersionMismatch {
                 broker_protocol_version,
-            } => Err(BrokerLocalError::UnsupportedVersion {
+            } => Err(BrokerLocalNegotiationError::UnsupportedVersion {
                 requested,
                 broker_protocol_version,
             }),
-            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
+            BrokerResponse::Error(error) => Err(BrokerLocalNegotiationError::Broker(error)),
             response @ BrokerResponse::Core(_) => {
-                Err(BrokerLocalError::UnexpectedResponse(response))
+                Err(BrokerLocalNegotiationError::UnexpectedResponse(response))
             }
         }
     }
 
     /// Sends one active BrokerCore request.
     pub fn request(&mut self, request: CoreRequest) -> Result<CoreResponse, T::Error> {
-        match raw_request(&mut self.channel, BrokerRequest::Core(request))? {
+        match raw_request(
+            &mut self.channel,
+            BrokerRequest::Core(request),
+            BrokerLocalError::Channel,
+            BrokerLocalError::ChannelClosed,
+        )? {
             BrokerResponse::Core(response) => Ok(response),
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => Err(BrokerLocalError::UnexpectedResponse(response)),
@@ -78,17 +85,17 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     }
 }
 
-fn raw_request<T: LocalControlChannel>(
+fn raw_request<T: LocalControlChannel, E>(
     channel: &mut T,
     request: BrokerRequest,
-) -> Result<BrokerResponse, T::Error> {
-    channel
-        .send_request(&request)
-        .map_err(BrokerLocalError::Channel)?;
+    channel_error: impl Fn(T::Error) -> E,
+    channel_closed: E,
+) -> core::result::Result<BrokerResponse, E> {
+    channel.send_request(&request).map_err(&channel_error)?;
     channel
         .recv_response()
-        .map_err(BrokerLocalError::Channel)?
-        .ok_or(BrokerLocalError::ChannelClosed)
+        .map_err(&channel_error)?
+        .ok_or(channel_closed)
 }
 
 #[cfg(test)]
@@ -141,7 +148,7 @@ mod tests {
 
         assert!(matches!(
             BrokerLocal::negotiate(channel),
-            Err(BrokerLocalError::IncompatibleNegotiation {
+            Err(BrokerLocalNegotiationError::IncompatibleNegotiation {
                 requested,
                 broker_protocol_version: broker
             }) if requested == BROKER_PROTOCOL_VERSION && broker == broker_protocol_version
@@ -157,7 +164,7 @@ mod tests {
 
         assert!(matches!(
             BrokerLocal::negotiate(channel),
-            Err(BrokerLocalError::UnsupportedVersion {
+            Err(BrokerLocalNegotiationError::UnsupportedVersion {
                 requested,
                 broker_protocol_version: broker
             }) if requested == BROKER_PROTOCOL_VERSION && broker == broker_protocol_version

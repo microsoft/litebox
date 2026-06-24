@@ -56,10 +56,6 @@ where
                 }
                 BrokerLocalError::Broker(error) => BrokerControlError::Broker(error),
                 BrokerLocalError::UnexpectedResponse(_) => BrokerControlError::UnexpectedResponse,
-                BrokerLocalError::IncompatibleNegotiation { .. }
-                | BrokerLocalError::UnsupportedVersion { .. } => {
-                    unreachable!("negotiation errors cannot occur on active broker requests")
-                }
             })?;
         Ok(response)
     }
