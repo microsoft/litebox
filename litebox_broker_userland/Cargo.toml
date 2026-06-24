@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.33", features = ["derive"] }
+libc = { version = "0.2.169", default-features = false }
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
 litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
@@ -20,7 +21,6 @@ path = "tests/userland_broker.rs"
 harness = false
 
 [dev-dependencies]
-libc = { version = "0.2.169", default-features = false }
 litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 
