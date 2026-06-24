@@ -8,7 +8,6 @@ use crate::event::{counter::EventCounterError, polling::TryOpError};
 
 /// Error returned by the deployment-provided broker control path.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
 pub(crate) enum BrokerControlError {
     #[error("broker control transport failed")]
     Transport,

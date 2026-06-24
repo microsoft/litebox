@@ -342,7 +342,6 @@ struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
 
 /// Potential errors when writing or reading from a pipe
 #[derive(Error, Debug)]
-#[non_exhaustive]
 enum PipeError {
     #[error("this end has been shut down")]
     ThisEndShutdown,

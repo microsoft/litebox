@@ -85,14 +85,16 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
                             broker_protocol_version,
                         }),
                         BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-                        response => Err(BrokerLocalError::UnexpectedResponse(response)),
+                        response @ BrokerResponse::Core(_) => {
+                            Err(BrokerLocalError::UnexpectedResponse(response))
+                        }
                     }
                 }
-                _ => Err(BrokerLocalError::NotNegotiated),
+                BrokerRequest::Core(_) => Err(BrokerLocalError::NotNegotiated),
             },
             ConnectionState::Active => match request {
                 BrokerRequest::Negotiate { .. } => Err(BrokerLocalError::AlreadyNegotiated),
-                request => match self.raw_request(request)? {
+                request @ BrokerRequest::Core(_) => match self.raw_request(request)? {
                     BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
                     response => Ok(response),
                 },

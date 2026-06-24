@@ -131,7 +131,6 @@ impl From<SocketAddrV4> for CSockInetAddr {
 
 /// Socket address structure for different address families.
 /// Currently only supports IPv4 (AF_INET).
-#[non_exhaustive]
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum SocketAddress {
     Inet(SocketAddr),
@@ -148,14 +147,14 @@ impl SocketAddress {
     pub(crate) fn inet(self) -> Option<SocketAddr> {
         match self {
             SocketAddress::Inet(addr) => Some(addr),
-            _ => None,
+            SocketAddress::Unix(_) => None,
         }
     }
 
     pub(crate) fn unix(self) -> Option<UnixSocketAddr> {
         match self {
             SocketAddress::Unix(addr) => Some(addr),
-            _ => None,
+            SocketAddress::Inet(_) => None,
         }
     }
 }

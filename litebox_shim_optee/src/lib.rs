@@ -1151,7 +1151,6 @@ impl TeeCrypState {
 }
 
 #[allow(clippy::enum_variant_names)]
-#[non_exhaustive]
 #[derive(Clone)]
 pub(crate) enum Cipher {
     Aes128Ctr(Ctr128BE<Aes128>),

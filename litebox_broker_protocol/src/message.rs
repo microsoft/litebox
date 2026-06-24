@@ -13,7 +13,6 @@ use crate::{
 /// domain-specific operations are grouped below it so new object families do not
 /// accumulate as unrelated top-level broker variants.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum BrokerRequest {
     /// Protocol negotiation request.
     Negotiate {
@@ -26,7 +25,6 @@ pub enum BrokerRequest {
 
 /// Request adapted by the broker host into a BrokerCore domain call.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum CoreRequest {
     /// Event object request family.
     Event(EventRequest),
@@ -34,7 +32,6 @@ pub enum CoreRequest {
 
 /// Broker-owned event object request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum EventRequest {
     /// Create a broker-owned event object.
     Create(CreateEventRequest),
@@ -52,7 +49,6 @@ pub enum EventRequest {
 /// grouped under [`CoreResponse`] so future object families can evolve without
 /// turning the broker envelope into a flat operation/result list.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum BrokerResponse {
     /// Negotiation result.
     Negotiated {
@@ -79,7 +75,6 @@ pub enum BrokerResponse {
 
 /// Response returned by a BrokerCore domain request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum CoreResponse {
     /// Event object response family.
     Event(EventResponse),
@@ -87,7 +82,6 @@ pub enum CoreResponse {
 
 /// Broker-owned event object response.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum EventResponse {
     /// Create operation response.
     Create(CreateEventResponse),
