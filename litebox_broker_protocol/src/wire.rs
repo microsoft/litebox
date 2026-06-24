@@ -47,8 +47,6 @@ pub enum WireError {
     InvalidBoolean,
     #[error("invalid broker wire tag")]
     InvalidTag,
-    #[error("invalid broker error code")]
-    InvalidErrorCode,
     #[error("broker wire offset overflow")]
     OffsetOverflow,
 }
@@ -133,7 +131,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
             BrokerResponse::Core(core_message::decode_core_response(&mut decoder)?)
         }
         RESPONSE_TAG_ERROR => {
-            let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidErrorCode)?;
+            let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerResponse::Error(error)
         }
         _ => return Err(WireError::InvalidTag),
@@ -267,7 +265,7 @@ mod tests {
         );
         assert_eq!(
             decode_response(&[2, 0xff, 0xff]),
-            Err(WireError::InvalidErrorCode)
+            Err(WireError::InvalidTag)
         );
 
         let mut invalid_bool = [1, 0, 2, 2, 0];
