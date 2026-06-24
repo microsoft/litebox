@@ -534,6 +534,24 @@ pub const HV_GENERIC_SET_SPARSE_4K: u64 = 0;
 /// Each bank contains 64 VPs.
 pub const HV_FLUSH_EX_VP_SET_BANKS: usize = MAX_CORES.div_ceil(64);
 
+/// `valid_bank_mask` value that marks every VP-set bank valid.
+///
+/// The sparse VP-set format permits a *valid* bank to carry an all-zero
+/// contents mask (no VPs). Always declaring all `HV_FLUSH_EX_VP_SET_BANKS`
+/// banks valid lets the input keep a fixed-size `vp_set_bank_contents` array
+/// while targeting the VPs whose bits are set. Empty banks -> no flush.
+pub const HV_FLUSH_EX_ALL_BANKS_VALID: u64 = (1u64 << HV_FLUSH_EX_VP_SET_BANKS) - 1;
+
+/// Number of 64-bit words the VP set contributes to an EX flush hypercall's
+/// variable header (`varhead`).
+///
+/// Only `vp_set_bank_contents` is variable-header; `vp_set_format` and
+/// `vp_set_valid_bank_mask` are part of the hypercall's fixed input header.
+/// All `HV_FLUSH_EX_VP_SET_BANKS` banks are always sent, so this applies to
+/// both `HvInputFlushVirtualAddressSpaceEx` and `HvInputFlushVirtualAddressListEx`.
+#[expect(clippy::cast_possible_truncation)]
+pub const HV_FLUSH_EX_VP_SET_QWORD_COUNT: u16 = HV_FLUSH_EX_VP_SET_BANKS as u16;
+
 /// Input structure for `HvCallFlushVirtualAddressSpaceEx` (0x0013).
 ///
 /// Layout (<https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/hypercalls/hvcallflushvirtualaddressspaceex>):
@@ -579,10 +597,6 @@ const HV_FLUSH_EX_MAX_GVAS: usize = ((PAGE_SIZE as u32
     / (u64::BITS / 8)) as usize;
 
 impl HvInputFlushVirtualAddressListEx {
-    /// Number of 64-bit words occupied by the VP-set variable header.
-    #[allow(clippy::cast_possible_truncation)]
-    pub const VP_SET_QWORD_COUNT: u16 = (2 + HV_FLUSH_EX_VP_SET_BANKS) as u16;
-
     /// Maximum number of GVA range entries per EX hypercall invocation.
     pub const MAX_GVAS_PER_REQUEST: usize = HV_FLUSH_EX_MAX_GVAS;
 }
