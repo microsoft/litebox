@@ -37,6 +37,12 @@ use crate::{ShimFS, Task};
 struct ElfFile<'a, FS: ShimFS> {
     task: &'a Task<FS>,
     fd: i32,
+    /// When `true`, [`reserve`](litebox_common_linux::loader::MapMemory::reserve)
+    /// places this image at the top of the address space (top-down)
+    /// instead of at [`PIE_LOAD_OFFSET`](super::PIE_LOAD_OFFSET). Set for
+    /// the ELF interpreter so it does not cap a low-loaded ET_EXEC main's
+    /// brk heap.
+    load_high: bool,
 }
 
 impl<'a, FS: ShimFS> ElfFile<'a, FS> {
@@ -48,7 +54,11 @@ impl<'a, FS: ShimFS> ElfFile<'a, FS> {
                 Mode::empty(),
             )?
             .reinterpret_as_signed();
-        Ok(ElfFile { task, fd })
+        Ok(ElfFile {
+            task,
+            fd,
+            load_high: false,
+        })
     }
 }
 
@@ -96,9 +106,26 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
-        // Start PIE binaries at a fixed offset into the partition so that the
-        // low addresses remain unmapped (NULL-dereference guard region).
-        let hint = self.task.process_state.borrow().pm.addr_min() + super::PIE_LOAD_OFFSET;
+        let hint = {
+            let process_state = self.task.process_state.borrow();
+            if self.load_high {
+                // Load the ELF interpreter at the top of the address
+                // space (top-down), mirroring how the kernel places
+                // `ld.so` for an ET_EXEC main. Hinting at `addr_max()` is
+                // out of range, so `sys_mmap` falls through to its
+                // top-down search — the same path a PIE main's
+                // interpreter already takes when the `PIE_LOAD_OFFSET`
+                // slot is occupied. This keeps the gap above a
+                // low-loaded ET_EXEC main free for the brk heap to grow
+                // into, instead of capping it at `PIE_LOAD_OFFSET`.
+                process_state.pm.addr_max()
+            } else {
+                // Start PIE binaries at a fixed offset into the partition
+                // so that the low addresses remain unmapped
+                // (NULL-dereference guard region).
+                process_state.pm.addr_min() + super::PIE_LOAD_OFFSET
+            }
+        };
 
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
@@ -1285,7 +1312,12 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
 
         // Parse the interpreter ELF file, if any.
         let interp = if let Some(interp_name) = main.parsed.interp(&mut &main.file)? {
-            Some(FileAndParsed::new(task, interp_name)?)
+            let mut interp = FileAndParsed::new(task, interp_name)?;
+            // Load the interpreter top-down (high in the address space)
+            // so it does not cap a low-loaded ET_EXEC main's brk heap.
+            // See `ElfFile::reserve` / `ElfFile::load_high`.
+            interp.file.load_high = true;
+            Some(interp)
         } else {
             None
         };

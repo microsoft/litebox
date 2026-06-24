@@ -19,6 +19,7 @@ pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
 pub(crate) mod fork_pipe_inheritance;
 pub(crate) mod getrandom_tests;
+pub(crate) mod heap_layout;
 pub(crate) mod hypb;
 pub(crate) mod inherit_matrix;
 pub(crate) mod inotify;
@@ -1038,6 +1039,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     shell::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     vscode_shape::register_cli_startup_mimic_tests(&mut registry::Registry::new(&mut tests));
     vscode_shape::register_vscode_shape_tests(&mut registry::Registry::new(&mut tests));
+    heap_layout::register_heap_layout_tests(&mut registry::Registry::new(&mut tests));
     shell::register_bg_redirect_poll_tests(&mut registry::Registry::new(&mut tests));
     shell::register_bg_redirect_stdin_poll_tests(&mut registry::Registry::new(&mut tests));
     pipe_bridge::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
