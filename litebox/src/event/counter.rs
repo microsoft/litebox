@@ -61,8 +61,8 @@ where
                 CreateEventRequest { initial_count },
             )))
             .map_err(BrokerObjectError::from)
-            .map(event_response_from_core)
             .map_err(EventCounterError::from)?;
+        let CoreResponse::Event(response) = response;
         let EventResponse::Create(response) = response else {
             return Err(BrokerObjectError::UnexpectedResponse.into());
         };
@@ -134,10 +134,11 @@ where
     }
 
     fn request_event(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
-        self.broker
+        let CoreResponse::Event(response) = self
+            .broker
             .request(CoreRequest::Event(request))
-            .map_err(BrokerObjectError::from)
-            .map(event_response_from_core)
+            .map_err(BrokerObjectError::from)?;
+        Ok(response)
     }
 }
 
@@ -167,11 +168,5 @@ where
             events |= Events::OUT;
         }
         events
-    }
-}
-
-fn event_response_from_core(response: CoreResponse) -> EventResponse {
-    match response {
-        CoreResponse::Event(response) => response,
     }
 }

@@ -80,19 +80,25 @@ fn handle_request(
             BrokerRequest::Negotiate { protocol_version } => {
                 if protocol_version == BROKER_PROTOCOL_VERSION {
                     *state = ConnectionState::Active;
-                    BrokerDispatch::continue_after(BrokerResponse::Negotiated {
-                        broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                    })
+                    BrokerDispatch {
+                        response: BrokerResponse::Negotiated {
+                            broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                        },
+                        outcome: DispatchOutcome::Continue,
+                    }
                 } else {
-                    BrokerDispatch::continue_after(BrokerResponse::VersionMismatch {
-                        broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                    })
+                    BrokerDispatch {
+                        response: BrokerResponse::VersionMismatch {
+                            broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                        },
+                        outcome: DispatchOutcome::Continue,
+                    }
                 }
             }
-            BrokerRequest::Core(_) => BrokerDispatch::close_after(
-                BrokerResponse::Error(ErrorCode::ProtocolState),
-                CloseReason::ProtocolViolation,
-            ),
+            BrokerRequest::Core(_) => BrokerDispatch {
+                response: BrokerResponse::Error(ErrorCode::ProtocolState),
+                outcome: DispatchOutcome::Close(CloseReason::ProtocolViolation),
+            },
         },
         ConnectionState::Active => handle_active_request(session, request),
     }
@@ -100,19 +106,14 @@ fn handle_request(
 
 fn handle_active_request(session: &BrokerSession, request: BrokerRequest) -> BrokerDispatch {
     match request {
-        BrokerRequest::Negotiate { .. } => BrokerDispatch::close_after(
-            BrokerResponse::Error(ErrorCode::ProtocolState),
-            CloseReason::ProtocolViolation,
-        ),
-        BrokerRequest::Core(request) => {
-            BrokerDispatch::continue_after(handle_core_request(session, request))
-        }
-    }
-}
-
-fn handle_core_request(session: &BrokerSession, request: CoreRequest) -> BrokerResponse {
-    match request {
-        CoreRequest::Event(request) => handle_event_request(session, request),
+        BrokerRequest::Negotiate { .. } => BrokerDispatch {
+            response: BrokerResponse::Error(ErrorCode::ProtocolState),
+            outcome: DispatchOutcome::Close(CloseReason::ProtocolViolation),
+        },
+        BrokerRequest::Core(CoreRequest::Event(request)) => BrokerDispatch {
+            response: handle_event_request(session, request),
+            outcome: DispatchOutcome::Continue,
+        },
     }
 }
 
@@ -165,22 +166,6 @@ struct BrokerDispatch {
 enum DispatchOutcome {
     Continue,
     Close(CloseReason),
-}
-
-impl BrokerDispatch {
-    const fn continue_after(response: BrokerResponse) -> Self {
-        Self {
-            response,
-            outcome: DispatchOutcome::Continue,
-        }
-    }
-
-    const fn close_after(response: BrokerResponse, reason: CloseReason) -> Self {
-        Self {
-            response,
-            outcome: DispatchOutcome::Close(reason),
-        }
-    }
 }
 
 /// Reason the broker host closed the connection after sending a response.
