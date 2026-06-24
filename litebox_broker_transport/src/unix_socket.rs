@@ -84,8 +84,7 @@ impl UnixStreamLocalControlChannel {
     }
 
     fn clear_active_request_deadline(&mut self) -> IoResult<()> {
-        if self.io_deadline.is_none() {
-            self.active_request_deadline = None;
+        if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
             self.set_stream_io_timeout(self.io_timeout)?;
         }
         Ok(())
