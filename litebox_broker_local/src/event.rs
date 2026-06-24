@@ -24,7 +24,9 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
             self.request_event(EventRequest::Create(CreateEventRequest { initial_count }))?;
         match response {
             EventResponse::Create(response) => Ok(response.handle),
-            response => Err(unexpected_event_response(response)),
+            response => Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(
+                CoreResponse::Event(response),
+            ))),
         }
     }
 
@@ -33,7 +35,9 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         let response = self.request_event(EventRequest::Wait(WaitEventRequest { handle }))?;
         match response {
             EventResponse::Wait(response) => Ok(response.readiness),
-            response => Err(unexpected_event_response(response)),
+            response => Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(
+                CoreResponse::Event(response),
+            ))),
         }
     }
 
@@ -46,7 +50,9 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         let response = self.request_event(EventRequest::Add(AddEventRequest { handle, value }))?;
         match response {
             EventResponse::Add(response) => Ok(response.readiness),
-            response => Err(unexpected_event_response(response)),
+            response => Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(
+                CoreResponse::Event(response),
+            ))),
         }
     }
 
@@ -60,7 +66,9 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
             self.request_event(EventRequest::Consume(ConsumeEventRequest { handle, mode }))?;
         match response {
             EventResponse::Consume(response) => Ok(response),
-            response => Err(unexpected_event_response(response)),
+            response => Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(
+                CoreResponse::Event(response),
+            ))),
         }
     }
 
@@ -68,8 +76,4 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         let CoreResponse::Event(response) = self.request(CoreRequest::Event(request))?;
         Ok(response)
     }
-}
-
-fn unexpected_event_response<E>(response: EventResponse) -> BrokerLocalError<E> {
-    BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(CoreResponse::Event(response)))
 }
