@@ -17,13 +17,12 @@ use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
-const RUNNER_BINARY: &str = "litebox_runner_linux_userland";
 
 #[derive(Parser, Debug)]
 struct CliArgs {
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
-    runner: Option<PathBuf>,
+    runner: PathBuf,
     /// Arguments to pass to the local runner.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
@@ -38,8 +37,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
 
-    let runner = args.runner.unwrap_or(default_runner_path()?);
-    let mut runner = RunnerChild::new(spawn_runner(&runner, &socket_path, &args.runner_arguments)?);
+    let mut runner = RunnerChild::new(spawn_runner(
+        &args.runner,
+        &socket_path,
+        &args.runner_arguments,
+    )?);
     let (stream, _) = accept_runner_connection(&listener, runner.child_mut())?;
     let runner_status = {
         let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
@@ -101,11 +103,6 @@ fn runner_exited_before_connecting(status: ExitStatus) -> io::Error {
     io::Error::other(format!(
         "local runner exited before connecting to broker: {status}"
     ))
-}
-
-fn default_runner_path() -> io::Result<PathBuf> {
-    let current_exe = std::env::current_exe()?;
-    Ok(current_exe.with_file_name(RUNNER_BINARY))
 }
 
 struct RunnerChild {
