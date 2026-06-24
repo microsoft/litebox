@@ -27,14 +27,12 @@ pub struct BrokerLocal<T> {
     channel: T,
 }
 
-impl<T> BrokerLocal<T> {
+impl<T: LocalControlChannel> BrokerLocal<T> {
     /// Returns the underlying control channel for deployment-specific configuration.
     pub fn control_channel_mut(&mut self) -> &mut T {
         &mut self.channel
     }
-}
 
-impl<T: LocalControlChannel> BrokerLocal<T> {
     /// Negotiates the broker protocol over an already-connected control channel.
     pub fn negotiate(mut channel: T) -> Result<Self, T::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
