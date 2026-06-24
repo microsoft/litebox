@@ -37,8 +37,8 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the broker returns a protocol response that does not match the
-    /// negotiation request.
+    /// Panics if the broker reports an unrecoverable error or returns a protocol
+    /// response that does not match the negotiation request.
     pub fn negotiate(mut channel: Channel) -> Result<Self, Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         match raw_request(
@@ -59,7 +59,16 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             BrokerResponse::VersionMismatch { .. } => {
                 Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
             }
-            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
+            BrokerResponse::Error(error) => match error {
+                ErrorCode::UnsupportedVersion | ErrorCode::PolicyDenied => {
+                    Err(BrokerLocalError::Broker(error))
+                }
+                ErrorCode::MalformedRequest
+                | ErrorCode::ProtocolState
+                | ErrorCode::UnsupportedOperation
+                | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
+                _ => panic!("broker returned unexpected negotiation error: {error}"),
+            },
             response @ BrokerResponse::Core(_) => {
                 panic!("broker returned unexpected negotiation response: {response:?}")
             }
@@ -70,12 +79,24 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the broker returns a protocol response that does not match an
-    /// active core request.
+    /// Panics if the broker reports an unrecoverable error or returns a protocol
+    /// response that does not match an active core request.
     pub fn request(&mut self, request: CoreRequest) -> Result<CoreResponse, Channel::Error> {
         match raw_request(&mut self.channel, BrokerRequest::Core(request))? {
             BrokerResponse::Core(response) => Ok(response),
-            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
+            BrokerResponse::Error(error) => match error {
+                ErrorCode::PolicyDenied
+                | ErrorCode::UnknownObject
+                | ErrorCode::InvalidRights
+                | ErrorCode::ResourceExhausted
+                | ErrorCode::WouldBlock => Err(BrokerLocalError::Broker(error)),
+                ErrorCode::UnsupportedVersion
+                | ErrorCode::MalformedRequest
+                | ErrorCode::ProtocolState
+                | ErrorCode::UnsupportedOperation
+                | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
+                _ => panic!("broker returned unsupported error: {error}"),
+            },
             response => panic!("broker returned unexpected active response: {response:?}"),
         }
     }
@@ -136,6 +157,32 @@ mod tests {
     }
 
     #[test]
+    fn active_request_returns_recoverable_broker_error() {
+        let request = CoreRequest::Event(EventRequest::Create(CreateEventRequest {
+            initial_count: 0,
+        }));
+        let channel = FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::WouldBlock)));
+        let mut local = BrokerLocal { channel };
+
+        assert!(matches!(
+            local.request(request),
+            Err(BrokerLocalError::Broker(ErrorCode::WouldBlock))
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "broker returned unrecoverable error")]
+    fn active_request_panics_on_unrecoverable_broker_error() {
+        let request = CoreRequest::Event(EventRequest::Create(CreateEventRequest {
+            initial_count: 0,
+        }));
+        let channel = FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::Internal)));
+        let mut local = BrokerLocal { channel };
+
+        let _ = local.request(request);
+    }
+
+    #[test]
     #[should_panic(expected = "broker returned unexpected negotiation response")]
     fn negotiate_rejects_broker_different_version_response() {
         let broker_protocol_version = ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1);
@@ -157,6 +204,14 @@ mod tests {
             BrokerLocal::negotiate(channel),
             Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
         ));
+    }
+
+    #[test]
+    #[should_panic(expected = "broker returned unrecoverable error")]
+    fn negotiate_panics_on_unrecoverable_broker_error() {
+        let channel = FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::Internal)));
+
+        let _ = BrokerLocal::negotiate(channel);
     }
 
     struct FakeControlChannel {

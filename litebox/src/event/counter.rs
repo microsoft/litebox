@@ -55,8 +55,8 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if the broker returns a protocol response that does not match the
-    /// issued event request.
+    /// Panics if the broker reports an unrecoverable error or returns a protocol
+    /// response that does not match the issued event request.
     pub fn new(litebox: &LiteBox<Platform>, initial_count: u64) -> Result<Self, EventCounterError> {
         let Some(broker) = litebox.broker_control() else {
             return Err(EventCounterError::Unavailable);
