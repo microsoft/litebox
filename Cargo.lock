@@ -1817,6 +1817,7 @@ dependencies = [
  "bitvec",
  "libc",
  "litebox",
+ "litebox_broker_protocol",
  "litebox_common_linux",
  "litebox_platform_multiplex",
  "litebox_syscall_rewriter",

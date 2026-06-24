@@ -4,10 +4,9 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
-pub use litebox_broker_protocol::event::EventConsumeMode as EventCounterReadMode;
 use litebox_broker_protocol::event::{
-    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest, ReadinessState,
-    WaitEventRequest,
+    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
+    EventConsumeMode, ReadinessState, WaitEventRequest,
 };
 use litebox_broker_protocol::message::{CoreRequest, CoreResponse, EventRequest, EventResponse};
 use thiserror::Error;
@@ -84,7 +83,7 @@ where
         &self,
         cx: &WaitContext<'_, Platform>,
         nonblock: bool,
-        mode: EventCounterReadMode,
+        mode: EventConsumeMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
         self.pollee.wait(cx, nonblock, Events::IN, || {
             let response = self.consume(mode)?;
@@ -114,10 +113,7 @@ where
         })
     }
 
-    fn consume(
-        &self,
-        mode: EventCounterReadMode,
-    ) -> Result<ConsumeEventResponse, BrokerObjectError> {
+    fn consume(&self, mode: EventConsumeMode) -> Result<ConsumeEventResponse, BrokerObjectError> {
         let response = self.request_event(EventRequest::Consume(ConsumeEventRequest {
             handle: self.handle,
             mode,
