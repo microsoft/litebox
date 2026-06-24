@@ -3,9 +3,8 @@
 
 use std::error::Error;
 use std::ffi::OsString;
-use std::io;
 use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use clap::Parser;
@@ -34,25 +33,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         PrincipalRights::all(),
     ))?;
 
-    spawn_runner(&args.runner, &socket_path, &args.runner_arguments)?;
+    Command::new(&args.runner)
+        .arg("--unstable")
+        .arg("--broker-socket")
+        .arg(&socket_path)
+        .args(&args.runner_arguments)
+        .spawn()?;
 
     loop {
         let (stream, _) = listener.accept()?;
         let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
         serve_connection(&broker, &mut channel)?;
     }
-}
-
-fn spawn_runner(
-    runner: &Path,
-    socket_path: &Path,
-    runner_arguments: &[OsString],
-) -> io::Result<()> {
-    Command::new(runner)
-        .arg("--unstable")
-        .arg("--broker-socket")
-        .arg(socket_path)
-        .args(runner_arguments)
-        .spawn()?;
-    Ok(())
 }
