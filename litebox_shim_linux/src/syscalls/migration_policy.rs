@@ -202,8 +202,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             independent_fork: IndependentForkPolicy::CfgOnlyVariant,
         },
         // eventfd / timerfd / pidfd all share `EventfdSubsystem`.
-        // Two separate emit loops handle eventfd promotion and
-        // timerfd snapshot respectively.
+        // A single emit loop bridges broker-backed handles.
         RawFdRef::Eventfd(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::EVENTFD_AND_TIMERFD_BRIDGE_LOOP_NAME,

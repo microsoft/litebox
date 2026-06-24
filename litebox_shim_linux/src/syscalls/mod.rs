@@ -46,11 +46,9 @@ pub use broker_tcp_conn::{
 pub use broker_unix_stream::{broker_unix_stream_provider, set_broker_unix_stream_provider};
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::broker_pgrp_signal_provider;
-pub use eventfd::broker_pidfd_provider;
 pub use eventfd::broker_timerfd_provider;
 pub use eventfd::set_broker_eventfd_provider;
 pub use eventfd::set_broker_pgrp_signal_provider;
-pub use eventfd::set_broker_pidfd_provider;
 pub use eventfd::set_broker_timerfd_provider;
 pub use guest_pid::{
     broker_guest_pid_provider, set_broker_guest_pid_provider, try_mark_broker_process_exited,
