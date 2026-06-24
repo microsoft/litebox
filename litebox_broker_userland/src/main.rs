@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
@@ -34,11 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         PrincipalRights::all(),
     ))?;
 
-    let _runner = RunnerChild::new(spawn_runner(
-        &args.runner,
-        &socket_path,
-        &args.runner_arguments,
-    )?);
+    spawn_runner(&args.runner, &socket_path, &args.runner_arguments)?;
 
     loop {
         let (stream, _) = listener.accept()?;
@@ -51,39 +47,12 @@ fn spawn_runner(
     runner: &Path,
     socket_path: &Path,
     runner_arguments: &[OsString],
-) -> io::Result<Child> {
+) -> io::Result<()> {
     Command::new(runner)
         .arg("--unstable")
         .arg("--broker-socket")
         .arg(socket_path)
         .args(runner_arguments)
-        .spawn()
-}
-
-struct RunnerChild {
-    child: Option<Child>,
-}
-
-impl RunnerChild {
-    const fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
-}
-
-impl Drop for RunnerChild {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            match child.try_wait() {
-                Ok(Some(_status)) => {}
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(_error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
-        }
-    }
+        .spawn()?;
+    Ok(())
 }
