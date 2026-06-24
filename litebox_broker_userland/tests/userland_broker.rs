@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,13 +16,43 @@ use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 #[test]
 fn separate_process_broker_spawns_runner_and_serves_until_stopped() {
-    let runner = TestRunnerScript::new();
-    let mut broker = ChildGuard::new(spawn_broker(&runner));
+    let dir = tempfile::Builder::new()
+        .prefix("litebox-broker-userland-test-")
+        .tempdir()
+        .unwrap();
+    let runner_path = dir.path().join("test-runner.sh");
+    let status_path = dir.path().join("test-runner.status");
+    fs::write(
+        &runner_path,
+        b"#!/bin/sh
+[ \"$1\" = \"--unstable\" ] || exit 1
+[ \"$2\" = \"--broker-socket\" ] || exit 1
+socket=$3
+shift 3
+LITEBOX_BROKER_TEST_SOCKET=\"$socket\" \"$LITEBOX_BROKER_TEST_EXE\" \"$@\" --exact --nocapture
+echo \"$?\" > \"$LITEBOX_BROKER_TEST_STATUS\"
+",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&runner_path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&runner_path, permissions).unwrap();
+
+    let mut broker = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
+            .arg("--runner")
+            .arg(&runner_path)
+            .arg("broker_test_runner_child")
+            .env("LITEBOX_BROKER_TEST_EXE", env::current_exe().unwrap())
+            .env("LITEBOX_BROKER_TEST_STATUS", &status_path)
+            .spawn()
+            .unwrap(),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if runner.status_path.exists() {
-            let status = fs::read_to_string(&runner.status_path).unwrap();
+        if status_path.exists() {
+            let status = fs::read_to_string(&status_path).unwrap();
             assert_eq!(status.trim(), "0");
             return;
         }
@@ -72,17 +102,6 @@ fn broker_test_runner_child() {
     drop(local);
 }
 
-fn spawn_broker(runner: &TestRunnerScript) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
-        .arg("--runner")
-        .arg(&runner.path)
-        .arg("broker_test_runner_child")
-        .env("LITEBOX_BROKER_TEST_EXE", env::current_exe().unwrap())
-        .env("LITEBOX_BROKER_TEST_STATUS", &runner.status_path)
-        .spawn()
-        .unwrap()
-}
-
 struct ChildGuard {
     child: Child,
 }
@@ -102,43 +121,6 @@ impl Drop for ChildGuard {
         if !matches!(self.child.try_wait(), Ok(Some(_status))) {
             let _ = self.child.kill();
             let _ = self.child.wait();
-        }
-    }
-}
-
-struct TestRunnerScript {
-    _dir: tempfile::TempDir,
-    path: PathBuf,
-    status_path: PathBuf,
-}
-
-impl TestRunnerScript {
-    fn new() -> Self {
-        let dir = tempfile::Builder::new()
-            .prefix("litebox-broker-userland-test-")
-            .tempdir()
-            .unwrap();
-        let path = dir.path().join("test-runner.sh");
-        let status_path = dir.path().join("test-runner.status");
-        fs::write(
-            &path,
-            b"#!/bin/sh
-[ \"$1\" = \"--unstable\" ] || exit 1
-[ \"$2\" = \"--broker-socket\" ] || exit 1
-socket=$3
-shift 3
-LITEBOX_BROKER_TEST_SOCKET=\"$socket\" \"$LITEBOX_BROKER_TEST_EXE\" \"$@\" --exact --nocapture
-echo \"$?\" > \"$LITEBOX_BROKER_TEST_STATUS\"
-",
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&path, permissions).unwrap();
-        Self {
-            _dir: dir,
-            path,
-            status_path,
         }
     }
 }
