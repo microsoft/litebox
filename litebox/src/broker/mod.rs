@@ -22,25 +22,29 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<CoreResponse, BrokerControlError>;
 }
 
-pub(crate) struct BrokerLocalControl<Platform: RawSyncPrimitivesProvider, T> {
-    local: Mutex<Platform, BrokerLocal<T>>,
+pub(crate) struct BrokerLocalControl<
+    Platform: RawSyncPrimitivesProvider,
+    Channel: LocalControlChannel + Send,
+> {
+    local: Mutex<Platform, BrokerLocal<Channel>>,
 }
 
-impl<Platform, T> BrokerLocalControl<Platform, T>
+impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
 where
     Platform: RawSyncPrimitivesProvider,
+    Channel: LocalControlChannel + Send,
 {
-    pub(crate) const fn new(local: BrokerLocal<T>) -> Self {
+    pub(crate) const fn new(local: BrokerLocal<Channel>) -> Self {
         Self {
             local: Mutex::new(local),
         }
     }
 }
 
-impl<Platform, T> BrokerControl for BrokerLocalControl<Platform, T>
+impl<Platform, Channel> BrokerControl for BrokerLocalControl<Platform, Channel>
 where
     Platform: RawSyncPrimitivesProvider,
-    T: LocalControlChannel + Send,
+    Channel: LocalControlChannel + Send,
 {
     fn request(
         &self,

@@ -9,9 +9,9 @@ use litebox_broker_protocol::{
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
-impl<T: LocalControlChannel> BrokerLocal<T> {
+impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned event object.
-    pub fn create_event(&mut self) -> Result<ObjectHandle, T::Error> {
+    pub fn create_event(&mut self) -> Result<ObjectHandle, Channel::Error> {
         self.create_event_with_count(0)
     }
 
@@ -19,7 +19,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     pub fn create_event_with_count(
         &mut self,
         initial_count: u64,
-    ) -> Result<ObjectHandle, T::Error> {
+    ) -> Result<ObjectHandle, Channel::Error> {
         let response =
             self.request_event(EventRequest::Create(CreateEventRequest { initial_count }))?;
         match response {
@@ -31,7 +31,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     }
 
     /// Checks whether an event wait would complete now.
-    pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<ReadinessState, T::Error> {
+    pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<ReadinessState, Channel::Error> {
         let response = self.request_event(EventRequest::Wait(WaitEventRequest { handle }))?;
         match response {
             EventResponse::Wait(response) => Ok(response.readiness),
@@ -46,7 +46,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         &mut self,
         handle: ObjectHandle,
         value: u64,
-    ) -> Result<ReadinessState, T::Error> {
+    ) -> Result<ReadinessState, Channel::Error> {
         let response = self.request_event(EventRequest::Add(AddEventRequest { handle, value }))?;
         match response {
             EventResponse::Add(response) => Ok(response.readiness),
@@ -61,7 +61,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         &mut self,
         handle: ObjectHandle,
         mode: EventConsumeMode,
-    ) -> Result<ConsumeEventResponse, T::Error> {
+    ) -> Result<ConsumeEventResponse, Channel::Error> {
         let response =
             self.request_event(EventRequest::Consume(ConsumeEventRequest { handle, mode }))?;
         match response {
@@ -72,7 +72,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         }
     }
 
-    fn request_event(&mut self, request: EventRequest) -> Result<EventResponse, T::Error> {
+    fn request_event(&mut self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
         let CoreResponse::Event(response) = self.request(CoreRequest::Event(request))?;
         Ok(response)
     }

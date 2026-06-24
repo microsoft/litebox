@@ -38,18 +38,18 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     }
 
     /// Create a new [`LiteBox`] instance with a negotiated broker-local control adapter installed.
-    pub fn new_with_broker_local<T>(
+    pub fn new_with_broker_local<Channel>(
         platform: &'static Platform,
-        broker_local: BrokerLocal<T>,
+        broker_local: BrokerLocal<Channel>,
     ) -> Self
     where
-        T: LocalControlChannel + Send + 'static,
+        Channel: LocalControlChannel + Send + 'static,
     {
         Self::new_inner(
             platform,
-            Some(Arc::new(broker::BrokerLocalControl::<Platform, T>::new(
-                broker_local,
-            ))),
+            Some(Arc::new(
+                broker::BrokerLocalControl::<Platform, Channel>::new(broker_local),
+            )),
         )
     }
 

@@ -23,18 +23,18 @@ use litebox_broker_protocol::{
 pub use error::{BrokerLocalError, Result};
 
 /// Typed broker-local control adapter for broker operations.
-pub struct BrokerLocal<T> {
-    channel: T,
+pub struct BrokerLocal<Channel: LocalControlChannel> {
+    channel: Channel,
 }
 
-impl<T: LocalControlChannel> BrokerLocal<T> {
+impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Returns the underlying control channel for deployment-specific configuration.
-    pub fn control_channel_mut(&mut self) -> &mut T {
+    pub fn control_channel_mut(&mut self) -> &mut Channel {
         &mut self.channel
     }
 
     /// Negotiates the broker protocol over an already-connected control channel.
-    pub fn negotiate(mut channel: T) -> Result<Self, T::Error> {
+    pub fn negotiate(mut channel: Channel) -> Result<Self, Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         match raw_request(
             &mut channel,
@@ -61,7 +61,7 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     }
 
     /// Sends one active BrokerCore request.
-    pub fn request(&mut self, request: CoreRequest) -> Result<CoreResponse, T::Error> {
+    pub fn request(&mut self, request: CoreRequest) -> Result<CoreResponse, Channel::Error> {
         match raw_request(&mut self.channel, BrokerRequest::Core(request))? {
             BrokerResponse::Core(response) => Ok(response),
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
@@ -70,10 +70,10 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
     }
 }
 
-fn raw_request<T: LocalControlChannel>(
-    channel: &mut T,
+fn raw_request<Channel: LocalControlChannel>(
+    channel: &mut Channel,
     request: BrokerRequest,
-) -> Result<BrokerResponse, T::Error> {
+) -> Result<BrokerResponse, Channel::Error> {
     channel
         .send_request(&request)
         .map_err(BrokerLocalError::Channel)?;

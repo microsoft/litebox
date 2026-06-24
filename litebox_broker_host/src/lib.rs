@@ -26,12 +26,12 @@ mod error;
 pub use error::{BrokerHostError, Result};
 
 /// Serves one broker connection over the provided connected control channel.
-pub fn serve_connection<T>(
+pub fn serve_connection<Channel>(
     core: &BrokerCore,
-    channel: &mut T,
-) -> Result<ConnectionTermination, T::Error>
+    channel: &mut Channel,
+) -> Result<ConnectionTermination, Channel::Error>
 where
-    T: HostControlChannel,
+    Channel: HostControlChannel,
 {
     let peer_credential = channel
         .peer_credential()
@@ -45,12 +45,12 @@ where
     serve_request_loop(channel, &session)
 }
 
-fn serve_request_loop<T>(
-    channel: &mut T,
+fn serve_request_loop<Channel>(
+    channel: &mut Channel,
     session: &BrokerSession,
-) -> Result<ConnectionTermination, T::Error>
+) -> Result<ConnectionTermination, Channel::Error>
 where
-    T: HostControlChannel,
+    Channel: HostControlChannel,
 {
     let mut state = ConnectionState::AwaitingNegotiation;
     loop {

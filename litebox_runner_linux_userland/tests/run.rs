@@ -359,14 +359,14 @@ fn spawn_test_broker(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-struct CountingHostControlChannel<T> {
-    inner: T,
+struct CountingHostControlChannel<Channel: litebox_broker_protocol::HostControlChannel> {
+    inner: Channel,
     event_request_count: usize,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<T> CountingHostControlChannel<T> {
-    const fn new(inner: T) -> Self {
+impl<Channel: litebox_broker_protocol::HostControlChannel> CountingHostControlChannel<Channel> {
+    const fn new(inner: Channel) -> Self {
         Self {
             inner,
             event_request_count: 0,
@@ -379,11 +379,10 @@ impl<T> CountingHostControlChannel<T> {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<T> litebox_broker_protocol::HostControlChannel for CountingHostControlChannel<T>
-where
-    T: litebox_broker_protocol::HostControlChannel,
+impl<Channel: litebox_broker_protocol::HostControlChannel>
+    litebox_broker_protocol::HostControlChannel for CountingHostControlChannel<Channel>
 {
-    type Error = T::Error;
+    type Error = Channel::Error;
 
     fn peer_credential(&self) -> Result<litebox_broker_protocol::PeerCredential, Self::Error> {
         self.inner.peer_credential()
