@@ -59,9 +59,6 @@ impl<E> From<BrokerLocalError<E>> for BrokerControlError {
         match error {
             BrokerLocalError::Channel(_) | BrokerLocalError::ChannelClosed => Self::Transport,
             BrokerLocalError::Broker(error) => Self::Broker(error),
-            BrokerLocalError::UnexpectedResponse(response) => {
-                panic!("broker returned unexpected response: {response:?}")
-            }
         }
     }
 }

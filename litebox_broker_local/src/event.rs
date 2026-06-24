@@ -2,20 +2,30 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::{
-    AddEventRequest, BrokerResponse, ConsumeEventRequest, ConsumeEventResponse, CoreRequest,
-    CoreResponse, CreateEventRequest, EventConsumeMode, EventRequest, EventResponse,
-    LocalControlChannel, ObjectHandle, ReadinessState, WaitEventRequest,
+    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CoreRequest, CoreResponse,
+    CreateEventRequest, EventConsumeMode, EventRequest, EventResponse, LocalControlChannel,
+    ObjectHandle, ReadinessState, WaitEventRequest,
 };
 
-use crate::{BrokerLocal, BrokerLocalError, Result};
+use crate::{BrokerLocal, Result};
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned event object.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// issued event request.
     pub fn create_event(&mut self) -> Result<ObjectHandle, Channel::Error> {
         self.create_event_with_count(0)
     }
 
     /// Creates a broker-owned event object with initial readiness credits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// issued event request.
     pub fn create_event_with_count(
         &mut self,
         initial_count: u64,
@@ -24,24 +34,30 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             self.request_event(EventRequest::Create(CreateEventRequest { initial_count }))?;
         match response {
             EventResponse::Create(response) => Ok(response.handle),
-            response => Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(
-                CoreResponse::Event(response),
-            ))),
+            response => panic!("broker returned unexpected event response: {response:?}"),
         }
     }
 
     /// Checks whether an event wait would complete now.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// issued event request.
     pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<ReadinessState, Channel::Error> {
         let response = self.request_event(EventRequest::Wait(WaitEventRequest { handle }))?;
         match response {
             EventResponse::Wait(response) => Ok(response.readiness),
-            response => Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(
-                CoreResponse::Event(response),
-            ))),
+            response => panic!("broker returned unexpected event response: {response:?}"),
         }
     }
 
     /// Adds readiness credits to a broker-owned event object.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// issued event request.
     pub fn add_event(
         &mut self,
         handle: ObjectHandle,
@@ -50,13 +66,16 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         let response = self.request_event(EventRequest::Add(AddEventRequest { handle, value }))?;
         match response {
             EventResponse::Add(response) => Ok(response.readiness),
-            response => Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(
-                CoreResponse::Event(response),
-            ))),
+            response => panic!("broker returned unexpected event response: {response:?}"),
         }
     }
 
     /// Consumes readiness credits from a broker-owned event object.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// issued event request.
     pub fn consume_event(
         &mut self,
         handle: ObjectHandle,
@@ -66,9 +85,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             self.request_event(EventRequest::Consume(ConsumeEventRequest { handle, mode }))?;
         match response {
             EventResponse::Consume(response) => Ok(response),
-            response => Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(
-                CoreResponse::Event(response),
-            ))),
+            response => panic!("broker returned unexpected event response: {response:?}"),
         }
     }
 

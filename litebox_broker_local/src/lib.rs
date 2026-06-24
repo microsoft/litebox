@@ -34,6 +34,11 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     }
 
     /// Negotiates the broker protocol over an already-connected control channel.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// negotiation request.
     pub fn negotiate(mut channel: Channel) -> Result<Self, Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         match raw_request(
@@ -45,9 +50,10 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             response @ BrokerResponse::Negotiated {
                 broker_protocol_version,
             } => {
-                if requested != broker_protocol_version {
-                    return Err(BrokerLocalError::UnexpectedResponse(response));
-                }
+                assert_eq!(
+                    requested, broker_protocol_version,
+                    "broker returned unexpected negotiation response: {response:?}"
+                );
                 Ok(Self { channel })
             }
             BrokerResponse::VersionMismatch { .. } => {
@@ -55,17 +61,22 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             }
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
             response @ BrokerResponse::Core(_) => {
-                Err(BrokerLocalError::UnexpectedResponse(response))
+                panic!("broker returned unexpected negotiation response: {response:?}")
             }
         }
     }
 
     /// Sends one active BrokerCore request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match an
+    /// active core request.
     pub fn request(&mut self, request: CoreRequest) -> Result<CoreResponse, Channel::Error> {
         match raw_request(&mut self.channel, BrokerRequest::Core(request))? {
             BrokerResponse::Core(response) => Ok(response),
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => Err(BrokerLocalError::UnexpectedResponse(response)),
+            response => panic!("broker returned unexpected active response: {response:?}"),
         }
     }
 }
@@ -125,18 +136,14 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "broker returned unexpected negotiation response")]
     fn negotiate_rejects_broker_different_version_response() {
         let broker_protocol_version = ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1);
         let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version,
         }));
 
-        assert!(matches!(
-            BrokerLocal::negotiate(channel),
-            Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Negotiated {
-                broker_protocol_version: broker
-            })) if broker == broker_protocol_version
-        ));
+        let _ = BrokerLocal::negotiate(channel);
     }
 
     #[test]

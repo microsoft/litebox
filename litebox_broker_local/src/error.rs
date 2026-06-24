@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::{BrokerResponse, ErrorCode};
+use litebox_broker_protocol::ErrorCode;
 use thiserror::Error;
 
 /// Errors returned by active broker-local control requests.
@@ -13,8 +13,6 @@ pub enum BrokerLocalError<E> {
     ChannelClosed,
     #[error("broker rejected request: {0}")]
     Broker(#[source] ErrorCode),
-    #[error("broker returned unexpected response: {0:?}")]
-    UnexpectedResponse(BrokerResponse),
 }
 
 /// Broker-local control adapter result type.
