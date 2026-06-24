@@ -543,7 +543,6 @@ impl From<litebox::event::counter::EventCounterError> for Errno {
             litebox::event::counter::EventCounterError::WouldBlock
             | litebox::event::counter::EventCounterError::ResourceExhausted => Errno::EAGAIN,
             litebox::event::counter::EventCounterError::Io
-            | litebox::event::counter::EventCounterError::UnexpectedResponse
             | litebox::event::counter::EventCounterError::Unavailable => Errno::EIO,
             _ => Errno::EIO,
         }

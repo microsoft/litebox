@@ -34,8 +34,6 @@ pub enum EventCounterError {
     ResourceExhausted,
     #[error("event counter I/O failed")]
     Io,
-    #[error("event counter received unexpected response")]
-    UnexpectedResponse,
     #[error("event counter backing authority unavailable")]
     Unavailable,
 }
@@ -52,6 +50,11 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     /// Creates a local-core event counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// issued event request.
     pub fn new(litebox: &LiteBox<Platform>, initial_count: u64) -> Result<Self, EventCounterError> {
         let Some(broker) = litebox.broker_control() else {
             return Err(EventCounterError::Unavailable);
@@ -64,7 +67,7 @@ where
             .map_err(EventCounterError::from)?;
         let CoreResponse::Event(response) = response;
         let EventResponse::Create(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse.into());
+            panic!("broker returned unexpected event response: {response:?}");
         };
         Ok(Self {
             broker,
@@ -74,6 +77,11 @@ where
     }
 
     /// Reads the event counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// issued event request.
     pub fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -90,6 +98,11 @@ where
     }
 
     /// Writes readiness credits to the event counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// issued event request.
     pub fn write(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -117,7 +130,7 @@ where
             mode,
         }))?;
         let EventResponse::Consume(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse);
+            panic!("broker returned unexpected event response: {response:?}");
         };
         Ok(response)
     }
@@ -128,7 +141,7 @@ where
             value,
         }))?;
         let EventResponse::Add(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse);
+            panic!("broker returned unexpected event response: {response:?}");
         };
         Ok(response.readiness)
     }
@@ -150,6 +163,10 @@ where
         self.pollee.register_observer(observer, mask);
     }
 
+    /// # Panics
+    ///
+    /// Panics if the broker returns a protocol response that does not match the
+    /// issued event request.
     fn check_io_events(&self) -> Events {
         let Ok(response) = self.request_event(EventRequest::Wait(WaitEventRequest {
             handle: self.handle,
@@ -157,7 +174,7 @@ where
             return Events::empty();
         };
         let EventResponse::Wait(response) = response else {
-            return Events::empty();
+            panic!("broker returned unexpected event response: {response:?}");
         };
         let readiness = response.readiness;
         let mut events = Events::empty();
