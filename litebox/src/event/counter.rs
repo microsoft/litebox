@@ -22,6 +22,24 @@ use crate::{
     sync::RawSyncPrimitivesProvider,
 };
 
+/// Read behavior for event counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventCounterReadMode {
+    /// Consume all available readiness credits.
+    All,
+    /// Consume one readiness credit.
+    One,
+}
+
+impl From<EventCounterReadMode> for EventConsumeMode {
+    fn from(mode: EventCounterReadMode) -> Self {
+        match mode {
+            EventCounterReadMode::All => Self::All,
+            EventCounterReadMode::One => Self::One,
+        }
+    }
+}
+
 /// Errors returned by local-core event counters.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -83,7 +101,7 @@ where
         &self,
         cx: &WaitContext<'_, Platform>,
         nonblock: bool,
-        mode: EventConsumeMode,
+        mode: EventCounterReadMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
         self.pollee.wait(cx, nonblock, Events::IN, || {
             let response = self.consume(mode)?;
@@ -113,10 +131,13 @@ where
         })
     }
 
-    fn consume(&self, mode: EventConsumeMode) -> Result<ConsumeEventResponse, BrokerObjectError> {
+    fn consume(
+        &self,
+        mode: EventCounterReadMode,
+    ) -> Result<ConsumeEventResponse, BrokerObjectError> {
         let response = self.request_event(EventRequest::Consume(ConsumeEventRequest {
             handle: self.handle,
-            mode,
+            mode: mode.into(),
         }))?;
         let EventResponse::Consume(response) = response else {
             panic!("broker returned unexpected event response: {response:?}");

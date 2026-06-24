@@ -8,7 +8,7 @@ use core::sync::atomic::AtomicU32;
 use litebox::{
     event::{
         Events, IOPollable,
-        counter::{EventCounter, EventCounterError},
+        counter::{EventCounter, EventCounterError, EventCounterReadMode},
         observer::Observer,
         polling::{Pollee, TryOpError},
         wait::WaitContext,
@@ -18,7 +18,6 @@ use litebox::{
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
-use litebox_broker_protocol::event::EventConsumeMode;
 use litebox_common_linux::{EfdFlags, errno::Errno};
 
 use crate::{GlobalState, Platform, ShimFS};
@@ -75,9 +74,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
                     cx,
                     nonblock,
                     if semaphore {
-                        EventConsumeMode::One
+                        EventCounterReadMode::One
                     } else {
-                        EventConsumeMode::All
+                        EventCounterReadMode::All
                     },
                 )
                 .map_err(Errno::from),
