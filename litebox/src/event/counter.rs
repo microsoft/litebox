@@ -4,9 +4,10 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
+pub use litebox_broker_protocol::event::EventConsumeMode as EventCounterReadMode;
 use litebox_broker_protocol::event::{
-    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
-    EventConsumeMode, ReadinessState, WaitEventRequest,
+    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest, ReadinessState,
+    WaitEventRequest,
 };
 use litebox_broker_protocol::message::{CoreRequest, CoreResponse, EventRequest, EventResponse};
 use thiserror::Error;
@@ -21,24 +22,6 @@ use crate::{
     platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
 };
-
-/// Read behavior for event counters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EventCounterReadMode {
-    /// Consume all available readiness credits.
-    All,
-    /// Consume one readiness credit.
-    One,
-}
-
-impl From<EventCounterReadMode> for EventConsumeMode {
-    fn from(mode: EventCounterReadMode) -> Self {
-        match mode {
-            EventCounterReadMode::All => Self::All,
-            EventCounterReadMode::One => Self::One,
-        }
-    }
-}
 
 /// Errors returned by local-core event counters.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -137,7 +120,7 @@ where
     ) -> Result<ConsumeEventResponse, BrokerObjectError> {
         let response = self.request_event(EventRequest::Consume(ConsumeEventRequest {
             handle: self.handle,
-            mode: mode.into(),
+            mode,
         }))?;
         let EventResponse::Consume(response) = response else {
             panic!("broker returned unexpected event response: {response:?}");
