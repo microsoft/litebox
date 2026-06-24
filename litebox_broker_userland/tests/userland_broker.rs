@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 use std::env;
-use std::fs;
 use std::io;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
@@ -15,12 +15,6 @@ use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 #[test]
 fn separate_process_broker_spawns_runner_and_serves_until_stopped() {
-    let dir = tempfile::Builder::new()
-        .prefix("litebox-broker-userland-test-")
-        .tempdir()
-        .unwrap();
-    let status_path = dir.path().join("test-runner.status");
-
     let mut broker = ChildGuard::new(
         Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
             .arg("--runner")
@@ -28,68 +22,69 @@ fn separate_process_broker_spawns_runner_and_serves_until_stopped() {
             .arg("broker_test_runner_child")
             .arg("--exact")
             .arg("--nocapture")
-            .env("LITEBOX_BROKER_TEST_STATUS", &status_path)
+            .env("LITEBOX_BROKER_USERLAND_TEST_RUNNER", "1")
             .spawn()
             .unwrap(),
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if status_path.exists() {
-            let status = fs::read_to_string(&status_path).unwrap();
-            assert_eq!(status.trim(), "0");
-            return;
-        }
         if let Some(status) = broker.try_wait().unwrap() {
-            panic!("broker exited before runner completed: {status}");
+            assert_eq!(status.signal(), Some(libc::SIGTERM));
+            return;
         }
         thread::sleep(Duration::from_millis(10));
     }
-    panic!("timed out waiting for test runner to complete");
+    panic!("timed out waiting for broker to stop");
 }
 
 #[test]
 fn broker_test_runner_child() {
-    let Some(status_path) = env::var_os("LITEBOX_BROKER_TEST_STATUS") else {
+    if env::var_os("LITEBOX_BROKER_USERLAND_TEST_RUNNER").is_none() {
         return;
-    };
-    let result = std::panic::catch_unwind(|| {
-        let socket_path = env::var("LITEBOX_BROKER_SOCKET").unwrap();
-        let mut channel = connect_with_retry(Path::new(&socket_path)).unwrap();
-        channel
-            .set_io_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut local = BrokerLocal::negotiate(channel).unwrap();
-
-        let handle = local.create_event().unwrap();
-        assert_eq!(
-            local.wait_event(handle).unwrap(),
-            ReadinessState {
-                read_ready: false,
-                write_ready: true,
-            }
-        );
-
-        assert_eq!(
-            local.add_event(handle, 1).unwrap(),
-            ReadinessState {
-                read_ready: true,
-                write_ready: true,
-            }
-        );
-
-        assert_eq!(
-            local.wait_event(handle).unwrap(),
-            ReadinessState {
-                read_ready: true,
-                write_ready: true,
-            }
-        );
-    });
-    fs::write(&status_path, if result.is_ok() { "0" } else { "101" }).unwrap();
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
     }
+    let socket_path = env::var("LITEBOX_BROKER_SOCKET").unwrap();
+    let mut channel = connect_with_retry(Path::new(&socket_path)).unwrap();
+    channel
+        .set_io_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut local = BrokerLocal::negotiate(channel).unwrap();
+
+    let handle = local.create_event().unwrap();
+    assert_eq!(
+        local.wait_event(handle).unwrap(),
+        ReadinessState {
+            read_ready: false,
+            write_ready: true,
+        }
+    );
+
+    assert_eq!(
+        local.add_event(handle, 1).unwrap(),
+        ReadinessState {
+            read_ready: true,
+            write_ready: true,
+        }
+    );
+
+    assert_eq!(
+        local.wait_event(handle).unwrap(),
+        ReadinessState {
+            read_ready: true,
+            write_ready: true,
+        }
+    );
+    drop(local);
+    // SAFETY: `getppid` takes no pointer arguments and has no Rust-side aliasing requirements.
+    let broker_pid = unsafe { libc::getppid() };
+    // SAFETY: `broker_pid` is the runner's parent process and `SIGTERM` is a valid signal number.
+    let kill_result = unsafe { libc::kill(broker_pid, libc::SIGTERM) };
+    assert_eq!(
+        kill_result,
+        0,
+        "failed to stop broker: {}",
+        io::Error::last_os_error()
+    );
 }
 
 struct ChildGuard {

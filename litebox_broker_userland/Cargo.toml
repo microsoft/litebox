@@ -15,6 +15,7 @@ name = "litebox-broker-userland"
 path = "src/main.rs"
 
 [dev-dependencies]
+libc = { version = "0.2.169", default-features = false }
 litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 
