@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::{
-    AddEventRequest, BrokerRequest, BrokerResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CoreRequest, CoreResponse, CreateEventRequest, EventConsumeMode, EventRequest, EventResponse,
+    AddEventRequest, BrokerResponse, ConsumeEventRequest, ConsumeEventResponse, CoreRequest,
+    CoreResponse, CreateEventRequest, EventConsumeMode, EventRequest, EventResponse,
     LocalControlChannel, ObjectHandle, ReadinessState, WaitEventRequest,
 };
 
@@ -20,25 +20,20 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         &mut self,
         initial_count: u64,
     ) -> Result<ObjectHandle, T::Error> {
-        match self.request(event_request(EventRequest::Create(CreateEventRequest {
-            initial_count,
-        })))? {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(response))) => {
-                Ok(response.handle)
-            }
-            response => Err(BrokerLocalError::UnexpectedResponse(response)),
+        let response =
+            self.request_event(EventRequest::Create(CreateEventRequest { initial_count }))?;
+        match response {
+            EventResponse::Create(response) => Ok(response.handle),
+            response => Err(unexpected_event_response(response)),
         }
     }
 
     /// Checks whether an event wait would complete now.
     pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<ReadinessState, T::Error> {
-        match self.request(event_request(EventRequest::Wait(WaitEventRequest {
-            handle,
-        })))? {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(response))) => {
-                Ok(response.readiness)
-            }
-            response => Err(BrokerLocalError::UnexpectedResponse(response)),
+        let response = self.request_event(EventRequest::Wait(WaitEventRequest { handle }))?;
+        match response {
+            EventResponse::Wait(response) => Ok(response.readiness),
+            response => Err(unexpected_event_response(response)),
         }
     }
 
@@ -48,14 +43,10 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         handle: ObjectHandle,
         value: u64,
     ) -> Result<ReadinessState, T::Error> {
-        match self.request(event_request(EventRequest::Add(AddEventRequest {
-            handle,
-            value,
-        })))? {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(response))) => {
-                Ok(response.readiness)
-            }
-            response => Err(BrokerLocalError::UnexpectedResponse(response)),
+        let response = self.request_event(EventRequest::Add(AddEventRequest { handle, value }))?;
+        match response {
+            EventResponse::Add(response) => Ok(response.readiness),
+            response => Err(unexpected_event_response(response)),
         }
     }
 
@@ -65,18 +56,20 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> Result<ConsumeEventResponse, T::Error> {
-        match self.request(event_request(EventRequest::Consume(ConsumeEventRequest {
-            handle,
-            mode,
-        })))? {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(response))) => {
-                Ok(response)
-            }
-            response => Err(BrokerLocalError::UnexpectedResponse(response)),
+        let response =
+            self.request_event(EventRequest::Consume(ConsumeEventRequest { handle, mode }))?;
+        match response {
+            EventResponse::Consume(response) => Ok(response),
+            response => Err(unexpected_event_response(response)),
         }
+    }
+
+    fn request_event(&mut self, request: EventRequest) -> Result<EventResponse, T::Error> {
+        let CoreResponse::Event(response) = self.request(CoreRequest::Event(request))?;
+        Ok(response)
     }
 }
 
-const fn event_request(request: EventRequest) -> BrokerRequest {
-    BrokerRequest::Core(CoreRequest::Event(request))
+fn unexpected_event_response<E>(response: EventResponse) -> BrokerLocalError<E> {
+    BrokerLocalError::UnexpectedResponse(BrokerResponse::Core(CoreResponse::Event(response)))
 }

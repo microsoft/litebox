@@ -2,9 +2,7 @@
 // Licensed under the MIT license.
 
 use litebox_broker_local::{BrokerLocal, BrokerLocalError};
-use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, LocalControlChannel,
-};
+use litebox_broker_protocol::{CoreRequest, CoreResponse, LocalControlChannel};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
@@ -51,15 +49,18 @@ where
         let response = self
             .local
             .lock()
-            .request(BrokerRequest::Core(request))
+            .request(request)
             .map_err(|error| match error {
+                BrokerLocalError::Channel(_) | BrokerLocalError::ChannelClosed => {
+                    BrokerControlError::Transport
+                }
                 BrokerLocalError::Broker(error) => BrokerControlError::Broker(error),
                 BrokerLocalError::UnexpectedResponse(_) => BrokerControlError::UnexpectedResponse,
-                _ => BrokerControlError::Transport,
+                BrokerLocalError::IncompatibleNegotiation { .. }
+                | BrokerLocalError::UnsupportedVersion { .. } => {
+                    unreachable!("negotiation errors cannot occur on active broker requests")
+                }
             })?;
-        match response {
-            BrokerResponse::Core(response) => Ok(response),
-            _ => Err(BrokerControlError::UnexpectedResponse),
-        }
+        Ok(response)
     }
 }
