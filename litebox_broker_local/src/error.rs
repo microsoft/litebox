@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::{BrokerResponse, ErrorCode, ProtocolVersion};
+use litebox_broker_protocol::{BrokerResponse, ErrorCode};
 use thiserror::Error;
 
 /// Errors returned by active broker-local control requests.
@@ -16,34 +16,6 @@ pub enum BrokerLocalError<E> {
     #[error("broker returned unexpected response: {0:?}")]
     UnexpectedResponse(BrokerResponse),
 }
-
-/// Errors returned while negotiating the broker-local control adapter.
-#[derive(Debug, Error)]
-pub enum BrokerLocalNegotiationError<E> {
-    #[error(transparent)]
-    Control(#[from] BrokerLocalError<E>),
-    #[error(
-        "broker accepted incompatible protocol negotiation: requested {requested:?}, broker supports {broker_protocol_version:?}"
-    )]
-    IncompatibleNegotiation {
-        /// Protocol version requested by this local adapter.
-        requested: ProtocolVersion,
-        /// Protocol version advertised by the broker.
-        broker_protocol_version: ProtocolVersion,
-    },
-    #[error(
-        "broker does not support requested protocol version {requested:?}; broker supports {broker_protocol_version:?}"
-    )]
-    UnsupportedVersion {
-        /// Protocol version requested by this local adapter.
-        requested: ProtocolVersion,
-        /// Protocol version advertised by the broker.
-        broker_protocol_version: ProtocolVersion,
-    },
-}
-
-/// Broker-local control adapter negotiation result type.
-pub type NegotiationResult<T, E> = core::result::Result<T, BrokerLocalNegotiationError<E>>;
 
 /// Broker-local control adapter result type.
 pub type Result<T, E> = core::result::Result<T, BrokerLocalError<E>>;

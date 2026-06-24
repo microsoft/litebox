@@ -16,11 +16,11 @@ mod error;
 mod event;
 
 use litebox_broker_protocol::{
-    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse,
+    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, ErrorCode,
     LocalControlChannel,
 };
 
-pub use error::{BrokerLocalError, BrokerLocalNegotiationError, NegotiationResult, Result};
+pub use error::{BrokerLocalError, Result};
 
 /// Typed broker-local control adapter for broker operations.
 pub struct BrokerLocal<T> {
@@ -36,7 +36,7 @@ impl<T> BrokerLocal<T> {
 
 impl<T: LocalControlChannel> BrokerLocal<T> {
     /// Negotiates the broker protocol over an already-connected control channel.
-    pub fn negotiate(mut channel: T) -> NegotiationResult<Self, T::Error> {
+    pub fn negotiate(mut channel: T) -> Result<Self, T::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         match raw_request(
             &mut channel,
@@ -44,26 +44,20 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
                 protocol_version: requested,
             },
         )? {
-            BrokerResponse::Negotiated {
+            response @ BrokerResponse::Negotiated {
                 broker_protocol_version,
             } => {
                 if requested != broker_protocol_version {
-                    return Err(BrokerLocalNegotiationError::IncompatibleNegotiation {
-                        requested,
-                        broker_protocol_version,
-                    });
+                    return Err(BrokerLocalError::UnexpectedResponse(response));
                 }
                 Ok(Self { channel })
             }
-            BrokerResponse::VersionMismatch {
-                broker_protocol_version,
-            } => Err(BrokerLocalNegotiationError::UnsupportedVersion {
-                requested,
-                broker_protocol_version,
-            }),
-            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error).into()),
+            BrokerResponse::VersionMismatch { .. } => {
+                Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
+            }
+            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
             response @ BrokerResponse::Core(_) => {
-                Err(BrokerLocalError::UnexpectedResponse(response).into())
+                Err(BrokerLocalError::UnexpectedResponse(response))
             }
         }
     }
@@ -141,10 +135,9 @@ mod tests {
 
         assert!(matches!(
             BrokerLocal::negotiate(channel),
-            Err(BrokerLocalNegotiationError::IncompatibleNegotiation {
-                requested,
+            Err(BrokerLocalError::UnexpectedResponse(BrokerResponse::Negotiated {
                 broker_protocol_version: broker
-            }) if requested == BROKER_PROTOCOL_VERSION && broker == broker_protocol_version
+            })) if broker == broker_protocol_version
         ));
     }
 
@@ -157,10 +150,7 @@ mod tests {
 
         assert!(matches!(
             BrokerLocal::negotiate(channel),
-            Err(BrokerLocalNegotiationError::UnsupportedVersion {
-                requested,
-                broker_protocol_version: broker
-            }) if requested == BROKER_PROTOCOL_VERSION && broker == broker_protocol_version
+            Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
         ));
     }
 
