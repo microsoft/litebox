@@ -3,9 +3,7 @@
 
 use std::error::Error;
 use std::ffi::OsString;
-use std::io;
 use std::os::unix::net::UnixListener;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -42,23 +40,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .arg("--broker-socket")
         .arg(&socket_path)
         .args(&args.runner_arguments);
-    // SAFETY: `pre_exec` runs after fork and before exec in the runner child. The
-    // closure only calls async-signal-safe Linux syscalls to make the runner exit if
-    // its broker parent exits.
-    unsafe {
-        runner_command.pre_exec(|| {
-            // SAFETY: `prctl` is called with PR_SET_PDEATHSIG and a valid signal number.
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: `getppid` takes no pointer arguments and has no Rust-side aliasing requirements.
-            if libc::getppid() == 1 {
-                // SAFETY: `_exit` terminates the child immediately if the broker died before prctl.
-                libc::_exit(1);
-            }
-            Ok(())
-        });
-    }
     let mut runner = runner_command.spawn()?;
     let _runner_waiter = thread::spawn(move || {
         if let Err(error) = runner.wait() {
