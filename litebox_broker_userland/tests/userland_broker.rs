@@ -70,10 +70,7 @@ fn run_fake_runner(args: &[OsString]) {
     assert_eq!(args.len(), 4, "unexpected runner arguments: {args:?}");
 
     let socket_path = args.get(2).unwrap();
-    let mut channel = connect_with_retry(Path::new(socket_path)).unwrap();
-    channel
-        .set_io_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    let channel = connect_with_retry(Path::new(socket_path)).unwrap();
     let mut local = BrokerLocal::negotiate(channel).unwrap();
 
     let handle = local.create_event_with_count(0).unwrap();
@@ -130,7 +127,7 @@ impl Drop for ChildGuard {
 fn connect_with_retry(socket_path: &Path) -> Result<UnixStreamLocalControlChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixStreamLocalControlChannel::connect(socket_path) {
+        match UnixStreamLocalControlChannel::connect_with_setup_deadline(socket_path, deadline) {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != ErrorKind::NotFound

@@ -40,17 +40,12 @@ fn connect_to_endpoint(socket_path: &Path) -> Result<BrokerConnection> {
 
 fn connect_with_retry(socket_path: &Path, setup_deadline: Instant) -> Result<Local> {
     loop {
-        match UnixStreamLocalControlChannel::connect(socket_path) {
-            Ok(mut channel) => {
-                channel
-                    .set_io_deadline(Some(setup_deadline))
-                    .context("failed to configure broker setup deadline")?;
-                let mut local =
-                    BrokerLocal::negotiate(channel).context("broker negotiation failed")?;
-                local
-                    .control_channel_mut()
-                    .set_io_deadline(None)
-                    .context("failed to clear broker setup deadline")?;
+        match UnixStreamLocalControlChannel::connect_with_setup_deadline(
+            socket_path,
+            setup_deadline,
+        ) {
+            Ok(channel) => {
+                let local = BrokerLocal::negotiate(channel).context("broker negotiation failed")?;
                 return Ok(local);
             }
             Err(error) => {

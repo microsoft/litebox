@@ -30,11 +30,6 @@ pub struct BrokerLocal<Channel: LocalControlChannel> {
 }
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
-    /// Returns the underlying control channel for deployment-specific configuration.
-    pub fn control_channel_mut(&mut self) -> &mut Channel {
-        &mut self.channel
-    }
-
     /// Negotiates the broker protocol over an already-connected control channel.
     ///
     /// # Panics

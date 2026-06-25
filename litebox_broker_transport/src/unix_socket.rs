@@ -29,9 +29,7 @@ const MAX_FRAME_LEN: usize = 64 * 1024;
 /// Local-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamLocalControlChannel {
     stream: UnixStream,
-    io_timeout: Option<Duration>,
-    io_deadline: Option<Instant>,
-    active_request_deadline: Option<Instant>,
+    setup_deadline: Option<Instant>,
 }
 
 impl UnixStreamLocalControlChannel {
@@ -39,9 +37,7 @@ impl UnixStreamLocalControlChannel {
     pub const fn from_connected(stream: UnixStream) -> Self {
         Self {
             stream,
-            io_timeout: None,
-            io_deadline: None,
-            active_request_deadline: None,
+            setup_deadline: None,
         }
     }
 
@@ -50,71 +46,31 @@ impl UnixStreamLocalControlChannel {
         UnixStream::connect(path).map(Self::from_connected)
     }
 
-    /// Sets the read and write timeout for broker control-channel operations.
-    pub fn set_io_timeout(&mut self, timeout: Option<Duration>) -> IoResult<()> {
-        self.io_timeout = timeout;
-        self.io_deadline = None;
-        self.active_request_deadline = None;
-        self.set_stream_io_timeout(timeout)
-    }
-
-    /// Sets a wall-clock deadline for broker control-channel operations.
-    pub fn set_io_deadline(&mut self, deadline: Option<Instant>) -> IoResult<()> {
-        self.io_deadline = deadline;
-        self.active_request_deadline = None;
-        match deadline {
-            Some(deadline) => self.set_stream_io_timeout(Some(io_timeout_for_deadline(deadline)?)),
-            None => self.set_stream_io_timeout(self.io_timeout),
-        }
-    }
-
-    fn set_stream_io_timeout(&self, timeout: Option<Duration>) -> IoResult<()> {
-        self.stream.set_read_timeout(timeout)?;
-        self.stream.set_write_timeout(timeout)
-    }
-
-    fn current_deadline(&mut self) -> IoResult<Option<Instant>> {
-        if let Some(deadline) = self.io_deadline {
-            return Ok(Some(deadline));
-        }
-        if let Some(deadline) = self.active_request_deadline {
-            return Ok(Some(deadline));
-        }
-        let Some(timeout) = self.io_timeout else {
-            return Ok(None);
-        };
-        let deadline = deadline_after(timeout)?;
-        self.active_request_deadline = Some(deadline);
-        Ok(Some(deadline))
+    /// Connects to a userland broker Unix socket with a deadline for setup I/O.
+    ///
+    /// TODO: `UnixStream` does not expose a connect timeout, so this
+    /// deadline currently covers setup I/O after the initial connect
+    /// succeeds, but not a blocking connect call.
+    pub fn connect_with_setup_deadline(
+        path: impl AsRef<Path>,
+        deadline: Instant,
+    ) -> IoResult<Self> {
+        UnixStream::connect(path).map(|stream| Self {
+            stream,
+            setup_deadline: Some(deadline),
+        })
     }
 }
 
 /// Host-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamHostControlChannel {
     stream: UnixStream,
-    io_deadline: Option<Instant>,
 }
 
 impl UnixStreamHostControlChannel {
     /// Creates a host control channel from an accepted Unix stream.
     pub const fn from_accepted(stream: UnixStream) -> Self {
-        Self {
-            stream,
-            io_deadline: None,
-        }
-    }
-
-    /// Sets a wall-clock deadline for all broker control-channel operations.
-    pub fn set_io_deadline(&mut self, deadline: Option<Instant>) -> IoResult<()> {
-        self.io_deadline = deadline;
-        if let Some(deadline) = deadline {
-            let timeout = io_timeout_for_deadline(deadline)?;
-            self.stream.set_read_timeout(Some(timeout))?;
-            self.stream.set_write_timeout(Some(timeout))
-        } else {
-            self.stream.set_read_timeout(None)?;
-            self.stream.set_write_timeout(None)
-        }
+        Self { stream }
     }
 }
 
@@ -123,21 +79,16 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
         let frame = encode_handshake_request(request.clone());
-        let deadline = self.current_deadline()?;
-        let result = write_frame_with_deadline(&mut self.stream, &frame, deadline);
-        if result.is_err() {
-            self.active_request_deadline = None;
-        }
-        result
+        write_frame_with_deadline(&mut self.stream, &frame, self.setup_deadline)
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
-        let deadline = self.current_deadline()?;
-        let frame = read_frame_with_deadline(&mut self.stream, deadline);
-        if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
-            self.set_stream_io_timeout(self.io_timeout)?;
+        let frame = read_frame_with_deadline(&mut self.stream, self.setup_deadline)?;
+        if self.setup_deadline.take().is_some() {
+            self.stream.set_read_timeout(None)?;
+            self.stream.set_write_timeout(None)?;
         }
-        match frame? {
+        match frame {
             Some(frame) => decode_handshake_response(&frame)
                 .map(Some)
                 .map_err(wire_error),
@@ -147,21 +98,11 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
 
     fn send_request(&mut self, request: &BrokerRequest) -> IoResult<()> {
         let frame = encode_request(request.clone());
-        let deadline = self.current_deadline()?;
-        let result = write_frame_with_deadline(&mut self.stream, &frame, deadline);
-        if result.is_err() {
-            self.active_request_deadline = None;
-        }
-        result
+        write_frame_with_deadline(&mut self.stream, &frame, None)
     }
 
     fn recv_response(&mut self) -> IoResult<Option<BrokerResponse>> {
-        let deadline = self.current_deadline()?;
-        let frame = read_frame_with_deadline(&mut self.stream, deadline);
-        if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
-            self.set_stream_io_timeout(self.io_timeout)?;
-        }
-        match frame? {
+        match read_frame_with_deadline(&mut self.stream, None)? {
             Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
             None => Ok(None),
         }
@@ -178,7 +119,7 @@ impl HostControlChannel for UnixStreamHostControlChannel {
     }
 
     fn recv_handshake_request(&mut self) -> IoResult<HostReceive<BrokerHandshakeRequest>> {
-        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.io_deadline)? else {
+        let Some(frame) = read_frame_with_deadline(&mut self.stream, None)? else {
             return Ok(HostReceive::PeerClosed);
         };
         match decode_handshake_request(&frame) {
@@ -192,12 +133,12 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         write_frame_with_deadline(
             &mut self.stream,
             &encode_handshake_response(response.clone()),
-            self.io_deadline,
+            None,
         )
     }
 
     fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
-        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.io_deadline)? else {
+        let Some(frame) = read_frame_with_deadline(&mut self.stream, None)? else {
             return Ok(HostReceive::PeerClosed);
         };
         match decode_request(&frame) {
@@ -208,11 +149,7 @@ impl HostControlChannel for UnixStreamHostControlChannel {
     }
 
     fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
-        write_frame_with_deadline(
-            &mut self.stream,
-            &encode_response(response.clone()),
-            self.io_deadline,
-        )
+        write_frame_with_deadline(&mut self.stream, &encode_response(response.clone()), None)
     }
 }
 
@@ -304,12 +241,6 @@ fn io_timeout_for_deadline(deadline: Instant) -> IoResult<Duration> {
     Ok(timeout)
 }
 
-fn deadline_after(timeout: Duration) -> IoResult<Instant> {
-    Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "broker I/O timeout overflow"))
-}
-
 fn invalid_data(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
@@ -395,14 +326,14 @@ mod tests {
     }
 
     #[test]
-    fn local_response_read_io_timeout_is_wall_clock() {
+    fn local_handshake_response_read_setup_deadline_is_wall_clock() {
         let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
-        channel
-            .set_io_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
+        let mut channel = UnixStreamLocalControlChannel {
+            stream: local_stream,
+            setup_deadline: Some(Instant::now() + Duration::from_millis(50)),
+        };
 
-        let reader = std::thread::spawn(move || channel.recv_response().unwrap_err());
+        let reader = std::thread::spawn(move || channel.recv_handshake_response().unwrap_err());
         host_stream.write_all(&8u32.to_le_bytes()).unwrap();
         for _ in 0..8 {
             std::thread::sleep(Duration::from_millis(20));
