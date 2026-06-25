@@ -473,8 +473,21 @@ impl StateObject for InetDgramState {
     }
 }
 
+/// Returns `true` for datagrams addressed to the broker's virtual DNS resolver.
+///
+/// Recognises the legacy litebox resolver address (`10.0.0.1:53`) **and** any
+/// loopback `:53` (`127.0.0.0/8`, `::1`). The VS Code agent-host (`code` CLI,
+/// hickory/tokio resolver) targets the systemd-resolved stub `127.0.0.1:53`
+/// regardless of `/etc/resolv.conf`; inside the sandbox nothing listens there,
+/// so those queries must be forwarded through the host resolver just like
+/// `10.0.0.1:53`, otherwise name resolution silently times out.
 pub(crate) fn is_broker_dns_service(peer: SocketAddr) -> bool {
-    matches!(peer, SocketAddr::V4(addr) if *addr.ip() == BROKER_DNS_ADDR && addr.port() == DNS_PORT)
+    match peer {
+        SocketAddr::V4(addr) => {
+            addr.port() == DNS_PORT && (*addr.ip() == BROKER_DNS_ADDR || addr.ip().is_loopback())
+        }
+        SocketAddr::V6(addr) => addr.port() == DNS_PORT && addr.ip().is_loopback(),
+    }
 }
 
 fn recv_loop(
@@ -576,6 +589,38 @@ mod tests {
             other => panic!("expected WouldBlock, got {other:?}"),
         }
         assert_eq!(state.current_events(), NOTIFY_EVENT_OUT);
+    }
+
+    #[test]
+    fn is_broker_dns_service_matches_virtual_and_loopback() {
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let v4 =
+            |a, b, c, d, port| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), port));
+        // Legacy litebox virtual resolver address.
+        assert!(is_broker_dns_service(v4(10, 0, 0, 1, 53)));
+        // systemd-resolved stub that the VS Code `code` CLI resolver targets
+        // regardless of /etc/resolv.conf — the case this fix added.
+        assert!(is_broker_dns_service(v4(127, 0, 0, 1, 53)));
+        // Any loopback address on :53 (e.g. systemd-resolved's 127.0.0.53).
+        assert!(is_broker_dns_service(v4(127, 0, 0, 53, 53)));
+        assert!(is_broker_dns_service(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            53,
+            0,
+            0
+        ))));
+        // Wrong port is never the virtual DNS service.
+        assert!(!is_broker_dns_service(v4(127, 0, 0, 1, 80)));
+        assert!(!is_broker_dns_service(v4(10, 0, 0, 1, 5353)));
+        // A real external resolver must NOT be intercepted/forwarded.
+        assert!(!is_broker_dns_service(v4(8, 8, 8, 8, 53)));
+        // Non-loopback IPv6 must not be intercepted.
+        assert!(!is_broker_dns_service(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+            53,
+            0,
+            0
+        ))));
     }
 
     #[test]

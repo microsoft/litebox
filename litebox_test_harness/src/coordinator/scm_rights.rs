@@ -3,6 +3,7 @@
 
 //! SCM_RIGHTS fd-passing tests over Unix domain sockets.
 
+use std::ffi::CStr;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
@@ -110,6 +111,9 @@ enum ScmKind {
     PassEventfd,
     PassEventfdPollWake,
     PassTcpSocket,
+    PassTcpAccepted,
+    PassUnixSocketpair,
+    PassPty,
     PassThenCloseSender,
     PassTwoFdsOneMsg,
     /// Originally designed as a HypB probe for the broker
@@ -161,6 +165,18 @@ const SCM_SCENARIOS: &[ScmScenario] = &[
     ScmScenario {
         name: "pass_tcp_socket",
         kind: ScmKind::PassTcpSocket,
+    },
+    ScmScenario {
+        name: "pass_tcp_accepted",
+        kind: ScmKind::PassTcpAccepted,
+    },
+    ScmScenario {
+        name: "pass_unix_socketpair",
+        kind: ScmKind::PassUnixSocketpair,
+    },
+    ScmScenario {
+        name: "pass_pty",
+        kind: ScmKind::PassPty,
     },
     ScmScenario {
         name: "pass_then_close_sender",
@@ -386,6 +402,9 @@ fn accept_and_validate(kind: ScmKind, listener: UnixListener) -> Result<ScmOut, 
         ScmKind::PassEventfd => receive_eventfd(stream, 7, false, "eventfd"),
         ScmKind::PassEventfdPollWake => receive_eventfd_poll_wake(stream),
         ScmKind::PassTcpSocket => receive_tcp(stream),
+        ScmKind::PassTcpAccepted => receive_tcp_accepted(stream),
+        ScmKind::PassUnixSocketpair => receive_unix_socketpair(stream),
+        ScmKind::PassPty => receive_pty(stream),
         ScmKind::PassThenCloseSender => receive_eventfd(stream, 5, true, "close_sender"),
         ScmKind::PassTwoFdsOneMsg => receive_two_eventfds(stream),
         ScmKind::PassPipeDoubleWake => receive_pipe_double_wake(stream),
@@ -421,6 +440,9 @@ fn send_for_scenario(kind: ScmKind, socket_path: &str) -> Result<(), String> {
             Ok(())
         }
         ScmKind::PassTcpSocket => send_tcp(socket_path),
+        ScmKind::PassTcpAccepted => send_tcp_accepted(socket_path),
+        ScmKind::PassUnixSocketpair => send_unix_socketpair(socket_path),
+        ScmKind::PassPty => send_pty(socket_path),
         ScmKind::PassThenCloseSender => {
             let ev = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
             let source_fd = ev.as_raw_fd();
@@ -688,6 +710,163 @@ fn receive_pipe_double_wake(stream: UnixStream) -> Result<ScmOut, String> {
     })
 }
 
+fn send_unix_socketpair(socket_path: &str) -> Result<(), String> {
+    let (passed_end, peer_end) = unix_socketpair()?;
+    let stream = UnixStream::connect(socket_path)?;
+    stream.send_fd(passed_end.as_fd(), b"unix_socketpair")?;
+    drop(passed_end);
+
+    let ping = read_exact(peer_end.as_raw_fd(), b"SCM_USP_PING".len())?;
+    if ping != b"SCM_USP_PING" {
+        return Err(format!(
+            "unix socketpair peer read mismatch: {:?}",
+            String::from_utf8_lossy(&ping)
+        ));
+    }
+    write_all(peer_end.as_raw_fd(), b"SCM_USP_PONG")?;
+    Ok(())
+}
+
+fn receive_unix_socketpair(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, "unix_socketpair")?;
+    let raw = fd.as_raw_fd();
+    write_all(raw, b"SCM_USP_PING")?;
+    let pong = read_exact(raw, b"SCM_USP_PONG".len())?;
+    if pong != b"SCM_USP_PONG" {
+        return Err(format!(
+            "unix socketpair echo mismatch: {:?}",
+            String::from_utf8_lossy(&pong)
+        ));
+    }
+    Ok(ScmOut {
+        detail: format!("received_unix_socketpair_fd={raw} bidi=ok"),
+    })
+}
+
+fn unix_socketpair() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut fds = [0i32; 2];
+    // SAFETY: fds points to space for two raw fds; socketpair initializes both on success.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!("socketpair: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: socketpair returned two fresh, uniquely-owned fds.
+    let first = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: socketpair returned two fresh, uniquely-owned fds.
+    let second = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((first, second))
+}
+
+fn send_pty(socket_path: &str) -> Result<(), String> {
+    let (master, slave) = open_pty_pair()?;
+    make_raw(slave.as_raw_fd())?;
+    let stream = UnixStream::connect(socket_path)?;
+    stream.send_fd(master.as_fd(), b"pty")?;
+
+    let ping = read_exact(slave.as_raw_fd(), b"SCM_PTY_PING".len())?;
+    if ping != b"SCM_PTY_PING" {
+        return Err(format!(
+            "pty slave read mismatch: {:?}",
+            String::from_utf8_lossy(&ping)
+        ));
+    }
+    write_all(slave.as_raw_fd(), b"SCM_PTY_PONG")?;
+    Ok(())
+}
+
+fn receive_pty(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, "pty")?;
+    let raw = fd.as_raw_fd();
+    let mut pty_num = 0u32;
+    // SAFETY: TIOCGPTN writes a u32 to the provided pointer for a PTY master fd.
+    let rc = unsafe { libc::ioctl(raw, libc::TIOCGPTN, std::ptr::addr_of_mut!(pty_num)) };
+    if rc != 0 {
+        return Err(format!(
+            "received pty TIOCGPTN: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    write_all(raw, b"SCM_PTY_PING")?;
+    let pong = read_exact(raw, b"SCM_PTY_PONG".len())?;
+    if pong != b"SCM_PTY_PONG" {
+        return Err(format!(
+            "pty master read mismatch: {:?}",
+            String::from_utf8_lossy(&pong)
+        ));
+    }
+    Ok(ScmOut {
+        detail: format!("received_pty_master_fd={raw} pty_num={pty_num} bidi=ok"),
+    })
+}
+
+fn open_pty_pair() -> Result<(OwnedFd, OwnedFd), String> {
+    // SAFETY: posix_openpt returns a fresh fd on success.
+    let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if master_raw < 0 {
+        return Err(format!("posix_openpt: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: master_raw was just returned by posix_openpt and is uniquely owned.
+    let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
+    // SAFETY: grantpt/unlockpt operate on a live PTY master fd.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
+        return Err(format!("grantpt: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: grantpt/unlockpt operate on a live PTY master fd.
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+        return Err(format!("unlockpt: {}", std::io::Error::last_os_error()));
+    }
+
+    let mut name = [0i8; 128];
+    // SAFETY: name is a valid writable buffer and master is a live PTY master fd.
+    let pts_rc = unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    if pts_rc != 0 {
+        return Err(format!(
+            "ptsname_r: {}",
+            std::io::Error::from_raw_os_error(pts_rc)
+        ));
+    }
+    // SAFETY: ptsname_r wrote a NUL-terminated C string into name on success.
+    let slave_path = unsafe { CStr::from_ptr(name.as_ptr()) };
+    // SAFETY: open creates a fresh fd on success and does not retain slave_path.
+    let slave_raw = unsafe {
+        libc::open(
+            slave_path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if slave_raw < 0 {
+        return Err(format!("open slave: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: slave_raw was just returned by open and is uniquely owned.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+    Ok((master, slave))
+}
+
+fn make_raw(fd: i32) -> Result<(), String> {
+    // SAFETY: zeroed termios is immediately overwritten by tcgetattr on success.
+    let mut tio = unsafe { std::mem::zeroed::<libc::termios>() };
+    // SAFETY: tcgetattr writes termios for a live terminal fd.
+    if unsafe { libc::tcgetattr(fd, std::ptr::addr_of_mut!(tio)) } != 0 {
+        return Err(format!("tcgetattr: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: cfmakeraw mutates the initialized termios struct in place.
+    unsafe { libc::cfmakeraw(std::ptr::addr_of_mut!(tio)) };
+    // SAFETY: tcsetattr reads the initialized termios struct.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, std::ptr::addr_of!(tio)) } != 0 {
+        return Err(format!("tcsetattr: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 fn send_tcp(socket_path: &str) -> Result<(), String> {
     let listener = tcp_listener()?;
     let port = listener_port(listener.as_raw_fd())?;
@@ -704,6 +883,7 @@ fn receive_tcp(stream: UnixStream) -> Result<ScmOut, String> {
     let (fd, payload) = stream.recv_fd(64)?;
     expect_payload(&payload, "tcp")?;
     let raw = fd.as_raw_fd();
+    assert_so_type(raw, libc::SOCK_STREAM, "received tcp")?;
     let payload = b"SCM_TCP_PAYLOAD";
     write_all(raw, payload)?;
     let echoed = read_exact(raw, payload.len())?;
@@ -714,8 +894,114 @@ fn receive_tcp(stream: UnixStream) -> Result<ScmOut, String> {
         ));
     }
     Ok(ScmOut {
-        detail: format!("received_tcp_fd={raw} echo=ok"),
+        detail: format!("received_tcp_fd={raw} so_type=stream echo=ok"),
     })
+}
+
+fn send_tcp_accepted(socket_path: &str) -> Result<(), String> {
+    // Mirror the VS Code code-server: listen, let a client connect, accept,
+    // SCM-pass the ACCEPTED (server) side, then close our copy. The receiver
+    // must be able to write data that reaches the still-open client side.
+    let listener = tcp_listener()?;
+    let port = listener_port(listener.as_raw_fd())?;
+    let client = tcp_connect(port)?;
+    let accepted = tcp_accept(listener.as_raw_fd())?;
+    let stream = UnixStream::connect(socket_path)?;
+    stream.send_fd(accepted.as_fd(), b"tcp_accepted")?;
+    drop(accepted);
+
+    // Server->client (the exthost->client keepalive direction): the receiver
+    // writes to the accepted socket; we must receive it on the client side.
+    let s2c = read_exact(client.as_raw_fd(), b"SCM_ACC_S2C".len())?;
+    if s2c != b"SCM_ACC_S2C" {
+        return Err(format!(
+            "accepted->client delivery failed: {:?}",
+            String::from_utf8_lossy(&s2c)
+        ));
+    }
+    // Client->server, for symmetry.
+    write_all(client.as_raw_fd(), b"SCM_ACC_C2S")?;
+    Ok(())
+}
+
+fn receive_tcp_accepted(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, "tcp_accepted")?;
+    let raw = fd.as_raw_fd();
+    assert_so_type(raw, libc::SOCK_STREAM, "received accepted tcp")?;
+    write_all(raw, b"SCM_ACC_S2C")?;
+    let c2s = read_exact(raw, b"SCM_ACC_C2S".len())?;
+    if c2s != b"SCM_ACC_C2S" {
+        return Err(format!(
+            "client->accepted mismatch: {:?}",
+            String::from_utf8_lossy(&c2s)
+        ));
+    }
+    Ok(ScmOut {
+        detail: format!("received_accepted_fd={raw} so_type=stream bidi=ok"),
+    })
+}
+
+/// Mirror libuv's `uv_guess_handle`: a passed socket is only usable by
+/// node/libuv if `getsockopt(SOL_SOCKET, SO_TYPE)` succeeds and reports the
+/// expected type. On failure libuv returns `UV_UNKNOWN_HANDLE` and node
+/// refuses to adopt the fd — the exact failure that stalled the VS Code
+/// exthost when a BrokerTcpConn was SCM-passed (the broker rejected SO_TYPE
+/// with EOPNOTSUPP).
+fn assert_so_type(raw: i32, expected: libc::c_int, label: &str) -> Result<(), String> {
+    let mut sotype: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes up to `len` bytes into `sotype`; `len` is set
+    // to its size and updated in place by the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            raw,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(sotype).cast(),
+            std::ptr::addr_of_mut!(len),
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "{label}: getsockopt(SO_TYPE) failed (libuv uv_guess_handle would \
+             return UV_UNKNOWN_HANDLE): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if sotype != expected {
+        return Err(format!("{label}: SO_TYPE={sotype}, expected {expected}"));
+    }
+    Ok(())
+}
+
+fn tcp_accept(listener: i32) -> Result<OwnedFd, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: accept4 operates on the live listener fd and returns a fresh fd.
+        let raw = unsafe {
+            libc::accept4(
+                listener,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
+        if raw >= 0 {
+            // SAFETY: raw was just returned by accept4 and is uniquely owned here.
+            return Ok(unsafe { OwnedFd::from_raw_fd(raw) });
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK)
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => return Err(format!("tcp accept: {err}")),
+        }
+    }
 }
 
 fn tcp_listener() -> Result<OwnedFd, String> {

@@ -8,7 +8,7 @@
 //! - `EP.*`  — raw epoll + TCP socket wakeup (direct and tokio variants, forked leaf agents)
 //! - `POLL.*` — epoll/ppoll IN-event readiness over a pipe
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
@@ -126,6 +126,34 @@ const EPOLL_SPIN_BROKER_UDP_WRITABLE: HandlerToken<(), EpollSpinOut> =
     HandlerToken::new("epoll_pidfd.epoll_spin_broker_udp_writable");
 const EPOLL_SPIN_BROKER_TCP_STICKY_OUT: HandlerToken<PeerAddrArgs, EpollSpinOut> =
     HandlerToken::new("epoll_pidfd.epoll_spin_broker_tcp_sticky_out");
+const EPOLL_SPIN_BROKER_TCP_STICKY_IN: HandlerToken<PeerAddrArgs, EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_spin_broker_tcp_sticky_in");
+const EPOLL_SPIN_BROKER_TCP_HALF_CLOSED: HandlerToken<PeerAddrArgs, EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_spin_broker_tcp_half_closed");
+const EPOLL_REFIRE_BROKER_TCP_DRAIN_IN_ET: HandlerToken<PeerAddrArgs, EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.epoll_refire_broker_tcp_drain_in_et");
+// EP.span.* — full-span EPOLLET / level-triggered / EPOLLONESHOT readiness
+// matrix across always-ready broker fd kinds (eventfd, pipe, socketpair) for
+// both IN and OUT readiness, plus the correctness guards (ET re-fires after a
+// real transition; LT keeps reporting; ONESHOT fires once).
+const EPOLL_SPAN_EVENTFD_OUT_ET: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.span_eventfd_out_et");
+const EPOLL_SPAN_EVENTFD_IN_ET: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.span_eventfd_in_et");
+const EPOLL_SPAN_PIPE_OUT_ET: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.span_pipe_out_et");
+const EPOLL_SPAN_PIPE_IN_ET: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.span_pipe_in_et");
+const EPOLL_SPAN_SOCKETPAIR_OUT_ET: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.span_socketpair_out_et");
+const EPOLL_SPAN_SOCKETPAIR_IN_ET: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.span_socketpair_in_et");
+const EPOLL_SPAN_EVENTFD_IN_REFIRE: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.span_eventfd_in_refire");
+const EPOLL_SPAN_EVENTFD_OUT_LT: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.span_eventfd_out_lt");
+const EPOLL_SPAN_EVENTFD_IN_ONESHOT: HandlerToken<(), EpollSpinOut> =
+    HandlerToken::new("epoll_pidfd.span_eventfd_in_oneshot");
 
 #[derive(Serialize, Deserialize, Debug)]
 struct EpollSpinOut {
@@ -614,6 +642,568 @@ fn spawn_tcp_echo_task(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// EP.span.* — full-span epoll readiness semantics matrix.
+//
+// The EPOLLET-persistent probes are spin guards: a persistently-ready fd must
+// fire its edge once then block, not re-fire on every wait. The refire / LT /
+// oneshot probes are correctness guards so a general edge-dedup fix can't pass
+// by simply over-suppressing.
+// ---------------------------------------------------------------------------
+
+fn write_eventfd_counter(fd: i32, val: u64) -> Result<(), HandlerError> {
+    let buf = val.to_ne_bytes();
+    // SAFETY: fd is a live eventfd; buf is 8 valid bytes.
+    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+    if n == buf.len() as isize {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "eventfd write: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+fn drain_eventfd_counter(fd: i32) -> Result<(), HandlerError> {
+    let mut buf = [0u8; 8];
+    // SAFETY: fd is a live eventfd; buf is 8 valid writable bytes.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n == buf.len() as isize {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "eventfd read: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+fn make_pipe_cloexec() -> Result<(OwnedFd, OwnedFd), HandlerError> {
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2 writes two fresh fds into `fds` on success.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(HandlerError(format!(
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: both are freshly returned owned descriptors.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+fn make_stream_socketpair() -> Result<(OwnedFd, OwnedFd), HandlerError> {
+    let mut sv = [0i32; 2];
+    // SAFETY: socketpair writes two fresh fds into `sv` on success.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(HandlerError(format!(
+            "socketpair: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: both are freshly returned owned descriptors.
+    Ok(unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) })
+}
+
+/// One 1000ms wait to consume the initial edge, then a 5s loop of 1000ms waits
+/// with no further state change. A correct EPOLLET (or disabled ONESHOT) epoll
+/// does <=~5 iterations (each blocks to timeout); a spin does thousands.
+fn persistent_et_spin_out(label: &str, epfd: i32) -> Result<EpollSpinOut, HandlerError> {
+    let first = timed_epoll_pwait(epfd, 1000, 4)?;
+    let loop_start = Instant::now();
+    let loop_deadline = loop_start + Duration::from_secs(5);
+    let mut iterations = 0_u64;
+    let mut zero_event_returns = u64::from(first.events == 0);
+    while Instant::now() < loop_deadline {
+        let sample = timed_epoll_pwait(epfd, 1000, 4)?;
+        iterations += 1;
+        zero_event_returns += u64::from(sample.events == 0);
+    }
+    let loop_elapsed_ms = elapsed_ms(loop_start.elapsed());
+    Ok(EpollSpinOut {
+        detail: format!(
+            "step={label} first_events={} first_elapsed_ms={} iterations={} loop_elapsed_ms={} zero_event_returns={}",
+            first.events,
+            elapsed_ms(first.elapsed),
+            iterations,
+            loop_elapsed_ms,
+            zero_event_returns
+        ),
+        first_elapsed_ms: elapsed_ms(first.elapsed),
+        first_events: first.events,
+        iterations,
+        loop_elapsed_ms,
+        timer_ready: 0,
+        zero_event_returns,
+    })
+}
+
+async fn handle_epoll_spin_broker_tcp_sticky_in(
+    args: PeerAddrArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let mut stream = connect_peer(&args.peer_addr)
+        .map_err(|e| HandlerError(format!("tcp connect {}: {e}", args.peer_addr)))?;
+    // Write a few bytes; the echo peer sends them back so our conn becomes
+    // persistently readable (sticky IN) without us ever draining it.
+    stream
+        .write_all(b"spin-probe")
+        .map_err(|e| HandlerError(format!("tcp write: {e}")))?;
+    wait_readable(&stream, Duration::from_secs(2))
+        .map_err(|e| HandlerError(format!("await echo: {e}")))?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| HandlerError(format!("set_nonblocking: {e}")))?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        stream.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLET).cast_unsigned(),
+        7,
+    )?;
+    // Never read the echoed data: the sticky IN must fire once then block. A
+    // litebox that re-delivers IN on every broker notification spins — the VS
+    // Code agent-host's unread-HTTPS-response (update.code.visualstudio.com)
+    // signature that the OUT-only dedup missed.
+    persistent_et_spin_out("broker_tcp_sticky_in_et", epfd.as_raw_fd())
+}
+
+async fn handle_epoll_spin_broker_tcp_half_closed(
+    args: PeerAddrArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let mut stream = connect_peer(&args.peer_addr)
+        .map_err(|e| HandlerError(format!("tcp connect {}: {e}", args.peer_addr)))?;
+    stream
+        .write_all(b"spin-probe")
+        .map_err(|e| HandlerError(format!("tcp write: {e}")))?;
+    wait_readable(&stream, Duration::from_secs(2))
+        .map_err(|e| HandlerError(format!("await echo: {e}")))?;
+    // Half-close our write side: the echo peer reads EOF and closes, so our
+    // conn gains a sticky RDHUP on top of the sticky IN — the exact half-closed
+    // agent-host connection signature (IN|RDHUP under EPOLLET).
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|e| HandlerError(format!("shutdown write: {e}")))?;
+    std::thread::sleep(Duration::from_millis(150));
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| HandlerError(format!("set_nonblocking: {e}")))?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        stream.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET) as u32,
+        7,
+    )?;
+    persistent_et_spin_out("broker_tcp_half_closed_et", epfd.as_raw_fd())
+}
+
+async fn handle_epoll_refire_broker_tcp_drain_in_et(
+    args: PeerAddrArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    const CYCLES: usize = 4;
+
+    let mut stream = connect_peer(&args.peer_addr)
+        .map_err(|e| HandlerError(format!("tcp connect {}: {e}", args.peer_addr)))?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| HandlerError(format!("set_nonblocking: {e}")))?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        stream.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLET).cast_unsigned(),
+        7,
+    )?;
+
+    let mut first_events = 0;
+    let mut first_elapsed_ms = 0;
+    let mut refires = 0_u64;
+    let mut drained_bytes = 0_usize;
+    let mut samples = Vec::with_capacity(CYCLES);
+
+    for cycle in 0..CYCLES {
+        let payload = format!("broker-tcp-drain-refire-cycle-{cycle}");
+        write_all_nonblocking(&mut stream, payload.as_bytes(), Duration::from_secs(5))
+            .map_err(|e| HandlerError(format!("cycle {cycle} tcp write: {e}")))?;
+        // Generous per-cycle deadline: a correct re-fire returns immediately, so
+        // a real under-fire still hangs the full timeout; the slack only absorbs
+        // deep non-PIE-chain (dng) scheduling latency under heavy load so the
+        // guard doesn't flake on the dashboard.
+        let sample = timed_epoll_pwait(epfd.as_raw_fd(), 5000, 4)?;
+        if cycle == 0 {
+            first_events = sample.events;
+            first_elapsed_ms = elapsed_ms(sample.elapsed);
+        }
+        samples.push(sample.events);
+        if sample.events <= 0 {
+            return Ok(EpollSpinOut {
+                detail: format!(
+                    "step=broker_tcp_drain_in_refire_et cycle={cycle} timed out samples={samples:?} drained_bytes={drained_bytes}"
+                ),
+                first_elapsed_ms,
+                first_events,
+                iterations: cycle as u64,
+                loop_elapsed_ms: 0,
+                timer_ready: refires,
+                zero_event_returns: 1,
+            });
+        }
+        refires += 1;
+        drained_bytes += drain_tcp_stream_to_eagain(&mut stream)
+            .map_err(|e| HandlerError(format!("cycle {cycle} drain: {e}")))?;
+    }
+
+    Ok(EpollSpinOut {
+        detail: format!(
+            "step=broker_tcp_drain_in_refire_et cycles={CYCLES} samples={samples:?} drained_bytes={drained_bytes}"
+        ),
+        first_elapsed_ms,
+        first_events,
+        iterations: CYCLES as u64,
+        loop_elapsed_ms: 0,
+        timer_ready: refires,
+        zero_event_returns: 0,
+    })
+}
+
+fn write_all_nonblocking(
+    stream: &mut std::net::TcpStream,
+    mut buf: &[u8],
+    timeout: Duration,
+) -> Result<(), std::io::Error> {
+    let deadline = Instant::now() + timeout;
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "tcp write returned zero",
+                ));
+            }
+            Ok(n) => buf = &buf[n..],
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out writing to tcp stream",
+                    ));
+                }
+                std::thread::yield_now();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn drain_tcp_stream_to_eagain(stream: &mut std::net::TcpStream) -> Result<usize, std::io::Error> {
+    let mut total = 0_usize;
+    let mut buf = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "tcp stream closed while draining",
+                ));
+            }
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if total == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "epoll reported readable but drain saw no bytes",
+                    ));
+                }
+                return Ok(total);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn drive_broker_tcp_in_probe(
+    run: &mut RunContext<'_>,
+    observer: &super::agents::AgentHandle,
+    peer: &super::agents::AgentHandle,
+    token: &'static HandlerToken<PeerAddrArgs, EpollSpinOut>,
+) -> Result<String, String> {
+    let peer_addr = open_peer_addr(run, peer).await?;
+    let out = run
+        .send_named_typed(observer, token, PeerAddrArgs { peer_addr })
+        .await
+        .map_err(|e| format!("send_named: {e}"))?;
+    check_span_et_no_spin(&out)
+}
+
+fn register_broker_tcp_in_test(
+    reg: &mut Registry<'_>,
+    agent: AgentName,
+    name: &str,
+    token: &'static HandlerToken<PeerAddrArgs, EpollSpinOut>,
+) {
+    let label = agent.to_string();
+    reg.test("vscode", "epoll_pidfd", format!("EP.spin.{name}.{agent}"))
+        .timeout(60)
+        .build(move |cx| {
+            let observer = cx.require(agent);
+            let peer_agent = peer_for(agent);
+            let peer = if peer_agent == agent {
+                observer.clone()
+            } else {
+                cx.require(peer_agent)
+            };
+            let label = label.clone();
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let result = drive_broker_tcp_in_probe(run, &observer, &peer, token).await;
+                    match result {
+                        Ok(detail) => TestOutcome::new(&label, true, detail),
+                        Err(detail) => TestOutcome::new(&label, false, detail),
+                    }
+                })
+            })
+        });
+}
+
+async fn handle_span_eventfd_out_et(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let efd = EventFd::open(0, "cloexec")?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        efd.as_raw_fd(),
+        (libc::EPOLLOUT | libc::EPOLLET) as u32,
+        1,
+    )?;
+    persistent_et_spin_out("eventfd_out_et", epfd.as_raw_fd())
+}
+
+async fn handle_span_eventfd_in_et(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    // counter=1 → readable now, never drained: the tokio wakeup-eventfd shape.
+    let efd = EventFd::open(1, "cloexec")?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        efd.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLET) as u32,
+        1,
+    )?;
+    persistent_et_spin_out("eventfd_in_et", epfd.as_raw_fd())
+}
+
+async fn handle_span_pipe_out_et(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let (_read_end, write_end) = make_pipe_cloexec()?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        write_end.as_raw_fd(),
+        (libc::EPOLLOUT | libc::EPOLLET) as u32,
+        1,
+    )?;
+    persistent_et_spin_out("pipe_out_et", epfd.as_raw_fd())
+}
+
+async fn handle_span_pipe_in_et(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let (read_end, write_end) = make_pipe_cloexec()?;
+    // Make the read end persistently readable without draining it.
+    write_eventfd_counter(write_end.as_raw_fd(), 1)?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        read_end.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLET) as u32,
+        1,
+    )?;
+    persistent_et_spin_out("pipe_in_et", epfd.as_raw_fd())
+}
+
+async fn handle_span_socketpair_out_et(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let (a, _b) = make_stream_socketpair()?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        a.as_raw_fd(),
+        (libc::EPOLLOUT | libc::EPOLLET) as u32,
+        1,
+    )?;
+    persistent_et_spin_out("socketpair_out_et", epfd.as_raw_fd())
+}
+
+async fn handle_span_socketpair_in_et(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    let (a, b) = make_stream_socketpair()?;
+    // Make `a` persistently readable: write from `b`, never drain `a`.
+    write_eventfd_counter(b.as_raw_fd(), 1)?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        a.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLET) as u32,
+        1,
+    )?;
+    persistent_et_spin_out("socketpair_in_et", epfd.as_raw_fd())
+}
+
+async fn handle_span_eventfd_in_refire(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    // Correctness guard against over-suppression: ET must re-deliver after a
+    // genuine not-ready -> ready transition. write -> edge; drain -> not ready
+    // (next wait times out); write -> edge again.
+    let efd = EventFd::open(0, "cloexec")?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        efd.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLET) as u32,
+        1,
+    )?;
+    write_eventfd_counter(efd.as_raw_fd(), 1)?;
+    let e1 = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+    drain_eventfd_counter(efd.as_raw_fd())?;
+    let e2 = timed_epoll_pwait(epfd.as_raw_fd(), 300, 4)?;
+    write_eventfd_counter(efd.as_raw_fd(), 1)?;
+    let e3 = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+    Ok(EpollSpinOut {
+        detail: format!(
+            "step=eventfd_in_refire e1={} e2={} e3={} e1_ms={} e3_ms={}",
+            e1.events,
+            e2.events,
+            e3.events,
+            elapsed_ms(e1.elapsed),
+            elapsed_ms(e3.elapsed)
+        ),
+        first_elapsed_ms: elapsed_ms(e1.elapsed),
+        first_events: e1.events,
+        // re-purposed: 1 iff the post-rewrite edge re-fired.
+        timer_ready: u64::from(e3.events > 0),
+        // re-purposed: 1 iff the drained wait correctly timed out.
+        zero_event_returns: u64::from(e2.events == 0),
+        iterations: 0,
+        loop_elapsed_ms: 0,
+    })
+}
+
+async fn handle_span_eventfd_out_lt(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    // Level-triggered guard: a persistently-writable fd registered WITHOUT
+    // EPOLLET must report ready on EVERY wait. A high iteration count with zero
+    // timeouts is the CORRECT outcome here.
+    let efd = EventFd::open(0, "cloexec")?;
+    let epfd = epoll_create()?;
+    epoll_add(epfd.as_raw_fd(), efd.as_raw_fd(), libc::EPOLLOUT as u32, 1)?;
+    let first = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+    let loop_start = Instant::now();
+    let loop_deadline = loop_start + Duration::from_secs(2);
+    let mut iterations = 0_u64;
+    let mut zero_event_returns = u64::from(first.events == 0);
+    while Instant::now() < loop_deadline {
+        let sample = timed_epoll_pwait(epfd.as_raw_fd(), 1000, 4)?;
+        iterations += 1;
+        zero_event_returns += u64::from(sample.events == 0);
+    }
+    Ok(EpollSpinOut {
+        detail: format!(
+            "step=eventfd_out_lt first_events={} iterations={} zero_event_returns={}",
+            first.events, iterations, zero_event_returns
+        ),
+        first_elapsed_ms: elapsed_ms(first.elapsed),
+        first_events: first.events,
+        iterations,
+        loop_elapsed_ms: elapsed_ms(loop_start.elapsed()),
+        timer_ready: 0,
+        zero_event_returns,
+    })
+}
+
+async fn handle_span_eventfd_in_oneshot(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollSpinOut, HandlerError> {
+    // EPOLLONESHOT: a ready fd fires once then is disabled until re-armed via
+    // EPOLL_CTL_MOD. We never re-arm, so after the initial fire every wait
+    // must block (time out).
+    let efd = EventFd::open(1, "cloexec")?;
+    let epfd = epoll_create()?;
+    epoll_add(
+        epfd.as_raw_fd(),
+        efd.as_raw_fd(),
+        (libc::EPOLLIN | libc::EPOLLONESHOT) as u32,
+        1,
+    )?;
+    persistent_et_spin_out("eventfd_in_oneshot", epfd.as_raw_fd())
+}
+
+fn check_span_et_no_spin(out: &EpollSpinOut) -> Result<String, String> {
+    // The initial edge fires once (first_events>0); a 5s loop of 1000ms waits
+    // then does <=~5 iterations when the epoll correctly blocks. A spin returns
+    // immediately thousands of times. `iterations` is the discriminator; a
+    // stray spurious wakeup or two is tolerated (the spin signal is ~100x).
+    if out.first_events > 0 && out.iterations <= 10 {
+        Ok(out.detail.clone())
+    } else {
+        Err(out.detail.clone())
+    }
+}
+
+fn check_span_refire(out: &EpollSpinOut) -> Result<String, String> {
+    // e1 fired (first_events>0), drained wait timed out (zero_event_returns==1),
+    // re-armed write re-fired (timer_ready==1).
+    if out.first_events > 0 && out.zero_event_returns == 1 && out.timer_ready == 1 {
+        Ok(out.detail.clone())
+    } else {
+        Err(out.detail.clone())
+    }
+}
+
+fn check_span_lt_persistent(out: &EpollSpinOut) -> Result<String, String> {
+    // Level-triggered writable: every wait returns ready, so iterations is high
+    // and no wait times out. Guards that the general ET fix does not suppress
+    // legitimate level-triggered readiness.
+    if out.first_events > 0 && out.iterations > 100 && out.zero_event_returns == 0 {
+        Ok(out.detail.clone())
+    } else {
+        Err(out.detail.clone())
+    }
+}
+
 pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("wait-forever", leaf_subcmd::subcmd_wait_forever);
 
@@ -636,6 +1226,30 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
     register_handler!(
         EPOLL_SPIN_BROKER_TCP_STICKY_OUT,
         handle_epoll_spin_broker_tcp_sticky_out
+    );
+    register_handler!(
+        EPOLL_SPIN_BROKER_TCP_STICKY_IN,
+        handle_epoll_spin_broker_tcp_sticky_in
+    );
+    register_handler!(
+        EPOLL_SPIN_BROKER_TCP_HALF_CLOSED,
+        handle_epoll_spin_broker_tcp_half_closed
+    );
+    register_handler!(
+        EPOLL_REFIRE_BROKER_TCP_DRAIN_IN_ET,
+        handle_epoll_refire_broker_tcp_drain_in_et
+    );
+    register_handler!(EPOLL_SPAN_EVENTFD_OUT_ET, handle_span_eventfd_out_et);
+    register_handler!(EPOLL_SPAN_EVENTFD_IN_ET, handle_span_eventfd_in_et);
+    register_handler!(EPOLL_SPAN_PIPE_OUT_ET, handle_span_pipe_out_et);
+    register_handler!(EPOLL_SPAN_PIPE_IN_ET, handle_span_pipe_in_et);
+    register_handler!(EPOLL_SPAN_SOCKETPAIR_OUT_ET, handle_span_socketpair_out_et);
+    register_handler!(EPOLL_SPAN_SOCKETPAIR_IN_ET, handle_span_socketpair_in_et);
+    register_handler!(EPOLL_SPAN_EVENTFD_IN_REFIRE, handle_span_eventfd_in_refire);
+    register_handler!(EPOLL_SPAN_EVENTFD_OUT_LT, handle_span_eventfd_out_lt);
+    register_handler!(
+        EPOLL_SPAN_EVENTFD_IN_ONESHOT,
+        handle_span_eventfd_in_oneshot
     );
 
     for &agent in EPI_AGENTS {
@@ -725,6 +1339,71 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
             check_epoll_spin_broker_writable_et,
         );
         register_broker_tcp_sticky_out_test(reg, agent);
+        register_broker_tcp_in_test(
+            reg,
+            agent,
+            "broker_tcp_sticky_in_et",
+            &EPOLL_SPIN_BROKER_TCP_STICKY_IN,
+        );
+        register_broker_tcp_in_test(
+            reg,
+            agent,
+            "broker_tcp_half_closed_et",
+            &EPOLL_SPIN_BROKER_TCP_HALF_CLOSED,
+        );
+        register_broker_tcp_refire_test(reg, agent);
+        for (name, token, check) in [
+            (
+                "eventfd_out_et",
+                &EPOLL_SPAN_EVENTFD_OUT_ET,
+                check_span_et_no_spin as fn(&EpollSpinOut) -> Result<String, String>,
+            ),
+            (
+                "eventfd_in_et",
+                &EPOLL_SPAN_EVENTFD_IN_ET,
+                check_span_et_no_spin,
+            ),
+            (
+                "pipe_out_et",
+                &EPOLL_SPAN_PIPE_OUT_ET,
+                check_span_et_no_spin,
+            ),
+            ("pipe_in_et", &EPOLL_SPAN_PIPE_IN_ET, check_span_et_no_spin),
+            (
+                "socketpair_out_et",
+                &EPOLL_SPAN_SOCKETPAIR_OUT_ET,
+                check_span_et_no_spin,
+            ),
+            (
+                "socketpair_in_et",
+                &EPOLL_SPAN_SOCKETPAIR_IN_ET,
+                check_span_et_no_spin,
+            ),
+            (
+                "eventfd_in_oneshot",
+                &EPOLL_SPAN_EVENTFD_IN_ONESHOT,
+                check_span_et_no_spin,
+            ),
+            (
+                "eventfd_in_refire",
+                &EPOLL_SPAN_EVENTFD_IN_REFIRE,
+                check_span_refire,
+            ),
+            (
+                "eventfd_out_lt",
+                &EPOLL_SPAN_EVENTFD_OUT_LT,
+                check_span_lt_persistent,
+            ),
+        ] {
+            reg.single_agent_handler_test(
+                "vscode",
+                "epoll_pidfd",
+                format!("EP.span.{name}.{agent}"),
+                agent,
+                token,
+                check,
+            );
+        }
     }
 }
 
@@ -748,6 +1427,35 @@ fn register_broker_tcp_sticky_out_test(reg: &mut Registry<'_>, agent: AgentName)
         Box::new(move |run| {
             Box::pin(async move {
                 let result = drive_broker_tcp_sticky_out_probe(run, &observer, &peer).await;
+                match result {
+                    Ok(detail) => TestOutcome::new(&label, true, detail),
+                    Err(detail) => TestOutcome::new(&label, false, detail),
+                }
+            })
+        })
+    });
+}
+
+fn register_broker_tcp_refire_test(reg: &mut Registry<'_>, agent: AgentName) {
+    let label = agent.to_string();
+    reg.test(
+        "vscode",
+        "epoll_pidfd",
+        format!("EP.refire.broker_tcp_drain_in_et.{agent}"),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let observer = cx.require(agent);
+        let peer_agent = peer_for(agent);
+        let peer = if peer_agent == agent {
+            observer.clone()
+        } else {
+            cx.require(peer_agent)
+        };
+        let label = label.clone();
+        Box::new(move |run| {
+            Box::pin(async move {
+                let result = drive_broker_tcp_refire_probe(run, &observer, &peer).await;
                 match result {
                     Ok(detail) => TestOutcome::new(&label, true, detail),
                     Err(detail) => TestOutcome::new(&label, false, detail),
@@ -800,6 +1508,18 @@ fn check_epoll_spin_broker_tcp_sticky_out(out: &EpollSpinOut) -> Result<String, 
     // 3s loop with 100ms timeouts: native completes about 30 blocking waits.
     // The sticky-broker-notification bug returns immediately thousands of times.
     if out.first_events > 0 && out.iterations <= 40 && out.zero_event_returns == out.iterations {
+        Ok(out.detail.clone())
+    } else {
+        Err(out.detail.clone())
+    }
+}
+
+fn check_broker_tcp_refire(out: &EpollSpinOut) -> Result<String, String> {
+    if out.first_events > 0
+        && out.iterations == 4
+        && out.timer_ready == 4
+        && out.zero_event_returns == 0
+    {
         Ok(out.detail.clone())
     } else {
         Err(out.detail.clone())
@@ -1161,6 +1881,24 @@ async fn drive_broker_tcp_sticky_out_probe(
         .map_err(|e| format!("send_named: {e}"))?;
     check_epoll_spin_broker_tcp_sticky_out(&out)
 }
+
+async fn drive_broker_tcp_refire_probe(
+    run: &mut RunContext<'_>,
+    observer: &super::agents::AgentHandle,
+    peer: &super::agents::AgentHandle,
+) -> Result<String, String> {
+    let peer_addr = open_peer_addr(run, peer).await?;
+    let out = run
+        .send_named_typed(
+            observer,
+            &EPOLL_REFIRE_BROKER_TCP_DRAIN_IN_ET,
+            PeerAddrArgs { peer_addr },
+        )
+        .await
+        .map_err(|e| format!("send_named: {e}"))?;
+    check_broker_tcp_refire(&out)
+}
+
 async fn open_peer_addr(
     run: &mut RunContext<'_>,
     peer: &super::agents::AgentHandle,

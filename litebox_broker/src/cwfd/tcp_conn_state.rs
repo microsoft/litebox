@@ -43,6 +43,10 @@ pub enum TcpConnError {
 pub struct TcpConnState {
     inner: Mutex<TcpConnInner>,
     subject: SubscriptionList,
+    /// Set by a `read` that drains the socket to `WouldBlock`; consumed by the
+    /// poll thread to re-send a still-asserted readable level exactly once after
+    /// a drain (missed-wakeup recovery) instead of unconditionally every tick.
+    read_drained: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -88,6 +92,7 @@ impl TcpConnState {
         let state = Arc::new(Self {
             inner: Mutex::new(TcpConnInner::Connected(connected)),
             subject: SubscriptionList::new(),
+            read_drained: AtomicBool::new(false),
         });
         if let Some(poll_stream) = poll_stream {
             Self::spawn_poll_thread(Arc::downgrade(&state), poll_stream);
@@ -102,6 +107,7 @@ impl TcpConnState {
                 pending_sockopts: Vec::new(),
             }),
             subject: SubscriptionList::new(),
+            read_drained: AtomicBool::new(false),
         })
     }
 
@@ -243,10 +249,25 @@ impl TcpConnState {
                 self.notify_current();
                 if n == 0 {
                     self.subject.notify(NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP);
+                } else {
+                    // The reader consumed a unit of data. Arm a one-shot re-send
+                    // so the poll thread re-notifies subsequently-arriving data
+                    // even when the readable level looks unchanged — a whole-unit
+                    // reader (e.g. dropbear reading one SSH packet) never hits the
+                    // WouldBlock arm below, so without this the next packet that
+                    // lands inside a 10ms poll window is never signalled and the
+                    // subscriber blocks forever.
+                    self.read_drained.store(true, Ordering::Release);
                 }
                 Ok(buf)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(TcpConnError::WouldBlock),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Reader drained the socket. Arm a one-shot re-send so the poll
+                // thread re-notifies when data next arrives even if the level
+                // mask looks unchanged (see spawn_poll_thread).
+                self.read_drained.store(true, Ordering::Release);
+                Err(TcpConnError::WouldBlock)
+            }
             Err(e)
                 if matches!(
                     e.kind(),
@@ -549,11 +570,21 @@ impl TcpConnState {
                     };
                     let events = poll_stream_events(&stream);
                     let notify = notification_events(events);
-                    // Data/HUP/error readiness is level-triggered; repeat it so a read
-                    // that drained data between poll samples cannot mask the next arrival.
-                    let level_triggered =
+                    // Edge-correct re-notification. Data/HUP/error readiness is
+                    // level-triggered, so a read that drains the socket between
+                    // poll samples must not mask the next arrival when the level
+                    // mask looks unchanged. The old code resent on *every* tick
+                    // whenever a readable bit was set, which converts a
+                    // persistently-asserted level into an unbounded edge storm
+                    // and livelocks a fast (libuv-style, level-triggered) epoll
+                    // subscriber. Instead, resend a still-asserted readable level
+                    // only once per drain: a `read` that hit WouldBlock arms
+                    // `read_drained`, which we consume here.
+                    let readable =
                         notify & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR) != 0;
-                    if notify != 0 && (notify != last || level_triggered) {
+                    let drained_resend =
+                        readable && state.read_drained.swap(false, Ordering::AcqRel);
+                    if notify != 0 && (notify != last || drained_resend) {
                         state.subject.notify(notify);
                     }
                     last = notify;
@@ -783,8 +814,22 @@ fn io_error_to_tcp_error(err: std::io::Error) -> TcpConnError {
 mod tests {
     use super::*;
     use crate::cwfd::inet_listener_state::decode_sockaddr;
+    use litebox_common_linux::notification_ring::NotificationReceiver;
+    use litebox_common_linux::shmem_ring::ShmemRingPair;
     use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
+
+    fn make_notification_pair() -> (Arc<Mutex<NotificationSender>>, NotificationReceiver) {
+        let (pair, tx_fd, rx_fd) = ShmemRingPair::create().expect("ring create");
+        let (broker_writer, _broker_reader_unused) = pair.into_parts();
+        let (_worker_writer_unused, worker_reader) =
+            ShmemRingPair::open(tx_fd, rx_fd).expect("ring open");
+        (
+            Arc::new(Mutex::new(NotificationSender::new(broker_writer))),
+            NotificationReceiver::new(worker_reader),
+        )
+    }
 
     fn wait_for_connect(
         state: &Arc<TcpConnState>,
@@ -891,6 +936,152 @@ mod tests {
 
         state.shutdown(false, true).unwrap();
         assert_eq!(state.write(b"again"), Err(TcpConnError::PeerClosed));
+    }
+
+    /// Regression: a persistently-readable connection whose readiness level
+    /// never changes must not produce an unbounded per-tick re-notification
+    /// storm to a fast subscriber. That storm livelocked libuv's
+    /// level-triggered epoll loop and stalled the VS Code remote exthost
+    /// keepalive (server->client silence -> 25s reconnect churn).
+    #[test]
+    fn poll_thread_does_not_storm_persistently_readable_conn() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(target).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let state = TcpConnState::new(server);
+
+        let (sender, receiver) = make_notification_pair();
+        state
+            .subscribe(1, NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT, sender)
+            .unwrap();
+
+        // Persistently readable; we never drain it from the broker side, so the
+        // poll thread observes an unchanged IN|OUT level on every 10ms tick.
+        client.write_all(b"persistently-readable").unwrap();
+
+        // Fast consumer: drain every frame so subscription coalescing cannot
+        // hide a re-send storm.
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_thread = count.clone();
+        let drainer = std::thread::spawn(move || {
+            let mut receiver = receiver;
+            while receiver.recv().is_ok() {
+                count_thread.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(150));
+        let observed = count.load(Ordering::Relaxed);
+
+        // Close the ring so the drainer's blocking recv returns and it exits.
+        drop(state);
+        let _ = drainer.join();
+
+        // 150ms is ~15 poll ticks. Edge-correct delivery emits only the initial
+        // readiness edges (subscribe OUT, then the first IN|OUT); the old
+        // every-tick resend emitted ~15. Generous slack for the initial edges.
+        assert!(
+            observed <= 4,
+            "broker re-notification storm: {observed} frames in 150ms for an \
+             unchanged readable level (expected a few edges, not a per-tick storm)"
+        );
+    }
+
+    /// The drain-aware re-send must still recover readiness after a reader
+    /// drains the socket and new data later arrives — the property the old
+    /// unconditional every-tick resend provided.
+    #[test]
+    fn poll_thread_renotifies_after_drain_then_new_data() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(target).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let state = TcpConnState::new(server);
+
+        let (sender, receiver) = make_notification_pair();
+        state.subscribe(1, NOTIFY_EVENT_IN, sender).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_thread = count.clone();
+        let drainer = std::thread::spawn(move || {
+            let mut receiver = receiver;
+            while receiver.recv().is_ok() {
+                count_thread.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // First arrival, drained fully: the trailing read returns WouldBlock,
+        // which arms read_drained.
+        client.write_all(b"first").unwrap();
+        assert_eq!(read_wait(&state, 64), b"first");
+        assert_eq!(state.read(64), Err(TcpConnError::WouldBlock));
+        std::thread::sleep(Duration::from_millis(60));
+        let before = count.load(Ordering::Relaxed);
+
+        // New data after the drain must produce a fresh readiness notification.
+        client.write_all(b"second").unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        let after = count.load(Ordering::Relaxed);
+
+        drop(state);
+        let _ = drainer.join();
+
+        assert!(
+            after > before,
+            "no re-notification after drain + new data (before={before}, after={after}): \
+             the missed-wakeup recovery regressed"
+        );
+    }
+
+    /// Regression for the whole-unit-reader hang (broke the VS Code SSH
+    /// handshake): a subscriber that reads a complete unit successfully —
+    /// never hitting WouldBlock — must still be re-notified when the next unit
+    /// arrives. dropbear reads one SSH packet at a time; an earlier version of
+    /// this fix armed the re-notify only on the WouldBlock path, so the next
+    /// packet landing inside a 10ms poll window was never signalled and
+    /// `pselect6` blocked forever.
+    #[test]
+    fn poll_thread_renotifies_after_whole_unit_read_then_next_unit() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(target).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let state = TcpConnState::new(server);
+
+        let (sender, receiver) = make_notification_pair();
+        state.subscribe(1, NOTIFY_EVENT_IN, sender).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_thread = count.clone();
+        let drainer = std::thread::spawn(move || {
+            let mut receiver = receiver;
+            while receiver.recv().is_ok() {
+                count_thread.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Let the first unit settle so the read takes it whole in one Ok(n)
+        // without ever hitting WouldBlock (the dropbear single-packet pattern).
+        client.write_all(b"unit-1").unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(read_wait(&state, 6), b"unit-1");
+        std::thread::sleep(Duration::from_millis(40));
+        let before = count.load(Ordering::Relaxed);
+
+        // Next unit must produce a fresh readiness notification.
+        client.write_all(b"unit-2").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let after = count.load(Ordering::Relaxed);
+
+        drop(state);
+        let _ = drainer.join();
+
+        assert!(
+            after > before,
+            "whole-unit reader was not re-notified for the next unit (before={before}, \
+             after={after}): the SSH-handshake hang regressed"
+        );
     }
 }
 

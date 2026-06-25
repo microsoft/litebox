@@ -4,7 +4,7 @@
 //! Broker-backed TCP connection file descriptors.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use litebox::{
     event::{Events, IOPollable, observer::Observer, polling::Pollee, wait::WaitContext},
@@ -77,6 +77,8 @@ pub(crate) struct BrokerTcpConnFd<P: RawSyncPrimitivesProvider + litebox::platfo
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
     pollee: Arc<Pollee<P>>,
+    read_edge_reset_generation: AtomicU64,
+    write_edge_reset_generation: AtomicU64,
 }
 
 impl<P> BrokerTcpConnFd<P>
@@ -101,6 +103,8 @@ where
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
             pollee: Arc::new(Pollee::new()),
+            read_edge_reset_generation: AtomicU64::new(0),
+            write_edge_reset_generation: AtomicU64::new(0),
         }
     }
 
@@ -123,6 +127,14 @@ where
         FdKind::BrokerTcpConn {
             handle_id: self.handle(),
         }
+    }
+
+    pub(crate) fn read_edge_reset_generation(&self) -> u64 {
+        self.read_edge_reset_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn write_edge_reset_generation(&self) -> u64 {
+        self.write_edge_reset_generation.load(Ordering::Acquire)
     }
 }
 
@@ -174,7 +186,15 @@ impl BrokerTcpConnFd<Platform> {
             .setsockopt(self.handle(), level, optname, optval)
             .map_err(|err| match err {
                 BrokerOpError::InvalidValue => Errno::EOPNOTSUPP,
-                other => broker_err_to_errno(other),
+                BrokerOpError::WouldBlock => broker_err_to_errno(BrokerOpError::WouldBlock),
+                BrokerOpError::UnknownHandle => broker_err_to_errno(BrokerOpError::UnknownHandle),
+                BrokerOpError::PermissionDenied => {
+                    broker_err_to_errno(BrokerOpError::PermissionDenied)
+                }
+                BrokerOpError::ProtocolNotSupported => {
+                    broker_err_to_errno(BrokerOpError::ProtocolNotSupported)
+                }
+                BrokerOpError::Io => broker_err_to_errno(BrokerOpError::Io),
             })
     }
 
@@ -188,7 +208,15 @@ impl BrokerTcpConnFd<Platform> {
             .getsockopt(self.handle(), level, optname, optlen)
             .map_err(|err| match err {
                 BrokerOpError::InvalidValue => Errno::EOPNOTSUPP,
-                other => broker_err_to_errno(other),
+                BrokerOpError::WouldBlock => broker_err_to_errno(BrokerOpError::WouldBlock),
+                BrokerOpError::UnknownHandle => broker_err_to_errno(BrokerOpError::UnknownHandle),
+                BrokerOpError::PermissionDenied => {
+                    broker_err_to_errno(BrokerOpError::PermissionDenied)
+                }
+                BrokerOpError::ProtocolNotSupported => {
+                    broker_err_to_errno(BrokerOpError::ProtocolNotSupported)
+                }
+                BrokerOpError::Io => broker_err_to_errno(BrokerOpError::Io),
             })
     }
 
@@ -204,7 +232,11 @@ impl BrokerTcpConnFd<Platform> {
                 buf[..n].copy_from_slice(&bytes[..n]);
                 Ok(n)
             }
-            Err(BrokerOpError::WouldBlock) => Err(Errno::EAGAIN),
+            Err(BrokerOpError::WouldBlock) => {
+                self.read_edge_reset_generation
+                    .fetch_add(1, Ordering::AcqRel);
+                Err(Errno::EAGAIN)
+            }
             Err(e) => Err(broker_err_to_errno(e)),
         }
     }
@@ -214,7 +246,11 @@ impl BrokerTcpConnFd<Platform> {
         let chunk = &buf[..core::cmp::min(buf.len(), WRITE_TCP_CONN_CHUNK)];
         match self.provider.write_tcp_conn(self.handle(), chunk) {
             Ok(n) => Ok(n),
-            Err(BrokerOpError::WouldBlock) => Err(Errno::EAGAIN),
+            Err(BrokerOpError::WouldBlock) => {
+                self.write_edge_reset_generation
+                    .fetch_add(1, Ordering::AcqRel);
+                Err(Errno::EAGAIN)
+            }
             Err(BrokerOpError::InvalidValue) => Err(Errno::EPIPE),
             Err(e) => Err(broker_err_to_errno(e)),
         }

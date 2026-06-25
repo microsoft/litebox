@@ -35,6 +35,7 @@ use litebox_platform_multiplex::Platform;
 
 use super::broker_backed::{BrokerBackedCommon, broker_err_to_errno};
 use super::fork_snapshot::FdKind;
+use litebox_common_linux::cwfd::fd_transfer_frame::{PassedToken, StreamScmDeframer};
 
 static BROKER_SOCKETPAIR_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerSocketPairProvider>> =
     once_cell::race::OnceBox::new();
@@ -79,6 +80,14 @@ pub(crate) struct BrokerSocketPairFd<P: RawSyncPrimitivesProvider + litebox::pla
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
     pollee: Arc<Pollee<P>>,
+    /// In-band `SCM_RIGHTS` LBFD frame reassembly. The socketpair is a
+    /// true byte stream — framed (fd-bearing) and unframed writes
+    /// interleave and `read(2)` boundaries coalesce / split them — so the
+    /// reader must persist across `recvmsg` calls. Reset to empty after
+    /// fork-restore (the snapshot carries only `handle_id` + `endpoint`),
+    /// which matches the cross-process handoff usage (the child is the
+    /// sole reader and starts clean).
+    deframer: litebox::sync::Mutex<P, StreamScmDeframer>,
 }
 
 impl<P> BrokerSocketPairFd<P>
@@ -124,6 +133,7 @@ where
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
             pollee: Arc::new(Pollee::new()),
+            deframer: litebox::sync::Mutex::new(StreamScmDeframer::new()),
         }
     }
 
@@ -202,6 +212,26 @@ impl BrokerSocketPairFd<Platform> {
                 litebox::event::polling::TryOpError::WaitError(_) => Errno::EINTR,
                 litebox::event::polling::TryOpError::Other(errno) => errno,
             })
+    }
+
+    /// Receive into `buf`, transparently de-framing any in-band LBFD
+    /// `SCM_RIGHTS` frames. Returns `(bytes_copied, tokens)`; `tokens`
+    /// carries the fd tokens that arrived with this unit (empty for
+    /// ordinary unframed data). One *unit* — a single frame, or a run of
+    /// raw bytes — is returned per call, so coalesced frames each surface
+    /// with their own fds. The caller (`recvmsg`) materialises the tokens
+    /// into descriptor-table fds.
+    pub(crate) fn read_deframed(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+    ) -> Result<(usize, alloc::vec::Vec<PassedToken>), Errno> {
+        self.deframer.lock().read_unit(buf, |max| {
+            let mut chunk = alloc::vec![0u8; max];
+            let n = self.read(cx, &mut chunk)?;
+            chunk.truncate(n);
+            Ok(chunk)
+        })
     }
 
     pub(crate) fn shutdown(&self, read: bool, write: bool) -> Result<(), Errno> {

@@ -135,8 +135,8 @@ pub enum SubsystemTag {
     /// Broker-hosted pipe write end for SCM_RIGHTS token transfer. Wire value `15`.
     PipeWrite,
     /// Broker-hosted pseudo-terminal endpoint. Wire value `10`.
-    /// Phase E reserves this tag for PTY master/slave identity that
-    /// must survive cross-worker `exec_on_remote_host`.
+    /// Used for PTY master identity that must survive cross-worker
+    /// `exec_on_remote_host` and `SCM_RIGHTS` transfer.
     Pty,
     /// Broker-hosted TCP listener. Wire value `11`. Phase A.
     InetListener,
@@ -155,6 +155,12 @@ pub enum SubsystemTag {
     /// AF_UNIX datagram SCM_RIGHTS to reconstruct a 9P file fid that shares the
     /// sender's open file description.
     File,
+    /// Broker-backed AF_UNIX `SOCK_STREAM` socketpair endpoint A. Wire value `18`.
+    SocketPairA,
+    /// Broker-backed AF_UNIX `SOCK_STREAM` socketpair endpoint B. Wire value `19`.
+    SocketPairB,
+    /// Broker-backed connected AF_UNIX named `SOCK_STREAM` endpoint. Wire value `20`.
+    UnixStream,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
     /// the specific fd while continuing to deliver the rest of the
@@ -183,6 +189,9 @@ impl SubsystemTag {
             SubsystemTag::PipeWrite => 15,
             SubsystemTag::HostFd => 16,
             SubsystemTag::File => 17,
+            SubsystemTag::SocketPairA => 18,
+            SubsystemTag::SocketPairB => 19,
+            SubsystemTag::UnixStream => 20,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -209,6 +218,9 @@ impl SubsystemTag {
             15 => SubsystemTag::PipeWrite,
             16 => SubsystemTag::HostFd,
             17 => SubsystemTag::File,
+            18 => SubsystemTag::SocketPairA,
+            19 => SubsystemTag::SocketPairB,
+            20 => SubsystemTag::UnixStream,
             other => SubsystemTag::Unknown(other),
         }
     }
@@ -302,6 +314,25 @@ pub struct OwnedFrame {
     pub data: Vec<u8>,
 }
 
+/// A single unit pulled from a mixed framed/raw byte stream by
+/// [`FdTransferReader::take_unit`].
+///
+/// Stream transports (the broker AF_UNIX `SOCK_STREAM` socketpair and
+/// named unix-stream) carry SCM-bearing LBFD frames *interleaved* with
+/// ordinary unframed `write(2)` bytes, and `read(2)` boundaries split or
+/// coalesce them arbitrarily. `take_unit` resynchronises the stream one
+/// unit at a time.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReaderUnit {
+    /// A complete decoded frame; its bytes have been consumed.
+    Frame(OwnedFrame),
+    /// A run of raw, non-framed bytes (consumed). They precede the next
+    /// frame magic, or are trailing bytes when no frame follows.
+    Raw(Vec<u8>),
+    /// Not enough buffered bytes to decide yet — `push` more and retry.
+    NeedMore,
+}
+
 impl Default for FdTransferReader {
     fn default() -> Self {
         Self::new()
@@ -354,6 +385,178 @@ impl FdTransferReader {
             Err(other) => Err(other),
         }
     }
+
+    /// Extract the next [`ReaderUnit`] from the front of the buffer,
+    /// transparently separating interleaved LBFD frames from raw bytes
+    /// across arbitrary `read(2)` chunking.
+    ///
+    /// Semantics:
+    /// - Buffer empty → [`ReaderUnit::NeedMore`].
+    /// - Begins with [`FRAME_MAGIC`] and a full frame is buffered →
+    ///   [`ReaderUnit::Frame`] (bytes consumed).
+    /// - Begins with the magic but the frame body has not fully arrived →
+    ///   [`ReaderUnit::NeedMore`].
+    /// - Begins with the magic but the frame is structurally malformed (a
+    ///   false-positive magic embedded in raw data, or genuine
+    ///   corruption) → one raw byte is yielded so the stream
+    ///   resynchronises (`decode_frame` bounds every length field, so this
+    ///   cannot mistake garbage for an unbounded truncated body).
+    /// - Otherwise the leading non-framed bytes up to the next magic
+    ///   occurrence are returned as [`ReaderUnit::Raw`]. A 1..=3-byte
+    ///   partial magic at the very tail is retained (it may be the head of
+    ///   an as-yet-incomplete frame); if that prefix is all that remains,
+    ///   [`ReaderUnit::NeedMore`] is returned.
+    pub fn take_unit(&mut self) -> ReaderUnit {
+        let magic = FRAME_MAGIC.to_le_bytes();
+        let n = self.buf.len();
+        if n == 0 {
+            return ReaderUnit::NeedMore;
+        }
+        let starts_with_magic = n >= 4 && self.buf[..4] == magic;
+        if starts_with_magic {
+            return match decode_frame(&self.buf) {
+                Ok(decoded) => {
+                    let frame = OwnedFrame {
+                        tokens: decoded.tokens,
+                        data: decoded.data.to_vec(),
+                    };
+                    self.buf.drain(..decoded.consumed);
+                    ReaderUnit::Frame(frame)
+                }
+                Err(FrameError::HeaderTruncated { .. } | FrameError::BodyTruncated { .. }) => {
+                    ReaderUnit::NeedMore
+                }
+                Err(_) => {
+                    // Valid magic word but malformed frame: treat the lead
+                    // byte as raw and resync.
+                    let b = self.buf.remove(0);
+                    ReaderUnit::Raw(alloc::vec![b])
+                }
+            };
+        }
+        // Does not begin with a full magic. If the whole (short) buffer is
+        // a strict prefix of the magic, it might be a frame head still
+        // arriving — wait for more.
+        if n < 4 && self.buf[..] == magic[..n] {
+            return ReaderUnit::NeedMore;
+        }
+        // Raw run: bytes up to the next full magic occurrence (scan from
+        // offset 1 since offset 0 is known not to start a full magic).
+        let mut i = 1usize;
+        let mut found = None;
+        while i + 4 <= n {
+            if self.buf[i..i + 4] == magic {
+                found = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let cut = if let Some(f) = found {
+            f
+        } else {
+            // Retain a trailing partial-magic prefix (1..=3 bytes).
+            let maxp = core::cmp::min(3, n);
+            let mut keep = 0usize;
+            for p in (1..=maxp).rev() {
+                if self.buf[n - p..] == magic[..p] {
+                    keep = p;
+                    break;
+                }
+            }
+            n - keep
+        };
+        if cut == 0 {
+            return ReaderUnit::NeedMore;
+        }
+        let raw: Vec<u8> = self.buf[..cut].to_vec();
+        self.buf.drain(..cut);
+        ReaderUnit::Raw(raw)
+    }
+}
+
+/// Per-endpoint receive-side reassembly for the in-band LBFD framing used
+/// to carry `SCM_RIGHTS` fd tokens over a byte-stream transport (the
+/// broker AF_UNIX `SOCK_STREAM` socketpair and named unix-stream).
+///
+/// Framed (fd-bearing) and unframed writes interleave on the stream and
+/// `read(2)` boundaries coalesce or split them arbitrarily, so the reader
+/// must persist across `recvmsg` calls. The pre-fix code rebuilt a fresh
+/// [`FdTransferReader`] per call and decoded only one frame, silently
+/// dropping every coalesced frame after the first — the bug that stalled
+/// VS Code's exthost handle passing.
+///
+/// [`read_unit`](Self::read_unit) returns exactly one stream *unit* per
+/// call (one frame's data + its tokens, or a run of raw bytes), matching
+/// Linux's per-ancillary-boundary `SOCK_STREAM` delivery, and buffers any
+/// payload that overran the caller's buffer.
+#[derive(Default)]
+pub struct StreamScmDeframer {
+    reader: FdTransferReader,
+    /// Decoded data bytes not yet delivered because they overran a
+    /// caller's buffer. Returned (token-less) on subsequent reads.
+    pending: Vec<u8>,
+}
+
+impl StreamScmDeframer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Deframe one stream unit into `buf`, returning `(bytes_copied,
+    /// tokens)`. `fill(max_len)` returns up to `max_len` freshly-read raw
+    /// bytes from the underlying transport (an empty buffer signals EOF)
+    /// and is called only when more bytes are needed to complete the next
+    /// unit.
+    ///
+    /// `max_len` is bounded by the caller's `buf` so the per-`recvmsg`
+    /// broker read request matches the pre-deframer size: a fixed
+    /// oversized request (e.g. 60 KiB for a 64-byte `recv_fd`) needlessly
+    /// swamps the shared broker under concurrency.
+    pub fn read_unit<E>(
+        &mut self,
+        buf: &mut [u8],
+        mut fill: impl FnMut(usize) -> Result<Vec<u8>, E>,
+    ) -> Result<(usize, Vec<PassedToken>), E> {
+        if buf.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        // Deliver any leftover decoded bytes first (token-less tail of a
+        // frame / raw run that overran a prior caller's buffer).
+        if !self.pending.is_empty() {
+            let n = buf.len().min(self.pending.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            return Ok((n, Vec::new()));
+        }
+        loop {
+            match self.reader.take_unit() {
+                ReaderUnit::Frame(frame) => {
+                    let n = buf.len().min(frame.data.len());
+                    buf[..n].copy_from_slice(&frame.data[..n]);
+                    if n < frame.data.len() {
+                        self.pending.extend_from_slice(&frame.data[n..]);
+                    }
+                    return Ok((n, frame.tokens));
+                }
+                ReaderUnit::Raw(bytes) => {
+                    let n = buf.len().min(bytes.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        self.pending.extend_from_slice(&bytes[n..]);
+                    }
+                    return Ok((n, Vec::new()));
+                }
+                ReaderUnit::NeedMore => {
+                    let chunk = fill(buf.len())?;
+                    if chunk.is_empty() {
+                        // EOF / read-shutdown: no further units possible.
+                        return Ok((0, Vec::new()));
+                    }
+                    self.reader.push(&chunk);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -400,6 +603,165 @@ mod reader_tests {
         let frame = r.take_frame().unwrap().expect("frame ready");
         assert_eq!(frame.tokens, vec![pt(42)]);
         assert_eq!(frame.data, b"trickle");
+    }
+
+    #[test]
+    fn take_unit_empty_is_need_more() {
+        let mut r = FdTransferReader::new();
+        assert_eq!(r.take_unit(), ReaderUnit::NeedMore);
+    }
+
+    #[test]
+    fn take_unit_drains_two_coalesced_frames() {
+        // The regression that broke VS Code: two SCM frames in one read
+        // must both be recoverable, one per take_unit call.
+        let mut r = FdTransferReader::new();
+        r.push(&encoded_frame(&[pt(1)], b"a"));
+        r.push(&encoded_frame(&[pt(2)], b"b"));
+        let ReaderUnit::Frame(f) = r.take_unit() else {
+            panic!("expected first frame");
+        };
+        assert_eq!(f.tokens, vec![pt(1)]);
+        assert_eq!(f.data, b"a");
+        let ReaderUnit::Frame(f) = r.take_unit() else {
+            panic!("expected second frame");
+        };
+        assert_eq!(f.tokens, vec![pt(2)]);
+        assert_eq!(f.data, b"b");
+        assert_eq!(r.take_unit(), ReaderUnit::NeedMore);
+    }
+
+    #[test]
+    fn take_unit_raw_then_frame() {
+        let mut r = FdTransferReader::new();
+        r.push(b"plain json bytes");
+        r.push(&encoded_frame(&[pt(9)], b"x"));
+        let ReaderUnit::Raw(raw) = r.take_unit() else {
+            panic!("expected raw run");
+        };
+        assert_eq!(raw, b"plain json bytes");
+        let ReaderUnit::Frame(f) = r.take_unit() else {
+            panic!("expected frame");
+        };
+        assert_eq!(f.tokens, vec![pt(9)]);
+        assert_eq!(f.data, b"x");
+    }
+
+    #[test]
+    fn take_unit_frame_then_raw() {
+        let mut r = FdTransferReader::new();
+        r.push(&encoded_frame(&[pt(3)], b"hdr"));
+        r.push(b"tail-bytes");
+        assert!(matches!(r.take_unit(), ReaderUnit::Frame(_)));
+        let ReaderUnit::Raw(raw) = r.take_unit() else {
+            panic!("expected trailing raw");
+        };
+        assert_eq!(raw, b"tail-bytes");
+    }
+
+    #[test]
+    fn take_unit_partial_frame_is_need_more() {
+        let mut r = FdTransferReader::new();
+        let bytes = encoded_frame(&[pt(5)], b"incomplete");
+        r.push(&bytes[..bytes.len() - 1]); // header complete, body short
+        assert_eq!(r.take_unit(), ReaderUnit::NeedMore);
+        r.push(&bytes[bytes.len() - 1..]);
+        assert!(matches!(r.take_unit(), ReaderUnit::Frame(_)));
+    }
+
+    #[test]
+    fn take_unit_retains_tail_partial_magic() {
+        // A raw run that ends in the first bytes of a magic must NOT
+        // consume the partial magic — it could be the head of the next
+        // frame.
+        let mut r = FdTransferReader::new();
+        let magic = FRAME_MAGIC.to_le_bytes();
+        r.push(b"raw");
+        r.push(&magic[..2]); // two leading magic bytes, frame not yet here
+        let ReaderUnit::Raw(raw) = r.take_unit() else {
+            panic!("expected raw without the partial magic");
+        };
+        assert_eq!(raw, b"raw");
+        // Only the 2-byte partial magic remains; still undecidable.
+        assert_eq!(r.take_unit(), ReaderUnit::NeedMore);
+        // Completing the frame makes it decodable.
+        let frame = encoded_frame(&[pt(8)], b"z");
+        r.push(&frame[2..]);
+        let ReaderUnit::Frame(f) = r.take_unit() else {
+            panic!("expected frame after completion");
+        };
+        assert_eq!(f.data, b"z");
+    }
+
+    /// A `fill` closure that streams `wire` in `chunk`-sized pieces; used
+    /// to drive `StreamScmDeframer::read_unit` deterministically.
+    fn chunked_fill(wire: Vec<u8>, chunk: usize) -> impl FnMut(usize) -> Result<Vec<u8>, ()> {
+        let mut cursor = 0usize;
+        move |max: usize| {
+            let take = max.min(chunk).min(wire.len() - cursor);
+            let out = wire[cursor..cursor + take].to_vec();
+            cursor += take;
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn deframer_drains_coalesced_frames() {
+        // Two fd-bearing frames delivered in one fill must each surface
+        // with their own token, one per read_unit call.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&encoded_frame(&[pt(1)], b"a"));
+        wire.extend_from_slice(&encoded_frame(&[pt(2)], b"b"));
+        let mut fill = chunked_fill(wire, usize::MAX);
+        let mut d = StreamScmDeframer::new();
+        let mut buf = [0u8; 64];
+        let (n1, t1) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n1], b"a");
+        assert_eq!(t1, vec![pt(1)]);
+        let (n2, t2) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n2], b"b");
+        assert_eq!(t2, vec![pt(2)]);
+    }
+
+    #[test]
+    fn deframer_reassembles_split_frame() {
+        // A frame delivered one byte per fill must still reassemble.
+        let wire = encoded_frame(&[pt(5)], b"trickle");
+        let mut fill = chunked_fill(wire, 1);
+        let mut d = StreamScmDeframer::new();
+        let mut buf = [0u8; 64];
+        let (n, t) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n], b"trickle");
+        assert_eq!(t, vec![pt(5)]);
+    }
+
+    #[test]
+    fn deframer_buffers_overrun_into_pending() {
+        // A caller buffer smaller than the frame data gets the token with
+        // the first chunk; the remainder drains token-less.
+        let wire = encoded_frame(&[pt(7)], b"hello");
+        let mut fill = chunked_fill(wire, usize::MAX);
+        let mut d = StreamScmDeframer::new();
+        let mut buf = [0u8; 2];
+        let (n1, t1) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n1], b"he");
+        assert_eq!(t1, vec![pt(7)]);
+        let (n2, t2) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n2], b"ll");
+        assert!(t2.is_empty());
+        let (n3, t3) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(&buf[..n3], b"o");
+        assert!(t3.is_empty());
+    }
+
+    #[test]
+    fn deframer_eof_returns_zero() {
+        let mut fill = chunked_fill(Vec::new(), usize::MAX);
+        let mut d = StreamScmDeframer::new();
+        let mut buf = [0u8; 16];
+        let (n, t) = d.read_unit(&mut buf, &mut fill).unwrap();
+        assert_eq!(n, 0);
+        assert!(t.is_empty());
     }
 
     #[test]
@@ -888,7 +1250,10 @@ mod tests {
                 | SubsystemTag::InetDgram
                 | SubsystemTag::InetRaw
                 | SubsystemTag::HostFd
-                | SubsystemTag::File => panic!("expected Unknown({raw:#x}), got {tag:?}"),
+                | SubsystemTag::File
+                | SubsystemTag::SocketPairA
+                | SubsystemTag::SocketPairB
+                | SubsystemTag::UnixStream => panic!("expected Unknown({raw:#x}), got {tag:?}"),
             }
         }
     }
@@ -907,6 +1272,9 @@ mod tests {
         assert_eq!(SubsystemTag::PipeWrite.as_u8(), 15);
         assert_eq!(SubsystemTag::HostFd.as_u8(), 16);
         assert_eq!(SubsystemTag::File.as_u8(), 17);
+        assert_eq!(SubsystemTag::SocketPairA.as_u8(), 18);
+        assert_eq!(SubsystemTag::SocketPairB.as_u8(), 19);
+        assert_eq!(SubsystemTag::UnixStream.as_u8(), 20);
         for tag in [
             SubsystemTag::Eventfd,
             SubsystemTag::TcpSocket,
@@ -925,6 +1293,9 @@ mod tests {
             SubsystemTag::PipeWrite,
             SubsystemTag::HostFd,
             SubsystemTag::File,
+            SubsystemTag::SocketPairA,
+            SubsystemTag::SocketPairB,
+            SubsystemTag::UnixStream,
         ] {
             assert!(tag.is_known(), "{tag:?} should be known");
             assert_eq!(SubsystemTag::from_u8(tag.as_u8()), tag);

@@ -29,6 +29,7 @@ use litebox_common_linux::{
     cwfd::{
         broker_subscribable::BrokerSubscribable,
         broker_unix_stream_provider::{BrokerOpError, BrokerUnixStreamProvider},
+        fd_transfer_frame::{PassedToken, StreamScmDeframer},
         notification_frame::{
             NOTIFY_EVENT_ERR, NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
         },
@@ -70,6 +71,10 @@ pub(crate) struct BrokerUnixStreamFd<P: RawSyncPrimitivesProvider + litebox::pla
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
     pollee: Arc<Pollee<P>>,
+    /// In-band `SCM_RIGHTS` LBFD frame reassembly across `recvmsg` calls
+    /// (see [`StreamScmDeframer`]); the named unix-stream is a byte stream
+    /// with the same coalescing hazard as the broker socketpair.
+    deframer: litebox::sync::Mutex<P, StreamScmDeframer>,
 }
 
 impl<P> BrokerUnixStreamFd<P>
@@ -92,6 +97,7 @@ where
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
             pollee: Arc::new(Pollee::new()),
+            deframer: litebox::sync::Mutex::new(StreamScmDeframer::new()),
         }
     }
 
@@ -194,6 +200,21 @@ impl BrokerUnixStreamFd<Platform> {
                 }
             })
             .map_err(map_try_op_err)
+    }
+
+    /// Receive into `buf`, transparently de-framing in-band LBFD
+    /// `SCM_RIGHTS` frames. Returns `(bytes_copied, tokens)`; one stream
+    /// unit (a frame's data + its tokens, or a run of raw bytes) per call,
+    /// so coalesced frames each surface with their own fds. The caller
+    /// (`recvmsg`) materialises the tokens into descriptor-table fds.
+    pub(crate) fn recv_deframed(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        buf: &mut [u8],
+    ) -> Result<(usize, alloc::vec::Vec<PassedToken>), Errno> {
+        self.deframer.lock().read_unit(buf, |max| {
+            self.recv(cx, u32::try_from(max).unwrap_or(u32::MAX))
+        })
     }
 
     pub(crate) fn shutdown(&self, how: u8) -> Result<(), Errno> {
