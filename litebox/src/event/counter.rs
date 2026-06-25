@@ -145,18 +145,20 @@ where
             .broker
             .request(BrokerRequest::Event(request))
             .map_err(BrokerObjectError::from)
-            .map_err(|error| self.handle_request_error(error))?
-        {
+            .inspect_err(|&error| {
+                if error != BrokerObjectError::WouldBlock {
+                    self.pollee.notify_observers(Events::ERR);
+                }
+            })? {
             BrokerResponse::Event(response) => Ok(response),
-            BrokerResponse::Error(error) => Err(self.handle_request_error(error.into())),
+            BrokerResponse::Error(error) => {
+                let error = error.into();
+                if error != BrokerObjectError::WouldBlock {
+                    self.pollee.notify_observers(Events::ERR);
+                }
+                Err(error)
+            }
         }
-    }
-
-    fn handle_request_error(&self, error: BrokerObjectError) -> BrokerObjectError {
-        if error != BrokerObjectError::WouldBlock {
-            self.pollee.notify_observers(Events::ERR);
-        }
-        error
     }
 }
 
