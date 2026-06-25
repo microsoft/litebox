@@ -449,6 +449,11 @@ pub struct SessionManager {
     /// (`true` == held). Entries are created lazily only for UUIDs that
     /// have been observed to be single-instance — never for unknown UUIDs
     /// whose load might fail or turn out to be multi-instance.
+    ///
+    /// We do not remove its entry even if the instance is destroyed to
+    /// support a future reload of the same TA. This is bounded in
+    /// practice because we only support a few managed TAs. This entry
+    /// management should be aligned with `known_flags`.
     single_instance_locks: SpinMutex<HashMap<TeeUuid, bool>>,
     /// Shared serialization state for first-ever loads of unknown UUIDs
     /// (`true` == held). Held by OpenSession while flags are still
