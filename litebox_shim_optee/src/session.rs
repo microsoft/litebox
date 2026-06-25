@@ -627,11 +627,11 @@ impl SessionManager {
     ///
     /// The per-UUID lock is acquired *before* the final session-map
     /// re-read. This excludes concurrent `mark_sessions_dead_for_instance`
-    /// and cache eviction (both of which require the UUID lock), so the
-    /// `Live` / `Dead` state observed in the re-read remains authoritative
-    /// for the lifetime of the returned token. Reading the entry before
-    /// taking the UUID lock would let a sibling complete the entire
-    /// mark-dead / evict / teardown sequence between our read and our
+    /// and cache eviction (which callers perform only while holding the UUID
+    /// lock), so the `Live` / `Dead` state observed in the re-read remains
+    /// authoritative for the lifetime of the returned token. Reading the
+    /// entry before taking the UUID lock would let a sibling complete the
+    /// entire mark-dead / evict / teardown sequence between our read and our
     /// lock acquisition, leaving us holding a stale `Live` entry pointing
     /// at a torn-down page table.
     ///

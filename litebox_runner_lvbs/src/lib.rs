@@ -1005,7 +1005,7 @@ fn handle_invoke_command(
         let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
         // Write response BEFORE switching page tables (accesses user memory).
-        // `with_session`'s marker keeps the entry stable so another core cannot
+        // `with_session`'s serialization keeps the entry stable so another core cannot
         // tear down the active page table while this core is copying TA outputs.
         let write_result = write_msg_args_to_normal_world(
             msg_args,
