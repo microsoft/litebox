@@ -48,16 +48,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         let (stream, _) = listener.accept()?;
-        let broker = broker.clone();
-        drop(
-            std::thread::Builder::new()
-                .name("litebox-broker-connection".to_owned())
-                .spawn(move || {
-                    let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
-                    if let Err(error) = serve_connection(&broker, &mut channel) {
-                        eprintln!("failed to serve broker connection: {error}");
-                    }
-                })?,
-        );
+        let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
+        serve_connection(&broker, &mut channel)?;
     }
 }
