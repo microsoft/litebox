@@ -6,17 +6,11 @@ use std::ffi::OsString;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
 use litebox_broker_host::serve_connection;
 use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
-
-const MAX_CONNECTION_HANDLERS: usize = 64;
 
 #[derive(Parser, Debug)]
 struct CliArgs {
@@ -52,47 +46,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let active_connection_handlers = Arc::new(AtomicUsize::new(0));
     loop {
         let (stream, _) = listener.accept()?;
-        if active_connection_handlers
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < MAX_CONNECTION_HANDLERS).then_some(count + 1)
-            })
-            .is_err()
-        {
-            eprintln!("too many active broker connections; dropping connection");
-            continue;
-        }
-
         let broker = broker.clone();
-        let handler_count = active_connection_handlers.clone();
-        match std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("litebox-broker-connection".to_owned())
             .spawn(move || {
-                let _active_connection = ActiveConnectionHandler {
-                    count: handler_count,
-                };
                 let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
                 if let Err(error) = serve_connection(&broker, &mut channel) {
                     eprintln!("failed to serve broker connection: {error}");
                 }
-            }) {
-            Ok(handle) => drop(handle),
-            Err(error) => {
-                active_connection_handlers.fetch_sub(1, Ordering::Relaxed);
-                eprintln!("failed to spawn broker connection handler: {error}");
-            }
+            })
+        {
+            eprintln!("failed to spawn broker connection handler: {error}");
         }
-    }
-}
-
-struct ActiveConnectionHandler {
-    count: Arc<AtomicUsize>,
-}
-
-impl Drop for ActiveConnectionHandler {
-    fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::Relaxed);
     }
 }
