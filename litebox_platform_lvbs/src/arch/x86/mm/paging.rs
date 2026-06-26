@@ -35,6 +35,17 @@ use crate::mm::{
 #[cfg(not(test))]
 const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
 
+/// PML4 index of the first VTL1-kernel slot (`PA + KERNEL_OFFSET`).
+///
+/// Only slots `>= KERNEL_PML4_START` are safe to share between page tables:
+/// the kernel mapping structure is fixed after boot. Lower slots (user,
+/// direct-map, vmap) have mappings that change at runtime and are not synced
+/// across page tables, so sharing a stale snapshot would make the base and a
+/// task observe different leaves for the same page (cross-PT write fault).
+///
+/// `KERNEL_OFFSET` is 512 GiB (PML4-slot) aligned, so this is an exact cutoff.
+pub(crate) const KERNEL_PML4_START: usize = ((crate::KERNEL_OFFSET >> 39) & 0x1FF) as usize;
+
 /// Flush TLB entries for a contiguous page range across all cores.
 ///
 /// Uses Hyper-V hypercalls so that remote cores sharing the same page table
@@ -612,7 +623,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             } else {
                 flags
             };
-            let table_flags = page_flags - PageTableFlags::NO_EXECUTE; // parent entries should not have NO_EXECUTE
+            // Parent entries use a stable permissive constant, not leaf-derived flags.
+            let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
             match unsafe {
                 inner.map_to_with_table_flags(
@@ -755,14 +767,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         unsafe { Self::init(frame.start_address()) }
     }
 
-    /// Copy all non-zero PML4 entries from `source` into this page table.
+    /// Share the VTL1-kernel P3/P2/P1 tables from `source` by copying its
+    /// kernel PML4 entries (slots `>= KERNEL_PML4_START`), avoiding per-task
+    /// allocation of the kernel intermediate frames. Lower slots (user,
+    /// direct-map, vmap) are deliberately not shared; see [`KERNEL_PML4_START`].
     ///
-    /// This is used to share kernel page table structures (P3/P2/P1) between
-    /// the base page table and task page tables, avoiding per-task allocation
-    /// of intermediate page table frames for the kernel region.
-    ///
-    /// Only entries that are present in `source` and absent in `self` are copied.
-    /// Entries already present in `self` are left unchanged.
+    /// Only entries present in `source` and absent in `self` are copied.
     pub(crate) fn copy_pml4_entries_from(&self, source: &Self) {
         let mut dst = self.inner.lock();
         let src = source.inner.lock();
@@ -770,6 +780,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             .level_4_table_mut()
             .iter_mut()
             .zip(src.level_4_table().iter())
+            .skip(KERNEL_PML4_START)
         {
             if !src_entry.is_unused() && dst_entry.is_unused() {
                 dst_entry.set_addr(src_entry.addr(), src_entry.flags());
@@ -777,11 +788,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         }
     }
 
-    /// Clear PML4 entries that are shared with the base page table.
-    ///
-    /// This must be called before `cleanup_page_table_frames` / `drop` to
-    /// prevent the task page table from freeing P3/P2/P1 frames that are
-    /// owned by the base page table.
+    /// Clear the kernel PML4 entries shared with `base` before
+    /// `cleanup_page_table_frames` / `drop`, so the task page table does not
+    /// free base-owned P3/P2/P1 frames. Only the shareable kernel slots
+    /// (`>= KERNEL_PML4_START`) are inspected.
     pub(crate) fn clear_shared_pml4_entries(&self, base: &Self) {
         let mut dst = self.inner.lock();
         let src = base.inner.lock();
@@ -789,8 +799,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             .level_4_table_mut()
             .iter_mut()
             .zip(src.level_4_table().iter())
+            .skip(KERNEL_PML4_START)
         {
-            // If the entry points to the same P3 frame as the base, it is shared.
+            // Shared iff it still points to the base's P3 frame; a task never
+            // allocates its own P3 in this range.
             if !src_entry.is_unused() && dst_entry.addr() == src_entry.addr() {
                 dst_entry.set_unused();
             }
