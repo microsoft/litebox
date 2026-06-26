@@ -4,7 +4,7 @@
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
-use litebox_platform_multiplex::{Platform, set_platform};
+use litebox_platform_multiplex::{Platform, platform, set_platform};
 use zerocopy::FromBytes as _;
 
 use crate::MutPtr;
@@ -14,7 +14,7 @@ extern crate std;
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 
 #[must_use]
-pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate::DefaultFS> {
+pub(crate) fn platform_for_tests(tun_device_name: Option<&str>) -> &'static Platform {
     static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
     PLATFORM_INIT.call_once(|| {
         #[cfg(target_os = "linux")]
@@ -25,8 +25,31 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
 
         set_platform(platform);
     });
+    platform()
+}
 
-    let shim_builder = crate::LinuxShimBuilder::new();
+#[must_use]
+pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate::DefaultFS> {
+    let _ = platform_for_tests(tun_device_name);
+    init_platform_with_builder(crate::LinuxShimBuilder::new(), tun_device_name)
+}
+
+#[must_use]
+pub(crate) fn init_platform_with_litebox(
+    litebox: litebox::LiteBox<Platform>,
+    tun_device_name: Option<&str>,
+) -> crate::Task<crate::DefaultFS> {
+    let _ = platform_for_tests(tun_device_name);
+    init_platform_with_builder(
+        crate::LinuxShimBuilder::new_with_litebox(litebox),
+        tun_device_name,
+    )
+}
+
+fn init_platform_with_builder(
+    shim_builder: crate::LinuxShimBuilder,
+    tun_device_name: Option<&str>,
+) -> crate::Task<crate::DefaultFS> {
     let litebox = shim_builder.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
