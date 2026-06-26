@@ -15,12 +15,12 @@ extern crate std;
 mod error;
 mod event;
 
-use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
 };
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle};
 
 pub use error::{BrokerLocalError, Result};
 
@@ -106,6 +106,22 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             response @ (BrokerResponse::Event(_) | BrokerResponse::ObjectClosed) => Ok(response),
         }
     }
+
+    /// Closes one broker object reference.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a protocol
+    /// response that does not match an object close request.
+    pub fn close_object(&mut self, handle: ObjectHandle) -> Result<(), Channel::Error> {
+        match self.request(BrokerRequest::CloseObject(handle))? {
+            BrokerResponse::ObjectClosed => Ok(()),
+            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response @ BrokerResponse::Event(_) => {
+                panic!("broker returned unexpected close response: {response:?}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -150,14 +166,14 @@ mod tests {
     }
 
     #[test]
-    fn active_request_sends_close_object_request() {
+    fn close_object_sends_close_object_request() {
         let handle = ObjectHandle(7);
         let request = BrokerRequest::CloseObject(handle);
         let response = BrokerResponse::ObjectClosed;
         let channel = FakeControlChannel::new(None, Some(response.clone()));
         let mut local = BrokerLocal { channel };
 
-        assert_eq!(local.request(request.clone()).unwrap(), response);
+        assert!(local.close_object(handle).is_ok());
         assert_eq!(local.channel.sent_request, Some(request));
     }
 

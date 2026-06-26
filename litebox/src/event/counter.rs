@@ -5,18 +5,15 @@ use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
 pub use litebox_broker_protocol::event::EventConsumeMode as EventCounterReadMode;
-use litebox_broker_protocol::event::{
-    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest, ReadinessState,
-    WaitEventRequest,
-};
-use litebox_broker_protocol::message::{
-    BrokerRequest, BrokerResponse, EventRequest, EventResponse,
-};
+use litebox_broker_protocol::event::{ConsumeEventResponse, ReadinessState};
 use thiserror::Error;
 
 use crate::{
     LiteBox,
-    broker::{BrokerControl, error::BrokerObjectError},
+    broker::{
+        BrokerControl,
+        error::{BrokerControlError, BrokerObjectError},
+    },
     event::{
         Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
         wait::WaitContext,
@@ -64,18 +61,13 @@ where
         let Some(broker) = litebox.broker_control() else {
             return Err(EventCounterError::Unavailable);
         };
-        let response = broker
-            .request(BrokerRequest::Event(EventRequest::Create(
-                CreateEventRequest { initial_count },
-            )))
+        let handle = broker
+            .create_event_with_count(initial_count)
             .map_err(BrokerObjectError::from)
             .map_err(EventCounterError::from)?;
-        let BrokerResponse::Event(EventResponse::Create(response)) = response else {
-            panic!("broker returned unexpected event response: {response:?}");
-        };
         Ok(Self {
             broker,
-            handle: response.handle,
+            handle,
             pollee: Pollee::new(),
         })
     }
@@ -119,49 +111,23 @@ where
         &self,
         mode: EventCounterReadMode,
     ) -> Result<ConsumeEventResponse, BrokerObjectError> {
-        let response = self.request_event(EventRequest::Consume(ConsumeEventRequest {
-            handle: self.handle,
-            mode,
-        }))?;
-        let EventResponse::Consume(response) = response else {
-            panic!("broker returned unexpected event response: {response:?}");
-        };
-        Ok(response)
+        self.broker
+            .consume_event(self.handle, mode)
+            .map_err(|error| self.broker_request_error(error))
     }
 
     fn add(&self, value: u64) -> Result<ReadinessState, BrokerObjectError> {
-        let response = self.request_event(EventRequest::Add(AddEventRequest {
-            handle: self.handle,
-            value,
-        }))?;
-        let EventResponse::Add(response) = response else {
-            panic!("broker returned unexpected event response: {response:?}");
-        };
-        Ok(response.readiness)
+        self.broker
+            .add_event(self.handle, value)
+            .map_err(|error| self.broker_request_error(error))
     }
 
-    fn request_event(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
-        match self
-            .broker
-            .request(BrokerRequest::Event(request))
-            .map_err(BrokerObjectError::from)
-            .inspect_err(|&error| {
-                if error != BrokerObjectError::WouldBlock {
-                    self.pollee.notify_observers(Events::ERR);
-                }
-            })? {
-            BrokerResponse::Event(response) => Ok(response),
-            BrokerResponse::Error(error) => {
-                let error = error.into();
-                if error != BrokerObjectError::WouldBlock {
-                    self.pollee.notify_observers(Events::ERR);
-                }
-                Err(error)
-            }
-            response @ BrokerResponse::ObjectClosed => {
-                panic!("broker returned unexpected event response: {response:?}");
-            }
+    fn broker_request_error(&self, error: BrokerControlError) -> BrokerObjectError {
+        let error = error.into();
+        if error != BrokerObjectError::WouldBlock {
+            self.pollee.notify_observers(Events::ERR);
         }
+        error
     }
 }
 
@@ -170,7 +136,7 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn drop(&mut self) {
-        let _ = self.broker.request(BrokerRequest::CloseObject(self.handle));
+        let _ = self.broker.close_object(self.handle);
     }
 }
 
@@ -183,17 +149,15 @@ where
     }
 
     fn check_io_events(&self) -> Events {
-        let response = match self.request_event(EventRequest::Wait(WaitEventRequest {
-            handle: self.handle,
-        })) {
-            Ok(response) => response,
+        let readiness = match self
+            .broker
+            .wait_event(self.handle)
+            .map_err(|error| self.broker_request_error(error))
+        {
+            Ok(readiness) => readiness,
             Err(BrokerObjectError::WouldBlock) => return Events::empty(),
             Err(_) => return Events::ERR,
         };
-        let EventResponse::Wait(response) = response else {
-            panic!("broker returned unexpected event response: {response:?}");
-        };
-        let readiness = response.readiness;
         let mut events = Events::empty();
         if readiness.read_ready {
             events |= Events::IN;
