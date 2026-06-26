@@ -36,10 +36,11 @@ pub fn serve_connection<Channel>(
 where
     Channel: HostControlChannel,
 {
-    match negotiate_connection(core, channel)? {
-        NegotiatedConnection::Active(session) => serve_request_loop(channel, &session),
-        NegotiatedConnection::Terminated(termination) => Ok(termination),
+    let session = create_session(core, channel)?;
+    if let Some(termination) = negotiate_protocol(channel)? {
+        return Ok(termination);
     }
+    serve_request_loop(channel, &session)
 }
 
 /// Authenticates, negotiates, and serves one broker connection with notifications.
@@ -56,18 +57,17 @@ where
     ControlChannel: HostControlChannel,
     NotificationChannel: HostNotificationChannel<Error = ControlChannel::Error>,
 {
-    match negotiate_connection(core, control_channel)? {
-        NegotiatedConnection::Active(session) => {
-            serve_request_loop_with_notifications(control_channel, &session, notification_channel)
-        }
-        NegotiatedConnection::Terminated(termination) => Ok(termination),
+    let session = create_session(core, control_channel)?;
+    if let Some(termination) = negotiate_protocol(control_channel)? {
+        return Ok(termination);
     }
+    serve_request_loop_with_notifications(control_channel, &session, notification_channel)
 }
 
-fn negotiate_connection<Channel>(
+fn create_session<Channel>(
     core: &BrokerCore,
-    channel: &mut Channel,
-) -> Result<NegotiatedConnection, Channel::Error>
+    channel: &Channel,
+) -> Result<BrokerSession, Channel::Error>
 where
     Channel: HostControlChannel,
 {
@@ -78,8 +78,15 @@ where
         PeerCredential::Unauthenticated => CallerCredential::Unauthenticated,
         _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
     };
-    let session = core.create_session(caller_credential)?;
+    Ok(core.create_session(caller_credential)?)
+}
 
+fn negotiate_protocol<Channel>(
+    channel: &mut Channel,
+) -> Result<Option<ConnectionTermination>, Channel::Error>
+where
+    Channel: HostControlChannel,
+{
     loop {
         let request = match channel
             .recv_handshake_request()
@@ -92,15 +99,9 @@ where
                         ErrorCode::ProtocolState,
                     ))
                     .map_err(BrokerHostError::Channel)?;
-                return Ok(NegotiatedConnection::Terminated(
-                    ConnectionTermination::ProtocolViolation,
-                ));
+                return Ok(Some(ConnectionTermination::ProtocolViolation));
             }
-            HostReceive::PeerClosed => {
-                return Ok(NegotiatedConnection::Terminated(
-                    ConnectionTermination::PeerClosed,
-                ));
-            }
+            HostReceive::PeerClosed => return Ok(Some(ConnectionTermination::PeerClosed)),
         };
 
         let negotiated = request.protocol_version == BROKER_PROTOCOL_VERSION;
@@ -121,7 +122,7 @@ where
         }
     }
 
-    Ok(NegotiatedConnection::Active(session))
+    Ok(None)
 }
 
 fn serve_request_loop<Channel>(
@@ -263,11 +264,6 @@ fn event_readiness_notification(
         ),
         _ => None,
     }
-}
-
-enum NegotiatedConnection {
-    Active(BrokerSession),
-    Terminated(ConnectionTermination),
 }
 
 /// Terminal outcome after processing one broker connection.
