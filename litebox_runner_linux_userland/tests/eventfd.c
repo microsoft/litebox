@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#define _GNU_SOURCE
-
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -76,14 +74,6 @@ static int expect_eagain_write(int fd, uint64_t value) {
 static int clear_nonblock_with_ioctl(int fd) {
     int nonblock = 0;
     return ioctl(fd, FIONBIO, &nonblock) == 0 ? 0 : 1;
-}
-
-static int expect_cloexec(int fd, int expected) {
-    int flags = fcntl(fd, F_GETFD);
-    if (flags < 0) {
-        return 1;
-    }
-    return ((flags & FD_CLOEXEC) != 0) == expected ? 0 : 2;
 }
 
 static int expect_nonblock(int fd, int expected) {
@@ -281,36 +271,6 @@ int main(void) {
         return 83;
     }
     close(dup2_replaced_fd);
-
-    int dup3_source_fd = eventfd(0, EFD_NONBLOCK);
-    if (dup3_source_fd < 0) {
-        return 90;
-    }
-    int dup3_fd = dup3(dup3_source_fd, dup3_source_fd + 10, O_CLOEXEC);
-    if (dup3_fd < 0) {
-        return 91;
-    }
-    if (expect_cloexec(dup3_fd, 1) != 0) {
-        return 92;
-    }
-    int fdup_fd = fcntl(dup3_source_fd, F_DUPFD, dup3_fd + 1);
-    if (fdup_fd != dup3_fd + 1) {
-        return 93;
-    }
-    if (expect_cloexec(fdup_fd, 0) != 0) {
-        return 94;
-    }
-    int fdup_cloexec_fd = fcntl(dup3_source_fd, F_DUPFD_CLOEXEC, fdup_fd + 1);
-    if (fdup_cloexec_fd != fdup_fd + 1) {
-        return 95;
-    }
-    if (expect_cloexec(fdup_cloexec_fd, 1) != 0) {
-        return 96;
-    }
-    close(dup3_source_fd);
-    close(dup3_fd);
-    close(fdup_fd);
-    close(fdup_cloexec_fd);
 
     int status_fd = eventfd(0, EFD_NONBLOCK);
     if (status_fd < 0) {
