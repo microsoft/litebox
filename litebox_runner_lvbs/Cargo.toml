@@ -14,7 +14,6 @@ litebox_shim_optee = { path = "../litebox_shim_optee/", version = "0.1.0" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 log = { version = "0.4", default-features = false }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
-once_cell = { version = "1.21.3", default-features = false, features = ["race", "alloc"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

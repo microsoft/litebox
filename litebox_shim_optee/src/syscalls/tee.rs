@@ -95,7 +95,7 @@ impl Task {
                 if prop_buf.len() < core::mem::size_of::<TeeIdentity>() {
                     return Err(TeeResult::ShortBuffer);
                 }
-                let identity = self.client_identity;
+                let identity = self.current_client_identity();
                 prop_buf[..core::mem::size_of::<TeeIdentity>()]
                     .copy_from_slice(identity.as_bytes());
                 prop_len

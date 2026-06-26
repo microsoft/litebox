@@ -761,7 +761,7 @@ pub struct TaHead {
 pub const TA_HEAD_SECTION_NAME: &str = ".ta_head";
 
 /// `TEE_Identity` from `optee_os/lib/libutee/include/tee_api_types.h`.
-#[derive(Clone, Copy, PartialEq, Immutable, IntoBytes)]
+#[derive(Clone, Copy, PartialEq, Debug, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct TeeIdentity {
     pub login: TeeLogin,
@@ -850,7 +850,7 @@ const TEE_LOGIN_REE_KERNEL: u32 = 0x8000_0000;
 
 /// `TEE Login type` from `optee_os/lib/libutee/include/tee_api_defines.h`
 /// (plus the `TEE_LOGIN_REE_KERNEL` extension).
-#[derive(Clone, Copy, PartialEq, TryFromPrimitive, Immutable, IntoBytes)]
+#[derive(Clone, Copy, PartialEq, Debug, TryFromPrimitive, Immutable, IntoBytes)]
 #[repr(u32)]
 pub enum TeeLogin {
     Public = TEE_LOGIN_PUBLIC,

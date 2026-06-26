@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::session::SessionManager;
+use litebox_shim_optee::session::session_manager;
 use std::path::PathBuf;
 
 mod tests;
@@ -109,21 +109,14 @@ fn run_ta_with_default_commands(
     ldelf_bin: &[u8],
     ta_bin: &[u8],
 ) {
-    let session_manager = SessionManager::new();
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
         if func_id == UteeEntryFunc::OpenSession {
-            let session_token = session_manager.try_acquire_open_session_token().unwrap();
+            let session_token = session_manager().try_acquire_open_session_token().unwrap();
             let session_id = session_token.session_id().unwrap();
             let loaded_program = shim
-                .load_ldelf(
-                    ldelf_bin,
-                    TeeUuid::default(),
-                    Some(ta_bin),
-                    None,
-                    session_id,
-                )
+                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin))
                 .map_err(|_| {
                     panic!("Failed to load ldelf");
                 })
@@ -140,7 +133,7 @@ fn run_ta_with_default_commands(
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
             let _ = entrypoints
-                .load_ta_context(params.as_slice(), None, func_id as u32, None)
+                .load_ta_context(params.as_slice(), session_id, func_id as u32, None)
                 .map_err(|_| {
                     panic!("Failed to load TA context");
                 });

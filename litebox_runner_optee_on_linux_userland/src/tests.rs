@@ -10,7 +10,7 @@ use litebox::utils::TruncateExt;
 use litebox_common_optee::{
     TeeIdentity, TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
 };
-use litebox_shim_optee::session::SessionManager;
+use litebox_shim_optee::session::session_manager;
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -28,7 +28,9 @@ pub fn run_ta_with_test_commands(
         serde_json::from_str(&json_str).unwrap()
     };
     let mut ta_info: Option<LoadedProgram> = None;
-    let session_manager = SessionManager::new();
+    // The active session id for the TA. Set at OpenSession and reused for the
+    // subsequent InvokeCommand entries on the same persistent session.
+    let mut session_id: Option<u32> = None;
 
     for cmd in ta_commands {
         assert!(
@@ -52,7 +54,9 @@ pub fn run_ta_with_test_commands(
         if func_id == UteeEntryFunc::OpenSession {
             let ta_head = litebox_common_optee::parse_ta_head(ta_bin)
                 .expect("Failed to parse TA header from ta_bin");
-            let session_token = session_manager.try_acquire_open_session_token().unwrap();
+            let mut session_token = session_manager().try_acquire_open_session_token().unwrap();
+            let open_session_id = session_token.session_id().unwrap();
+            session_id = Some(open_session_id);
             // Emulate the client identity a real REE client would present. The
             // secure world normally derives this from the OpenSession meta
             // params; here the test file states it, defaulting to a `user` login.
@@ -63,14 +67,9 @@ pub fn run_ta_with_test_commands(
                 },
                 ClientIdentityJson::to_tee_identity,
             );
+            session_manager().set_session_client_identity(open_session_id, Some(client_identity));
             let loaded = shim
-                .load_ldelf(
-                    ldelf_bin,
-                    ta_head.uuid,
-                    Some(ta_bin),
-                    Some(client_identity),
-                    session_token.session_id().unwrap(),
-                )
+                .load_ldelf(ldelf_bin, ta_head.uuid, Some(ta_bin))
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
@@ -89,17 +88,28 @@ pub fn run_ta_with_test_commands(
                 "ldelf exits with error: return_code={:#x}",
                 ctx.rax
             );
+            // The session persists across all commands, so disarm the token:
+            // its drop must not recycle the id or clear the client identity.
+            session_token.disarm();
         }
 
         if let Some(info) = ta_info.as_mut() {
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
+            // `ta_info` is only `Some` after an OpenSession, which also sets
+            // `session_id`, so this command runs on that established session.
+            let session_id = session_id.expect("session id set by OpenSession");
             let _ = info
                 .entrypoints
                 .as_ref()
                 .unwrap()
-                .load_ta_context(params.as_slice(), None, func_id as u32, Some(cmd.cmd_id))
+                .load_ta_context(
+                    params.as_slice(),
+                    session_id,
+                    func_id as u32,
+                    Some(cmd.cmd_id),
+                )
                 .map_err(|_| {
                     panic!("Failed to load TA context");
                 });

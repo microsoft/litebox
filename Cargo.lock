@@ -1642,7 +1642,6 @@ dependencies = [
  "litebox_shim_optee",
  "litebox_util_log",
  "log",
- "once_cell",
  "spin 0.10.0",
  "x86_64",
 ]
