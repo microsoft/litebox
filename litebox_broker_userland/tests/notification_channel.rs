@@ -188,8 +188,11 @@ fn connect_notification_with_retry(
 ) -> Result<UnixStreamLocalNotificationChannel> {
     let deadline = Instant::now() + TEST_TIMEOUT;
     loop {
-        match UnixStreamLocalNotificationChannel::connect(socket_path) {
-            Ok(channel) => return Ok(channel),
+        match UnixStream::connect(socket_path) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(TEST_TIMEOUT))?;
+                return Ok(UnixStreamLocalNotificationChannel::from_connected(stream));
+            }
             Err(error) if retry_socket_connect(&error, deadline) => {
                 std::thread::sleep(Duration::from_millis(10));
             }
