@@ -92,6 +92,10 @@ static int expect_ebadf_close(int fd) {
     return errno == EBADF ? 0 : 2;
 }
 
+static int expect_close(int fd) {
+    return close(fd) == 0 ? 0 : 1;
+}
+
 int main(void) {
     int fd = eventfd(0, EFD_NONBLOCK);
     if (fd < 0) {
@@ -159,7 +163,9 @@ int main(void) {
     if (expect_poll_events(fd, POLLOUT) != 0) {
         return 30;
     }
-    close(fd);
+    if (expect_close(fd) != 0) {
+        return 120;
+    }
 
     int ioctl_toggle_fd = eventfd(1, EFD_NONBLOCK);
     if (ioctl_toggle_fd < 0) {
@@ -171,7 +177,9 @@ int main(void) {
     if (read_value(ioctl_toggle_fd, 1) != 0) {
         return 33;
     }
-    close(ioctl_toggle_fd);
+    if (expect_close(ioctl_toggle_fd) != 0) {
+        return 121;
+    }
 
     int semaphore_fd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
     if (semaphore_fd < 0) {
@@ -204,7 +212,9 @@ int main(void) {
     if (expect_eagain_read(semaphore_fd) != 0) {
         return 49;
     }
-    close(semaphore_fd);
+    if (expect_close(semaphore_fd) != 0) {
+        return 122;
+    }
 
     int dup_source_fd = eventfd(0, EFD_NONBLOCK);
     if (dup_source_fd < 0) {
@@ -220,7 +230,9 @@ int main(void) {
     if (read_value(dup_fd, 7) != 0) {
         return 63;
     }
-    close(dup_source_fd);
+    if (expect_close(dup_source_fd) != 0) {
+        return 123;
+    }
     if (expect_ebadf_write(dup_source_fd, 1) != 0) {
         return 64;
     }
@@ -230,7 +242,9 @@ int main(void) {
     if (read_value(dup_fd, 3) != 0) {
         return 66;
     }
-    close(dup_fd);
+    if (expect_close(dup_fd) != 0) {
+        return 124;
+    }
     if (expect_ebadf_close(dup_fd) != 0) {
         return 67;
     }
@@ -246,14 +260,18 @@ int main(void) {
     if (close_dup_fd < 0) {
         return 71;
     }
-    close(close_dup_fd);
+    if (expect_close(close_dup_fd) != 0) {
+        return 125;
+    }
     if (write_value(close_original_fd, 5) != 0) {
         return 72;
     }
     if (read_value(close_original_fd, 5) != 0) {
         return 73;
     }
-    close(close_original_fd);
+    if (expect_close(close_original_fd) != 0) {
+        return 126;
+    }
 
     int dup2_source_fd = eventfd(0, EFD_NONBLOCK);
     int dup2_replaced_fd = eventfd(0, EFD_NONBLOCK);
@@ -263,14 +281,18 @@ int main(void) {
     if (dup2(dup2_source_fd, dup2_replaced_fd) != dup2_replaced_fd) {
         return 81;
     }
-    close(dup2_source_fd);
+    if (expect_close(dup2_source_fd) != 0) {
+        return 127;
+    }
     if (write_value(dup2_replaced_fd, 11) != 0) {
         return 82;
     }
     if (read_value(dup2_replaced_fd, 11) != 0) {
         return 83;
     }
-    close(dup2_replaced_fd);
+    if (expect_close(dup2_replaced_fd) != 0) {
+        return 128;
+    }
 
     int status_fd = eventfd(0, EFD_NONBLOCK);
     if (status_fd < 0) {
@@ -298,8 +320,12 @@ int main(void) {
     if (expect_eagain_read(status_fd) != 0) {
         return 107;
     }
-    close(status_fd);
-    close(status_dup_fd);
+    if (expect_close(status_fd) != 0) {
+        return 129;
+    }
+    if (expect_close(status_dup_fd) != 0) {
+        return 130;
+    }
 
     return 0;
 }
