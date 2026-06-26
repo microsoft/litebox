@@ -30,11 +30,13 @@ mod primitive;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
+const REQUEST_TAG_CLOSE_OBJECT: u8 = 2;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
 const RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
+const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
 
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -73,7 +75,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         REQUEST_TAG_NEGOTIATE => BrokerHandshakeRequest {
             protocol_version: decoder.protocol_version()?,
         },
-        REQUEST_TAG_EVENT => return Err(WireError::WrongMessagePhase),
+        REQUEST_TAG_EVENT | REQUEST_TAG_CLOSE_OBJECT => return Err(WireError::WrongMessagePhase),
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -87,6 +89,10 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
 pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
     let mut encoder = Encoder::default();
     match request {
+        BrokerRequest::CloseObject(handle) => {
+            encoder.u8(REQUEST_TAG_CLOSE_OBJECT);
+            encoder.handle(handle);
+        }
         BrokerRequest::Event(request) => {
             encoder.u8(REQUEST_TAG_EVENT);
             event::encode_event_request(&mut encoder, request);
@@ -101,6 +107,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
     let tag = decoder.u8()?;
     let request = match tag {
         REQUEST_TAG_NEGOTIATE => return Err(WireError::WrongMessagePhase),
+        REQUEST_TAG_CLOSE_OBJECT => BrokerRequest::CloseObject(decoder.handle()?),
         REQUEST_TAG_EVENT => BrokerRequest::Event(event::decode_event_request(&mut decoder)?),
         _ => return Err(WireError::InvalidTag),
     };
@@ -143,7 +150,9 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
         },
-        RESPONSE_TAG_EVENT => return Err(WireError::WrongMessagePhase),
+        RESPONSE_TAG_EVENT | RESPONSE_TAG_OBJECT_CLOSED => {
+            return Err(WireError::WrongMessagePhase);
+        }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version: decoder.protocol_version()?,
         },
@@ -164,6 +173,9 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
 pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
     let mut encoder = Encoder::default();
     match response {
+        BrokerResponse::ObjectClosed => {
+            encoder.u8(RESPONSE_TAG_OBJECT_CLOSED);
+        }
         BrokerResponse::Event(response) => {
             encoder.u8(RESPONSE_TAG_EVENT);
             event::encode_event_response(&mut encoder, response);
@@ -189,6 +201,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerResponse::Error(error)
         }
+        RESPONSE_TAG_OBJECT_CLOSED => BrokerResponse::ObjectClosed,
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -224,6 +237,7 @@ mod tests {
     fn request_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
         let requests = [
+            BrokerRequest::CloseObject(handle),
             BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
             })),
@@ -275,6 +289,7 @@ mod tests {
     fn response_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
         let responses = [
+            BrokerResponse::ObjectClosed,
             BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle })),
             BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
                 readiness: ReadinessState {
@@ -327,6 +342,12 @@ mod tests {
         assert_eq!(
             decode_handshake_request(&encode_request(BrokerRequest::Event(EventRequest::Create(
                 CreateEventRequest { initial_count: 0 },
+            )))),
+            Err(WireError::WrongMessagePhase)
+        );
+        assert_eq!(
+            decode_handshake_request(&encode_request(BrokerRequest::CloseObject(ObjectHandle(
+                13
             )))),
             Err(WireError::WrongMessagePhase)
         );
@@ -387,6 +408,10 @@ mod tests {
                     handle: ObjectHandle(13),
                 }),
             ))),
+            Err(WireError::WrongMessagePhase)
+        );
+        assert_eq!(
+            decode_handshake_response(&encode_response(BrokerResponse::ObjectClosed)),
             Err(WireError::WrongMessagePhase)
         );
 

@@ -110,6 +110,10 @@ where
 
 fn handle_request(session: &BrokerSession, request: BrokerRequest) -> BrokerResponse {
     match request {
+        BrokerRequest::CloseObject(handle) => match session.close_object_reference(handle) {
+            Ok(()) => BrokerResponse::ObjectClosed,
+            Err(error) => BrokerResponse::Error(error.into()),
+        },
         BrokerRequest::Event(request) => handle_event_request(session, request),
     }
 }
@@ -163,9 +167,9 @@ pub enum ConnectionTermination {
 mod tests {
     use super::*;
     use litebox_broker_core::{PolicyEngine, PrincipalRights};
-    use litebox_broker_protocol::ProtocolVersion;
-    use litebox_broker_protocol::event::CreateEventRequest;
+    use litebox_broker_protocol::event::{CreateEventRequest, WaitEventRequest};
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
+    use litebox_broker_protocol::{ObjectHandle, ProtocolVersion};
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
@@ -179,6 +183,7 @@ mod tests {
         serve_connection_rejects_active_request_before_negotiation(&broker);
         serve_connection_rejects_handshake_request_after_negotiation(&broker);
         serve_connection_returns_channel_error_when_response_send_fails(&broker);
+        active_request_closes_object_reference(&broker);
     }
 
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
@@ -296,6 +301,41 @@ mod tests {
             result => panic!("unexpected serve result: {result:?}"),
         }
         assert!(channel.handshake_responses.is_empty());
+    }
+
+    fn active_request_closes_object_reference(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let response = handle_request(
+            &session,
+            BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
+                initial_count: 0,
+            })),
+        );
+        let BrokerResponse::Event(EventResponse::Create(response)) = response else {
+            panic!("unexpected create response: {response:?}");
+        };
+        let handle = response.handle;
+
+        assert_eq!(
+            handle_request(&session, BrokerRequest::CloseObject(handle)),
+            BrokerResponse::ObjectClosed
+        );
+        assert_eq!(
+            handle_request(
+                &session,
+                BrokerRequest::Event(EventRequest::Wait(WaitEventRequest { handle }))
+            ),
+            BrokerResponse::Error(ErrorCode::UnknownObject)
+        );
+        assert_eq!(
+            handle_request(
+                &session,
+                BrokerRequest::CloseObject(ObjectHandle(handle.0 + 1))
+            ),
+            BrokerResponse::Error(ErrorCode::UnknownObject)
+        );
     }
 
     struct FakeHostControlChannel {

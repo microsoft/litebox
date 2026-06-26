@@ -30,10 +30,9 @@ impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 /// Backing counter for a Linux eventfd file description.
 ///
-/// New blocking eventfds still use the shim-local implementation to keep the
-/// initial broker-backed scope narrow. Broker-backed nonblocking eventfds can
-/// still be switched to blocking mode because the local-core counter can block
-/// through LiteBox-local readiness notifications.
+/// New blocking eventfds use the shim-local path. Broker-backed counters stay
+/// nonblocking even if file status flags are later changed, until broker
+/// readiness notifications can wake local waiters.
 enum EventFileCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     ShimLocal {
         count: Mutex<Platform, u64>,
@@ -72,7 +71,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
             Self::LocalCore(counter) => counter
                 .read(
                     cx,
-                    nonblock,
+                    // Broker-backed eventfds cannot safely park local waiters
+                    // until broker readiness notifications exist.
+                    true,
                     if semaphore {
                         EventCounterReadMode::One
                     } else {
@@ -95,7 +96,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
                     Self::try_write_local(count, pollee, value)
                 })
                 .map_err(Errno::from),
-            Self::LocalCore(counter) => counter.write(cx, nonblock, value).map_err(Errno::from),
+            // See the matching LocalCore read path for why this stays nonblocking.
+            Self::LocalCore(counter) => counter.write(cx, true, value).map_err(Errno::from),
         }
     }
 

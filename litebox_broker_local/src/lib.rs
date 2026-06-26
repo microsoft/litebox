@@ -103,7 +103,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
                 _ => panic!("broker returned unsupported error: {error}"),
             },
-            response @ BrokerResponse::Event(_) => Ok(response),
+            response @ (BrokerResponse::Event(_) | BrokerResponse::ObjectClosed) => Ok(response),
         }
     }
 }
@@ -142,6 +142,18 @@ mod tests {
             initial_count: 0,
         }));
         let response = BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }));
+        let channel = FakeControlChannel::new(None, Some(response.clone()));
+        let mut local = BrokerLocal { channel };
+
+        assert_eq!(local.request(request.clone()).unwrap(), response);
+        assert_eq!(local.channel.sent_request, Some(request));
+    }
+
+    #[test]
+    fn active_request_sends_close_object_request() {
+        let handle = ObjectHandle(7);
+        let request = BrokerRequest::CloseObject(handle);
+        let response = BrokerResponse::ObjectClosed;
         let channel = FakeControlChannel::new(None, Some(response.clone()));
         let mut local = BrokerLocal { channel };
 

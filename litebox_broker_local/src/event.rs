@@ -87,6 +87,9 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         match self.request(BrokerRequest::Event(request))? {
             BrokerResponse::Event(response) => Ok(response),
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response @ BrokerResponse::ObjectClosed => {
+                panic!("broker returned unexpected event response: {response:?}");
+            }
         }
     }
 }

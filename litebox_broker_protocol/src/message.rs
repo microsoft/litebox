@@ -1,12 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::ProtocolVersion;
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
     CreateEventRequest, CreateEventResponse, WaitEventRequest, WaitEventResponse,
 };
+use crate::{ObjectHandle, ProtocolVersion};
 
 /// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,6 +18,8 @@ pub struct BrokerHandshakeRequest {
 /// Broker request sent over an active control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerRequest {
+    /// Close one broker object reference.
+    CloseObject(ObjectHandle),
     /// Event object request family.
     Event(EventRequest),
 }
@@ -62,6 +64,8 @@ pub enum EventRequest {
 /// Broker response sent over an active control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResponse {
+    /// Object close operation completed.
+    ObjectClosed,
     /// Event object response family.
     Event(EventResponse),
     /// Operation failed with an ABI-neutral broker error.

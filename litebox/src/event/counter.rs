@@ -158,7 +158,19 @@ where
                 }
                 Err(error)
             }
+            response @ BrokerResponse::ObjectClosed => {
+                panic!("broker returned unexpected event response: {response:?}");
+            }
         }
+    }
+}
+
+impl<Platform> Drop for EventCounter<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
+{
+    fn drop(&mut self) {
+        let _ = self.broker.request(BrokerRequest::CloseObject(self.handle));
     }
 }
 
