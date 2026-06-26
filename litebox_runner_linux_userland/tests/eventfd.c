@@ -289,13 +289,13 @@ int main(void) {
     if (expect_nonblock(status_fd, 0) != 0 || expect_nonblock(status_dup_fd, 0) != 0) {
         return 104;
     }
-    if (expect_eagain_read(status_fd) != 0) {
+    if (fcntl(status_fd, F_SETFL, O_NONBLOCK) != 0) {
         return 105;
     }
-    if (fcntl(status_fd, F_SETFL, O_NONBLOCK) != 0) {
+    if (expect_nonblock(status_fd, 1) != 0 || expect_nonblock(status_dup_fd, 1) != 0) {
         return 106;
     }
-    if (expect_nonblock(status_fd, 1) != 0 || expect_nonblock(status_dup_fd, 1) != 0) {
+    if (expect_eagain_read(status_fd) != 0) {
         return 107;
     }
     close(status_fd);
