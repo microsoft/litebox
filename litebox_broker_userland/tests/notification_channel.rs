@@ -7,17 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
-use litebox_broker_host::{ConnectionTermination, serve_connection};
+use litebox_broker_host::{ConnectionTermination, serve_connection_with_notifications};
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::{
-    HostControlChannel, HostNotificationChannel, HostReceive, LocalNotificationChannel,
-    PeerCredential,
-};
-use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-    BrokerResponse, EventReadinessNotification, EventRequest, EventResponse,
-};
+use litebox_broker_protocol::channel::LocalNotificationChannel;
+use litebox_broker_protocol::message::{BrokerNotification, EventReadinessNotification};
 use litebox_broker_transport::unix_socket::{
     UnixStreamHostControlChannel, UnixStreamHostNotificationChannel, UnixStreamLocalControlChannel,
     UnixStreamLocalNotificationChannel,
@@ -73,14 +66,17 @@ fn spawn_test_broker(
             PrincipalRights::all(),
         ))
         .unwrap();
-        let mut channel = NotifyingHostControlChannel {
-            inner: UnixStreamHostControlChannel::from_accepted(control_stream),
-            notifications: UnixStreamHostNotificationChannel::from_accepted(notification_stream),
-            pending_add_handle: None,
-        };
+        let mut control_channel = UnixStreamHostControlChannel::from_accepted(control_stream);
+        let mut notification_channel =
+            UnixStreamHostNotificationChannel::from_accepted(notification_stream);
 
         assert_eq!(
-            serve_connection(&broker, &mut channel).unwrap(),
+            serve_connection_with_notifications(
+                &broker,
+                &mut control_channel,
+                &mut notification_channel,
+            )
+            .unwrap(),
             ConnectionTermination::PeerClosed
         );
     });
@@ -119,54 +115,6 @@ impl TestBroker {
 impl Drop for TestBroker {
     fn drop(&mut self) {
         self.cleanup();
-    }
-}
-
-struct NotifyingHostControlChannel {
-    inner: UnixStreamHostControlChannel,
-    notifications: UnixStreamHostNotificationChannel,
-    pending_add_handle: Option<ObjectHandle>,
-}
-
-impl HostControlChannel for NotifyingHostControlChannel {
-    type Error = Error;
-
-    fn peer_credential(&self) -> Result<PeerCredential> {
-        self.inner.peer_credential()
-    }
-
-    fn recv_handshake_request(&mut self) -> Result<HostReceive<BrokerHandshakeRequest>> {
-        self.inner.recv_handshake_request()
-    }
-
-    fn send_handshake_response(&mut self, response: &BrokerHandshakeResponse) -> Result<()> {
-        self.inner.send_handshake_response(response)
-    }
-
-    fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>> {
-        let request = self.inner.recv_request()?;
-        self.pending_add_handle = match &request {
-            HostReceive::Message(BrokerRequest::Event(EventRequest::Add(request))) => {
-                Some(request.handle)
-            }
-            _ => None,
-        };
-        Ok(request)
-    }
-
-    fn send_response(&mut self, response: &BrokerResponse) -> Result<()> {
-        if let (Some(handle), BrokerResponse::Event(EventResponse::Add(response))) =
-            (self.pending_add_handle.take(), response)
-        {
-            self.notifications
-                .send_notification(&BrokerNotification::EventReadiness(
-                    EventReadinessNotification {
-                        handle,
-                        readiness: response.readiness,
-                    },
-                ))?;
-        }
-        self.inner.send_response(response)
     }
 }
 
