@@ -114,12 +114,12 @@ pub(super) fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<EventRe
     Ok(response)
 }
 
-fn encode_readiness(encoder: &mut Encoder, readiness: ReadinessState) {
+pub(super) fn encode_readiness(encoder: &mut Encoder, readiness: ReadinessState) {
     encoder.bool(readiness.read_ready);
     encoder.bool(readiness.write_ready);
 }
 
-fn decode_readiness(decoder: &mut Decoder<'_>) -> Result<ReadinessState, WireError> {
+pub(super) fn decode_readiness(decoder: &mut Decoder<'_>) -> Result<ReadinessState, WireError> {
     Ok(ReadinessState {
         read_ready: decoder.bool()?,
         write_ready: decoder.bool()?,

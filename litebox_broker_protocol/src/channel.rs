@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 use crate::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
+    BrokerResponse,
 };
 
 /// Peer identity information supplied by the channel or host layer.
@@ -84,4 +85,33 @@ pub trait HostControlChannel {
 
     /// Sends one active broker response.
     fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;
+}
+
+/// Local-side receive channel for broker-initiated asynchronous notifications.
+///
+/// A notification channel is separate from the control channel so active broker
+/// requests remain strictly paired with their responses. The deployment is
+/// responsible for binding this channel to the same authenticated broker
+/// association as the matching control channel.
+pub trait LocalNotificationChannel {
+    /// Channel-specific error type.
+    type Error;
+
+    /// Receives one broker notification.
+    ///
+    /// Returns `Ok(None)` when the broker closed the channel cleanly before
+    /// starting another notification frame.
+    fn recv_notification(&mut self) -> Result<Option<BrokerNotification>, Self::Error>;
+}
+
+/// Host-side send channel for broker-initiated asynchronous notifications.
+///
+/// Implementations carry notification frames only; object operation responses
+/// continue to use [`HostControlChannel::send_response`].
+pub trait HostNotificationChannel {
+    /// Channel-specific error type.
+    type Error;
+
+    /// Sends one broker notification.
+    fn send_notification(&mut self, notification: &BrokerNotification) -> Result<(), Self::Error>;
 }

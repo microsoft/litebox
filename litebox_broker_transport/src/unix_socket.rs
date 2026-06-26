@@ -13,15 +13,17 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use litebox_broker_protocol::channel::{
-    HostControlChannel, HostReceive, LocalControlChannel, PeerCredential,
+    HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
+    LocalNotificationChannel, PeerCredential,
 };
 use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
+    BrokerResponse,
 };
 use litebox_broker_protocol::wire::{
-    WireError, decode_handshake_request, decode_handshake_response, decode_request,
-    decode_response, encode_handshake_request, encode_handshake_response, encode_request,
-    encode_response,
+    WireError, decode_handshake_request, decode_handshake_response, decode_notification,
+    decode_request, decode_response, encode_handshake_request, encode_handshake_response,
+    encode_notification, encode_request, encode_response,
 };
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
@@ -67,8 +69,37 @@ pub struct UnixStreamHostControlChannel {
     stream: UnixStream,
 }
 
+/// Local-side Unix-domain-socket notification channel for the hosted userland POC.
+pub struct UnixStreamLocalNotificationChannel {
+    stream: UnixStream,
+}
+
+/// Host-side Unix-domain-socket notification channel for the hosted userland POC.
+pub struct UnixStreamHostNotificationChannel {
+    stream: UnixStream,
+}
+
 impl UnixStreamHostControlChannel {
     /// Creates a host control channel from an accepted Unix stream.
+    pub const fn from_accepted(stream: UnixStream) -> Self {
+        Self { stream }
+    }
+}
+
+impl UnixStreamLocalNotificationChannel {
+    /// Creates a local notification channel from an already-connected Unix stream.
+    pub const fn from_connected(stream: UnixStream) -> Self {
+        Self { stream }
+    }
+
+    /// Connects to a userland broker Unix notification socket.
+    pub fn connect(path: impl AsRef<Path>) -> IoResult<Self> {
+        UnixStream::connect(path).map(Self::from_connected)
+    }
+}
+
+impl UnixStreamHostNotificationChannel {
+    /// Creates a host notification channel from an accepted Unix stream.
     pub const fn from_accepted(stream: UnixStream) -> Self {
         Self { stream }
     }
@@ -150,6 +181,29 @@ impl HostControlChannel for UnixStreamHostControlChannel {
 
     fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
         write_frame_with_deadline(&mut self.stream, &encode_response(response.clone()), None)
+    }
+}
+
+impl LocalNotificationChannel for UnixStreamLocalNotificationChannel {
+    type Error = Error;
+
+    fn recv_notification(&mut self) -> IoResult<Option<BrokerNotification>> {
+        match read_frame_with_deadline(&mut self.stream, None)? {
+            Some(frame) => decode_notification(&frame).map(Some).map_err(wire_error),
+            None => Ok(None),
+        }
+    }
+}
+
+impl HostNotificationChannel for UnixStreamHostNotificationChannel {
+    type Error = Error;
+
+    fn send_notification(&mut self, notification: &BrokerNotification) -> IoResult<()> {
+        write_frame_with_deadline(
+            &mut self.stream,
+            &encode_notification(notification.clone()),
+            None,
+        )
     }
 }
 
@@ -382,5 +436,25 @@ mod tests {
             channel.recv_request().unwrap(),
             HostReceive::ProtocolViolation
         );
+    }
+
+    #[test]
+    fn notification_frame_round_trip() {
+        let (local_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut local = UnixStreamLocalNotificationChannel::from_connected(local_stream);
+        let mut host = UnixStreamHostNotificationChannel::from_accepted(host_stream);
+        let notification = BrokerNotification::EventReadiness(
+            litebox_broker_protocol::message::EventReadinessNotification {
+                handle: litebox_broker_protocol::ObjectHandle(7),
+                readiness: litebox_broker_protocol::event::ReadinessState {
+                    read_ready: true,
+                    write_ready: false,
+                },
+            },
+        );
+
+        host.send_notification(&notification).unwrap();
+
+        assert_eq!(local.recv_notification().unwrap(), Some(notification));
     }
 }

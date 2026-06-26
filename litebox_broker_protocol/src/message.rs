@@ -4,7 +4,7 @@
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CreateEventRequest, CreateEventResponse, WaitEventRequest, WaitEventResponse,
+    CreateEventRequest, CreateEventResponse, ReadinessState, WaitEventRequest, WaitEventResponse,
 };
 use crate::{ObjectHandle, ProtocolVersion};
 
@@ -83,4 +83,24 @@ pub enum EventResponse {
     Add(AddEventResponse),
     /// Consume operation response.
     Consume(ConsumeEventResponse),
+}
+
+/// Broker-initiated asynchronous notification.
+///
+/// Notifications are level-triggered snapshots and may be coalesced or
+/// duplicated by a transport. Local waiters must treat them as wakeups to
+/// re-check authoritative state, not as ordered state transitions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrokerNotification {
+    /// Readiness changed or should be re-checked for a broker-owned event object.
+    EventReadiness(EventReadinessNotification),
+}
+
+/// Readiness notification for a broker-owned event object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventReadinessNotification {
+    /// Event object handle.
+    pub handle: ObjectHandle,
+    /// Current broker-authoritative readiness snapshot.
+    pub readiness: ReadinessState,
 }
