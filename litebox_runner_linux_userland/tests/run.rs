@@ -426,8 +426,6 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn test_runner_broker_integration_with_rewriter() {
-    const EVENTFD_C_TEST_EVENTFD_COUNT: usize = 8;
-
     let true_path = run_which("true");
     let target = common::compile("./tests/eventfd.c", "broker_eventfd_rewriter", false, false);
     let socket_path = unique_test_socket_path("runner-broker");
@@ -447,10 +445,8 @@ fn test_runner_broker_integration_with_rewriter() {
     Runner::new(&target, "broker_eventfd_rewriter")
         .broker_socket(&socket_path)
         .run();
-    assert_eq!(
-        broker_thread.next_close_object_count(),
-        EVENTFD_C_TEST_EVENTFD_COUNT
-    );
+    // eventfd.c creates eight eventfd objects; each should release one broker object.
+    assert_eq!(broker_thread.next_close_object_count(), 8);
 
     broker_thread.join();
 }
