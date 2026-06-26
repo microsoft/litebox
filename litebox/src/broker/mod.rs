@@ -15,6 +15,10 @@ use error::BrokerControlError;
 /// LiteBox owns broker-backed local objects and constructs broker protocol
 /// requests. Deployment code owns endpoint selection and supplies the connected
 /// transport behind this protocol-level boundary.
+///
+/// The current interface is intentionally blocking for the initial broker POC.
+/// Longer-term broker integrations should move away from blocking control calls
+/// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
     /// Sends one active broker request and returns its response.
     fn request(

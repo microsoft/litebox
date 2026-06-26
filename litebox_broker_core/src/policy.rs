@@ -41,6 +41,10 @@ impl PrincipalRights {
 }
 
 /// Broker policy decision and audit component.
+///
+/// This initial engine is a placeholder static policy surface for the broker
+/// POC. A fuller policy model is intentionally deferred until the broker needs
+/// authenticated principals, richer rules, and audit integration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyEngine {
     profile: PolicyProfile,
