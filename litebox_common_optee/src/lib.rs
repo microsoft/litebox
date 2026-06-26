@@ -626,7 +626,7 @@ pub struct TeeUuid {
 impl TeeUuid {
     /// The nil UUID (all zeros, RFC 4122 S4.1.7).
     ///
-    /// Used for anonymous clients (e.g. ,`TeeLogin::Public`) that carry no
+    /// Used for anonymous clients (e.g., `TeeLogin::Public`) that carry no
     /// REE-derived identity.
     pub const NIL: Self = Self {
         time_low: 0,

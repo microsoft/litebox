@@ -474,7 +474,7 @@ pub struct SessionManager {
     /// Session ids currently being handled (Invoke/Close). Guards a session
     /// against concurrent SMC entry by another core that targets the same id.
     active_sessions: SpinMutex<HashSet<u32>>,
-    /// Per-session client identity, Matching OP-TEE OS's `tee_ta_session.clnt_id`.
+    /// Per-session client identity, matching OP-TEE OS's `tee_ta_session.clnt_id`.
     ///
     /// Populated by the runner before the OpenSession entry point runs and
     /// removed when the session is unregistered.

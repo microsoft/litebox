@@ -684,6 +684,9 @@ fn open_session_single_instance(
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
         } else {
+            // The session id is forgotten (never recycled), so the token's drop
+            // won't clear the recorded identity. Remove the client identity here.
+            session_manager().clear_session_client_identity(runner_session_id);
             session_token.disarm();
         }
         return Err(e);
