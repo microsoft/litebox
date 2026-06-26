@@ -794,9 +794,8 @@ impl Task {
         })
     }
 
-    /// The session id currently executing in this task, taken from the thread's
-    /// init state (set per entry by [`Self::load_ta_context`]). Returns `None`
-    /// outside a TA entry.
+    /// The session id currently executing in this task (set per entry by
+    /// [`Self::load_ta_context`]). Returns `None` outside a TA entry.
     fn current_session_id(&self) -> Option<u32> {
         match self.thread.init_state.get() {
             ThreadInitState::Ta { session_id, .. } => Some(session_id.trunc()),
@@ -1319,8 +1318,8 @@ impl TaUuidMap {
 }
 
 /// Per-instance TA state which can be shared between sessions if it is
-/// a single-instance TA. The active session id is carried per entry
-/// (see [`Task::current_session_id`]).
+/// a single-instance multi-session TA. The active session id is carried
+/// per entry (see [`Task::current_session_id`]).
 struct Task {
     global: Arc<GlobalState>,
     thread: ThreadState,

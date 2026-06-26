@@ -423,7 +423,7 @@ impl Drop for SessionToken<'_> {
             if self.owns_id_recycling {
                 // The session was never published (an OpenSession failure
                 // path), so the id is recycled here. Drop any client identity
-                // recorded for it so a future reuse of the id starts clean.
+                // recorded for it to avoid unnecessary memory leak.
                 self.manager.clear_session_client_identity(id);
                 recycle_session_id(id);
             }
@@ -476,8 +476,8 @@ pub struct SessionManager {
     active_sessions: SpinMutex<HashSet<u32>>,
     /// Per-session client identity, matching OP-TEE OS's `tee_ta_session.clnt_id`.
     ///
-    /// Populated by the runner before the OpenSession entry point runs and
-    /// removed when the session is unregistered.
+    /// Populated before the OpenSession entry point runs and removed when
+    /// the session is unregistered.
     session_client_identities: SpinMutex<HashMap<u32, TeeIdentity>>,
 }
 
@@ -823,7 +823,7 @@ impl SessionManager {
 
     /// The client identity recorded for `session_id`, or the anonymous public
     /// client if none was recorded.
-    pub fn client_identity(&self, session_id: u32) -> TeeIdentity {
+    pub(crate) fn client_identity(&self, session_id: u32) -> TeeIdentity {
         self.session_client_identities
             .lock()
             .get(&session_id)

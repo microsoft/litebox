@@ -57,9 +57,7 @@ pub fn run_ta_with_test_commands(
             let mut session_token = session_manager().try_acquire_open_session_token().unwrap();
             let open_session_id = session_token.session_id().unwrap();
             session_id = Some(open_session_id);
-            // Emulate the client identity a real REE client would present. The
-            // secure world normally derives this from the OpenSession meta
-            // params; here the test file states it, defaulting to a `user` login.
+            // Emulate the client identity a real REE client would present.
             let client_identity = cmd.client_identity.as_ref().map_or(
                 TeeIdentity {
                     login: TeeLogin::User,
@@ -197,12 +195,6 @@ pub struct TaCommandBase64 {
     cmd_id: u32,
     #[serde(default)]
     args: Vec<TaCommandParamsBase64>,
-    /// Client identity presented for an `OpenSession`, mirroring the
-    /// `TEE_Identity` a real REE client would supply (the secure world derives
-    /// this from the message meta params; this userland harness has no such
-    /// client, so the test states it here). Ignored for other commands. When
-    /// absent it defaults to a `user` login with the nil UUID, which is what a
-    /// typical REE user client presents.
     #[serde(default)]
     client_identity: Option<ClientIdentityJson>,
 }
@@ -212,13 +204,11 @@ pub struct TaCommandBase64 {
 struct ClientIdentityJson {
     #[serde(default)]
     login: ClientLoginJson,
-    /// RFC 4122 UUID string (hyphens optional). Defaults to the nil UUID.
     #[serde(default)]
     uuid: Option<String>,
 }
 
-/// JSON mirror of [`TeeLogin`], so test files can name logins (e.g. `"user"`)
-/// instead of raw `TEE_LOGIN_*` constants.
+/// JSON mirror of [`TeeLogin`].
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ClientLoginJson {
@@ -261,7 +251,6 @@ impl ClientIdentityJson {
     }
 }
 
-/// Parse an RFC 4122 UUID string (hyphens optional) into a [`TeeUuid`].
 fn parse_uuid_or_panic(s: &str) -> TeeUuid {
     let hex: String = s.chars().filter(|&c| c != '-').collect();
     assert_eq!(hex.len(), 32, "client uuid must be 32 hex digits: {s:?}");

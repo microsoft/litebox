@@ -843,13 +843,10 @@ const TEE_LOGIN_APPLICATION: u32 = 0x4;
 const TEE_LOGIN_APPLICATION_USER: u32 = 0x5;
 const TEE_LOGIN_APPLICATION_GROUP: u32 = 0x6;
 const TEE_LOGIN_TRUSTED_APP: u32 = 0xf000_0000;
-// Private OP-TEE login for in-kernel REE clients (from
-// `tee_api_defines_extensions.h`). Userspace cannot send it. It uses
-// the nil client UUID.
+// Private OP-TEE login for in-kernel REE clients (`tee_api_defines_extensions.h`).
 const TEE_LOGIN_REE_KERNEL: u32 = 0x8000_0000;
 
 /// `TEE Login type` from `optee_os/lib/libutee/include/tee_api_defines.h`
-/// (plus the `TEE_LOGIN_REE_KERNEL` extension).
 #[derive(Clone, Copy, PartialEq, Debug, TryFromPrimitive, Immutable, IntoBytes)]
 #[repr(u32)]
 pub enum TeeLogin {
@@ -1486,9 +1483,8 @@ const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
 // Note: `OPTEE_MSG_ATTR_TYPE_FMEM_*` are aliases of `OPTEE_MSG_ATTR_TYPE_RMEM_*`.
 // Whether it is RMEM of FMEM depends on the conduit.
 
-/// Meta-parameter marker (bit 8) of the attribute word. Set on the `OpenSession`
-/// TA-UUID and client-identity params, which are consumed by the secure world
-/// and not delivered to the TA.
+/// Meta-parameter marker of the attribute word. Set on the `OpenSession`
+/// TA-UUID and client-identity params.
 const OPTEE_MSG_ATTR_META: u64 = 1 << 8;
 
 #[non_exhaustive]
@@ -1789,10 +1785,9 @@ impl OpteeMsgArgs {
     /// Read a value parameter that must be tagged as an `OpenSession` meta parameter.
     ///
     /// `OpenSession` conveys the TA UUID and client identity in the first two
-    /// params, each marked exactly [`OpteeMsgAttr::META_VALUE_INPUT`]. This
-    /// mirrors OP-TEE OS `get_open_session_meta()`, which rejects the request
-    /// unless the full attr word of both meta params equals that value. Plain
-    /// `get_param_value` ignores these bits, so it must not be used for this.
+    /// params, each marked exactly [`OpteeMsgAttr::META_VALUE_INPUT`], mirroring
+    /// OP-TEE OS `get_open_session_meta()`. Plain `get_param_value` ignores
+    /// these bits, so it must not be used for this.
     pub fn get_meta_param_value(
         &self,
         index: usize,
