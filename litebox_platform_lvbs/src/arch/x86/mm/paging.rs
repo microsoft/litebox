@@ -38,10 +38,11 @@ const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
 /// PML4 index of the first VTL1-kernel slot (`PA + KERNEL_OFFSET`).
 ///
 /// Only slots `>= KERNEL_PML4_START` are safe to share between page tables:
-/// the kernel mapping structure is fixed after boot. Lower slots (user,
-/// direct-map, vmap) have mappings that change at runtime and are not synced
-/// across page tables, so sharing a stale snapshot would make the base and a
-/// task observe different leaves for the same page (cross-PT write fault).
+/// their intermediate tables (P3/P2/P1) are fixed after boot, so sharing them
+/// is read-only. Lower slots (user, direct-map, vmap) get intermediate tables
+/// allocated and freed at runtime on whichever page table is active. Sharing
+/// those would let a task mutate the base's intermediate tables (and make
+/// frame ownership ambiguous at teardown), so each page table must own them.
 ///
 /// `KERNEL_OFFSET` is 512 GiB (PML4-slot) aligned, so this is an exact cutoff.
 pub(crate) const KERNEL_PML4_START: usize = ((crate::KERNEL_OFFSET >> 39) & 0x1FF) as usize;

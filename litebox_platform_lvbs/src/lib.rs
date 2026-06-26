@@ -317,8 +317,9 @@ impl PageTableManager {
     pub fn create_task_page_table(&self) -> Result<usize, Errno> {
         let pt = unsafe { mm::PageTable::new_top_level() };
 
-        // Share kernel page table structures by copying PML4 entries from the
-        // base page table. This is safe because kernel mappings are never modified.
+        // Share the base page table's kernel intermediate tables (kernel PML4
+        // slots only). This is safe because the kernel mapping structure is
+        // fixed after boot; lower slots are not shared (see `copy_pml4_entries_from`).
         pt.copy_pml4_entries_from(&self.base_page_table);
 
         let pt = alloc::boxed::Box::new(pt);
@@ -375,7 +376,8 @@ impl PageTableManager {
             pt.clear_shared_pml4_entries(&self.base_page_table);
 
             // Safety: We're about to delete this page table, so it's safe to
-            // free the remaining (user-space) intermediate page table frames.
+            // free the remaining task-owned intermediate page table frames
+            // (user, direct-map, and vmap slots).
             unsafe {
                 pt.cleanup_page_table_frames();
             }
@@ -744,8 +746,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 
         let mut boxed = box_new_zeroed::<T>();
         // Use memcpy_fallible instead of ptr::copy_nonoverlapping to handle
-        // the race where another core unmaps this page (via a shared page
-        // table) between map_vtl0_guard and the copy.  The mapping is valid
+        // the race where another core running on the same page table unmaps
+        // this page between map_vtl0_guard and the copy. The mapping is valid
         // at this point, so a fault is not expected in the common case.
         // TODO: Once VTL0 page-range locking is in place, this fallible copy
         // may become unnecessary since the lock would prevent concurrent
