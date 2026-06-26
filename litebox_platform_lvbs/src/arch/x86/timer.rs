@@ -17,7 +17,8 @@
 //! live. The deadline spans a whole dispatch, bounding the *cumulative* VTL1
 //! residency which touches guest code. The timer stays armed across the
 //! guest's syscalls and faults (VTL1's own kernel work is trusted and
-//! bounded). This is what keeps VTL0 from tripping its CPU lockup watchdog.
+//! bounded). This is what keeps VTL0's RCU from detecting a CPU stall
+//! (`rcu_preempt detected stalls`) on the parked VP. See `QUANTUM_MICROS`.
 //!
 //! Direct mode injects `STIMER_VECTOR` straight into the local APIC, so the
 //! usual fire path is an ordinary user-mode interrupt (ISR -> exception_callback
@@ -55,11 +56,16 @@ const X2APIC_EOI: u32 = 0x80b; // End-of-interrupt (write 0)
 const CPUID_FEATURE_INFO: u32 = 1;
 const CPUID_FEATURE_INFO_ECX_X2APIC: u32 = 1 << 21;
 
-/// Per-entry execution budget in microseconds. 8 s sits under Linux's default
-/// 10 s hard-lockup watchdog, so VTL1 kills a runaway guest and returns the VP
-/// before VTL0 declares its CPU locked, with margin for the kill/return path.
+/// Per-entry execution budget in microseconds.
+///
+/// While VTL1 holds the VP, VTL0's RCU sees no quiescent state on that CPU and
+/// trips its stall detector (`rcu_preempt detected stalls`). The binding
+/// threshold is the first stall warning, at `CONFIG_RCU_CPU_STALL_TIMEOUT`
+/// (60 s on Azure Linux). 50 s stays under it with margin for the kill/return path.
+//
+// TODO: Make the quantum configurable to support various distros.
 #[cfg(not(feature = "preemption_test_quantum"))]
-const QUANTUM_MICROS: u64 = 8_000_000; // 8 s
+const QUANTUM_MICROS: u64 = 50_000_000; // 50 s
 
 /// Tight budget under the `preemption_test_quantum` feature so a runaway-guest
 /// kill fires in ~10 ms. Test builds only.
