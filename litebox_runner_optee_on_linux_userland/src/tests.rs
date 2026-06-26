@@ -8,7 +8,7 @@
 use litebox::platform::RawConstPointer;
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
-use litebox_shim_optee::session::allocate_session_id;
+use litebox_shim_optee::session::SessionManager;
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -26,6 +26,7 @@ pub fn run_ta_with_test_commands(
         serde_json::from_str(&json_str).unwrap()
     };
     let mut ta_info: Option<LoadedProgram> = None;
+    let session_manager = SessionManager::new();
 
     for cmd in ta_commands {
         assert!(
@@ -49,13 +50,14 @@ pub fn run_ta_with_test_commands(
         if func_id == UteeEntryFunc::OpenSession {
             let ta_head = litebox_common_optee::parse_ta_head(ta_bin)
                 .expect("Failed to parse TA header from ta_bin");
+            let session_token = session_manager.try_acquire_open_session_token().unwrap();
             let loaded = shim
                 .load_ldelf(
                     ldelf_bin,
                     ta_head.uuid,
                     Some(ta_bin),
                     None,
-                    allocate_session_id().unwrap(),
+                    session_token.session_id().unwrap(),
                 )
                 .map_err(|_| {
                     panic!("Failed to load TA");
