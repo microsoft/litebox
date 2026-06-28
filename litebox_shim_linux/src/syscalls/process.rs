@@ -6043,6 +6043,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let mut entries = Vec::new();
         let mut open_file_descriptions = Vec::new();
+        let mut deferred_reopen = Vec::new();
         for raw_fd in &alive_fds {
             let raw_fd = *raw_fd;
             let fd_flags = fd_flags_by_raw
@@ -6840,15 +6841,32 @@ impl<FS: ShimFS> Task<FS> {
             // restore can reopen the file (e.g. /dev/null, /dev/tty, or
             // bash's saved fd 255).
             if is_non_terminal_fs && let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-                let path = files.fs.fd_path(&fd);
-                open_file_descriptions.push(super::fork_snapshot::OpenFileDescriptionSnapshot {
-                    object_id: fd.object_id().as_u64(),
-                    file_offset: 0,
-                    reopen_path: path,
-                });
+                // Defer the reopen-path lookup until after `dt` is dropped
+                // (below). `fd_path` → `descriptor_path` re-acquires
+                // `descriptor_table().read()` — the same RwLock `dt` already
+                // holds. That re-entrant read self-deadlocks (~30% of fork
+                // snapshots) when a writer queues on the writer-preferring
+                // RwLock between the outer (line ~6042) and inner read — gdb
+                // caught the snapshot thread parked in `read_contended` on a
+                // `0xC0000001` (writer-held) lock; same bug class as commit
+                // `f080b1b3`. `fd` is an owned `Arc<TypedFd>`, so it safely
+                // outlives the `dt`/`rds` guards.
+                deferred_reopen.push((fd.object_id().as_u64(), fd));
             }
         }
         drop(dt);
+
+        // Resolve the deferred reopen paths now that the descriptor-table
+        // read guard is released: `fd_path` re-acquires the descriptor table
+        // internally, which is safe here only because no outer descriptor or
+        // raw-descriptor-store guard is held (see the deferral in the loop).
+        for (object_id, fd) in deferred_reopen {
+            open_file_descriptions.push(super::fork_snapshot::OpenFileDescriptionSnapshot {
+                object_id,
+                file_offset: 0,
+                reopen_path: files.fs.fd_path(&fd),
+            });
+        }
 
         let stdio_object_ids = [
             host_stdio_oids[0].map(litebox::fd::DescriptorObjectId::as_u64),
