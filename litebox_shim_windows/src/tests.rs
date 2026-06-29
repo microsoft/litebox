@@ -15,7 +15,7 @@ use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
 
-use crate::nt_types::{ObjectAttributes, ObjectAttributesFlags, UnicodeString};
+use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
 use crate::{
     ConstPtr, DefaultFS, GlobalState, MutPtr, Process, Task, WindowsHandleStore,
