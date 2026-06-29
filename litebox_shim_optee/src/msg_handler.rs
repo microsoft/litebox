@@ -405,6 +405,10 @@ pub struct TaRequestInfo<const ALIGN: usize> {
 /// acquire this lock since they maintain their own mappings.
 ///
 /// Hold the guard only across the packed-page read/write.
+///
+/// TODO: This is a temporary mitigation. It should be replaced by a more fundamental
+/// approach such as shared mapping support, physical address range reservation, and/or
+/// sub-page access control.
 #[must_use]
 pub fn packed_msg_args_lock() -> spin::mutex::SpinMutexGuard<'static, ()> {
     static PACKED_MSG_ARGS_LOCK: spin::mutex::SpinMutex<()> = spin::mutex::SpinMutex::new(());
