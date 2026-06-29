@@ -39,7 +39,8 @@ use litebox_platform_lvbs::{
 };
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::msg_handler::{
-    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
+    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, packed_msg_args_lock,
+    update_optee_msg_args,
 };
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
@@ -1250,6 +1251,8 @@ fn write_non_ta_msg_args_to_normal_world(
     )?;
     // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
     // The blob contains the serialized variable-length optee_msg_arg structure(s).
+    // Serialize the packed-page write. See `packed_msg_args_lock`.
+    let _packed_guard = packed_msg_args_lock();
     unsafe { ptr.write_slice_at_offset(0, &blob) }?;
     Ok(())
 }
