@@ -828,7 +828,7 @@ fn map_read_error(error: ReadError) -> NtStatus {
 mod tests {
     use crate::tests::{
         TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, test_platform,
-        unicode_string,
+        unicode_string, utf16_units as utf16,
     };
 
     use super::*;
@@ -895,10 +895,6 @@ mod tests {
         fn RegDeleteTreeW(hKey: *mut core::ffi::c_void, lpSubKey: *const u16) -> i32;
     }
 
-    fn utf16(value: &str) -> std::vec::Vec<u16> {
-        value.encode_utf16().collect()
-    }
-
     fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
         let litebox = LiteBox::new(test_platform());
         let registry = RegistryStore::new(&litebox);
@@ -921,7 +917,7 @@ mod tests {
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     fn nul_terminated_utf16(value: &str) -> Vec<u16> {
-        let mut value: Vec<u16> = value.encode_utf16().collect();
+        let mut value = utf16(value);
         value.push(0);
         value
     }

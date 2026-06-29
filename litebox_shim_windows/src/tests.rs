@@ -5,6 +5,7 @@ extern crate std;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, AtomicU32};
@@ -57,6 +58,10 @@ pub(crate) fn unicode_string(units: &[u16]) -> UnicodeString {
         padding_0: [0; 4],
         buffer: units.as_ptr() as usize,
     }
+}
+
+pub(crate) fn utf16_units(value: &str) -> Vec<u16> {
+    value.encode_utf16().collect()
 }
 
 pub(crate) fn object_attributes(name: &UnicodeString, attributes: u32) -> ObjectAttributes {

@@ -1092,7 +1092,7 @@ mod tests {
     use crate::nt_types::ObjectAttributes;
     use crate::tests::{
         TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes, test_task,
-        unicode_string,
+        unicode_string, utf16_units,
     };
 
     const DIRECTORY_QUERY: u32 = 0x0000_0001;
@@ -1183,7 +1183,7 @@ mod tests {
         task: &Task<TestPlatform, crate::tests::TestFS>,
         path: &str,
     ) -> Handle {
-        let name_units: alloc::vec::Vec<u16> = path.encode_utf16().collect();
+        let name_units = utf16_units(path);
         let name = unicode_string(&name_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
         let mut handle = Handle::default();
@@ -1201,7 +1201,7 @@ mod tests {
     }
 
     fn open_named_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
-        let name_units: alloc::vec::Vec<u16> = path.encode_utf16().collect();
+        let name_units = utf16_units(path);
         let name = unicode_string(&name_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
         let mut handle = Handle::default();
@@ -1236,7 +1236,7 @@ mod tests {
     fn open_seeded_root_directory_succeeds() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let name_units: alloc::vec::Vec<u16> = r"\".encode_utf16().collect();
+            let name_units = utf16_units(r"\");
             let name = unicode_string(&name_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let mut handle = Handle::default();
@@ -1257,7 +1257,7 @@ mod tests {
     fn open_directory_rejects_openlink_attribute() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let name_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let name_units = utf16_units(r"\BaseNamedObjects");
             let name = unicode_string(&name_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE | OBJ_OPENLINK);
             let mut handle = Handle::default();
@@ -1296,7 +1296,7 @@ mod tests {
                     NtStatus::OBJECT_NAME_NOT_FOUND,
                 ),
             ] {
-                let name_units: alloc::vec::Vec<u16> = path.encode_utf16().collect();
+                let name_units = utf16_units(path);
                 let name = unicode_string(&name_units);
                 let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
                 let mut handle = Handle::default();
@@ -1319,7 +1319,7 @@ mod tests {
     fn create_directory_distinguishes_null_object_name_from_empty_name() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let root_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let root_units = utf16_units(r"\BaseNamedObjects");
             let root_name = unicode_string(&root_units);
             let root_attrs = object_attributes(&root_name, OBJ_CASE_INSENSITIVE);
             let mut root = Handle::default();
@@ -1398,7 +1398,7 @@ mod tests {
     fn create_and_open_directory_relative_to_root_directory() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let root_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let root_units = utf16_units(r"\BaseNamedObjects");
             let root_name = unicode_string(&root_units);
             let root_attrs = object_attributes(&root_name, OBJ_CASE_INSENSITIVE);
             let mut root = Handle::default();
@@ -1411,7 +1411,7 @@ mod tests {
                 NtStatus::SUCCESS
             );
 
-            let child_units: alloc::vec::Vec<u16> = "LiteBoxDirectory".encode_utf16().collect();
+            let child_units = utf16_units("LiteBoxDirectory");
             let child_name = unicode_string(&child_units);
             let child_attrs = ObjectAttributes {
                 length: u32::try_from(size_of::<ObjectAttributes>()).expect("fits in ULONG"),
@@ -1459,9 +1459,7 @@ mod tests {
                 create_named_directory(&task, r"\BaseNamedObjects\liteboxcaselower");
             let upper_open = open_named_directory(&task, r"\BASENAMEDOBJECTS\LITEBOXCASELOWER");
 
-            let duplicate_units: alloc::vec::Vec<u16> = r"\basenamedobjects\liteboxcasemixed\"
-                .encode_utf16()
-                .collect();
+            let duplicate_units = utf16_units(r"\basenamedobjects\liteboxcasemixed\");
             let duplicate_name = unicode_string(&duplicate_units);
             let duplicate_attrs = object_attributes(&duplicate_name, OBJ_CASE_INSENSITIVE);
             let mut duplicate = Handle::default();
@@ -1537,7 +1535,7 @@ mod tests {
     fn relative_directory_name_requires_root_traverse_access() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let root_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let root_units = utf16_units(r"\BaseNamedObjects");
             let root_name = unicode_string(&root_units);
             let root_attrs = object_attributes(&root_name, OBJ_CASE_INSENSITIVE);
             let mut root = Handle::default();
@@ -1550,8 +1548,7 @@ mod tests {
                 NtStatus::SUCCESS
             );
 
-            let child_units: alloc::vec::Vec<u16> =
-                "LiteBoxTraverseDenied".encode_utf16().collect();
+            let child_units = utf16_units("LiteBoxTraverseDenied");
             let child_name = unicode_string(&child_units);
             let child_attrs = ObjectAttributes {
                 length: u32::try_from(size_of::<ObjectAttributes>()).expect("fits in ULONG"),
@@ -1581,9 +1578,7 @@ mod tests {
     fn create_nested_directory_after_parent_exists() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let parent_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects\LiteBoxTreeParent"
-                .encode_utf16()
-                .collect();
+            let parent_units = utf16_units(r"\BaseNamedObjects\LiteBoxTreeParent");
             let parent_name = unicode_string(&parent_units);
             let parent_attrs = object_attributes(&parent_name, OBJ_CASE_INSENSITIVE);
             let mut parent = Handle::default();
@@ -1598,10 +1593,7 @@ mod tests {
                 NtStatus::SUCCESS
             );
 
-            let child_units: alloc::vec::Vec<u16> =
-                r"\BaseNamedObjects\LiteBoxTreeParent\LiteBoxTreeChild"
-                    .encode_utf16()
-                    .collect();
+            let child_units = utf16_units(r"\BaseNamedObjects\LiteBoxTreeParent\LiteBoxTreeChild");
             let child_name = unicode_string(&child_units);
             let child_attrs = object_attributes(&child_name, OBJ_CASE_INSENSITIVE);
             let mut child = Handle::default();
@@ -1635,9 +1627,7 @@ mod tests {
     fn create_existing_directory_obeys_openif() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let name_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects\LiteBoxOpenIfDirectory"
-                .encode_utf16()
-                .collect();
+            let name_units = utf16_units(r"\BaseNamedObjects\LiteBoxOpenIfDirectory");
             let name = unicode_string(&name_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let mut first = Handle::default();
@@ -1690,7 +1680,7 @@ mod tests {
     fn query_empty_directory_reports_no_more_entries() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let name_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let name_units = utf16_units(r"\BaseNamedObjects");
             let name = unicode_string(&name_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let mut handle = Handle::default();
@@ -1881,7 +1871,7 @@ mod tests {
     fn query_requires_directory_query_access() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let name_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let name_units = utf16_units(r"\BaseNamedObjects");
             let name = unicode_string(&name_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let mut handle = Handle::default();
@@ -1915,7 +1905,7 @@ mod tests {
     fn create_probes_output_before_name_resolution() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let name_units: alloc::vec::Vec<u16> = r"\MissingParent\Child".encode_utf16().collect();
+            let name_units = utf16_units(r"\MissingParent\Child");
             let name = unicode_string(&name_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
 
@@ -1948,7 +1938,7 @@ mod tests {
 
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let name_units: alloc::vec::Vec<u16> = r"\".encode_utf16().collect();
+            let name_units = utf16_units(r"\");
             let name = unicode_string(&name_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let mut host_handle = core::ptr::null_mut();

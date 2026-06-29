@@ -324,6 +324,7 @@ mod tests {
     use crate::nt_types::{ObjectAttributes, UnicodeString};
     use crate::tests::{
         TestPlatform, const_ptr, mut_ptr, object_attributes, test_task, unicode_string,
+        utf16_units as test_utf16_units,
     };
 
     const SYMBOLIC_LINK_QUERY: u32 = 0x0000_0001;
@@ -340,7 +341,7 @@ mod tests {
     }
 
     fn link_target(value: &str) -> (Vec<u16>, UnicodeString) {
-        let units: Vec<u16> = value.encode_utf16().collect();
+        let units = test_utf16_units(value);
         let unicode = unicode_string(&units);
         (units, unicode)
     }
@@ -350,7 +351,7 @@ mod tests {
         path: &str,
         target: &str,
     ) -> Handle {
-        let path_units: Vec<u16> = path.encode_utf16().collect();
+        let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
         let (_target_units, target) = link_target(target);
@@ -368,7 +369,7 @@ mod tests {
     }
 
     fn create_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
-        let path_units: Vec<u16> = path.encode_utf16().collect();
+        let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
         let mut handle = Handle::default();
@@ -386,7 +387,7 @@ mod tests {
     }
 
     fn open_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
-        let path_units: Vec<u16> = path.encode_utf16().collect();
+        let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
         let mut handle = Handle::default();
@@ -402,7 +403,7 @@ mod tests {
     }
 
     fn open_link(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
-        let path_units: Vec<u16> = path.encode_utf16().collect();
+        let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE | OBJ_OPENLINK);
         let mut handle = Handle::default();
@@ -421,7 +422,7 @@ mod tests {
         task: &Task<TestPlatform, crate::tests::TestFS>,
         path: &str,
     ) -> Handle {
-        let path_units: Vec<u16> = path.encode_utf16().collect();
+        let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
         let mut handle = Handle::default();
@@ -488,9 +489,7 @@ mod tests {
     fn create_symbolic_link_rejects_empty_target() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let path_units: Vec<u16> = r"\BaseNamedObjects\LiteBoxEmptyTarget"
-                .encode_utf16()
-                .collect();
+            let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxEmptyTarget");
             let name = unicode_string(&path_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let empty_target = unicode_string(&[]);
@@ -614,7 +613,7 @@ mod tests {
     fn open_symbolic_link_rejects_directory_type() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let path_units: Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let path_units = test_utf16_units(r"\BaseNamedObjects");
             let name = unicode_string(&path_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let mut handle = Handle::default();
@@ -640,9 +639,7 @@ mod tests {
                 r"\BaseNamedObjects\LiteBoxOpenIfSymlink",
                 r"\BaseNamedObjects\Target",
             );
-            let path_units: Vec<u16> = r"\BaseNamedObjects\LiteBoxOpenIfSymlink"
-                .encode_utf16()
-                .collect();
+            let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxOpenIfSymlink");
             let name = unicode_string(&path_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let (_target_units, target) = link_target(r"\BaseNamedObjects\Target");
@@ -683,9 +680,7 @@ mod tests {
     fn create_symbolic_link_rejects_existing_directory_type() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let path_units: Vec<u16> = r"\BaseNamedObjects\LiteBoxSymlinkTypeDirectory"
-                .encode_utf16()
-                .collect();
+            let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxSymlinkTypeDirectory");
             let name = unicode_string(&path_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let mut directory = Handle::default();

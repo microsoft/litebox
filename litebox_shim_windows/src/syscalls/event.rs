@@ -527,14 +527,15 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
     use core::mem::size_of;
 
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
     use crate::nt_types::ObjectAttributes;
-    use crate::tests::{const_ptr, mut_ptr, object_attributes, test_task, unicode_string};
+    use crate::tests::{
+        const_ptr, mut_ptr, object_attributes, test_task, unicode_string, utf16_units,
+    };
 
     const EVENT_QUERY_STATE: u32 = 0x0001;
     const EVENT_MODIFY_STATE: u32 = 0x0002;
@@ -738,7 +739,7 @@ mod tests {
     #[test]
     fn named_event_open_shares_state() {
         let task = test_task();
-        let name_units: Vec<u16> = "\\BaseNamedObjects\\LiteBoxEvent".encode_utf16().collect();
+        let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxEvent");
         let name = unicode_string(&name_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
 
@@ -813,7 +814,7 @@ mod tests {
     #[test]
     fn create_openif_existing_named_event_returns_name_exists() {
         let task = test_task();
-        let name_units: Vec<u16> = "\\BaseNamedObjects\\LiteBoxOpenIf".encode_utf16().collect();
+        let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxOpenIf");
         let name = unicode_string(&name_units);
         let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
         let openif_attrs = ObjectAttributes {
@@ -1124,10 +1125,10 @@ mod tests {
         #[test]
         fn named_open_matches_host_state_sharing() {
             let unique = 0u8;
-            let name_units: Vec<u16> =
-                alloc::format!(r"\BaseNamedObjects\LiteBoxEventFidelity{:p}", &unique,)
-                    .encode_utf16()
-                    .collect();
+            let name_units = utf16_units(&alloc::format!(
+                r"\BaseNamedObjects\LiteBoxEventFidelity{:p}",
+                &unique,
+            ));
             let name = unicode_string(&name_units);
             let attributes = object_attributes(&name, OBJ_CASE_INSENSITIVE);
 
