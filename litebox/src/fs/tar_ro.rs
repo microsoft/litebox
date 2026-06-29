@@ -31,6 +31,7 @@ use hashbrown::HashMap;
 
 use crate::{
     LiteBox,
+    fd::Descriptors,
     fs::{DirEntry, FileType},
     path::Arg as _,
     sync,
@@ -106,9 +107,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     }
 
     /// Get the stored path from any fd's Descriptor.
-    fn descriptor_path(&self, dirfd: &FileFd<Platform>) -> Option<String> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table.get_entry(dirfd)?;
+    fn descriptor_path(
+        dirfd: &FileFd<Platform>,
+        descriptors: &Descriptors<Platform>,
+    ) -> Option<String> {
+        let entry = descriptors.get_entry(dirfd)?;
         let path = match &entry.entry {
             Descriptor::File { path, .. } | Descriptor::Dir { path, .. } => path,
         };
@@ -284,6 +287,8 @@ fn normalize_tar_filename(filename: &str) -> &str {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
+    type DescriptorPlatform = Platform;
+
     fn open(
         &self,
         path: impl crate::path::Arg,
@@ -757,8 +762,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         self.rename(old_abs, new_abs)
     }
 
-    fn fd_path(&self, fd: &FileFd<Platform>) -> Option<alloc::string::String> {
-        self.descriptor_path(fd)
+    fn fd_path(
+        &self,
+        fd: &FileFd<Platform>,
+        descriptors: &Descriptors<Platform>,
+    ) -> Option<alloc::string::String> {
+        Self::descriptor_path(fd, descriptors)
     }
 
     fn mkdir_at(

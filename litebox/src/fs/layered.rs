@@ -16,7 +16,7 @@ use hashbrown::{HashMap, HashSet};
 use crate::log_println;
 
 use crate::LiteBox;
-use crate::fd::{InternalFd, MetadataError, TypedFd};
+use crate::fd::{Descriptors, InternalFd, MetadataError, TypedFd};
 use crate::path::Arg;
 use crate::sync;
 
@@ -507,9 +507,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     }
 
     /// Get the stored path from any fd's Descriptor.
-    fn descriptor_path(&self, dirfd: &FileFd<Platform, Upper, Lower>) -> Option<String> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table.get_entry(dirfd)?;
+    fn descriptor_path(
+        dirfd: &FileFd<Platform, Upper, Lower>,
+        descriptors: &Descriptors<Platform>,
+    ) -> Option<String> {
+        let entry = descriptors.get_entry(dirfd)?;
         Some(entry.entry.path.clone())
     }
 
@@ -673,6 +675,8 @@ impl<
     Lower: super::FileSystem + 'static,
 > super::FileSystem for FileSystem<Platform, Upper, Lower>
 {
+    type DescriptorPlatform = Platform;
+
     fn walks_follow_symlinks(&self) -> bool {
         // Returns true if either layer follows symlinks during walks.
         // The upper layer (in_mem/tar) has no symlinks, so it returns
@@ -2686,8 +2690,12 @@ impl<
         self.rename(old_abs, new_abs)
     }
 
-    fn fd_path(&self, fd: &FileFd<Platform, Upper, Lower>) -> Option<alloc::string::String> {
-        self.descriptor_path(fd)
+    fn fd_path(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        descriptors: &Descriptors<Platform>,
+    ) -> Option<alloc::string::String> {
+        Self::descriptor_path(fd, descriptors)
     }
 
     fn mkdir_at(

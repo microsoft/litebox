@@ -14,7 +14,7 @@ use alloc::sync::Weak;
 use crate::{
     LiteBox,
     event::{Events, IOPollable, observer::Observer},
-    fd::MetadataError,
+    fd::{Descriptors, MetadataError},
     fs::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
@@ -256,6 +256,8 @@ impl<
         + TimeProvider,
 > super::FileSystem for FileSystem<Platform>
 {
+    type DescriptorPlatform = Platform;
+
     fn open(
         &self,
         path: impl Arg,
@@ -728,7 +730,11 @@ impl<
         Err(super::errors::RenameError::NotADirectory)
     }
 
-    fn fd_path(&self, _fd: &FileFd<Platform>) -> Option<alloc::string::String> {
+    fn fd_path(
+        &self,
+        _fd: &FileFd<Platform>,
+        _descriptors: &Descriptors<Platform>,
+    ) -> Option<alloc::string::String> {
         // Devices don't track paths.
         None
     }
