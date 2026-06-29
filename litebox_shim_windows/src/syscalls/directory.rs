@@ -776,14 +776,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         directory: Arc<ObjectNode<Platform>>,
         granted_access: DirectoryAccess,
     ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<DirectoryObjectSubsystem<Platform>>(DirectoryHandleObject {
-            directory,
-            granted_access,
-        })
+        self.insert_typed_handle::<DirectoryObjectSubsystem<Platform>>(
+            DirectoryHandleObject {
+                directory,
+                granted_access,
+            },
+            drop,
+        )
     }
 
     pub(crate) fn close_directory_handle(&self, handle: Handle) {
-        self.close_typed_handle::<DirectoryObjectSubsystem<Platform>>(handle);
+        self.close_typed_handle::<DirectoryObjectSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_directory(directory: DirectoryHandleObject<Platform>) {

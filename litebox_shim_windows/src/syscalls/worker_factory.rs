@@ -15,10 +15,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use crate::nt_types::{AccessMask, ObjectAttributes, read_object_attributes};
 use crate::syscalls::iocp::{IoCompletionAccess, IoCompletionObject, IoCompletionSubsystem};
 use crate::syscalls::{Handle, ProcessHandle};
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    remove_raw_handle,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,29 +238,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         factory: Arc<WorkerFactoryObject<Platform>>,
         granted_access: WorkerFactoryAccess,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<WorkerFactorySubsystem<Platform>>(WorkerFactoryHandleObject {
+        self.insert_typed_handle::<WorkerFactorySubsystem<Platform>>(
+            WorkerFactoryHandleObject {
                 factory,
                 granted_access,
-            });
-        insert_raw_handle::<Platform, WorkerFactorySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
+            },
             drop,
         )
     }
 
     pub(crate) fn close_worker_factory_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, WorkerFactorySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            drop,
-        );
+        self.close_typed_handle::<WorkerFactorySubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_worker_factory(worker_factory: WorkerFactoryHandleObject<Platform>) {

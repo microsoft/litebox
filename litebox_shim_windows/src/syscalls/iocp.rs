@@ -12,10 +12,7 @@ use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, read_object_attributes};
 use crate::syscalls::Handle;
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    remove_raw_handle,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,29 +120,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         port: Arc<IoCompletionObject<Platform>>,
         granted_access: IoCompletionAccess,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<IoCompletionSubsystem<Platform>>(IoCompletionHandleObject {
+        self.insert_typed_handle::<IoCompletionSubsystem<Platform>>(
+            IoCompletionHandleObject {
                 port,
                 granted_access,
-            });
-        insert_raw_handle::<Platform, IoCompletionSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
+            },
             drop,
         )
     }
 
     pub(crate) fn close_io_completion_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, IoCompletionSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            drop,
-        );
+        self.close_typed_handle::<IoCompletionSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_io_completion(io_completion: IoCompletionHandleObject<Platform>) {

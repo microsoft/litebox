@@ -97,14 +97,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         link: Arc<ObjectNode<Platform>>,
         granted_access: SymbolicLinkAccess,
     ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<SymbolicLinkSubsystem<Platform>>(SymbolicLinkHandleObject {
-            link,
-            granted_access,
-        })
+        self.insert_typed_handle::<SymbolicLinkSubsystem<Platform>>(
+            SymbolicLinkHandleObject {
+                link,
+                granted_access,
+            },
+            drop,
+        )
     }
 
     fn close_symbolic_link_handle(&self, handle: Handle) {
-        self.close_typed_handle::<SymbolicLinkSubsystem<Platform>>(handle);
+        self.close_typed_handle::<SymbolicLinkSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_symbolic_link(link: SymbolicLinkHandleObject<Platform>) {

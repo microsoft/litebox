@@ -193,7 +193,7 @@ where
     true
 }
 
-pub(crate) fn insert_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
+fn insert_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore<Platform>,
     typed: litebox::fd::TypedFd<Subsystem>,
@@ -235,7 +235,7 @@ where
     litebox.descriptor_table().entry_handle(&typed)
 }
 
-pub(crate) fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
+fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore<Platform>,
     handle: syscalls::Handle,
@@ -250,7 +250,7 @@ pub(crate) fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsy
         remove_raw_handle_by_raw_fd::<Platform, Subsystem>(litebox, handles, raw_fd, cleanup_entry);
 }
 
-pub(crate) fn remove_raw_handle_by_raw_fd<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
+fn remove_raw_handle_by_raw_fd<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore<Platform>,
     raw_fd: usize,
@@ -480,6 +480,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn insert_typed_handle<Subsystem>(
         &self,
         entry: Subsystem::Entry,
+        cleanup_entry: impl FnOnce(Subsystem::Entry),
     ) -> Result<syscalls::Handle, NtStatus>
     where
         Subsystem: litebox::fd::FdEnabledSubsystem,
@@ -493,19 +494,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &self.global.litebox,
             &self.process.handles,
             typed,
-            drop,
+            cleanup_entry,
         )
     }
 
-    fn close_typed_handle<Subsystem>(&self, handle: syscalls::Handle)
-    where
+    fn close_typed_handle<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+        cleanup_entry: impl FnOnce(Subsystem::Entry),
+    ) where
         Subsystem: litebox::fd::FdEnabledSubsystem,
     {
         remove_raw_handle::<Platform, Subsystem>(
             &self.global.litebox,
             &self.process.handles,
             handle,
-            drop,
+            cleanup_entry,
         );
     }
 

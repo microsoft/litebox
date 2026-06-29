@@ -16,8 +16,7 @@ use crate::nt_types::{
 };
 use crate::syscalls::Handle;
 use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    raw_handle_entry, remove_raw_handle,
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
 };
 
 const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
@@ -323,26 +322,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn insert_file_handle(&self, file: FileObject<FS>) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<FileObjectSubsystem<FS>>(file);
-        insert_raw_handle::<Platform, FileObjectSubsystem<FS>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
-            |file| self.close_file(file),
-        )
+        self.insert_typed_handle::<FileObjectSubsystem<FS>>(file, |file| self.close_file(file))
     }
 
     pub(crate) fn close_file_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, FileObjectSubsystem<FS>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            |file| self.close_file(file),
-        );
+        self.close_typed_handle::<FileObjectSubsystem<FS>>(handle, |file| self.close_file(file));
     }
 
     pub(crate) fn close_file(&self, file: FileObject<FS>) {

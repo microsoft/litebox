@@ -44,9 +44,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::Handle;
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, raw_handle_entry, remove_raw_handle,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, raw_handle_entry};
 
 use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
 
@@ -364,26 +362,15 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         key: RegistryKeyObject<Platform>,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<RegistryKeySubsystem<Platform>>(key);
-        insert_raw_handle::<Platform, RegistryKeySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
-            |key| self.close_registry_key(key),
-        )
+        self.insert_typed_handle::<RegistryKeySubsystem<Platform>>(key, |key| {
+            self.close_registry_key(key);
+        })
     }
 
     pub(crate) fn close_registry_key_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, RegistryKeySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            |key| self.close_registry_key(key),
-        );
+        self.close_typed_handle::<RegistryKeySubsystem<Platform>>(handle, |key| {
+            self.close_registry_key(key);
+        });
     }
 
     pub(crate) fn close_registry_key(&self, key: RegistryKeyObject<Platform>) {

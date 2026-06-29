@@ -19,8 +19,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
 use crate::syscalls::Handle;
 use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    raw_handle_entry, remove_raw_handle,
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
 };
 
 const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
@@ -279,29 +278,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         event: Arc<EventObject<Platform>>,
         granted_access: EventAccess,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<EventSubsystem<Platform>>(EventHandleObject {
+        self.insert_typed_handle::<EventSubsystem<Platform>>(
+            EventHandleObject {
                 event,
                 granted_access,
-            });
-        insert_raw_handle::<Platform, EventSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
+            },
             drop,
         )
     }
 
     pub(crate) fn close_event_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, EventSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            drop,
-        );
+        self.close_typed_handle::<EventSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_event(event: EventHandleObject<Platform>) {

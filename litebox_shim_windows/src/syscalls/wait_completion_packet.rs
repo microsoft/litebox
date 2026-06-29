@@ -16,10 +16,7 @@ use crate::syscalls::Handle;
 use crate::syscalls::event::{EventAccess, EventSubsystem};
 use crate::syscalls::iocp::{IoCompletionAccess, IoCompletionSubsystem};
 use crate::syscalls::timer::{TimerAccess, TimerSubsystem};
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    remove_raw_handle,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
     | AccessMask::READ_CONTROL.bits()
@@ -274,29 +271,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         packet: Arc<WaitCompletionPacketObject<Platform>>,
         granted_access: WaitCompletionPacketAccess,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<WaitCompletionPacketSubsystem<Platform>>(WaitCompletionPacketHandleObject {
+        self.insert_typed_handle::<WaitCompletionPacketSubsystem<Platform>>(
+            WaitCompletionPacketHandleObject {
                 packet,
                 granted_access,
-            });
-        insert_raw_handle::<Platform, WaitCompletionPacketSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
+            },
             drop,
         )
     }
 
     pub(crate) fn close_wait_completion_packet_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, WaitCompletionPacketSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            drop,
-        );
+        self.close_typed_handle::<WaitCompletionPacketSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_wait_completion_packet(
