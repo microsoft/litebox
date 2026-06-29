@@ -765,8 +765,8 @@ fn create_directory_mode(file_attributes: u32) -> Mode {
 /// mapped directly into the sandbox filesystem. Today that includes `\??\`,
 /// `\\?\`, any drive-letter prefix, both `\SystemRoot\` and `/SystemRoot/`,
 /// `\Device\HarddiskVolume1\`, and `\Device\ConDrv\`. A unified object-manager
-/// walk through directory, symbolic-link, and device objects is the parked
-/// symlink/device increment, not part of this file-path mapper.
+/// walk through device objects into the backing filesystem namespace remains
+/// outside this file-path mapper.
 fn absolute_nt_file_name_to_fs_path(name: &str) -> Result<String, NtStatus> {
     let mut name = name;
     if let Some(rest) = strip_case_insensitive_prefix(name, "\\??\\") {

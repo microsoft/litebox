@@ -27,7 +27,7 @@ const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct SymbolicLinkAccess: u32 {
+    struct SymbolicLinkAccess: u32 {
         const QUERY = 0x0001;
 
         const READ = AccessMask::STANDARD_RIGHTS_READ.bits() | Self::QUERY.bits();
@@ -41,26 +41,13 @@ bitflags::bitflags! {
 
 impl SymbolicLinkAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        let mut access = Self::from_bits_retain(desired_access);
-        if desired_access & AccessMask::GENERIC_READ.bits() != 0 {
-            access.insert(Self::READ);
-        }
-        if desired_access & AccessMask::GENERIC_WRITE.bits() != 0 {
-            access.insert(Self::WRITE);
-        }
-        if desired_access & AccessMask::GENERIC_EXECUTE.bits() != 0 {
-            access.insert(Self::EXECUTE);
-        }
-        if desired_access & AccessMask::GENERIC_ALL.bits() != 0 {
-            access.insert(Self::ALL_ACCESS);
-        }
-        access.remove(Self::from_bits_retain(
-            AccessMask::GENERIC_READ.bits()
-                | AccessMask::GENERIC_WRITE.bits()
-                | AccessMask::GENERIC_EXECUTE.bits()
-                | AccessMask::GENERIC_ALL.bits(),
-        ));
-        access
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::READ.bits(),
+            Self::WRITE.bits(),
+            Self::EXECUTE.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
     }
 
     fn require(self, required: Self) -> Result<(), NtStatus> {
@@ -175,6 +162,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> NtStatus {
         self.process.directory_namespace.create_symlink(
             &link_name.path,
+            &link_name.original_path,
             target,
             |link| {
                 if !open_if {
@@ -211,19 +199,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(link_handle) {
             return status;
         }
-        let (open_link, link_name) =
-            match self.read_directory_object_attributes(object_attributes, true) {
-                Ok((Some(object_attributes), Some(link_name))) => {
-                    (object_attributes.attributes & OBJ_OPENLINK != 0, link_name)
-                }
-                Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
-                Ok((None, Some(_))) => return NtStatus::INVALID_PARAMETER,
-                Err(status) => return status,
-            };
+        let link_name = match self.read_directory_object_attributes(object_attributes, true) {
+            Ok((Some(_), Some(link_name))) => link_name,
+            Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
+            Ok((None, Some(_))) => return NtStatus::INVALID_PARAMETER,
+            Err(status) => return status,
+        };
         let link = match self
             .process
             .directory_namespace
-            .resolve_symlink(&link_name.path, open_link)
+            .resolve_symlink(&link_name.path, true)
         {
             Ok(link) => link,
             Err(status) => return status,
@@ -274,7 +259,22 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(units) => units,
             Err(status) => return status,
         };
-        let required = u32::try_from(units.len() * size_of::<u16>()).expect("USHORT fits in ULONG");
+        let required_len = units
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or(NtStatus::NAME_TOO_LONG);
+        let Ok(required_len) = required_len else {
+            return NtStatus::NAME_TOO_LONG;
+        };
+        let required = match units
+            .len()
+            .checked_add(1)
+            .and_then(|units| units.checked_mul(size_of::<u16>()))
+            .and_then(|bytes| u32::try_from(bytes).ok())
+        {
+            Some(required) if u16::try_from(required).is_ok() => required,
+            _ => return NtStatus::NAME_TOO_LONG,
+        };
         let Some(mut unicode) = link_target.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
@@ -291,14 +291,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
 
+        let mut output_units = units;
+        output_units.push(0);
         let target_buffer = MutPtr::<Platform, u16>::from_usize(unicode.buffer);
         target_buffer
-            .write_slice_at_offset(0, &units)
+            .write_slice_at_offset(0, &output_units)
             .ok_or(NtStatus::ACCESS_VIOLATION)
             .map_or_else(
                 |status| status,
                 |()| {
-                    unicode.length = u16::try_from(required).expect("required length fits");
+                    unicode.length = u16::try_from(required_len).expect("required length fits");
                     if link_target.write_at_offset(0, unicode).is_none() {
                         NtStatus::ACCESS_VIOLATION
                     } else {
@@ -413,6 +415,25 @@ mod tests {
         handle
     }
 
+    fn open_link_without_openlink(
+        task: &Task<TestPlatform, crate::tests::TestFS>,
+        path: &str,
+    ) -> Handle {
+        let path_units: Vec<u16> = path.encode_utf16().collect();
+        let name = unicode_string(&path_units);
+        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let mut handle = Handle::default();
+        assert_eq!(
+            task.sys_nt_open_symbolic_link_object(
+                mut_ptr(&mut handle),
+                SYMBOLIC_LINK_QUERY,
+                Some(const_ptr(&attrs)),
+            ),
+            NtStatus::SUCCESS
+        );
+        handle
+    }
+
     fn query_link(
         task: &Task<TestPlatform, crate::tests::TestFS>,
         handle: Handle,
@@ -438,6 +459,7 @@ mod tests {
         assert_eq!(target.buffer, original_buffer);
         assert_eq!(target.maximum_length, original_maximum_length);
         assert!(usize::from(target.length) <= size_of_val(output_units));
+        assert_eq!(output_units[usize::from(target.length) / 2], 0);
         (target, returned_length)
     }
 
@@ -448,9 +470,9 @@ mod tests {
             let target = r"\BaseNamedObjects\LiteBoxTarget";
             let created = create_link(&task, r"\BaseNamedObjects\LiteBoxSymlink", target);
             let opened = open_link(&task, r"\BaseNamedObjects\LiteBoxSymlink");
-            let mut output = alloc::vec![0u16; target.encode_utf16().count()];
+            let mut output = alloc::vec![0u16; target.encode_utf16().count() + 1];
             let (target, returned_length) = query_link(&task, opened, &mut output);
-            assert_eq!(returned_length, u32::from(target.length));
+            assert_eq!(returned_length, u32::from(target.length) + 2);
             assert_eq!(
                 String::from_utf16_lossy(&output[..usize::from(target.length) / 2]),
                 r"\BaseNamedObjects\LiteBoxTarget"
@@ -486,35 +508,25 @@ mod tests {
     }
 
     #[test]
-    fn open_symbolic_link_without_openlink_follows_and_detects_cycle() {
+    fn open_symbolic_link_without_openlink_returns_final_link_itself() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let first = create_link(
+            let created = create_link(
                 &task,
-                r"\BaseNamedObjects\LiteBoxCycleA",
-                r"\BaseNamedObjects\LiteBoxCycleB",
+                r"\BaseNamedObjects\LiteBoxNoOpenLinkFinal",
+                r"\BaseNamedObjects\MissingTarget",
             );
-            let second = create_link(
-                &task,
-                r"\BaseNamedObjects\LiteBoxCycleB",
-                r"\BaseNamedObjects\LiteBoxCycleA",
-            );
-            let path_units: Vec<u16> = r"\BaseNamedObjects\LiteBoxCycleA".encode_utf16().collect();
-            let name = unicode_string(&path_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
-            let mut handle = Handle::default();
+            let opened =
+                open_link_without_openlink(&task, r"\BaseNamedObjects\LiteBoxNoOpenLinkFinal");
+            let mut output = [0u16; 64];
+            let (target, _) = query_link(&task, opened, &mut output);
 
             assert_eq!(
-                task.sys_nt_open_directory_object(
-                    mut_ptr(&mut handle),
-                    DIRECTORY_QUERY,
-                    Some(const_ptr(&attrs)),
-                ),
-                NtStatus::NAME_TOO_LONG
+                String::from_utf16_lossy(&output[..usize::from(target.length) / 2]),
+                r"\BaseNamedObjects\MissingTarget"
             );
-            assert_eq!(handle, Handle::default());
-            assert_eq!(task.sys_nt_close(second), NtStatus::SUCCESS);
-            assert_eq!(task.sys_nt_close(first), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(created), NtStatus::SUCCESS);
         });
     }
 
@@ -735,10 +747,160 @@ mod tests {
             assert_eq!(output, [0xeeeeu16; 2]);
             assert_eq!(
                 returned_length,
-                u32::try_from(r"\BaseNamedObjects\LongTarget".encode_utf16().count() * 2)
+                u32::try_from((r"\BaseNamedObjects\LongTarget".encode_utf16().count() + 1) * 2)
                     .expect("target fits")
             );
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn query_symbolic_link_requires_space_for_trailing_nul() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let target = r"\BaseNamedObjects\ExactLengthTarget";
+            let handle = create_link(&task, r"\BaseNamedObjects\LiteBoxExactSymlink", target);
+            let mut output = alloc::vec![0xeeeeu16; target.encode_utf16().count()];
+            let mut target_string = UnicodeString {
+                length: 0x1234,
+                maximum_length: u16::try_from(size_of_val(output.as_slice()))
+                    .expect("test buffer fits"),
+                padding_0: [0; 4],
+                buffer: output.as_mut_ptr() as usize,
+            };
+            let mut returned_length = 0;
+
+            assert_eq!(
+                task.sys_nt_query_symbolic_link_object(
+                    handle,
+                    mut_ptr(&mut target_string),
+                    Some(mut_ptr(&mut returned_length)),
+                ),
+                NtStatus::BUFFER_TOO_SMALL
+            );
+            assert_eq!(
+                returned_length,
+                u32::try_from((target.encode_utf16().count() + 1) * 2).expect("target fits")
+            );
+            assert!(output.iter().all(|unit| *unit == 0xeeee));
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn host_symbolic_link_open_and_query_fidelity() {
+        use core::ffi::c_void;
+
+        unsafe extern "system" {
+            fn NtCreateSymbolicLinkObject(
+                handle: *mut *mut c_void,
+                access: u32,
+                attributes: *const ObjectAttributes,
+                target: *const UnicodeString,
+            ) -> i32;
+            fn NtOpenSymbolicLinkObject(
+                handle: *mut *mut c_void,
+                access: u32,
+                attributes: *const ObjectAttributes,
+            ) -> i32;
+            fn NtQuerySymbolicLinkObject(
+                handle: *mut c_void,
+                target: *mut UnicodeString,
+                returned_length: *mut u32,
+            ) -> i32;
+            fn NtClose(handle: *mut c_void) -> i32;
+        }
+
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let path = r"\BaseNamedObjects\LiteBoxHostSymlinkFidelity";
+            let target = r"\BaseNamedObjects\LiteBoxHostSymlinkTarget";
+            let path_units: Vec<u16> = path.encode_utf16().collect();
+            let target_units: Vec<u16> = target.encode_utf16().collect();
+            let name = unicode_string(&path_units);
+            let target_string = unicode_string(&target_units);
+            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let mut host_created = core::ptr::null_mut();
+
+            // SAFETY: The host syscall receives pointers to live test stack
+            // values, and host_created is closed below if the call succeeds.
+            let host_create_status = unsafe {
+                NtCreateSymbolicLinkObject(
+                    &raw mut host_created,
+                    SYMBOLIC_LINK_ALL_ACCESS,
+                    &raw const attrs,
+                    &raw const target_string,
+                )
+            };
+            if host_create_status != NtStatus::SUCCESS.as_raw() {
+                return;
+            }
+
+            let mut host_opened = core::ptr::null_mut();
+            // SAFETY: attrs points to a live OBJECT_ATTRIBUTES value naming the
+            // link created above; host_opened is closed below on success.
+            let host_open_status = unsafe {
+                NtOpenSymbolicLinkObject(
+                    &raw mut host_opened,
+                    SYMBOLIC_LINK_QUERY,
+                    &raw const attrs,
+                )
+            };
+            if host_open_status != NtStatus::SUCCESS.as_raw() {
+                // SAFETY: host_created was returned by a successful host
+                // NtCreateSymbolicLinkObject call above and has not been closed.
+                unsafe {
+                    NtClose(host_created);
+                }
+                assert_eq!(host_open_status, NtStatus::SUCCESS.as_raw());
+            }
+
+            let mut host_output = alloc::vec![0u16; target_units.len() + 1];
+            let mut host_query_target = UnicodeString {
+                length: 0,
+                maximum_length: u16::try_from(size_of_val(host_output.as_slice()))
+                    .expect("host test buffer fits"),
+                padding_0: [0; 4],
+                buffer: host_output.as_mut_ptr() as usize,
+            };
+            let mut host_returned_length = 0u32;
+            // SAFETY: host_opened is a live symbolic-link handle, and the output
+            // UNICODE_STRING points to writable test memory.
+            let host_query_status = unsafe {
+                NtQuerySymbolicLinkObject(
+                    host_opened,
+                    &raw mut host_query_target,
+                    &raw mut host_returned_length,
+                )
+            };
+            // SAFETY: Both handles were returned by successful host ntdll calls
+            // in this test and are closed exactly once here.
+            unsafe {
+                NtClose(host_opened);
+                NtClose(host_created);
+            }
+            assert_eq!(host_query_status, NtStatus::SUCCESS.as_raw());
+
+            let litebox_created = create_link(&task, path, target);
+            let litebox_opened = open_link_without_openlink(&task, path);
+            let mut litebox_output = alloc::vec![0u16; target_units.len() + 1];
+            let (litebox_query_target, litebox_returned_length) =
+                query_link(&task, litebox_opened, &mut litebox_output);
+
+            assert_eq!(
+                usize::from(litebox_query_target.length),
+                target_units.len() * 2
+            );
+            assert_eq!(
+                litebox_returned_length,
+                u32::try_from((target_units.len() + 1) * 2).expect("target length fits")
+            );
+            assert_eq!(litebox_query_target.length, host_query_target.length);
+            assert_eq!(litebox_returned_length, host_returned_length);
+            assert_eq!(litebox_output, host_output);
+            assert_eq!(task.sys_nt_close(litebox_opened), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(litebox_created), NtStatus::SUCCESS);
         });
     }
 }

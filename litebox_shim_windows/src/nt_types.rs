@@ -161,6 +161,35 @@ bitflags::bitflags! {
     }
 }
 
+impl AccessMask {
+    pub(crate) fn expand_generic_access(
+        desired_access: u32,
+        generic_read: u32,
+        generic_write: u32,
+        generic_execute: u32,
+        generic_all: u32,
+    ) -> u32 {
+        let mut access = desired_access;
+        if desired_access & Self::GENERIC_READ.bits() != 0 {
+            access |= generic_read;
+        }
+        if desired_access & Self::GENERIC_WRITE.bits() != 0 {
+            access |= generic_write;
+        }
+        if desired_access & Self::GENERIC_EXECUTE.bits() != 0 {
+            access |= generic_execute;
+        }
+        if desired_access & Self::GENERIC_ALL.bits() != 0 {
+            access |= generic_all;
+        }
+        access
+            & !(Self::GENERIC_READ.bits()
+                | Self::GENERIC_WRITE.bits()
+                | Self::GENERIC_EXECUTE.bits()
+                | Self::GENERIC_ALL.bits())
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable)]
 pub(crate) struct ObjectAttributes {

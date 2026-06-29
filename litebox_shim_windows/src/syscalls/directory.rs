@@ -18,8 +18,9 @@
 //! The tree is still an object-manager tree, not a `litebox::fs` filesystem:
 //! `litebox::fs` is a byte-stream interface, while object-manager directories
 //! hold typed kernel objects with object-specific handle semantics rather than
-//! file contents. Symbolic-link traversal hangs off this tree in a later
-//! increment; `NtQueryDirectoryObject` enumerates the tree's direct children.
+//! file contents. Symbolic-link traversal is handled in this namespace; the
+//! later integration point is walking through device objects into filesystem
+//! drivers.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString as _};
@@ -47,7 +48,7 @@ const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
 
 // Wine's server seeds these object-manager directories during init_directories/create_session;
 // ReactOS initializes the same root-style namespace through ObpRootDirectoryObject.
-pub(crate) const SEEDED_DIRECTORY_PATHS: &[&str] = &[
+const SEEDED_DIRECTORY_PATHS: &[&str] = &[
     r"\",
     r"\??",
     r"\BaseNamedObjects",
@@ -68,7 +69,7 @@ pub(crate) const SEEDED_DIRECTORY_PATHS: &[&str] = &[
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct DirectoryAccess: u32 {
+    struct DirectoryAccess: u32 {
         const QUERY = 0x0001;
         const TRAVERSE = 0x0002;
         const CREATE_OBJECT = 0x0004;
@@ -95,26 +96,13 @@ bitflags::bitflags! {
 
 impl DirectoryAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        let mut access = Self::from_bits_retain(desired_access);
-        if desired_access & AccessMask::GENERIC_READ.bits() != 0 {
-            access.insert(Self::READ);
-        }
-        if desired_access & AccessMask::GENERIC_WRITE.bits() != 0 {
-            access.insert(Self::WRITE);
-        }
-        if desired_access & AccessMask::GENERIC_EXECUTE.bits() != 0 {
-            access.insert(Self::EXECUTE);
-        }
-        if desired_access & AccessMask::GENERIC_ALL.bits() != 0 {
-            access.insert(Self::ALL_ACCESS);
-        }
-        access.remove(Self::from_bits_retain(
-            AccessMask::GENERIC_READ.bits()
-                | AccessMask::GENERIC_WRITE.bits()
-                | AccessMask::GENERIC_EXECUTE.bits()
-                | AccessMask::GENERIC_ALL.bits(),
-        ));
-        access
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::READ.bits(),
+            Self::WRITE.bits(),
+            Self::EXECUTE.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
     }
 
     fn require(self, required: Self) -> Result<(), NtStatus> {
@@ -135,12 +123,13 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for DirectoryObjectSubsys
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for DirectoryHandleObject<Platform> {}
 
 pub(crate) struct DirectoryHandleObject<Platform: crate::ShimPlatform> {
-    pub(super) directory: Arc<ObjectNode<Platform>>,
+    directory: Arc<ObjectNode<Platform>>,
     granted_access: DirectoryAccess,
 }
 
 pub(super) struct ObjectNode<Platform: crate::ShimPlatform> {
-    pub(super) path: String,
+    path: String,
+    name: String,
     parent: Option<Weak<ObjectNode<Platform>>>,
     body: litebox::sync::RwLock<Platform, NamedObject<Platform>>,
     _not_send_without_platform: PhantomData<fn(Platform)>,
@@ -150,7 +139,7 @@ pub(crate) struct DirectoryNamespace<Platform: crate::ShimPlatform> {
     root: Arc<ObjectNode<Platform>>,
 }
 
-pub(super) enum NamedObject<Platform: crate::ShimPlatform> {
+enum NamedObject<Platform: crate::ShimPlatform> {
     Directory {
         children: BTreeMap<String, Arc<ObjectNode<Platform>>>,
     },
@@ -206,9 +195,14 @@ pub(crate) struct DirectoryQueryParameters<Platform: RawPointerProvider> {
 }
 
 impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
-    fn new_directory(path: String, parent: Option<Weak<ObjectNode<Platform>>>) -> Self {
+    fn new_directory(
+        path: String,
+        parent: Option<Weak<ObjectNode<Platform>>>,
+        name: String,
+    ) -> Self {
         Self {
             path,
+            name,
             parent,
             body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Directory {
                 children: BTreeMap::new(),
@@ -220,10 +214,12 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
     fn new_symlink(
         path: String,
         parent: Option<Weak<ObjectNode<Platform>>>,
+        name: String,
         target: String,
     ) -> Self {
         Self {
             path,
+            name,
             parent,
             body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Symlink { target }),
             _not_send_without_platform: PhantomData,
@@ -240,9 +236,9 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
     fn children_snapshot(&self) -> Result<Vec<DirectoryEntrySnapshot>, NtStatus> {
         match &*self.body.read() {
             NamedObject::Directory { children } => Ok(children
-                .iter()
-                .map(|(name, child)| DirectoryEntrySnapshot {
-                    name: name.clone(),
+                .values()
+                .map(|child| DirectoryEntrySnapshot {
+                    name: child.name.clone(),
                     type_name: child.type_name(),
                 })
                 .collect()),
@@ -280,7 +276,11 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
 impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     fn new() -> Self {
         Self {
-            root: Arc::new(ObjectNode::new_directory(r"\".to_string(), None)),
+            root: Arc::new(ObjectNode::new_directory(
+                r"\".to_string(),
+                None,
+                String::new(),
+            )),
         }
     }
 
@@ -297,11 +297,13 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     fn create_directory(
         &self,
         path: &str,
+        original_path: &str,
         on_exists: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
         on_created: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
     ) -> NtStatus {
         self.create_child(
             path,
+            original_path,
             ObjectNode::is_directory,
             ObjectNode::new_directory,
             on_exists,
@@ -312,14 +314,16 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     pub(super) fn create_symlink(
         &self,
         path: &str,
+        original_path: &str,
         target: String,
         on_exists: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
         on_created: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
     ) -> NtStatus {
         self.create_child(
             path,
+            original_path,
             ObjectNode::is_symlink,
-            |path, parent| ObjectNode::new_symlink(path, parent, target),
+            |path, parent, name| ObjectNode::new_symlink(path, parent, name, target),
             on_exists,
             on_created,
         )
@@ -328,8 +332,13 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     fn create_child(
         &self,
         path: &str,
+        original_path: &str,
         existing_matches: impl Fn(&ObjectNode<Platform>) -> bool,
-        construct: impl FnOnce(String, Option<Weak<ObjectNode<Platform>>>) -> ObjectNode<Platform>,
+        construct: impl FnOnce(
+            String,
+            Option<Weak<ObjectNode<Platform>>>,
+            String,
+        ) -> ObjectNode<Platform>,
         on_exists: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
         on_created: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
     ) -> NtStatus {
@@ -340,12 +349,23 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         if tail.is_empty() {
             return on_exists(Arc::clone(&self.root));
         }
+        let original_tail = match absolute_path_tail(original_path) {
+            Ok(tail) => tail,
+            Err(status) => return status,
+        };
 
         let (parent_tail, leaf_name) = match tail.rsplit_once('\\') {
             Some((parent, leaf)) => (parent, leaf),
             None => ("", tail),
         };
+        let display_leaf_name = match original_tail.rsplit_once('\\') {
+            Some((_, leaf)) => leaf,
+            None => original_tail,
+        };
         if leaf_name.is_empty() {
+            return NtStatus::OBJECT_NAME_INVALID;
+        }
+        if display_leaf_name.is_empty() {
             return NtStatus::OBJECT_NAME_INVALID;
         }
 
@@ -367,6 +387,7 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         let node = Arc::new(construct(
             join_directory_path(&parent.path, leaf_name),
             Some(Arc::downgrade(&parent)),
+            display_leaf_name.to_string(),
         ));
         debug_assert!(node.parent().is_some());
         let status = on_created(Arc::clone(&node));
@@ -390,8 +411,13 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         }
     }
 
-    fn seed_directory(&self, path: &str) {
-        let status = self.create_directory(path, |_| NtStatus::SUCCESS, |_| NtStatus::SUCCESS);
+    fn seed_directory(&self, path: &str, original_path: &str) {
+        let status = self.create_directory(
+            path,
+            original_path,
+            |_| NtStatus::SUCCESS,
+            |_| NtStatus::SUCCESS,
+        );
         assert!(
             status == NtStatus::SUCCESS,
             "seeded NT object directory must have seeded ancestors: {status:?}"
@@ -471,6 +497,7 @@ enum TailResolution<Platform: crate::ShimPlatform> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DirectoryName {
     pub(super) path: String,
+    pub(super) original_path: String,
 }
 
 fn normalize_directory_path(path: &str) -> String {
@@ -542,15 +569,26 @@ fn utf16_byte_len(value: &str) -> Result<usize, NtStatus> {
 fn directory_record_size(entry: &DirectoryEntrySnapshot) -> Result<usize, NtStatus> {
     size_of::<ObjectDirectoryInformation>()
         .checked_add(utf16_byte_len(&entry.name)?)
+        .and_then(|size| size.checked_add(size_of::<u16>()))
         .and_then(|size| size.checked_add(utf16_byte_len(entry.type_name).ok()?))
+        .and_then(|size| size.checked_add(size_of::<u16>()))
         .ok_or(NtStatus::NAME_TOO_LONG)
+}
+
+fn directory_query_required_size(entries: &[DirectoryEntrySnapshot]) -> Result<usize, NtStatus> {
+    entries
+        .iter()
+        .try_fold(size_of::<ObjectDirectoryInformation>(), |size, entry| {
+            size.checked_add(directory_record_size(entry)?)
+                .ok_or(NtStatus::NAME_TOO_LONG)
+        })
 }
 
 fn byte_offset(offset: usize) -> Result<isize, NtStatus> {
     isize::try_from(offset).map_err(|_| NtStatus::BUFFER_TOO_SMALL)
 }
 
-fn write_utf16_bytes<Platform: RawPointerProvider>(
+fn write_utf16_nul_terminated<Platform: RawPointerProvider>(
     buffer: MutPtr<Platform, u8>,
     offset: usize,
     value: &str,
@@ -559,6 +597,7 @@ fn write_utf16_bytes<Platform: RawPointerProvider>(
     for unit in value.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
+    bytes.extend_from_slice(&0u16.to_le_bytes());
     buffer
         .write_slice_at_offset(byte_offset(offset)?, &bytes)
         .ok_or(NtStatus::ACCESS_VIOLATION)
@@ -570,9 +609,12 @@ fn output_unicode_string(
     len: usize,
 ) -> Result<UnicodeString, NtStatus> {
     let len = u16::try_from(len).map_err(|_| NtStatus::NAME_TOO_LONG)?;
+    let maximum_length = len
+        .checked_add(u16::try_from(size_of::<u16>()).expect("WCHAR size fits in USHORT"))
+        .ok_or(NtStatus::NAME_TOO_LONG)?;
     Ok(UnicodeString {
         length: len,
-        maximum_length: len,
+        maximum_length,
         padding_0: [0; 4],
         buffer: buffer_base
             .checked_add(offset)
@@ -580,46 +622,59 @@ fn output_unicode_string(
     })
 }
 
-fn write_directory_record<Platform: RawPointerProvider>(
+fn write_directory_records<Platform: RawPointerProvider>(
     buffer: MutPtr<Platform, u8>,
     buffer_base: usize,
-    offset: usize,
-    entry: &DirectoryEntrySnapshot,
-) -> Result<usize, NtStatus> {
+    entries: &[DirectoryEntrySnapshot],
+) -> Result<(), NtStatus> {
     let header_size = size_of::<ObjectDirectoryInformation>();
-    let name_len = utf16_byte_len(&entry.name)?;
-    let type_len = utf16_byte_len(entry.type_name)?;
-    let name_offset = offset
-        .checked_add(header_size)
+    let mut string_offset = entries
+        .len()
+        .checked_add(1)
+        .and_then(|records| records.checked_mul(header_size))
         .ok_or(NtStatus::NAME_TOO_LONG)?;
-    let type_offset = name_offset
-        .checked_add(name_len)
-        .ok_or(NtStatus::NAME_TOO_LONG)?;
-    let record = ObjectDirectoryInformation::new(
-        output_unicode_string(buffer_base, name_offset, name_len)?,
-        output_unicode_string(buffer_base, type_offset, type_len)?,
-    );
-    buffer
-        .write_slice_at_offset(byte_offset(offset)?, record.as_bytes())
-        .ok_or(NtStatus::ACCESS_VIOLATION)?;
-    write_utf16_bytes::<Platform>(buffer, name_offset, &entry.name)?;
-    write_utf16_bytes::<Platform>(buffer, type_offset, entry.type_name)?;
-    type_offset
-        .checked_add(type_len)
-        .ok_or(NtStatus::NAME_TOO_LONG)
-}
 
-fn write_directory_terminator<Platform: RawPointerProvider>(
-    buffer: MutPtr<Platform, u8>,
-    offset: usize,
-) -> Result<usize, NtStatus> {
-    let record = ObjectDirectoryInformation::zero();
+    for (index, entry) in entries.iter().enumerate() {
+        let name_len = utf16_byte_len(&entry.name)?;
+        let type_len = utf16_byte_len(entry.type_name)?;
+        let name_offset = string_offset;
+        let type_offset = name_offset
+            .checked_add(name_len)
+            .and_then(|offset| offset.checked_add(size_of::<u16>()))
+            .ok_or(NtStatus::NAME_TOO_LONG)?;
+        let record = ObjectDirectoryInformation::new(
+            output_unicode_string(buffer_base, name_offset, name_len)?,
+            output_unicode_string(buffer_base, type_offset, type_len)?,
+        );
+        buffer
+            .write_slice_at_offset(
+                byte_offset(
+                    index
+                        .checked_mul(header_size)
+                        .ok_or(NtStatus::NAME_TOO_LONG)?,
+                )?,
+                record.as_bytes(),
+            )
+            .ok_or(NtStatus::ACCESS_VIOLATION)?;
+        write_utf16_nul_terminated::<Platform>(buffer, name_offset, &entry.name)?;
+        write_utf16_nul_terminated::<Platform>(buffer, type_offset, entry.type_name)?;
+        string_offset = type_offset
+            .checked_add(type_len)
+            .and_then(|offset| offset.checked_add(size_of::<u16>()))
+            .ok_or(NtStatus::NAME_TOO_LONG)?;
+    }
+
+    let terminator_offset = entries
+        .len()
+        .checked_mul(header_size)
+        .ok_or(NtStatus::NAME_TOO_LONG)?;
     buffer
-        .write_slice_at_offset(byte_offset(offset)?, record.as_bytes())
+        .write_slice_at_offset(
+            byte_offset(terminator_offset)?,
+            ObjectDirectoryInformation::zero().as_bytes(),
+        )
         .ok_or(NtStatus::ACCESS_VIOLATION)?;
-    offset
-        .checked_add(size_of::<ObjectDirectoryInformation>())
-        .ok_or(NtStatus::NAME_TOO_LONG)
+    Ok(())
 }
 
 fn probe_output_buffer<Platform: RawPointerProvider>(
@@ -629,11 +684,16 @@ fn probe_output_buffer<Platform: RawPointerProvider>(
     if buffer_length == 0 {
         return Ok(());
     }
-    let Some(bytes) = buffer.to_owned_slice(buffer_length) else {
-        return Err(NtStatus::ACCESS_VIOLATION);
-    };
+    let value = buffer.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION)?;
     buffer
-        .write_slice_at_offset(0, &bytes)
+        .write_at_offset(0, value)
+        .ok_or(NtStatus::ACCESS_VIOLATION)?;
+    let last_offset = byte_offset(buffer_length - 1)?;
+    let value = buffer
+        .read_at_offset(last_offset)
+        .ok_or(NtStatus::ACCESS_VIOLATION)?;
+    buffer
+        .write_at_offset(last_offset, value)
         .ok_or(NtStatus::ACCESS_VIOLATION)
 }
 
@@ -651,9 +711,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         handle: Handle,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
         let entry = self.directory_entry(handle)?;
-        // TODO: enforce DIRECTORY_TRAVERSE on root handles before resolving relative
-        // object-manager paths.
-        Ok(entry.with_entry(|entry| Arc::clone(&entry.directory)))
+        entry.with_entry(|entry| {
+            entry.granted_access.require(DirectoryAccess::TRAVERSE)?;
+            Ok(Arc::clone(&entry.directory))
+        })
     }
 
     pub(super) fn read_directory_object_attributes(
@@ -683,7 +744,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Ok((Some(object_attributes), None));
         }
 
-        let path = if object_attributes.root_directory.is_null() {
+        let original_path = if object_attributes.root_directory.is_null() {
             if !raw_name.starts_with('\\') {
                 return Err(NtStatus::OBJECT_PATH_SYNTAX_BAD);
             }
@@ -696,12 +757,18 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.directory_object_for_name_resolution(object_attributes.root_directory)?;
             join_directory_path(&root.path, &raw_name)
         };
-        if path.len() > 1 && path[1..].contains(r"\\") {
+        if original_path.len() > 1 && original_path[1..].contains(r"\\") {
             return Err(NtStatus::OBJECT_NAME_INVALID);
         }
         // The initial directory namespace follows the NT default of case-insensitive lookup.
-        let path = normalize_directory_path(&path);
-        Ok((Some(object_attributes), Some(DirectoryName { path })))
+        let path = normalize_directory_path(&original_path);
+        Ok((
+            Some(object_attributes),
+            Some(DirectoryName {
+                path,
+                original_path,
+            }),
+        ))
     }
 
     fn insert_directory_handle(
@@ -757,6 +824,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(directory_name) = directory_name {
             return self.process.directory_namespace.create_directory(
                 &directory_name.path,
+                &directory_name.original_path,
                 |directory| {
                     let Some(object_attributes) = object_attributes else {
                         return NtStatus::INVALID_PARAMETER;
@@ -786,7 +854,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
 
-        let directory = Arc::new(ObjectNode::new_directory(String::new(), None));
+        let directory = Arc::new(ObjectNode::new_directory(
+            String::new(),
+            None,
+            String::new(),
+        ));
         let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
             return NtStatus::QUOTA_EXCEEDED;
         };
@@ -893,13 +965,24 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::NO_MORE_ENTRIES;
         }
 
-        let first_required = match directory_record_size(&entries[start_index]) {
-            Ok(size) => size,
-            Err(status) => return status,
+        let end_for_required = if params.return_single_entry != 0 {
+            start_index + 1
+        } else {
+            entries.len()
         };
+        let total_required =
+            match directory_query_required_size(&entries[start_index..end_for_required]) {
+                Ok(size) => size,
+                Err(status) => return status,
+            };
+        let first_required =
+            match directory_query_required_size(core::slice::from_ref(&entries[start_index])) {
+                Ok(size) => size,
+                Err(status) => return status,
+            };
         if buffer_length < first_required {
             if let Some(return_length) = params.return_length {
-                let required = u32::try_from(first_required).map_err(|_| NtStatus::NAME_TOO_LONG);
+                let required = u32::try_from(total_required).map_err(|_| NtStatus::NAME_TOO_LONG);
                 let Ok(required) = required else {
                     return NtStatus::NAME_TOO_LONG;
                 };
@@ -907,51 +990,44 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return NtStatus::ACCESS_VIOLATION;
                 }
             }
-            return NtStatus::BUFFER_TOO_SMALL;
+            return if params.return_single_entry != 0 {
+                NtStatus::BUFFER_TOO_SMALL
+            } else {
+                NtStatus::MORE_ENTRIES
+            };
         }
 
         let buffer_base = params.buffer.as_usize();
         let mut next_index = start_index;
-        let mut bytes_written = 0usize;
+        let mut required_for_written = size_of::<ObjectDirectoryInformation>();
         while next_index < entries.len() {
             let entry_size = match directory_record_size(&entries[next_index]) {
                 Ok(size) => size,
                 Err(status) => return status,
             };
-            if bytes_written
+            if required_for_written
                 .checked_add(entry_size)
                 .is_none_or(|needed| needed > buffer_length)
             {
                 break;
             }
-            bytes_written = match write_directory_record::<Platform>(
-                params.buffer,
-                buffer_base,
-                bytes_written,
-                &entries[next_index],
-            ) {
-                Ok(bytes_written) => bytes_written,
-                Err(status) => return status,
-            };
+            required_for_written += entry_size;
             next_index += 1;
             if params.return_single_entry != 0 {
                 break;
             }
         }
 
+        if let Err(status) = write_directory_records::<Platform>(
+            params.buffer,
+            buffer_base,
+            &entries[start_index..next_index],
+        ) {
+            return status;
+        }
         let status = if next_index < entries.len() {
             NtStatus::MORE_ENTRIES
         } else {
-            if buffer_length
-                .checked_sub(bytes_written)
-                .is_some_and(|remaining| remaining >= size_of::<ObjectDirectoryInformation>())
-            {
-                bytes_written =
-                    match write_directory_terminator::<Platform>(params.buffer, bytes_written) {
-                        Ok(bytes_written) => bytes_written,
-                        Err(status) => return status,
-                    };
-            }
             NtStatus::SUCCESS
         };
 
@@ -960,7 +1036,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
         if let Some(return_length) = params.return_length {
-            let Ok(returned) = u32::try_from(bytes_written) else {
+            let Ok(returned) = u32::try_from(total_required) else {
                 return NtStatus::NAME_TOO_LONG;
             };
             if return_length.write_at_offset(0, returned).is_none() {
@@ -975,8 +1051,8 @@ pub(crate) fn seed_directory_namespace<Platform: crate::ShimPlatform>()
 -> crate::WindowsDirectoryNamespace<Platform> {
     let namespace = DirectoryNamespace::new();
     for path in SEEDED_DIRECTORY_PATHS {
-        let path = normalize_directory_path(path);
-        namespace.seed_directory(&path);
+        let normalized_path = normalize_directory_path(path);
+        namespace.seed_directory(&normalized_path, path);
     }
     namespace
 }
@@ -1049,9 +1125,21 @@ mod tests {
     fn read_directory_information(buffer: &[u8], offset: usize) -> ParsedDirectoryInformation {
         let buffer_base = buffer.as_ptr() as usize;
         let name_len = usize::from(read_u16(buffer, offset));
+        let name_max = usize::from(read_u16(buffer, offset + 2));
         let name_buffer = read_usize(buffer, offset + 8);
         let type_len = usize::from(read_u16(buffer, offset + 16));
+        let type_max = usize::from(read_u16(buffer, offset + 18));
         let type_buffer = read_usize(buffer, offset + 24);
+        assert_eq!(name_max, name_len + size_of::<u16>());
+        assert_eq!(type_max, type_len + size_of::<u16>());
+        let name_offset = name_buffer
+            .checked_sub(buffer_base)
+            .expect("name buffer points into output buffer");
+        let type_offset = type_buffer
+            .checked_sub(buffer_base)
+            .expect("type buffer points into output buffer");
+        assert_eq!(read_u16(buffer, name_offset + name_len), 0);
+        assert_eq!(read_u16(buffer, type_offset + type_len), 0);
         ParsedDirectoryInformation {
             name: read_utf16_string(buffer, buffer_base, name_buffer, name_len),
             type_name: read_utf16_string(buffer, buffer_base, type_buffer, type_len),
@@ -1107,7 +1195,17 @@ mod tests {
     fn expected_record_size(name: &str, type_name: &str) -> usize {
         size_of::<ObjectDirectoryInformation>()
             + name.encode_utf16().count() * size_of::<u16>()
+            + size_of::<u16>()
             + type_name.encode_utf16().count() * size_of::<u16>()
+            + size_of::<u16>()
+    }
+
+    fn expected_query_size(entries: &[(&str, &str)]) -> usize {
+        size_of::<ObjectDirectoryInformation>()
+            + entries
+                .iter()
+                .map(|(name, type_name)| expected_record_size(name, type_name))
+                .sum::<usize>()
     }
 
     #[test]
@@ -1243,6 +1341,50 @@ mod tests {
             );
             assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(created), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(root), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn relative_directory_name_requires_root_traverse_access() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let root_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let root_name = unicode_string(&root_units);
+            let root_attrs = object_attributes(&root_name, OBJ_CASE_INSENSITIVE);
+            let mut root = Handle::default();
+            assert_eq!(
+                task.sys_nt_open_directory_object(
+                    mut_ptr(&mut root),
+                    DIRECTORY_QUERY,
+                    Some(const_ptr(&root_attrs)),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let child_units: alloc::vec::Vec<u16> =
+                "LiteBoxTraverseDenied".encode_utf16().collect();
+            let child_name = unicode_string(&child_units);
+            let child_attrs = ObjectAttributes {
+                length: u32::try_from(size_of::<ObjectAttributes>()).expect("fits in ULONG"),
+                root_directory: root,
+                object_name: core::ptr::from_ref(&child_name) as usize,
+                attributes: OBJ_CASE_INSENSITIVE,
+                security_descriptor: 0,
+                security_quality_of_service: 0,
+            };
+            let mut child = Handle::default();
+            assert_eq!(
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut child),
+                    DIRECTORY_ALL_ACCESS,
+                    Some(const_ptr(&child_attrs)),
+                    Handle::default(),
+                    0,
+                ),
+                NtStatus::ACCESS_DENIED
+            );
+            assert_eq!(child, Handle::default());
             assert_eq!(task.sys_nt_close(root), NtStatus::SUCCESS);
         });
     }
@@ -1423,29 +1565,30 @@ mod tests {
             assert_eq!(
                 first_record,
                 ParsedDirectoryInformation {
-                    name: "liteboxenuma".to_string(),
+                    name: "LiteBoxEnumA".to_string(),
                     type_name: "Directory".to_string(),
                 }
             );
-            let second_offset = expected_record_size("liteboxenuma", "Directory");
+            let second_offset = size_of::<ObjectDirectoryInformation>();
             let second_record = read_directory_information(&buffer, second_offset);
             assert_eq!(
                 second_record,
                 ParsedDirectoryInformation {
-                    name: "liteboxenumb".to_string(),
+                    name: "LiteBoxEnumB".to_string(),
                     type_name: "Directory".to_string(),
                 }
             );
             assert_zero_directory_information(
                 &buffer,
-                second_offset + expected_record_size("liteboxenumb", "Directory"),
+                second_offset + size_of::<ObjectDirectoryInformation>(),
             );
             assert_eq!(context, 2);
             assert_eq!(
                 usize::try_from(return_length).unwrap(),
-                expected_record_size("liteboxenuma", "Directory")
-                    + expected_record_size("liteboxenumb", "Directory")
-                    + size_of::<ObjectDirectoryInformation>()
+                expected_query_size(&[
+                    ("LiteBoxEnumA", "Directory"),
+                    ("LiteBoxEnumB", "Directory")
+                ])
             );
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(second), NtStatus::SUCCESS);
@@ -1480,7 +1623,7 @@ mod tests {
             assert_eq!(
                 read_directory_information(&buffer, 0),
                 ParsedDirectoryInformation {
-                    name: "liteboxsinglea".to_string(),
+                    name: "LiteBoxSingleA".to_string(),
                     type_name: "Directory".to_string(),
                 }
             );
@@ -1502,14 +1645,11 @@ mod tests {
             assert_eq!(
                 read_directory_information(&buffer, 0),
                 ParsedDirectoryInformation {
-                    name: "liteboxsingleb".to_string(),
+                    name: "LiteBoxSingleB".to_string(),
                     type_name: "Directory".to_string(),
                 }
             );
-            assert_zero_directory_information(
-                &buffer,
-                expected_record_size("liteboxsingleb", "Directory"),
-            );
+            assert_zero_directory_information(&buffer, size_of::<ObjectDirectoryInformation>());
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(second), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(first), NtStatus::SUCCESS);
@@ -1536,12 +1676,12 @@ mod tests {
                     context: mut_ptr(&mut context),
                     return_length: Some(mut_ptr(&mut return_length)),
                 },),
-                NtStatus::BUFFER_TOO_SMALL
+                NtStatus::MORE_ENTRIES
             );
             assert_eq!(context, 99);
             assert_eq!(
                 usize::try_from(return_length).unwrap(),
-                expected_record_size("liteboxsmall", "Directory")
+                expected_query_size(&[("LiteBoxSmall", "Directory")])
             );
             assert_eq!(buffer, [0xffu8; 8]);
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
@@ -1624,10 +1764,14 @@ mod tests {
             let name = unicode_string(&name_units);
             let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
             let mut host_handle = core::ptr::null_mut();
+            // SAFETY: The object attributes and output handle point to live test
+            // stack values for the duration of the host ntdll call.
             let host_status = unsafe {
                 NtOpenDirectoryObject(&raw mut host_handle, DIRECTORY_QUERY, &raw const attrs)
             };
             if host_status == NtStatus::SUCCESS.as_raw() && !host_handle.is_null() {
+                // SAFETY: NtOpenDirectoryObject returned this non-null handle with
+                // STATUS_SUCCESS, so it is valid to close once here.
                 unsafe {
                     NtClose(host_handle);
                 }
