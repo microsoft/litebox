@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::event::wait::{WaitContext, Waker};
-use crate::platform::{RawMutex as RawMutexTrait, TimeProvider};
+use crate::platform::RawMutex as RawMutexTrait;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider, RwLock};
 use zerocopy::byteorder::{I32, LE, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -678,13 +678,6 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             // worker host stays alive for diagnostics.
             let Some(entry) = table.get_mut(&id) else {
                 drop(table);
-                #[cfg(feature = "std")]
-                {
-                    // Best-effort visibility; the registry is no_std but
-                    // litebox may be built with the `std` feature for
-                    // worker hosts. Either way, this branch should not
-                    // be taken in correct operation.
-                }
                 before_notify(None);
                 return None;
             };

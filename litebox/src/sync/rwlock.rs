@@ -619,6 +619,13 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
             .ensure_registered(LockType::RwLock, || &raw const self.raw.state);
 
         #[cfg(feature = "lock_tracing")]
+        super::lock_tracing::LockTracker::panic_on_reentrant_lock_attempt(
+            LockType::RwLockRead,
+            &raw const self.raw.state,
+            &self.creation,
+        );
+
+        #[cfg(feature = "lock_tracing")]
         let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
             LockType::RwLockRead,
             &raw const self.raw.state,
@@ -637,6 +644,13 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
         #[cfg(feature = "lock_tracing")]
         self.creation
             .ensure_registered(LockType::RwLock, || &raw const self.raw.state);
+
+        #[cfg(feature = "lock_tracing")]
+        super::lock_tracing::LockTracker::panic_on_reentrant_lock_attempt(
+            LockType::RwLockWrite,
+            &raw const self.raw.state,
+            &self.creation,
+        );
 
         #[cfg(feature = "lock_tracing")]
         let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
@@ -709,3 +723,112 @@ unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for RwLock<Platfo
 // writer can transfer `T` between threads, but the `Sync` bound is necessary,
 // too, since readers on multiple threads can share `T` simultaneously.
 unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + Sync> Sync for RwLock<Platform, T> {}
+
+#[cfg(all(test, feature = "lock_tracing"))]
+mod tests {
+    extern crate std;
+
+    use std::any::Any;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::string::String;
+    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
+
+    use crate::platform::mock::MockPlatform;
+    use crate::sync::lock_tracing::LockTracker;
+
+    use super::RwLock;
+
+    type TestRwLock<T> = RwLock<MockPlatform, T>;
+
+    fn init_lock_tracing() {
+        LockTracker::init(MockPlatform::new());
+    }
+
+    fn serialize_lock_tracing_tests() -> StdMutexGuard<'static, ()> {
+        static TEST_MUTEX: StdMutex<()> = StdMutex::new(());
+        TEST_MUTEX.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn assert_reentrant_rwlock_panic(payload: &(dyn Any + Send)) {
+        let message = if let Some(message) = payload.downcast_ref::<&'static str>() {
+            *message
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.as_str()
+        } else {
+            panic!("re-entrant RwLock panic should use a string payload");
+        };
+
+        assert!(
+            message.contains("Re-entrant RwLock acquisition would deadlock"),
+            "unexpected panic message: {message}",
+        );
+        assert!(
+            message.contains("lock created at "),
+            "panic should locate the lock creation site: {message}",
+        );
+        assert!(
+            message.contains("current acquisition "),
+            "panic should locate the current acquisition site: {message}",
+        );
+    }
+
+    #[test]
+    fn lock_tracing_panics_on_same_thread_reentrant_read() {
+        let _test_guard = serialize_lock_tracing_tests();
+        init_lock_tracing();
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let lock = TestRwLock::new(());
+            let _first_read = lock.read();
+            let _second_read = lock.read();
+        }))
+        .expect_err("re-entrant read of the same RwLock should panic");
+
+        assert_reentrant_rwlock_panic(payload.as_ref());
+    }
+
+    #[test]
+    fn lock_tracing_allows_same_thread_reads_of_different_rwlocks() {
+        let _test_guard = serialize_lock_tracing_tests();
+        init_lock_tracing();
+
+        let first = TestRwLock::new(1);
+        let second = TestRwLock::new(2);
+        let _first_read = first.read();
+        let _second_read = second.read();
+    }
+
+    #[test]
+    fn lock_tracing_panics_on_write_while_holding_read() {
+        let _test_guard = serialize_lock_tracing_tests();
+        init_lock_tracing();
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let lock = TestRwLock::new(());
+            let _read = lock.read();
+            let _write = lock.write();
+        }))
+        .expect_err("write acquisition while holding the same RwLock should panic");
+
+        assert_reentrant_rwlock_panic(payload.as_ref());
+    }
+
+    fn descriptor_table_lookup(lock: &TestRwLock<u32>) {
+        let _nested_read = lock.read();
+    }
+
+    #[test]
+    fn lock_tracing_catches_nested_descriptor_table_read_repro() {
+        let _test_guard = serialize_lock_tracing_tests();
+        init_lock_tracing();
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let descriptor_table = TestRwLock::new(0);
+            let _descriptor_table_read = descriptor_table.read();
+            descriptor_table_lookup(&descriptor_table);
+        }))
+        .expect_err("nested descriptor table read should panic under lock tracing");
+
+        assert_reentrant_rwlock_panic(payload.as_ref());
+    }
+}

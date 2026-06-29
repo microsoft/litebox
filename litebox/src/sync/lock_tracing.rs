@@ -48,6 +48,15 @@ const CONFIG_MAX_NUMBER_OF_TRACKED_LOCKS: usize = 512;
 /// bracketing discipline has not been satisfied.
 const CONFIG_PANIC_ON_NON_BRACKETED_UNLOCK: bool = false;
 
+/// Panic if an RwLock acquisition would re-enter the same underlying RwLock on
+/// the current lock-tracked thread in a way that can self-deadlock.
+///
+/// This is intentionally enabled whenever `lock_tracing` is enabled: normal
+/// builds compile this module out entirely, while lock-tracing CI should turn
+/// probabilistic writer-preferring RwLock self-deadlocks into deterministic,
+/// located panics.
+const CONFIG_PANIC_ON_REENTRANT_LOCK: bool = true;
+
 /// Print the actual remaining locks if true; otherwise only print the specific lock that was locked
 /// or unlocked.
 const CONFIG_PRINT_REMAINING: bool = false;
@@ -214,6 +223,19 @@ impl Locked {
                 LockType::RwLockRead | LockType::RwLockWrite,
             ) | (LockType::Mutex, LockType::Mutex)
         )
+    }
+
+    fn rwlock_reentrant_attempt_would_deadlock(&self, attempt: &Self) -> bool {
+        if !self.is_same_underlying_lock(attempt) {
+            return false;
+        }
+
+        let held_read = self.lock_type == LockType::RwLockRead;
+        let held_write = self.lock_type == LockType::RwLockWrite;
+        let attempting_read = attempt.lock_type == LockType::RwLockRead;
+        let attempting_write = attempt.lock_type == LockType::RwLockWrite;
+
+        (held_read && attempting_read) || ((held_read || held_write) && attempting_write)
     }
 }
 
@@ -515,6 +537,27 @@ impl LockTracker {
     pub(crate) fn init<Platform: RawSyncPrimitivesProvider>(platform: &'static Platform) {
         LOCK_TRACKER.call_once(|| Self::new(platform));
     }
+
+    /// Panic if the current lock attempt would re-enter the same underlying
+    /// RwLock in a pattern known to self-deadlock.
+    ///
+    /// This check must run before blocking in the raw lock operation.
+    #[track_caller]
+    pub(crate) fn panic_on_reentrant_lock_attempt<T>(
+        lock_type: LockType,
+        lock_addr: *const T,
+        creation: &Creation,
+    ) {
+        if !CONFIG_PANIC_ON_REENTRANT_LOCK {
+            return;
+        }
+
+        let Some(l_tracker) = LockTracker::global() else {
+            return;
+        };
+
+        LockTrackerX::panic_on_reentrant_lock_attempt(l_tracker, lock_type, lock_addr, creation);
+    }
 }
 
 static LOCK_TRACKER: spin::Once<LockTracker> = spin::Once::new();
@@ -626,6 +669,32 @@ impl LockTracker {
 }
 
 impl LockTrackerX {
+    #[track_caller]
+    fn panic_on_reentrant_lock_attempt<T>(
+        l_tracker: &'static LockTracker,
+        lock_type: LockType,
+        lock_addr: *const T,
+        creation: &Creation,
+    ) {
+        let attempted = Locked {
+            lock_type,
+            lock_addr: lock_addr as usize,
+            location: core::panic::Location::caller().into(),
+        };
+        let tracker = l_tracker.x.lock();
+        if let Some(held) = tracker
+            .held
+            .iter()
+            .flatten()
+            .find(|held| held.rwlock_reentrant_attempt_would_deadlock(&attempted))
+        {
+            panic!(
+                "Re-entrant RwLock acquisition would deadlock: lock created at {}:{}; current acquisition {attempted}; already held as {held}",
+                creation.file, creation.line,
+            );
+        }
+    }
+
     /// Access this via [`LockTracker::begin_lock_attempt`]
     #[must_use]
     #[track_caller]
