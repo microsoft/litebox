@@ -207,7 +207,12 @@ pub fn handle_optee_smc_args(
         OpteeSmcFunction::CallWithArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
             let msg_args_addr: usize = msg_args_addr.trunc();
-            let (msg_args, _) = read_optee_msg_args_from_phys(msg_args_addr, false)?;
+            // Serialize the packed-page read against a concurrent write-back. See
+            // `packed_msg_args_lock`.
+            let (msg_args, _) = {
+                let _packed_guard = packed_msg_args_lock();
+                read_optee_msg_args_from_phys(msg_args_addr, false)?
+            };
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
                 rpc_args: None,
@@ -217,7 +222,10 @@ pub fn handle_optee_smc_args(
         OpteeSmcFunction::CallWithRpcArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
             let msg_args_addr: usize = msg_args_addr.trunc();
-            let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
+            let (msg_args, rpc_args) = {
+                let _packed_guard = packed_msg_args_lock();
+                read_optee_msg_args_from_phys(msg_args_addr, true)?
+            };
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
                 rpc_args,
@@ -237,7 +245,12 @@ pub fn handle_optee_smc_args(
                 main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.trunc());
 
             let mut blob = alloc::vec![0u8; copy_size];
-            shm_info.read_at(offset, &mut blob)?;
+            // Serialize the packed-page read against a concurrent write-back. See
+            // `packed_msg_args_lock`.
+            {
+                let _packed_guard = packed_msg_args_lock();
+                shm_info.read_at(offset, &mut blob)?;
+            }
             let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
 
             // Compute the physical address of `OpteeMsgArgs`
@@ -381,6 +394,25 @@ pub struct TaRequestInfo<const ALIGN: usize> {
     pub cmd_id: u32,
     pub params: [UteeParamOwned; UteeParamOwned::TEE_NUM_PARAMS],
     pub out_shm_info: [Option<ShmInfo<ALIGN>>; UteeParamOwned::TEE_NUM_PARAMS],
+}
+
+/// Acquire the lock serializing packed-`OpteeMsgArgs` page access on the base page table.
+///
+/// The OP-TEE driver packs multiple requests into sub-page slots of one frame which can be
+/// concurrently access by multiple cores which are on the base page table. Since LiteBox
+/// currently doesn't support shared mapping, it uses this lock to serialize the concurrent
+/// access. Note that cores on different task page tables (i.e., instances) do not need to
+/// acquire this lock since they maintain their own mappings.
+///
+/// Hold the guard only across the packed-page read/write.
+///
+/// TODO: This is a temporary mitigation. It should be replaced by a more fundamental
+/// approach such as shared mapping support, physical address range reservation, and/or
+/// sub-page access control.
+#[must_use]
+pub fn packed_msg_args_lock() -> spin::mutex::SpinMutexGuard<'static, ()> {
+    static PACKED_MSG_ARGS_LOCK: spin::mutex::SpinMutex<()> = spin::mutex::SpinMutex::new(());
+    PACKED_MSG_ARGS_LOCK.lock()
 }
 
 /// This function decodes a TA request contained in `OpteeMsgArgs`.
