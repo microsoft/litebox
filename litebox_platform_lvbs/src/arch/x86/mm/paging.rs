@@ -35,6 +35,29 @@ use crate::mm::{
 #[cfg(not(test))]
 const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
 
+/// Bit position of the PML4 (level-4) index within a virtual address, for
+/// x86-64 4-level paging: 12 page-offset bits + 9 bits each for P1-P3.
+const PML4_SHIFT: u32 = 39;
+
+/// Mask for a 9-bit page-table index (512 entries per table).
+const PML4_INDEX_MASK: u64 = 0x1FF;
+
+/// Number of bytes of virtual address space covered by one PML4 slot (512 GiB).
+const PML4_SLOT_SIZE: u64 = 1 << PML4_SHIFT;
+
+/// PML4 index of the first VTL1-kernel slot (`PA + KERNEL_OFFSET`).
+///
+/// Only slots `>= KERNEL_PML4_START` are safe to share between page tables:
+/// their intermediate tables (P3/P2/P1) are fixed after boot, so sharing them
+/// is read-only. Lower slots (user, direct-map, vmap) get intermediate tables
+/// allocated and freed at runtime on whichever page table is active. Sharing
+/// those would let a task mutate the base's intermediate tables (and make
+/// frame ownership ambiguous at teardown), so each page table must own them.
+///
+/// `KERNEL_OFFSET` is `PML4_SLOT_SIZE` aligned, so this is an exact cutoff.
+pub(crate) const KERNEL_PML4_START: usize =
+    ((crate::KERNEL_OFFSET >> PML4_SHIFT) & PML4_INDEX_MASK) as usize;
+
 /// Flush TLB entries for a contiguous page range across all cores.
 ///
 /// Uses Hyper-V hypercalls so that remote cores sharing the same page table
@@ -271,8 +294,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
-    /// Clean up intermediate page table frames (P1-P3) for a task page table
-    /// that is being destroyed.
+    /// Clean up task-owned intermediate page table frames (P1-P3) for a task
+    /// page table that is being destroyed.
     ///
     /// # Safety
     ///
@@ -280,13 +303,19 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// - All user data frames have been released before calling this function (e.g., using `PageManager::release_memory()`)
     /// - The page table is no longer active (not loaded in CR3)
     pub(crate) unsafe fn cleanup_page_table_frames(&self) {
-        use x86_64::structures::paging::mapper::CleanUp;
-
-        // Clean up all empty P1 - P3 tables
         let mut allocator = PageTableAllocator::<M>::new();
+        // Task-owned slots span the VA below the kernel region, i.e.,
+        // `0 ..= KERNEL_PML4_START * PML4_SLOT_SIZE - 1`. The kernel region at
+        // and above `KERNEL_PML4_START` is base-owned/shared.
+        let start = Page::<Size4KiB>::from_start_address(VirtAddr::new(0)).unwrap();
+        let end = Page::<Size4KiB>::containing_address(VirtAddr::new(
+            KERNEL_PML4_START as u64 * PML4_SLOT_SIZE - 1,
+        ));
         // Safety: The page table is being destroyed and will not be reused.
         unsafe {
-            self.inner.lock().clean_up(&mut allocator);
+            self.inner
+                .lock()
+                .clean_up_addr_range(Page::range_inclusive(start, end), &mut allocator);
         }
     }
 
@@ -612,7 +641,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             } else {
                 flags
             };
-            let table_flags = page_flags - PageTableFlags::NO_EXECUTE; // parent entries should not have NO_EXECUTE
+            // Parent entries use a stable permissive constant, not leaf-derived flags.
+            let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
             match unsafe {
                 inner.map_to_with_table_flags(
@@ -755,14 +785,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         unsafe { Self::init(frame.start_address()) }
     }
 
-    /// Copy all non-zero PML4 entries from `source` into this page table.
+    /// Share the VTL1-kernel P3/P2/P1 tables from `source` by copying its
+    /// kernel PML4 entries (slots `>= KERNEL_PML4_START`), avoiding per-task
+    /// allocation of the kernel intermediate frames. Lower slots (user,
+    /// direct-map, vmap) are deliberately not shared; see [`KERNEL_PML4_START`].
     ///
-    /// This is used to share kernel page table structures (P3/P2/P1) between
-    /// the base page table and task page tables, avoiding per-task allocation
-    /// of intermediate page table frames for the kernel region.
-    ///
-    /// Only entries that are present in `source` and absent in `self` are copied.
-    /// Entries already present in `self` are left unchanged.
+    /// Only entries present in `source` and absent in `self` are copied.
     pub(crate) fn copy_pml4_entries_from(&self, source: &Self) {
         let mut dst = self.inner.lock();
         let src = source.inner.lock();
@@ -770,29 +798,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             .level_4_table_mut()
             .iter_mut()
             .zip(src.level_4_table().iter())
+            .skip(KERNEL_PML4_START)
         {
             if !src_entry.is_unused() && dst_entry.is_unused() {
                 dst_entry.set_addr(src_entry.addr(), src_entry.flags());
-            }
-        }
-    }
-
-    /// Clear PML4 entries that are shared with the base page table.
-    ///
-    /// This must be called before `cleanup_page_table_frames` / `drop` to
-    /// prevent the task page table from freeing P3/P2/P1 frames that are
-    /// owned by the base page table.
-    pub(crate) fn clear_shared_pml4_entries(&self, base: &Self) {
-        let mut dst = self.inner.lock();
-        let src = base.inner.lock();
-        for (dst_entry, src_entry) in dst
-            .level_4_table_mut()
-            .iter_mut()
-            .zip(src.level_4_table().iter())
-        {
-            // If the entry points to the same P3 frame as the base, it is shared.
-            if !src_entry.is_unused() && dst_entry.addr() == src_entry.addr() {
-                dst_entry.set_unused();
             }
         }
     }
