@@ -457,6 +457,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "/usr/lib/x86_64-linux-gnu/libselinux.so.1",
                         "/usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.11.2",
                         "/usr/lib/x86_64-linux-gnu/libtinfo.so.6.4",
+                        // Transitive deps of the coreutils below
+                        // (libacl/libcrypto via ldd) — flagged by
+                        // CF.pipe4_* cold runs.
+                        "/usr/lib/x86_64-linux-gnu/libacl.so.1.1.2302",
+                        "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+                        // Remaining coreutils/findutils that fork/exec
+                        // matrix, concurrent-fork, script, and stat tests
+                        // exec (CF.*, BASH.*, XM.*, XB.*, SC.*, S.*,
+                        // PROC.*). Without these their cold first run
+                        // triggers a runtime rewrite that the harness
+                        // flags. All ship in the docker image so their
+                        // mtime is stable across containers.
+                        "/usr/bin/ls",
+                        "/usr/bin/dd",
+                        "/usr/bin/wc",
+                        "/usr/bin/env",
+                        "/usr/bin/chmod",
+                        "/usr/bin/readlink",
+                        "/usr/bin/sed",
+                        "/usr/bin/sort",
+                        "/usr/bin/rm",
+                        "/usr/bin/sleep",
+                        "/usr/bin/xargs",
+                        "/usr/bin/mkdir",
+                        "/usr/bin/touch",
+                        "/usr/bin/cp",
+                        "/usr/bin/mv",
+                        "/usr/bin/ln",
+                        "/usr/bin/date",
+                        "/usr/bin/mktemp",
+                        "/usr/bin/basename",
+                        "/usr/bin/dirname",
+                        "/usr/bin/seq",
+                        "/usr/bin/hostname",
+                        "/usr/bin/uname",
+                        // NSS/resolver shared libs glibc dlopens for
+                        // hostname lookup — networking tests (NA.*, XW3.*,
+                        // CF.rwlock_multi linking librt) rewrite these on
+                        // first connect.
+                        "/usr/lib/x86_64-linux-gnu/libnss_dns.so.2",
+                        "/usr/lib/x86_64-linux-gnu/libnss_files.so.2",
+                        "/usr/lib/x86_64-linux-gnu/libresolv.so.2",
+                        "/usr/lib/x86_64-linux-gnu/librt.so.1",
                         // Node.js (bundled with the litebox-test image
                         // and several integration scenarios that exec
                         // it: EX6-9 in `coordinator/special_cases/exit.rs`,
