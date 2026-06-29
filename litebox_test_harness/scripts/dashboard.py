@@ -2778,10 +2778,16 @@ def cmd_auto(args: argparse.Namespace) -> int:
     # exact-matches `commit_sha` (so the numbers stayed truthful for
     # the *displayed* sha while the displayed sha was itself stale).
     # The thread re-renders against the live DB every
-    # FRESHNESS_INTERVAL_SECS regardless of cycle phase. Rendering
-    # is ~50 ms against the current store, so this is essentially
-    # free compared to a cargo cycle.
-    FRESHNESS_INTERVAL_SECS = 30
+    # FRESHNESS_INTERVAL_SECS regardless of cycle phase. Rendering was
+    # ~50 ms on a small store but the `state_test_pass` materialization
+    # grows with `run_results`; at >1M rows a render is ~25 s, so a 30 s
+    # cadence pegged the supervisor (~85% duty) and starved the cargo
+    # cycles → they hit their deadline and got reaped. 300 s keeps the
+    # displayed HEAD acceptably fresh during long cycles while the render
+    # cost stays a single-digit-% duty. The main cargo cycle also
+    # renders at its boundaries, so the displayed numbers still settle
+    # quickly after a cycle. 300 s frees ~80% of a core for the cargos.
+    FRESHNESS_INTERVAL_SECS = 300
     freshness_stop = threading.Event()
 
     def _freshness_loop() -> None:
