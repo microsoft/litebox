@@ -10,7 +10,7 @@
 //! I/O manager hands the remaining path to a filesystem driver.
 //!
 //! This subset keeps the object namespace in a purpose-built in-memory tree
-//! keyed by normalized path components. That makes the NT rule structural: a
+//! keyed by case-insensitive path components. That makes the NT rule structural: a
 //! named node can exist only if every ancestor exists, so the component walk
 //! distinguishes a missing leaf from an earlier path-component miss in
 //! `NtOpenDirectoryObject`.
@@ -26,6 +26,8 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString as _};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::cmp::Ordering;
+use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::mem::size_of;
 
@@ -141,11 +143,53 @@ pub(crate) struct DirectoryNamespace<Platform: crate::ShimPlatform> {
 
 enum NamedObject<Platform: crate::ShimPlatform> {
     Directory {
-        children: BTreeMap<String, Arc<ObjectNode<Platform>>>,
+        children: BTreeMap<ObjectName, Arc<ObjectNode<Platform>>>,
     },
     Symlink {
         target: String,
     },
+}
+
+#[derive(Clone, Debug)]
+struct ObjectName(String);
+
+impl ObjectName {
+    // ReactOS and Wine keep the creator's object name but compare through a
+    // case-insensitive object-manager lookup key.
+    fn new(name: &str) -> Self {
+        Self(name.to_string())
+    }
+}
+
+impl PartialEq for ObjectName {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+
+impl Eq for ObjectName {}
+
+impl PartialOrd for ObjectName {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ObjectName {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .cmp(other.0.bytes().map(|byte| byte.to_ascii_lowercase()))
+    }
+}
+
+impl Hash for ObjectName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for byte in self.0.bytes() {
+            byte.to_ascii_lowercase().hash(state);
+        }
+    }
 }
 
 #[repr(C)]
@@ -228,7 +272,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
 
     fn child(&self, name: &str) -> Option<Arc<Self>> {
         match &*self.body.read() {
-            NamedObject::Directory { children } => children.get(name).cloned(),
+            NamedObject::Directory { children } => children.get(&ObjectName::new(name)).cloned(),
             NamedObject::Symlink { .. } => None,
         }
     }
@@ -297,13 +341,11 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     fn create_directory(
         &self,
         path: &str,
-        original_path: &str,
         on_exists: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
         on_created: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
     ) -> NtStatus {
         self.create_child(
             path,
-            original_path,
             ObjectNode::is_directory,
             ObjectNode::new_directory,
             on_exists,
@@ -314,14 +356,12 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     pub(super) fn create_symlink(
         &self,
         path: &str,
-        original_path: &str,
         target: String,
         on_exists: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
         on_created: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
     ) -> NtStatus {
         self.create_child(
             path,
-            original_path,
             ObjectNode::is_symlink,
             |path, parent, name| ObjectNode::new_symlink(path, parent, name, target),
             on_exists,
@@ -332,7 +372,6 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     fn create_child(
         &self,
         path: &str,
-        original_path: &str,
         existing_matches: impl Fn(&ObjectNode<Platform>) -> bool,
         construct: impl FnOnce(
             String,
@@ -349,23 +388,12 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         if tail.is_empty() {
             return on_exists(Arc::clone(&self.root));
         }
-        let original_tail = match absolute_path_tail(original_path) {
-            Ok(tail) => tail,
-            Err(status) => return status,
-        };
 
         let (parent_tail, leaf_name) = match tail.rsplit_once('\\') {
             Some((parent, leaf)) => (parent, leaf),
             None => ("", tail),
         };
-        let display_leaf_name = match original_tail.rsplit_once('\\') {
-            Some((_, leaf)) => leaf,
-            None => original_tail,
-        };
         if leaf_name.is_empty() {
-            return NtStatus::OBJECT_NAME_INVALID;
-        }
-        if display_leaf_name.is_empty() {
             return NtStatus::OBJECT_NAME_INVALID;
         }
 
@@ -377,7 +405,8 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         let NamedObject::Directory { children } = &mut *body else {
             return NtStatus::OBJECT_TYPE_MISMATCH;
         };
-        if let Some(existing) = children.get(leaf_name) {
+        let leaf_key = ObjectName::new(leaf_name);
+        if let Some(existing) = children.get(&leaf_key) {
             if !existing_matches(existing) {
                 return NtStatus::OBJECT_TYPE_MISMATCH;
             }
@@ -387,12 +416,12 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         let node = Arc::new(construct(
             join_directory_path(&parent.path, leaf_name),
             Some(Arc::downgrade(&parent)),
-            display_leaf_name.to_string(),
+            leaf_name.to_string(),
         ));
         debug_assert!(node.parent().is_some());
         let status = on_created(Arc::clone(&node));
         if status == NtStatus::SUCCESS {
-            children.insert(leaf_name.to_string(), node);
+            children.insert(leaf_key, node);
         }
         status
     }
@@ -411,13 +440,8 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         }
     }
 
-    fn seed_directory(&self, path: &str, original_path: &str) {
-        let status = self.create_directory(
-            path,
-            original_path,
-            |_| NtStatus::SUCCESS,
-            |_| NtStatus::SUCCESS,
-        );
+    fn seed_directory(&self, path: &str) {
+        let status = self.create_directory(path, |_| NtStatus::SUCCESS, |_| NtStatus::SUCCESS);
         assert!(
             status == NtStatus::SUCCESS,
             "seeded NT object directory must have seeded ancestors: {status:?}"
@@ -489,15 +513,15 @@ enum TailResolution<Platform: crate::ShimPlatform> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DirectoryName {
-    pub(super) path: String,
     pub(super) original_path: String,
 }
 
-fn normalize_directory_path(path: &str) -> String {
+fn trim_trailing_directory_path(path: &str) -> &str {
     if path == r"\" {
-        return r"\".to_string();
+        path
+    } else {
+        path.trim_end_matches('\\')
     }
-    path.trim_end_matches('\\').to_ascii_lowercase()
 }
 
 fn normalize_reparse_target(path: &str) -> Result<String, NtStatus> {
@@ -507,10 +531,11 @@ fn normalize_reparse_target(path: &str) -> Result<String, NtStatus> {
     if path.len() > 1 && path[1..].contains(r"\\") {
         return Err(NtStatus::OBJECT_NAME_INVALID);
     }
-    Ok(normalize_directory_path(path))
+    Ok(trim_trailing_directory_path(path).to_string())
 }
 
 fn absolute_path_tail(path: &str) -> Result<&str, NtStatus> {
+    let path = trim_trailing_directory_path(path);
     if path == r"\" {
         return Ok("");
     }
@@ -763,14 +788,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if original_path.len() > 1 && original_path[1..].contains(r"\\") {
             return Err(NtStatus::OBJECT_NAME_INVALID);
         }
-        // The initial directory namespace follows the NT default of case-insensitive lookup.
-        let path = normalize_directory_path(&original_path);
         Ok((
             Some(object_attributes),
-            Some(DirectoryName {
-                path,
-                original_path,
-            }),
+            Some(DirectoryName { original_path }),
         ))
     }
 
@@ -829,7 +849,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         if let Some(directory_name) = directory_name {
             return self.process.directory_namespace.create_directory(
-                &directory_name.path,
                 &directory_name.original_path,
                 |directory| {
                     let Some(object_attributes) = object_attributes else {
@@ -899,7 +918,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             match self
                 .process
                 .directory_namespace
-                .resolve_directory(&directory_name.path)
+                .resolve_directory(&directory_name.original_path)
             {
                 Ok(directory) => directory,
                 Err(status) => return status,
@@ -916,7 +935,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
         litebox_util_log::debug!(
-            object_name:% = directory_name.path.as_str(),
+            object_name:% = directory_name.original_path.as_str(),
             desired_access:% = format_args!("{desired_access:#x}");
             "Handled NtOpenDirectoryObject syscall"
         );
@@ -1057,8 +1076,7 @@ pub(crate) fn seed_directory_namespace<Platform: crate::ShimPlatform>()
 -> crate::WindowsDirectoryNamespace<Platform> {
     let namespace = DirectoryNamespace::new();
     for path in SEEDED_DIRECTORY_PATHS {
-        let normalized_path = normalize_directory_path(path);
-        namespace.seed_directory(&normalized_path, path);
+        namespace.seed_directory(path);
     }
     namespace
 }
@@ -1427,6 +1445,91 @@ mod tests {
             assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(created), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(root), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn directory_lookup_is_case_insensitive_and_case_preserving() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let mixed = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxCaseMixed");
+            let lower_open = open_named_directory(&task, r"\basenamedobjects\liteboxcasemixed");
+            let trailing_open = open_named_directory(&task, r"\BaseNamedObjects\LiteBoxCaseMixed\");
+            let lower_created =
+                create_named_directory(&task, r"\BaseNamedObjects\liteboxcaselower");
+            let upper_open = open_named_directory(&task, r"\BASENAMEDOBJECTS\LITEBOXCASELOWER");
+
+            let duplicate_units: alloc::vec::Vec<u16> = r"\basenamedobjects\liteboxcasemixed\"
+                .encode_utf16()
+                .collect();
+            let duplicate_name = unicode_string(&duplicate_units);
+            let duplicate_attrs = object_attributes(&duplicate_name, OBJ_CASE_INSENSITIVE);
+            let mut duplicate = Handle::default();
+            assert_eq!(
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut duplicate),
+                    DIRECTORY_ALL_ACCESS,
+                    Some(const_ptr(&duplicate_attrs)),
+                    Handle::default(),
+                    0,
+                ),
+                NtStatus::OBJECT_NAME_COLLISION
+            );
+            assert_eq!(duplicate, Handle::default());
+
+            let parent = open_named_directory(&task, r"\BaseNamedObjects");
+            let mut buffer = [0u8; 512];
+            let mut context = 0u32;
+            let mut return_length = 0u32;
+            assert_eq!(
+                task.sys_nt_query_directory_object(DirectoryQueryParameters {
+                    directory_handle: parent,
+                    buffer: mut_ptr(&mut buffer[0]),
+                    buffer_length: u32::try_from(buffer.len()).expect("test buffer fits in ULONG"),
+                    return_single_entry: 0,
+                    restart_scan: 1,
+                    context: mut_ptr(&mut context),
+                    return_length: Some(mut_ptr(&mut return_length)),
+                }),
+                NtStatus::SUCCESS
+            );
+
+            let first_record = read_directory_information(&buffer, 0);
+            assert_eq!(
+                first_record,
+                ParsedDirectoryInformation {
+                    name: "liteboxcaselower".to_string(),
+                    type_name: "Directory".to_string(),
+                }
+            );
+            let second_offset = size_of::<ObjectDirectoryInformation>();
+            let second_record = read_directory_information(&buffer, second_offset);
+            assert_eq!(
+                second_record,
+                ParsedDirectoryInformation {
+                    name: "LiteBoxCaseMixed".to_string(),
+                    type_name: "Directory".to_string(),
+                }
+            );
+            assert_zero_directory_information(
+                &buffer,
+                second_offset + size_of::<ObjectDirectoryInformation>(),
+            );
+            assert_eq!(context, 2);
+            assert_eq!(
+                usize::try_from(return_length).unwrap(),
+                expected_query_size(&[
+                    ("liteboxcaselower", "Directory"),
+                    ("LiteBoxCaseMixed", "Directory")
+                ])
+            );
+
+            assert_eq!(task.sys_nt_close(parent), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(upper_open), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(lower_created), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(trailing_open), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(lower_open), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(mixed), NtStatus::SUCCESS);
         });
     }
 

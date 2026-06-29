@@ -164,7 +164,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         open_if: bool,
     ) -> NtStatus {
         self.process.directory_namespace.create_symlink(
-            &link_name.path,
             &link_name.original_path,
             target,
             |link| {
@@ -211,7 +210,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let link = match self
             .process
             .directory_namespace
-            .resolve_symlink(&link_name.path, true)
+            .resolve_symlink(&link_name.original_path, true)
         {
             Ok(link) => link,
             Err(status) => return status,
