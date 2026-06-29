@@ -15,16 +15,12 @@ use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
 
-use crate::nt_types::{ObjectAttributes, UnicodeString};
+use crate::nt_types::{ObjectAttributes, ObjectAttributesFlags, UnicodeString};
 use crate::syscalls::Handle;
 use crate::{
     ConstPtr, DefaultFS, GlobalState, MutPtr, Process, Task, WindowsHandleStore,
     WindowsNlsSectionMappings, WindowsPageManager,
 };
-
-pub(crate) const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
-pub(crate) const OBJ_OPENIF: u32 = 0x0000_0080;
-pub(crate) const OBJ_OPENLINK: u32 = 0x0000_0100;
 
 #[cfg(target_os = "linux")]
 pub(crate) type TestPlatform = litebox_platform_linux_userland::LinuxUserland;

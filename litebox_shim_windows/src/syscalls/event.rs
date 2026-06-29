@@ -537,10 +537,9 @@ mod tests {
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
-    use crate::nt_types::ObjectAttributes;
+    use crate::nt_types::{ObjectAttributes, ObjectAttributesFlags};
     use crate::tests::{
-        OBJ_CASE_INSENSITIVE, OBJ_OPENIF, const_ptr, mut_ptr, object_attributes, test_task,
-        unicode_string, utf16_units,
+        const_ptr, mut_ptr, object_attributes, test_task, unicode_string, utf16_units,
     };
 
     const EVENT_QUERY_STATE: u32 = 0x0001;
@@ -746,7 +745,7 @@ mod tests {
         let task = test_task();
         let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxEvent");
         let name = unicode_string(&name_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
 
         let mut created = Handle::default();
         assert_eq!(
@@ -821,9 +820,10 @@ mod tests {
         let task = test_task();
         let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxOpenIf");
         let name = unicode_string(&name_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
         let openif_attrs = ObjectAttributes {
-            attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+            attributes: (ObjectAttributesFlags::CASE_INSENSITIVE | ObjectAttributesFlags::OPENIF)
+                .bits(),
             ..attrs
         };
 
@@ -1135,7 +1135,8 @@ mod tests {
                 &unique,
             ));
             let name = unicode_string(&name_units);
-            let attributes = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attributes =
+                object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
 
             let mut host_created = core::ptr::null_mut();
             let mut host_opened = core::ptr::null_mut();

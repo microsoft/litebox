@@ -1077,10 +1077,10 @@ mod tests {
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
-    use crate::nt_types::ObjectAttributes;
+    use crate::nt_types::{ObjectAttributes, ObjectAttributesFlags};
     use crate::tests::{
-        OBJ_CASE_INSENSITIVE, OBJ_OPENIF, OBJ_OPENLINK, TestPlatform, const_ptr, mut_ptr,
-        null_mut_ptr, object_attributes, test_task, unicode_string, utf16_units,
+        TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes, test_task,
+        unicode_string, utf16_units,
     };
 
     const DIRECTORY_QUERY: u32 = 0x0000_0001;
@@ -1171,7 +1171,7 @@ mod tests {
     ) -> Handle {
         let name_units = utf16_units(path);
         let name = unicode_string(&name_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
         let mut handle = Handle::default();
         assert_eq!(
             task.sys_nt_create_directory_object(
@@ -1189,7 +1189,7 @@ mod tests {
     fn open_named_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
         let name_units = utf16_units(path);
         let name = unicode_string(&name_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
         let mut handle = Handle::default();
         assert_eq!(
             task.sys_nt_open_directory_object(
@@ -1224,7 +1224,7 @@ mod tests {
             let task = test_task();
             let name_units = utf16_units(r"\");
             let name = unicode_string(&name_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut handle = Handle::default();
 
             assert_eq!(
@@ -1245,7 +1245,10 @@ mod tests {
             let task = test_task();
             let name_units = utf16_units(r"\BaseNamedObjects");
             let name = unicode_string(&name_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE | OBJ_OPENLINK);
+            let attrs = object_attributes(
+                &name,
+                (ObjectAttributesFlags::CASE_INSENSITIVE | ObjectAttributesFlags::OPENLINK).bits(),
+            );
             let mut handle = Handle::default();
 
             assert_eq!(
@@ -1284,7 +1287,8 @@ mod tests {
             ] {
                 let name_units = utf16_units(path);
                 let name = unicode_string(&name_units);
-                let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+                let attrs =
+                    object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
                 let mut handle = Handle::default();
 
                 assert_eq!(
@@ -1307,7 +1311,8 @@ mod tests {
             let task = test_task();
             let root_units = utf16_units(r"\BaseNamedObjects");
             let root_name = unicode_string(&root_units);
-            let root_attrs = object_attributes(&root_name, OBJ_CASE_INSENSITIVE);
+            let root_attrs =
+                object_attributes(&root_name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut root = Handle::default();
             assert_eq!(
                 task.sys_nt_open_directory_object(
@@ -1322,7 +1327,7 @@ mod tests {
                 length: size_of::<ObjectAttributes>().trunc(),
                 root_directory: root,
                 object_name: 0,
-                attributes: OBJ_CASE_INSENSITIVE,
+                attributes: ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
                 security_descriptor: 0,
                 security_quality_of_service: 0,
             };
@@ -1386,7 +1391,8 @@ mod tests {
             let task = test_task();
             let root_units = utf16_units(r"\BaseNamedObjects");
             let root_name = unicode_string(&root_units);
-            let root_attrs = object_attributes(&root_name, OBJ_CASE_INSENSITIVE);
+            let root_attrs =
+                object_attributes(&root_name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut root = Handle::default();
             assert_eq!(
                 task.sys_nt_open_directory_object(
@@ -1403,7 +1409,7 @@ mod tests {
                 length: size_of::<ObjectAttributes>().trunc(),
                 root_directory: root,
                 object_name: core::ptr::from_ref(&child_name) as usize,
-                attributes: OBJ_CASE_INSENSITIVE,
+                attributes: ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
                 security_descriptor: 0,
                 security_quality_of_service: 0,
             };
@@ -1447,7 +1453,10 @@ mod tests {
 
             let duplicate_units = utf16_units(r"\basenamedobjects\liteboxcasemixed\");
             let duplicate_name = unicode_string(&duplicate_units);
-            let duplicate_attrs = object_attributes(&duplicate_name, OBJ_CASE_INSENSITIVE);
+            let duplicate_attrs = object_attributes(
+                &duplicate_name,
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
             let mut duplicate = Handle::default();
             assert_eq!(
                 task.sys_nt_create_directory_object(
@@ -1523,7 +1532,8 @@ mod tests {
             let task = test_task();
             let root_units = utf16_units(r"\BaseNamedObjects");
             let root_name = unicode_string(&root_units);
-            let root_attrs = object_attributes(&root_name, OBJ_CASE_INSENSITIVE);
+            let root_attrs =
+                object_attributes(&root_name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut root = Handle::default();
             assert_eq!(
                 task.sys_nt_open_directory_object(
@@ -1540,7 +1550,7 @@ mod tests {
                 length: size_of::<ObjectAttributes>().trunc(),
                 root_directory: root,
                 object_name: core::ptr::from_ref(&child_name) as usize,
-                attributes: OBJ_CASE_INSENSITIVE,
+                attributes: ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
                 security_descriptor: 0,
                 security_quality_of_service: 0,
             };
@@ -1566,7 +1576,8 @@ mod tests {
             let task = test_task();
             let parent_units = utf16_units(r"\BaseNamedObjects\LiteBoxTreeParent");
             let parent_name = unicode_string(&parent_units);
-            let parent_attrs = object_attributes(&parent_name, OBJ_CASE_INSENSITIVE);
+            let parent_attrs =
+                object_attributes(&parent_name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut parent = Handle::default();
             assert_eq!(
                 task.sys_nt_create_directory_object(
@@ -1581,7 +1592,8 @@ mod tests {
 
             let child_units = utf16_units(r"\BaseNamedObjects\LiteBoxTreeParent\LiteBoxTreeChild");
             let child_name = unicode_string(&child_units);
-            let child_attrs = object_attributes(&child_name, OBJ_CASE_INSENSITIVE);
+            let child_attrs =
+                object_attributes(&child_name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut child = Handle::default();
             assert_eq!(
                 task.sys_nt_create_directory_object(
@@ -1615,7 +1627,7 @@ mod tests {
             let task = test_task();
             let name_units = utf16_units(r"\BaseNamedObjects\LiteBoxOpenIfDirectory");
             let name = unicode_string(&name_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut first = Handle::default();
             assert_eq!(
                 task.sys_nt_create_directory_object(
@@ -1642,7 +1654,9 @@ mod tests {
             assert_eq!(collision, Handle::default());
 
             let openif_attrs = ObjectAttributes {
-                attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+                attributes: (ObjectAttributesFlags::CASE_INSENSITIVE
+                    | ObjectAttributesFlags::OPENIF)
+                    .bits(),
                 ..attrs
             };
             let mut opened = Handle::default();
@@ -1668,7 +1682,7 @@ mod tests {
             let task = test_task();
             let name_units = utf16_units(r"\BaseNamedObjects");
             let name = unicode_string(&name_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut handle = Handle::default();
             assert_eq!(
                 task.sys_nt_open_directory_object(
@@ -1859,7 +1873,7 @@ mod tests {
             let task = test_task();
             let name_units = utf16_units(r"\BaseNamedObjects");
             let name = unicode_string(&name_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut handle = Handle::default();
             assert_eq!(
                 task.sys_nt_open_directory_object(
@@ -1893,7 +1907,7 @@ mod tests {
             let task = test_task();
             let name_units = utf16_units(r"\MissingParent\Child");
             let name = unicode_string(&name_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
 
             assert_eq!(
                 task.sys_nt_create_directory_object(
@@ -1926,7 +1940,7 @@ mod tests {
             let task = test_task();
             let name_units = utf16_units(r"\");
             let name = unicode_string(&name_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut host_handle = core::ptr::null_mut();
             // SAFETY: The object attributes and output handle point to live test
             // stack values for the duration of the host ntdll call.

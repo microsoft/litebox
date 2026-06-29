@@ -338,10 +338,10 @@ mod tests {
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
-    use crate::nt_types::{ObjectAttributes, UnicodeString};
+    use crate::nt_types::{ObjectAttributes, ObjectAttributesFlags, UnicodeString};
     use crate::tests::{
-        OBJ_CASE_INSENSITIVE, OBJ_OPENIF, OBJ_OPENLINK, TestPlatform, const_ptr, mut_ptr,
-        object_attributes, test_task, unicode_string, utf16_units as test_utf16_units,
+        TestPlatform, const_ptr, mut_ptr, object_attributes, test_task, unicode_string,
+        utf16_units as test_utf16_units,
     };
 
     const SYMBOLIC_LINK_QUERY: u32 = 0x0000_0001;
@@ -367,7 +367,7 @@ mod tests {
     ) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
         let (_target_units, target) = link_target(target);
         let mut handle = Handle::default();
         assert_eq!(
@@ -385,7 +385,7 @@ mod tests {
     fn create_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
         let mut handle = Handle::default();
         assert_eq!(
             task.sys_nt_create_directory_object(
@@ -403,7 +403,7 @@ mod tests {
     fn open_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
         let mut handle = Handle::default();
         assert_eq!(
             task.sys_nt_open_directory_object(
@@ -419,7 +419,10 @@ mod tests {
     fn open_link(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE | OBJ_OPENLINK);
+        let attrs = object_attributes(
+            &name,
+            (ObjectAttributesFlags::CASE_INSENSITIVE | ObjectAttributesFlags::OPENLINK).bits(),
+        );
         let mut handle = Handle::default();
         assert_eq!(
             task.sys_nt_open_symbolic_link_object(
@@ -438,7 +441,7 @@ mod tests {
     ) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
         let mut handle = Handle::default();
         assert_eq!(
             task.sys_nt_open_symbolic_link_object(
@@ -505,7 +508,7 @@ mod tests {
             let task = test_task();
             let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxEmptyTarget");
             let name = unicode_string(&path_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let empty_target = unicode_string(&[]);
             let mut handle = Handle::default();
 
@@ -528,7 +531,7 @@ mod tests {
             let task = test_task();
             let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxZeroTargetMax");
             let name = unicode_string(&path_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let (_target_units, mut target) = link_target(r"\BaseNamedObjects\Target");
             let mut handle = Handle::default();
             target.maximum_length = 0;
@@ -552,7 +555,7 @@ mod tests {
             let task = test_task();
             let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxShortTargetMax");
             let name = unicode_string(&path_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let (_target_units, mut target) = link_target(r"\BaseNamedObjects\Target");
             let mut handle = Handle::default();
             target.maximum_length = target.length - 2;
@@ -576,7 +579,7 @@ mod tests {
             let task = test_task();
             let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxOddTargetMax");
             let name = unicode_string(&path_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let (_target_units, mut target) = link_target(r"\BaseNamedObjects\Target");
             let mut handle = Handle::default();
             target.maximum_length = target.length + 1;
@@ -702,7 +705,7 @@ mod tests {
             let task = test_task();
             let path_units = test_utf16_units(r"\BaseNamedObjects");
             let name = unicode_string(&path_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut handle = Handle::default();
 
             assert_eq!(
@@ -728,7 +731,7 @@ mod tests {
             );
             let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxOpenIfSymlink");
             let name = unicode_string(&path_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let (_target_units, target) = link_target(r"\BaseNamedObjects\Target");
             let mut collision = Handle::default();
 
@@ -744,7 +747,9 @@ mod tests {
             assert_eq!(collision, Handle::default());
 
             let openif_attrs = ObjectAttributes {
-                attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+                attributes: (ObjectAttributesFlags::CASE_INSENSITIVE
+                    | ObjectAttributesFlags::OPENIF)
+                    .bits(),
                 ..attrs
             };
             let mut opened = Handle::default();
@@ -769,7 +774,7 @@ mod tests {
             let task = test_task();
             let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxSymlinkTypeDirectory");
             let name = unicode_string(&path_units);
-            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
             let mut directory = Handle::default();
             assert_eq!(
                 task.sys_nt_create_directory_object(
