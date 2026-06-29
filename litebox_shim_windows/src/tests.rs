@@ -22,6 +22,10 @@ use crate::{
     WindowsNlsSectionMappings, WindowsPageManager,
 };
 
+pub(crate) const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+pub(crate) const OBJ_OPENIF: u32 = 0x0000_0080;
+pub(crate) const OBJ_OPENLINK: u32 = 0x0000_0100;
+
 #[cfg(target_os = "linux")]
 pub(crate) type TestPlatform = litebox_platform_linux_userland::LinuxUserland;
 #[cfg(target_os = "windows")]

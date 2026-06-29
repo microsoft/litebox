@@ -539,14 +539,13 @@ mod tests {
     use super::*;
     use crate::nt_types::ObjectAttributes;
     use crate::tests::{
-        const_ptr, mut_ptr, object_attributes, test_task, unicode_string, utf16_units,
+        OBJ_CASE_INSENSITIVE, OBJ_OPENIF, const_ptr, mut_ptr, object_attributes, test_task,
+        unicode_string, utf16_units,
     };
 
     const EVENT_QUERY_STATE: u32 = 0x0001;
     const EVENT_MODIFY_STATE: u32 = 0x0002;
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
-    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
-    const OBJ_OPENIF: u32 = 0x0000_0080;
 
     fn event_basic_information_size() -> u32 {
         size_of::<EventBasicInformation>().trunc()

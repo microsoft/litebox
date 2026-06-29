@@ -1079,16 +1079,13 @@ mod tests {
     use super::*;
     use crate::nt_types::ObjectAttributes;
     use crate::tests::{
-        TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes, test_task,
-        unicode_string, utf16_units,
+        OBJ_CASE_INSENSITIVE, OBJ_OPENIF, OBJ_OPENLINK, TestPlatform, const_ptr, mut_ptr,
+        null_mut_ptr, object_attributes, test_task, unicode_string, utf16_units,
     };
 
     const DIRECTORY_QUERY: u32 = 0x0000_0001;
     const DIRECTORY_TRAVERSE: u32 = 0x0000_0002;
     const DIRECTORY_ALL_ACCESS: u32 = 0x000f_000f;
-    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
-    const OBJ_OPENIF: u32 = 0x0000_0080;
-    const OBJ_OPENLINK: u32 = 0x0000_0100;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct ParsedDirectoryInformation {
