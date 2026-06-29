@@ -2674,17 +2674,36 @@ mod in_mem_at {
 
     #[test]
     fn fd_path_returns_open_path() {
-        let mut fs = setup_with_dir_and_file();
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("mkdir /dir");
+            let fd = fs
+                .open("/dir/hello.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("create hello.txt");
+            fs.write(&fd, b"hello", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
         fs.with_root_privileges(|fs| {
             let dirfd = fs
                 .open("/dir", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
                 .expect("open dirfd");
-            assert_eq!(fs.fd_path(&dirfd).as_deref(), Some("/dir"));
+            {
+                let descriptors = litebox.descriptor_table();
+                assert_eq!(fs.fd_path(&dirfd, &descriptors).as_deref(), Some("/dir"));
+            }
 
             let fd = fs
                 .open("/dir/hello.txt", OFlags::RDONLY, Mode::empty())
                 .expect("open file");
-            assert_eq!(fs.fd_path(&fd).as_deref(), Some("/dir/hello.txt"));
+            {
+                let descriptors = litebox.descriptor_table();
+                assert_eq!(
+                    fs.fd_path(&fd, &descriptors).as_deref(),
+                    Some("/dir/hello.txt")
+                );
+            }
 
             fs.close(&fd).expect("close");
             fs.close(&dirfd).expect("close dirfd");

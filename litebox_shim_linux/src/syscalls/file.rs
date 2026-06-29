@@ -1779,7 +1779,10 @@ impl<FS: ShimFS> Task<FS> {
                             if !matches!(status.file_type, litebox::fs::FileType::Directory) {
                                 return Err(Errno::ENOTDIR);
                             }
-                            let dir_path = files.fs.fd_path(dirfd).ok_or(Errno::EBADF)?;
+                            let dir_path = {
+                                let descriptors = self.global.litebox.descriptor_table();
+                                files.fs.fd_path(dirfd, &*descriptors).ok_or(Errno::EBADF)?
+                            };
                             let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
                             let abs = if rel.starts_with('/') {
                                 rel.into()
@@ -1857,7 +1860,10 @@ impl<FS: ShimFS> Task<FS> {
                             if !matches!(status.file_type, litebox::fs::FileType::Directory) {
                                 return Err(Errno::ENOTDIR);
                             }
-                            let dir_path = files.fs.fd_path(dirfd).ok_or(Errno::EBADF)?;
+                            let dir_path = {
+                                let descriptors = self.global.litebox.descriptor_table();
+                                files.fs.fd_path(dirfd, &*descriptors).ok_or(Errno::EBADF)?
+                            };
                             let rel = path.to_str().map_err(|_| Errno::EINVAL)?;
                             // Linux returns EBUSY for rename(".") or rename("").
                             if rel.is_empty() || rel == "." {
@@ -2455,7 +2461,10 @@ impl<FS: ShimFS> Task<FS> {
                     };
                     let result = files.fs.write(fd, buf, offset).map_err(Errno::from);
                     if matches!(result, Ok(n) if n > 0)
-                        && let Some(path) = files.fs.fd_path(fd)
+                        && let Some(path) = {
+                            let descriptors = self.global.litebox.descriptor_table();
+                            files.fs.fd_path(fd, &*descriptors)
+                        }
                     {
                         self.notify_inotify_path(&path, IN_MODIFY, 0);
                     }
@@ -3325,7 +3334,10 @@ impl<FS: ShimFS> Task<FS> {
                 if !matches!(status.file_type, litebox::fs::FileType::Directory) {
                     return Err(Errno::ENOTDIR);
                 }
-                let dir_path = files.fs.fd_path(dirfd).ok_or(Errno::EBADF)?;
+                let dir_path = {
+                    let descriptors = self.global.litebox.descriptor_table();
+                    files.fs.fd_path(dirfd, &*descriptors).ok_or(Errno::EBADF)?
+                };
                 let rel = rel_path.to_str().map_err(|_| Errno::EINVAL)?;
                 Ok(if rel.is_empty() || rel == "." {
                     dir_path
@@ -4804,7 +4816,13 @@ impl<FS: ShimFS> Task<FS> {
                             0 => "/dev/stdin".to_string(),
                             1 => "/dev/stdout".to_string(),
                             2 => "/dev/stderr".to_string(),
-                            _ => files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT)?,
+                            _ => {
+                                let descriptors = self.global.litebox.descriptor_table();
+                                files
+                                    .fs
+                                    .fd_path(typed_fd.as_ref(), &*descriptors)
+                                    .ok_or(Errno::ENOENT)?
+                            }
                         });
                     }
                     if self
@@ -4881,7 +4899,10 @@ impl<FS: ShimFS> Task<FS> {
                     {
                         return Ok("/dev/tty".to_string());
                     }
-                    return files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT);
+                    return files
+                        .fs
+                        .fd_path(typed_fd.as_ref(), &*dt)
+                        .ok_or(Errno::ENOENT);
                 }
                 return Err(Errno::EBADF);
             }
@@ -6375,7 +6396,11 @@ impl<FS: ShimFS> Task<FS> {
                 if status.file_type != FileType::Directory {
                     return Err(Errno::ENOTDIR);
                 }
-                files.fs.fd_path(typed_fd).ok_or(Errno::EBADF)
+                let descriptors = self.global.litebox.descriptor_table();
+                files
+                    .fs
+                    .fd_path(typed_fd, &*descriptors)
+                    .ok_or(Errno::EBADF)
             }
             #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd

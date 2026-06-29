@@ -438,7 +438,7 @@ vector (currently empty / TODO):
 
 ```rust
 if subsystem_kind == FdKind::FilesystemFd && terminal_meta.is_none() {
-    if let Some(path) = files.fd_path(&typed_fd) {
+    if let Some(path) = files.fs.fd_path(&typed_fd, &*dt) {
         open_file_descriptions.push(OpenFileDescriptionSnapshot {
             object_id: typed_fd.object_id(),
             file_offset: 0, // TODO: capture seek position
