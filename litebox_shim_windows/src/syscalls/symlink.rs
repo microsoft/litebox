@@ -10,7 +10,7 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 
@@ -133,19 +133,18 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Err(status) => return status,
             };
         let target = match link_target.read_at_offset(0) {
-            Some(target) => match target.read_string::<Platform>() {
+            Some(target) => match read_symbolic_link_target::<Platform>(target) {
                 Ok(target) => target,
                 Err(status) => return status,
             },
             None => return NtStatus::ACCESS_VIOLATION,
         };
-        if target.is_empty() {
-            return NtStatus::INVALID_PARAMETER;
-        }
         if object_attributes.attributes & OBJ_OPENLINK != 0 {
             return NtStatus::INVALID_PARAMETER;
         }
 
+        // NT stores the symbolic-link target as an opaque string at creation time;
+        // object-manager lookup is deferred until a later name walk traverses it.
         let granted_access = SymbolicLinkAccess::from_desired_access(desired_access);
         self.create_symbolic_link(
             link_handle,
@@ -312,6 +311,23 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
             )
     }
+}
+
+fn read_symbolic_link_target<Platform: RawPointerProvider>(
+    target: UnicodeString,
+) -> Result<String, NtStatus> {
+    // ReactOS rounds odd MaximumLength down before validating this UNICODE_STRING;
+    // Wine's object-manager tests cover the zero MaximumLength rejection.
+    let maximum_length = target.maximum_length & !1u16;
+    if !target.length.is_multiple_of(2) || maximum_length < target.length || maximum_length == 0 {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+
+    let target = target.read_string::<Platform>()?;
+    if target.is_empty() {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -506,6 +522,79 @@ mod tests {
                 NtStatus::INVALID_PARAMETER
             );
             assert_eq!(handle, Handle::default());
+        });
+    }
+
+    #[test]
+    fn create_symbolic_link_rejects_zero_target_maximum_length() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxZeroTargetMax");
+            let name = unicode_string(&path_units);
+            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let (_target_units, mut target) = link_target(r"\BaseNamedObjects\Target");
+            let mut handle = Handle::default();
+            target.maximum_length = 0;
+
+            assert_eq!(
+                task.sys_nt_create_symbolic_link_object(
+                    mut_ptr(&mut handle),
+                    SYMBOLIC_LINK_ALL_ACCESS,
+                    Some(const_ptr(&attrs)),
+                    const_ptr(&target),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(handle, Handle::default());
+        });
+    }
+
+    #[test]
+    fn create_symbolic_link_rejects_target_maximum_length_shorter_than_length() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxShortTargetMax");
+            let name = unicode_string(&path_units);
+            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let (_target_units, mut target) = link_target(r"\BaseNamedObjects\Target");
+            let mut handle = Handle::default();
+            target.maximum_length = target.length - 2;
+
+            assert_eq!(
+                task.sys_nt_create_symbolic_link_object(
+                    mut_ptr(&mut handle),
+                    SYMBOLIC_LINK_ALL_ACCESS,
+                    Some(const_ptr(&attrs)),
+                    const_ptr(&target),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(handle, Handle::default());
+        });
+    }
+
+    #[test]
+    fn create_symbolic_link_allows_odd_target_maximum_length_after_rounding() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let path_units = test_utf16_units(r"\BaseNamedObjects\LiteBoxOddTargetMax");
+            let name = unicode_string(&path_units);
+            let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let (_target_units, mut target) = link_target(r"\BaseNamedObjects\Target");
+            let mut handle = Handle::default();
+            target.maximum_length = target.length + 1;
+
+            assert_eq!(
+                task.sys_nt_create_symbolic_link_object(
+                    mut_ptr(&mut handle),
+                    SYMBOLIC_LINK_ALL_ACCESS,
+                    Some(const_ptr(&attrs)),
+                    const_ptr(&target),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_ne!(handle, Handle::default());
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         });
     }
 
