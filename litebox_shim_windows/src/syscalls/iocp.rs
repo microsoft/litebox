@@ -33,26 +33,13 @@ bitflags::bitflags! {
 
 impl IoCompletionAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        let mut access = Self::from_bits_retain(desired_access);
-        if desired_access & AccessMask::GENERIC_READ.bits() != 0 {
-            access.insert(Self::READ);
-        }
-        if desired_access & AccessMask::GENERIC_WRITE.bits() != 0 {
-            access.insert(Self::WRITE);
-        }
-        if desired_access & AccessMask::GENERIC_EXECUTE.bits() != 0 {
-            access.insert(Self::EXECUTE);
-        }
-        if desired_access & AccessMask::GENERIC_ALL.bits() != 0 {
-            access.insert(Self::ALL_ACCESS);
-        }
-        access.remove(Self::from_bits_retain(
-            AccessMask::GENERIC_READ.bits()
-                | AccessMask::GENERIC_WRITE.bits()
-                | AccessMask::GENERIC_EXECUTE.bits()
-                | AccessMask::GENERIC_ALL.bits(),
-        ));
-        access
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::READ.bits(),
+            Self::WRITE.bits(),
+            Self::EXECUTE.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
     }
 
     pub(crate) fn require(self, required: Self) -> Result<(), NtStatus> {

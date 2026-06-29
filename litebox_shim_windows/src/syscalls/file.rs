@@ -84,10 +84,6 @@ bitflags::bitflags! {
         const WRITE_ATTRIBUTES = 0x0100;
         const DELETE = AccessMask::DELETE.bits();
         const SYNCHRONIZE = AccessMask::SYNCHRONIZE.bits();
-        const GENERIC_ALL = AccessMask::GENERIC_ALL.bits();
-        const GENERIC_EXECUTE = AccessMask::GENERIC_EXECUTE.bits();
-        const GENERIC_WRITE = AccessMask::GENERIC_WRITE.bits();
-        const GENERIC_READ = AccessMask::GENERIC_READ.bits();
 
         const GENERIC_READ_EXPANSION = AccessMask::STANDARD_RIGHTS_READ.bits()
             | Self::READ_DATA.bits()
@@ -144,24 +140,13 @@ bitflags::bitflags! {
 
 impl FileAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        let mut access = Self::from_bits_retain(desired_access);
-        if access.contains(Self::GENERIC_READ) {
-            access.remove(Self::GENERIC_READ);
-            access.insert(Self::GENERIC_READ_EXPANSION);
-        }
-        if access.contains(Self::GENERIC_WRITE) {
-            access.remove(Self::GENERIC_WRITE);
-            access.insert(Self::GENERIC_WRITE_EXPANSION);
-        }
-        if access.contains(Self::GENERIC_EXECUTE) {
-            access.remove(Self::GENERIC_EXECUTE);
-            access.insert(Self::GENERIC_EXECUTE_EXPANSION);
-        }
-        if access.contains(Self::GENERIC_ALL) {
-            access.remove(Self::GENERIC_ALL);
-            access.insert(Self::ALL_ACCESS);
-        }
-        access
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::GENERIC_READ_EXPANSION.bits(),
+            Self::GENERIC_WRITE_EXPANSION.bits(),
+            Self::GENERIC_EXECUTE_EXPANSION.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
     }
 
     fn open_flags(
