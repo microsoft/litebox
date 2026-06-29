@@ -431,20 +431,13 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         open_final_symlink: bool,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
         let mut tail = tail.to_string();
-        let mut reparses = 0usize;
-
-        loop {
+        for _ in 0..=MAX_SYMLINK_REPARSE_DEPTH {
             match self.resolve_tail_once(&tail, final_missing_status, open_final_symlink)? {
                 TailResolution::Resolved(node) => return Ok(node),
-                TailResolution::Reparse(next_tail) => {
-                    reparses += 1;
-                    if reparses > MAX_SYMLINK_REPARSE_DEPTH {
-                        return Err(NtStatus::NAME_TOO_LONG);
-                    }
-                    tail = next_tail;
-                }
+                TailResolution::Reparse(next_tail) => tail = next_tail,
             }
         }
+        Err(NtStatus::NAME_TOO_LONG)
     }
 
     fn resolve_tail_once(
