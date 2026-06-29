@@ -16,15 +16,13 @@ use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
+use crate::nt_types::{
+    AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString, read_object_attributes,
+};
 use crate::syscalls::Handle;
 use crate::{
     ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
 };
-
-const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
-const OBJ_OPENIF: u32 = 0x0000_0080;
-const OBJ_OPENLINK: u32 = 0x0000_0100;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
@@ -219,7 +217,9 @@ fn read_event_name<Platform: RawPointerProvider>(
     if key.is_empty() {
         return Err(NtStatus::OBJECT_NAME_INVALID);
     }
-    if object_attributes.attributes & OBJ_CASE_INSENSITIVE != 0 {
+    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+        .contains(ObjectAttributesFlags::CASE_INSENSITIVE)
+    {
         key = key.to_ascii_lowercase();
     }
     Ok(Some(EventName { key }))
@@ -236,7 +236,9 @@ fn read_event_object_attributes<Platform: RawPointerProvider>(
         return Ok((None, None));
     };
     let object_attributes = read_object_attributes::<Platform>(object_attributes_ptr)?;
-    if object_attributes.attributes & OBJ_OPENLINK != 0 {
+    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+        .contains(ObjectAttributesFlags::OPENLINK)
+    {
         return Err(NtStatus::INVALID_PARAMETER);
     }
     let event_name =
@@ -317,7 +319,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let Some(object_attributes) = object_attributes else {
                     return NtStatus::INVALID_PARAMETER;
                 };
-                if object_attributes.attributes & OBJ_OPENIF == 0 {
+                if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+                    .contains(ObjectAttributesFlags::OPENIF)
+                {
                     return NtStatus::OBJECT_NAME_COLLISION;
                 }
                 let Ok(handle) = self.insert_event_handle(event, granted_access) else {
@@ -541,6 +545,8 @@ mod tests {
     const EVENT_QUERY_STATE: u32 = 0x0001;
     const EVENT_MODIFY_STATE: u32 = 0x0002;
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+    const OBJ_OPENIF: u32 = 0x0000_0080;
 
     fn event_basic_information_size() -> u32 {
         size_of::<EventBasicInformation>().trunc()

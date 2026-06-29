@@ -14,13 +14,11 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProv
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 
-use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString};
+use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString};
 use crate::syscalls::directory::ObjectNode;
 use crate::syscalls::{Handle, directory::DirectoryName};
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
-const OBJ_OPENIF: u32 = 0x0000_0080;
-const OBJ_OPENLINK: u32 = 0x0000_0100;
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
     | AccessMask::READ_CONTROL.bits()
     | AccessMask::WRITE_DAC.bits()
@@ -139,7 +137,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
             None => return NtStatus::ACCESS_VIOLATION,
         };
-        if object_attributes.attributes & OBJ_OPENLINK != 0 {
+        let attributes = ObjectAttributesFlags::from_bits_retain(object_attributes.attributes);
+        if attributes.contains(ObjectAttributesFlags::OPENLINK) {
             return NtStatus::INVALID_PARAMETER;
         }
 
@@ -152,7 +151,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             granted_access,
             link_name,
             target,
-            object_attributes.attributes & OBJ_OPENIF != 0,
+            attributes.contains(ObjectAttributesFlags::OPENIF),
         )
     }
 

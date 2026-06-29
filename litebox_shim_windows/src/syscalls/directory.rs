@@ -17,12 +17,12 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProv
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
+use crate::nt_types::{
+    AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString, read_object_attributes,
+};
 use crate::syscalls::Handle;
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
-const OBJ_OPENIF: u32 = 0x0000_0080;
-const OBJ_OPENLINK: u32 = 0x0000_0100;
 const MAX_SYMLINK_REPARSE_DEPTH: usize = 64;
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
     | AccessMask::READ_CONTROL.bits()
@@ -824,7 +824,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Err(status) => return status,
             };
         if let Some(object_attributes) = object_attributes
-            && object_attributes.attributes & OBJ_OPENLINK != 0
+            && ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+                .contains(ObjectAttributesFlags::OPENLINK)
         {
             return NtStatus::INVALID_PARAMETER;
         }
@@ -837,7 +838,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let Some(object_attributes) = object_attributes else {
                         return NtStatus::INVALID_PARAMETER;
                     };
-                    if object_attributes.attributes & OBJ_OPENIF == 0 {
+                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+                        .contains(ObjectAttributesFlags::OPENIF)
+                    {
                         return NtStatus::OBJECT_NAME_COLLISION;
                     }
                     let Ok(handle) = self.insert_directory_handle(directory, granted_access) else {
@@ -888,7 +891,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let directory_name = match self.read_directory_object_attributes(object_attributes, true) {
             Ok((Some(object_attributes), Some(directory_name))) => {
-                if object_attributes.attributes & OBJ_OPENLINK != 0 {
+                if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+                    .contains(ObjectAttributesFlags::OPENLINK)
+                {
                     return NtStatus::INVALID_PARAMETER;
                 }
                 directory_name
@@ -1082,6 +1087,7 @@ mod tests {
     const DIRECTORY_TRAVERSE: u32 = 0x0000_0002;
     const DIRECTORY_ALL_ACCESS: u32 = 0x000f_000f;
     const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+    const OBJ_OPENIF: u32 = 0x0000_0080;
     const OBJ_OPENLINK: u32 = 0x0000_0100;
 
     #[derive(Clone, Debug, Eq, PartialEq)]

@@ -161,6 +161,18 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Flags carried in `OBJECT_ATTRIBUTES.Attributes`.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct ObjectAttributesFlags: u32 {
+        const CASE_INSENSITIVE = 0x0000_0040;
+        const OPENIF = 0x0000_0080;
+        const OPENLINK = 0x0000_0100;
+
+        const _ = !0;
+    }
+}
+
 impl AccessMask {
     pub(crate) fn expand_generic_access(
         desired_access: u32,
