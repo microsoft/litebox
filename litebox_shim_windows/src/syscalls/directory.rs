@@ -536,9 +536,7 @@ fn join_directory_path(root_path: &str, name: &str) -> String {
 fn read_directory_name_string<Platform: RawPointerProvider>(
     object_name: usize,
 ) -> Result<Option<String>, NtStatus> {
-    if object_name == 0 {
-        return Ok(None);
-    }
+    debug_assert!(object_name != 0);
     let unicode_string = ConstPtr::<Platform, UnicodeString>::from_usize(object_name)
         .read_at_offset(0)
         .ok_or(NtStatus::ACCESS_VIOLATION)?;
@@ -729,6 +727,18 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Ok((None, None));
         };
         let object_attributes = read_object_attributes::<Platform>(object_attributes_ptr)?;
+
+        if object_attributes.object_name == 0 {
+            if require_name {
+                return Err(NtStatus::OBJECT_NAME_INVALID);
+            }
+            if !object_attributes.root_directory.is_null() {
+                // Wine and ReactOS match Windows: a NULL ObjectName plus RootDirectory
+                // is invalid, while a present zero-length UNICODE_STRING creates unnamed.
+                return Err(NtStatus::OBJECT_NAME_INVALID);
+            }
+            return Ok((Some(object_attributes), None));
+        }
 
         let Some(raw_name) = read_directory_name_string::<Platform>(object_attributes.object_name)?
         else {
@@ -1291,6 +1301,85 @@ mod tests {
                 );
                 assert_eq!(handle, Handle::default());
             }
+        });
+    }
+
+    #[test]
+    fn create_directory_distinguishes_null_object_name_from_empty_name() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let root_units: alloc::vec::Vec<u16> = r"\BaseNamedObjects".encode_utf16().collect();
+            let root_name = unicode_string(&root_units);
+            let root_attrs = object_attributes(&root_name, OBJ_CASE_INSENSITIVE);
+            let mut root = Handle::default();
+            assert_eq!(
+                task.sys_nt_open_directory_object(
+                    mut_ptr(&mut root),
+                    DIRECTORY_TRAVERSE | DIRECTORY_QUERY,
+                    Some(const_ptr(&root_attrs)),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let null_name_with_root = ObjectAttributes {
+                length: u32::try_from(size_of::<ObjectAttributes>()).expect("fits in ULONG"),
+                root_directory: root,
+                object_name: 0,
+                attributes: OBJ_CASE_INSENSITIVE,
+                security_descriptor: 0,
+                security_quality_of_service: 0,
+            };
+            let mut handle = Handle::default();
+            assert_eq!(
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut handle),
+                    DIRECTORY_ALL_ACCESS,
+                    Some(const_ptr(&null_name_with_root)),
+                    Handle::default(),
+                    0,
+                ),
+                NtStatus::OBJECT_NAME_INVALID
+            );
+            assert_eq!(handle, Handle::default());
+
+            let null_name_without_root = ObjectAttributes {
+                root_directory: Handle::default(),
+                ..null_name_with_root
+            };
+            assert_eq!(
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut handle),
+                    DIRECTORY_ALL_ACCESS,
+                    Some(const_ptr(&null_name_without_root)),
+                    Handle::default(),
+                    0,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_ne!(handle, Handle::default());
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+
+            let empty_name_units: [u16; 0] = [];
+            let empty_name = unicode_string(&empty_name_units);
+            let empty_name_with_root = ObjectAttributes {
+                root_directory: root,
+                object_name: core::ptr::from_ref(&empty_name) as usize,
+                ..null_name_with_root
+            };
+            handle = Handle::default();
+            assert_eq!(
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut handle),
+                    DIRECTORY_ALL_ACCESS,
+                    Some(const_ptr(&empty_name_with_root)),
+                    Handle::default(),
+                    0,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_ne!(handle, Handle::default());
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(root), NtStatus::SUCCESS);
         });
     }
 
