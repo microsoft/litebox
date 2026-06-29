@@ -247,6 +247,9 @@ impl UnicodeString {
         if !self.length.is_multiple_of(2) {
             return Err(NtStatus::INVALID_PARAMETER);
         }
+        if self.maximum_length < self.length {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         if self.length == 0 {
             return Ok(String::new());
         }

@@ -143,8 +143,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER;
         }
 
-        // NT stores the symbolic-link target as an opaque string at creation time;
-        // object-manager lookup is deferred until a later name walk traverses it.
+        // NT stores the target as an opaque string at creation time. Wine's
+        // create_symlink only copies the target and ReactOS leaves LinkTargetObject
+        // null; both defer namespace lookup until the link is traversed.
         let granted_access = SymbolicLinkAccess::from_desired_access(desired_access);
         self.create_symbolic_link(
             link_handle,

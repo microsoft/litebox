@@ -2,25 +2,6 @@
 // Licensed under the MIT license.
 
 //! Windows NT object-manager directory syscalls.
-//!
-//! Object-manager directories are not filesystem directories. They name typed
-//! kernel objects such as directories, symbolic links, sections, events, and
-//! devices inside the NT object namespace; filesystem files only enter the
-//! picture after a real NT object-manager walk reaches a device object and the
-//! I/O manager hands the remaining path to a filesystem driver.
-//!
-//! This subset keeps the object namespace in a purpose-built in-memory tree
-//! keyed by case-insensitive path components. That makes the NT rule structural: a
-//! named node can exist only if every ancestor exists, so the component walk
-//! distinguishes a missing leaf from an earlier path-component miss in
-//! `NtOpenDirectoryObject`.
-//!
-//! The tree is still an object-manager tree, not a `litebox::fs` filesystem:
-//! `litebox::fs` is a byte-stream interface, while object-manager directories
-//! hold typed kernel objects with object-specific handle semantics rather than
-//! file contents. Symbolic-link traversal is handled in this namespace; the
-//! later integration point is walking through device objects into filesystem
-//! drivers.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString as _};
@@ -488,6 +469,8 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
             };
             let child = current.child(component).ok_or(missing_status)?;
             if child.is_symlink() && (!final_component || !open_final_symlink) {
+                // This is the lazy-resolution point paired with
+                // NtCreateSymbolicLinkObject storing the target without lookup.
                 let target = normalize_reparse_target(&child.symlink_target()?)?;
                 let target_tail = absolute_path_tail(&target)?;
                 let remaining = components.collect::<Vec<_>>().join("\\");
