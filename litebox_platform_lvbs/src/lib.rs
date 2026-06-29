@@ -370,14 +370,11 @@ impl PageTableManager {
         if let Some(pt) = task_pts.remove(&task_pt_id) {
             drop(task_pts);
 
-            // Clear PML4 entries that point to the base page table's P3/P2/P1
-            // frames. Without this, cleanup_page_table_frames and Drop would
-            // free page table frames owned by the base page table.
-            pt.clear_shared_pml4_entries(&self.base_page_table);
-
             // Safety: We're about to delete this page table, so it's safe to
-            // free the remaining task-owned intermediate page table frames
-            // (user, direct-map, and vmap slots).
+            // free the task-owned intermediate page table frames (user,
+            // direct-map, and vmap slots). The kernel slots are shared with the
+            // base page table and are deliberately left untouched, so its
+            // P3/P2/P1 frames are not freed.
             unsafe {
                 pt.cleanup_page_table_frames();
             }
