@@ -529,6 +529,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     use core::mem::size_of;
 
+    use litebox::utils::TruncateExt as _;
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
@@ -542,12 +543,11 @@ mod tests {
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
 
     fn event_basic_information_size() -> u32 {
-        u32::try_from(size_of::<EventBasicInformation>())
-            .expect("EVENT_BASIC_INFORMATION fits in ULONG")
+        size_of::<EventBasicInformation>().trunc()
     }
 
     fn object_attributes_size() -> u32 {
-        u32::try_from(size_of::<ObjectAttributes>()).expect("OBJECT_ATTRIBUTES fits in ULONG")
+        size_of::<ObjectAttributes>().trunc()
     }
 
     #[test]

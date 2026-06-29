@@ -576,7 +576,7 @@ fn utf16_byte_len(value: &str) -> Result<usize, NtStatus> {
         .count()
         .checked_mul(size_of::<u16>())
         .ok_or(NtStatus::NAME_TOO_LONG)?;
-    if len > usize::from(u16::MAX) {
+    if len > u16::MAX as usize {
         return Err(NtStatus::NAME_TOO_LONG);
     }
     Ok(len)
@@ -960,8 +960,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(entries) => entries,
             Err(status) => return status,
         };
-        let buffer_length =
-            usize::try_from(params.buffer_length).expect("ULONG buffer length fits in usize");
+        let buffer_length = params.buffer_length as usize;
         if let Err(status) = probe_output_buffer::<Platform>(params.buffer, buffer_length) {
             return status;
         }
@@ -972,7 +971,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Some(context) = params.context.read_at_offset(0) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
-            usize::try_from(context).expect("ULONG context fits in usize")
+            context as usize
         };
         if start_index >= entries.len() {
             let context =
@@ -1086,6 +1085,7 @@ mod tests {
     use core::mem::size_of;
 
     use litebox::platform::ThreadProvider;
+    use litebox::utils::TruncateExt as _;
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
@@ -1148,11 +1148,11 @@ mod tests {
 
     fn read_directory_information(buffer: &[u8], offset: usize) -> ParsedDirectoryInformation {
         let buffer_base = buffer.as_ptr() as usize;
-        let name_len = usize::from(read_u16(buffer, offset));
-        let name_max = usize::from(read_u16(buffer, offset + 2));
+        let name_len = read_u16(buffer, offset) as usize;
+        let name_max = read_u16(buffer, offset + 2) as usize;
         let name_buffer = read_usize(buffer, offset + 8);
-        let type_len = usize::from(read_u16(buffer, offset + 16));
-        let type_max = usize::from(read_u16(buffer, offset + 18));
+        let type_len = read_u16(buffer, offset + 16) as usize;
+        let type_max = read_u16(buffer, offset + 18) as usize;
         let type_buffer = read_usize(buffer, offset + 24);
         assert_eq!(name_max, name_len + size_of::<u16>());
         assert_eq!(type_max, type_len + size_of::<u16>());
@@ -1333,7 +1333,7 @@ mod tests {
             );
 
             let null_name_with_root = ObjectAttributes {
-                length: u32::try_from(size_of::<ObjectAttributes>()).expect("fits in ULONG"),
+                length: size_of::<ObjectAttributes>().trunc(),
                 root_directory: root,
                 object_name: 0,
                 attributes: OBJ_CASE_INSENSITIVE,
@@ -1414,7 +1414,7 @@ mod tests {
             let child_units = utf16_units("LiteBoxDirectory");
             let child_name = unicode_string(&child_units);
             let child_attrs = ObjectAttributes {
-                length: u32::try_from(size_of::<ObjectAttributes>()).expect("fits in ULONG"),
+                length: size_of::<ObjectAttributes>().trunc(),
                 root_directory: root,
                 object_name: core::ptr::from_ref(&child_name) as usize,
                 attributes: OBJ_CASE_INSENSITIVE,
@@ -1483,7 +1483,7 @@ mod tests {
                 task.sys_nt_query_directory_object(DirectoryQueryParameters {
                     directory_handle: parent,
                     buffer: mut_ptr(&mut buffer[0]),
-                    buffer_length: u32::try_from(buffer.len()).expect("test buffer fits in ULONG"),
+                    buffer_length: buffer.len().trunc(),
                     return_single_entry: 0,
                     restart_scan: 1,
                     context: mut_ptr(&mut context),
@@ -1515,7 +1515,7 @@ mod tests {
             );
             assert_eq!(context, 2);
             assert_eq!(
-                usize::try_from(return_length).unwrap(),
+                return_length as usize,
                 expected_query_size(&[
                     ("liteboxcaselower", "Directory"),
                     ("LiteBoxCaseMixed", "Directory")
@@ -1551,7 +1551,7 @@ mod tests {
             let child_units = utf16_units("LiteBoxTraverseDenied");
             let child_name = unicode_string(&child_units);
             let child_attrs = ObjectAttributes {
-                length: u32::try_from(size_of::<ObjectAttributes>()).expect("fits in ULONG"),
+                length: size_of::<ObjectAttributes>().trunc(),
                 root_directory: root,
                 object_name: core::ptr::from_ref(&child_name) as usize,
                 attributes: OBJ_CASE_INSENSITIVE,
@@ -1700,7 +1700,7 @@ mod tests {
                 task.sys_nt_query_directory_object(DirectoryQueryParameters {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
-                    buffer_length: u32::try_from(buffer.len()).expect("test buffer fits in ULONG"),
+                    buffer_length: buffer.len().trunc(),
                     return_single_entry: 0,
                     restart_scan: 1,
                     context: mut_ptr(&mut context),
@@ -1730,7 +1730,7 @@ mod tests {
                 task.sys_nt_query_directory_object(DirectoryQueryParameters {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
-                    buffer_length: u32::try_from(buffer.len()).expect("test buffer fits in ULONG"),
+                    buffer_length: buffer.len().trunc(),
                     return_single_entry: 0,
                     restart_scan: 1,
                     context: mut_ptr(&mut context),
@@ -1762,7 +1762,7 @@ mod tests {
             );
             assert_eq!(context, 2);
             assert_eq!(
-                usize::try_from(return_length).unwrap(),
+                return_length as usize,
                 expected_query_size(&[
                     ("LiteBoxEnumA", "Directory"),
                     ("LiteBoxEnumB", "Directory")
@@ -1789,7 +1789,7 @@ mod tests {
                 task.sys_nt_query_directory_object(DirectoryQueryParameters {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
-                    buffer_length: u32::try_from(buffer.len()).expect("test buffer fits in ULONG"),
+                    buffer_length: buffer.len().trunc(),
                     return_single_entry: 1,
                     restart_scan: 1,
                     context: mut_ptr(&mut context),
@@ -1811,7 +1811,7 @@ mod tests {
                 task.sys_nt_query_directory_object(DirectoryQueryParameters {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
-                    buffer_length: u32::try_from(buffer.len()).expect("test buffer fits in ULONG"),
+                    buffer_length: buffer.len().trunc(),
                     return_single_entry: 1,
                     restart_scan: 0,
                     context: mut_ptr(&mut context),
@@ -1848,7 +1848,7 @@ mod tests {
                 task.sys_nt_query_directory_object(DirectoryQueryParameters {
                     directory_handle: handle,
                     buffer: mut_ptr(&mut buffer[0]),
-                    buffer_length: u32::try_from(buffer.len()).expect("test buffer fits in ULONG"),
+                    buffer_length: buffer.len().trunc(),
                     return_single_entry: 0,
                     restart_scan: 1,
                     context: mut_ptr(&mut context),
@@ -1858,7 +1858,7 @@ mod tests {
             );
             assert_eq!(context, 99);
             assert_eq!(
-                usize::try_from(return_length).unwrap(),
+                return_length as usize,
                 expected_query_size(&[("LiteBoxSmall", "Directory")])
             );
             assert_eq!(buffer, [0xffu8; 8]);

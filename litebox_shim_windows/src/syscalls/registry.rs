@@ -1108,7 +1108,7 @@ mod tests {
                     value_name,
                     KeyValueInformationClass::Partial,
                     mut_byte_ptr(&mut information),
-                    u32::try_from(information.len()).unwrap(),
+                    information.len().trunc(),
                     mut_ptr(&mut result_length),
                 )
                 .is_ok()
@@ -1211,7 +1211,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .is_ok()
@@ -1224,7 +1224,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
@@ -1247,7 +1247,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .is_ok()
@@ -1262,10 +1262,7 @@ mod tests {
             KeyValuePartialInformation::read_from_prefix(information).unwrap();
         assert_eq!(information.title_index, 0);
         assert_eq!(information.value_type, RegistryValueType::Sz.into());
-        assert_eq!(
-            information.data_length,
-            u32::try_from(DEFAULT_ACP_VALUE.len()).unwrap()
-        );
+        assert_eq!(information.data_length, DEFAULT_ACP_VALUE.len().trunc());
         assert_eq!(data, DEFAULT_ACP_VALUE);
     }
 
@@ -1292,7 +1289,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
@@ -1316,7 +1313,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Basic,
                 mut_byte_ptr(&mut basic_information),
-                u32::try_from(basic_information.len()).unwrap(),
+                basic_information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .is_ok()
@@ -1340,7 +1337,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Full,
                 mut_byte_ptr(&mut full_information),
-                u32::try_from(full_information.len()).unwrap(),
+                full_information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .is_ok()
@@ -1348,7 +1345,7 @@ mod tests {
         let full_information = &full_information[..(result_length as usize)];
         let (full_header, full_tail) =
             KeyValueFullInformation::read_from_prefix(full_information).unwrap();
-        let data_offset = usize::try_from(full_header.data_offset).unwrap();
+        let data_offset = full_header.data_offset as usize;
         assert_eq!(full_header.title_index, 0);
         assert_eq!(full_header.value_type, RegistryValueType::Sz.into());
         assert_eq!(full_header.data_length as usize, DEFAULT_OEMCP_VALUE.len());
@@ -1378,7 +1375,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
@@ -1391,7 +1388,7 @@ mod tests {
                 missing_value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
@@ -1404,7 +1401,7 @@ mod tests {
                 const_ptr(&value_name),
                 0xffff,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             ),
             NtStatus::INVALID_INFO_CLASS
@@ -1416,7 +1413,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut short_information),
-                u32::try_from(short_information.len()).unwrap(),
+                short_information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),

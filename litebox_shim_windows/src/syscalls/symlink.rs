@@ -11,6 +11,7 @@ use core::mem::size_of;
 
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString};
@@ -77,7 +78,7 @@ fn utf16_units(value: &str) -> Result<Vec<u16>, NtStatus> {
     if units
         .len()
         .checked_mul(size_of::<u16>())
-        .is_none_or(|len| len > usize::from(u16::MAX))
+        .is_none_or(|len| len > u16::MAX as usize)
     {
         return Err(NtStatus::NAME_TOO_LONG);
     }
@@ -302,7 +303,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_or_else(
                 |status| status,
                 |()| {
-                    unicode.length = u16::try_from(required_len).expect("required length fits");
+                    unicode.length = required_len.trunc();
                     if link_target.write_at_offset(0, unicode).is_none() {
                         NtStatus::ACCESS_VIOLATION
                     } else {
@@ -444,7 +445,7 @@ mod tests {
     ) -> (UnicodeString, u32) {
         let mut target = UnicodeString {
             length: u16::MAX,
-            maximum_length: u16::try_from(size_of_val(output_units)).expect("test buffer fits"),
+            maximum_length: size_of_val(output_units).trunc(),
             padding_0: [0; 4],
             buffer: output_units.as_mut_ptr() as usize,
         };
@@ -461,8 +462,8 @@ mod tests {
         );
         assert_eq!(target.buffer, original_buffer);
         assert_eq!(target.maximum_length, original_maximum_length);
-        assert!(usize::from(target.length) <= size_of_val(output_units));
-        assert_eq!(output_units[usize::from(target.length) / 2], 0);
+        assert!(target.length as usize <= size_of_val(output_units));
+        assert_eq!(output_units[target.length as usize / 2], 0);
         (target, returned_length)
     }
 
@@ -477,7 +478,7 @@ mod tests {
             let (target, returned_length) = query_link(&task, opened, &mut output);
             assert_eq!(returned_length, u32::from(target.length) + 2);
             assert_eq!(
-                String::from_utf16_lossy(&output[..usize::from(target.length) / 2]),
+                String::from_utf16_lossy(&output[..target.length as usize / 2]),
                 r"\BaseNamedObjects\LiteBoxTarget"
             );
             assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
@@ -523,7 +524,7 @@ mod tests {
             let (target, _) = query_link(&task, opened, &mut output);
 
             assert_eq!(
-                String::from_utf16_lossy(&output[..usize::from(target.length) / 2]),
+                String::from_utf16_lossy(&output[..target.length as usize / 2]),
                 r"\BaseNamedObjects\MissingTarget"
             );
             assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
@@ -545,7 +546,7 @@ mod tests {
             let (target, _) = query_link(&task, opened, &mut output);
 
             assert_eq!(
-                String::from_utf16_lossy(&output[..usize::from(target.length) / 2]),
+                String::from_utf16_lossy(&output[..target.length as usize / 2]),
                 r"\BaseNamedObjects\MissingTarget"
             );
             assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
@@ -723,7 +724,7 @@ mod tests {
             let mut output = [0xeeeeu16; 2];
             let mut target = UnicodeString {
                 length: 0x1234,
-                maximum_length: u16::try_from(size_of_val(&output)).expect("test buffer fits"),
+                maximum_length: size_of_val(&output).trunc(),
                 padding_0: [0; 4],
                 buffer: output.as_mut_ptr() as usize,
             };
@@ -744,8 +745,7 @@ mod tests {
             assert_eq!(output, [0xeeeeu16; 2]);
             assert_eq!(
                 returned_length,
-                u32::try_from((r"\BaseNamedObjects\LongTarget".encode_utf16().count() + 1) * 2)
-                    .expect("target fits")
+                ((r"\BaseNamedObjects\LongTarget".encode_utf16().count() + 1) * 2).trunc()
             );
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         });
@@ -760,8 +760,7 @@ mod tests {
             let mut output = alloc::vec![0xeeeeu16; target.encode_utf16().count()];
             let mut target_string = UnicodeString {
                 length: 0x1234,
-                maximum_length: u16::try_from(size_of_val(output.as_slice()))
-                    .expect("test buffer fits"),
+                maximum_length: size_of_val(output.as_slice()).trunc(),
                 padding_0: [0; 4],
                 buffer: output.as_mut_ptr() as usize,
             };
@@ -777,7 +776,7 @@ mod tests {
             );
             assert_eq!(
                 returned_length,
-                u32::try_from((target.encode_utf16().count() + 1) * 2).expect("target fits")
+                ((target.encode_utf16().count() + 1) * 2).trunc()
             );
             assert!(output.iter().all(|unit| *unit == 0xeeee));
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
