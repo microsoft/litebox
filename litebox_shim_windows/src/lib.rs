@@ -881,6 +881,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQueryVolumeInformationFile {
+                file_handle,
+                io_status_block,
+                fs_information,
+                length,
+                fs_information_class,
+            } => {
+                let status = self.sys_nt_query_volume_information_file(
+                    file_handle,
+                    io_status_block,
+                    fs_information,
+                    length,
+                    fs_information_class,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenKey {
                 key_handle,
                 desired_access,
