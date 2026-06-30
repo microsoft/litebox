@@ -13,7 +13,7 @@ extern crate std;
 
 use core::sync::atomic::AtomicU32;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::vec::Vec;
 
@@ -58,6 +58,12 @@ impl MockPlatform {
 }
 
 impl Provider for MockPlatform {}
+
+impl ThreadIdentityProvider for MockPlatform {
+    fn current_thread_id(&self) -> usize {
+        MOCK_THREAD_ID.with(|thread_id| *thread_id)
+    }
+}
 
 impl RawMessageProvider for MockPlatform {}
 
@@ -389,7 +395,10 @@ mod tests {
 
 std::thread_local! {
     static MOCK_TLS: core::cell::Cell<*mut()>  = const { core::cell::Cell::new(core::ptr::null_mut()) };
+    static MOCK_THREAD_ID: usize = NEXT_MOCK_THREAD_ID.fetch_add(1, Ordering::Relaxed);
 }
+
+static NEXT_MOCK_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
 
 unsafe impl ThreadLocalStorageProvider for MockPlatform {
     fn get_thread_local_storage() -> *mut () {

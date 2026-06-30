@@ -2253,6 +2253,14 @@ impl litebox::platform::RawMessageProvider for WindowsUserland {}
 
 impl litebox::platform::Provider for WindowsUserland {}
 
+impl litebox::platform::ThreadIdentityProvider for WindowsUserland {
+    fn current_thread_id(&self) -> usize {
+        // SAFETY: `GetCurrentThreadId` has no preconditions and returns the
+        // caller's current Windows thread id.
+        unsafe { Win32_Threading::GetCurrentThreadId() as usize }
+    }
+}
+
 impl litebox::platform::SignalProvider for WindowsUserland {
     type Signal = litebox_common_linux::signal::Signal;
 

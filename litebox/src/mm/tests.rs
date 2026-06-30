@@ -90,9 +90,24 @@ impl crate::platform::DebugLogProvider for DummyVmemBackend {
 }
 
 #[cfg(feature = "lock_tracing")]
+impl crate::platform::ThreadIdentityProvider for DummyVmemBackend {
+    fn current_thread_id(&self) -> usize {
+        1
+    }
+}
+
+#[cfg(feature = "lock_tracing")]
 #[cfg(target_arch = "x86_64")]
 impl crate::platform::DebugLogProvider for RetryLow2gBackend {
     fn debug_log_print(&self, _msg: &str) {}
+}
+
+#[cfg(feature = "lock_tracing")]
+#[cfg(target_arch = "x86_64")]
+impl crate::platform::ThreadIdentityProvider for RetryLow2gBackend {
+    fn current_thread_id(&self) -> usize {
+        1
+    }
 }
 
 #[expect(unused_variables, reason = "dummy/mock backend")]

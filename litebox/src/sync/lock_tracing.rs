@@ -48,13 +48,12 @@ const CONFIG_MAX_NUMBER_OF_TRACKED_LOCKS: usize = 512;
 /// bracketing discipline has not been satisfied.
 const CONFIG_PANIC_ON_NON_BRACKETED_UNLOCK: bool = false;
 
-/// Panic if an RwLock acquisition would re-enter the same underlying RwLock on
-/// the current lock-tracked thread in a way that can self-deadlock.
+/// Panic if a lock acquisition would re-enter the same underlying lock on the
+/// current lock-tracked thread in a way that can self-deadlock.
 ///
 /// This is intentionally enabled whenever `lock_tracing` is enabled: normal
 /// builds compile this module out entirely, while lock-tracing CI should turn
-/// probabilistic writer-preferring RwLock self-deadlocks into deterministic,
-/// located panics.
+/// same-thread self-deadlocks into deterministic, located panics.
 const CONFIG_PANIC_ON_REENTRANT_LOCK: bool = true;
 
 /// Print the actual remaining locks if true; otherwise only print the specific lock that was locked
@@ -189,6 +188,7 @@ impl core::fmt::Display for Location {
 struct Locked {
     lock_type: LockType,
     lock_addr: usize,
+    thread_id: usize,
     location: Location,
 }
 impl core::fmt::Display for Locked {
@@ -196,6 +196,7 @@ impl core::fmt::Display for Locked {
         let Self {
             lock_type,
             lock_addr: _,
+            thread_id: _,
             location,
         } = self;
         write!(f, "{lock_type}({location})")
@@ -206,9 +207,10 @@ impl core::fmt::Debug for Locked {
         let Self {
             lock_type,
             lock_addr,
+            thread_id,
             location,
         } = self;
-        write!(f, "{lock_type}@{lock_addr:x}({location})")
+        write!(f, "{lock_type}@{lock_addr:x}#thread{thread_id}({location})")
     }
 }
 impl Locked {
@@ -225,17 +227,25 @@ impl Locked {
         )
     }
 
-    fn rwlock_reentrant_attempt_would_deadlock(&self, attempt: &Self) -> bool {
+    fn reentrant_attempt_would_deadlock(&self, attempt: &Self) -> bool {
         if !self.is_same_underlying_lock(attempt) {
             return false;
         }
 
-        let held_read = self.lock_type == LockType::RwLockRead;
-        let held_write = self.lock_type == LockType::RwLockWrite;
-        let attempting_read = attempt.lock_type == LockType::RwLockRead;
-        let attempting_write = attempt.lock_type == LockType::RwLockWrite;
-
-        (held_read && attempting_read) || ((held_read || held_write) && attempting_write)
+        match (self.lock_type, attempt.lock_type) {
+            (LockType::RwLockRead, LockType::RwLockRead | LockType::RwLockWrite)
+            | (LockType::RwLockWrite, LockType::RwLockWrite)
+            | (LockType::Mutex, LockType::Mutex) => true,
+            (
+                LockType::RwLock,
+                LockType::RwLock | LockType::RwLockRead | LockType::RwLockWrite | LockType::Mutex,
+            )
+            | (LockType::RwLockRead, LockType::RwLock | LockType::Mutex)
+            | (LockType::RwLockWrite, LockType::RwLock | LockType::RwLockRead | LockType::Mutex)
+            | (LockType::Mutex, LockType::RwLock | LockType::RwLockRead | LockType::RwLockWrite) => {
+                false
+            }
+        }
     }
 }
 
@@ -502,6 +512,8 @@ struct LockTrackerX<Platform: ?Sized = dyn DynLockTrackerProvider> {
 trait DynLockTrackerProvider: Send + Sync {
     /// Gets the current time, relative to some unspecified epoch.
     fn now(&self) -> Duration;
+    /// Gets a stable identity for the current thread.
+    fn current_thread_id(&self) -> usize;
     /// Print a debug log message.
     fn debug_log_print(&self, msg: &str);
 }
@@ -509,6 +521,10 @@ trait DynLockTrackerProvider: Send + Sync {
 impl<Platform: RawSyncPrimitivesProvider> DynLockTrackerProvider for LockTrackerPlatform<Platform> {
     fn now(&self) -> Duration {
         self.platform.now().duration_since(&self.start_time)
+    }
+
+    fn current_thread_id(&self) -> usize {
+        self.platform.current_thread_id()
     }
 
     fn debug_log_print(&self, msg: &str) {
@@ -539,7 +555,7 @@ impl LockTracker {
     }
 
     /// Panic if the current lock attempt would re-enter the same underlying
-    /// RwLock in a pattern known to self-deadlock.
+    /// lock in a pattern known to self-deadlock.
     ///
     /// This check must run before blocking in the raw lock operation.
     #[track_caller]
@@ -676,20 +692,24 @@ impl LockTrackerX {
         lock_addr: *const T,
         creation: &Creation,
     ) {
+        let tracker = l_tracker.x.lock();
+        let current_thread_id = tracker.platform.current_thread_id();
         let attempted = Locked {
             lock_type,
             lock_addr: lock_addr as usize,
+            thread_id: current_thread_id,
             location: core::panic::Location::caller().into(),
         };
-        let tracker = l_tracker.x.lock();
-        if let Some(held) = tracker
-            .held
-            .iter()
-            .flatten()
-            .find(|held| held.rwlock_reentrant_attempt_would_deadlock(&attempted))
-        {
+        if let Some(held) = tracker.held.iter().flatten().find(|held| {
+            held.thread_id == current_thread_id && held.reentrant_attempt_would_deadlock(&attempted)
+        }) {
+            let lock_kind = match attempted.lock_type {
+                LockType::RwLock => "lock",
+                LockType::RwLockRead | LockType::RwLockWrite => "RwLock",
+                LockType::Mutex => "Mutex",
+            };
             panic!(
-                "Re-entrant RwLock acquisition would deadlock: lock created at {}:{}; current acquisition {attempted}; already held as {held}",
+                "Re-entrant {lock_kind} acquisition would deadlock: lock created at {}:{}; current acquisition {attempted}; already held as {held}",
                 creation.file, creation.line,
             );
         }
@@ -707,6 +727,7 @@ impl LockTrackerX {
         let locked = Locked {
             lock_type,
             lock_addr: lock_addr as usize,
+            thread_id: 0,
             location: location.into(),
         };
         let tracker = (CONFIG_PRINT_LOCK_ATTEMPTS
@@ -783,6 +804,10 @@ impl LockTrackerX {
             tracker: l_tracker,
         } = attempt;
         let mut tracker = l_tracker.x.lock();
+        let locked = Locked {
+            thread_id: tracker.platform.current_thread_id(),
+            ..locked
+        };
         let idx = tracker.held.len();
         tracker.held.push(Some(locked));
         if let Some(max_allowed) = CONFIG_PRINT_LOCKS_SLOWER_THAN {

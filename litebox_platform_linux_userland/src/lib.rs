@@ -3054,6 +3054,15 @@ fn bridge_worker_output_to_stream(
 
 impl litebox::platform::Provider for LinuxUserland {}
 
+impl litebox::platform::ThreadIdentityProvider for LinuxUserland {
+    fn current_thread_id(&self) -> usize {
+        // SAFETY: `gettid` has no memory-safety preconditions and returns the
+        // kernel thread id for the calling thread.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        usize::try_from(tid).expect("gettid returned a negative thread id")
+    }
+}
+
 impl litebox::platform::RawMessageProvider for LinuxUserland {
     fn send_raw_message(&self, data: &[u8]) -> Result<usize, litebox::platform::SendError> {
         let guard = self.raw_message_fd.read().unwrap();

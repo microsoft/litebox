@@ -51,9 +51,17 @@ pub trait Provider:
     + TimeProvider
     + PunchthroughProvider
     + DebugLogProvider
+    + ThreadIdentityProvider
     + RawPointerProvider
     + AddressSpaceProvider
 {
+}
+
+/// Provides a cheap identity for the current host thread.
+pub trait ThreadIdentityProvider {
+    /// Returns an identifier that is stable for the calling thread while it is
+    /// running and distinct from other concurrently-running threads.
+    fn current_thread_id(&self) -> usize;
 }
 
 /// Thread management provider.

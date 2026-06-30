@@ -222,6 +222,13 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
             .ensure_registered(LockType::Mutex, || self.raw.raw.underlying_atomic());
 
         #[cfg(feature = "lock_tracing")]
+        super::lock_tracing::LockTracker::panic_on_reentrant_lock_attempt(
+            LockType::Mutex,
+            self.raw.raw.underlying_atomic(),
+            &self.creation,
+        );
+
+        #[cfg(feature = "lock_tracing")]
         let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
             LockType::Mutex,
             self.raw.raw.underlying_atomic(),
@@ -251,5 +258,135 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for Mutex<Platform, T>
     fn drop(&mut self) {
         self.creation
             .record_destruction_if_registered(LockType::Mutex, self.raw.raw.underlying_atomic());
+    }
+}
+
+#[cfg(all(test, feature = "lock_tracing"))]
+mod tests {
+    extern crate std;
+
+    use std::any::Any;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::string::String;
+    use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError, mpsc};
+    use std::time::Duration;
+
+    use crate::platform::mock::MockPlatform;
+    use crate::sync::lock_tracing::LockTracker;
+
+    use super::Mutex;
+
+    type TestMutex<T> = Mutex<MockPlatform, T>;
+
+    fn init_lock_tracing() {
+        LockTracker::init(MockPlatform::new());
+    }
+
+    fn serialize_lock_tracing_tests() -> StdMutexGuard<'static, ()> {
+        static TEST_MUTEX: StdMutex<()> = StdMutex::new(());
+        TEST_MUTEX.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn assert_reentrant_mutex_panic(payload: &(dyn Any + Send)) {
+        let message = if let Some(message) = payload.downcast_ref::<&'static str>() {
+            *message
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.as_str()
+        } else {
+            panic!("re-entrant Mutex panic should use a string payload");
+        };
+
+        assert!(
+            message.contains("Re-entrant Mutex acquisition would deadlock"),
+            "unexpected panic message: {message}",
+        );
+        assert!(
+            message.contains("lock created at "),
+            "panic should locate the lock creation site: {message}",
+        );
+        assert!(
+            message.contains("current acquisition "),
+            "panic should locate the current acquisition site: {message}",
+        );
+    }
+
+    #[test]
+    fn lock_tracing_panics_on_same_thread_reentrant_mutex_lock() {
+        let _test_guard = serialize_lock_tracing_tests();
+        init_lock_tracing();
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let lock = TestMutex::new(());
+            let _first_lock = lock.lock();
+            let _second_lock = lock.lock();
+        }))
+        .expect_err("re-entrant lock of the same Mutex should panic");
+
+        assert_reentrant_mutex_panic(payload.as_ref());
+    }
+
+    #[test]
+    fn lock_tracing_allows_same_thread_locks_of_different_mutexes() {
+        let _test_guard = serialize_lock_tracing_tests();
+        init_lock_tracing();
+
+        let first = TestMutex::new(1);
+        let second = TestMutex::new(2);
+        let _first_lock = first.lock();
+        let _second_lock = second.lock();
+    }
+
+    #[test]
+    fn lock_tracing_allows_cross_thread_mutex_contention() {
+        let _test_guard = serialize_lock_tracing_tests();
+        init_lock_tracing();
+
+        let lock = Arc::new(TestMutex::new(()));
+        let (held_tx, held_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let holder_lock = Arc::clone(&lock);
+        let holder = std::thread::spawn(move || {
+            let _held = holder_lock.lock();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        held_rx.recv().unwrap();
+
+        let contender_lock = Arc::clone(&lock);
+        let contender = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let _contended = contender_lock.lock();
+        });
+
+        attempt_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+
+        holder.join().expect("holder thread should not panic");
+        contender
+            .join()
+            .expect("cross-thread Mutex contention should not panic");
+    }
+
+    fn helper_that_relocks(lock: &TestMutex<u32>) {
+        let _nested_lock = lock.lock();
+    }
+
+    #[test]
+    fn lock_tracing_catches_helper_relocking_mutex_repro() {
+        let _test_guard = serialize_lock_tracing_tests();
+        init_lock_tracing();
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let state = TestMutex::new(0);
+            let _state_lock = state.lock();
+            helper_that_relocks(&state);
+        }))
+        .expect_err("helper re-locking a held Mutex should panic under lock tracing");
+
+        assert_reentrant_mutex_panic(payload.as_ref());
     }
 }
