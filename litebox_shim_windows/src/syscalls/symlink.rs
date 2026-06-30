@@ -503,6 +503,24 @@ mod tests {
     }
 
     #[test]
+    fn predefined_known_dll_path_symbolic_link_matches_loader_contract() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let opened = open_link(&task, r"\KnownDlls\KnownDllPath");
+            let target = r"C:\Windows\System32";
+            let mut output = alloc::vec![0u16; target.encode_utf16().count() + 1];
+            let (target_string, returned_length) = query_link(&task, opened, &mut output);
+
+            assert_eq!(returned_length, u32::from(target_string.length) + 2);
+            assert_eq!(
+                String::from_utf16_lossy(&output[..target_string.length as usize / 2]),
+                target
+            );
+            assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
     fn create_symbolic_link_rejects_empty_target() {
         run_with_test_platform_pointers(|| {
             let task = test_task();

@@ -50,6 +50,11 @@ const SEEDED_DIRECTORY_PATHS: &[&str] = &[
     r"\Sessions\BNOLINKS",
 ];
 
+// Wine's wineboot and ReactOS SMSS create KnownDllPath so ntdll can open/query
+// the DOS path prefix for known DLL lookups during loader initialization.
+const SEEDED_SYMLINK_PATHS: &[(&str, &str)] =
+    &[(r"\KnownDlls\KnownDllPath", r"C:\Windows\System32")];
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct DirectoryAccess: u32 {
@@ -426,6 +431,19 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         assert!(
             status == NtStatus::SUCCESS,
             "seeded NT object directory must have seeded ancestors: {status:?}"
+        );
+    }
+
+    fn seed_symlink(&self, path: &str, target: &str) {
+        let status = self.create_symlink(
+            path,
+            target.to_string(),
+            |_| NtStatus::SUCCESS,
+            |_| NtStatus::SUCCESS,
+        );
+        assert!(
+            status == NtStatus::SUCCESS,
+            "seeded NT object symbolic link must have seeded ancestors: {status:?}"
         );
     }
 
@@ -1064,6 +1082,9 @@ pub(crate) fn seed_directory_namespace<Platform: crate::ShimPlatform>()
     let namespace = DirectoryNamespace::new();
     for path in SEEDED_DIRECTORY_PATHS {
         namespace.seed_directory(path);
+    }
+    for (path, target) in SEEDED_SYMLINK_PATHS {
+        namespace.seed_symlink(path, target);
     }
     namespace
 }
