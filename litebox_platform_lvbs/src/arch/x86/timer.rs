@@ -78,6 +78,18 @@ const REF_TICKS_PER_MICRO: u64 = 10;
 /// Quantum as a reference-counter tick count (STIMER deadlines are in ticks).
 const QUANTUM_100NS: u64 = QUANTUM_MICROS * REF_TICKS_PER_MICRO;
 
+/// Nanoseconds per partition reference-counter tick: the counter runs at
+/// 10 MHz (`REF_TICKS_PER_MICRO` ticks per microsecond).
+pub(crate) const REF_COUNTER_TICK_NANOS: u64 = 1_000 / REF_TICKS_PER_MICRO;
+
+/// Read the Hyper-V partition reference counter (`HV_X64_MSR_TIME_REF_COUNT`).
+///
+/// A monotonic, frequency-invariant counter in 100 ns units, normalized by the
+/// hypervisor across TSC scaling and live migration.
+pub(crate) fn reference_time_100ns() -> u64 {
+    rdmsr(HV_X64_MSR_TIME_REF_COUNT)
+}
+
 // TODO: This backend is Hyper-V specific (STIMER direct mode). For non-Hyper-V
 // platforms, add alternative one-shot timer sources behind the same
 // arm/disarm/eoi interface and have `init` pick one per platform:

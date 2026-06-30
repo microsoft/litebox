@@ -7,10 +7,7 @@
 #![no_std]
 
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
-use core::{
-    arch::asm,
-    sync::atomic::{AtomicU32, AtomicU64},
-};
+use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
@@ -75,8 +72,6 @@ fn box_new_zeroed<T: FromBytes>() -> alloc::boxed::Box<T> {
     // T: FromBytes guarantees all-zero is a valid bit pattern.
     unsafe { alloc::boxed::Box::from_raw(ptr) }
 }
-
-static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
 /// Special page table ID for the base (kernel-only) page table.
 /// No real physical frame has address 0, so this is a safe sentinel.
@@ -615,10 +610,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         }))
     }
 
-    pub fn init(&self, cpu_mhz: u64) {
-        CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
-    }
-
     /// Returns the physical frame range belonging to VTL1.
     pub fn vtl1_phys_frame_range(&self) -> PhysFrameRange<Size4KiB> {
         self.vtl1_phys_frame_range
@@ -1043,7 +1034,10 @@ impl<Host: HostInterface> RawMutex<Host> {
     }
 }
 
-/// An implementation of [`litebox::platform::Instant`]
+/// An implementation of [`litebox::platform::Instant`].
+///
+/// Backed by the Hyper-V partition reference counter, which is monotonic
+/// and normalized by the hypervisor across TSC scaling and live migration.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
@@ -1065,37 +1059,22 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.0.checked_sub(earlier.0).map(|v| {
-            core::time::Duration::from_micros(
-                v / CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed),
-            )
-        })
+        let ticks = self.0.checked_sub(earlier.0)?;
+        // Each reference-counter tick is `REF_COUNTER_TICK_NANOS` (100) ns.
+        let nanos = ticks.checked_mul(crate::arch::timer::REF_COUNTER_TICK_NANOS)?;
+        Some(core::time::Duration::from_nanos(nanos))
     }
 
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
-        let duration_micros: u64 = duration.as_micros().try_into().ok()?;
-        Some(Instant(self.0.checked_add(
-            duration_micros.checked_mul(CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed))?,
-        )?))
+        let nanos: u64 = duration.as_nanos().try_into().ok()?;
+        let ticks = nanos / crate::arch::timer::REF_COUNTER_TICK_NANOS;
+        Some(Instant(self.0.checked_add(ticks)?))
     }
 }
 
 impl Instant {
-    fn rdtsc() -> u64 {
-        let lo: u32;
-        let hi: u32;
-        unsafe {
-            asm!(
-                "rdtsc",
-                out("eax") lo,
-                out("edx") hi,
-            );
-        }
-        (u64::from(hi) << 32) | u64::from(lo)
-    }
-
     fn now() -> Self {
-        Instant(Self::rdtsc())
+        Instant(crate::arch::timer::reference_time_100ns())
     }
 }
 

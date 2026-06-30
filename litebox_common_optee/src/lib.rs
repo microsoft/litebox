@@ -88,6 +88,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         buf: Platform::RawConstPointer<u8>,
         len: usize,
     },
+    GetTime {
+        cat: TeeTimeCategory,
+        time: Platform::RawMutPointer<TeeTime>,
+    },
     CrypStateAlloc {
         algo: TeeAlgorithm,
         op_mode: TeeOperationMode,
@@ -201,6 +205,10 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 flags: TeeMemoryAccessRights::try_from_usize(ctx.syscall_arg(0))?,
                 buf: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
                 len: ctx.syscall_arg(2),
+            },
+            TeeSyscallNr::GetTime => SyscallRequest::GetTime {
+                cat: TeeTimeCategory::try_from_usize(ctx.syscall_arg(0))?,
+                time: Platform::RawMutPointer::from_usize(ctx.syscall_arg(1)),
             },
             TeeSyscallNr::CrypStateAlloc => SyscallRequest::CrypStateAlloc {
                 algo: TeeAlgorithm::try_from_usize(ctx.syscall_arg(0))?,
@@ -781,6 +789,40 @@ pub struct TeeObjectInfo {
     pub handle_flags: TeeHandleFlag,
 }
 
+/// `TEE_Time` from `optee_os/lib/libutee/include/tee_api_types.h`.
+///
+/// Time since an implementation-defined origin, split into whole seconds plus
+/// a millisecond remainder (`millis` is always in `0..1000`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes)]
+#[repr(C)]
+pub struct TeeTime {
+    pub seconds: u32,
+    pub millis: u32,
+}
+
+/// `UTEE_TIME_CAT_*` from `optee_os/lib/libutee/include/utee_types.h`, the
+/// time category passed to the `get_time` syscall (`_utee_get_time`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromPrimitive)]
+#[repr(u32)]
+pub enum TeeTimeCategory {
+    /// `TEE_GetSystemTime`: monotonic time with an arbitrary, per-TA-instance
+    /// origin.
+    System = 0,
+    /// `TEE_GetTAPersistentTime`: persistent, TA-settable time.
+    TaPersistent = 1,
+    /// `TEE_GetREETime`: normal-world (REE) wall-clock time.
+    Ree = 2,
+}
+
+impl TeeTimeCategory {
+    pub fn try_from_usize(value: usize) -> Result<Self, Errno> {
+        u32::try_from(value)
+            .ok()
+            .and_then(|v| Self::try_from(v).ok())
+            .ok_or(Errno::EINVAL)
+    }
+}
+
 /// `TEE_USAGE_*` from `optee_os/lib/libutee/include/tee_api_defines.h`
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(transparent)]
@@ -1101,6 +1143,20 @@ pub enum TeeResult {
 impl From<TeeResult> for u32 {
     fn from(res: TeeResult) -> Self {
         res as u32
+    }
+}
+
+impl From<Errno> for TeeResult {
+    fn from(err: Errno) -> Self {
+        match err {
+            Errno::ENOSYS => Self::NotSupported,
+            Errno::EINVAL => Self::BadParameters,
+            Errno::EFAULT | Errno::EPERM | Errno::EACCES => Self::AccessDenied,
+            Errno::ENOMEM => Self::OutOfMemory,
+            Errno::EOVERFLOW => Self::Overflow,
+            Errno::EBUSY => Self::Busy,
+            _ => Self::GenericError,
+        }
     }
 }
 

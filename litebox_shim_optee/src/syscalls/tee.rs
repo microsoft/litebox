@@ -9,8 +9,8 @@ use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{
-    TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeUuid, UserTaPropType,
-    UteeParams,
+    TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeTime, TeeTimeCategory,
+    TeeUuid, UserTaPropType, UteeParams,
 };
 use num_enum::TryFromPrimitive;
 use zerocopy::IntoBytes;
@@ -317,6 +317,35 @@ impl Task {
         } else {
             Err(TeeResult::AccessDenied)
         }
+    }
+
+    /// A system call to read the current time for a category.
+    ///
+    /// Only the GP "system time" category is supported; it is monotonic with a
+    /// per-instance arbitrary origin (see [`crate::GlobalState`]). The
+    /// TA-persistent and REE categories would require secure storage and a
+    /// normal-world RPC respectively, neither of which the shim provides.
+    pub fn sys_get_time(
+        &self,
+        cat: TeeTimeCategory,
+        time: UserMutPtr<TeeTime>,
+    ) -> Result<(), TeeResult> {
+        let tee_time = match cat {
+            TeeTimeCategory::System => {
+                let elapsed = self.global.system_time();
+                TeeTime {
+                    // `seconds` is a u32 in the GP `TEE_Time`; saturate rather than wrap.
+                    seconds: u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX),
+                    millis: elapsed.subsec_millis(),
+                }
+            }
+            // Persistent time was never set by this TA; report it per the spec.
+            TeeTimeCategory::TaPersistent => return Err(TeeResult::TimeNotSet),
+            // REE (normal-world) time requires an RPC the shim does not issue.
+            TeeTimeCategory::Ree => return Err(TeeResult::NotSupported),
+        };
+        time.write_at_offset(0, tee_time)
+            .ok_or(TeeResult::AccessDenied)
     }
 }
 

@@ -41,3 +41,28 @@ fn test_cryp_random_number_generate() {
     let result = task.sys_cryp_random_number_generate(&mut buf);
     assert!(result.is_ok() && buf != [0u8; 16]);
 }
+
+#[test]
+fn test_sys_get_time_system_is_monotonic() {
+    use litebox::platform::RawConstPointer as _;
+    use litebox_common_optee::{TeeTime, TeeTimeCategory};
+
+    let task = init_platform();
+
+    let mut first = TeeTime::default();
+    let first_ptr = crate::UserMutPtr::<TeeTime>::from_usize(&raw mut first as usize);
+    task.sys_get_time(TeeTimeCategory::System, first_ptr)
+        .expect("system time should be supported");
+
+    let mut second = TeeTime::default();
+    let second_ptr = crate::UserMutPtr::<TeeTime>::from_usize(&raw mut second as usize);
+    task.sys_get_time(TeeTimeCategory::System, second_ptr)
+        .expect("system time should be supported");
+
+    // `millis` is the sub-second remainder, so always in `0..1000`.
+    assert!(first.millis < 1000 && second.millis < 1000);
+
+    let first_ms = u64::from(first.seconds) * 1000 + u64::from(first.millis);
+    let second_ms = u64::from(second.seconds) * 1000 + u64::from(second.millis);
+    assert!(second_ms >= first_ms, "system time went backwards");
+}
