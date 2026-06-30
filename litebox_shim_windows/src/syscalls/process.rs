@@ -3,13 +3,13 @@
 
 use core::sync::atomic::Ordering;
 use int_enum::IntEnum;
-use litebox::platform::RawMutPointer as _;
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::ProcessHandle;
-use crate::{MutPtr, ShimFS, ShimPlatform, Task};
+use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
 
 const ACTIVE_PROCESS_EXIT_STATUS: i32 = 0x0000_0103;
 const NORMAL_PROCESS_BASE_PRIORITY: i32 = 8;
@@ -52,6 +52,12 @@ struct ProcessBasicInformation {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct ProcessDefaultHardErrorMode {
     default_hard_error_mode: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable)]
+struct ProcessSchedulerSharedDataSlotInformation {
+    scheduler_shared_data_handle: usize,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -138,6 +144,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         status
     }
 
+    pub(crate) fn sys_nt_set_information_process(
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: ConstPtr<Platform, u8>,
+        process_information_length: u32,
+    ) -> NtStatus {
+        let Ok(process_information_class) =
+            ProcessInformationClass::try_from(process_information_class)
+        else {
+            litebox_util_log::debug!(
+                process_information_class = process_information_class;
+                "Unsupported NtSetInformationProcess class"
+            );
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+
+        let status = match process_information_class {
+            ProcessInformationClass::SchedulerSharedData => {
+                Self::set_process_scheduler_shared_data(
+                    process_handle,
+                    process_information,
+                    process_information_length,
+                )
+            }
+            // TODO: implement additional settable process information classes when a guest
+            // exercises them.
+            ProcessInformationClass::BasicInformation
+            | ProcessInformationClass::DebugPort
+            | ProcessInformationClass::DefaultHardErrorMode
+            | ProcessInformationClass::Wow64Information
+            | ProcessInformationClass::DebugFlags
+            | ProcessInformationClass::TlsInformation
+            | ProcessInformationClass::Cookie
+            | ProcessInformationClass::ConsoleHostProcess
+            | ProcessInformationClass::ImageInformation => {
+                litebox_util_log::debug!(
+                    process_information_class:? = process_information_class;
+                    "Unsupported NtSetInformationProcess class"
+                );
+                NtStatus::INVALID_INFO_CLASS
+            }
+        };
+
+        if status == NtStatus::SUCCESS {
+            litebox_util_log::debug!(
+                process_information_class:? = process_information_class,
+                process_information_length = process_information_length;
+                "Handled NtSetInformationProcess syscall"
+            );
+        }
+
+        status
+    }
+
     fn write_process_information<T: Immutable + IntoBytes>(
         process_information: MutPtr<Platform, u8>,
         process_information_length: u32,
@@ -163,6 +223,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
+    fn set_process_scheduler_shared_data(
+        process_handle: ProcessHandle,
+        process_information: ConstPtr<Platform, u8>,
+        process_information_length: u32,
+    ) -> NtStatus {
+        if process_information_length
+            < size_of::<ProcessSchedulerSharedDataSlotInformation>().trunc()
+        {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if !process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        let process_information =
+            ConstPtr::<Platform, ProcessSchedulerSharedDataSlotInformation>::from_usize(
+                process_information.as_usize(),
+            );
+        if process_information.read_at_offset(0).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        // Host 25H2 returns SUCCESS after probing this struct even when the inner scheduler
+        // shared-data handle is null or bogus; LiteBox has no scheduler-shared-data object to bind.
+        NtStatus::SUCCESS
+    }
+
     fn process_basic_information(&self) -> ProcessBasicInformation {
         ProcessBasicInformation {
             exit_status: ACTIVE_PROCESS_EXIT_STATUS,
@@ -185,16 +272,21 @@ pub(crate) const fn default_process_cookie() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{mut_byte_ptr, mut_ptr, null_mut_ptr};
+    use crate::tests::{mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr};
     use litebox::platform::ThreadProvider;
 
     const RETURN_LENGTH_SENTINEL: u32 = 0xaaaa_aaaa;
 
     type TestPlatform = crate::tests::TestPlatform;
+    type TestTask = Task<TestPlatform, crate::tests::TestFS>;
 
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
         let _ = crate::tests::test_platform();
         <TestPlatform as ThreadProvider>::run_test_thread(f)
+    }
+
+    fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
+        ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
     }
 
     #[test]
@@ -271,6 +363,68 @@ mod tests {
         });
     }
 
+    #[test]
+    fn nt_set_information_process_scheduler_shared_data_validates_arguments() {
+        run_with_test_platform_pointers(|| {
+            let information = ProcessSchedulerSharedDataSlotInformation {
+                scheduler_shared_data_handle: 0,
+            };
+            let information_len: u32 =
+                size_of::<ProcessSchedulerSharedDataSlotInformation>().trunc();
+            let bad_handle = ProcessHandle::from_raw(0x1234);
+
+            assert_eq!(
+                TestTask::sys_nt_set_information_process(
+                    bad_handle,
+                    ProcessInformationClass::SchedulerSharedData as u32,
+                    null_const_ptr::<u8>(),
+                    information_len - 1,
+                ),
+                NtStatus::INFO_LENGTH_MISMATCH
+            );
+
+            assert_eq!(
+                TestTask::sys_nt_set_information_process(
+                    bad_handle,
+                    0xffff,
+                    const_byte_ptr(&information),
+                    information_len - 1,
+                ),
+                NtStatus::INVALID_INFO_CLASS
+            );
+
+            assert_eq!(
+                TestTask::sys_nt_set_information_process(
+                    bad_handle,
+                    ProcessInformationClass::SchedulerSharedData as u32,
+                    null_const_ptr::<u8>(),
+                    information_len,
+                ),
+                NtStatus::INVALID_HANDLE
+            );
+
+            assert_eq!(
+                TestTask::sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::SchedulerSharedData as u32,
+                    null_const_ptr::<u8>(),
+                    information_len,
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+
+            assert_eq!(
+                TestTask::sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::SchedulerSharedData as u32,
+                    const_byte_ptr(&information),
+                    information_len,
+                ),
+                NtStatus::SUCCESS
+            );
+        });
+    }
+
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     mod host_fidelity {
         use core::ffi::c_void;
@@ -285,6 +439,12 @@ mod tests {
                 process_information: *mut c_void,
                 process_information_length: u32,
                 return_length: *mut u32,
+            ) -> i32;
+            fn NtSetInformationProcess(
+                process_handle: *mut c_void,
+                process_information_class: u32,
+                process_information: *const c_void,
+                process_information_length: u32,
             ) -> i32;
         }
 
@@ -317,6 +477,25 @@ mod tests {
                     process_information,
                     process_information_length,
                     return_length,
+                )
+            };
+            NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
+        }
+
+        fn host_nt_set_information_process(
+            process_handle: *mut c_void,
+            process_information_class: u32,
+            process_information: *const c_void,
+            process_information_length: u32,
+        ) -> NtStatus {
+            // SAFETY: The host ntdll call treats these as user-mode input pointers, probes them,
+            // and does not retain them. Tests pass either valid locals or null to observe NTSTATUS.
+            let status = unsafe {
+                NtSetInformationProcess(
+                    process_handle,
+                    process_information_class,
+                    process_information,
+                    process_information_length,
                 )
             };
             NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
@@ -377,6 +556,148 @@ mod tests {
 
                 assert_eq!(shim, host);
                 assert_eq!(shim_return_length, host_return_length);
+            });
+        }
+
+        #[test]
+        fn nt_set_information_process_scheduler_shared_data_matches_host_statuses() {
+            run_with_test_platform_pointers(|| {
+                let null_information = ProcessSchedulerSharedDataSlotInformation {
+                    scheduler_shared_data_handle: 0,
+                };
+                let bogus_information = ProcessSchedulerSharedDataSlotInformation {
+                    scheduler_shared_data_handle: 0x1234,
+                };
+                let information_len: u32 =
+                    size_of::<ProcessSchedulerSharedDataSlotInformation>().trunc();
+                let current_process = usize::MAX as *mut c_void;
+                let bad_process = 0x1234usize as *mut c_void;
+                let scheduler_class = ProcessInformationClass::SchedulerSharedData as u32;
+                let bad_class = 0xffff;
+
+                let supported_status = host_nt_set_information_process(
+                    current_process,
+                    scheduler_class,
+                    core::ptr::from_ref(&null_information).cast::<c_void>(),
+                    information_len,
+                );
+
+                if supported_status != NtStatus::INVALID_INFO_CLASS {
+                    assert_eq!(supported_status, NtStatus::SUCCESS);
+
+                    for (
+                        process_handle,
+                        shim_process_handle,
+                        process_information_class,
+                        host_process_information,
+                        shim_process_information,
+                        process_information_length,
+                    ) in [
+                        (
+                            current_process,
+                            ProcessHandle::CURRENT,
+                            scheduler_class,
+                            core::ptr::from_ref(&null_information).cast::<c_void>(),
+                            const_byte_ptr(&null_information),
+                            information_len,
+                        ),
+                        (
+                            current_process,
+                            ProcessHandle::CURRENT,
+                            scheduler_class,
+                            core::ptr::from_ref(&bogus_information).cast::<c_void>(),
+                            const_byte_ptr(&bogus_information),
+                            information_len,
+                        ),
+                        (
+                            current_process,
+                            ProcessHandle::CURRENT,
+                            scheduler_class,
+                            core::ptr::from_ref(&null_information).cast::<c_void>(),
+                            const_byte_ptr(&null_information),
+                            information_len - 1,
+                        ),
+                        (
+                            current_process,
+                            ProcessHandle::CURRENT,
+                            scheduler_class,
+                            core::ptr::null(),
+                            null_const_ptr::<u8>(),
+                            information_len,
+                        ),
+                        (
+                            current_process,
+                            ProcessHandle::CURRENT,
+                            bad_class,
+                            core::ptr::from_ref(&null_information).cast::<c_void>(),
+                            const_byte_ptr(&null_information),
+                            information_len,
+                        ),
+                        (
+                            bad_process,
+                            ProcessHandle::from_raw(0x1234),
+                            scheduler_class,
+                            core::ptr::from_ref(&null_information).cast::<c_void>(),
+                            const_byte_ptr(&null_information),
+                            information_len,
+                        ),
+                        (
+                            bad_process,
+                            ProcessHandle::from_raw(0x1234),
+                            scheduler_class,
+                            core::ptr::null(),
+                            null_const_ptr::<u8>(),
+                            information_len - 1,
+                        ),
+                        (
+                            bad_process,
+                            ProcessHandle::from_raw(0x1234),
+                            bad_class,
+                            core::ptr::from_ref(&null_information).cast::<c_void>(),
+                            const_byte_ptr(&null_information),
+                            information_len - 1,
+                        ),
+                        (
+                            bad_process,
+                            ProcessHandle::from_raw(0x1234),
+                            scheduler_class,
+                            core::ptr::null(),
+                            null_const_ptr::<u8>(),
+                            information_len,
+                        ),
+                        (
+                            current_process,
+                            ProcessHandle::CURRENT,
+                            scheduler_class,
+                            core::ptr::null(),
+                            null_const_ptr::<u8>(),
+                            information_len - 1,
+                        ),
+                        (
+                            current_process,
+                            ProcessHandle::CURRENT,
+                            bad_class,
+                            core::ptr::from_ref(&null_information).cast::<c_void>(),
+                            const_byte_ptr(&null_information),
+                            information_len - 1,
+                        ),
+                    ] {
+                        let host = host_nt_set_information_process(
+                            process_handle,
+                            process_information_class,
+                            host_process_information,
+                            process_information_length,
+                        );
+                        let shim = TestTask::sys_nt_set_information_process(
+                            shim_process_handle,
+                            process_information_class,
+                            shim_process_information,
+                            process_information_length,
+                        );
+
+                        assert_eq!(shim, host);
+                    }
+                }
             });
         }
     }

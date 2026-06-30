@@ -1039,6 +1039,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtSetInformationProcess {
+                process_handle,
+                process_information_class,
+                process_information,
+                process_information_length,
+            } => {
+                let status = Self::sys_nt_set_information_process(
+                    process_handle,
+                    process_information_class,
+                    process_information,
+                    process_information_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetInformationThread {
+                thread_handle,
+                thread_information_class,
+                thread_information,
+                thread_information_length,
+            } => {
+                let status = Self::sys_nt_set_information_thread(
+                    thread_handle,
+                    thread_information_class,
+                    thread_information,
+                    thread_information_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
                 flag,
                 source,

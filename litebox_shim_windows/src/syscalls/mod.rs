@@ -11,6 +11,7 @@ pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod symlink;
 mod sysinfo;
+pub(crate) mod thread;
 pub(crate) mod timer;
 pub(crate) mod wait_completion_packet;
 pub(crate) mod worker_factory;
@@ -91,6 +92,24 @@ impl ProcessHandle {
     #[must_use]
     pub(crate) const fn as_handle(self) -> Handle {
         self.0
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ThreadHandle(Handle);
+
+impl ThreadHandle {
+    pub(crate) const CURRENT: Self = Self::from_raw(usize::MAX - 1);
+
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(Handle::from_raw(raw))
+    }
+
+    #[must_use]
+    pub(crate) fn is_current(self) -> bool {
+        self == Self::CURRENT
     }
 }
 
@@ -333,6 +352,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         process_information: Platform::RawMutPointer<u8>,
         process_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtSetInformationProcess {
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: Platform::RawConstPointer<u8>,
+        process_information_length: u32,
+    },
+    NtSetInformationThread {
+        thread_handle: ThreadHandle,
+        thread_information_class: u32,
+        thread_information: Platform::RawConstPointer<u8>,
+        thread_information_length: u32,
     },
     NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
         flag: u32,
@@ -649,6 +680,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 process_information:*,
                 process_information_length,
                 return_length:*,
+            })),
+            NtSysno::NtSetInformationProcess => Some(sys_req!(NtSetInformationProcess {
+                process_handle: { ProcessHandle::from_raw },
+                process_information_class,
+                process_information:*,
+                process_information_length,
+            })),
+            NtSysno::NtSetInformationThread => Some(sys_req!(NtSetInformationThread {
+                thread_handle: { ThreadHandle::from_raw },
+                thread_information_class,
+                thread_information:*,
+                thread_information_length,
             })),
             NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(
                 sys_req!(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
