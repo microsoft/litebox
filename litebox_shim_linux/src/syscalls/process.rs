@@ -10858,11 +10858,19 @@ fn worker_exec_host_stdio_source_fd<FS: ShimFS>(
     files: &crate::syscalls::file::FilesState<FS>,
     fd: &litebox::fd::TypedFd<FS>,
 ) -> Option<i32> {
-    global
+    // Resolve the host-stdio-source metadata in its own statement so the
+    // `descriptor_table()` read guard drops before the `.or_else` fallbacks.
+    // The first fallback (`worker_exec_tty_stdio_source_fd`) re-reads
+    // `descriptor_table()`; holding this temporary across it would be a
+    // re-entrant read on the writer-preferring RwLock that self-deadlocks if a
+    // writer queues between (same class as the `with_socket` fix, surfaced by
+    // the per-thread lock_tracing detector on the worker-exec stdio path).
+    let host_source = global
         .litebox
         .descriptor_table()
         .with_metadata(fd, |crate::HostStdioSourceFd(source_fd)| *source_fd)
-        .ok()
+        .ok();
+    host_source
         .or_else(|| worker_exec_tty_stdio_source_fd(raw_fd, global, fd))
         .or_else(|| worker_exec_host_stdio_fd(files, fd.object_id()))
 }
