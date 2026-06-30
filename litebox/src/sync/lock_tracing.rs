@@ -48,13 +48,12 @@ const CONFIG_MAX_NUMBER_OF_TRACKED_LOCKS: usize = 512;
 /// bracketing discipline has not been satisfied.
 const CONFIG_PANIC_ON_NON_BRACKETED_UNLOCK: bool = false;
 
-/// Panic if an RwLock acquisition would re-enter the same underlying RwLock on
-/// the current lock-tracked thread in a way that can self-deadlock.
+/// Panic if a lock acquisition would re-enter the same underlying lock on the
+/// current lock-tracked thread in a way that can self-deadlock.
 ///
 /// This is intentionally enabled whenever `lock_tracing` is enabled: normal
 /// builds compile this module out entirely, while lock-tracing CI should turn
-/// probabilistic writer-preferring RwLock self-deadlocks into deterministic,
-/// located panics.
+/// same-thread self-deadlocks into deterministic, located panics.
 const CONFIG_PANIC_ON_REENTRANT_LOCK: bool = true;
 
 /// Print the actual remaining locks if true; otherwise only print the specific lock that was locked
@@ -225,17 +224,25 @@ impl Locked {
         )
     }
 
-    fn rwlock_reentrant_attempt_would_deadlock(&self, attempt: &Self) -> bool {
+    fn reentrant_attempt_would_deadlock(&self, attempt: &Self) -> bool {
         if !self.is_same_underlying_lock(attempt) {
             return false;
         }
 
-        let held_read = self.lock_type == LockType::RwLockRead;
-        let held_write = self.lock_type == LockType::RwLockWrite;
-        let attempting_read = attempt.lock_type == LockType::RwLockRead;
-        let attempting_write = attempt.lock_type == LockType::RwLockWrite;
-
-        (held_read && attempting_read) || ((held_read || held_write) && attempting_write)
+        match (self.lock_type, attempt.lock_type) {
+            (LockType::RwLockRead, LockType::RwLockRead | LockType::RwLockWrite)
+            | (LockType::RwLockWrite, LockType::RwLockWrite)
+            | (LockType::Mutex, LockType::Mutex) => true,
+            (
+                LockType::RwLock,
+                LockType::RwLock | LockType::RwLockRead | LockType::RwLockWrite | LockType::Mutex,
+            )
+            | (LockType::RwLockRead, LockType::RwLock | LockType::Mutex)
+            | (LockType::RwLockWrite, LockType::RwLock | LockType::RwLockRead | LockType::Mutex)
+            | (LockType::Mutex, LockType::RwLock | LockType::RwLockRead | LockType::RwLockWrite) => {
+                false
+            }
+        }
     }
 }
 
@@ -539,7 +546,7 @@ impl LockTracker {
     }
 
     /// Panic if the current lock attempt would re-enter the same underlying
-    /// RwLock in a pattern known to self-deadlock.
+    /// lock in a pattern known to self-deadlock.
     ///
     /// This check must run before blocking in the raw lock operation.
     #[track_caller]
@@ -686,10 +693,15 @@ impl LockTrackerX {
             .held
             .iter()
             .flatten()
-            .find(|held| held.rwlock_reentrant_attempt_would_deadlock(&attempted))
+            .find(|held| held.reentrant_attempt_would_deadlock(&attempted))
         {
+            let lock_kind = match attempted.lock_type {
+                LockType::RwLock => "lock",
+                LockType::RwLockRead | LockType::RwLockWrite => "RwLock",
+                LockType::Mutex => "Mutex",
+            };
             panic!(
-                "Re-entrant RwLock acquisition would deadlock: lock created at {}:{}; current acquisition {attempted}; already held as {held}",
+                "Re-entrant {lock_kind} acquisition would deadlock: lock created at {}:{}; current acquisition {attempted}; already held as {held}",
                 creation.file, creation.line,
             );
         }
