@@ -53,7 +53,12 @@ impl<Platform> RawSyncPrimitivesProvider for Platform where
 #[cfg(feature = "lock_tracing")]
 /// A convenience name for specific requirements from the platform
 pub trait RawSyncPrimitivesProvider:
-    platform::RawMutexProvider + platform::TimeProvider + platform::DebugLogProvider + Sync + 'static
+    platform::RawMutexProvider
+    + platform::TimeProvider
+    + platform::DebugLogProvider
+    + platform::ThreadIdentityProvider
+    + Sync
+    + 'static
 {
 }
 #[cfg(feature = "lock_tracing")]
@@ -61,6 +66,7 @@ impl<Platform> RawSyncPrimitivesProvider for Platform where
     Platform: platform::RawMutexProvider
         + platform::TimeProvider
         + platform::DebugLogProvider
+        + platform::ThreadIdentityProvider
         + Sync
         + 'static
 {

@@ -268,7 +268,8 @@ mod tests {
     use std::any::Any;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::string::String;
-    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
+    use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError, mpsc};
+    use std::time::Duration;
 
     use crate::platform::mock::MockPlatform;
     use crate::sync::lock_tracing::LockTracker;
@@ -333,6 +334,41 @@ mod tests {
         let second = TestMutex::new(2);
         let _first_lock = first.lock();
         let _second_lock = second.lock();
+    }
+
+    #[test]
+    fn lock_tracing_allows_cross_thread_mutex_contention() {
+        let _test_guard = serialize_lock_tracing_tests();
+        init_lock_tracing();
+
+        let lock = Arc::new(TestMutex::new(()));
+        let (held_tx, held_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let holder_lock = Arc::clone(&lock);
+        let holder = std::thread::spawn(move || {
+            let _held = holder_lock.lock();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        held_rx.recv().unwrap();
+
+        let contender_lock = Arc::clone(&lock);
+        let contender = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let _contended = contender_lock.lock();
+        });
+
+        attempt_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+
+        holder.join().expect("holder thread should not panic");
+        contender
+            .join()
+            .expect("cross-thread Mutex contention should not panic");
     }
 
     fn helper_that_relocks(lock: &TestMutex<u32>) {

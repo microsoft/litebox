@@ -188,6 +188,7 @@ impl core::fmt::Display for Location {
 struct Locked {
     lock_type: LockType,
     lock_addr: usize,
+    thread_id: usize,
     location: Location,
 }
 impl core::fmt::Display for Locked {
@@ -195,6 +196,7 @@ impl core::fmt::Display for Locked {
         let Self {
             lock_type,
             lock_addr: _,
+            thread_id: _,
             location,
         } = self;
         write!(f, "{lock_type}({location})")
@@ -205,9 +207,10 @@ impl core::fmt::Debug for Locked {
         let Self {
             lock_type,
             lock_addr,
+            thread_id,
             location,
         } = self;
-        write!(f, "{lock_type}@{lock_addr:x}({location})")
+        write!(f, "{lock_type}@{lock_addr:x}#thread{thread_id}({location})")
     }
 }
 impl Locked {
@@ -509,6 +512,8 @@ struct LockTrackerX<Platform: ?Sized = dyn DynLockTrackerProvider> {
 trait DynLockTrackerProvider: Send + Sync {
     /// Gets the current time, relative to some unspecified epoch.
     fn now(&self) -> Duration;
+    /// Gets a stable identity for the current thread.
+    fn current_thread_id(&self) -> usize;
     /// Print a debug log message.
     fn debug_log_print(&self, msg: &str);
 }
@@ -516,6 +521,10 @@ trait DynLockTrackerProvider: Send + Sync {
 impl<Platform: RawSyncPrimitivesProvider> DynLockTrackerProvider for LockTrackerPlatform<Platform> {
     fn now(&self) -> Duration {
         self.platform.now().duration_since(&self.start_time)
+    }
+
+    fn current_thread_id(&self) -> usize {
+        self.platform.current_thread_id()
     }
 
     fn debug_log_print(&self, msg: &str) {
@@ -683,18 +692,17 @@ impl LockTrackerX {
         lock_addr: *const T,
         creation: &Creation,
     ) {
+        let tracker = l_tracker.x.lock();
+        let current_thread_id = tracker.platform.current_thread_id();
         let attempted = Locked {
             lock_type,
             lock_addr: lock_addr as usize,
+            thread_id: current_thread_id,
             location: core::panic::Location::caller().into(),
         };
-        let tracker = l_tracker.x.lock();
-        if let Some(held) = tracker
-            .held
-            .iter()
-            .flatten()
-            .find(|held| held.reentrant_attempt_would_deadlock(&attempted))
-        {
+        if let Some(held) = tracker.held.iter().flatten().find(|held| {
+            held.thread_id == current_thread_id && held.reentrant_attempt_would_deadlock(&attempted)
+        }) {
             let lock_kind = match attempted.lock_type {
                 LockType::RwLock => "lock",
                 LockType::RwLockRead | LockType::RwLockWrite => "RwLock",
@@ -719,6 +727,7 @@ impl LockTrackerX {
         let locked = Locked {
             lock_type,
             lock_addr: lock_addr as usize,
+            thread_id: 0,
             location: location.into(),
         };
         let tracker = (CONFIG_PRINT_LOCK_ATTEMPTS
@@ -795,6 +804,10 @@ impl LockTrackerX {
             tracker: l_tracker,
         } = attempt;
         let mut tracker = l_tracker.x.lock();
+        let locked = Locked {
+            thread_id: tracker.platform.current_thread_id(),
+            ..locked
+        };
         let idx = tracker.held.len();
         tracker.held.push(Some(locked));
         if let Some(max_allowed) = CONFIG_PRINT_LOCKS_SLOWER_THAN {
