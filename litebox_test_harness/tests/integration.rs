@@ -1825,6 +1825,12 @@ fn ensure_binaries_built(ws_root: &Path) {
         build_args.push("--features");
         build_args.push(&trace_feature_runner);
     }
+    let lock_tracing_feature_runner;
+    if std::env::var("LITEBOX_LOCK_TRACING").is_ok() {
+        lock_tracing_feature_runner = String::from("litebox_runner_linux_userland/lock_tracing");
+        build_args.push("--features");
+        build_args.push(&lock_tracing_feature_runner);
+    }
     let status = Command::new("cargo")
         .current_dir(ws_root)
         .args(&build_args)
