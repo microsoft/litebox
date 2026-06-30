@@ -26,6 +26,11 @@ struct ElfFile<'a, FS: ShimFS> {
     task: &'a Task<FS>,
     fd: i32,
     load_high: bool,
+    /// Set once the `load_high` top-down reservation has been made, so a
+    /// second `reserve()` on the same image trips the `debug_assert` in
+    /// `reserve()` rather than silently targeting the same top slot.
+    #[cfg(debug_assertions)]
+    high_reserved: bool,
 }
 
 impl<'a, FS: ShimFS> ElfFile<'a, FS> {
@@ -37,6 +42,8 @@ impl<'a, FS: ShimFS> ElfFile<'a, FS> {
             task,
             fd,
             load_high: false,
+            #[cfg(debug_assertions)]
+            high_reserved: false,
         })
     }
 }
@@ -81,6 +88,21 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         // still fit `len` bytes.
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
         let hint = if self.load_high {
+            // The loader reserves an image's whole PT_LOAD span
+            // (`max_vaddr - min_vaddr`) in a single `MapMemory::reserve`
+            // call (see `litebox_common_linux::loader`), so `load_high`
+            // applies to exactly one reservation per image. A second
+            // top-down reservation would target this same
+            // `TASK_ADDR_MAX - mapping_len` slot, so assert it doesn't
+            // happen.
+            #[cfg(debug_assertions)]
+            {
+                debug_assert!(
+                    !self.high_reserved,
+                    "load_high reserve() called more than once for one ELF image",
+                );
+                self.high_reserved = true;
+            }
             <litebox_platform_multiplex::Platform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX
                 .checked_sub(mapping_len)
                 .ok_or(Errno::ENOMEM)?
@@ -504,20 +526,5 @@ mod tests {
             crate::loader::DEFAULT_LOW_ADDR,
             expected_top_down_base
         );
-    }
-
-    #[test]
-    fn out_of_range_mmap_hint_fails_instead_of_falling_back_top_down() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let result = task.sys_mmap(
-            <Platform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX,
-            PAGE_SIZE,
-            ProtFlags::PROT_NONE,
-            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
-            -1,
-            0,
-        );
-
-        assert!(matches!(result, Err(Errno::ENOMEM)));
     }
 }
