@@ -366,7 +366,6 @@ mod tests {
         fs::{Mode, OFlags},
         platform::PageManagementProvider,
     };
-    use litebox_common_linux::ProtFlags;
     use litebox_platform_multiplex::Platform;
 
     use super::*;
