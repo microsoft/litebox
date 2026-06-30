@@ -94,8 +94,14 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
 pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
 
 /// A trait required for file systems to be used in the shim.
-pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
-impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
+pub trait ShimFS:
+    litebox::fs::FileSystem<DescriptorPlatform = Platform> + Send + Sync + 'static
+{
+}
+impl<T: litebox::fs::FileSystem<DescriptorPlatform = Platform> + Send + Sync + 'static> ShimFS
+    for T
+{
+}
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {

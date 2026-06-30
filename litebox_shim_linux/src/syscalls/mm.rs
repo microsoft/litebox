@@ -268,9 +268,10 @@ impl<FS: ShimFS> Task<FS> {
             return None;
         };
         let files = self.files.borrow();
+        let descriptors = self.global.litebox.descriptor_table();
         files
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
-                crate::RawFdRef::Fs(typed_fd) => files.fs.fd_path(typed_fd),
+                crate::RawFdRef::Fs(typed_fd) => files.fs.fd_path(typed_fd, &*descriptors),
                 #[cfg(feature = "worker_local_inet")]
                 crate::RawFdRef::Net(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::Eventfd(_) => None, // non-FS descriptor has no filesystem path

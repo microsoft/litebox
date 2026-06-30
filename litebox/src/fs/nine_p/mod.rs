@@ -16,6 +16,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use thiserror::Error;
 
+use crate::fd::Descriptors;
 use crate::fs::OFlags;
 use crate::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -844,9 +845,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
     }
 
     /// Get the stored path from any fd's Descriptor.
-    fn descriptor_path(&self, dirfd: &FileFd<Platform, W>) -> Option<alloc::string::String> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table.get_entry(dirfd)?;
+    fn descriptor_path(
+        dirfd: &FileFd<Platform, W>,
+        descriptors: &Descriptors<Platform>,
+    ) -> Option<alloc::string::String> {
+        let entry = descriptors.get_entry(dirfd)?;
         Some(entry.entry.path.clone())
     }
 
@@ -1215,6 +1218,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::priv
 impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::FileSystem
     for FileSystem<Platform, W>
 {
+    type DescriptorPlatform = Platform;
+
     fn walks_follow_symlinks(&self) -> bool {
         // The 9P broker walk canonicalizes every component via
         // fs::canonicalize(), so symlinks are always resolved server-side.
@@ -2445,8 +2450,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         self.rename(old_abs, new_abs)
     }
 
-    fn fd_path(&self, fd: &FileFd<Platform, W>) -> Option<alloc::string::String> {
-        self.descriptor_path(fd)
+    fn fd_path(
+        &self,
+        fd: &FileFd<Platform, W>,
+        descriptors: &Descriptors<Platform>,
+    ) -> Option<alloc::string::String> {
+        Self::descriptor_path(fd, descriptors)
     }
 
     fn mkdir_at(

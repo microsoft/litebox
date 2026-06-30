@@ -4,8 +4,9 @@
 //! File-system related functionality
 
 use crate::event::IOPollable;
-use crate::fd::{FdEnabledSubsystem, MetadataError, TypedFd};
+use crate::fd::{Descriptors, FdEnabledSubsystem, MetadataError, TypedFd};
 use crate::path;
+use crate::sync::RawSyncPrimitivesProvider;
 
 use alloc::vec::Vec;
 use bitflags::bitflags;
@@ -60,6 +61,10 @@ mod private {
 /// However, users of any of these file systems might find benefit in having most of their code
 /// depend on this trait, rather than on any individual file system.
 pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
+    /// The sync primitive provider used by the descriptor table that stores this
+    /// filesystem's fd entries.
+    type DescriptorPlatform: RawSyncPrimitivesProvider;
+
     /// Whether the FS backend automatically follows symlinks during walk.
     ///
     /// When `true`, callers should skip client-side `realpath`-like
@@ -379,8 +384,13 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Get the path associated with an open file descriptor, if available.
     ///
     /// Returns the path that was used to open the file. Used by the ELF
-    /// patch cache and diagnostics.
-    fn fd_path(&self, fd: &TypedFd<Self>) -> Option<alloc::string::String>;
+    /// patch cache and diagnostics. The caller supplies the descriptor-table
+    /// view so path lookup does not re-acquire the global descriptor-table lock.
+    fn fd_path(
+        &self,
+        fd: &TypedFd<Self>,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
+    ) -> Option<alloc::string::String>;
 }
 
 pub(crate) fn memfd_display_path(name: &str) -> alloc::string::String {
