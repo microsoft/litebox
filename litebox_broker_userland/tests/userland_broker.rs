@@ -8,9 +8,8 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use litebox_broker_local::{BrokerLocal, BrokerNotifications};
+use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::event::ReadinessState;
-use litebox_broker_protocol::message::{BrokerNotification, EventReadinessNotification};
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
 };
@@ -80,10 +79,9 @@ fn run_fake_runner(args: &[OsString]) {
     let control_socket_path = args.get(2).unwrap();
     let notification_socket_path = args.get(4).unwrap();
     let control_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
-    let notification_channel =
+    let _notification_channel =
         connect_notification_with_retry(Path::new(notification_socket_path)).unwrap();
     let mut local = BrokerLocal::negotiate(control_channel).unwrap();
-    let mut notifications = BrokerNotifications::new(notification_channel);
 
     let handle = local.create_event_with_count(0).unwrap();
     assert_eq!(
@@ -99,12 +97,6 @@ fn run_fake_runner(args: &[OsString]) {
         write_ready: true,
     };
     assert_eq!(local.add_event(handle, 1).unwrap(), readiness);
-    assert_eq!(
-        notifications.recv_notification().unwrap(),
-        Some(BrokerNotification::EventReadiness(
-            EventReadinessNotification { handle, readiness }
-        ))
-    );
 
     assert_eq!(
         local.wait_event(handle).unwrap(),
@@ -113,7 +105,6 @@ fn run_fake_runner(args: &[OsString]) {
             write_ready: true,
         }
     );
-    drop(notifications);
     drop(local);
 
     // SAFETY: `getppid` takes no pointer arguments and has no Rust-side aliasing requirements.
