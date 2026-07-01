@@ -159,6 +159,8 @@ impl NtStatus {
             0xC0000046 => "STATUS_MUTANT_NOT_OWNED: Mutant not owned",
             0xC0000047 => "STATUS_SEMAPHORE_LIMIT_EXCEEDED: Semaphore limit exceeded",
             0xC0000048 => "STATUS_PORT_ALREADY_SET: Port already set",
+            0xC0000049 => "STATUS_SECTION_NOT_IMAGE: Section not image",
+            0xC000004E => "STATUS_SECTION_PROTECTION: Section protection",
             0xC000004F => "STATUS_EAS_NOT_SUPPORTED: EAS not supported",
             0xC0000050 => "STATUS_EA_TOO_LARGE: EA too large",
             0xC0000056 => "STATUS_DELETE_PENDING: Delete pending",
@@ -420,6 +422,9 @@ impl NtStatus {
     /// STATUS_SECTION_TOO_BIG
     pub const SECTION_TOO_BIG: Self = Self::from_raw(0xC0000040);
 
+    /// STATUS_SECTION_NOT_IMAGE
+    pub const SECTION_NOT_IMAGE: Self = Self::from_raw(0xC0000049);
+
     /// STATUS_PORT_CONNECTION_REFUSED
     pub const PORT_CONNECTION_REFUSED: Self = Self::from_raw(0xC0000041);
 
@@ -434,6 +439,9 @@ impl NtStatus {
 
     /// STATUS_INVALID_PAGE_PROTECTION
     pub const INVALID_PAGE_PROTECTION: Self = Self::from_raw(0xC0000045);
+
+    /// STATUS_SECTION_PROTECTION
+    pub const SECTION_PROTECTION: Self = Self::from_raw(0xC000004E);
 
     /// STATUS_MUTANT_NOT_OWNED
     pub const MUTANT_NOT_OWNED: Self = Self::from_raw(0xC0000046);

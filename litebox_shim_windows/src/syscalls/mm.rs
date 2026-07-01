@@ -40,7 +40,7 @@ bitflags::bitflags! {
 }
 
 impl PageProtection {
-    const BASE_MASK: u32 = 0xff;
+    pub(super) const BASE_MASK: u32 = 0xff;
 
     fn base(self) -> u32 {
         self.bits() & Self::BASE_MASK
@@ -611,6 +611,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None => return NtStatus::NOT_COMMITTED,
         };
 
+        if !new_permissions.contains(MemoryRegionPermissions::READ)
+            && let Err(status) = super::section::synchronize_pagefile_views_in_range(
+                &self.process.section_views,
+                &self.process.virtual_allocations,
+                aligned_base,
+                aligned_len,
+            )
+        {
+            return status;
+        }
+
         if update_permissions(
             &self.global.page_manager,
             aligned_base,
@@ -1065,7 +1076,9 @@ fn mark_pages_decommitted<Platform: ShimPlatform>(
     allocation.pages.remove(base..end);
 }
 
-fn parse_page_protection(protect: u32) -> Option<(PageProtection, MemoryRegionPermissions)> {
+pub(super) fn parse_page_protection(
+    protect: u32,
+) -> Option<(PageProtection, MemoryRegionPermissions)> {
     let protect = PageProtection::from_bits(protect)?;
     let permissions = page_protect_to_permissions(protect)?;
     Some((protect, permissions))
@@ -1124,7 +1137,7 @@ fn permissions_to_page_protect(permissions: MemoryRegionPermissions) -> PageProt
     }
 }
 
-fn create_pages<Platform: ShimPlatform>(
+pub(super) fn create_pages<Platform: ShimPlatform>(
     page_manager: &WindowsPageManager<Platform>,
     suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
     length: NonZeroPageSize<PAGE_SIZE>,

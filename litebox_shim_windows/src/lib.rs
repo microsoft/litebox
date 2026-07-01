@@ -38,6 +38,9 @@ use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::section::{
+    MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
+};
 use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::wait_completion_packet::{
@@ -90,6 +93,10 @@ pub(crate) type WindowsNlsSectionMappings<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
 pub(crate) type WindowsVirtualAllocations<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
+pub(crate) type WindowsSectionNamespace<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<String, Weak<SectionObject<Platform>>>>;
+pub(crate) type WindowsSectionViews<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsSectionView<Platform>>>;
 pub(crate) type WindowsEventNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Weak<EventObject<Platform>>>>;
 pub(crate) type WindowsDirectoryNamespace<Platform> = DirectoryNamespace<Platform>;
@@ -101,6 +108,22 @@ pub(crate) struct WindowsVirtualAllocation {
     pub(crate) allocation_protect: syscalls::mm::PageProtection,
     pub(crate) type_: syscalls::mm::MemoryType,
     pub(crate) pages: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
+}
+
+pub(crate) struct WindowsSectionView<Platform: ShimPlatform> {
+    pub(crate) size: usize,
+    pub(crate) section_offset: usize,
+    pub(crate) section: Option<Arc<SectionObject<Platform>>>,
+}
+
+impl<Platform: ShimPlatform> Clone for WindowsSectionView<Platform> {
+    fn clone(&self) -> Self {
+        Self {
+            size: self.size,
+            section_offset: self.section_offset,
+            section: self.section.clone(),
+        }
+    }
 }
 
 pub type DefaultFS<Platform> = WindowsFS<Platform>;
@@ -343,6 +366,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
             directory_namespace,
             event_namespace: WindowsEventNamespace::<Platform>::new(BTreeMap::new()),
+            section_namespace: WindowsSectionNamespace::<Platform>::new(BTreeMap::new()),
+            section_views: WindowsSectionViews::<Platform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
             virtual_allocations: load_info.virtual_allocations,
             system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
@@ -387,6 +412,8 @@ pub struct Process<Platform: ShimPlatform> {
     handles: WindowsHandleStore<Platform>,
     directory_namespace: WindowsDirectoryNamespace<Platform>,
     event_namespace: WindowsEventNamespace<Platform>,
+    section_namespace: WindowsSectionNamespace<Platform>,
+    section_views: WindowsSectionViews<Platform>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,
     system_lcid: AtomicU32,
@@ -668,6 +695,50 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     desired_access,
                     object_attributes,
                     number_of_concurrent_threads,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateSection {
+                section_handle,
+                desired_access,
+                object_attributes,
+                maximum_size,
+                section_page_protection,
+                allocation_attributes,
+                file_handle,
+            } => {
+                let status = self.sys_nt_create_section(
+                    section_handle,
+                    desired_access,
+                    object_attributes,
+                    maximum_size,
+                    section_page_protection,
+                    allocation_attributes,
+                    file_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateSectionEx {
+                section_handle,
+                desired_access,
+                object_attributes,
+                maximum_size,
+                section_page_protection,
+                allocation_attributes,
+                file_handle,
+                extended_parameters,
+                extended_parameter_count,
+            } => {
+                let status = self.sys_nt_create_section_ex(
+                    section_handle,
+                    desired_access,
+                    object_attributes,
+                    maximum_size,
+                    section_page_protection,
+                    allocation_attributes,
+                    file_handle,
+                    extended_parameters,
+                    extended_parameter_count,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -1032,6 +1103,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQuerySection {
+                section_handle,
+                section_information_class,
+                section_information,
+                section_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_section(
+                    section_handle,
+                    section_information_class,
+                    section_information,
+                    section_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQueryInformationProcess {
                 process_handle,
                 process_information_class,
@@ -1208,6 +1295,80 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtMapViewOfSection {
+                section_handle,
+                process_handle,
+                base_address,
+                zero_bits,
+                commit_size,
+                section_offset,
+                view_size,
+                inherit_disposition,
+                allocation_type,
+                page_protection,
+            } => {
+                let status = self.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                    section_handle,
+                    process_handle,
+                    base_address,
+                    zero_bits,
+                    commit_size,
+                    section_offset,
+                    view_size,
+                    inherit_disposition,
+                    allocation_type,
+                    page_protection,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtMapViewOfSectionEx {
+                section_handle,
+                process_handle,
+                base_address,
+                zero_bits,
+                commit_size,
+                section_offset,
+                view_size,
+                inherit_disposition,
+                allocation_type,
+                page_protection,
+                extended_parameters,
+                extended_parameter_count,
+            } => {
+                let status = self.sys_nt_map_view_of_section_ex(
+                    MapViewOfSectionParameters {
+                        section_handle,
+                        process_handle,
+                        base_address,
+                        zero_bits,
+                        commit_size,
+                        section_offset,
+                        view_size,
+                        inherit_disposition,
+                        allocation_type,
+                        page_protection,
+                    },
+                    extended_parameters,
+                    extended_parameter_count,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtUnmapViewOfSection {
+                process_handle,
+                base_address,
+            } => {
+                let status = self.sys_nt_unmap_view_of_section(process_handle, base_address);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtUnmapViewOfSectionEx {
+                process_handle,
+                base_address,
+                flags,
+            } => {
+                let status =
+                    self.sys_nt_unmap_view_of_section_ex(process_handle, base_address, flags);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,
@@ -1315,6 +1476,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, SectionSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |section| visitor.section(section),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         NtStatus::INVALID_HANDLE
     }
 
@@ -1351,6 +1520,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     );
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
+
+    fn section(&self, section: SectionHandleObject<Platform>);
 }
 
 struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
@@ -1397,6 +1568,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {
         Task::<Platform, FS>::close_worker_factory(worker_factory);
+    }
+
+    fn section(&self, section: SectionHandleObject<Platform>) {
+        Task::<Platform, FS>::close_section(section);
     }
 }
 

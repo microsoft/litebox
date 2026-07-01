@@ -314,7 +314,10 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         }
     }
 
-    fn resolve_directory(&self, path: &str) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+    pub(super) fn resolve_directory(
+        &self,
+        path: &str,
+    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
         let tail = absolute_path_tail(path)?;
         let node = self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, false)?;
         if node.is_directory() {
@@ -322,6 +325,23 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         } else {
             Err(NtStatus::OBJECT_TYPE_MISMATCH)
         }
+    }
+
+    pub(super) fn resolve_object(&self, path: &str) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+        let tail = absolute_path_tail(path)?;
+        self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, true)
+    }
+
+    pub(super) fn parent_directory_exists(&self, path: &str) -> bool {
+        let path = trim_trailing_directory_path(path);
+        if path == r"\" {
+            return false;
+        }
+        let Some(index) = path.rfind('\\') else {
+            return false;
+        };
+        let parent = if index == 0 { r"\" } else { &path[..index] };
+        self.resolve_directory(parent).is_ok()
     }
 
     fn create_directory(
@@ -946,48 +966,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "Handled NtOpenDirectoryObject syscall"
         );
         NtStatus::SUCCESS
-    }
-
-    pub(crate) fn sys_nt_open_section(
-        &self,
-        section_handle: MutPtr<Platform, Handle>,
-        _desired_access: u32,
-        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
-    ) -> NtStatus {
-        if section_handle
-            .write_at_offset(0, Handle::default())
-            .is_none()
-        {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        let Some(object_attributes) = object_attributes else {
-            return NtStatus::INVALID_PARAMETER;
-        };
-
-        let directory_name =
-            match self.read_directory_object_attributes(Some(object_attributes), true) {
-                Ok((Some(_), Some(directory_name))) => directory_name,
-                Ok(_) => return NtStatus::INVALID_PARAMETER,
-                Err(status) => return status,
-            };
-
-        // ReactOS opens sections through ObOpenObjectByName(..., MmSectionObjectType, ...), and
-        // Wine routes NtOpenSection to open_mapping. LiteBox seeds \KnownDlls as an object
-        // directory but does not seed section objects, matching the guest-observed file fallback:
-        // host 25H2 returns OBJECT_NAME_NOT_FOUND for a missing KnownDlls leaf and
-        // OBJECT_TYPE_MISMATCH when an existing directory is opened as a section.
-        // TODO(section-subsystem): once section objects exist, validate SECTION_* desired access
-        // and return ACCESS_DENIED for denied opens instead of resolving every object as missing.
-        // Also validate OBJ_OPENLINK there: host 25H2 returns INVALID_PARAMETER for OBJ_OPENLINK
-        // only when opening an existing section; missing section names still return name-miss.
-        match self
-            .process
-            .directory_namespace
-            .resolve_directory(&directory_name.original_path)
-        {
-            Ok(_) | Err(NtStatus::OBJECT_TYPE_MISMATCH) => NtStatus::OBJECT_TYPE_MISMATCH,
-            Err(status) => status,
-        }
     }
 
     pub(crate) fn sys_nt_query_directory_object(

@@ -155,6 +155,8 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             handles: WindowsHandleStore::<TestPlatform>::new(RawDescriptorStorage::new()),
             directory_namespace,
             event_namespace: crate::WindowsEventNamespace::<TestPlatform>::new(BTreeMap::new()),
+            section_namespace: crate::WindowsSectionNamespace::<TestPlatform>::new(BTreeMap::new()),
+            section_views: crate::WindowsSectionViews::<TestPlatform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
             virtual_allocations: crate::WindowsVirtualAllocations::<TestPlatform>::new(
                 BTreeMap::new(),

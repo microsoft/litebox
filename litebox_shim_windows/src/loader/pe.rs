@@ -1224,6 +1224,58 @@ fn load_image<Platform: crate::ShimPlatform, FS: ShimFS>(
     load_image_with_writable_sections(fs, path, platform, page_manager, &[])
 }
 
+pub(crate) fn load_image_section<Platform: crate::ShimPlatform, FS: ShimFS>(
+    platform: &'static Platform,
+    fs: Arc<FS>,
+    path: &str,
+    page_manager: &crate::WindowsPageManager<Platform>,
+    virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
+) -> Result<MappingInfo, WindowsLoadError> {
+    let image = load_image(platform, fs, path, page_manager)?;
+    let mapping = image.mapping;
+    register_image_virtual_allocation(virtual_allocations, mapping, image.pages);
+    Ok(mapping)
+}
+
+pub(crate) struct ImageSectionMetadata {
+    pub(crate) transfer_address: usize,
+    pub(crate) file_size: u32,
+    pub(crate) subsystem: u32,
+    pub(crate) subsystem_major_version: u16,
+    pub(crate) subsystem_minor_version: u16,
+    pub(crate) image_characteristics: u16,
+    pub(crate) dll_characteristics: u16,
+    pub(crate) machine: u16,
+}
+
+pub(crate) fn image_section_metadata<FS: ShimFS>(
+    fs: Arc<FS>,
+    path: &str,
+) -> Result<ImageSectionMetadata, WindowsLoadError> {
+    let file = PeImageFile::open(fs, path)?;
+    let parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+    let file_size = file
+        .fs
+        .fd_file_status(&file.fd)
+        .map_err(PeImageAccessError::FileStatus)?
+        .size
+        .try_into()
+        .map_err(|_| PeImageAccessError::AddressOverflow)?;
+    Ok(ImageSectionMetadata {
+        transfer_address: parsed
+            .image_base()
+            .checked_add(parsed.entry_point_rva())
+            .ok_or(PeImageAccessError::AddressOverflow)?,
+        file_size,
+        subsystem: u32::from(parsed.subsystem()),
+        subsystem_major_version: parsed.major_subsystem_version(),
+        subsystem_minor_version: parsed.minor_subsystem_version(),
+        image_characteristics: parsed.characteristics(),
+        dll_characteristics: parsed.dll_characteristics(),
+        machine: parsed.machine(),
+    })
+}
+
 fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
     fs: Arc<FS>,
     path: &str,

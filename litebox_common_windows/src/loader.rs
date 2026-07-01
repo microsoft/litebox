@@ -489,6 +489,21 @@ impl PeParsedFile {
         self.image.image_base
     }
 
+    #[must_use]
+    pub fn machine(&self) -> u16 {
+        self.image.machine
+    }
+
+    #[must_use]
+    pub fn characteristics(&self) -> u16 {
+        self.image.characteristics
+    }
+
+    #[must_use]
+    pub fn dll_characteristics(&self) -> u16 {
+        self.image.dll_characteristics
+    }
+
     /// Returns whether the image opts into dynamic-base loading.
     #[must_use]
     pub fn has_dynamic_base(&self) -> bool {
