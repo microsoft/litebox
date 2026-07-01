@@ -42,7 +42,7 @@ type DefaultFS = litebox::fs::layered::FileSystem<
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
         Platform,
-        litebox::fs::resolver::Resolver<Platform, litebox::fs::devices::Devices<Platform>>,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
         litebox::fs::nine_p::FileSystem<Platform, litebox_shim_linux::transport::ShimTransport>,
     >,
 >;
@@ -239,7 +239,12 @@ pub extern "C" fn sandbox_process_init(
     };
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
-        litebox::fs::devices::Devices::migration_helper_standalone_new(litebox),
+        litebox::fs::composer::Composer::builder()
+            .mount("/", |allocator| {
+                litebox::fs::devices::Devices::new(litebox, allocator)
+            })
+            .build()
+            .unwrap(),
     );
     let default_fs = litebox::fs::layered::FileSystem::new(
         litebox,

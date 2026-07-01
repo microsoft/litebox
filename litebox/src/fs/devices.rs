@@ -135,19 +135,13 @@ where
 {
     /// Construct a new `Devices` backend.
     #[must_use]
-    pub(crate) fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
         let dev_dir_inode = allocator.next();
         Self {
             litebox: litebox.clone(),
             dev_dir_inode,
             _alloc: allocator,
         }
-    }
-
-    /// Migration helper.  This function will disappear soon.
-    #[must_use]
-    pub fn migration_helper_standalone_new(litebox: &LiteBox<Platform>) -> Self {
-        Self::new(litebox, InodeAllocator::standalone())
     }
 }
 

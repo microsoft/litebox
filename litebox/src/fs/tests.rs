@@ -1988,7 +1988,13 @@ mod stdio {
     fn stdio_open_read_write() {
         let platform = MockPlatform::new();
         let litebox = LiteBox::new(platform);
-        let fs = Resolver::new(&litebox, Devices::migration_helper_standalone_new(&litebox));
+        let fs = Resolver::new(
+            &litebox,
+            crate::fs::composer::Composer::builder()
+                .mount("/", |allocator| Devices::new(&litebox, allocator))
+                .build()
+                .unwrap(),
+        );
 
         // Test opening and writing to /dev/stdout
         let fd_stdout = fs
@@ -2033,7 +2039,13 @@ mod stdio {
     #[test]
     fn non_dev_path_fails() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = Resolver::new(&litebox, Devices::migration_helper_standalone_new(&litebox));
+        let fs = Resolver::new(
+            &litebox,
+            crate::fs::composer::Composer::builder()
+                .mount("/", |allocator| Devices::new(&litebox, allocator))
+                .build()
+                .unwrap(),
+        );
 
         // Attempt to open a non-/dev/* path
         let result = fs.open("foo", OFlags::RDONLY, Mode::empty());
@@ -2048,10 +2060,11 @@ mod stdio {
 
 mod layered_stdio {
     use crate::LiteBox;
+    use crate::fs::devices::Devices;
     use crate::fs::layered::LayeringSemantics;
     use crate::fs::resolver::Resolver;
     use crate::fs::{FileSystem as _, Mode, OFlags};
-    use crate::fs::{devices, in_mem, layered};
+    use crate::fs::{in_mem, layered};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     extern crate std;
@@ -2065,7 +2078,10 @@ mod layered_stdio {
             in_mem::FileSystem::new(&litebox),
             Resolver::new(
                 &litebox,
-                devices::Devices::migration_helper_standalone_new(&litebox),
+                crate::fs::composer::Composer::builder()
+                    .mount("/", |allocator| Devices::new(&litebox, allocator))
+                    .build()
+                    .unwrap(),
             ),
             LayeringSemantics::LowerLayerWritableFiles,
         );
@@ -2132,7 +2148,10 @@ mod layered_stdio {
             in_mem,
             Resolver::new(
                 &litebox,
-                devices::Devices::migration_helper_standalone_new(&litebox),
+                crate::fs::composer::Composer::builder()
+                    .mount("/", |allocator| Devices::new(&litebox, allocator))
+                    .build()
+                    .unwrap(),
             ),
             LayeringSemantics::LowerLayerWritableFiles,
         );
