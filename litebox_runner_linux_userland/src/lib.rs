@@ -1214,18 +1214,16 @@ fn build_initial_fs(
             |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
              path,
              mode| {
-                let fd = {
-                    let mut descriptors = litebox.descriptor_table_mut();
-                    fs.open(
+                let mut descriptors = litebox.descriptor_table_mut();
+                let fd = fs
+                    .open(
                         path,
                         litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
                         mode,
                         &mut *descriptors,
                     )
-                    .unwrap()
-                };
-                fs.initialize_primarily_read_heavy_file(&fd, prog_data);
-                let mut descriptors = litebox.descriptor_table_mut();
+                    .unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, prog_data, &mut *descriptors);
                 fs.close(&fd, &mut *descriptors).unwrap();
             };
         let last = ancestor_modes_and_users.last().ok_or_else(|| {
@@ -1826,26 +1824,23 @@ fn inject_program_image_into_in_mem(
             }
         }
 
-        let fd = {
-            let mut descriptors = litebox_sys.descriptor_table_mut();
-            match fs.open(
-                path_str,
-                litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                dir_mode,
-                &mut *descriptors,
-            ) {
-                Ok(fd) => fd,
-                Err(err) => {
-                    inject_error = Some(anyhow!(
-                        "failed to create worker exec image {}: {err:?}",
-                        program_path.display()
-                    ));
-                    return;
-                }
+        let mut descriptors = litebox_sys.descriptor_table_mut();
+        let fd = match fs.open(
+            path_str,
+            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+            dir_mode,
+            &mut *descriptors,
+        ) {
+            Ok(fd) => fd,
+            Err(err) => {
+                inject_error = Some(anyhow!(
+                    "failed to create worker exec image {}: {err:?}",
+                    program_path.display()
+                ));
+                return;
             }
         };
-        fs.initialize_primarily_read_heavy_file(&fd, program_data);
-        let mut descriptors = litebox_sys.descriptor_table_mut();
+        fs.initialize_primarily_read_heavy_file(&fd, program_data, &mut *descriptors);
         if let Err(err) = fs.close(&fd, &mut *descriptors) {
             inject_error = Some(anyhow!(
                 "failed to close worker exec image {}: {err:?}",
@@ -2458,18 +2453,16 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
                 });
             }
             in_mem.with_root_privileges(|fs| {
-                let fd = {
-                    let mut descriptors = litebox.descriptor_table_mut();
-                    fs.open(
+                let mut descriptors = litebox.descriptor_table_mut();
+                let fd = fs
+                    .open(
                         prog.to_str().unwrap(),
                         litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
                         Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         &mut *descriptors,
                     )
-                    .unwrap()
-                };
-                fs.initialize_primarily_read_heavy_file(&fd, data);
-                let mut descriptors = litebox.descriptor_table_mut();
+                    .unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, data, &mut *descriptors);
                 fs.close(&fd, &mut *descriptors).unwrap();
             });
         }

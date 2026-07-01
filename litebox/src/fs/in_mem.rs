@@ -36,6 +36,7 @@ const BLOCK_SIZE: usize = 0;
 /// This has no physical backing store, thus any files in memory are erased as soon as this object
 /// is dropped.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
+    #[cfg_attr(not(test), allow(dead_code))]
     litebox: LiteBox<Platform>,
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
@@ -110,8 +111,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         &mut self,
         fd: &FileFd<Platform>,
         data: alloc::borrow::Cow<'static, [u8]>,
+        descriptors: &mut Descriptors<Platform>,
     ) {
-        let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::File {
             file,
             read_allowed: _,
@@ -119,7 +120,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
             position: _,
             append_mode: _,
             ..
-        } = &mut descriptor_table.get_entry_mut(fd).unwrap().entry
+        } = &mut descriptors.get_entry_mut(fd).unwrap().entry
         else {
             panic!("must only be used on files, not directories")
         };
