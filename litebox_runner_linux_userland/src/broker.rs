@@ -30,18 +30,16 @@ pub(crate) fn connect(
     control_socket_path: Option<&Path>,
     notification_socket_path: Option<&Path>,
 ) -> Result<Option<BrokerConnection>> {
-    match (control_socket_path, notification_socket_path) {
-        (Some(control_path), Some(notification_path)) => {
-            connect_to_endpoint(control_path, notification_path).map(Some)
+    let Some(control_socket_path) = control_socket_path else {
+        if notification_socket_path.is_some() {
+            bail!("broker control socket is required with broker notification socket");
         }
-        (None, None) => Ok(None),
-        (Some(_), None) => {
-            bail!("broker notification socket is required with broker control socket")
-        }
-        (None, Some(_)) => {
-            bail!("broker control socket is required with broker notification socket")
-        }
-    }
+        return Ok(None);
+    };
+    let Some(notification_socket_path) = notification_socket_path else {
+        bail!("broker notification socket is required with broker control socket");
+    };
+    connect_to_endpoint(control_socket_path, notification_socket_path).map(Some)
 }
 
 impl BrokerConnection {
