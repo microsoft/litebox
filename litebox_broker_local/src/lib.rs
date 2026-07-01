@@ -1,11 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Typed broker-local control adapter for broker requests.
+//! Typed broker-local adapters for broker requests and notifications.
 //!
 //! The local control adapter owns request/response sequencing but does not own a channel.
 //! Userland, kernel, or ring-buffer deployments can provide channels by
 //! implementing [`litebox_broker_protocol::channel::LocalControlChannel`].
+//! Notification receive adapters are intentionally separate so active control
+//! requests remain strictly paired with their responses.
 
 #![no_std]
 
@@ -15,10 +17,11 @@ extern crate std;
 mod error;
 mod event;
 
-use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::channel::{LocalControlChannel, LocalNotificationChannel};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
+    BrokerResponse,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle};
 
@@ -26,6 +29,11 @@ pub use error::{BrokerLocalError, Result};
 
 /// Typed broker-local control adapter for broker operations.
 pub struct BrokerLocal<Channel: LocalControlChannel> {
+    channel: Channel,
+}
+
+/// Broker-local receive adapter for broker-initiated asynchronous notifications.
+pub struct BrokerNotifications<Channel: LocalNotificationChannel> {
     channel: Channel,
 }
 
@@ -124,14 +132,33 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     }
 }
 
+impl<Channel: LocalNotificationChannel> BrokerNotifications<Channel> {
+    /// Creates a notification receiver from an already-associated notification channel.
+    pub const fn new(channel: Channel) -> Self {
+        Self { channel }
+    }
+
+    /// Receives the next broker notification.
+    ///
+    /// Returns `Ok(None)` when the broker closed the notification channel cleanly.
+    pub fn recv_notification(&mut self) -> Result<Option<BrokerNotification>, Channel::Error> {
+        self.channel
+            .recv_notification()
+            .map_err(BrokerLocalError::Channel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::convert::Infallible;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::ProtocolVersion;
+    use litebox_broker_protocol::channel::LocalNotificationChannel;
     use litebox_broker_protocol::event::{CreateEventRequest, CreateEventResponse};
-    use litebox_broker_protocol::message::{EventRequest, EventResponse};
+    use litebox_broker_protocol::message::{
+        EventReadinessNotification, EventRequest, EventResponse,
+    };
 
     #[test]
     fn negotiate_returns_active_local_connection() {
@@ -220,6 +247,23 @@ mod tests {
     }
 
     #[test]
+    fn notification_receiver_returns_broker_notifications() {
+        let notification = BrokerNotification::EventReadiness(EventReadinessNotification {
+            handle: ObjectHandle(7),
+            readiness: litebox_broker_protocol::event::ReadinessState {
+                read_ready: true,
+                write_ready: false,
+            },
+        });
+        let mut receiver = BrokerNotifications::new(FakeNotificationChannel {
+            notification: Some(notification.clone()),
+        });
+
+        assert_eq!(receiver.recv_notification().unwrap(), Some(notification));
+        assert_eq!(receiver.recv_notification().unwrap(), None);
+    }
+
+    #[test]
     fn negotiate_rejects_broker_unsupported_version_response() {
         let broker_protocol_version = ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1);
         let channel = FakeControlChannel::new(
@@ -294,6 +338,20 @@ mod tests {
 
         fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
             Ok(self.response.take())
+        }
+    }
+
+    struct FakeNotificationChannel {
+        notification: Option<BrokerNotification>,
+    }
+
+    impl LocalNotificationChannel for FakeNotificationChannel {
+        type Error = Infallible;
+
+        fn recv_notification(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerNotification>, Self::Error> {
+            Ok(self.notification.take())
         }
     }
 }

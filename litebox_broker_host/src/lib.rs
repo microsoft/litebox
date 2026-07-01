@@ -14,11 +14,14 @@ extern crate std;
 
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-use litebox_broker_protocol::channel::{HostControlChannel, HostReceive, PeerCredential};
+use litebox_broker_protocol::channel::{
+    HostControlChannel, HostNotificationChannel, HostReceive, PeerCredential,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse, WaitEventResponse};
 use litebox_broker_protocol::message::{
-    BrokerHandshakeResponse, BrokerRequest, BrokerResponse, EventRequest, EventResponse,
+    BrokerHandshakeResponse, BrokerNotification, BrokerRequest, BrokerResponse,
+    EventReadinessNotification, EventRequest, EventResponse,
 };
 
 mod error;
@@ -32,6 +35,39 @@ pub fn serve_connection<Channel>(
 ) -> Result<ConnectionTermination, Channel::Error>
 where
     Channel: HostControlChannel,
+{
+    serve_connection_inner(core, channel, |_notification| Ok(()))
+}
+
+/// Authenticates, negotiates, and serves one broker association over paired
+/// control and notification channels.
+///
+/// The deployment must bind both channels to the same authenticated peer
+/// association. Active requests and responses remain on the control channel;
+/// broker-initiated readiness wakeups are sent on the notification channel.
+pub fn serve_connection_with_notifications<ControlChannel, NotificationChannel>(
+    core: &BrokerCore,
+    control_channel: &mut ControlChannel,
+    notification_channel: &mut NotificationChannel,
+) -> Result<ConnectionTermination, ControlChannel::Error>
+where
+    ControlChannel: HostControlChannel,
+    NotificationChannel: HostNotificationChannel<Error = ControlChannel::Error>,
+{
+    serve_connection_inner(core, control_channel, |notification| {
+        notification_channel.send_notification(&BrokerNotification::EventReadiness(notification))
+    })
+}
+
+fn serve_connection_inner<Channel, NotifyEventReadiness>(
+    core: &BrokerCore,
+    channel: &mut Channel,
+    mut notify_event_readiness: NotifyEventReadiness,
+) -> Result<ConnectionTermination, Channel::Error>
+where
+    Channel: HostControlChannel,
+    NotifyEventReadiness:
+        FnMut(EventReadinessNotification) -> core::result::Result<(), Channel::Error>,
 {
     let peer_credential = channel
         .peer_credential()
@@ -77,15 +113,18 @@ where
         }
     }
 
-    serve_request_loop(channel, &session)
+    serve_request_loop(channel, &session, &mut notify_event_readiness)
 }
 
-fn serve_request_loop<Channel>(
+fn serve_request_loop<Channel, NotifyEventReadiness>(
     channel: &mut Channel,
     session: &BrokerSession,
+    notify_event_readiness: &mut NotifyEventReadiness,
 ) -> Result<ConnectionTermination, Channel::Error>
 where
     Channel: HostControlChannel,
+    NotifyEventReadiness:
+        FnMut(EventReadinessNotification) -> core::result::Result<(), Channel::Error>,
 {
     loop {
         let request = match channel.recv_request().map_err(BrokerHostError::Channel)? {
@@ -99,56 +138,85 @@ where
             HostReceive::PeerClosed => break,
         };
 
-        let response = handle_request(session, request);
+        let handled = handle_request(session, request);
         channel
-            .send_response(&response)
+            .send_response(&handled.response)
             .map_err(BrokerHostError::Channel)?;
+        if let Some(notification) = handled.event_readiness_notification {
+            notify_event_readiness(notification).map_err(BrokerHostError::Channel)?;
+        }
     }
 
     Ok(ConnectionTermination::PeerClosed)
 }
 
-fn handle_request(session: &BrokerSession, request: BrokerRequest) -> BrokerResponse {
+fn handle_request(session: &BrokerSession, request: BrokerRequest) -> HandledRequest {
     match request {
         BrokerRequest::CloseObject(handle) => match session.close_object_reference(handle) {
-            Ok(()) => BrokerResponse::ObjectClosed,
-            Err(error) => BrokerResponse::Error(error.into()),
+            Ok(()) => HandledRequest::response(BrokerResponse::ObjectClosed),
+            Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
         },
         BrokerRequest::Event(request) => handle_event_request(session, request),
     }
 }
 
-fn handle_event_request(session: &BrokerSession, request: EventRequest) -> BrokerResponse {
+fn handle_event_request(session: &BrokerSession, request: EventRequest) -> HandledRequest {
     match request {
         EventRequest::Create(request) => {
             match litebox_broker_core::event::create(session, request.initial_count) {
-                Ok(handle) => {
-                    BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }))
-                }
-                Err(error) => BrokerResponse::Error(error.into()),
+                Ok(handle) => HandledRequest::response(BrokerResponse::Event(
+                    EventResponse::Create(CreateEventResponse { handle }),
+                )),
+                Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
             }
         }
         EventRequest::Wait(request) => {
             match litebox_broker_core::event::wait(session, request.handle) {
-                Ok(readiness) => {
-                    BrokerResponse::Event(EventResponse::Wait(WaitEventResponse { readiness }))
-                }
-                Err(error) => BrokerResponse::Error(error.into()),
+                Ok(readiness) => HandledRequest::response(BrokerResponse::Event(
+                    EventResponse::Wait(WaitEventResponse { readiness }),
+                )),
+                Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
             }
         }
         EventRequest::Add(request) => {
             match litebox_broker_core::event::add(session, request.handle, request.value) {
-                Ok(readiness) => {
-                    BrokerResponse::Event(EventResponse::Add(AddEventResponse { readiness }))
-                }
-                Err(error) => BrokerResponse::Error(error.into()),
+                Ok(readiness) => HandledRequest {
+                    response: BrokerResponse::Event(EventResponse::Add(AddEventResponse {
+                        readiness,
+                    })),
+                    event_readiness_notification: Some(EventReadinessNotification {
+                        handle: request.handle,
+                        readiness,
+                    }),
+                },
+                Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
             }
         }
         EventRequest::Consume(request) => {
             match litebox_broker_core::event::consume(session, request.handle, request.mode) {
-                Ok(consumption) => BrokerResponse::Event(EventResponse::Consume(consumption)),
-                Err(error) => BrokerResponse::Error(error.into()),
+                Ok(consumption) => HandledRequest {
+                    event_readiness_notification: Some(EventReadinessNotification {
+                        handle: request.handle,
+                        readiness: consumption.readiness,
+                    }),
+                    response: BrokerResponse::Event(EventResponse::Consume(consumption)),
+                },
+                Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
             }
+        }
+    }
+}
+
+struct HandledRequest {
+    response: BrokerResponse,
+    event_readiness_notification: Option<EventReadinessNotification>,
+}
+
+impl HandledRequest {
+    fn response(response: BrokerResponse) -> Self {
+        Self {
+            response,
+            event_readiness_notification: None,
         }
     }
 }
@@ -183,6 +251,7 @@ mod tests {
         serve_connection_rejects_active_request_before_negotiation(&broker);
         serve_connection_rejects_handshake_request_after_negotiation(&broker);
         serve_connection_returns_channel_error_when_response_send_fails(&broker);
+        serve_request_loop_sends_event_readiness_notifications(&broker);
         active_request_closes_object_reference(&broker);
     }
 
@@ -303,6 +372,59 @@ mod tests {
         assert!(channel.handshake_responses.is_empty());
     }
 
+    fn serve_request_loop_sends_event_readiness_notifications(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = litebox_broker_core::event::create(&session, 0).unwrap();
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::new(),
+            std::vec::Vec::from([
+                Ok(HostReceive::Message(BrokerRequest::Event(
+                    EventRequest::Add(litebox_broker_protocol::event::AddEventRequest {
+                        handle,
+                        value: 1,
+                    }),
+                ))),
+                Ok(HostReceive::Message(BrokerRequest::Event(
+                    EventRequest::Consume(litebox_broker_protocol::event::ConsumeEventRequest {
+                        handle,
+                        mode: litebox_broker_protocol::event::EventConsumeMode::One,
+                    }),
+                ))),
+                Ok(HostReceive::PeerClosed),
+            ]),
+        );
+        let mut notifications = FakeHostNotificationChannel::default();
+
+        assert_eq!(
+            serve_request_loop(&mut channel, &session, &mut |notification| {
+                notifications.send_notification(&BrokerNotification::EventReadiness(notification))
+            })
+            .unwrap(),
+            ConnectionTermination::PeerClosed
+        );
+        assert_eq!(
+            notifications.notifications,
+            [
+                BrokerNotification::EventReadiness(EventReadinessNotification {
+                    handle,
+                    readiness: litebox_broker_protocol::event::ReadinessState {
+                        read_ready: true,
+                        write_ready: true,
+                    },
+                }),
+                BrokerNotification::EventReadiness(EventReadinessNotification {
+                    handle,
+                    readiness: litebox_broker_protocol::event::ReadinessState {
+                        read_ready: false,
+                        write_ready: true,
+                    },
+                }),
+            ]
+        );
+    }
+
     fn active_request_closes_object_reference(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
@@ -312,28 +434,31 @@ mod tests {
             BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
             })),
-        );
+        )
+        .response;
         let BrokerResponse::Event(EventResponse::Create(response)) = response else {
             panic!("unexpected create response: {response:?}");
         };
         let handle = response.handle;
 
         assert_eq!(
-            handle_request(&session, BrokerRequest::CloseObject(handle)),
+            handle_request(&session, BrokerRequest::CloseObject(handle)).response,
             BrokerResponse::ObjectClosed
         );
         assert_eq!(
             handle_request(
                 &session,
                 BrokerRequest::Event(EventRequest::Wait(WaitEventRequest { handle }))
-            ),
+            )
+            .response,
             BrokerResponse::Error(ErrorCode::UnknownObject)
         );
         assert_eq!(
             handle_request(
                 &session,
                 BrokerRequest::CloseObject(ObjectHandle(handle.0 + 1))
-            ),
+            )
+            .response,
             BrokerResponse::Error(ErrorCode::UnknownObject)
         );
     }
@@ -410,6 +535,23 @@ mod tests {
                 return Err(());
             }
             self.responses.push(response.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeHostNotificationChannel {
+        notifications: std::vec::Vec<BrokerNotification>,
+    }
+
+    impl HostNotificationChannel for FakeHostNotificationChannel {
+        type Error = ();
+
+        fn send_notification(
+            &mut self,
+            notification: &BrokerNotification,
+        ) -> core::result::Result<(), Self::Error> {
+            self.notifications.push(notification.clone());
             Ok(())
         }
     }
