@@ -117,15 +117,10 @@ where
             HostReceive::PeerClosed => break,
         };
 
-        let handled = handle_request(&connection.session, request);
+        let response = handle_request(connection, request).map_err(BrokerHostError::Channel)?;
         control_channel
-            .send_response(&handled.response)
+            .send_response(&response)
             .map_err(BrokerHostError::Channel)?;
-        if let Some(notification) = handled.event_readiness_notification {
-            connection
-                .notify_event_readiness(notification)
-                .map_err(BrokerHostError::Channel)?;
-        }
     }
 
     Ok(ConnectionTermination::PeerClosed)
@@ -150,73 +145,81 @@ where
     }
 }
 
-fn handle_request(session: &BrokerSession, request: BrokerRequest) -> HandledRequest {
+fn handle_request<NotificationChannel>(
+    connection: &mut HostConnection<'_, NotificationChannel>,
+    request: BrokerRequest,
+) -> core::result::Result<BrokerResponse, NotificationChannel::Error>
+where
+    NotificationChannel: HostNotificationChannel,
+{
     match request {
-        BrokerRequest::CloseObject(handle) => match session.close_object_reference(handle) {
-            Ok(()) => HandledRequest::response(BrokerResponse::ObjectClosed),
-            Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
-        },
-        BrokerRequest::Event(request) => handle_event_request(session, request),
+        BrokerRequest::CloseObject(handle) => {
+            match connection.session.close_object_reference(handle) {
+                Ok(()) => Ok(BrokerResponse::ObjectClosed),
+                Err(error) => Ok(BrokerResponse::Error(error.into())),
+            }
+        }
+        BrokerRequest::Event(request) => handle_event_request(connection, request),
     }
 }
 
-fn handle_event_request(session: &BrokerSession, request: EventRequest) -> HandledRequest {
+fn handle_event_request<NotificationChannel>(
+    connection: &mut HostConnection<'_, NotificationChannel>,
+    request: EventRequest,
+) -> core::result::Result<BrokerResponse, NotificationChannel::Error>
+where
+    NotificationChannel: HostNotificationChannel,
+{
     match request {
         EventRequest::Create(request) => {
-            match litebox_broker_core::event::create(session, request.initial_count) {
-                Ok(handle) => HandledRequest::response(BrokerResponse::Event(
-                    EventResponse::Create(CreateEventResponse { handle }),
-                )),
-                Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
+            match litebox_broker_core::event::create(&connection.session, request.initial_count) {
+                Ok(handle) => Ok(BrokerResponse::Event(EventResponse::Create(
+                    CreateEventResponse { handle },
+                ))),
+                Err(error) => Ok(BrokerResponse::Error(error.into())),
             }
         }
         EventRequest::Wait(request) => {
-            match litebox_broker_core::event::wait(session, request.handle) {
-                Ok(readiness) => HandledRequest::response(BrokerResponse::Event(
-                    EventResponse::Wait(WaitEventResponse { readiness }),
-                )),
-                Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
+            match litebox_broker_core::event::wait(&connection.session, request.handle) {
+                Ok(readiness) => Ok(BrokerResponse::Event(EventResponse::Wait(
+                    WaitEventResponse { readiness },
+                ))),
+                Err(error) => Ok(BrokerResponse::Error(error.into())),
             }
         }
         EventRequest::Add(request) => {
-            match litebox_broker_core::event::add(session, request.handle, request.value) {
-                Ok(readiness) => HandledRequest {
-                    response: BrokerResponse::Event(EventResponse::Add(AddEventResponse {
-                        readiness,
-                    })),
-                    event_readiness_notification: Some(EventReadinessNotification {
+            match litebox_broker_core::event::add(
+                &connection.session,
+                request.handle,
+                request.value,
+            ) {
+                Ok(readiness) => {
+                    connection.notify_event_readiness(EventReadinessNotification {
                         handle: request.handle,
                         readiness,
-                    }),
-                },
-                Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
+                    })?;
+                    Ok(BrokerResponse::Event(EventResponse::Add(
+                        AddEventResponse { readiness },
+                    )))
+                }
+                Err(error) => Ok(BrokerResponse::Error(error.into())),
             }
         }
         EventRequest::Consume(request) => {
-            match litebox_broker_core::event::consume(session, request.handle, request.mode) {
-                Ok(consumption) => HandledRequest {
-                    event_readiness_notification: Some(EventReadinessNotification {
+            match litebox_broker_core::event::consume(
+                &connection.session,
+                request.handle,
+                request.mode,
+            ) {
+                Ok(consumption) => {
+                    connection.notify_event_readiness(EventReadinessNotification {
                         handle: request.handle,
                         readiness: consumption.readiness,
-                    }),
-                    response: BrokerResponse::Event(EventResponse::Consume(consumption)),
-                },
-                Err(error) => HandledRequest::response(BrokerResponse::Error(error.into())),
+                    })?;
+                    Ok(BrokerResponse::Event(EventResponse::Consume(consumption)))
+                }
+                Err(error) => Ok(BrokerResponse::Error(error.into())),
             }
-        }
-    }
-}
-
-struct HandledRequest {
-    response: BrokerResponse,
-    event_readiness_notification: Option<EventReadinessNotification>,
-}
-
-impl HandledRequest {
-    fn response(response: BrokerResponse) -> Self {
-        Self {
-            response,
-            event_readiness_notification: None,
         }
     }
 }
@@ -462,36 +465,41 @@ mod tests {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
+        let mut notifications = FakeHostNotificationChannel::default();
+        let mut connection = HostConnection {
+            session,
+            notification_channel: &mut notifications,
+        };
         let response = handle_request(
-            &session,
+            &mut connection,
             BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
             })),
         )
-        .response;
+        .unwrap();
         let BrokerResponse::Event(EventResponse::Create(response)) = response else {
             panic!("unexpected create response: {response:?}");
         };
         let handle = response.handle;
 
         assert_eq!(
-            handle_request(&session, BrokerRequest::CloseObject(handle)).response,
+            handle_request(&mut connection, BrokerRequest::CloseObject(handle)).unwrap(),
             BrokerResponse::ObjectClosed
         );
         assert_eq!(
             handle_request(
-                &session,
+                &mut connection,
                 BrokerRequest::Event(EventRequest::Wait(WaitEventRequest { handle }))
             )
-            .response,
+            .unwrap(),
             BrokerResponse::Error(ErrorCode::UnknownObject)
         );
         assert_eq!(
             handle_request(
-                &session,
+                &mut connection,
                 BrokerRequest::CloseObject(ObjectHandle(handle.0 + 1))
             )
-            .response,
+            .unwrap(),
             BrokerResponse::Error(ErrorCode::UnknownObject)
         );
     }
