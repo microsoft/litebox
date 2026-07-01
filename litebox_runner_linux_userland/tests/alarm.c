@@ -139,11 +139,10 @@ int test_alarm_fires_in_userspace(void) {
 
     // Busy-wait (no syscalls) until SIGALRM arrives.
     // The platform's schedule_interrupt mechanism should interrupt us.
-    volatile int i = 0;
+    volatile unsigned long long iterations = 0;
     while (alarm_count == 0) {
-        i++;
-        // Avoid the compiler optimizing this away.
-        if (i < 0)
+        iterations++;
+        if (iterations == 0)
             break;
     }
 
@@ -153,7 +152,7 @@ int test_alarm_fires_in_userspace(void) {
     sa.sa_handler = SIG_DFL;
     sigaction(SIGALRM, &sa, NULL);
 
-    printf("alarm_fires_in_userspace: PASS (loop iterations=%d)\n", i);
+    printf("alarm_fires_in_userspace: PASS (loop iterations=%llu)\n", iterations);
     return 0;
 }
 
