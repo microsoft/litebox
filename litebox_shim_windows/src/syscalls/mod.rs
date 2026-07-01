@@ -371,6 +371,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         open_as_self: u32,
         token_handle: Platform::RawMutPointer<Handle>,
     },
+    NtOpenThreadTokenEx {
+        thread_handle: ThreadHandle,
+        desired_access: u32,
+        open_as_self: u32,
+        handle_attributes: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
     NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
         flag: u32,
         source: Platform::RawConstPointer<u64>,
@@ -703,6 +710,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 thread_handle: { ThreadHandle::from_raw },
                 desired_access,
                 open_as_self,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenThreadTokenEx => Some(sys_req!(NtOpenThreadTokenEx {
+                thread_handle: { ThreadHandle::from_raw },
+                desired_access,
+                open_as_self,
+                handle_attributes,
                 token_handle:*,
             })),
             NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(

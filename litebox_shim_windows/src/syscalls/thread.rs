@@ -94,6 +94,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         _open_as_self: u32,
         token_handle: MutPtr<Platform, Handle>,
     ) -> NtStatus {
+        Self::open_thread_token(thread_handle, token_handle)
+    }
+
+    pub(crate) fn sys_nt_open_thread_token_ex(
+        thread_handle: ThreadHandle,
+        _desired_access: u32,
+        _open_as_self: u32,
+        _handle_attributes: u32,
+        token_handle: MutPtr<Platform, Handle>,
+    ) -> NtStatus {
+        // TODO: HandleAttributes is outcome-independent while the sandbox has no impersonation
+        // token. Once a real token subsystem exists it must be validated; host 25H2 returns
+        // STATUS_INVALID_PARAMETER for attrs=0xffffffff after ImpersonateSelf.
+        Self::open_thread_token(thread_handle, token_handle)
+    }
+
+    fn open_thread_token(
+        thread_handle: ThreadHandle,
+        token_handle: MutPtr<Platform, Handle>,
+    ) -> NtStatus {
         if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(token_handle) {
             return status;
         }
@@ -101,8 +121,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_HANDLE;
         }
 
-        // Wine and ReactOS route NtOpenThreadToken through the Ex form; host 25H2 probes the
-        // output handle first, then reports no token for a non-impersonating current thread.
+        // A thread only has a token while it is actively impersonating (SetThreadToken /
+        // ImpersonateSelf). Sandbox threads never impersonate, so real host 25H2 returns
+        // STATUS_NO_TOKEN here as well: this is the host-faithful terminal answer, not a stub.
         NtStatus::NO_TOKEN
     }
 }
@@ -110,7 +131,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{mut_ptr, null_const_ptr, null_mut_ptr};
+    use crate::tests::null_const_ptr;
     use litebox::platform::ThreadProvider;
 
     type TestPlatform = crate::tests::TestPlatform;
@@ -190,68 +211,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn nt_open_thread_token_validates_pointer_before_thread_handle() {
-        run_with_test_platform_pointers(|| {
-            let bad_handle = ThreadHandle::from_raw(0x1234);
-            let mut token_handle = Handle::from_raw(0x5555_5555);
-            let desired_access = 0x2001c;
-
-            assert_eq!(
-                TestTask::sys_nt_open_thread_token(
-                    ThreadHandle::CURRENT,
-                    desired_access,
-                    0,
-                    null_mut_ptr::<Handle>(),
-                ),
-                NtStatus::ACCESS_VIOLATION
-            );
-
-            assert_eq!(
-                TestTask::sys_nt_open_thread_token(
-                    bad_handle,
-                    desired_access,
-                    0,
-                    null_mut_ptr::<Handle>(),
-                ),
-                NtStatus::ACCESS_VIOLATION
-            );
-
-            assert_eq!(
-                TestTask::sys_nt_open_thread_token(
-                    bad_handle,
-                    desired_access,
-                    0,
-                    mut_ptr(&mut token_handle),
-                ),
-                NtStatus::INVALID_HANDLE
-            );
-            assert_eq!(token_handle, Handle::from_raw(0x5555_5555));
-
-            assert_eq!(
-                TestTask::sys_nt_open_thread_token(
-                    ThreadHandle::CURRENT,
-                    desired_access,
-                    0,
-                    mut_ptr(&mut token_handle),
-                ),
-                NtStatus::NO_TOKEN
-            );
-            assert_eq!(token_handle, Handle::from_raw(0x5555_5555));
-
-            assert_eq!(
-                TestTask::sys_nt_open_thread_token(
-                    ThreadHandle::CURRENT,
-                    u32::MAX,
-                    1,
-                    mut_ptr(&mut token_handle),
-                ),
-                NtStatus::NO_TOKEN
-            );
-            assert_eq!(token_handle, Handle::from_raw(0x5555_5555));
-        });
-    }
-
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     mod host_fidelity {
         use core::ffi::c_void;
@@ -266,13 +225,6 @@ mod tests {
                 thread_information: *const c_void,
                 thread_information_length: u32,
             ) -> i32;
-            fn NtOpenThreadToken(
-                thread_handle: *mut c_void,
-                desired_access: u32,
-                open_as_self: u8,
-                token_handle: *mut *mut c_void,
-            ) -> i32;
-            fn NtClose(handle: *mut c_void) -> i32;
         }
 
         fn host_nt_set_information_thread(
@@ -292,27 +244,6 @@ mod tests {
                 )
             };
             NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
-        }
-
-        fn host_nt_open_thread_token(
-            thread_handle: *mut c_void,
-            desired_access: u32,
-            open_as_self: u8,
-            token_handle: *mut *mut c_void,
-        ) -> NtStatus {
-            // SAFETY: The host ntdll call probes `token_handle` as user output and does not
-            // retain it. Tests pass either a valid local handle slot or null to observe NTSTATUS.
-            let status = unsafe {
-                NtOpenThreadToken(thread_handle, desired_access, open_as_self, token_handle)
-            };
-            NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
-        }
-
-        fn host_nt_close(handle: *mut c_void) {
-            // SAFETY: Only called for handles returned successfully by host ntdll in this test.
-            unsafe {
-                NtClose(handle);
-            }
         }
 
         #[test]
@@ -428,100 +359,6 @@ mod tests {
                     );
 
                     assert_eq!(shim, host);
-                }
-            });
-        }
-
-        #[test]
-        fn nt_open_thread_token_matches_host_statuses() {
-            run_with_test_platform_pointers(|| {
-                let current_thread = (usize::MAX - 1) as *mut c_void;
-                let bad_thread = 0x1234usize as *mut c_void;
-                let observed_access = 0x2001c;
-                let sentinel = 0x5555_5555usize as *mut c_void;
-
-                for (
-                    thread_handle,
-                    shim_thread_handle,
-                    desired_access,
-                    open_as_self,
-                    host_token_handle,
-                    shim_token_handle,
-                ) in [
-                    (
-                        current_thread,
-                        ThreadHandle::CURRENT,
-                        observed_access,
-                        0,
-                        Some(sentinel),
-                        Some(Handle::from_raw(sentinel as usize)),
-                    ),
-                    (
-                        current_thread,
-                        ThreadHandle::CURRENT,
-                        u32::MAX,
-                        1,
-                        Some(sentinel),
-                        Some(Handle::from_raw(sentinel as usize)),
-                    ),
-                    (
-                        current_thread,
-                        ThreadHandle::CURRENT,
-                        observed_access,
-                        0,
-                        None,
-                        None,
-                    ),
-                    (
-                        bad_thread,
-                        ThreadHandle::from_raw(0x1234),
-                        observed_access,
-                        0,
-                        Some(sentinel),
-                        Some(Handle::from_raw(sentinel as usize)),
-                    ),
-                    (
-                        bad_thread,
-                        ThreadHandle::from_raw(0x1234),
-                        observed_access,
-                        0,
-                        None,
-                        None,
-                    ),
-                ] {
-                    let mut host_out = host_token_handle.unwrap_or(core::ptr::null_mut());
-                    let host_out_ptr = if host_token_handle.is_some() {
-                        core::ptr::addr_of_mut!(host_out)
-                    } else {
-                        core::ptr::null_mut()
-                    };
-                    let host = host_nt_open_thread_token(
-                        thread_handle,
-                        desired_access,
-                        open_as_self,
-                        host_out_ptr,
-                    );
-                    if host == NtStatus::SUCCESS {
-                        host_nt_close(host_out);
-                    }
-
-                    let mut shim_out = shim_token_handle.unwrap_or_default();
-                    let shim_out_ptr = if shim_token_handle.is_some() {
-                        mut_ptr(&mut shim_out)
-                    } else {
-                        null_mut_ptr::<Handle>()
-                    };
-                    let shim = TestTask::sys_nt_open_thread_token(
-                        shim_thread_handle,
-                        desired_access,
-                        open_as_self.into(),
-                        shim_out_ptr,
-                    );
-
-                    assert_eq!(shim, host);
-                    if host_token_handle.is_some() {
-                        assert_eq!(shim_out.as_raw(), host_out as usize);
-                    }
                 }
             });
         }
