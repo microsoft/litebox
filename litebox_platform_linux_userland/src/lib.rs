@@ -1295,8 +1295,12 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase => {
-                set_guest_fsbase(val);
-                Ok(())
+                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                    set_guest_fsbase(val);
+                    Ok(())
+                } else {
+                    Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
+                }
             }
             litebox::platform::ArchSpecificRegister::GsBase => {
                 // GS base is used internally by this platform to hold the host

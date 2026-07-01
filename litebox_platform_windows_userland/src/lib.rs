@@ -1480,9 +1480,13 @@ impl litebox::platform::ArchSpecificProvider for WindowsUserland {
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase => {
-                // Use WindowsUserland's per-thread FS base management system
-                Self::set_thread_fs_base(val);
-                Ok(())
+                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                    // Use WindowsUserland's per-thread FS base management system
+                    Self::set_thread_fs_base(val);
+                    Ok(())
+                } else {
+                    Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
+                }
             }
             litebox::platform::ArchSpecificRegister::GsBase => {
                 // Windows uses GS for its own thread environment block
