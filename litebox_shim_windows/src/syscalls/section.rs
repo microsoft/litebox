@@ -33,6 +33,12 @@ enum SectionBacking {
     /// LiteBox lacks shared anonymous backing, so a pagefile section is
     /// metadata-only until its single allowed view is mapped. Remap after unmap
     /// is rejected instead of storing contents in shim memory or a file.
+    ///
+    /// Shared write-through backing across concurrent views is the deferred
+    /// capability (see `TODO(section-subsystem)`); until it lands, a single view
+    /// is the only observable-faithful case, which is why both the
+    /// second-concurrent-view and the remap-after-unmap rejects exist. They are
+    /// one missing feature, not two unrelated limitations.
     Pagefile,
     ImageFile,
 }
