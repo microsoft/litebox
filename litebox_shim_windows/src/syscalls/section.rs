@@ -464,8 +464,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    // Wine's virtual_map_section and ReactOS MmMapViewOfSection dispatch by section backing:
-    // pagefile views copy from the control backing, while image views use the PE image map path.
     pub(crate) fn sys_nt_map_view_of_section(
         &self,
         request: MapViewOfSectionParameters<Platform>,
