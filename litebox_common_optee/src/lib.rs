@@ -1549,6 +1549,10 @@ impl OpteeMsgParam {
     pub fn attr_type(&self) -> OpteeMsgAttrType {
         OpteeMsgAttrType::try_from(self.attr.attr_type()).unwrap_or(OpteeMsgAttrType::None)
     }
+    /// Returns `true` when the meta bit (bit 8) is set.
+    pub fn is_meta(&self) -> bool {
+        self.attr.meta()
+    }
     pub fn get_param_tmem(&self) -> Option<OpteeMsgParamTmem> {
         if matches!(
             self.attr.attr_type(),

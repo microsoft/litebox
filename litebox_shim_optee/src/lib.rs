@@ -80,6 +80,7 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
                 return if result.is_ok() {
                     ContinueOperation::Resume
                 } else {
+                    self.task.clear_ta_context();
                     ContinueOperation::Terminate
                 };
             } else if result.is_ok() {
@@ -90,6 +91,7 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
         }
         // OP-TEE has no signal handling. Kill the TA on any non-PF exception.
         ctx.rax = (TeeResult::TargetDead as u32) as usize;
+        self.task.clear_ta_context();
         ContinueOperation::Terminate
     }
 
@@ -375,9 +377,11 @@ impl Task {
 
         if let SyscallRequest::Return { ret } = request {
             ctx.rax = self.sys_return(ret);
+            self.clear_ta_context();
             return ContinueOperation::Terminate;
         } else if let SyscallRequest::Panic { code } = request {
             ctx.rax = self.sys_panic(code);
+            self.clear_ta_context();
             return ContinueOperation::Terminate;
         }
         let res: Result<(), TeeResult> = match request {
@@ -795,7 +799,8 @@ impl Task {
     }
 
     /// The session id currently executing in this task (set per entry by
-    /// [`Self::load_ta_context`]). Returns `None` outside a TA entry.
+    /// [`Self::load_ta_context`], cleared on entry termination by
+    /// [`Self::clear_ta_context`]). Returns `None` outside a TA entry.
     fn current_session_id(&self) -> Option<u32> {
         match self.thread.init_state.get() {
             ThreadInitState::Ta { session_id, .. } => Some(session_id.trunc()),
@@ -813,6 +818,13 @@ impl Task {
             },
             |session_id| crate::session::session_manager().client_identity(session_id),
         )
+    }
+
+    /// Clear the per-entry TA execution state once a TA entry has terminated.
+    fn clear_ta_context(&self) {
+        if matches!(self.thread.init_state.get(), ThreadInitState::Ta { .. }) {
+            self.thread.init_state.set(ThreadInitState::None);
+        }
     }
 
     /// Allocate the guest TLS for an OP-TEE TA.

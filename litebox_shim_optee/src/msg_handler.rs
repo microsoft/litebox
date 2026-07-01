@@ -503,6 +503,12 @@ pub fn decode_ta_request(
         .skip(skip)
         .enumerate()
     {
+        // The meta bit marks the OpenSession TA-UUID/client-identity params,
+        // which were already consumed via `skip`. A client parameter must not
+        // carry it (mirrors OP-TEE OS `copy_in_params`).
+        if param.is_meta() {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
         ta_req_info.params[i] = match param.attr_type() {
             OpteeMsgAttrType::None => UteeParamOwned::None,
             OpteeMsgAttrType::ValueInput => {
