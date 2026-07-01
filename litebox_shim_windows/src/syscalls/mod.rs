@@ -143,6 +143,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
     },
+    NtOpenSection {
+        section_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
     NtQueryDirectoryObject {
         directory_handle: Handle,
         buffer: Platform::RawMutPointer<u8>,
@@ -478,8 +483,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 object_attributes:*,
             })),
+            NtSysno::NtOpenSection => Some(sys_req!(NtOpenSection {
+                section_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
             NtSysno::NtQueryDirectoryObject => Some(sys_req!(NtQueryDirectoryObject {
-                directory_handle:{Handle::from_raw},
+                directory_handle:{ Handle::from_raw },
                 buffer:*,
                 buffer_length,
                 return_single_entry,

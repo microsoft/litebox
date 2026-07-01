@@ -948,6 +948,48 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
+    pub(crate) fn sys_nt_open_section(
+        &self,
+        section_handle: MutPtr<Platform, Handle>,
+        _desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+    ) -> NtStatus {
+        if section_handle
+            .write_at_offset(0, Handle::default())
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let Some(object_attributes) = object_attributes else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+
+        let directory_name =
+            match self.read_directory_object_attributes(Some(object_attributes), true) {
+                Ok((Some(_), Some(directory_name))) => directory_name,
+                Ok(_) => return NtStatus::INVALID_PARAMETER,
+                Err(status) => return status,
+            };
+
+        // ReactOS opens sections through ObOpenObjectByName(..., MmSectionObjectType, ...), and
+        // Wine routes NtOpenSection to open_mapping. LiteBox seeds \KnownDlls as an object
+        // directory but does not seed section objects, matching the guest-observed file fallback:
+        // host 25H2 returns OBJECT_NAME_NOT_FOUND for a missing KnownDlls leaf and
+        // OBJECT_TYPE_MISMATCH when an existing directory is opened as a section.
+        // TODO(section-subsystem): once section objects exist, validate SECTION_* desired access
+        // and return ACCESS_DENIED for denied opens instead of resolving every object as missing.
+        // Also validate OBJ_OPENLINK there: host 25H2 returns INVALID_PARAMETER for OBJ_OPENLINK
+        // only when opening an existing section; missing section names still return name-miss.
+        match self
+            .process
+            .directory_namespace
+            .resolve_directory(&directory_name.original_path)
+        {
+            Ok(_) | Err(NtStatus::OBJECT_TYPE_MISMATCH) => NtStatus::OBJECT_TYPE_MISMATCH,
+            Err(status) => status,
+        }
+    }
+
     pub(crate) fn sys_nt_query_directory_object(
         &self,
         params: DirectoryQueryParameters<Platform>,
@@ -1223,6 +1265,17 @@ mod tests {
         handle
     }
 
+    fn object_attributes_with_root(
+        name: &UnicodeString,
+        root_directory: Handle,
+        attributes: u32,
+    ) -> ObjectAttributes {
+        ObjectAttributes {
+            root_directory,
+            ..object_attributes(name, attributes)
+        }
+    }
+
     fn expected_record_size(name: &str, type_name: &str) -> usize {
         size_of::<ObjectDirectoryInformation>()
             + name.encode_utf16().count() * size_of::<u16>()
@@ -1323,6 +1376,104 @@ mod tests {
                 );
                 assert_eq!(handle, Handle::default());
             }
+        });
+    }
+
+    #[test]
+    fn open_section_rejects_empty_known_dlls_with_zeroed_output() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let known_dlls_units = utf16_units(r"\KnownDlls");
+            let known_dlls_name = unicode_string(&known_dlls_units);
+            let known_dlls_attrs = object_attributes(
+                &known_dlls_name,
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            let mut known_dlls = Handle::default();
+            assert_eq!(
+                task.sys_nt_open_directory_object(
+                    mut_ptr(&mut known_dlls),
+                    DIRECTORY_QUERY | DIRECTORY_TRAVERSE,
+                    Some(const_ptr(&known_dlls_attrs)),
+                ),
+                NtStatus::SUCCESS
+            );
+            let kernel32_units = utf16_units("KERNEL32.DLL");
+            let kernel32 = unicode_string(&kernel32_units);
+            let attrs = object_attributes_with_root(
+                &kernel32,
+                known_dlls,
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            let mut handle = Handle::from_raw(0x5555_5555);
+
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(handle, Handle::default());
+
+            let attrs = object_attributes_with_root(
+                &kernel32,
+                known_dlls,
+                (ObjectAttributesFlags::CASE_INSENSITIVE | ObjectAttributesFlags::OPENLINK).bits(),
+            );
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(handle, Handle::default());
+
+            let missing_parent_units = utf16_units(r"\MissingLiteBoxParent\KERNEL32.DLL");
+            let missing_parent = unicode_string(&missing_parent_units);
+            let attrs = object_attributes(
+                &missing_parent,
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::OBJECT_PATH_NOT_FOUND
+            );
+            assert_eq!(handle, Handle::default());
+
+            let attrs = object_attributes(
+                &known_dlls_name,
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::OBJECT_TYPE_MISMATCH
+            );
+            assert_eq!(handle, Handle::default());
+
+            let attrs = object_attributes_with_root(
+                &kernel32,
+                Handle::from_raw(0x1234),
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::INVALID_HANDLE
+            );
+            assert_eq!(handle, Handle::default());
+
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, None),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(handle, Handle::default());
+
+            assert_eq!(
+                task.sys_nt_open_section(null_mut_ptr::<Handle>(), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::ACCESS_VIOLATION
+            );
+
+            assert_eq!(task.sys_nt_close(known_dlls), NtStatus::SUCCESS);
         });
     }
 

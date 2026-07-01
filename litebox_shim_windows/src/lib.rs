@@ -588,6 +588,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenSection {
+                section_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status =
+                    self.sys_nt_open_section(section_handle, desired_access, object_attributes);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQueryDirectoryObject {
                 directory_handle,
                 buffer,
