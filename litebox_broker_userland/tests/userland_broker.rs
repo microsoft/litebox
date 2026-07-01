@@ -8,9 +8,12 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use litebox_broker_local::BrokerLocal;
+use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::event::ReadinessState;
-use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
+use litebox_broker_protocol::message::{BrokerNotification, EventReadinessNotification};
+use litebox_broker_transport::unix_socket::{
+    UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
+};
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 
@@ -30,10 +33,11 @@ fn run_parent_test() {
     // This custom-harness integration test uses its own executable as the broker's
     // runner. Cargo starts this executable without broker args, so it runs the
     // parent path here. The broker then starts the same executable with the real
-    // runner argv (`--unstable --broker-socket <path>`), which runs `run_fake_runner`.
-    // After the fake runner finishes its broker requests, it terminates the broker
-    // parent process; this lets the test exercise the long-running broker without a
-    // test-only shutdown path.
+    // runner argv (`--unstable --broker-socket <path>
+    // --broker-notification-socket <path>`), which runs `run_fake_runner`. After
+    // the fake runner finishes its broker requests, it terminates the broker
+    // parent process; this lets the test exercise the long-running broker
+    // without a test-only shutdown path.
     let mut broker = ChildGuard {
         child: Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
             .arg("--runner")
@@ -65,13 +69,21 @@ fn run_fake_runner(args: &[OsString]) {
     );
     assert_eq!(
         args.get(3).map(OsString::as_os_str),
+        Some(OsStr::new("--broker-notification-socket"))
+    );
+    assert_eq!(
+        args.get(5).map(OsString::as_os_str),
         Some(OsStr::new(RUNNER_ARGUMENT))
     );
-    assert_eq!(args.len(), 4, "unexpected runner arguments: {args:?}");
+    assert_eq!(args.len(), 6, "unexpected runner arguments: {args:?}");
 
-    let socket_path = args.get(2).unwrap();
-    let channel = connect_with_retry(Path::new(socket_path)).unwrap();
-    let mut local = BrokerLocal::negotiate(channel).unwrap();
+    let control_socket_path = args.get(2).unwrap();
+    let notification_socket_path = args.get(4).unwrap();
+    let control_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
+    let notification_channel =
+        connect_notification_with_retry(Path::new(notification_socket_path)).unwrap();
+    let mut local = BrokerLocal::negotiate(control_channel).unwrap();
+    let mut notifications = BrokerNotifications::new(notification_channel);
 
     let handle = local.create_event_with_count(0).unwrap();
     assert_eq!(
@@ -82,12 +94,16 @@ fn run_fake_runner(args: &[OsString]) {
         }
     );
 
+    let readiness = ReadinessState {
+        read_ready: true,
+        write_ready: true,
+    };
+    assert_eq!(local.add_event(handle, 1).unwrap(), readiness);
     assert_eq!(
-        local.add_event(handle, 1).unwrap(),
-        ReadinessState {
-            read_ready: true,
-            write_ready: true,
-        }
+        notifications.recv_notification().unwrap(),
+        Some(BrokerNotification::EventReadiness(
+            EventReadinessNotification { handle, readiness }
+        ))
     );
 
     assert_eq!(
@@ -97,6 +113,7 @@ fn run_fake_runner(args: &[OsString]) {
             write_ready: true,
         }
     );
+    drop(notifications);
     drop(local);
 
     // SAFETY: `getppid` takes no pointer arguments and has no Rust-side aliasing requirements.
@@ -124,10 +141,30 @@ impl Drop for ChildGuard {
     }
 }
 
-fn connect_with_retry(socket_path: &Path) -> Result<UnixStreamLocalControlChannel> {
+fn connect_control_with_retry(socket_path: &Path) -> Result<UnixStreamLocalControlChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match UnixStreamLocalControlChannel::connect_with_setup_deadline(socket_path, deadline) {
+            Ok(channel) => return Ok(channel),
+            Err(error) if Instant::now() < deadline => {
+                if error.kind() != ErrorKind::NotFound
+                    && error.kind() != ErrorKind::ConnectionRefused
+                {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn connect_notification_with_retry(
+    socket_path: &Path,
+) -> Result<UnixStreamLocalNotificationChannel> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match UnixStreamLocalNotificationChannel::connect(socket_path) {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != ErrorKind::NotFound

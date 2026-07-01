@@ -28,17 +28,6 @@ mod error;
 
 pub use error::{BrokerHostError, Result};
 
-/// Authenticates, negotiates, and serves one broker connection over the control channel.
-pub fn serve_connection<ControlChannel>(
-    core: &BrokerCore,
-    control_channel: &mut ControlChannel,
-) -> Result<ConnectionTermination, ControlChannel::Error>
-where
-    ControlChannel: HostControlChannel,
-{
-    serve_connection_inner(core, control_channel, |_notification| Ok(()))
-}
-
 /// Authenticates, negotiates, and serves one broker association over paired
 /// control and notification channels.
 ///
@@ -53,21 +42,6 @@ pub fn serve_connection_with_notifications<ControlChannel, NotificationChannel>(
 where
     ControlChannel: HostControlChannel,
     NotificationChannel: HostNotificationChannel<Error = ControlChannel::Error>,
-{
-    serve_connection_inner(core, control_channel, |notification| {
-        notification_channel.send_notification(&BrokerNotification::EventReadiness(notification))
-    })
-}
-
-fn serve_connection_inner<ControlChannel, NotifyEventReadiness>(
-    core: &BrokerCore,
-    control_channel: &mut ControlChannel,
-    mut notify_event_readiness: NotifyEventReadiness,
-) -> Result<ConnectionTermination, ControlChannel::Error>
-where
-    ControlChannel: HostControlChannel,
-    NotifyEventReadiness:
-        FnMut(EventReadinessNotification) -> core::result::Result<(), ControlChannel::Error>,
 {
     let peer_credential = control_channel
         .peer_credential()
@@ -113,18 +87,17 @@ where
         }
     }
 
-    serve_request_loop(control_channel, &session, &mut notify_event_readiness)
+    serve_request_loop(control_channel, notification_channel, &session)
 }
 
-fn serve_request_loop<ControlChannel, NotifyEventReadiness>(
+fn serve_request_loop<ControlChannel, NotificationChannel>(
     control_channel: &mut ControlChannel,
+    notification_channel: &mut NotificationChannel,
     session: &BrokerSession,
-    notify_event_readiness: &mut NotifyEventReadiness,
 ) -> Result<ConnectionTermination, ControlChannel::Error>
 where
     ControlChannel: HostControlChannel,
-    NotifyEventReadiness:
-        FnMut(EventReadinessNotification) -> core::result::Result<(), ControlChannel::Error>,
+    NotificationChannel: HostNotificationChannel<Error = ControlChannel::Error>,
 {
     loop {
         let request = match control_channel
@@ -146,7 +119,9 @@ where
             .send_response(&handled.response)
             .map_err(BrokerHostError::Channel)?;
         if let Some(notification) = handled.event_readiness_notification {
-            notify_event_readiness(notification).map_err(BrokerHostError::Channel)?;
+            notification_channel
+                .send_notification(&BrokerNotification::EventReadiness(notification))
+                .map_err(BrokerHostError::Channel)?;
         }
     }
 
@@ -270,9 +245,10 @@ mod tests {
                 Ok(HostReceive::PeerClosed),
             ]),
         );
+        let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection(broker, &mut channel).unwrap(),
+            serve_connection_with_notifications(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -300,9 +276,10 @@ mod tests {
             ]),
             std::vec::Vec::from([Ok(HostReceive::PeerClosed)]),
         );
+        let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection(broker, &mut channel).unwrap(),
+            serve_connection_with_notifications(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -323,9 +300,10 @@ mod tests {
             std::vec::Vec::from([Ok(HostReceive::ProtocolViolation)]),
             std::vec::Vec::new(),
         );
+        let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection(broker, &mut channel).unwrap(),
+            serve_connection_with_notifications(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::ProtocolViolation
         );
         assert_eq!(
@@ -342,9 +320,10 @@ mod tests {
             }))]),
             std::vec::Vec::from([Ok(HostReceive::ProtocolViolation)]),
         );
+        let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection(broker, &mut channel).unwrap(),
+            serve_connection_with_notifications(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::ProtocolViolation
         );
         assert_eq!(
@@ -367,8 +346,9 @@ mod tests {
             std::vec::Vec::new(),
         );
         channel.send_error = true;
+        let mut notifications = FakeHostNotificationChannel::default();
 
-        match serve_connection(broker, &mut channel) {
+        match serve_connection_with_notifications(broker, &mut channel, &mut notifications) {
             Err(BrokerHostError::Channel(())) => {}
             result => panic!("unexpected serve result: {result:?}"),
         }
@@ -401,10 +381,7 @@ mod tests {
         let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_request_loop(&mut channel, &session, &mut |notification| {
-                notifications.send_notification(&BrokerNotification::EventReadiness(notification))
-            })
-            .unwrap(),
+            serve_request_loop(&mut channel, &mut notifications, &session).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(

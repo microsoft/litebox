@@ -89,6 +89,16 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub broker_socket: Option<PathBuf>,
+    /// Broker-supplied Unix socket path for the local notification channel.
+    #[arg(
+        long = "broker-notification-socket",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath,
+        hide = true,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_notification_socket: Option<PathBuf>,
 }
 
 struct MmappedFile {
@@ -213,7 +223,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
-    let broker_connection = broker::connect(cli_args.broker_socket.as_deref())?;
+    let broker_connection = broker::connect(
+        cli_args.broker_socket.as_deref(),
+        cli_args.broker_notification_socket.as_deref(),
+    )?;
 
     let shim_builder = if let Some(broker_connection) = broker_connection {
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(

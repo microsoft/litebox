@@ -123,8 +123,15 @@ impl Runner {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn broker_socket(&mut self, socket_path: &Path) -> &mut Self {
-        self.command.arg("--broker-socket").arg(socket_path);
+    fn broker_socket(
+        &mut self,
+        control_socket_path: &Path,
+        notification_socket_path: &Path,
+    ) -> &mut Self {
+        self.command.arg("--broker-socket").arg(control_socket_path);
+        self.command
+            .arg("--broker-notification-socket")
+            .arg(notification_socket_path);
         self
     }
 
@@ -264,7 +271,8 @@ struct TestBroker {
     thread: Option<std::thread::JoinHandle<()>>,
     done_rx: std::sync::mpsc::Receiver<()>,
     close_object_count_rx: std::sync::mpsc::Receiver<usize>,
-    socket_path: PathBuf,
+    control_socket_path: PathBuf,
+    notification_socket_path: PathBuf,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -284,54 +292,79 @@ impl TestBroker {
             .expect("broker test host thread missing")
             .join()
             .expect("broker test host panicked");
-        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(&self.control_socket_path);
+        let _ = std::fs::remove_file(&self.notification_socket_path);
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl Drop for TestBroker {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(&self.control_socket_path);
+        let _ = std::fs::remove_file(&self.notification_socket_path);
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn spawn_test_broker(
-    socket_path: &Path,
+    control_socket_path: &Path,
+    notification_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
 ) -> TestBroker {
-    let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(control_socket_path);
+    let _ = std::fs::remove_file(notification_socket_path);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let (close_object_count_tx, close_object_count_rx) = std::sync::mpsc::channel();
-    let server_socket_path = socket_path.to_path_buf();
-    let cleanup_socket_path = socket_path.to_path_buf();
+    let server_control_socket_path = control_socket_path.to_path_buf();
+    let server_notification_socket_path = notification_socket_path.to_path_buf();
+    let cleanup_control_socket_path = control_socket_path.to_path_buf();
+    let cleanup_notification_socket_path = notification_socket_path.to_path_buf();
     let broker_thread = std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let listener = std::os::unix::net::UnixListener::bind(&server_socket_path)
-                .expect("failed to bind broker test socket");
+            let control_listener =
+                std::os::unix::net::UnixListener::bind(&server_control_socket_path)
+                    .expect("failed to bind broker test control socket");
+            let notification_listener =
+                std::os::unix::net::UnixListener::bind(&server_notification_socket_path)
+                    .expect("failed to bind broker test notification socket");
             let broker =
                 litebox_broker_core::BrokerCore::new(policy).expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
 
             for _ in 0..connection_count {
-                let (stream, _) = listener
+                let (control_stream, _) = control_listener
                     .accept()
                     .expect("failed to accept broker local control connection");
-                stream
+                let (notification_stream, _) = notification_listener
+                    .accept()
+                    .expect("failed to accept broker local notification connection");
+                control_stream
                     .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test read timeout");
-                stream
+                control_stream
                     .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test write timeout");
+                notification_stream
+                    .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
+                    .expect("failed to configure broker notification test read timeout");
+                notification_stream
+                    .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
+                    .expect("failed to configure broker notification test write timeout");
                 let mut channel = CountingHostControlChannel {
-                    inner: litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream),
+                    inner: litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(control_stream),
                     close_object_count: 0,
                 };
-                let termination = litebox_broker_host::serve_connection(&broker, &mut channel)
-                    .expect("broker host failed");
+                let mut notification_channel =
+                    litebox_broker_transport::unix_socket::UnixStreamHostNotificationChannel::from_accepted(notification_stream);
+                let termination = litebox_broker_host::serve_connection_with_notifications(
+                    &broker,
+                    &mut channel,
+                    &mut notification_channel,
+                )
+                .expect("broker host failed");
                 assert_eq!(
                     termination,
                     litebox_broker_host::ConnectionTermination::PeerClosed
@@ -341,7 +374,8 @@ fn spawn_test_broker(
                     .expect("failed to report broker close-object count");
             }
         }));
-        let _ = std::fs::remove_file(&server_socket_path);
+        let _ = std::fs::remove_file(&server_control_socket_path);
+        let _ = std::fs::remove_file(&server_notification_socket_path);
         let _ = done_tx.send(());
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
@@ -355,7 +389,8 @@ fn spawn_test_broker(
         thread: Some(broker_thread),
         done_rx,
         close_object_count_rx,
-        socket_path: cleanup_socket_path,
+        control_socket_path: cleanup_control_socket_path,
+        notification_socket_path: cleanup_notification_socket_path,
     }
 }
 
@@ -428,9 +463,11 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
 fn test_runner_broker_integration_with_rewriter() {
     let true_path = run_which("true");
     let target = common::compile("./tests/eventfd.c", "broker_eventfd_rewriter", false, false);
-    let socket_path = unique_test_socket_path("runner-broker");
+    let control_socket_path = unique_test_socket_path("runner-broker-control");
+    let notification_socket_path = unique_test_socket_path("runner-broker-notification");
     let broker_thread = spawn_test_broker(
-        &socket_path,
+        &control_socket_path,
+        &notification_socket_path,
         litebox_broker_core::PolicyEngine::with_unauthenticated_rights(
             litebox_broker_core::PrincipalRights::all(),
         ),
@@ -438,12 +475,12 @@ fn test_runner_broker_integration_with_rewriter() {
     );
 
     Runner::new(&true_path, "broker_true_rewriter")
-        .broker_socket(&socket_path)
+        .broker_socket(&control_socket_path, &notification_socket_path)
         .run();
     assert_eq!(broker_thread.next_close_object_count(), 0);
 
     Runner::new(&target, "broker_eventfd_rewriter")
-        .broker_socket(&socket_path)
+        .broker_socket(&control_socket_path, &notification_socket_path)
         .run();
     // eventfd.c creates eight eventfd objects; each should release one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 8);

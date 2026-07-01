@@ -9,8 +9,10 @@ use std::process::Command;
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
-use litebox_broker_host::serve_connection;
-use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
+use litebox_broker_host::serve_connection_with_notifications;
+use litebox_broker_transport::unix_socket::{
+    UnixStreamHostControlChannel, UnixStreamHostNotificationChannel,
+};
 
 #[derive(Parser, Debug)]
 struct CliArgs {
@@ -27,8 +29,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let socket_dir = tempfile::Builder::new()
         .prefix("litebox-broker-userland-")
         .tempdir()?;
-    let socket_path = socket_dir.path().join("broker.sock");
-    let listener = UnixListener::bind(&socket_path)?;
+    let control_socket_path = socket_dir.path().join("broker.sock");
+    let notification_socket_path = socket_dir.path().join("broker-notification.sock");
+    let control_listener = UnixListener::bind(&control_socket_path)?;
+    let notification_listener = UnixListener::bind(&notification_socket_path)?;
     let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
         PrincipalRights::all(),
     ))?;
@@ -37,7 +41,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     runner_command
         .arg("--unstable")
         .arg("--broker-socket")
-        .arg(&socket_path)
+        .arg(&control_socket_path)
+        .arg("--broker-notification-socket")
+        .arg(&notification_socket_path)
         .args(&args.runner_arguments);
     let mut runner = runner_command.spawn()?;
     let _runner_waiter = std::thread::spawn(move || {
@@ -47,13 +53,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     loop {
-        let (stream, _) = listener.accept()?;
+        let (control_stream, _) = control_listener.accept()?;
+        let (notification_stream, _) = notification_listener.accept()?;
         let broker = broker.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("litebox-broker-connection".to_owned())
             .spawn(move || {
-                let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
-                if let Err(error) = serve_connection(&broker, &mut channel) {
+                let mut control_channel =
+                    UnixStreamHostControlChannel::from_accepted(control_stream);
+                let mut notification_channel =
+                    UnixStreamHostNotificationChannel::from_accepted(notification_stream);
+                if let Err(error) = serve_connection_with_notifications(
+                    &broker,
+                    &mut control_channel,
+                    &mut notification_channel,
+                ) {
                     eprintln!("failed to serve broker connection: {error}");
                 }
             })
