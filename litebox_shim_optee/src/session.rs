@@ -831,9 +831,11 @@ impl SessionManager {
             .unwrap_or(ANONYMOUS_CLIENT_IDENTITY)
     }
 
-    /// Drop the recorded client identity for `session_id`. Used on OpenSession
-    /// rollback paths (the TA's OpenSession failed, so the session is never
-    /// published). The normal close path goes through [`Self::unregister_session`].
+    /// Drop the recorded client identity for `session_id`.
+    ///
+    /// Called directly only on OpenSession rollback paths (the TA's OpenSession
+    /// failed, so the session is never published). The normal close path calls
+    /// this indirectly via [`Self::unregister_session`].
     pub fn clear_session_client_identity(&self, session_id: u32) {
         self.session_client_identities.lock().remove(&session_id);
     }
@@ -844,7 +846,7 @@ impl SessionManager {
     /// `is_keep_alive` after removal).
     pub fn unregister_session(&self, session_id: u32) -> Option<TaFlags> {
         let entry = self.sessions.remove(session_id);
-        self.session_client_identities.lock().remove(&session_id);
+        self.clear_session_client_identity(session_id);
         if entry.is_some() {
             recycle_session_id(session_id);
         }
