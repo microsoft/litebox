@@ -34,7 +34,7 @@ pub use error::{BrokerHostError, Result};
 /// The deployment must bind both channels to the same authenticated peer
 /// association. Active requests and responses remain on the control channel;
 /// broker-initiated readiness wakeups are sent on the notification channel.
-pub fn serve_connection_with_notifications<ControlChannel, NotificationChannel>(
+pub fn serve_connection<ControlChannel, NotificationChannel>(
     core: &BrokerCore,
     control_channel: &mut ControlChannel,
     notification_channel: &mut NotificationChannel,
@@ -248,7 +248,7 @@ mod tests {
         let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection_with_notifications(broker, &mut channel, &mut notifications).unwrap(),
+            serve_connection(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -279,7 +279,7 @@ mod tests {
         let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection_with_notifications(broker, &mut channel, &mut notifications).unwrap(),
+            serve_connection(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -303,7 +303,7 @@ mod tests {
         let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection_with_notifications(broker, &mut channel, &mut notifications).unwrap(),
+            serve_connection(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::ProtocolViolation
         );
         assert_eq!(
@@ -323,7 +323,7 @@ mod tests {
         let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection_with_notifications(broker, &mut channel, &mut notifications).unwrap(),
+            serve_connection(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::ProtocolViolation
         );
         assert_eq!(
@@ -348,7 +348,7 @@ mod tests {
         channel.send_error = true;
         let mut notifications = FakeHostNotificationChannel::default();
 
-        match serve_connection_with_notifications(broker, &mut channel, &mut notifications) {
+        match serve_connection(broker, &mut channel, &mut notifications) {
             Err(BrokerHostError::Channel(())) => {}
             result => panic!("unexpected serve result: {result:?}"),
         }

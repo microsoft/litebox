@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
-use litebox_broker_host::{ConnectionTermination, serve_connection_with_notifications};
+use litebox_broker_host::{ConnectionTermination, serve_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::event::ReadinessState;
 use litebox_broker_protocol::message::{BrokerNotification, EventReadinessNotification};
@@ -29,7 +29,7 @@ fn host_sends_readiness_notifications_over_paired_userland_channel() {
     let host_thread = std::thread::spawn(move || {
         let mut control = UnixStreamHostControlChannel::from_accepted(host_control);
         let mut notification = UnixStreamHostNotificationChannel::from_accepted(host_notification);
-        serve_connection_with_notifications(&broker, &mut control, &mut notification)
+        serve_connection(&broker, &mut control, &mut notification)
     });
 
     let mut local =

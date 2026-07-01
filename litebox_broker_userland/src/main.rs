@@ -9,7 +9,7 @@ use std::process::Command;
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
-use litebox_broker_host::serve_connection_with_notifications;
+use litebox_broker_host::serve_connection;
 use litebox_broker_transport::unix_socket::{
     UnixStreamHostControlChannel, UnixStreamHostNotificationChannel,
 };
@@ -63,11 +63,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     UnixStreamHostControlChannel::from_accepted(control_stream);
                 let mut notification_channel =
                     UnixStreamHostNotificationChannel::from_accepted(notification_stream);
-                if let Err(error) = serve_connection_with_notifications(
-                    &broker,
-                    &mut control_channel,
-                    &mut notification_channel,
-                ) {
+                if let Err(error) =
+                    serve_connection(&broker, &mut control_channel, &mut notification_channel)
+                {
                     eprintln!("failed to serve broker connection: {error}");
                 }
             })
