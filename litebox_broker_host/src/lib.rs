@@ -29,14 +29,14 @@ mod error;
 pub use error::{BrokerHostError, Result};
 
 /// Authenticates, negotiates, and serves one broker connection over the control channel.
-pub fn serve_connection<Channel>(
+pub fn serve_connection<ControlChannel>(
     core: &BrokerCore,
-    channel: &mut Channel,
-) -> Result<ConnectionTermination, Channel::Error>
+    control_channel: &mut ControlChannel,
+) -> Result<ConnectionTermination, ControlChannel::Error>
 where
-    Channel: HostControlChannel,
+    ControlChannel: HostControlChannel,
 {
-    serve_connection_inner(core, channel, |_notification| Ok(()))
+    serve_connection_inner(core, control_channel, |_notification| Ok(()))
 }
 
 /// Authenticates, negotiates, and serves one broker association over paired
@@ -59,17 +59,17 @@ where
     })
 }
 
-fn serve_connection_inner<Channel, NotifyEventReadiness>(
+fn serve_connection_inner<ControlChannel, NotifyEventReadiness>(
     core: &BrokerCore,
-    channel: &mut Channel,
+    control_channel: &mut ControlChannel,
     mut notify_event_readiness: NotifyEventReadiness,
-) -> Result<ConnectionTermination, Channel::Error>
+) -> Result<ConnectionTermination, ControlChannel::Error>
 where
-    Channel: HostControlChannel,
+    ControlChannel: HostControlChannel,
     NotifyEventReadiness:
-        FnMut(EventReadinessNotification) -> core::result::Result<(), Channel::Error>,
+        FnMut(EventReadinessNotification) -> core::result::Result<(), ControlChannel::Error>,
 {
-    let peer_credential = channel
+    let peer_credential = control_channel
         .peer_credential()
         .map_err(BrokerHostError::Channel)?;
     let caller_credential = match peer_credential {
@@ -79,13 +79,13 @@ where
     let session = core.create_session(caller_credential)?;
 
     loop {
-        let request = match channel
+        let request = match control_channel
             .recv_handshake_request()
             .map_err(BrokerHostError::Channel)?
         {
             HostReceive::Message(request) => request,
             HostReceive::ProtocolViolation => {
-                channel
+                control_channel
                     .send_handshake_response(&BrokerHandshakeResponse::Error(
                         ErrorCode::ProtocolState,
                     ))
@@ -105,7 +105,7 @@ where
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }
         };
-        channel
+        control_channel
             .send_handshake_response(&response)
             .map_err(BrokerHostError::Channel)?;
         if negotiated {
@@ -113,24 +113,27 @@ where
         }
     }
 
-    serve_request_loop(channel, &session, &mut notify_event_readiness)
+    serve_request_loop(control_channel, &session, &mut notify_event_readiness)
 }
 
-fn serve_request_loop<Channel, NotifyEventReadiness>(
-    channel: &mut Channel,
+fn serve_request_loop<ControlChannel, NotifyEventReadiness>(
+    control_channel: &mut ControlChannel,
     session: &BrokerSession,
     notify_event_readiness: &mut NotifyEventReadiness,
-) -> Result<ConnectionTermination, Channel::Error>
+) -> Result<ConnectionTermination, ControlChannel::Error>
 where
-    Channel: HostControlChannel,
+    ControlChannel: HostControlChannel,
     NotifyEventReadiness:
-        FnMut(EventReadinessNotification) -> core::result::Result<(), Channel::Error>,
+        FnMut(EventReadinessNotification) -> core::result::Result<(), ControlChannel::Error>,
 {
     loop {
-        let request = match channel.recv_request().map_err(BrokerHostError::Channel)? {
+        let request = match control_channel
+            .recv_request()
+            .map_err(BrokerHostError::Channel)?
+        {
             HostReceive::Message(request) => request,
             HostReceive::ProtocolViolation => {
-                channel
+                control_channel
                     .send_response(&BrokerResponse::Error(ErrorCode::ProtocolState))
                     .map_err(BrokerHostError::Channel)?;
                 return Ok(ConnectionTermination::ProtocolViolation);
@@ -139,7 +142,7 @@ where
         };
 
         let handled = handle_request(session, request);
-        channel
+        control_channel
             .send_response(&handled.response)
             .map_err(BrokerHostError::Channel)?;
         if let Some(notification) = handled.event_readiness_notification {
