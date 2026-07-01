@@ -611,17 +611,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None => return NtStatus::NOT_COMMITTED,
         };
 
-        if !new_permissions.contains(MemoryRegionPermissions::READ)
-            && let Err(status) = super::section::synchronize_pagefile_views_in_range(
-                &self.process.section_views,
-                &self.process.virtual_allocations,
-                aligned_base,
-                aligned_len,
-            )
-        {
-            return status;
-        }
-
         if update_permissions(
             &self.global.page_manager,
             aligned_base,
@@ -1433,7 +1422,7 @@ fn allocation_granularity_aligned_candidate(
     }
 }
 
-pub(super) fn update_permissions<Platform: ShimPlatform>(
+fn update_permissions<Platform: ShimPlatform>(
     page_manager: &WindowsPageManager<Platform>,
     aligned_base: usize,
     aligned_len: usize,

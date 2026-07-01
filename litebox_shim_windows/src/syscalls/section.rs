@@ -3,8 +3,6 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
-use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -14,20 +12,14 @@ use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
-use litebox::sync::RwLock;
 use litebox_common_windows::nt_status::NtStatus;
 use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
-use crate::syscalls::mm::{
-    MemoryType, PageProtection, create_pages, parse_page_protection, update_permissions,
-};
+use crate::syscalls::mm::{MemoryType, PageProtection, create_pages, parse_page_protection};
 use crate::syscalls::{Handle, ProcessHandle};
-use crate::{
-    ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsSectionView,
-    WindowsVirtualAllocations,
-};
+use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsSectionView};
 
 const VIEW_SHARE: u32 = 1;
 const VIEW_UNMAP: u32 = 2;
@@ -37,10 +29,11 @@ const MEM_DIFFERENT_IMAGE_BASE_OK: u32 = 0x0080_0000;
 const SUPPORTED_MAP_ALLOCATION_TYPES: u32 =
     MEM_TOP_DOWN | MEM_PHYSICAL | MEM_DIFFERENT_IMAGE_BASE_OK;
 
-enum SectionBacking<Platform: ShimPlatform> {
-    /// LiteBox lacks shared anonymous mappings, so pagefile sections allow one
-    /// active view and flush it here to preserve unmap/remap contents.
-    Pagefile(RwLock<Platform, Vec<u8>>),
+enum SectionBacking {
+    /// LiteBox lacks shared anonymous backing, so a pagefile section is
+    /// metadata-only until its single allowed view is mapped. Remap after unmap
+    /// is rejected instead of storing contents in shim memory or a file.
+    Pagefile,
     ImageFile,
 }
 
@@ -62,8 +55,9 @@ pub(crate) struct SectionObject<Platform: ShimPlatform> {
     size: usize,
     attributes: SectionAllocationAttributes,
     protection: PageProtection,
-    backing: SectionBacking<Platform>,
+    backing: SectionBacking,
     pagefile_view_active: AtomicBool,
+    _platform: PhantomData<fn(Platform)>,
 }
 
 pub(crate) struct MapViewOfSectionParameters<Platform: ShimPlatform> {
@@ -320,8 +314,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             size,
             attributes,
             protection,
-            backing: SectionBacking::Pagefile(RwLock::new(vec![0; size])),
+            backing: SectionBacking::Pagefile,
             pagefile_view_active: AtomicBool::new(false),
+            _platform: PhantomData,
         });
         if let Some(name) = &name {
             let status = self.insert_named_section(name, &section);
@@ -417,6 +412,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             protection: PageProtection::PAGE_EXECUTE_WRITECOPY,
             backing: SectionBacking::ImageFile,
             pagefile_view_active: AtomicBool::new(false),
+            _platform: PhantomData,
         });
         self.publish_section_handle(section_handle, section, granted_access)
     }
@@ -512,8 +508,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(section) => section,
             Err(status) => return status,
         };
-        match &section.backing {
-            SectionBacking::Pagefile(_) => self.map_pagefile_section(
+        match section.backing {
+            SectionBacking::Pagefile => self.map_pagefile_section(
                 request,
                 &section,
                 requested_view_size,
@@ -550,14 +546,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::NOT_MAPPED_VIEW;
         };
         let ptr = MutPtr::<Platform, u8>::from_usize(view_base);
-        if let Err(status) = synchronize_pagefile_view::<Platform>(
-            view_base,
-            &view,
-            &self.process.virtual_allocations,
-        ) {
-            self.process.section_views.write().insert(view_base, view);
-            return status;
-        }
         // SAFETY: Section views are tracked only after this shim successfully creates the pages;
         // unmapping consumes the tracked view and removes the exact owned range.
         if unsafe { self.global.page_manager.remove_pages(ptr, view.size) }.is_err() {
@@ -565,7 +553,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::UNABLE_TO_FREE_VM;
         }
         self.process.virtual_allocations.write().remove(&view_base);
-        release_pagefile_view_slot(&view);
         NtStatus::SUCCESS
     }
 
@@ -663,10 +650,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(mapped_size) else {
             return NtStatus::INVALID_VIEW_SIZE;
         };
-        let backing = match &section.backing {
-            SectionBacking::Pagefile(backing) => backing,
+        match section.backing {
+            SectionBacking::Pagefile => {}
             SectionBacking::ImageFile => return NtStatus::INVALID_FILE_FOR_SECTION,
-        };
+        }
         if !pagefile_view_protection_is_compatible(section.protection, page_protection) {
             litebox_util_log::debug!(
                 section_protection:% = format_args!("{:#x}", section.protection.bits()),
@@ -680,12 +667,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 section_size = section.size,
                 requested_view_size,
                 section_offset;
-                "Rejected second active pagefile section view"
+                "Rejected additional pagefile section view"
             );
-            // Host 25H2 allows multiple simultaneous pagefile views of one section
-            // (second NtMapViewOfSection -> STATUS_SUCCESS). LiteBox returns
-            // TODO(section-subsystem): allow this once PageManager has first-class shared
-            // anonymous backing for one section object mapped at multiple virtual addresses.
+            // Host 25H2 allows repeated and simultaneous pagefile views. LiteBox
+            // returns NOT_SUPPORTED until PageManager has first-class shared
+            // anonymous backing that avoids kernel-side content storage.
             return NtStatus::NOT_SUPPORTED;
         }
         let Ok(mapping) = create_pages(
@@ -693,27 +679,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None,
             length,
             CreatePagesFlags::empty(),
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-            |ptr| {
-                let backing = backing.read();
-                let bytes = &backing[section_offset..section_offset + mapped_size];
-                ptr.copy_from_slice(0, bytes)
-                    .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
-                Ok(mapped_size)
-            },
+            permissions,
+            |_| Ok(0),
         ) else {
             section.pagefile_view_active.store(false, Ordering::Release);
             return NtStatus::NO_MEMORY;
         };
         let base = mapping.as_usize();
-        if permissions != MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
-            && update_permissions(&self.global.page_manager, base, mapped_size, permissions)
-                .is_err()
-        {
-            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
-            section.pagefile_view_active.store(false, Ordering::Release);
-            return NtStatus::ACCESS_VIOLATION;
-        }
         if request.base_address.write_at_offset(0, base).is_none()
             || request.view_size.write_at_offset(0, view_size).is_none()
         {
@@ -1051,125 +1023,6 @@ fn write_section_image_information<Platform: ShimPlatform, FS: ShimFS>(
         return NtStatus::ACCESS_VIOLATION;
     }
     NtStatus::SUCCESS
-}
-
-fn release_pagefile_view_slot<Platform: ShimPlatform>(view: &WindowsSectionView<Platform>) {
-    if let Some(section) = &view.section
-        && matches!(section.backing, SectionBacking::Pagefile(_))
-    {
-        section.pagefile_view_active.store(false, Ordering::Release);
-    }
-}
-
-pub(super) fn synchronize_pagefile_views_in_range<Platform: ShimPlatform>(
-    views: &crate::WindowsSectionViews<Platform>,
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
-    base: usize,
-    size: usize,
-) -> Result<(), NtStatus> {
-    let Some(end) = base.checked_add(size) else {
-        return Err(NtStatus::INVALID_PARAMETER);
-    };
-    let snapshots = views
-        .read()
-        .iter()
-        .filter_map(|(&view_base, view)| {
-            let view_end = view_base.checked_add(view.size)?;
-            (view_base < end && base < view_end).then(|| (view_base, view.clone()))
-        })
-        .collect::<Vec<_>>();
-    for (view_base, view) in snapshots {
-        synchronize_pagefile_view::<Platform>(view_base, &view, virtual_allocations)?;
-    }
-    Ok(())
-}
-
-fn synchronize_pagefile_view<Platform: ShimPlatform>(
-    view_base: usize,
-    view: &WindowsSectionView<Platform>,
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
-) -> Result<(), NtStatus> {
-    let Some(section) = &view.section else {
-        return Ok(());
-    };
-    let SectionBacking::Pagefile(backing) = &section.backing else {
-        return Ok(());
-    };
-    let mut backing = backing.write();
-    let Some(end) = view.section_offset.checked_add(view.size) else {
-        return Err(NtStatus::INVALID_PARAMETER);
-    };
-    if end > backing.len() {
-        return Err(NtStatus::INVALID_PARAMETER);
-    }
-    for (range_start, range_end) in
-        readable_section_view_ranges(virtual_allocations, view_base, view.size)
-    {
-        let range_len = range_end - range_start;
-        let view_offset = range_start - view_base;
-        let backing_start = view
-            .section_offset
-            .checked_add(view_offset)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        let backing_end = backing_start
-            .checked_add(range_len)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if backing_end > backing.len() {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        let source = ConstPtr::<Platform, u8>::from_usize(range_start);
-        for (offset, byte) in backing[backing_start..backing_end].iter_mut().enumerate() {
-            let offset = isize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-            *byte = source
-                .read_at_offset(offset)
-                .ok_or(NtStatus::ACCESS_VIOLATION)?;
-        }
-    }
-    Ok(())
-}
-
-fn readable_section_view_ranges<Platform: ShimPlatform>(
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
-    view_base: usize,
-    view_size: usize,
-) -> Vec<(usize, usize)> {
-    let Some(view_end) = view_base.checked_add(view_size) else {
-        return Vec::new();
-    };
-    let allocations = virtual_allocations.read();
-    let Some((_, allocation)) = allocations.range(..=view_base).next_back() else {
-        return Vec::new();
-    };
-    if allocation
-        .base
-        .checked_add(allocation.size)
-        .is_none_or(|allocation_end| view_end > allocation_end)
-    {
-        return Vec::new();
-    }
-    allocation
-        .pages
-        .overlapping(view_base..view_end)
-        .filter(|(_, protect)| page_protection_is_readable(**protect))
-        .map(|(range, _)| {
-            let range_start = range.start.max(view_base);
-            let range_end = range.end.min(view_end);
-            (range_start, range_end)
-        })
-        .filter(|(range_start, range_end)| range_start < range_end)
-        .collect()
-}
-
-fn page_protection_is_readable(protect: PageProtection) -> bool {
-    matches!(
-        protect.bits() & PageProtection::BASE_MASK,
-        value if value == PageProtection::PAGE_READONLY.bits()
-            || value == PageProtection::PAGE_READWRITE.bits()
-            || value == PageProtection::PAGE_WRITECOPY.bits()
-            || value == PageProtection::PAGE_EXECUTE_READ.bits()
-            || value == PageProtection::PAGE_EXECUTE_READWRITE.bits()
-            || value == PageProtection::PAGE_EXECUTE_WRITECOPY.bits()
-    )
 }
 
 fn committed_pages(
@@ -1649,19 +1502,18 @@ mod tests {
     #[test]
     fn pagefile_map_accepts_compatible_noaccess_and_copy_protections() {
         let task = test_task();
-        let readonly = create_pagefile_section(
-            &task,
-            SectionAccess::ALL_ACCESS.bits(),
-            0x2000,
-            PageProtection::PAGE_READONLY,
-        );
-
         // Host 25H2 and ReactOS allow PAGE_WRITECOPY and PAGE_NOACCESS views of
         // a PAGE_READONLY pagefile section.
         for page_protection in [
             PageProtection::PAGE_WRITECOPY,
             PageProtection::PAGE_NOACCESS,
         ] {
+            let readonly = create_pagefile_section(
+                &task,
+                SectionAccess::ALL_ACCESS.bits(),
+                0x2000,
+                PageProtection::PAGE_READONLY,
+            );
             let mut base = 0usize;
             let mut view_size = 0usize;
             assert_eq!(
@@ -1862,13 +1714,29 @@ mod tests {
             task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, first_base),
             NtStatus::SUCCESS
         );
-        let (second_base, second_size) = map_pagefile_section(&task, opened);
-        assert_eq!(second_size, 0x2000);
-        assert_ne!(second_base, 0);
+        second_base = 0;
+        second_size = 0;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: opened,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut second_base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut second_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_READWRITE.bits(),
+            }),
+            NtStatus::NOT_SUPPORTED
+        );
+        assert_eq!(second_base, 0);
+        assert_eq!(second_size, 0);
     }
 
     #[test]
-    fn pagefile_view_unmap_remap_preserves_guest_writes() {
+    fn pagefile_view_unmap_remap_is_not_supported() {
         let task = test_task();
         let handle = create_pagefile_section(
             &task,
@@ -1879,52 +1747,6 @@ mod tests {
         let (first_base, first_size) = map_pagefile_section(&task, handle);
         assert_eq!(first_size, 0x2000);
 
-        let first = MutPtr::<TestPlatform, u32>::from_usize(first_base);
-        assert!(first.write_at_offset(0, 0xdead_beef).is_some());
-        let first_second_page = MutPtr::<TestPlatform, u32>::from_usize(first_base + PAGE_SIZE);
-        assert!(first_second_page.write_at_offset(0, 0x0bad_f00d).is_some());
-
-        assert_eq!(
-            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, first_base),
-            NtStatus::SUCCESS
-        );
-
-        let (second_base, second_size) = map_pagefile_section(&task, handle);
-        assert_eq!(second_size, 0x2000);
-        assert_ne!(second_base, 0);
-        let second = MutPtr::<TestPlatform, u32>::from_usize(second_base);
-        assert_eq!(second.read_at_offset(0), Some(0xdead_beef));
-        let second_second_page = MutPtr::<TestPlatform, u32>::from_usize(second_base + PAGE_SIZE);
-        assert_eq!(second_second_page.read_at_offset(0), Some(0x0bad_f00d));
-    }
-
-    #[test]
-    fn dirty_pagefile_view_flushes_before_noaccess_protect() {
-        let task = test_task();
-        let handle = create_pagefile_section(
-            &task,
-            SectionAccess::ALL_ACCESS.bits(),
-            0x2000,
-            PageProtection::PAGE_READWRITE,
-        );
-        let (first_base, first_size) = map_pagefile_section(&task, handle);
-        assert_eq!(first_size, 0x2000);
-        let first = MutPtr::<TestPlatform, u32>::from_usize(first_base);
-        assert!(first.write_at_offset(0, 0x55aa_1234).is_some());
-
-        let mut protect_base = first_base;
-        let mut protect_size = first_size;
-        let mut old_protect = 0;
-        assert_eq!(
-            task.sys_nt_protect_virtual_memory(
-                ProcessHandle::CURRENT,
-                mut_ptr(&mut protect_base),
-                mut_ptr(&mut protect_size),
-                PageProtection::PAGE_NOACCESS.bits(),
-                mut_ptr(&mut old_protect),
-            ),
-            NtStatus::SUCCESS
-        );
         assert_eq!(
             task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, first_base),
             NtStatus::SUCCESS
@@ -1945,66 +1767,10 @@ mod tests {
                 allocation_type: 0,
                 page_protection: PageProtection::PAGE_READWRITE.bits(),
             }),
-            NtStatus::SUCCESS
+            NtStatus::NOT_SUPPORTED
         );
-        assert_ne!(second_base, 0);
-        assert_eq!(second_size, 0x2000);
-        let second = MutPtr::<TestPlatform, u32>::from_usize(second_base);
-        assert_eq!(second.read_at_offset(0), Some(0x55aa_1234));
-    }
-
-    #[test]
-    fn partial_noaccess_protect_flushes_still_readable_section_pages() {
-        let task = test_task();
-        let handle = create_pagefile_section(
-            &task,
-            SectionAccess::ALL_ACCESS.bits(),
-            0x2000,
-            PageProtection::PAGE_READWRITE,
-        );
-        let (first_base, first_size) = map_pagefile_section(&task, handle);
-        assert_eq!(first_size, 0x2000);
-
-        let first_second_page = MutPtr::<TestPlatform, u32>::from_usize(first_base + PAGE_SIZE);
-        assert!(first_second_page.write_at_offset(0, 0x1111_1111).is_some());
-
-        let mut first_page_base = first_base;
-        let mut first_page_size = PAGE_SIZE;
-        let mut old_protect = 0;
-        assert_eq!(
-            task.sys_nt_protect_virtual_memory(
-                ProcessHandle::CURRENT,
-                mut_ptr(&mut first_page_base),
-                mut_ptr(&mut first_page_size),
-                PageProtection::PAGE_NOACCESS.bits(),
-                mut_ptr(&mut old_protect),
-            ),
-            NtStatus::SUCCESS
-        );
-
-        assert!(first_second_page.write_at_offset(0, 0x2222_2222).is_some());
-
-        let mut second_page_base = first_base + PAGE_SIZE;
-        let mut second_page_size = PAGE_SIZE;
-        assert_eq!(
-            task.sys_nt_protect_virtual_memory(
-                ProcessHandle::CURRENT,
-                mut_ptr(&mut second_page_base),
-                mut_ptr(&mut second_page_size),
-                PageProtection::PAGE_NOACCESS.bits(),
-                mut_ptr(&mut old_protect),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, first_base),
-            NtStatus::SUCCESS
-        );
-
-        let (second_base, second_size) = map_pagefile_section(&task, handle);
-        assert_eq!(second_size, 0x2000);
-        let second_second_page = MutPtr::<TestPlatform, u32>::from_usize(second_base + PAGE_SIZE);
-        assert_eq!(second_second_page.read_at_offset(0), Some(0x2222_2222));
+        assert_eq!(second_base, 0);
+        assert_eq!(second_size, 0);
     }
 
     #[test]
