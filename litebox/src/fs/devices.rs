@@ -150,6 +150,18 @@ pub struct FileSystem<
     current_working_dir: String,
 }
 
+#[cfg(test)]
+impl<
+    Platform: crate::platform::StdioProvider
+        + crate::sync::RawSyncPrimitivesProvider
+        + TimeProvider
+        + crate::platform::DebugLogProvider
+        + crate::platform::CrngProvider,
+> FileSystem<Platform>
+{
+    super::impl_test_descriptor_compat!();
+}
+
 impl<
     Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesProvider + TimeProvider,
 > FileSystem<Platform>
@@ -263,6 +275,7 @@ impl<
         path: impl Arg,
         flags: OFlags,
         mode: Mode,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<FileFd<Platform>, OpenError> {
         let requested_status = flags & OFlags::STATUS_FLAGS_MASK;
         let open_directory = flags.contains(OFlags::DIRECTORY);
@@ -353,28 +366,34 @@ impl<
         if open_directory {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        let fd = self
-            .litebox
-            .descriptor_table_mut()
-            .insert(DescriptorEntry::<Platform> {
-                entry: device,
-                _marker: core::marker::PhantomData,
-            });
+        let fd = descriptors.insert(DescriptorEntry::<Platform> {
+            entry: device,
+            _marker: core::marker::PhantomData,
+        });
         if truncate {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
             assert!(matches!(
-                self.truncate(&fd, 0, true),
+                <Self as super::FileSystem>::truncate(self, &fd, 0, true, descriptors),
                 Err(TruncateError::IsTerminalDevice)
             ));
         }
-        self.set_open_status_flags(&fd, requested_status)
-            .map_err(|_| OpenError::Io)?;
+        <Self as super::FileSystem>::set_open_status_flags(
+            self,
+            &fd,
+            requested_status,
+            descriptors,
+        )
+        .map_err(|_| OpenError::Io)?;
         Ok(fd)
     }
 
-    fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
+    fn close(
+        &self,
+        fd: &FileFd<Platform>,
+        descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), CloseError> {
+        descriptors.remove(fd);
         Ok(())
     }
 
@@ -383,15 +402,15 @@ impl<
         fd: &FileFd<Platform>,
         buf: &mut [u8],
         _offset: Option<usize>,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<usize, ReadError> {
         let nonblocking = {
-            let table = self.litebox.descriptor_table();
-            let nonblocking = table
+            let nonblocking = descriptors
                 .with_metadata(fd, |DeviceStatusFlags(flags)| {
                     flags.contains(OFlags::NONBLOCK)
                 })
                 .unwrap_or(false);
-            match &table.get_entry(fd).ok_or(ReadError::ClosedFd)?.entry {
+            match &descriptors.get_entry(fd).ok_or(ReadError::ClosedFd)?.entry {
                 Device::Stdin | Device::Tty => nonblocking,
                 Device::Stdout | Device::Stderr => {
                     return Err(ReadError::NotForReading);
@@ -428,14 +447,9 @@ impl<
         fd: &FileFd<Platform>,
         buf: &[u8],
         _offset: Option<usize>,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<usize, WriteError> {
-        let stream = match &self
-            .litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(WriteError::ClosedFd)?
-            .entry
-        {
+        let stream = match &descriptors.get_entry(fd).ok_or(WriteError::ClosedFd)?.entry {
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout | Device::Tty => StdioOutStream::Stdout,
             Device::Stderr => StdioOutStream::Stderr,
@@ -466,14 +480,9 @@ impl<
         fd: &FileFd<Platform>,
         _offset: isize,
         _whence: SeekWhence,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<usize, SeekError> {
-        match &self
-            .litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(SeekError::ClosedFd)?
-            .entry
-        {
+        match &descriptors.get_entry(fd).ok_or(SeekError::ClosedFd)?.entry {
             Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty => {
                 Err(SeekError::NonSeekable)
             }
@@ -489,6 +498,7 @@ impl<
         _fd: &FileFd<Platform>,
         _length: usize,
         _reset_offset: bool,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), TruncateError> {
         Err(TruncateError::IsTerminalDevice)
     }
@@ -534,7 +544,12 @@ impl<
         unimplemented!()
     }
 
-    fn rename(&self, _old: impl Arg, _new: impl Arg) -> Result<(), RenameError> {
+    fn rename(
+        &self,
+        _old: impl Arg,
+        _new: impl Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), RenameError> {
         unimplemented!()
     }
 
@@ -551,6 +566,7 @@ impl<
     fn read_dir(
         &self,
         _fd: &FileFd<Platform>,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<alloc::vec::Vec<crate::fs::DirEntry>, ReadDirError> {
         Err(ReadDirError::NotADirectory)
     }
@@ -637,10 +653,12 @@ impl<
         Ok(Self::device_file_status(device))
     }
 
-    fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        let device = self
-            .litebox
-            .descriptor_table()
+    fn fd_file_status(
+        &self,
+        fd: &FileFd<Platform>,
+        descriptors: &Descriptors<Platform>,
+    ) -> Result<FileStatus, FileStatusError> {
+        let device = descriptors
             .get_entry(fd)
             .ok_or(FileStatusError::ClosedFd)?
             .entry;
@@ -650,9 +668,9 @@ impl<
     fn get_io_pollable(
         &self,
         fd: &FileFd<Platform>,
+        descriptors: &Descriptors<Platform>,
     ) -> Option<alloc::boxed::Box<dyn crate::event::IOPollable>> {
-        let table = self.litebox.descriptor_table();
-        let entry = table.get_entry(fd)?;
+        let entry = descriptors.get_entry(fd)?;
         match entry.entry {
             Device::Stdin | Device::Tty => {
                 let litebox = self.litebox.clone();
@@ -668,15 +686,15 @@ impl<
         &self,
         fd: &FileFd<Platform>,
         flags: OFlags,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), MetadataError> {
         let status = flags & OFlags::STATUS_FLAGS_MASK;
-        let mut table = self.litebox.descriptor_table_mut();
-        match table.with_metadata_mut(fd, |DeviceStatusFlags(existing)| {
+        match descriptors.with_metadata_mut(fd, |DeviceStatusFlags(existing)| {
             *existing = status;
         }) {
             Ok(()) => Ok(()),
             Err(MetadataError::NoSuchMetadata) => {
-                let old = table.set_entry_metadata(fd, DeviceStatusFlags(status));
+                let old = descriptors.set_entry_metadata(fd, DeviceStatusFlags(status));
                 debug_assert!(old.is_none());
                 Ok(())
             }
@@ -690,6 +708,7 @@ impl<
         _rel_path: impl crate::path::Arg,
         _flags: super::OFlags,
         _mode: super::Mode,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<FileFd<Platform>, super::errors::OpenError> {
         // Device fds are not directories — fd-relative open is not meaningful.
         Err(super::errors::OpenError::NotADirectory)
@@ -700,6 +719,7 @@ impl<
         _dirfd: &FileFd<Platform>,
         _rel_path: impl crate::path::Arg,
         _follow_symlinks: bool,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         Err(super::errors::FileStatusError::NotADirectory)
     }
@@ -708,6 +728,7 @@ impl<
         &self,
         _dirfd: &FileFd<Platform>,
         _rel_path: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<(), super::errors::UnlinkError> {
         Err(super::errors::UnlinkError::NotADirectory)
     }
@@ -716,6 +737,7 @@ impl<
         &self,
         _dirfd: &FileFd<Platform>,
         _rel_path: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
         Err(super::errors::ReadLinkError::NotADirectory)
     }
@@ -726,6 +748,7 @@ impl<
         _old_rel: impl crate::path::Arg,
         _new_dirfd: &FileFd<Platform>,
         _new_rel: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::RenameError> {
         Err(super::errors::RenameError::NotADirectory)
     }
@@ -744,6 +767,7 @@ impl<
         _dirfd: &FileFd<Platform>,
         _rel_path: impl Arg,
         _mode: Mode,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<(), MkdirError> {
         Err(MkdirError::Io)
     }

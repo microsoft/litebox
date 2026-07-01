@@ -195,7 +195,11 @@ impl<FS: ShimFS> Task<FS> {
             .downcast_ref::<litebox::fd::TypedFd<FS>>()
             .ok_or(Errno::EBADF)?;
         let files = self.files.borrow();
-        files.fs.write(fd, buf, offset).map_err(Errno::from)
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
+        files
+            .fs
+            .write(fd, buf, offset, &mut *descriptors)
+            .map_err(Errno::from)
     }
 
     /// Check whether the file referenced by an internal handle was opened
@@ -205,7 +209,8 @@ impl<FS: ShimFS> Task<FS> {
             return false;
         };
         let files = self.files.borrow();
-        files.fs.is_writable(fd)
+        let descriptors = self.global.litebox.descriptor_table();
+        files.fs.is_writable(fd, &*descriptors)
     }
 
     /// Close an internal file handle. Takes ownership to ensure the handle
@@ -213,7 +218,8 @@ impl<FS: ShimFS> Task<FS> {
     fn internal_fs_close(&self, handle: InternalHandle) {
         if let Ok(fd) = handle.downcast::<litebox::fd::TypedFd<FS>>() {
             let files = self.files.borrow();
-            let _ = files.fs.close(&*fd);
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            let _ = files.fs.close(&*fd, &mut *descriptors);
             // `fd` is dropped here; OwnedFd::Drop is safe because
             // fs.close() already called mark_as_closed().
         }
@@ -228,14 +234,18 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
             crate::RawFdRef::Fs(typed_fd) => {
-                let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
+                let descriptors = self.global.litebox.descriptor_table();
+                let status = files
+                    .fs
+                    .fd_file_status(typed_fd, &*descriptors)
+                    .map_err(Errno::from)?;
                 if status.file_type != litebox::fs::FileType::RegularFile {
                     return Err(Errno::ENODEV);
                 }
                 let mut probe = [];
                 files
                     .fs
-                    .read(typed_fd, &mut probe, Some(0))
+                    .read(typed_fd, &mut probe, Some(0), &*descriptors)
                     .map_err(Errno::from)?;
                 Ok(())
             }
@@ -939,7 +949,10 @@ impl<FS: ShimFS> Task<FS> {
 
         let static_data = files
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
-                crate::RawFdRef::Fs(typed_fd) => files.fs.get_static_backing_data(typed_fd),
+                crate::RawFdRef::Fs(typed_fd) => {
+                    let descriptors = self.global.litebox.descriptor_table();
+                    files.fs.get_static_backing_data(typed_fd, &*descriptors)
+                }
                 #[cfg(feature = "worker_local_inet")]
                 crate::RawFdRef::Net(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::Eventfd(_) => None, // CoW fast path only supports FS static backing

@@ -117,8 +117,12 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 
     /// Access to the file descriptor table.
     ///
-    /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
-    /// potential deadlocks.
+    /// Note: this takes a (writer-preferring, non-reentrant) read lock. Do not
+    /// hold the returned guard across a call that itself accesses the
+    /// descriptor table — re-acquiring it on the same thread can self-deadlock
+    /// (see [`RwLock::read`](crate::sync::RwLock::read)). Prefer passing the
+    /// borrowed [`Descriptors`] down to callees instead of letting them
+    /// re-acquire it.
     pub fn descriptor_table(
         &self,
     ) -> impl core::ops::Deref<Target = Descriptors<Platform>> + use<'_, Platform> {
@@ -127,8 +131,10 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 
     /// Mutable access to the file descriptor table.
     ///
-    /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
-    /// potential deadlocks.
+    /// Note: this takes a (non-reentrant) write lock. Do not hold the returned
+    /// guard across a call that itself accesses the descriptor table (read or
+    /// write) — re-acquiring it on the same thread will deadlock (see
+    /// [`RwLock::write`](crate::sync::RwLock::write)).
     pub fn descriptor_table_mut(
         &self,
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {

@@ -3936,7 +3936,9 @@ impl<FS: ShimFS> Task<FS> {
                             let Some(provider) = super::broker_fs_provider() else {
                                 return Ok(false);
                             };
-                            let Some(fid) = files.fs.descriptor_backend_fid(fd) else {
+                            let descriptors = self.global.litebox.descriptor_table();
+                            let Some(fid) = files.fs.descriptor_backend_fid(fd, &*descriptors)
+                            else {
                                 return Ok(false);
                             };
                             let open_file_id = provider.register_ofd(fid).map_err(|err| {
@@ -4941,10 +4943,12 @@ impl<FS: ShimFS> Task<FS> {
                             self.fs_free_fid_number(new_fid);
                             return Err(super::broker_backed::broker_err_to_errno(err));
                         }
+                        let mut descriptors = self.global.litebox.descriptor_table_mut();
                         let file = match self.files.borrow().fs.wrap_existing_fid(
                             new_fid,
                             "",
                             litebox::fs::OFlags::empty(),
+                            &mut *descriptors,
                         ) {
                             Ok(file) => file,
                             Err(_) => {

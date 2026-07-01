@@ -4312,8 +4312,9 @@ impl<FS: ShimFS> Task<FS> {
                             files
                                 .run_on_raw_fd(entry.fd, |raw_fd_ref| match raw_fd_ref {
                                     crate::RawFdRef::Fs(fd) => {
-                                        let fid = files.fs.descriptor_backend_fid(fd)?;
                                         let descriptors = self.global.litebox.descriptor_table();
+                                        let fid =
+                                            files.fs.descriptor_backend_fid(fd, &*descriptors)?;
                                         files.fs.fd_path(fd, &*descriptors).map(|path| (fid, path))
                                     }
                                     #[allow(
@@ -7366,7 +7367,8 @@ impl<FS: ShimFS> Task<FS> {
         let mut rds = files.raw_descriptor_store.write();
         if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
             drop(rds);
-            let _ = files.fs.close(&old_fs);
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            let _ = files.fs.close(&old_fs, &mut *descriptors);
             rds = files.raw_descriptor_store.write();
         } else if let Ok(old_unix) =
             rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(guest_fd)
@@ -8941,6 +8943,7 @@ impl<FS: ShimFS> Task<FS> {
             .global
             .platform
             .spawn_worker_host_for_exec(
+                &self.global.litebox,
                 &load_path,
                 &argv,
                 &envp,
@@ -10449,12 +10452,17 @@ fn emit_fs_bridge_specs<FS: ShimFS>(
                 files.fs.fd_path(typed, &*descriptors)
             };
             path.and_then(|path| {
+                let descriptors = task.global.litebox.descriptor_table();
                 let position = files
                     .fs
-                    .seek(typed, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
+                    .seek(
+                        typed,
+                        0,
+                        litebox::fs::SeekWhence::RelativeToCurrentOffset,
+                        &*descriptors,
+                    )
                     .ok()?;
                 let status_flags_bits = {
-                    let descriptors = task.global.litebox.descriptor_table();
                     descriptors
                         .with_metadata(typed, |crate::StdioStatusFlags(flags)| flags.bits())
                         .unwrap_or(OFlags::RDONLY.bits())
@@ -10671,10 +10679,9 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
     files
         .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
     crate::RawFdRef::Fs(fd) => {
-                let status = files.fs.fd_file_status(fd).ok();
-                let open_flags = global
-                    .litebox
-                    .descriptor_table()
+                let descriptors = global.litebox.descriptor_table();
+                let status = files.fs.fd_file_status(fd, &*descriptors).ok();
+                let open_flags = descriptors
                     .with_metadata(fd, |crate::StdioStatusFlags(flags)| *flags)
                     .unwrap_or(OFlags::empty());
                 let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);

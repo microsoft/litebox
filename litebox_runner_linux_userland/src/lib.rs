@@ -1214,15 +1214,17 @@ fn build_initial_fs(
             |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
              path,
              mode| {
+                let mut descriptors = litebox.descriptor_table_mut();
                 let fd = fs
                     .open(
                         path,
                         litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
                         mode,
+                        &mut *descriptors,
                     )
                     .unwrap();
-                fs.initialize_primarily_read_heavy_file(&fd, prog_data);
-                fs.close(&fd).unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, prog_data, &mut *descriptors);
+                fs.close(&fd, &mut *descriptors).unwrap();
             };
         let last = ancestor_modes_and_users.last().ok_or_else(|| {
             anyhow!("program path has no ancestor directories (is it the root path?)")
@@ -1776,6 +1778,7 @@ fn set_fd_cloexec(fd: i32) -> Result<()> {
 }
 
 fn inject_program_image_into_in_mem(
+    litebox_sys: &litebox::LiteBox<Platform>,
     in_mem: &mut litebox::fs::in_mem::FileSystem<Platform>,
     program_path: &Path,
     program_data: alloc::borrow::Cow<'static, [u8]>,
@@ -1821,10 +1824,12 @@ fn inject_program_image_into_in_mem(
             }
         }
 
+        let mut descriptors = litebox_sys.descriptor_table_mut();
         let fd = match fs.open(
             path_str,
             litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
             dir_mode,
+            &mut *descriptors,
         ) {
             Ok(fd) => fd,
             Err(err) => {
@@ -1835,8 +1840,8 @@ fn inject_program_image_into_in_mem(
                 return;
             }
         };
-        fs.initialize_primarily_read_heavy_file(&fd, program_data);
-        if let Err(err) = fs.close(&fd) {
+        fs.initialize_primarily_read_heavy_file(&fd, program_data, &mut *descriptors);
+        if let Err(err) = fs.close(&fd, &mut *descriptors) {
             inject_error = Some(anyhow!(
                 "failed to close worker exec image {}: {err:?}",
                 program_path.display()
@@ -2422,7 +2427,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
     });
 
     if let Some(program_data) = transferred_exec_image {
-        inject_program_image_into_in_mem(&mut in_mem, &guest_load_path, program_data)?;
+        inject_program_image_into_in_mem(litebox, &mut in_mem, &guest_load_path, program_data)?;
     } else if cli_args.nine_p_broker.is_none() && !cli_args.program_from_tar {
         // If no transferred guest image was provided and the binary is on the
         // host filesystem, inject it into the in-memory FS.
@@ -2448,20 +2453,27 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
                 });
             }
             in_mem.with_root_privileges(|fs| {
+                let mut descriptors = litebox.descriptor_table_mut();
                 let fd = fs
                     .open(
                         prog.to_str().unwrap(),
                         litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
                         Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                        &mut *descriptors,
                     )
                     .unwrap();
-                fs.initialize_primarily_read_heavy_file(&fd, data);
-                fs.close(&fd).unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, data, &mut *descriptors);
+                fs.close(&fd, &mut *descriptors).unwrap();
             });
         }
     }
     if let Some((interp_path, interp_data)) = transferred_interp_image {
-        inject_program_image_into_in_mem(&mut in_mem, Path::new(interp_path), interp_data)?;
+        inject_program_image_into_in_mem(
+            litebox,
+            &mut in_mem,
+            Path::new(interp_path),
+            interp_data,
+        )?;
     }
 
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
