@@ -51,6 +51,10 @@ where
         _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
     };
     let session = core.create_session(caller_credential)?;
+    let mut connection = HostConnection {
+        session,
+        notification_channel,
+    };
 
     loop {
         let request = match control_channel
@@ -87,13 +91,12 @@ where
         }
     }
 
-    serve_request_loop(control_channel, notification_channel, &session)
+    serve_request_loop(control_channel, &mut connection)
 }
 
 fn serve_request_loop<ControlChannel, NotificationChannel, ChannelError>(
     control_channel: &mut ControlChannel,
-    notification_channel: &mut NotificationChannel,
-    session: &BrokerSession,
+    connection: &mut HostConnection<'_, NotificationChannel>,
 ) -> Result<ConnectionTermination, ChannelError>
 where
     ControlChannel: HostControlChannel<Error = ChannelError>,
@@ -114,18 +117,37 @@ where
             HostReceive::PeerClosed => break,
         };
 
-        let handled = handle_request(session, request);
+        let handled = handle_request(&connection.session, request);
         control_channel
             .send_response(&handled.response)
             .map_err(BrokerHostError::Channel)?;
         if let Some(notification) = handled.event_readiness_notification {
-            notification_channel
-                .send_notification(&BrokerNotification::EventReadiness(notification))
+            connection
+                .notify_event_readiness(notification)
                 .map_err(BrokerHostError::Channel)?;
         }
     }
 
     Ok(ConnectionTermination::PeerClosed)
+}
+
+/// Broker-host state for one authenticated control/notification association.
+struct HostConnection<'a, NotificationChannel> {
+    session: BrokerSession,
+    notification_channel: &'a mut NotificationChannel,
+}
+
+impl<NotificationChannel> HostConnection<'_, NotificationChannel>
+where
+    NotificationChannel: HostNotificationChannel,
+{
+    fn notify_event_readiness(
+        &mut self,
+        notification: EventReadinessNotification,
+    ) -> core::result::Result<(), NotificationChannel::Error> {
+        self.notification_channel
+            .send_notification(&BrokerNotification::EventReadiness(notification))
+    }
 }
 
 fn handle_request(session: &BrokerSession, request: BrokerRequest) -> HandledRequest {
@@ -230,6 +252,7 @@ mod tests {
         serve_connection_rejects_handshake_request_after_negotiation(&broker);
         serve_connection_returns_channel_error_when_response_send_fails(&broker);
         serve_request_loop_sends_event_readiness_notifications(&broker);
+        host_connection_sends_event_readiness_notifications(&broker);
         active_request_closes_object_reference(&broker);
     }
 
@@ -379,11 +402,16 @@ mod tests {
             ]),
         );
         let mut notifications = FakeHostNotificationChannel::default();
-
-        assert_eq!(
-            serve_request_loop(&mut channel, &mut notifications, &session).unwrap(),
-            ConnectionTermination::PeerClosed
-        );
+        {
+            let mut connection = HostConnection {
+                session,
+                notification_channel: &mut notifications,
+            };
+            assert_eq!(
+                serve_request_loop(&mut channel, &mut connection).unwrap(),
+                ConnectionTermination::PeerClosed
+            );
+        }
         assert_eq!(
             notifications.notifications,
             [
@@ -402,6 +430,31 @@ mod tests {
                     },
                 }),
             ]
+        );
+    }
+
+    fn host_connection_sends_event_readiness_notifications(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = litebox_broker_core::event::create(&session, 0).unwrap();
+        let readiness = litebox_broker_protocol::event::ReadinessState {
+            read_ready: true,
+            write_ready: true,
+        };
+        let notification = EventReadinessNotification { handle, readiness };
+        let mut notifications = FakeHostNotificationChannel::default();
+        {
+            let mut connection = HostConnection {
+                session,
+                notification_channel: &mut notifications,
+            };
+            connection.notify_event_readiness(notification).unwrap();
+        }
+
+        assert_eq!(
+            notifications.notifications,
+            [BrokerNotification::EventReadiness(notification)]
         );
     }
 
