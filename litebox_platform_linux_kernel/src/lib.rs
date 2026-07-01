@@ -79,8 +79,12 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                unsafe { litebox_common_linux::wrfsbase(val) };
-                Ok(())
+                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                    unsafe { litebox_common_linux::wrfsbase(val) };
+                    Ok(())
+                } else {
+                    Err(ArchSpecificError::RegisterUnpermittedValue)
+                }
             }
             ArchSpecificRegister::GsBase => {
                 // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538

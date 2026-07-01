@@ -58,4 +58,6 @@ pub enum ArchSpecificError {
     RegisterUnsupported,
     #[error("register is reserved by the platform and access is not allowed")]
     RegisterReserved,
+    #[error("register value is outside the permitted range")]
+    RegisterUnpermittedValue,
 }

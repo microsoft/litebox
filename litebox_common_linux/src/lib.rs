@@ -3206,6 +3206,16 @@ pub mod arch {
         | EFLAGS_OF
         | EFLAGS_RF
         | EFLAGS_ID;
+
+    /// Returns whether `base` is a valid x86_64 Linux user FS-segment base.
+    ///
+    /// A user FS base is valid iff it is below the top of the user address
+    /// space. `wrfsbase` with an invalid (i.e., non-canonical) value can
+    /// result in #GP. This check is based on Linux kernel's `do_arch_prctl_64`.
+    #[must_use]
+    pub fn is_valid_user_fs_base(base: usize) -> bool {
+        base < USER_ADDR_END
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

@@ -619,6 +619,7 @@ impl From<litebox::platform::ArchSpecificError> for Errno {
                 unimplemented!()
             }
             litebox::platform::ArchSpecificError::RegisterReserved => Errno::EINVAL,
+            litebox::platform::ArchSpecificError::RegisterUnpermittedValue => Errno::EPERM,
             _ => unimplemented!(),
         }
     }
