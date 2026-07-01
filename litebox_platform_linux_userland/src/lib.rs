@@ -1285,6 +1285,7 @@ impl LinuxUserland {
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
     pub fn spawn_worker_host_for_exec<FS>(
         &'static self,
+        litebox: &'static litebox::LiteBox<LinuxUserland>,
         guest_binary_path: &str,
         argv: &[alloc::ffi::CString],
         envp: &[alloc::ffi::CString],
@@ -1304,7 +1305,7 @@ impl LinuxUserland {
         controlling_pty: Option<u32>,
     ) -> Result<WorkerExecSpawnResult, i32>
     where
-        FS: litebox::fs::FileSystem + Send + Sync + 'static,
+        FS: litebox::fs::FileSystem<DescriptorPlatform = LinuxUserland> + Send + Sync + 'static,
     {
         use std::os::unix::ffi::OsStrExt;
 
@@ -1672,7 +1673,7 @@ impl LinuxUserland {
         let mut direct_pipes: Vec<ExecPipeDirectIo> = Vec::new();
         for (source, write_fd) in input_bridges {
             {
-                let Ok(bridge) = spawn_worker_input_bridge(self, source, write_fd) else {
+                let Ok(bridge) = spawn_worker_input_bridge(self, litebox, source, write_fd) else {
                     for dp in &direct_pipes {
                         close_raw_fd(dp.parent_os_fd);
                     }
@@ -1684,7 +1685,8 @@ impl LinuxUserland {
         }
         for (sink, read_fd, _target_fd) in output_bridges {
             {
-                let bridge = if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
+                let bridge = if let Ok(handle) = spawn_worker_output_bridge(litebox, sink, read_fd)
+                {
                     DetachedWorkerBridge {
                         handle,
                         input_control: None,
@@ -2740,11 +2742,12 @@ where
 
 fn spawn_worker_input_bridge<FS>(
     platform: &'static LinuxUserland,
+    litebox: &'static litebox::LiteBox<LinuxUserland>,
     source: WorkerExecInputSource<FS>,
     host_write_fd: std::os::fd::OwnedFd,
 ) -> std::io::Result<DetachedWorkerBridge>
 where
-    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+    FS: litebox::fs::FileSystem<DescriptorPlatform = LinuxUserland> + Send + Sync + 'static,
 {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     match source {
@@ -2753,7 +2756,15 @@ where
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let handle = std::thread::Builder::new().spawn(move || {
                 block_guest_signals();
-                bridge_worker_input_from_fs(platform, fs, fd, host_write_fd, thread_cancel, sender);
+                bridge_worker_input_from_fs(
+                    platform,
+                    litebox,
+                    fs,
+                    fd,
+                    host_write_fd,
+                    thread_cancel,
+                    sender,
+                );
             })?;
             let thread_handle = receiver.recv().ok();
             Ok(DetachedWorkerBridge {
@@ -2790,17 +2801,19 @@ where
 }
 
 fn spawn_worker_output_bridge<FS>(
-    platform: &'static LinuxUserland,
+    litebox: &'static litebox::LiteBox<LinuxUserland>,
     sink: WorkerExecOutputSink<FS>,
     host_read_fd: std::os::fd::OwnedFd,
 ) -> std::io::Result<std::thread::JoinHandle<()>>
 where
-    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+    FS: litebox::fs::FileSystem<DescriptorPlatform = LinuxUserland> + Send + Sync + 'static,
 {
     std::thread::Builder::new().spawn(move || {
         block_guest_signals();
         match sink {
-            WorkerExecOutputSink::Fs { fs, fd } => bridge_worker_output_to_fs(fs, fd, host_read_fd),
+            WorkerExecOutputSink::Fs { fs, fd } => {
+                bridge_worker_output_to_fs(litebox, fs, fd, host_read_fd);
+            }
             WorkerExecOutputSink::Stream(writer) => {
                 bridge_worker_output_to_stream(writer, host_read_fd);
             }
@@ -2870,6 +2883,7 @@ fn terminate_worker_after_bridge_spawn_failure(
 
 fn bridge_worker_input_from_fs<FS>(
     platform: &'static LinuxUserland,
+    litebox: &'static litebox::LiteBox<LinuxUserland>,
     fs: std::sync::Arc<FS>,
     fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
     host_write_fd: std::os::fd::OwnedFd,
@@ -2878,7 +2892,7 @@ fn bridge_worker_input_from_fs<FS>(
         litebox::event::wait::ThreadHandle<LinuxUserland>,
     >,
 ) where
-    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+    FS: litebox::fs::FileSystem<DescriptorPlatform = LinuxUserland> + Send + Sync + 'static,
 {
     use litebox::event::polling::TryOpError;
 
@@ -2892,7 +2906,10 @@ fn bridge_worker_input_from_fs<FS>(
     ThreadHandle::run_with_handle(|| {
         let mut host_write = std::fs::File::from(host_write_fd);
         let mut buf = [0_u8; 8192];
-        let io_pollable = fs.get_io_pollable(fd.as_ref());
+        let io_pollable = {
+            let descriptors = litebox.descriptor_table();
+            fs.get_io_pollable(fd.as_ref(), &*descriptors)
+        };
         let use_waker = io_pollable.as_ref().is_some_and(|p| !p.needs_host_poll());
         let wait_state = litebox::event::wait::WaitState::new(platform);
         let _ = thread_handle_sender.send(wait_state.thread_handle());
@@ -2919,13 +2936,16 @@ fn bridge_worker_input_from_fs<FS>(
                         pollable.register_observer(observer, filter);
                         Ok::<_, litebox::fs::errors::ReadError>(())
                     },
-                    || match fs.read(fd.as_ref(), &mut buf, None) {
-                        Ok(n) => Ok(n),
-                        Err(
-                            litebox::fs::errors::ReadError::WouldBlock
-                            | litebox::fs::errors::ReadError::Interrupted,
-                        ) => Err(TryOpError::TryAgain),
-                        Err(e) => Err(TryOpError::Other(e)),
+                    || {
+                        let descriptors = litebox.descriptor_table();
+                        match fs.read(fd.as_ref(), &mut buf, None, &*descriptors) {
+                            Ok(n) => Ok(n),
+                            Err(
+                                litebox::fs::errors::ReadError::WouldBlock
+                                | litebox::fs::errors::ReadError::Interrupted,
+                            ) => Err(TryOpError::TryAgain),
+                            Err(e) => Err(TryOpError::Other(e)),
+                        }
                     },
                 );
                 match result {
@@ -2942,7 +2962,8 @@ fn bridge_worker_input_from_fs<FS>(
                 }
             } else {
                 // Fallback: sleep-poll for non-pollable fds.
-                match fs.read(fd.as_ref(), &mut buf, None) {
+                let descriptors = litebox.descriptor_table();
+                match fs.read(fd.as_ref(), &mut buf, None, &*descriptors) {
                     Ok(0) => break,
                     Ok(read) => {
                         if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
@@ -2961,11 +2982,12 @@ fn bridge_worker_input_from_fs<FS>(
 }
 
 fn bridge_worker_output_to_fs<FS>(
+    litebox: &'static litebox::LiteBox<LinuxUserland>,
     fs: std::sync::Arc<FS>,
     fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
     host_read_fd: std::os::fd::OwnedFd,
 ) where
-    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+    FS: litebox::fs::FileSystem<DescriptorPlatform = LinuxUserland> + Send + Sync + 'static,
 {
     let mut host_read = std::fs::File::from(host_read_fd);
     let mut buf = [0_u8; 8192];
@@ -2975,7 +2997,13 @@ fn bridge_worker_output_to_fs<FS>(
             Ok(mut remaining) => {
                 let mut offset = 0;
                 while remaining > 0 {
-                    match fs.write(fd.as_ref(), &buf[offset..offset + remaining], None) {
+                    let mut descriptors = litebox.descriptor_table_mut();
+                    match fs.write(
+                        fd.as_ref(),
+                        &buf[offset..offset + remaining],
+                        None,
+                        &mut *descriptors,
+                    ) {
                         Ok(0) => return,
                         Ok(written) => {
                             offset += written;

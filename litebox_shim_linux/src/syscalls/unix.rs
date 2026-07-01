@@ -75,7 +75,7 @@ pub(crate) enum UnixSocketAddr {
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<FS: ShimFS> {
-    Path((String, FileFd<FS>, Arc<FS>)),
+    Path((String, FileFd<FS>, Arc<FS>, Arc<GlobalState<FS>>)),
     Abstract((Vec<u8>, Arc<FS>)),
 }
 
@@ -122,14 +122,15 @@ impl UnixSocketAddr {
                     OFlags::RDWR
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
-                let file = task
-                    .files
-                    .borrow()
+                let files = task.files.borrow();
+                let mut descriptors = task.global.litebox.descriptor_table_mut();
+                let file = files
                     .fs
                     .open(
                         path.as_str(),
                         flags,
                         Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                        &mut *descriptors,
                     )
                     .map_err(|err| {
                         // reason: unsupported variants intentionally share this fallback path.
@@ -142,7 +143,8 @@ impl UnixSocketAddr {
                 Ok(UnixBoundSocketAddr::Path((
                     path,
                     file,
-                    task.files.borrow().fs.clone(),
+                    files.fs.clone(),
+                    task.global.clone(),
                 )))
             }
             UnixSocketAddr::Abstract(data) => {
@@ -192,8 +194,9 @@ impl<FS: ShimFS> UnixBoundSocketAddr<FS> {
 impl<FS: ShimFS> Drop for UnixBoundSocketAddr<FS> {
     fn drop(&mut self) {
         match self {
-            Self::Path((_, file, fs)) => {
-                let _ = fs.close(file);
+            Self::Path((_, file, fs, global)) => {
+                let mut descriptors = global.litebox.descriptor_table_mut();
+                let _ = fs.close(file, &mut *descriptors);
             }
             Self::Abstract(_) => {}
         }

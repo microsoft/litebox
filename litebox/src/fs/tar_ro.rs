@@ -119,9 +119,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     }
 
     /// Get the stored path from a directory fd's Descriptor.
-    fn dir_fd_path(&self, dirfd: &FileFd<Platform>) -> Result<String, super::DirFdError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table
+    fn dir_fd_path(
+        &self,
+        dirfd: &FileFd<Platform>,
+        descriptors: &Descriptors<Platform>,
+    ) -> Result<String, super::DirFdError> {
+        let entry = descriptors
             .get_entry(dirfd)
             .ok_or(super::DirFdError::ClosedFd)?;
         match &entry.entry {
@@ -294,6 +297,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         path: impl crate::path::Arg,
         flags: OFlags,
         _mode: Mode,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
         let flags = flags - OFlags::PATH;
@@ -323,7 +327,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 .tar_index
                 .dir_by_path("")
                 .expect("root directory always exists");
-            return Ok(self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+            return Ok(descriptors.insert(Descriptor::Dir {
                 idx,
                 path: alloc::string::String::from("/"),
             }));
@@ -338,15 +342,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             if flags.contains(OFlags::DIRECTORY) {
                 return Err(OpenError::PathError(PathError::ComponentNotADirectory));
             }
-            self.litebox
-                .descriptor_table_mut()
-                .insert(Descriptor::File {
-                    idx,
-                    position: 0,
-                    path: path.clone(),
-                })
+            descriptors.insert(Descriptor::File {
+                idx,
+                position: 0,
+                path: path.clone(),
+            })
         } else if let Some((idx, _)) = self.tar_index.dir_by_path(stripped) {
-            self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+            descriptors.insert(Descriptor::Dir {
                 idx,
                 path: path.clone(),
             })
@@ -354,10 +356,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
         if flags.contains(OFlags::TRUNC) {
-            match self.truncate(&fd, 0, true) {
+            match self.truncate(&fd, 0, true, descriptors) {
                 Ok(()) => {}
                 Err(e) => {
-                    self.close(&fd).unwrap();
+                    self.close(&fd, descriptors).unwrap();
                     return Err(e.into());
                 }
             }
@@ -365,8 +367,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(fd)
     }
 
-    fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
+    fn close(
+        &self,
+        fd: &FileFd<Platform>,
+        descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), CloseError> {
+        descriptors.remove(fd);
         Ok(())
     }
 
@@ -375,9 +381,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         fd: &FileFd<Platform>,
         buf: &mut [u8],
         mut offset: Option<usize>,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<usize, ReadError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::File { idx, position, .. } = &mut descriptor_table
+        let Descriptor::File { idx, position, .. } = &mut descriptors
             .get_entry_mut(fd)
             .ok_or(ReadError::ClosedFd)?
             .entry
@@ -400,14 +406,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         fd: &FileFd<Platform>,
         _buf: &[u8],
         _offset: Option<usize>,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<usize, WriteError> {
-        match self
-            .litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(WriteError::ClosedFd)?
-            .entry
-        {
+        match descriptors.get_entry(fd).ok_or(WriteError::ClosedFd)?.entry {
             Descriptor::File { .. } => Err(WriteError::NotForWriting),
             Descriptor::Dir { .. } => Err(WriteError::NotAFile),
         }
@@ -418,9 +419,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         fd: &FileFd<Platform>,
         offset: isize,
         whence: SeekWhence,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<usize, SeekError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::File { idx, position, .. } = &mut descriptor_table
+        let Descriptor::File { idx, position, .. } = &mut descriptors
             .get_entry_mut(fd)
             .ok_or(SeekError::ClosedFd)?
             .entry
@@ -449,10 +450,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         fd: &FileFd<Platform>,
         _length: usize,
         _reset_offset: bool,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), TruncateError> {
-        match self
-            .litebox
-            .descriptor_table()
+        match descriptors
             .get_entry(fd)
             .ok_or(TruncateError::ClosedFd)?
             .entry
@@ -508,6 +508,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         &self,
         _old: impl crate::path::Arg,
         _new: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), RenameError> {
         Err(RenameError::ReadOnlyFileSystem)
     }
@@ -524,9 +525,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
-    fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::Dir { idx, .. } = &descriptor_table
+    fn read_dir(
+        &self,
+        fd: &FileFd<Platform>,
+        descriptors: &mut Descriptors<Platform>,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        let Descriptor::Dir { idx, .. } = &descriptors
             .get_entry(fd)
             .ok_or(ReadDirError::ClosedFd)?
             .entry
@@ -621,10 +625,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn fd_file_status(
         &self,
         fd: &FileFd<Platform>,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        match &self
-            .litebox
-            .descriptor_table()
+        match &descriptors
             .get_entry(fd)
             .ok_or(super::errors::FileStatusError::ClosedFd)?
             .entry
@@ -668,8 +671,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         rel_path: impl crate::path::Arg,
         flags: super::OFlags,
         mode: super::Mode,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<FileFd<Platform>, OpenError> {
-        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+        let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => OpenError::ClosedFd,
             super::DirFdError::NotADirectory => OpenError::NotADirectory,
             super::DirFdError::Io => OpenError::Io,
@@ -678,7 +682,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .as_rust_str()
             .map_err(|e| OpenError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(OpenError::PathError)?;
-        self.open(abs, flags, mode)
+        self.open(abs, flags, mode, descriptors)
     }
 
     fn stat_at(
@@ -686,8 +690,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         dirfd: &FileFd<Platform>,
         rel_path: impl crate::path::Arg,
         _follow_symlinks: bool,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<super::FileStatus, super::FileStatusError> {
-        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+        let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => super::FileStatusError::ClosedFd,
             super::DirFdError::NotADirectory => super::FileStatusError::NotADirectory,
             super::DirFdError::Io => super::FileStatusError::Io,
@@ -703,8 +708,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         &self,
         dirfd: &FileFd<Platform>,
         rel_path: impl crate::path::Arg,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<(), UnlinkError> {
-        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+        let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => UnlinkError::ClosedFd,
             super::DirFdError::NotADirectory => UnlinkError::NotADirectory,
             super::DirFdError::Io => UnlinkError::Io,
@@ -720,8 +726,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         &self,
         dirfd: &FileFd<Platform>,
         rel_path: impl crate::path::Arg,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
-        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+        let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => super::errors::ReadLinkError::ClosedFd,
             super::DirFdError::NotADirectory => super::errors::ReadLinkError::NotADirectory,
             super::DirFdError::Io => super::errors::ReadLinkError::Io,
@@ -740,26 +747,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         old_rel: impl crate::path::Arg,
         new_dirfd: &FileFd<Platform>,
         new_rel: impl crate::path::Arg,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), RenameError> {
-        let old_dir = self.dir_fd_path(old_dirfd).map_err(|e| match e {
-            super::DirFdError::ClosedFd => RenameError::ClosedFd,
-            super::DirFdError::NotADirectory => RenameError::NotADirectory,
-            super::DirFdError::Io => RenameError::Io,
-        })?;
+        let old_dir = self
+            .dir_fd_path(old_dirfd, descriptors)
+            .map_err(|e| match e {
+                super::DirFdError::ClosedFd => RenameError::ClosedFd,
+                super::DirFdError::NotADirectory => RenameError::NotADirectory,
+                super::DirFdError::Io => RenameError::Io,
+            })?;
         let old_r = old_rel
             .as_rust_str()
             .map_err(|e| RenameError::PathError(e.into()))?;
         let old_abs = Self::resolve_relative(&old_dir, old_r).map_err(RenameError::PathError)?;
-        let new_dir = self.dir_fd_path(new_dirfd).map_err(|e| match e {
-            super::DirFdError::ClosedFd => RenameError::ClosedFd,
-            super::DirFdError::NotADirectory => RenameError::NotADirectory,
-            super::DirFdError::Io => RenameError::Io,
-        })?;
+        let new_dir = self
+            .dir_fd_path(new_dirfd, descriptors)
+            .map_err(|e| match e {
+                super::DirFdError::ClosedFd => RenameError::ClosedFd,
+                super::DirFdError::NotADirectory => RenameError::NotADirectory,
+                super::DirFdError::Io => RenameError::Io,
+            })?;
         let new_r = new_rel
             .as_rust_str()
             .map_err(|e| RenameError::PathError(e.into()))?;
         let new_abs = Self::resolve_relative(&new_dir, new_r).map_err(RenameError::PathError)?;
-        self.rename(old_abs, new_abs)
+        self.rename(old_abs, new_abs, descriptors)
     }
 
     fn fd_path(
@@ -775,6 +787,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         _dirfd: &FileFd<Platform>,
         _rel_path: impl crate::path::Arg,
         _mode: Mode,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<(), MkdirError> {
         Err(MkdirError::ReadOnlyFileSystem)
     }

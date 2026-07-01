@@ -368,7 +368,8 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             })),
             EpollDescriptor::File(file) => {
                 // Check if the file supports async I/O polling (e.g., PTY master).
-                if let Some(io_poll) = fs.get_io_pollable(file) {
+                let descriptors = global.litebox.descriptor_table();
+                if let Some(io_poll) = fs.get_io_pollable(file, &*descriptors) {
                     let events = poll(&*io_poll);
                     return Some(events);
                 }
@@ -438,7 +439,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 handle.with_entry(|entry| entry.compute_needs_host_poll(global, fs))
             }
             EpollDescriptor::File(file) => fs
-                .get_io_pollable(file)
+                .get_io_pollable(file, &*global.litebox.descriptor_table())
                 .is_some_and(|p| p.needs_host_poll()),
             EpollDescriptor::HostPassthroughFd(_) => true,
             EpollDescriptor::BrokerPipe(_) => false,
