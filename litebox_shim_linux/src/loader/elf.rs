@@ -7,7 +7,7 @@ use alloc::{ffi::CString, vec::Vec};
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    platform::{PageManagementProvider, RawConstPointer as _, SystemInfoProvider as _},
+    platform::{RawConstPointer as _, SystemInfoProvider as _},
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
@@ -26,11 +26,6 @@ struct ElfFile<'a, FS: ShimFS> {
     task: &'a Task<FS>,
     fd: i32,
     load_high: bool,
-    /// Set once the `load_high` top-down reservation has been made, so a
-    /// second `reserve()` on the same image trips the `debug_assert` in
-    /// `reserve()` rather than silently targeting the same top slot.
-    #[cfg(debug_assertions)]
-    high_reserved: bool,
 }
 
 impl<'a, FS: ShimFS> ElfFile<'a, FS> {
@@ -42,8 +37,6 @@ impl<'a, FS: ShimFS> ElfFile<'a, FS> {
             task,
             fd,
             load_high: false,
-            #[cfg(debug_assertions)]
-            high_reserved: false,
         })
     }
 }
@@ -88,24 +81,14 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         // still fit `len` bytes.
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
         let hint = if self.load_high {
-            // The loader reserves an image's whole PT_LOAD span
-            // (`max_vaddr - min_vaddr`) in a single `MapMemory::reserve`
-            // call (see `litebox_common_linux::loader`), so `load_high`
-            // applies to exactly one reservation per image. A second
-            // top-down reservation would target this same
-            // `TASK_ADDR_MAX - mapping_len` slot, so assert it doesn't
-            // happen.
-            #[cfg(debug_assertions)]
-            {
-                debug_assert!(
-                    !self.high_reserved,
-                    "load_high reserve() called more than once for one ELF image",
-                );
-                self.high_reserved = true;
-            }
-            <litebox_platform_multiplex::Platform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX
-                .checked_sub(mapping_len)
-                .ok_or(Errno::ENOMEM)?
+            // Reserve the interpreter top-down by passing no hint: LiteBox's
+            // `get_unmmaped_area` then runs its top-down search and returns
+            // the highest free slot (see `litebox/src/mm/linux.rs`), which is
+            // where we want `ld.so` so the low ET_EXEC brk heap below stays
+            // uncapped. This needs no explicit `TASK_ADDR_MAX` arithmetic and
+            // no reserve-once bookkeeping, and it does not rely on any
+            // platform honoring an out-of-range hint.
+            0
         } else {
             super::DEFAULT_LOW_ADDR
         };
