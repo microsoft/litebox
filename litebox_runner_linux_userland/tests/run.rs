@@ -123,12 +123,14 @@ impl Runner {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn broker_socket(
+    fn broker_sockets(
         &mut self,
         control_socket_path: &Path,
         notification_socket_path: &Path,
     ) -> &mut Self {
-        self.command.arg("--broker-socket").arg(control_socket_path);
+        self.command
+            .arg("--broker-control-socket")
+            .arg(control_socket_path);
         self.command
             .arg("--broker-notification-socket")
             .arg(notification_socket_path);
@@ -475,12 +477,12 @@ fn test_runner_broker_integration_with_rewriter() {
     );
 
     Runner::new(&true_path, "broker_true_rewriter")
-        .broker_socket(&control_socket_path, &notification_socket_path)
+        .broker_sockets(&control_socket_path, &notification_socket_path)
         .run();
     assert_eq!(broker_thread.next_close_object_count(), 0);
 
     Runner::new(&target, "broker_eventfd_rewriter")
-        .broker_socket(&control_socket_path, &notification_socket_path)
+        .broker_sockets(&control_socket_path, &notification_socket_path)
         .run();
     // eventfd.c creates eight eventfd objects; each should release one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 8);

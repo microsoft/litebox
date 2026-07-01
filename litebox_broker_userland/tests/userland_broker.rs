@@ -32,7 +32,7 @@ fn run_parent_test() {
     // This custom-harness integration test uses its own executable as the broker's
     // runner. Cargo starts this executable without broker args, so it runs the
     // parent path here. The broker then starts the same executable with the real
-    // runner argv (`--unstable --broker-socket <path>
+    // runner argv (`--unstable --broker-control-socket <path>
     // --broker-notification-socket <path>`), which runs `run_fake_runner`. After
     // the fake runner finishes its broker requests, it terminates the broker
     // parent process; this lets the test exercise the long-running broker
@@ -64,7 +64,7 @@ fn run_fake_runner(args: &[OsString]) {
     );
     assert_eq!(
         args.get(1).map(OsString::as_os_str),
-        Some(OsStr::new("--broker-socket"))
+        Some(OsStr::new("--broker-control-socket"))
     );
     assert_eq!(
         args.get(3).map(OsString::as_os_str),

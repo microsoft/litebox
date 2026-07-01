@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut runner_command = Command::new(&args.runner);
     runner_command
         .arg("--unstable")
-        .arg("--broker-socket")
+        .arg("--broker-control-socket")
         .arg(&control_socket_path)
         .arg("--broker-notification-socket")
         .arg(&notification_socket_path)

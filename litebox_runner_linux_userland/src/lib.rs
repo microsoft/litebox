@@ -81,14 +81,14 @@ pub struct CliArgs {
     pub program_from_tar: bool,
     /// Broker-supplied Unix socket path for the local control channel.
     #[arg(
-        long = "broker-socket",
+        long = "broker-control-socket",
         value_name = "PATH",
         value_hint = clap::ValueHint::FilePath,
         hide = true,
         requires = "unstable",
         help_heading = "Unstable Options"
     )]
-    pub broker_socket: Option<PathBuf>,
+    pub broker_control_socket: Option<PathBuf>,
     /// Broker-supplied Unix socket path for the local notification channel.
     #[arg(
         long = "broker-notification-socket",
@@ -224,7 +224,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     litebox_platform_multiplex::set_platform(platform);
     let broker_connection = broker::connect(
-        cli_args.broker_socket.as_deref(),
+        cli_args.broker_control_socket.as_deref(),
         cli_args.broker_notification_socket.as_deref(),
     )?;
 
