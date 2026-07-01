@@ -36,6 +36,8 @@ const SUPPORTED_MAP_ALLOCATION_TYPES: u32 =
     MEM_TOP_DOWN | MEM_PHYSICAL | MEM_DIFFERENT_IMAGE_BASE_OK;
 
 enum SectionBacking<Platform: ShimPlatform> {
+    /// LiteBox lacks shared anonymous mappings, so pagefile sections allow one
+    /// active view and flush it here to preserve unmap/remap contents.
     Pagefile(RwLock<Platform, Vec<u8>>),
     ImageFile,
 }
