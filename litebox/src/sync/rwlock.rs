@@ -611,6 +611,19 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
+    /// Acquires a shared read lock, blocking the current thread until it can be
+    /// acquired.
+    ///
+    /// # Reentrancy
+    ///
+    /// This lock is **not reentrant**. It is writer-preferring (to avoid writer
+    /// starvation), so a thread that already holds a read guard and calls
+    /// `read()` again will **deadlock** the instant a writer is waiting: the
+    /// second `read()` blocks (a new reader cannot acquire while a writer
+    /// waits), while that writer blocks on the still-held first guard. Never
+    /// hold a read guard across a call that might re-acquire the same lock; pass
+    /// the already-borrowed data down instead. (With the `lock_tracing` feature
+    /// such same-thread re-acquisitions become deterministic panics.)
     #[inline]
     #[track_caller]
     pub fn read(&self) -> RwLockReadGuard<'_, Platform, T> {
@@ -638,6 +651,16 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
         }
     }
 
+    /// Acquires an exclusive write lock, blocking the current thread until it
+    /// can be acquired.
+    ///
+    /// # Reentrancy
+    ///
+    /// This lock is **not reentrant**. A thread that already holds *any* guard
+    /// (read or write) on this lock and calls `write()` will **deadlock** — the
+    /// exclusive write can never be granted while an outstanding guard from the
+    /// same thread is held. Never hold a guard across a call that might
+    /// re-acquire the same lock.
     #[inline]
     #[track_caller]
     pub fn write(&self) -> RwLockWriteGuard<'_, Platform, T> {

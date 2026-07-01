@@ -214,6 +214,15 @@ unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for Mutex<Platfor
 unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Sync for Mutex<Platform, T> {}
 
 impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
+    /// Acquires the mutex, blocking the current thread until it can be acquired.
+    ///
+    /// # Reentrancy
+    ///
+    /// This mutex is **not reentrant**. A thread that already holds the guard
+    /// and calls `lock()` again will **deadlock** (mutual exclusion admits no
+    /// second holder). Never hold the guard across a call that might re-acquire
+    /// the same mutex. (With the `lock_tracing` feature such same-thread
+    /// re-acquisitions become deterministic panics.)
     #[inline]
     #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, Platform, T> {
