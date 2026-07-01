@@ -363,8 +363,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
-    // Wine's open_mapping and ReactOS object-manager open path first resolve a named Section object;
-    // KnownDlls misses then report object-manager path/name status rather than a link-specific error.
     pub(crate) fn sys_nt_open_section(
         &self,
         section_handle: MutPtr<Platform, Handle>,
