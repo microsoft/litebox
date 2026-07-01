@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
@@ -27,28 +27,6 @@ pub(crate) struct BrokerConnection {
 }
 
 pub(crate) fn connect(
-    control_socket_path: Option<&Path>,
-    notification_socket_path: Option<&Path>,
-) -> Result<Option<BrokerConnection>> {
-    let Some(control_socket_path) = control_socket_path else {
-        if notification_socket_path.is_some() {
-            bail!("broker control socket is required with broker notification socket");
-        }
-        return Ok(None);
-    };
-    let Some(notification_socket_path) = notification_socket_path else {
-        bail!("broker notification socket is required with broker control socket");
-    };
-    connect_to_endpoint(control_socket_path, notification_socket_path).map(Some)
-}
-
-impl BrokerConnection {
-    pub(crate) fn into_local(self) -> Local {
-        self.local
-    }
-}
-
-fn connect_to_endpoint(
     control_socket_path: &Path,
     notification_socket_path: &Path,
 ) -> Result<BrokerConnection> {
@@ -90,6 +68,12 @@ fn connect_to_endpoint(
         local,
         notification_receiver_thread: notification_thread,
     })
+}
+
+impl BrokerConnection {
+    pub(crate) fn into_local(self) -> Local {
+        self.local
+    }
 }
 
 fn connect_control_with_retry(
