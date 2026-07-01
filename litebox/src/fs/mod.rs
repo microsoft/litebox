@@ -24,6 +24,192 @@ pub mod tar_ro;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+macro_rules! impl_test_descriptor_compat {
+    () => {
+        pub fn open(
+            &self,
+            path: impl $crate::path::Arg,
+            flags: $crate::fs::OFlags,
+            mode: $crate::fs::Mode,
+        ) -> Result<$crate::fd::TypedFd<Self>, $crate::fs::OpenError> {
+            let mut descriptors = self.litebox.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::open(self, path, flags, mode, &mut *descriptors)
+        }
+
+        pub fn close(&self, fd: &$crate::fd::TypedFd<Self>) -> Result<(), $crate::fs::CloseError> {
+            let mut descriptors = self.litebox.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::close(self, fd, &mut *descriptors)
+        }
+
+        pub fn read(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            buf: &mut [u8],
+            offset: Option<usize>,
+        ) -> Result<usize, $crate::fs::ReadError> {
+            let descriptors = self.litebox.descriptor_table();
+            <Self as $crate::fs::FileSystem>::read(self, fd, buf, offset, &*descriptors)
+        }
+
+        pub fn write(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            buf: &[u8],
+            offset: Option<usize>,
+        ) -> Result<usize, $crate::fs::WriteError> {
+            let mut descriptors = self.litebox.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::write(self, fd, buf, offset, &mut *descriptors)
+        }
+
+        pub fn seek(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            offset: isize,
+            whence: $crate::fs::SeekWhence,
+        ) -> Result<usize, $crate::fs::SeekError> {
+            let descriptors = self.litebox.descriptor_table();
+            <Self as $crate::fs::FileSystem>::seek(self, fd, offset, whence, &*descriptors)
+        }
+
+        pub fn truncate(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            length: usize,
+            reset_offset: bool,
+        ) -> Result<(), $crate::fs::TruncateError> {
+            let mut descriptors = self.litebox.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::truncate(
+                self,
+                fd,
+                length,
+                reset_offset,
+                &mut *descriptors,
+            )
+        }
+
+        pub fn rename(
+            &self,
+            old_path: impl $crate::path::Arg,
+            new_path: impl $crate::path::Arg,
+        ) -> Result<(), $crate::fs::RenameError> {
+            let mut descriptors = self.litebox.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::rename(self, old_path, new_path, &mut *descriptors)
+        }
+
+        pub fn read_dir(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+        ) -> Result<alloc::vec::Vec<$crate::fs::DirEntry>, $crate::fs::ReadDirError> {
+            let mut descriptors = self.litebox.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::read_dir(self, fd, &mut *descriptors)
+        }
+
+        pub fn fd_file_status(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+        ) -> Result<$crate::fs::FileStatus, $crate::fs::FileStatusError> {
+            let descriptors = self.litebox.descriptor_table();
+            <Self as $crate::fs::FileSystem>::fd_file_status(self, fd, &*descriptors)
+        }
+
+        pub fn get_static_backing_data(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+        ) -> Option<&'static [u8]> {
+            let descriptors = self.litebox.descriptor_table();
+            <Self as $crate::fs::FileSystem>::get_static_backing_data(self, fd, &*descriptors)
+        }
+
+        pub fn set_open_status_flags(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            flags: $crate::fs::OFlags,
+        ) -> Result<(), $crate::fd::MetadataError> {
+            let mut descriptors = self.litebox.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::set_open_status_flags(
+                self,
+                fd,
+                flags,
+                &mut *descriptors,
+            )
+        }
+
+        pub fn open_at(
+            &self,
+            dirfd: &$crate::fd::TypedFd<Self>,
+            rel_path: impl $crate::path::Arg,
+            flags: $crate::fs::OFlags,
+            mode: $crate::fs::Mode,
+        ) -> Result<$crate::fd::TypedFd<Self>, $crate::fs::OpenError> {
+            let mut descriptors = self.litebox.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::open_at(
+                self,
+                dirfd,
+                rel_path,
+                flags,
+                mode,
+                &mut *descriptors,
+            )
+        }
+
+        pub fn stat_at(
+            &self,
+            dirfd: &$crate::fd::TypedFd<Self>,
+            rel_path: impl $crate::path::Arg,
+            follow_symlinks: bool,
+        ) -> Result<$crate::fs::FileStatus, $crate::fs::FileStatusError> {
+            let descriptors = self.litebox.descriptor_table();
+            <Self as $crate::fs::FileSystem>::stat_at(
+                self,
+                dirfd,
+                rel_path,
+                follow_symlinks,
+                &*descriptors,
+            )
+        }
+
+        pub fn unlink_at(
+            &self,
+            dirfd: &$crate::fd::TypedFd<Self>,
+            rel_path: impl $crate::path::Arg,
+        ) -> Result<(), $crate::fs::UnlinkError> {
+            let descriptors = self.litebox.descriptor_table();
+            <Self as $crate::fs::FileSystem>::unlink_at(self, dirfd, rel_path, &*descriptors)
+        }
+
+        pub fn readlink_at(
+            &self,
+            dirfd: &$crate::fd::TypedFd<Self>,
+            rel_path: impl $crate::path::Arg,
+        ) -> Result<alloc::string::String, $crate::fs::errors::ReadLinkError> {
+            let descriptors = self.litebox.descriptor_table();
+            <Self as $crate::fs::FileSystem>::readlink_at(self, dirfd, rel_path, &*descriptors)
+        }
+
+        pub fn rename_at(
+            &self,
+            old_dirfd: &$crate::fd::TypedFd<Self>,
+            old_rel: impl $crate::path::Arg,
+            new_dirfd: &$crate::fd::TypedFd<Self>,
+            new_rel: impl $crate::path::Arg,
+        ) -> Result<(), $crate::fs::RenameError> {
+            let mut descriptors = self.litebox.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::rename_at(
+                self,
+                old_dirfd,
+                old_rel,
+                new_dirfd,
+                new_rel,
+                &mut *descriptors,
+            )
+        }
+    };
+}
+
+#[cfg(test)]
+pub(crate) use impl_test_descriptor_compat;
+
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
     ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,

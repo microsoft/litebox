@@ -861,6 +861,7 @@ mod in_mem {
 mod tar_ro {
     use crate::LiteBox;
     use crate::fs::tar_ro;
+    #[allow(unused_imports)]
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
@@ -2196,6 +2197,7 @@ mod layered {
 
 mod stdio {
     use crate::LiteBox;
+    #[allow(unused_imports)]
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;

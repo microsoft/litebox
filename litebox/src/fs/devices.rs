@@ -150,6 +150,18 @@ pub struct FileSystem<
     current_working_dir: String,
 }
 
+#[cfg(test)]
+impl<
+    Platform: crate::platform::StdioProvider
+        + crate::sync::RawSyncPrimitivesProvider
+        + TimeProvider
+        + crate::platform::DebugLogProvider
+        + crate::platform::CrngProvider,
+> FileSystem<Platform>
+{
+    super::impl_test_descriptor_compat!();
+}
+
 impl<
     Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesProvider + TimeProvider,
 > FileSystem<Platform>
@@ -362,12 +374,17 @@ impl<
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
             assert!(matches!(
-                self.truncate(&fd, 0, true, descriptors),
+                <Self as super::FileSystem>::truncate(self, &fd, 0, true, descriptors),
                 Err(TruncateError::IsTerminalDevice)
             ));
         }
-        self.set_open_status_flags(&fd, requested_status, descriptors)
-            .map_err(|_| OpenError::Io)?;
+        <Self as super::FileSystem>::set_open_status_flags(
+            self,
+            &fd,
+            requested_status,
+            descriptors,
+        )
+        .map_err(|_| OpenError::Io)?;
         Ok(fd)
     }
 

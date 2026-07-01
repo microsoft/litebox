@@ -430,6 +430,7 @@ struct WriteBuffer {
 /// - `W`: The transport write half type that implements the `Write` trait.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> {
     /// Reference to the LiteBox instance
+    #[cfg_attr(not(test), allow(dead_code))]
     litebox: LiteBox<Platform>,
     /// 9P client for protocol operations
     client: client::Client<Platform, W>,
@@ -475,6 +476,11 @@ pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider, W: transport::W
     /// prevent stale RPC results from being cached when a concurrent write
     /// occurs during the RPC round-trip.
     cache_generation: AtomicUsize,
+}
+
+#[cfg(test)]
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<Platform, W> {
+    super::impl_test_descriptor_compat!();
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<Platform, W> {
@@ -2355,7 +2361,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .as_rust_str()
             .map_err(|e| super::errors::OpenError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(super::errors::OpenError::PathError)?;
-        self.open(abs, flags, mode, descriptors)
+        <Self as super::FileSystem>::open(self, abs, flags, mode, descriptors)
     }
 
     /// Note: `_follow_symlinks` is currently ignored because
@@ -2458,7 +2464,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .map_err(|e| super::errors::RenameError::PathError(e.into()))?;
         let new_abs = Self::resolve_relative(&new_dir, new_r)
             .map_err(super::errors::RenameError::PathError)?;
-        self.rename(old_abs, new_abs, descriptors)
+        <Self as super::FileSystem>::rename(self, old_abs, new_abs, descriptors)
     }
 
     fn fd_path(

@@ -86,6 +86,16 @@ pub struct FileSystem<
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
 }
 
+#[cfg(test)]
+impl<
+    Platform: sync::RawSyncPrimitivesProvider,
+    Upper: super::FileSystem<DescriptorPlatform = Platform> + 'static,
+    Lower: super::FileSystem<DescriptorPlatform = Platform> + 'static,
+> FileSystem<Platform, Upper, Lower>
+{
+    super::impl_test_descriptor_compat!();
+}
+
 impl<
     Platform: sync::RawSyncPrimitivesProvider,
     Upper: super::FileSystem<DescriptorPlatform = Platform>,
@@ -866,11 +876,11 @@ impl<
     fn open(
         &self,
         path: impl crate::path::Arg,
-        flags: OFlags,
+        mut flags: OFlags,
         mode: Mode,
         descriptors: &mut Descriptors<Platform>,
     ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
-        let mut flags = flags - OFlags::PATH;
+        flags.remove(OFlags::PATH);
         let currently_supported_oflags: OFlags = OFlags::CREAT
             | OFlags::RDONLY
             | OFlags::WRONLY
@@ -888,7 +898,7 @@ impl<
         if !unsupported.is_empty() {
             // Strip unsupported flags rather than panicking — Node.js/V8 may
             // pass platform-specific flags that are harmless to ignore.
-            flags = flags & currently_supported_oflags;
+            flags &= currently_supported_oflags;
         }
         let path = self.absolute_path(path)?;
         if self.has_tombstoned_ancestor(&path)? {
@@ -906,7 +916,13 @@ impl<
             } else {
                 // We must first attempt to open the file _without_ creating it, and only if that
                 // fails, do we fall-through and end up creating it.
-                if let Ok(fd) = self.open(path.as_str(), flags - OFlags::CREAT, mode, descriptors) {
+                if let Ok(fd) = <Self as super::FileSystem>::open(
+                    self,
+                    path.as_str(),
+                    flags - OFlags::CREAT,
+                    mode,
+                    descriptors,
+                ) {
                     return Ok(fd);
                 }
             }
@@ -1190,7 +1206,15 @@ impl<
                         if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
                             // We must migrate the directories above, and then re-trigger the open
                             match self.mkdir_migrating_ancestor_dirs(&path) {
-                                Ok(()) => return self.open(path, flags, mode, descriptors),
+                                Ok(()) => {
+                                    return <Self as super::FileSystem>::open(
+                                        self,
+                                        path,
+                                        flags,
+                                        mode,
+                                        descriptors,
+                                    );
+                                }
                                 Err(MkdirError::NoWritePerms) => {
                                     return Err(OpenError::NoWritePerms);
                                 }
@@ -1215,7 +1239,6 @@ impl<
         }
         // We must check the lower level, creating an entry if needed
         let original_flags = flags;
-        let mut flags = flags;
         match self.layering_semantics {
             LayeringSemantics::LowerLayerReadOnly => {
                 // Prevent creation or truncation of files at lower level
@@ -1369,14 +1392,14 @@ impl<
             // not exist at the upper level but exists at the lower level; in that case, our
             // `truncate` functionality (at the layered FS itself) should correctly migrate things
             // over and handle them.
-            match self.truncate(&fd, 0, true, descriptors) {
+            match <Self as super::FileSystem>::truncate(self, &fd, 0, true, descriptors) {
                 Ok(()) | Err(TruncateError::IsTerminalDevice) => {
                     // The terminal device is the one case we need to (due to Linux compatibility)
                     // explicitly ignore the truncation ability, and instead silently continue as if
                     // no error was thrown during truncation.
                 }
                 Err(e) => {
-                    self.close(&fd, descriptors).unwrap();
+                    <Self as super::FileSystem>::close(self, &fd, descriptors).unwrap();
                     return Err(e.into());
                 }
             }
@@ -1645,7 +1668,7 @@ impl<
         ));
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
-        self.write(fd, buf, offset, descriptors)
+        <Self as super::FileSystem>::write(self, fd, buf, offset, descriptors)
     }
 
     fn seek(
@@ -2305,7 +2328,8 @@ impl<
         }
 
         let mut descriptors = self.litebox.descriptor_table_mut();
-        let dir_fd = match self.open(
+        let dir_fd = match <Self as super::FileSystem>::open(
+            self,
             path.as_str(),
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -2332,12 +2356,13 @@ impl<
                 }
             },
         };
-        let entries = match self.read_dir(&dir_fd, &mut *descriptors) {
+        let entries = match <Self as super::FileSystem>::read_dir(self, &dir_fd, &mut *descriptors)
+        {
             Ok(entries) => entries,
             Err(ReadDirError::ClosedFd | ReadDirError::NotADirectory) => unreachable!(),
             Err(ReadDirError::Io) => return Err(RmdirError::Io),
         };
-        self.close(&dir_fd, &mut *descriptors)
+        <Self as super::FileSystem>::close(self, &dir_fd, &mut *descriptors)
             .map_err(|_| RmdirError::Io)?;
         // "." and ".." are always present; anything more => not empty.
         if entries.len() > 2 {
@@ -2634,7 +2659,7 @@ impl<
             .as_rust_str()
             .map_err(|e| OpenError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(OpenError::PathError)?;
-        self.open(abs, flags, mode, descriptors)
+        <Self as super::FileSystem>::open(self, abs, flags, mode, descriptors)
     }
 
     fn stat_at(
@@ -2731,7 +2756,7 @@ impl<
             .as_rust_str()
             .map_err(|e| RenameError::PathError(e.into()))?;
         let new_abs = Self::resolve_relative(&new_dir, new_r).map_err(RenameError::PathError)?;
-        self.rename(old_abs, new_abs, descriptors)
+        <Self as super::FileSystem>::rename(self, old_abs, new_abs, descriptors)
     }
 
     fn fd_path(

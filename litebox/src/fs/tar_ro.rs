@@ -61,10 +61,16 @@ const BLOCK_SIZE: usize = 0;
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
+    #[cfg_attr(not(test), allow(dead_code))]
     litebox: LiteBox<Platform>,
     tar_index: TarIndex,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
+}
+
+#[cfg(test)]
+impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
+    super::impl_test_descriptor_compat!();
 }
 
 /// An empty tar file to support an empty file system.
@@ -356,10 +362,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
         if flags.contains(OFlags::TRUNC) {
-            match self.truncate(&fd, 0, true, descriptors) {
+            match <Self as super::FileSystem>::truncate(self, &fd, 0, true, descriptors) {
                 Ok(()) => {}
                 Err(e) => {
-                    self.close(&fd, descriptors).unwrap();
+                    <Self as super::FileSystem>::close(self, &fd, descriptors).unwrap();
                     return Err(e.into());
                 }
             }
@@ -682,7 +688,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .as_rust_str()
             .map_err(|e| OpenError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(OpenError::PathError)?;
-        self.open(abs, flags, mode, descriptors)
+        <Self as super::FileSystem>::open(self, abs, flags, mode, descriptors)
     }
 
     fn stat_at(
@@ -771,7 +777,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .as_rust_str()
             .map_err(|e| RenameError::PathError(e.into()))?;
         let new_abs = Self::resolve_relative(&new_dir, new_r).map_err(RenameError::PathError)?;
-        self.rename(old_abs, new_abs, descriptors)
+        <Self as super::FileSystem>::rename(self, old_abs, new_abs, descriptors)
     }
 
     fn fd_path(
