@@ -1,6 +1,9 @@
 [
   {
     "func_id": "open_session",
+    "client_identity": {
+      "login": "user"
+    },
     "args": [
       {
         "param_type": "value_input",
@@ -31,6 +34,9 @@
   },
   {
     "func_id": "open_session",
+    "client_identity": {
+      "login": "user"
+    },
     "args": [
       {
         "param_type": "value_input",

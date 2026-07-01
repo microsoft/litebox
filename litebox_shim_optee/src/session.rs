@@ -106,11 +106,18 @@ use crate::{LoadedProgram, OpteeShim, SessionIdPool};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use hashbrown::{HashMap, HashSet};
-use litebox_common_optee::{OpteeSmcReturnCode, TaFlags, TeeUuid};
+use litebox_common_optee::{OpteeSmcReturnCode, TaFlags, TeeIdentity, TeeLogin, TeeUuid};
 use spin::mutex::SpinMutex;
 
 /// Maximum number of concurrent TA instances to avoid out of memory situations.
 const MAX_TA_INSTANCES: usize = 16;
+
+/// The anonymous public client identity. Used as the fallback when no per-session
+/// identity is recorded, matching OP-TEE OS / the Linux driver.
+const ANONYMOUS_CLIENT_IDENTITY: TeeIdentity = TeeIdentity {
+    login: TeeLogin::Public,
+    uuid: TeeUuid::NIL,
+};
 
 /// A loaded TA instance.
 ///
@@ -414,6 +421,10 @@ impl Drop for SessionToken<'_> {
         if let Some(id) = self.active_session_id.take() {
             self.manager.active_sessions.lock().remove(&id);
             if self.owns_id_recycling {
+                // The session was never published (an OpenSession failure
+                // path), so the id is recycled here. Drop any client identity
+                // recorded for it to avoid unnecessary memory leak.
+                self.manager.clear_session_client_identity(id);
                 recycle_session_id(id);
             }
         }
@@ -463,6 +474,18 @@ pub struct SessionManager {
     /// Session ids currently being handled (Invoke/Close). Guards a session
     /// against concurrent SMC entry by another core that targets the same id.
     active_sessions: SpinMutex<HashSet<u32>>,
+    /// Per-session client identity, matching OP-TEE OS's `tee_ta_session.clnt_id`.
+    ///
+    /// Populated before the OpenSession entry point runs and removed when
+    /// the session is unregistered.
+    session_client_identities: SpinMutex<HashMap<u32, TeeIdentity>>,
+}
+
+/// Get the global session manager.
+pub fn session_manager() -> &'static SessionManager {
+    static SESSION_MANAGER: once_cell::race::OnceBox<SessionManager> =
+        once_cell::race::OnceBox::new();
+    SESSION_MANAGER.get_or_init(|| alloc::boxed::Box::new(SessionManager::new()))
 }
 
 impl SessionManager {
@@ -475,6 +498,7 @@ impl SessionManager {
             single_instance_locks: SpinMutex::new(HashMap::new()),
             ta_load_lock: AtomicBool::new(false),
             active_sessions: SpinMutex::new(HashSet::new()),
+            session_client_identities: SpinMutex::new(HashMap::new()),
         }
     }
 
@@ -790,12 +814,39 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Record the client identity for `session_id`.
+    pub fn set_session_client_identity(&self, session_id: u32, identity: Option<TeeIdentity>) {
+        self.session_client_identities
+            .lock()
+            .insert(session_id, identity.unwrap_or(ANONYMOUS_CLIENT_IDENTITY));
+    }
+
+    /// The client identity recorded for `session_id`, or the anonymous public
+    /// client if none was recorded.
+    pub(crate) fn client_identity(&self, session_id: u32) -> TeeIdentity {
+        self.session_client_identities
+            .lock()
+            .get(&session_id)
+            .copied()
+            .unwrap_or(ANONYMOUS_CLIENT_IDENTITY)
+    }
+
+    /// Drop the recorded client identity for `session_id`.
+    ///
+    /// Called directly only on OpenSession rollback paths (the TA's OpenSession
+    /// failed, so the session is never published). The normal close path calls
+    /// this indirectly via [`Self::unregister_session`].
+    pub fn clear_session_client_identity(&self, session_id: u32) {
+        self.session_client_identities.lock().remove(&session_id);
+    }
+
     /// Unregister a session and recycle its session ID. Returns whether
     /// the session was registered and what flags it had (the latter for
     /// callers that need to dispatch on `is_single_instance` /
     /// `is_keep_alive` after removal).
     pub fn unregister_session(&self, session_id: u32) -> Option<TaFlags> {
         let entry = self.sessions.remove(session_id);
+        self.clear_session_client_identity(session_id);
         if entry.is_some() {
             recycle_session_id(session_id);
         }

@@ -436,25 +436,43 @@ pub fn decode_ta_request(
 
     let (ta_uuid, client_identity, skip): (Option<TeeUuid>, Option<TeeIdentity>, usize) =
         if ta_entry_func == UteeEntryFunc::OpenSession {
-            // If it is an OpenSession request, extract UUIDs and login from params[0] and params[1]
-            // Based on observed Linux kernel behavior:
+            // If it is an OpenSession request, extract the TA UUID, client UUID,
+            // and login from the two meta params. Wire layout (per the Linux
+            // OP-TEE driver):
             // - params[0].a/b = TA UUID (two little-endian u64 values)
-            // - params[1].a/b = client UUID (two little-endian u64 values)
+            // - params[1].a/b = client UUID, but only meaningful for the
+            //   user/group/application logins; PUBLIC/REE_KERNEL ignore it and
+            //   report the nil UUID (see the match below).
             // - params[1].c = client login type (TEE_LOGIN_*)
-            let param0 = msg_args.get_param_value(0)?;
+            let param0 = msg_args.get_meta_param_value(0)?;
             let ta_data = [param0.a, param0.b];
 
-            let param1 = msg_args.get_param_value(1)?;
-            let client_data = [param1.a, param1.b];
+            let param1 = msg_args.get_meta_param_value(1)?;
             let login: u32 = param1.c.trunc();
-            let login = TeeLogin::try_from(login).unwrap_or(TeeLogin::Public);
+            // Reject unknown login methods
+            let login = TeeLogin::try_from(login).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+            // Only the REE-derived user/group/application logins carry a
+            // meaningful client UUID. PUBLIC and REE_KERNEL clients are anonymous
+            // and must report the nil UUID (OP-TEE OS memsets it to zero).
+            // TRUSTED_APP identifies a TA-to-TA caller and is established
+            // internally, never from a normal-world message.
+            let client_uuid = match login {
+                TeeLogin::Public | TeeLogin::ReeKernel => TeeUuid::NIL,
+                TeeLogin::User
+                | TeeLogin::Group
+                | TeeLogin::Application
+                | TeeLogin::ApplicationUser
+                | TeeLogin::ApplicationGroup => TeeUuid::from_u64_array([param1.a, param1.b]),
+                TeeLogin::TrustedApp => return Err(OpteeSmcReturnCode::EBadCmd),
+            };
 
             // Skip the first two parameters as they convey TA and client UUIDs
             (
                 Some(TeeUuid::from_u64_array(ta_data)),
                 Some(TeeIdentity {
                     login,
-                    uuid: TeeUuid::from_u64_array(client_data),
+                    uuid: client_uuid,
                 }),
                 2,
             )
@@ -485,6 +503,12 @@ pub fn decode_ta_request(
         .skip(skip)
         .enumerate()
     {
+        // The meta bit marks the OpenSession TA-UUID/client-identity params,
+        // which were already consumed via `skip`. A client parameter must not
+        // carry it (mirrors OP-TEE OS `copy_in_params`).
+        if param.is_meta() {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
         ta_req_info.params[i] = match param.attr_type() {
             OpteeMsgAttrType::None => UteeParamOwned::None,
             OpteeMsgAttrType::ValueInput => {

@@ -624,6 +624,17 @@ pub struct TeeUuid {
 }
 
 impl TeeUuid {
+    /// The nil UUID (all zeros, RFC 4122 S4.1.7).
+    ///
+    /// Used for anonymous clients (e.g., `TeeLogin::Public`) that carry no
+    /// REE-derived identity.
+    pub const NIL: Self = Self {
+        time_low: 0,
+        time_mid: 0,
+        time_hi_and_version: 0,
+        clock_seq_and_node: [0; 8],
+    };
+
     /// Converts a UUID from a 16-byte array in RFC 4122 format (big-endian for numeric fields).
     ///
     /// The byte layout is:
@@ -750,7 +761,7 @@ pub struct TaHead {
 pub const TA_HEAD_SECTION_NAME: &str = ".ta_head";
 
 /// `TEE_Identity` from `optee_os/lib/libutee/include/tee_api_types.h`.
-#[derive(Clone, Copy, PartialEq, Immutable, IntoBytes)]
+#[derive(Clone, Copy, PartialEq, Debug, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct TeeIdentity {
     pub login: TeeLogin,
@@ -832,9 +843,11 @@ const TEE_LOGIN_APPLICATION: u32 = 0x4;
 const TEE_LOGIN_APPLICATION_USER: u32 = 0x5;
 const TEE_LOGIN_APPLICATION_GROUP: u32 = 0x6;
 const TEE_LOGIN_TRUSTED_APP: u32 = 0xf000_0000;
+// Private OP-TEE login for in-kernel REE clients (`tee_api_defines_extensions.h`).
+const TEE_LOGIN_REE_KERNEL: u32 = 0x8000_0000;
 
 /// `TEE Login type` from `optee_os/lib/libutee/include/tee_api_defines.h`
-#[derive(Clone, Copy, PartialEq, TryFromPrimitive, Immutable, IntoBytes)]
+#[derive(Clone, Copy, PartialEq, Debug, TryFromPrimitive, Immutable, IntoBytes)]
 #[repr(u32)]
 pub enum TeeLogin {
     Public = TEE_LOGIN_PUBLIC,
@@ -843,6 +856,7 @@ pub enum TeeLogin {
     Application = TEE_LOGIN_APPLICATION,
     ApplicationUser = TEE_LOGIN_APPLICATION_USER,
     ApplicationGroup = TEE_LOGIN_APPLICATION_GROUP,
+    ReeKernel = TEE_LOGIN_REE_KERNEL,
     TrustedApp = TEE_LOGIN_TRUSTED_APP,
 }
 
@@ -1469,6 +1483,10 @@ const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
 // Note: `OPTEE_MSG_ATTR_TYPE_FMEM_*` are aliases of `OPTEE_MSG_ATTR_TYPE_RMEM_*`.
 // Whether it is RMEM of FMEM depends on the conduit.
 
+/// Meta-parameter marker of the attribute word. Set on the `OpenSession`
+/// TA-UUID and client-identity params.
+const OPTEE_MSG_ATTR_META: u64 = 1 << 8;
+
 #[non_exhaustive]
 #[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u8)]
@@ -1492,11 +1510,17 @@ pub enum OpteeMsgAttrType {
 /// - bit  8       – meta
 /// - bit  9       – noncontig
 /// - bits \[63:10\] – reserved (zero)
-#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(transparent)]
 pub struct OpteeMsgAttr(u64);
 
 impl OpteeMsgAttr {
+    /// The exact attribute word an `OpenSession` meta value parameter must carry
+    /// (`OPTEE_MSG_ATTR_META | OPTEE_MSG_ATTR_TYPE_VALUE_INPUT`, all other bits
+    /// zero). See [`OpteeMsgArgs::get_meta_param_value`].
+    pub const META_VALUE_INPUT: Self =
+        Self(OPTEE_MSG_ATTR_META | OPTEE_MSG_ATTR_TYPE_VALUE_INPUT as u64);
+
     /// Returns the attribute type (bits 0–7).
     #[allow(clippy::cast_possible_truncation)]
     pub fn attr_type(&self) -> u8 {
@@ -1524,6 +1548,10 @@ pub struct OpteeMsgParam {
 impl OpteeMsgParam {
     pub fn attr_type(&self) -> OpteeMsgAttrType {
         OpteeMsgAttrType::try_from(self.attr.attr_type()).unwrap_or(OpteeMsgAttrType::None)
+    }
+    /// Returns `true` when the meta bit (bit 8) is set.
+    pub fn is_meta(&self) -> bool {
+        self.attr.meta()
     }
     pub fn get_param_tmem(&self) -> Option<OpteeMsgParamTmem> {
         if matches!(
@@ -1757,6 +1785,27 @@ impl OpteeMsgArgs {
                 .ok_or(OpteeSmcReturnCode::EBadCmd)?)
         }
     }
+
+    /// Read a value parameter that must be tagged as an `OpenSession` meta parameter.
+    ///
+    /// `OpenSession` conveys the TA UUID and client identity in the first two
+    /// params, each marked exactly [`OpteeMsgAttr::META_VALUE_INPUT`], mirroring
+    /// OP-TEE OS `get_open_session_meta()`. Plain `get_param_value` ignores
+    /// these bits, so it must not be used for this.
+    pub fn get_meta_param_value(
+        &self,
+        index: usize,
+    ) -> Result<OpteeMsgParamValue, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            return Err(OpteeSmcReturnCode::ENotAvail);
+        }
+        let param = &self.params[index];
+        if param.attr != OpteeMsgAttr::META_VALUE_INPUT {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        param.get_param_value().ok_or(OpteeSmcReturnCode::EBadCmd)
+    }
+
     pub fn set_param_value(
         &mut self,
         index: usize,

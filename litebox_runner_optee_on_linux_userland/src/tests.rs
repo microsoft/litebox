@@ -7,8 +7,10 @@
 
 use litebox::platform::RawConstPointer;
 use litebox::utils::TruncateExt;
-use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
-use litebox_shim_optee::session::SessionManager;
+use litebox_common_optee::{
+    TeeIdentity, TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
+};
+use litebox_shim_optee::session::session_manager;
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -26,7 +28,9 @@ pub fn run_ta_with_test_commands(
         serde_json::from_str(&json_str).unwrap()
     };
     let mut ta_info: Option<LoadedProgram> = None;
-    let session_manager = SessionManager::new();
+    // The active session id for the TA. Set at OpenSession and reused for the
+    // subsequent InvokeCommand entries on the same persistent session.
+    let mut session_id: Option<u32> = None;
 
     for cmd in ta_commands {
         assert!(
@@ -50,15 +54,20 @@ pub fn run_ta_with_test_commands(
         if func_id == UteeEntryFunc::OpenSession {
             let ta_head = litebox_common_optee::parse_ta_head(ta_bin)
                 .expect("Failed to parse TA header from ta_bin");
-            let session_token = session_manager.try_acquire_open_session_token().unwrap();
+            let mut session_token = session_manager().try_acquire_open_session_token().unwrap();
+            let open_session_id = session_token.session_id().unwrap();
+            session_id = Some(open_session_id);
+            // Emulate the client identity a real REE client would present.
+            let client_identity = cmd.client_identity.as_ref().map_or(
+                TeeIdentity {
+                    login: TeeLogin::User,
+                    uuid: TeeUuid::NIL,
+                },
+                ClientIdentityJson::to_tee_identity,
+            );
+            session_manager().set_session_client_identity(open_session_id, Some(client_identity));
             let loaded = shim
-                .load_ldelf(
-                    ldelf_bin,
-                    ta_head.uuid,
-                    Some(ta_bin),
-                    None,
-                    session_token.session_id().unwrap(),
-                )
+                .load_ldelf(ldelf_bin, ta_head.uuid, Some(ta_bin))
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
@@ -77,17 +86,28 @@ pub fn run_ta_with_test_commands(
                 "ldelf exits with error: return_code={:#x}",
                 ctx.rax
             );
+            // The session persists across all commands, so disarm the token:
+            // its drop must not recycle the id or clear the client identity.
+            session_token.disarm();
         }
 
         if let Some(info) = ta_info.as_mut() {
             // In OP-TEE TA, each command invocation is like (re)starting the TA with a new stack with
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
+            // `ta_info` is only `Some` after an OpenSession, which also sets
+            // `session_id`, so this command runs on that established session.
+            let session_id = session_id.expect("session id set by OpenSession");
             let _ = info
                 .entrypoints
                 .as_ref()
                 .unwrap()
-                .load_ta_context(params.as_slice(), None, func_id as u32, Some(cmd.cmd_id))
+                .load_ta_context(
+                    params.as_slice(),
+                    session_id,
+                    func_id as u32,
+                    Some(cmd.cmd_id),
+                )
                 .map_err(|_| {
                     panic!("Failed to load TA context");
                 });
@@ -175,6 +195,71 @@ pub struct TaCommandBase64 {
     cmd_id: u32,
     #[serde(default)]
     args: Vec<TaCommandParamsBase64>,
+    #[serde(default)]
+    client_identity: Option<ClientIdentityJson>,
+}
+
+/// Client identity for an `OpenSession`, parsed from the test JSON.
+#[derive(Debug, Deserialize)]
+struct ClientIdentityJson {
+    #[serde(default)]
+    login: ClientLoginJson,
+    #[serde(default)]
+    uuid: Option<String>,
+}
+
+/// JSON mirror of [`TeeLogin`].
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ClientLoginJson {
+    Public,
+    #[default]
+    User,
+    Group,
+    Application,
+    ApplicationUser,
+    ApplicationGroup,
+    ReeKernel,
+    TrustedApp,
+}
+
+impl From<ClientLoginJson> for TeeLogin {
+    fn from(login: ClientLoginJson) -> Self {
+        match login {
+            ClientLoginJson::Public => TeeLogin::Public,
+            ClientLoginJson::User => TeeLogin::User,
+            ClientLoginJson::Group => TeeLogin::Group,
+            ClientLoginJson::Application => TeeLogin::Application,
+            ClientLoginJson::ApplicationUser => TeeLogin::ApplicationUser,
+            ClientLoginJson::ApplicationGroup => TeeLogin::ApplicationGroup,
+            ClientLoginJson::ReeKernel => TeeLogin::ReeKernel,
+            ClientLoginJson::TrustedApp => TeeLogin::TrustedApp,
+        }
+    }
+}
+
+impl ClientIdentityJson {
+    fn to_tee_identity(&self) -> TeeIdentity {
+        let uuid = self
+            .uuid
+            .as_deref()
+            .map_or(TeeUuid::NIL, parse_uuid_or_panic);
+        TeeIdentity {
+            login: self.login.into(),
+            uuid,
+        }
+    }
+}
+
+fn parse_uuid_or_panic(s: &str) -> TeeUuid {
+    let hex: String = s.chars().filter(|&c| c != '-').collect();
+    assert_eq!(hex.len(), 32, "client uuid must be 32 hex digits: {s:?}");
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .unwrap_or_else(|_| panic!("invalid hex in client uuid: {s:?}"));
+    }
+    TeeUuid::from_bytes(bytes)
 }
 
 #[derive(Debug, Deserialize)]

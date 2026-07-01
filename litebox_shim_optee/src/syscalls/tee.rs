@@ -95,7 +95,7 @@ impl Task {
                 if prop_buf.len() < core::mem::size_of::<TeeIdentity>() {
                     return Err(TeeResult::ShortBuffer);
                 }
-                let identity = self.client_identity;
+                let identity = self.current_client_identity();
                 prop_buf[..core::mem::size_of::<TeeIdentity>()]
                     .copy_from_slice(identity.as_bytes());
                 prop_len
@@ -103,6 +103,24 @@ impl Task {
                     .ok_or(TeeResult::AccessDenied)?;
                 prop_type
                     .write_at_offset(0, UserTaPropType::Identity as u32)
+                    .ok_or(TeeResult::AccessDenied)?;
+                Ok(())
+            }
+            GpdPropertyIndex::ClientEndian => {
+                const CLIENT_ENDIAN_LITTLE: u32 = 0;
+                if prop_set != TeePropSet::CurrentClient {
+                    return Err(TeeResult::BadParameters);
+                }
+                if prop_buf.len() < core::mem::size_of::<u32>() {
+                    return Err(TeeResult::ShortBuffer);
+                }
+                prop_buf[..core::mem::size_of::<u32>()]
+                    .copy_from_slice(&CLIENT_ENDIAN_LITTLE.to_le_bytes());
+                prop_len
+                    .write_at_offset(0, core::mem::size_of::<u32>().trunc())
+                    .ok_or(TeeResult::AccessDenied)?;
+                prop_type
+                    .write_at_offset(0, UserTaPropType::U32 as u32)
                     .ok_or(TeeResult::AccessDenied)?;
                 Ok(())
             }
@@ -143,6 +161,16 @@ impl Task {
                 if prop_set == TeePropSet::CurrentClient {
                     index
                         .write_at_offset(0, GpdPropertyIndex::ClientIdentity as u32)
+                        .ok_or(TeeResult::AccessDenied)?;
+                    Ok(())
+                } else {
+                    Err(TeeResult::BadParameters)
+                }
+            }
+            "gpd.client.endian" => {
+                if prop_set == TeePropSet::CurrentClient {
+                    index
+                        .write_at_offset(0, GpdPropertyIndex::ClientEndian as u32)
                         .ok_or(TeeResult::AccessDenied)?;
                     Ok(())
                 } else {
@@ -299,6 +327,7 @@ impl Task {
 #[repr(u32)]
 pub enum GpdPropertyIndex {
     ClientIdentity = 0xffff_0000,
-    CurrentTaUuid = 0xffff_0001,
+    ClientEndian = 0xffff_0001,
+    CurrentTaUuid = 0xffff_0002,
     None = 0xffff_ffff,
 }

@@ -80,6 +80,7 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
                 return if result.is_ok() {
                     ContinueOperation::Resume
                 } else {
+                    self.task.clear_ta_context();
                     ContinueOperation::Terminate
                 };
             } else if result.is_ok() {
@@ -90,6 +91,7 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
         }
         // OP-TEE has no signal handling. Kill the TA on any non-PF exception.
         ctx.rax = (TeeResult::TargetDead as u32) as usize;
+        self.task.clear_ta_context();
         ContinueOperation::Terminate
     }
 
@@ -228,26 +230,25 @@ pub struct OpteeShim(Arc<GlobalState>);
 
 impl OpteeShim {
     /// Load the given `ldelf` binary into memory while making it ready to load the TA binary specified
-    /// by `ta_uuid` (and optionally `ta_bin`). `client` specifies the one requesting the TA load.
+    /// by `ta_uuid` (and optionally `ta_bin`).
+    ///
+    /// The loaded program is an *instance*: a single instance can serve many
+    /// sessions. The active session id is supplied per entry via
+    /// [`OpteeShimEntrypoints::load_ta_context`], and the caller's identity is
+    /// recorded per session in the session registry via
+    /// [`session::SessionManager::set_session_client_identity`].
     pub fn load_ldelf(
         &self,
         ldelf_bin: &[u8],
         ta_uuid: TeeUuid,
         ta_bin: Option<&[u8]>,
-        client: Option<TeeIdentity>,
-        session_id: u32,
     ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
                 thread: ThreadState::new(),
-                session_id,
                 ta_app_id: ta_uuid,
-                client_identity: client.unwrap_or(TeeIdentity {
-                    login: TeeLogin::User,
-                    uuid: TeeUuid::default(),
-                }),
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
@@ -314,7 +315,7 @@ impl OpteeShimEntrypoints {
     pub fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
-        session_id: Option<u32>,
+        session_id: u32,
         func_id: u32,
         cmd_id: Option<u32>,
     ) -> Result<(), loader::elf::ElfLoaderError> {
@@ -323,10 +324,6 @@ impl OpteeShimEntrypoints {
             .load_ta_context(params, session_id, func_id, cmd_id)?;
         self.task.thread.init_state.set(init_state);
         Ok(())
-    }
-
-    pub fn get_session_id(&self) -> u32 {
-        self.task.session_id
     }
 }
 
@@ -380,9 +377,11 @@ impl Task {
 
         if let SyscallRequest::Return { ret } = request {
             ctx.rax = self.sys_return(ret);
+            self.clear_ta_context();
             return ContinueOperation::Terminate;
         } else if let SyscallRequest::Panic { code } = request {
             ctx.rax = self.sys_panic(code);
+            self.clear_ta_context();
             return ContinueOperation::Terminate;
         }
         let res: Result<(), TeeResult> = match request {
@@ -760,7 +759,7 @@ impl Task {
     fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
-        session_id: Option<u32>,
+        session_id: u32,
         func_id: u32,
         cmd_id: Option<u32>,
     ) -> Result<ThreadInitState, ElfLoaderError> {
@@ -792,11 +791,40 @@ impl Task {
         Ok(ThreadInitState::Ta {
             cmd_id: cmd_id.unwrap_or(0) as usize,
             params_address: ta_stack.get_params_address(),
-            session_id: session_id.unwrap_or(self.session_id) as usize,
+            session_id: session_id as usize,
             func_id: func_id as usize,
             entry_point: self.get_ta_entry_point(),
             stack_top: ta_stack.get_cur_stack_top(),
         })
+    }
+
+    /// The session id currently executing in this task (set per entry by
+    /// [`Self::load_ta_context`], cleared on entry termination by
+    /// [`Self::clear_ta_context`]). Returns `None` outside a TA entry.
+    fn current_session_id(&self) -> Option<u32> {
+        match self.thread.init_state.get() {
+            ThreadInitState::Ta { session_id, .. } => Some(session_id.trunc()),
+            _ => None,
+        }
+    }
+
+    /// The client identity of the session currently executing in this task.
+    /// Falls back to the anonymous public client outside a TA entry.
+    fn current_client_identity(&self) -> TeeIdentity {
+        self.current_session_id().map_or(
+            TeeIdentity {
+                login: TeeLogin::Public,
+                uuid: TeeUuid::NIL,
+            },
+            |session_id| crate::session::session_manager().client_identity(session_id),
+        )
+    }
+
+    /// Clear the per-entry TA execution state once a TA entry has terminated.
+    fn clear_ta_context(&self) {
+        if matches!(self.thread.init_state.get(), ThreadInitState::Ta { .. }) {
+            self.thread.init_state.set(ThreadInitState::None);
+        }
     }
 
     /// Allocate the guest TLS for an OP-TEE TA.
@@ -1305,16 +1333,14 @@ impl TaUuidMap {
     }
 }
 
-/// TA/session-related information for the current task
+/// Per-instance TA state which can be shared between sessions if it is
+/// a single-instance multi-session TA. The active session id is carried
+/// per entry (see [`Task::current_session_id`]).
 struct Task {
     global: Arc<GlobalState>,
     thread: ThreadState,
-    /// Session ID
-    session_id: u32,
     /// TA UUID
     ta_app_id: TeeUuid,
-    /// Client identity (VTL0 process or another TA)
-    client_identity: TeeIdentity,
     /// TEE cryptography state map
     tee_cryp_state_map: TeeCrypStateMap,
     /// TEE object map
@@ -1476,12 +1502,7 @@ mod test_utils {
             Task {
                 global: self.clone(),
                 thread: ThreadState::new(),
-                session_id: SessionIdPool::allocate().unwrap(),
                 ta_app_id: TeeUuid::default(),
-                client_identity: TeeIdentity {
-                    login: TeeLogin::User,
-                    uuid: TeeUuid::default(),
-                },
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),

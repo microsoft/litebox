@@ -42,9 +42,8 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, packed_msg_args_lock,
     update_optee_msg_args,
 };
-use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
+use litebox_shim_optee::session::{OpenSessionTarget, TaInstance, session_manager};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
-use once_cell::race::OnceBox;
 
 /// Seed the initial heap regions so the global allocator has enough memory
 /// for slab-backed allocations (the slab needs >= 2 MB backing pages).
@@ -284,12 +283,6 @@ fn optee_smc_handler_entry_inner(
     Ok(0)
 }
 
-/// Get the global session manager.
-fn session_manager() -> &'static SessionManager {
-    static SESSION_MANAGER: OnceBox<SessionManager> = OnceBox::new();
-    SESSION_MANAGER.get_or_init(|| Box::new(SessionManager::new()))
-}
-
 /// Switch to the base page table.
 ///
 /// This must be called before returning to VTL0 to ensure VTL1 reentry is
@@ -523,6 +516,7 @@ fn handle_open_session(
             msg_args_phys_addr,
             instance,
             params,
+            client_identity,
             &ta_req_info,
         ),
         OpenSessionTarget::NewInstance => open_session_new_instance(
@@ -556,6 +550,7 @@ fn open_session_single_instance(
     msg_args_phys_addr: u64,
     instance: &TaInstance,
     params: &[litebox_common_optee::UteeParamOwned],
+    client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let task_pt_id = instance.task_page_table_id();
@@ -565,6 +560,9 @@ fn open_session_single_instance(
     let mut session_token = session_manager().try_acquire_open_session_token()?;
     // Safe to unwrap: session ID has been just created.
     let runner_session_id = session_token.session_id().unwrap();
+
+    // Record the client identity before running OpenSession
+    session_manager().set_session_client_identity(runner_session_id, client_identity);
 
     debug_serial_println!(
         "Reusing single-instance TA: uuid={:?}, task_pt_id={}, session_id={}",
@@ -584,7 +582,7 @@ fn open_session_single_instance(
         .ok_or(OpteeSmcReturnCode::EBadCmd)?
         .load_ta_context(
             params,
-            Some(runner_session_id),
+            runner_session_id,
             UteeEntryFunc::OpenSession as u32,
             None,
         )
@@ -682,6 +680,9 @@ fn open_session_single_instance(
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
         } else {
+            // The session id is forgotten (never recycled), so the token's drop
+            // won't clear the recorded identity. Remove the client identity here.
+            session_manager().clear_session_client_identity(runner_session_id);
             session_token.disarm();
         }
         return Err(e);
@@ -700,7 +701,7 @@ fn open_session_single_instance(
 }
 
 /// Create a new TA instance for a session. Must be called from within a
-/// [`SessionManager::with_ta`] closure.
+/// [`litebox_shim_optee::session::SessionManager::with_ta`] closure.
 ///
 /// If ldelf loading or OpenSession entry point fails, the page table is torn down.
 /// Per OP-TEE OS semantics: if OpenSession returns non-success, cleanup happens.
@@ -737,19 +738,13 @@ fn open_session_new_instance(
     // Load ldelf and TA - Box immediately to keep at fixed heap address
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
     let loaded_program = Box::new(
-        shim.load_ldelf(
-            LDELF_BINARY,
-            ta_uuid,
-            Some(ta_bin),
-            client_identity,
-            runner_session_id,
-        )
-        .map_err(|_| {
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
-            unsafe { teardown_ta_page_table(&shim, task_pt_id) };
-            OpteeSmcReturnCode::ENomem
-        })?,
+        shim.load_ldelf(LDELF_BINARY, ta_uuid, Some(ta_bin))
+            .map_err(|_| {
+                // Safety: We are about to tear down this TA instance;
+                // no references to user-space memory will be held afterwards.
+                unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+                OpteeSmcReturnCode::ENomem
+            })?,
     );
 
     let ta_flags = loaded_program.ta_flags;
@@ -797,6 +792,9 @@ fn open_session_new_instance(
         return Ok(());
     }
 
+    // Record the client identity before running OpenSession
+    session_manager().set_session_client_identity(runner_session_id, client_identity);
+
     // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
         // Safety: We are about to tear down this TA instance;
@@ -810,7 +808,7 @@ fn open_session_new_instance(
         .unwrap()
         .load_ta_context(
             params,
-            Some(runner_session_id),
+            runner_session_id,
             UteeEntryFunc::OpenSession as u32,
             None,
         )
@@ -979,7 +977,7 @@ fn handle_invoke_command(
         entrypoints_ref
             .load_ta_context(
                 params.as_slice(),
-                Some(session_id),
+                session_id,
                 UteeEntryFunc::InvokeCommand as u32,
                 Some(cmd_id),
             )
@@ -1091,7 +1089,7 @@ fn handle_close_session(
             .unwrap()
             .load_ta_context(
                 &[],
-                Some(session_id),
+                session_id,
                 UteeEntryFunc::CloseSession as u32,
                 None,
             )
