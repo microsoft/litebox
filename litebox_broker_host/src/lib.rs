@@ -88,16 +88,6 @@ where
         }
     }
 
-    serve_request_loop(control_channel, &session)
-}
-
-fn serve_request_loop<ControlChannel, ChannelError>(
-    control_channel: &mut ControlChannel,
-    session: &BrokerSession,
-) -> Result<ConnectionTermination, ChannelError>
-where
-    ControlChannel: HostControlChannel<Error = ChannelError>,
-{
     loop {
         let request = match control_channel
             .recv_request()
@@ -113,7 +103,7 @@ where
             HostReceive::PeerClosed => break,
         };
 
-        let response = handle_request(session, request);
+        let response = handle_request(&session, request);
         control_channel
             .send_response(&response)
             .map_err(BrokerHostError::Channel)?;
