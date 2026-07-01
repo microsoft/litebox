@@ -230,8 +230,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         drop(section);
     }
 
-    // Wine's create_mapping and ReactOS MmCreateSection validate the output handle before creating
-    // the control object, then select pagefile/file/image backing from AllocationAttributes.
     #[expect(
         clippy::too_many_arguments,
         reason = "NtCreateSection has seven ABI parameters; keeping ABI args explicit avoids reshuffling"
@@ -421,8 +419,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.publish_section_handle(section_handle, section, granted_access)
     }
 
-    // Wine's NtQuerySection and ReactOS NtQuerySection support Basic and Image classes with the same
-    // externally visible output sizes; Image information is populated from the PE section object.
     pub(crate) fn sys_nt_query_section(
         &self,
         section_handle: Handle,
@@ -526,8 +522,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    // Wine's NtMapViewOfSectionEx validates the MEM_EXTENDED_PARAMETER array before delegating to
-    // the same virtual_map_section path; ReactOS keeps the same base map operation split.
     pub(crate) fn sys_nt_map_view_of_section_ex(
         &self,
         request: MapViewOfSectionParameters<Platform>,
@@ -541,8 +535,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.sys_nt_map_view_of_section(request)
     }
 
-    // Wine and ReactOS route unmap through the virtual memory view teardown path after process-handle
-    // validation, so the shim consumes the tracked view before removing its pages.
     pub(crate) fn sys_nt_unmap_view_of_section(
         &self,
         process_handle: ProcessHandle,
