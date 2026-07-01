@@ -31,22 +31,30 @@ pub(crate) fn connect(
     notification_socket_path: &Path,
 ) -> Result<BrokerConnection> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_channel = connect_control_with_retry(control_socket_path, setup_deadline)
-        .with_context(|| {
-            format!(
-                "failed to connect to broker at {}",
-                control_socket_path.display()
-            )
-        })?;
-    let notification_channel =
-        connect_notification_with_retry(notification_socket_path, setup_deadline).with_context(
-            || {
-                format!(
-                    "failed to connect to broker notifications at {}",
-                    notification_socket_path.display()
-                )
-            },
-        )?;
+    let control_channel = connect_with_retry(
+        control_socket_path,
+        setup_deadline,
+        "timed out connecting to broker",
+        |path, deadline| UnixStreamLocalControlChannel::connect_with_setup_deadline(path, deadline),
+    )
+    .with_context(|| {
+        format!(
+            "failed to connect to broker at {}",
+            control_socket_path.display()
+        )
+    })?;
+    let notification_channel = connect_with_retry(
+        notification_socket_path,
+        setup_deadline,
+        "timed out connecting to broker notifications",
+        |path, _deadline| UnixStreamLocalNotificationChannel::connect(path),
+    )
+    .with_context(|| {
+        format!(
+            "failed to connect to broker notifications at {}",
+            notification_socket_path.display()
+        )
+    })?;
     let local = BrokerLocal::negotiate(control_channel).context("broker negotiation failed")?;
     let mut notifications = BrokerNotifications::new(notification_channel);
     let notification_thread = std::thread::Builder::new()
@@ -76,37 +84,18 @@ impl BrokerConnection {
     }
 }
 
-fn connect_control_with_retry(
+fn connect_with_retry<Channel>(
     socket_path: &Path,
     setup_deadline: Instant,
-) -> Result<UnixStreamLocalControlChannel> {
+    timeout_message: &'static str,
+    mut connect: impl FnMut(&Path, Instant) -> std::io::Result<Channel>,
+) -> Result<Channel> {
     loop {
-        match UnixStreamLocalControlChannel::connect_with_setup_deadline(
-            socket_path,
-            setup_deadline,
-        ) {
+        match connect(socket_path, setup_deadline) {
             Ok(channel) => return Ok(channel),
             Err(error) => {
                 if Instant::now() >= setup_deadline {
-                    return Err(error).context("timed out connecting to broker");
-                }
-            }
-        }
-        let remaining = setup_deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(RETRY_DELAY.min(remaining));
-    }
-}
-
-fn connect_notification_with_retry(
-    socket_path: &Path,
-    setup_deadline: Instant,
-) -> Result<UnixStreamLocalNotificationChannel> {
-    loop {
-        match UnixStreamLocalNotificationChannel::connect(socket_path) {
-            Ok(channel) => return Ok(channel),
-            Err(error) => {
-                if Instant::now() >= setup_deadline {
-                    return Err(error).context("timed out connecting to broker notifications");
+                    return Err(error).context(timeout_message);
                 }
             }
         }
