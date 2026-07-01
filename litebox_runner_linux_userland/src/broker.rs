@@ -19,7 +19,11 @@ type Local = BrokerLocal<UnixStreamLocalControlChannel>;
 
 pub(crate) struct BrokerConnection {
     local: Local,
-    _notification_thread: JoinHandle<()>,
+    #[expect(
+        dead_code,
+        reason = "keeps the notification receiver thread alive while the broker connection is installed"
+    )]
+    notification_receiver_thread: JoinHandle<()>,
 }
 
 pub(crate) fn connect(
@@ -86,7 +90,7 @@ fn connect_to_endpoint(
         .context("failed to start broker notification receiver")?;
     Ok(BrokerConnection {
         local,
-        _notification_thread: notification_thread,
+        notification_receiver_thread: notification_thread,
     })
 }
 
