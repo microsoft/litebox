@@ -20,7 +20,9 @@ use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
-use crate::syscalls::mm::{MemoryType, PageProtection, create_pages, parse_page_protection};
+use crate::syscalls::mm::{
+    MemoryType, PageProtection, create_pages, parse_page_protection, update_permissions,
+};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{
     ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsSectionView,
@@ -501,8 +503,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Err(status) => return status,
         };
         let result = entry.with_entry(|entry| {
-            required_map_access(page_protection)
-                .and_then(|required| entry.granted_access.require(required))
+            entry
+                .granted_access
+                .require(required_map_access(page_protection))
                 .map(|()| Arc::clone(&entry.section))
         });
         let section = match result {
@@ -664,6 +667,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SectionBacking::Pagefile(backing) => backing,
             SectionBacking::ImageFile => return NtStatus::INVALID_FILE_FOR_SECTION,
         };
+        if !pagefile_view_protection_is_compatible(section.protection, page_protection) {
+            litebox_util_log::debug!(
+                section_protection:% = format_args!("{:#x}", section.protection.bits()),
+                page_protection:% = format_args!("{:#x}", page_protection.bits());
+                "Rejected pagefile section view protection incompatible with section protection"
+            );
+            return NtStatus::SECTION_PROTECTION;
+        }
         if section.pagefile_view_active.swap(true, Ordering::AcqRel) {
             litebox_util_log::debug!(
                 section_size = section.size,
@@ -682,7 +693,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None,
             length,
             CreatePagesFlags::empty(),
-            permissions,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
             |ptr| {
                 let backing = backing.read();
                 let bytes = &backing[section_offset..section_offset + mapped_size];
@@ -695,6 +706,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::NO_MEMORY;
         };
         let base = mapping.as_usize();
+        if permissions != MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
+            && update_permissions(&self.global.page_manager, base, mapped_size, permissions)
+                .is_err()
+        {
+            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
+            section.pagefile_view_active.store(false, Ordering::Release);
+            return NtStatus::ACCESS_VIOLATION;
+        }
         if request.base_address.write_at_offset(0, base).is_none()
             || request.view_size.write_at_offset(0, view_size).is_none()
         {
@@ -732,10 +751,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(fs_path) = &section.fs_path else {
             return NtStatus::INVALID_FILE_FOR_SECTION;
         };
-        if matches!(
-            required_map_access(page_protection),
-            Ok(required) if required.contains(SectionAccess::MAP_WRITE)
-        ) {
+        if required_map_access(page_protection).contains(SectionAccess::MAP_WRITE) {
             litebox_util_log::debug!(
                 page_protection:% = format_args!("{:#x}", page_protection.bits()),
                 fs_path:% = fs_path;
@@ -872,9 +888,11 @@ fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
         .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
-fn required_map_access(protection: PageProtection) -> Result<SectionAccess, NtStatus> {
+fn required_map_access(protection: PageProtection) -> SectionAccess {
     let base = protection.bits() & PageProtection::BASE_MASK;
-    let required = if matches!(
+    if base == PageProtection::PAGE_NOACCESS.bits() {
+        SectionAccess::MAP_READ
+    } else if matches!(
         base,
         value if value == PageProtection::PAGE_READWRITE.bits()
             || value == PageProtection::PAGE_EXECUTE_READWRITE.bits()
@@ -887,12 +905,64 @@ fn required_map_access(protection: PageProtection) -> Result<SectionAccess, NtSt
             || value == PageProtection::PAGE_EXECUTE_WRITECOPY.bits()
     ) {
         SectionAccess::MAP_EXECUTE
-    } else if base == PageProtection::PAGE_NOACCESS.bits() {
-        return Err(NtStatus::SECTION_PROTECTION);
     } else {
         SectionAccess::MAP_READ
-    };
-    Ok(required)
+    }
+}
+
+fn pagefile_view_protection_is_compatible(
+    section_protection: PageProtection,
+    view_protection: PageProtection,
+) -> bool {
+    let view_base = view_protection.bits() & PageProtection::BASE_MASK;
+    if view_base == PageProtection::PAGE_NOACCESS.bits() {
+        return true;
+    }
+
+    if page_protection_has_read(view_protection) && !page_protection_has_read(section_protection) {
+        return false;
+    }
+    if page_protection_has_direct_write(view_protection)
+        && !page_protection_has_direct_write(section_protection)
+    {
+        return false;
+    }
+    if page_protection_has_execute(view_protection)
+        && !page_protection_has_execute(section_protection)
+    {
+        return false;
+    }
+    true
+}
+
+fn page_protection_has_read(protection: PageProtection) -> bool {
+    matches!(
+        protection.bits() & PageProtection::BASE_MASK,
+        value if value == PageProtection::PAGE_READONLY.bits()
+            || value == PageProtection::PAGE_READWRITE.bits()
+            || value == PageProtection::PAGE_WRITECOPY.bits()
+            || value == PageProtection::PAGE_EXECUTE_READ.bits()
+            || value == PageProtection::PAGE_EXECUTE_READWRITE.bits()
+            || value == PageProtection::PAGE_EXECUTE_WRITECOPY.bits()
+    )
+}
+
+fn page_protection_has_direct_write(protection: PageProtection) -> bool {
+    matches!(
+        protection.bits() & PageProtection::BASE_MASK,
+        value if value == PageProtection::PAGE_READWRITE.bits()
+            || value == PageProtection::PAGE_EXECUTE_READWRITE.bits()
+    )
+}
+
+fn page_protection_has_execute(protection: PageProtection) -> bool {
+    matches!(
+        protection.bits() & PageProtection::BASE_MASK,
+        value if value == PageProtection::PAGE_EXECUTE.bits()
+            || value == PageProtection::PAGE_EXECUTE_READ.bits()
+            || value == PageProtection::PAGE_EXECUTE_READWRITE.bits()
+            || value == PageProtection::PAGE_EXECUTE_WRITECOPY.bits()
+    )
 }
 
 fn write_section_basic_information<Platform: ShimPlatform>(
@@ -1177,6 +1247,7 @@ mod tests {
         task: &Task<TestPlatform, TestFS>,
         access: u32,
         size: i64,
+        protection: PageProtection,
     ) -> Handle {
         let mut handle = Handle::default();
         assert_eq!(
@@ -1185,7 +1256,7 @@ mod tests {
                 access,
                 None,
                 Some(const_ptr(&size)),
-                PageProtection::PAGE_READWRITE.bits(),
+                protection.bits(),
                 SectionAllocationAttributes::SEC_COMMIT.bits(),
                 Handle::default(),
             ),
@@ -1270,7 +1341,12 @@ mod tests {
     #[test]
     fn nt_create_section_creates_queryable_pagefile_section() {
         let task = test_task();
-        let handle = create_pagefile_section(&task, SectionAccess::ALL_ACCESS.bits(), 0x2345);
+        let handle = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2345,
+            PageProtection::PAGE_READWRITE,
+        );
         let mut info = SectionBasicInformation {
             base_address: usize::MAX,
             attributes: u32::MAX,
@@ -1496,7 +1572,12 @@ mod tests {
     #[test]
     fn nt_map_view_of_section_maps_writable_pagefile_section() {
         let task = test_task();
-        let handle = create_pagefile_section(&task, SectionAccess::ALL_ACCESS.bits(), 0x2000);
+        let handle = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_READWRITE,
+        );
         let (base, view_size) = map_pagefile_section(&task, handle);
         assert_ne!(base, 0);
         assert_eq!(view_size, 0x2000);
@@ -1517,9 +1598,138 @@ mod tests {
     }
 
     #[test]
+    fn pagefile_map_rejects_protection_incompatible_with_section_protection() {
+        let task = test_task();
+        let readonly = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_READONLY,
+        );
+        let execute = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_EXECUTE,
+        );
+        let readwrite = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_READWRITE,
+        );
+
+        for (handle, page_protection) in [
+            (readonly, PageProtection::PAGE_READWRITE),
+            (execute, PageProtection::PAGE_READONLY),
+            (readwrite, PageProtection::PAGE_EXECUTE_READ),
+        ] {
+            let mut base = 0usize;
+            let mut view_size = 0usize;
+            assert_eq!(
+                task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                    section_handle: handle,
+                    process_handle: ProcessHandle::CURRENT,
+                    base_address: mut_ptr(&mut base),
+                    zero_bits: 0,
+                    commit_size: 0,
+                    section_offset: None,
+                    view_size: mut_ptr(&mut view_size),
+                    inherit_disposition: VIEW_SHARE,
+                    allocation_type: 0,
+                    page_protection: page_protection.bits(),
+                }),
+                NtStatus::SECTION_PROTECTION
+            );
+            assert_eq!(base, 0);
+            assert_eq!(view_size, 0);
+        }
+    }
+
+    #[test]
+    fn pagefile_map_accepts_compatible_noaccess_and_copy_protections() {
+        let task = test_task();
+        let readonly = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_READONLY,
+        );
+
+        // Host 25H2 and ReactOS allow PAGE_WRITECOPY and PAGE_NOACCESS views of
+        // a PAGE_READONLY pagefile section.
+        for page_protection in [
+            PageProtection::PAGE_WRITECOPY,
+            PageProtection::PAGE_NOACCESS,
+        ] {
+            let mut base = 0usize;
+            let mut view_size = 0usize;
+            assert_eq!(
+                task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                    section_handle: readonly,
+                    process_handle: ProcessHandle::CURRENT,
+                    base_address: mut_ptr(&mut base),
+                    zero_bits: 0,
+                    commit_size: 0,
+                    section_offset: None,
+                    view_size: mut_ptr(&mut view_size),
+                    inherit_disposition: VIEW_SHARE,
+                    allocation_type: 0,
+                    page_protection: page_protection.bits(),
+                }),
+                NtStatus::SUCCESS
+            );
+            assert_ne!(base, 0);
+            assert_eq!(view_size, 0x2000);
+            assert_eq!(
+                task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
+                NtStatus::SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    fn pagefile_noaccess_view_requires_map_read_access() {
+        let task = test_task();
+        let handle = create_pagefile_section(
+            &task,
+            SectionAccess::QUERY.bits(),
+            0x2000,
+            PageProtection::PAGE_READWRITE,
+        );
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+
+        // Host 25H2 returns STATUS_ACCESS_DENIED for PAGE_NOACCESS maps unless
+        // the section handle has SECTION_MAP_READ.
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_NOACCESS.bits(),
+            }),
+            NtStatus::ACCESS_DENIED
+        );
+        assert_eq!(base, 0);
+        assert_eq!(view_size, 0);
+    }
+
+    #[test]
     fn nt_map_view_of_section_ex_maps_and_unmaps_pagefile_section() {
         let task = test_task();
-        let handle = create_pagefile_section(&task, SectionAccess::ALL_ACCESS.bits(), 0x2000);
+        let handle = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_READWRITE,
+        );
         let mut base = 0usize;
         let mut view_size = 0usize;
 
@@ -1561,7 +1771,12 @@ mod tests {
     #[test]
     fn nt_map_view_of_section_ex_rejects_extended_parameters() {
         let task = test_task();
-        let handle = create_pagefile_section(&task, SectionAccess::ALL_ACCESS.bits(), 0x1000);
+        let handle = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x1000,
+            PageProtection::PAGE_READWRITE,
+        );
         let mut base = 0usize;
         let mut view_size = 0usize;
         let extended_parameter = 0u8;
@@ -1655,7 +1870,12 @@ mod tests {
     #[test]
     fn pagefile_view_unmap_remap_preserves_guest_writes() {
         let task = test_task();
-        let handle = create_pagefile_section(&task, SectionAccess::ALL_ACCESS.bits(), 0x2000);
+        let handle = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_READWRITE,
+        );
         let (first_base, first_size) = map_pagefile_section(&task, handle);
         assert_eq!(first_size, 0x2000);
 
@@ -1681,7 +1901,12 @@ mod tests {
     #[test]
     fn dirty_pagefile_view_flushes_before_noaccess_protect() {
         let task = test_task();
-        let handle = create_pagefile_section(&task, SectionAccess::ALL_ACCESS.bits(), 0x2000);
+        let handle = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_READWRITE,
+        );
         let (first_base, first_size) = map_pagefile_section(&task, handle);
         assert_eq!(first_size, 0x2000);
         let first = MutPtr::<TestPlatform, u32>::from_usize(first_base);
@@ -1731,7 +1956,12 @@ mod tests {
     #[test]
     fn partial_noaccess_protect_flushes_still_readable_section_pages() {
         let task = test_task();
-        let handle = create_pagefile_section(&task, SectionAccess::ALL_ACCESS.bits(), 0x2000);
+        let handle = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            0x2000,
+            PageProtection::PAGE_READWRITE,
+        );
         let (first_base, first_size) = map_pagefile_section(&task, handle);
         assert_eq!(first_size, 0x2000);
 

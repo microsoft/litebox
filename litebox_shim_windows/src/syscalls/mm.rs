@@ -1433,7 +1433,7 @@ fn allocation_granularity_aligned_candidate(
     }
 }
 
-fn update_permissions<Platform: ShimPlatform>(
+pub(super) fn update_permissions<Platform: ShimPlatform>(
     page_manager: &WindowsPageManager<Platform>,
     aligned_base: usize,
     aligned_len: usize,
