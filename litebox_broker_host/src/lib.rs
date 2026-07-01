@@ -34,14 +34,14 @@ pub use error::{BrokerHostError, Result};
 /// The deployment must bind both channels to the same authenticated peer
 /// association. Active requests and responses remain on the control channel;
 /// broker-initiated readiness wakeups are sent on the notification channel.
-pub fn serve_connection<ControlChannel, NotificationChannel>(
+pub fn serve_connection<ControlChannel, NotificationChannel, ChannelError>(
     core: &BrokerCore,
     control_channel: &mut ControlChannel,
     notification_channel: &mut NotificationChannel,
-) -> Result<ConnectionTermination, ControlChannel::Error>
+) -> Result<ConnectionTermination, ChannelError>
 where
-    ControlChannel: HostControlChannel,
-    NotificationChannel: HostNotificationChannel<Error = ControlChannel::Error>,
+    ControlChannel: HostControlChannel<Error = ChannelError>,
+    NotificationChannel: HostNotificationChannel<Error = ChannelError>,
 {
     let peer_credential = control_channel
         .peer_credential()
@@ -90,14 +90,14 @@ where
     serve_request_loop(control_channel, notification_channel, &session)
 }
 
-fn serve_request_loop<ControlChannel, NotificationChannel>(
+fn serve_request_loop<ControlChannel, NotificationChannel, ChannelError>(
     control_channel: &mut ControlChannel,
     notification_channel: &mut NotificationChannel,
     session: &BrokerSession,
-) -> Result<ConnectionTermination, ControlChannel::Error>
+) -> Result<ConnectionTermination, ChannelError>
 where
-    ControlChannel: HostControlChannel,
-    NotificationChannel: HostNotificationChannel<Error = ControlChannel::Error>,
+    ControlChannel: HostControlChannel<Error = ChannelError>,
+    NotificationChannel: HostNotificationChannel<Error = ChannelError>,
 {
     loop {
         let request = match control_channel
