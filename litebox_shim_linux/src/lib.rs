@@ -337,7 +337,7 @@ fn default_fs(
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
-            .mount("/", |allocator| {
+            .mount("/dev", |allocator| {
                 litebox::fs::devices::Devices::new(litebox, allocator)
             })
             .build()

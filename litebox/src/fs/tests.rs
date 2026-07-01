@@ -1991,7 +1991,7 @@ mod stdio {
         let fs = Resolver::new(
             &litebox,
             crate::fs::composer::Composer::builder()
-                .mount("/", |allocator| Devices::new(&litebox, allocator))
+                .mount("/dev", |allocator| Devices::new(&litebox, allocator))
                 .build()
                 .unwrap(),
         );
@@ -2042,7 +2042,7 @@ mod stdio {
         let fs = Resolver::new(
             &litebox,
             crate::fs::composer::Composer::builder()
-                .mount("/", |allocator| Devices::new(&litebox, allocator))
+                .mount("/dev", |allocator| Devices::new(&litebox, allocator))
                 .build()
                 .unwrap(),
         );
@@ -2079,7 +2079,7 @@ mod layered_stdio {
             Resolver::new(
                 &litebox,
                 crate::fs::composer::Composer::builder()
-                    .mount("/", |allocator| Devices::new(&litebox, allocator))
+                    .mount("/dev", |allocator| Devices::new(&litebox, allocator))
                     .build()
                     .unwrap(),
             ),
@@ -2149,7 +2149,7 @@ mod layered_stdio {
             Resolver::new(
                 &litebox,
                 crate::fs::composer::Composer::builder()
-                    .mount("/", |allocator| Devices::new(&litebox, allocator))
+                    .mount("/dev", |allocator| Devices::new(&litebox, allocator))
                     .build()
                     .unwrap(),
             ),

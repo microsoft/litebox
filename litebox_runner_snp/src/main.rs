@@ -240,7 +240,7 @@ pub extern "C" fn sandbox_process_init(
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
-            .mount("/", |allocator| {
+            .mount("/dev", |allocator| {
                 litebox::fs::devices::Devices::new(litebox, allocator)
             })
             .build()

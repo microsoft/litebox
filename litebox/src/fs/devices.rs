@@ -3,12 +3,10 @@
 
 //! Unix-y devices [`super::backend::Backend`].
 //!
-//! Provides `/dev/{stdin,stdout,null,urandom,...}`.
-
-// XXX(jayb): soon this will switch to just being {stdin,stdout,...}, so that it is _mounted_ at
-// `/dev/` rather than associated at `/`, but that will be later.
+//! Provides `{stdin,stdout,null,urandom,...}` entries, intended to be mounted at `/dev`.
 
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::LiteBox;
@@ -16,7 +14,7 @@ use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
     Backend, BackendHandles, DirHandle, FileHandle, PermissionCheck, Permissioned, SeekBehavior,
-    WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -121,8 +119,8 @@ where
         + 'static,
 {
     litebox: LiteBox<Platform>,
-    /// Stable inode info for `/dev`.
-    dev_dir_inode: NodeInfo,
+    /// Stable inode info for this backend's root directory.
+    root_inode: NodeInfo,
     _alloc: InodeAllocator,
 }
 
@@ -136,19 +134,13 @@ where
     /// Construct a new `Devices` backend.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
-        let dev_dir_inode = allocator.next();
+        let root_inode = allocator.next();
         Self {
             litebox: litebox.clone(),
-            dev_dir_inode,
+            root_inode,
             _alloc: allocator,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Location {
-    Root,
-    Dev,
 }
 
 /// Owned file handle; identifies which device backs this fd.
@@ -161,9 +153,7 @@ pub struct DeviceFileHandle {
 // For devices, since no borrows are needed, we reuse this struct for both the walking handles as
 // well as the dir handles.
 #[derive(Debug, Clone, Copy)]
-pub struct DeviceDirHandle {
-    location: Location,
-}
+pub struct DeviceDirHandle;
 
 impl<Platform> super::backend::private::Sealed for Devices<Platform> where
     Platform: RawSyncPrimitivesProvider
@@ -193,9 +183,7 @@ where
         + 'static,
 {
     fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(DeviceDirHandle {
-            location: Location::Root,
-        })
+        WalkingDirHandle::from_typed::<Self>(DeviceDirHandle)
     }
 
     fn walk_directories<'a>(
@@ -204,33 +192,20 @@ where
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
         let from = from.into_typed::<Self>();
-        // This backend only exposes one directory below root. Device files are
-        // final path targets, so directory walking must stop before them.
-        let mut location = from.location;
-        let mut walked_components: Vec<WalkedComponent> = Vec::with_capacity(components.len());
-        for &c in components {
-            match (location, c) {
-                (Location::Root, "dev") => {
-                    walked_components.push(WalkedComponent {
-                        permissions: PermissionCheck::ByBackend,
-                    });
-                    location = Location::Dev;
-                }
-                (Location::Dev, name) if Device::from_name(name).is_some() => {
-                    return Ok(WalkOutcome {
-                        components: walked_components,
-                        last: WalkingDirHandle::from_typed::<Self>(DeviceDirHandle { location }),
-                        stop_reason: WalkStopReason::StoppedAtNonDirectory,
-                    });
-                }
-                _ => {
-                    return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
-                }
+        // Device files are final path targets, so directory walking must stop before them.
+        if let Some(&component) = components.first() {
+            if Device::from_name(component).is_some() {
+                return Ok(WalkOutcome {
+                    components: vec![],
+                    last: WalkingDirHandle::from_typed::<Self>(from),
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                });
             }
+            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
         }
         Ok(WalkOutcome {
-            components: walked_components,
-            last: WalkingDirHandle::from_typed::<Self>(DeviceDirHandle { location }),
+            components: vec![],
+            last: WalkingDirHandle::from_typed::<Self>(from),
             stop_reason: WalkStopReason::CompleteDirectory,
         })
     }
@@ -251,10 +226,7 @@ where
         name: &str,
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
-        let dir = dir.into_typed::<Self>();
-        if dir.location != Location::Dev {
-            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
-        }
+        let _dir = dir.into_typed::<Self>();
         let device = Device::from_name(name)
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
 
@@ -289,22 +261,15 @@ where
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        let handle = handle.into_typed::<Self>();
-        match handle.location {
-            Location::Root => Ok(alloc::vec![DirEntry {
-                name: String::from("dev"),
-                file_type: FileType::Directory,
-                ino_info: Some(self.dev_dir_inode.clone()),
-            }]),
-            Location::Dev => Ok(Device::ALL
-                .iter()
-                .map(|(n, d)| DirEntry {
-                    name: String::from(*n),
-                    file_type: FileType::CharacterDevice,
-                    ino_info: Some(d.file_status().node_info),
-                })
-                .collect()),
-        }
+        let _handle = handle.into_typed::<Self>();
+        Ok(Device::ALL
+            .iter()
+            .map(|(n, d)| DirEntry {
+                name: String::from(*n),
+                file_type: FileType::CharacterDevice,
+                ino_info: Some(d.file_status().node_info),
+            })
+            .collect())
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
@@ -374,28 +339,14 @@ where
     }
 
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
-        let h = h.get_typed::<Self>();
-        Ok(match h.location {
-            Location::Root => FileStatus {
-                file_type: FileType::Directory,
-                mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                size: super::DEFAULT_DIRECTORY_SIZE,
-                owner: UserInfo::ROOT,
-                node_info: NodeInfo {
-                    dev: self.dev_dir_inode.dev,
-                    ino: 0,
-                    rdev: None,
-                },
-                blksize: super::DEFAULT_DIRECTORY_SIZE,
-            },
-            Location::Dev => FileStatus {
-                file_type: FileType::Directory,
-                mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                size: super::DEFAULT_DIRECTORY_SIZE,
-                owner: UserInfo::ROOT,
-                node_info: self.dev_dir_inode.clone(),
-                blksize: super::DEFAULT_DIRECTORY_SIZE,
-            },
+        let _h = h.get_typed::<Self>();
+        Ok(FileStatus {
+            file_type: FileType::Directory,
+            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: UserInfo::ROOT,
+            node_info: self.root_inode.clone(),
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
         })
     }
 
