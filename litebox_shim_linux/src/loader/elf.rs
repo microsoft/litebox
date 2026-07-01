@@ -498,15 +498,20 @@ mod tests {
             .load_mapped(task.global.platform)
             .expect("interpreter should load");
 
-        let expected_top_down_base =
-            <Platform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX - PAGE_SIZE;
-        assert_eq!(
-            interp.base_addr,
-            expected_top_down_base,
-            "ET_EXEC interpreter loaded at {:#x}, leaving heap capped near {:#x}, not top-down at {:#x}",
+        // The interpreter must land high — via the top-down search — so the
+        // low ET_EXEC brk heap below it is not capped. The exact address is
+        // not asserted: `get_unmmaped_area` returns the highest free gap, and
+        // host mappings seeded into the userland VMA tree can sit near the top
+        // and push that gap below the very top slot (see `mm/linux.rs`). Assert
+        // the invariant that matters — placement in the high half of the
+        // address space, far above the low-heap region — not one exact slot.
+        let addr_max = <Platform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
+        assert!(
+            interp.base_addr >= addr_max / 2,
+            "ET_EXEC interpreter loaded at {:#x}, near the low-heap region {:#x} rather than top-down high (>= {:#x})",
             interp.base_addr,
             crate::loader::DEFAULT_LOW_ADDR,
-            expected_top_down_base
+            addr_max / 2,
         );
     }
 }
