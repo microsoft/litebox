@@ -89,10 +89,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     ///
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
-    pub fn new(_litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
+    #[cfg_attr(not(test), allow(unused_variables))]
+    pub fn new(litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
         Self {
             #[cfg(test)]
-            test_box: _litebox.clone(),
+            test_box: litebox.clone(),
             _platform: core::marker::PhantomData,
             tar_index: TarIndex::new(tar_data),
             current_working_dir: "/".into(),

@@ -506,8 +506,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
     /// # Errors
     ///
     /// Returns an error if version negotiation or attach fails.
+    #[cfg_attr(not(test), allow(unused_variables))]
     pub fn new<R: transport::Read>(
-        _litebox: &LiteBox<Platform>,
+        litebox: &LiteBox<Platform>,
         writer: W,
         reader: R,
         msize: u32,
@@ -521,7 +522,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
         Ok((
             Self {
                 #[cfg(test)]
-                test_box: _litebox.clone(),
+                test_box: litebox.clone(),
                 client,
                 root: (qid, fid, String::from(path)),
                 current_working_dir: String::from("/"),

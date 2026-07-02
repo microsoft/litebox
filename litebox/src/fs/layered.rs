@@ -105,8 +105,9 @@ impl<
 {
     /// Construct a new `FileSystem` instance
     #[must_use]
+    #[cfg_attr(not(test), allow(unused_variables))]
     pub fn new(
-        _litebox: &LiteBox<Platform>,
+        litebox: &LiteBox<Platform>,
         upper: Upper,
         lower: Lower,
         layering_semantics: LayeringSemantics,
@@ -115,7 +116,7 @@ impl<
         let node_info_lookup = sync::RwLock::new(HashMap::new());
         Self {
             #[cfg(test)]
-            test_box: _litebox.clone(),
+            test_box: litebox.clone(),
             upper,
             lower,
             root,

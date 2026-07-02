@@ -60,11 +60,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     #[must_use]
-    pub fn new(_litebox: &LiteBox<Platform>) -> Self {
+    #[cfg_attr(not(test), allow(unused_variables))]
+    pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let root = sync::RwLock::new(RootDir::new());
         Self {
             #[cfg(test)]
-            test_box: _litebox.clone(),
+            test_box: litebox.clone(),
             root,
             current_user: UserInfo {
                 user: 1000,
