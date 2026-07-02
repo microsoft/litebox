@@ -30,9 +30,6 @@ impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 /// Backing counter for a Linux eventfd file description.
 ///
-/// New blocking eventfds use the shim-local path. Broker-backed counters stay
-/// nonblocking even if file status flags are later changed, until broker
-/// readiness notifications can wake local waiters.
 enum EventFileCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     ShimLocal {
         count: Mutex<Platform, u64>,
@@ -71,9 +68,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
             Self::LocalCore(counter) => counter
                 .read(
                     cx,
-                    // Broker-backed eventfds cannot safely park local waiters
-                    // until broker readiness notifications exist.
-                    true,
+                    nonblock,
                     if semaphore {
                         EventCounterReadMode::One
                     } else {
@@ -96,8 +91,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
                     Self::try_write_local(count, pollee, value)
                 })
                 .map_err(Errno::from),
-            // See the matching LocalCore read path for why this stays nonblocking.
-            Self::LocalCore(counter) => counter.write(cx, true, value).map_err(Errno::from),
+            Self::LocalCore(counter) => counter.write(cx, nonblock, value).map_err(Errno::from),
         }
     }
 
@@ -215,14 +209,10 @@ impl<FS: ShimFS> GlobalState<FS> {
         }
 
         let count = u64::from(initval);
-        let counter = if flags.contains(EfdFlags::NONBLOCK) {
-            match EventCounter::new(&self.litebox, count) {
-                Ok(counter) => EventFileCounter::LocalCore(counter),
-                Err(EventCounterError::Unavailable) => EventFileCounter::shim_local(count),
-                Err(error) => return Err(error.into()),
-            }
-        } else {
-            EventFileCounter::shim_local(count)
+        let counter = match EventCounter::new(&self.litebox, count) {
+            Ok(counter) => EventFileCounter::LocalCore(counter),
+            Err(EventCounterError::Unavailable) => EventFileCounter::shim_local(count),
+            Err(error) => return Err(error.into()),
         };
         Ok(EventFile::new(counter, flags))
     }

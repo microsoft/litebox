@@ -4,7 +4,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -63,6 +66,22 @@ static int expect_poll_events(int fd, short expected) {
     return 0;
 }
 
+static int expect_poll_wait_events(int fd, short expected) {
+    struct pollfd poll_fd = {
+        .fd = fd,
+        .events = POLLIN | POLLOUT,
+    };
+    errno = 0;
+    int ready = poll(&poll_fd, 1, 1000);
+    if (ready != 1) {
+        return 1;
+    }
+    if ((poll_fd.revents & (POLLIN | POLLOUT)) != expected) {
+        return 2;
+    }
+    return 0;
+}
+
 static int expect_eagain_write(int fd, uint64_t value) {
     errno = 0;
     if (write(fd, &value, sizeof(value)) != -1) {
@@ -96,7 +115,158 @@ static int expect_close(int fd) {
     return close(fd) == 0 ? 0 : 1;
 }
 
+struct read_thread_args {
+    int fd;
+    uint64_t expected;
+    int result;
+};
+
+static void *read_thread(void *arg) {
+    struct read_thread_args *args = arg;
+    args->result = read_value(args->fd, args->expected);
+    return NULL;
+}
+
+struct write_thread_args {
+    int fd;
+    uint64_t value;
+    int result;
+};
+
+static void *write_thread(void *arg) {
+    struct write_thread_args *args = arg;
+    args->result = write_value(args->fd, args->value);
+    return NULL;
+}
+
+static int join_thread(pthread_t thread) {
+    return pthread_join(thread, NULL) == 0 ? 0 : 1;
+}
+
+static int test_blocking_read_wakeup(void) {
+    int fd = eventfd(0, EFD_NONBLOCK);
+    if (fd < 0) {
+        return 1;
+    }
+    if (fcntl(fd, F_SETFL, 0) != 0) {
+        return 2;
+    }
+
+    struct read_thread_args args = {
+        .fd = fd,
+        .expected = 5,
+        .result = -1,
+    };
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, read_thread, &args) != 0) {
+        return 3;
+    }
+    usleep(10000);
+    if (write_value(fd, 5) != 0) {
+        return 4;
+    }
+    if (join_thread(thread) != 0 || args.result != 0) {
+        return 5;
+    }
+    return expect_close(fd) == 0 ? 0 : 6;
+}
+
+static int test_blocking_write_wakeup(void) {
+    int fd = eventfd(0, 0);
+    if (fd < 0) {
+        return 1;
+    }
+    if (write_value(fd, UINT64_MAX - 1) != 0) {
+        return 2;
+    }
+
+    struct write_thread_args args = {
+        .fd = fd,
+        .value = 1,
+        .result = -1,
+    };
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, write_thread, &args) != 0) {
+        return 3;
+    }
+    usleep(10000);
+    if (read_value(fd, UINT64_MAX - 1) != 0) {
+        return 4;
+    }
+    if (join_thread(thread) != 0 || args.result != 0) {
+        return 5;
+    }
+    if (read_value(fd, 1) != 0) {
+        return 6;
+    }
+    return expect_close(fd) == 0 ? 0 : 7;
+}
+
+static int test_poll_wakeup(void) {
+    int fd = eventfd(0, EFD_NONBLOCK);
+    if (fd < 0) {
+        return 1;
+    }
+    if (fcntl(fd, F_SETFL, 0) != 0) {
+        return 2;
+    }
+    if (expect_poll_events(fd, POLLOUT) != 0) {
+        return 3;
+    }
+    if (write_value(fd, 1) != 0) {
+        return 4;
+    }
+    if (expect_poll_wait_events(fd, POLLIN | POLLOUT) != 0) {
+        return 5;
+    }
+    if (read_value(fd, 1) != 0) {
+        return 6;
+    }
+    if (expect_poll_events(fd, POLLOUT) != 0) {
+        return 7;
+    }
+    return expect_close(fd) == 0 ? 0 : 8;
+}
+
+static int test_epoll_wakeup(void) {
+    int fd = eventfd(0, 0);
+    if (fd < 0) {
+        return 1;
+    }
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        return 2;
+    }
+    struct epoll_event event = {
+        .events = EPOLLIN,
+        .data.fd = fd,
+    };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0) {
+        return 3;
+    }
+    if (write_value(fd, 1) != 0) {
+        return 4;
+    }
+    struct epoll_event ready;
+    int ready_count = epoll_wait(epoll_fd, &ready, 1, 1000);
+    if (ready_count != 1 || ready.data.fd != fd || (ready.events & EPOLLIN) == 0) {
+        return 5;
+    }
+    if (read_value(fd, 1) != 0) {
+        return 6;
+    }
+    if (epoll_wait(epoll_fd, &ready, 1, 0) != 0) {
+        return 7;
+    }
+    if (expect_close(epoll_fd) != 0) {
+        return 8;
+    }
+    return expect_close(fd) == 0 ? 0 : 9;
+}
+
 int main(void) {
+    alarm(10);
+
     int fd = eventfd(0, EFD_NONBLOCK);
     if (fd < 0) {
         return 10;
@@ -327,5 +497,19 @@ int main(void) {
         return 130;
     }
 
+    if (test_blocking_read_wakeup() != 0) {
+        return 140;
+    }
+    if (test_blocking_write_wakeup() != 0) {
+        return 141;
+    }
+    if (test_poll_wakeup() != 0) {
+        return 142;
+    }
+    if (test_epoll_wakeup() != 0) {
+        return 143;
+    }
+
+    alarm(0);
     return 0;
 }
