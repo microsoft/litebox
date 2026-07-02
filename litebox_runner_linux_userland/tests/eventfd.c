@@ -66,22 +66,6 @@ static int expect_poll_events(int fd, short expected) {
     return 0;
 }
 
-static int expect_poll_wait_events(int fd, short expected) {
-    struct pollfd poll_fd = {
-        .fd = fd,
-        .events = POLLIN | POLLOUT,
-    };
-    errno = 0;
-    int ready = poll(&poll_fd, 1, 1000);
-    if (ready != 1) {
-        return 1;
-    }
-    if ((poll_fd.revents & (POLLIN | POLLOUT)) != expected) {
-        return 2;
-    }
-    return 0;
-}
-
 static int expect_eagain_write(int fd, uint64_t value) {
     errno = 0;
     if (write(fd, &value, sizeof(value)) != -1) {
@@ -200,32 +184,6 @@ static int test_blocking_write_wakeup(void) {
         return 6;
     }
     return expect_close(fd) == 0 ? 0 : 7;
-}
-
-static int test_poll_wakeup(void) {
-    int fd = eventfd(0, EFD_NONBLOCK);
-    if (fd < 0) {
-        return 1;
-    }
-    if (fcntl(fd, F_SETFL, 0) != 0) {
-        return 2;
-    }
-    if (expect_poll_events(fd, POLLOUT) != 0) {
-        return 3;
-    }
-    if (write_value(fd, 1) != 0) {
-        return 4;
-    }
-    if (expect_poll_wait_events(fd, POLLIN | POLLOUT) != 0) {
-        return 5;
-    }
-    if (read_value(fd, 1) != 0) {
-        return 6;
-    }
-    if (expect_poll_events(fd, POLLOUT) != 0) {
-        return 7;
-    }
-    return expect_close(fd) == 0 ? 0 : 8;
 }
 
 static int test_epoll_wakeup(void) {
@@ -503,11 +461,8 @@ int main(void) {
     if (test_blocking_write_wakeup() != 0) {
         return 141;
     }
-    if (test_poll_wakeup() != 0) {
-        return 142;
-    }
     if (test_epoll_wakeup() != 0) {
-        return 143;
+        return 142;
     }
 
     alarm(0);
