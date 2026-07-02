@@ -1220,25 +1220,7 @@ mod tests {
             NtStatus::SUCCESS
         );
 
-        let mut info = SectionImageInformation {
-            transfer_address: 0,
-            zero_bits: u32::MAX,
-            _padding0: u32::MAX,
-            maximum_stack_size: usize::MAX,
-            committed_stack_size: usize::MAX,
-            subsystem_type: u32::MAX,
-            subsystem_minor_version: u16::MAX,
-            subsystem_major_version: u16::MAX,
-            gp_value: u32::MAX,
-            image_characteristics: u16::MAX,
-            dll_characteristics: u16::MAX,
-            machine: u16::MAX,
-            image_contains_code: u8::MAX,
-            image_flags: u8::MAX,
-            loader_flags: u32::MAX,
-            image_file_size: u32::MAX,
-            checksum: u32::MAX,
-        };
+        let mut info = <SectionImageInformation as zerocopy::FromZeros>::new_zeroed();
         let mut return_length = 0usize;
         assert_eq!(
             task.sys_nt_query_section(
