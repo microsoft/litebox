@@ -20,7 +20,7 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
-    utils::TruncateExt,
+    utils::{ReinterpretUnsignedExt, TruncateExt},
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 use litebox_common_optee::{
@@ -383,7 +383,8 @@ impl Task {
         let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
             Ok(request) => request,
             Err(err) => {
-                ctx.rax = TeeResult::from(err) as usize;
+                // TODO: this seems like the wrong kind of error for OPTEE.
+                ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
                 return ContinueOperation::Resume;
             }
         };
@@ -663,7 +664,8 @@ impl Task {
         let request = match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
             Ok(request) => request,
             Err(err) => {
-                ctx.rax = TeeResult::from(err) as usize;
+                // TODO: this seems like the wrong kind of error for OPTEE.
+                ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
                 return ContinueOperation::Resume;
             }
         };
