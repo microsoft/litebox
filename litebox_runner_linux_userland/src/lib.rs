@@ -241,12 +241,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let shim_builder = if let Some(broker_connection) = broker_connection {
-        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(
-            litebox::LiteBox::new_with_broker_local(
-                litebox_platform_multiplex::platform(),
-                broker_connection.into_local(),
-            ),
-        )
+        let (broker_local, broker_notifications) = broker_connection.into_parts();
+        let litebox = litebox::LiteBox::new_with_broker_local(
+            litebox_platform_multiplex::platform(),
+            broker_local,
+        );
+        broker::start_notification_receiver(
+            broker_notifications,
+            litebox.broker_notification_sink(),
+        )?;
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(litebox)
     } else {
         litebox_shim_linux::LinuxShimBuilder::new()
     };

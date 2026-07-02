@@ -3,7 +3,6 @@
 
 use std::{
     path::Path,
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -16,14 +15,11 @@ use litebox_broker_transport::unix_socket::{
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 type Local = BrokerLocal<UnixStreamLocalControlChannel>;
+type Notifications = BrokerNotifications<UnixStreamLocalNotificationChannel>;
 
 pub(crate) struct BrokerConnection {
     local: Local,
-    #[expect(
-        dead_code,
-        reason = "keeps the notification receiver thread alive while the broker connection is installed"
-    )]
-    notification_receiver_thread: JoinHandle<()>,
+    notifications: Notifications,
 }
 
 pub(crate) fn connect(
@@ -56,13 +52,25 @@ pub(crate) fn connect(
         )
     })?;
     let local = BrokerLocal::negotiate(control_channel).context("broker negotiation failed")?;
-    let mut notifications = BrokerNotifications::new(notification_channel);
-    let notification_thread = std::thread::Builder::new()
+    Ok(BrokerConnection {
+        local,
+        notifications: BrokerNotifications::new(notification_channel),
+    })
+}
+
+pub(crate) fn start_notification_receiver<Platform>(
+    mut notifications: Notifications,
+    sink: litebox::BrokerNotificationSink<Platform>,
+) -> Result<()>
+where
+    Platform: litebox::sync::RawSyncPrimitivesProvider + litebox::platform::TimeProvider + 'static,
+{
+    std::thread::Builder::new()
         .name("litebox-broker-notifications".to_owned())
         .spawn(move || {
             loop {
                 match notifications.recv_notification() {
-                    Ok(Some(_notification)) => {}
+                    Ok(Some(notification)) => sink.dispatch(notification),
                     Ok(None) => break,
                     Err(error) => {
                         eprintln!("failed to receive broker notification: {error}");
@@ -72,15 +80,12 @@ pub(crate) fn connect(
             }
         })
         .context("failed to start broker notification receiver")?;
-    Ok(BrokerConnection {
-        local,
-        notification_receiver_thread: notification_thread,
-    })
+    Ok(())
 }
 
 impl BrokerConnection {
-    pub(crate) fn into_local(self) -> Local {
-        self.local
+    pub(crate) fn into_parts(self) -> (Local, Notifications) {
+        (self.local, self.notifications)
     }
 }
 

@@ -7,10 +7,12 @@ use alloc::sync::Arc;
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::message::BrokerNotification;
 
 use crate::{
     broker,
     fd::Descriptors,
+    platform::TimeProvider,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -24,6 +26,15 @@ use crate::{
 /// platform are dependent on the particular subsystems.
 pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
     pub(crate) x: Arc<LiteBoxX<Platform>>,
+}
+
+/// Dispatch handle for broker-initiated notifications into a [`LiteBox`] instance.
+///
+/// Deployment code that owns a broker notification transport can move this
+/// handle into its receive loop without cloning or exposing the whole
+/// [`LiteBox`] object.
+pub struct BrokerNotificationSink<Platform: RawSyncPrimitivesProvider> {
+    x: Arc<LiteBoxX<Platform>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
@@ -100,6 +111,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 platform,
                 descriptors,
                 broker: broker_control,
+                broker_events: Arc::new(broker::BrokerEventRegistry::new()),
             }),
         }
     }
@@ -138,6 +150,32 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     pub(crate) fn broker_control(&self) -> Option<Arc<dyn broker::BrokerControl>> {
         self.x.broker.clone()
     }
+
+    pub(crate) fn broker_event_registry(&self) -> Arc<broker::BrokerEventRegistry<Platform>> {
+        Arc::clone(&self.x.broker_events)
+    }
+
+    /// Returns a dispatch handle for broker-initiated notifications.
+    pub fn broker_notification_sink(&self) -> BrokerNotificationSink<Platform> {
+        BrokerNotificationSink {
+            x: Arc::clone(&self.x),
+        }
+    }
+}
+
+impl<Platform> BrokerNotificationSink<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
+{
+    /// Dispatches one broker notification to the matching local-core object.
+    pub fn dispatch(&self, notification: BrokerNotification) {
+        match notification {
+            BrokerNotification::EventReadiness(notification) => self
+                .x
+                .broker_events
+                .notify_event_readiness(notification.handle, notification.readiness),
+        }
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
@@ -145,4 +183,5 @@ pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
     broker: Option<Arc<dyn broker::BrokerControl>>,
+    broker_events: Arc<broker::BrokerEventRegistry<Platform>>,
 }
