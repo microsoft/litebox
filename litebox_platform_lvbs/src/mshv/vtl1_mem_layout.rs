@@ -25,10 +25,10 @@ pub const VTL1_PTE_0_PAGE: usize = 5;
 pub const VTL1_KERNEL_STACK_PAGE: usize = VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT;
 
 /// PDPT page for the Phase 1 high-canonical PML4 entry. Placed after the
-/// VTL0-reserved special pages (GDT, TSS, PT pages, stack, boot params,
-/// cmdline) so that all 8 VTL0 PTE pages remain available for the
-/// high-canonical mapping. This page is within the VTL0 identity-mapped
-/// 16 MiB region but is otherwise unused memory.
+/// VTL0-reserved special pages (GDT, TSS, PT pages, and stack) so that all 8
+/// VTL0 PTE pages remain available for the high-canonical mapping. This page
+/// is within the VTL0 identity-mapped 16 MiB region but is otherwise unused
+/// memory.
 pub const VTL1_REMAP_PDPT_PAGE: usize = VTL1_KERNEL_STACK_PAGE + 1;
 
 /// PDE page for the Phase 1 high-canonical mapping. PDE entries point to

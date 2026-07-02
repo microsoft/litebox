@@ -176,16 +176,16 @@ unsafe fn apply_relocations() {
 /// │ PML4 (page 2, from VTL0)                                            │
 /// │ ┌──────────────────────────────────────────────┐                    │
 /// │ │ [0]   → VTL0 PDPT (page 3)    ← identity     │ kept (harmless)    │
-/// │ │ [256] → new  PDPT (page 16)   ← high-canon   │ Phase 1 adds       │
+/// │ │ [256] → new  PDPT (page 14)   ← high-canon   │ Phase 1 adds       │
 /// │ │  ...                                         │                    │
 /// │ └──────────────────────────────────────────────┘                    │
 /// │                                                                     │
-/// │ New PDPT (page 16)                                                  │
+/// │ New PDPT (page 14)                                                  │
 /// │ ┌──────────────────────────────────────────────┐                    │
-/// │ │ [pdpt_idx] → new PDE (page 17)               │                    │
+/// │ │ [pdpt_idx] → new PDE (page 15)               │                    │
 /// │ └──────────────────────────────────────────────┘                    │
 /// │                                                                     │
-/// │ New PDE (page 17)                                                   │
+/// │ New PDE (page 15)                                                   │
 /// │ ┌──────────────────────────────────────────────┐                    │
 /// │ │ [pde+0] → VTL0 PTE page 5  (2 MiB, 4KB pgs)  │ reused as-is       │
 /// │ │ [pde+1] → VTL0 PTE page 6                    │                    │
@@ -213,7 +213,7 @@ unsafe fn apply_relocations() {
 /// │ The entire low half [0, 0x7FFF_FFFF_F000) is now available          │
 /// │ for user-space (TAs / Linux apps).                                  │
 /// │                                                                     │
-/// │ Reclaim all Phase 1 pages (2–12, 16–17) back to the allocator.      │
+/// │ Reclaim all Phase 1 pages (2–12, 14–15) back to the allocator.      │
 /// └─────────────────────────────────────────────────────────────────────┘
 /// ```
 ///
@@ -229,22 +229,22 @@ unsafe fn apply_relocations() {
 /// means the existing PTE pages can be **reused as-is** for the
 /// high-canonical mapping; we only need a new PDPT page and a new PDE page.
 ///
-/// The PDPT and PDE pages are allocated from unused memory after the
-/// VTL0-reserved special pages (pages 16–17), preserving all 8 PTE pages
-/// for the high-canonical mapping and covering the full 16 MiB.
+/// The PDPT and PDE pages are allocated from unused memory after the boot
+/// stack page (pages 14–15), preserving all 8 PTE pages for the high-canonical
+/// mapping and covering the full 16 MiB.
 ///
 /// ## Page table pages used
 ///
 /// | page | constant              | purpose                                |
 /// |------|-----------------------|----------------------------------------|
-/// | 16   | `VTL1_REMAP_PDPT_PAGE`| PDPT for the high-canonical PML4 entry |
-/// | 17   | `VTL1_REMAP_PDE_PAGE` | PDE pointing to PTE pages 5–12         |
+/// | 14   | `VTL1_REMAP_PDPT_PAGE`| PDPT for the high-canonical PML4 entry |
+/// | 15   | `VTL1_REMAP_PDE_PAGE` | PDE pointing to PTE pages 5–12         |
 ///
 /// ## Algorithm
 ///
 /// 1. Compute PML4/PDPT/PDE indices from `memory_base + KERNEL_OFFSET`.
-/// 2. Zero and populate a PDPT page (page 16).
-/// 3. Zero and populate a PDE page (page 17) pointing to all 8 VTL0 PTE
+/// 2. Zero and populate a PDPT page (page 14).
+/// 3. Zero and populate a PDE page (page 15) pointing to all 8 VTL0 PTE
 ///    pages 5–12 (4KB page mappings, no huge pages).
 /// 4. Wire PML4 → PDPT → PDE.
 /// 5. Flush TLB and jump to `continue_boot` at the high-canonical address.
@@ -280,12 +280,12 @@ unsafe fn remap_to_high_canonical() -> ! {
     let pml4_pa = cr3 & CR3_ADDR_MASK;
     let pml4_ptr = pml4_pa as *mut u64;
 
-    // Set up the PDPT page (page 16)
+    // Set up the PDPT page.
     let pdpt_page_pa = memory_base + (VTL1_REMAP_PDPT_PAGE * vtl1_mem_layout::PAGE_SIZE) as u64;
     let pdpt_ptr = pdpt_page_pa as *mut u64;
     unsafe { core::ptr::write_bytes(pdpt_ptr, 0, ENTRIES_PER_PT_PAGE) };
 
-    // Set up the PDE page (page 17)
+    // Set up the PDE page.
     let pde_page_pa = memory_base + (VTL1_REMAP_PDE_PAGE * vtl1_mem_layout::PAGE_SIZE) as u64;
     let pde_ptr = pde_page_pa as *mut u64;
     unsafe { core::ptr::write_bytes(pde_ptr, 0, ENTRIES_PER_PT_PAGE) };
