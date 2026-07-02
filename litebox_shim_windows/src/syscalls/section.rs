@@ -1686,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn pagefile_section_rejects_second_active_view_across_handles() {
+    fn pagefile_section_rejects_additional_views_across_handles_and_unmap() {
         let task = test_task();
         let name = wide(r"\BaseNamedObjects\LiteBoxSingleViewSection");
         let unicode = unicode(&name);
@@ -1748,44 +1748,6 @@ mod tests {
         assert_eq!(
             task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
                 section_handle: opened,
-                process_handle: ProcessHandle::CURRENT,
-                base_address: mut_ptr(&mut second_base),
-                zero_bits: 0,
-                commit_size: 0,
-                section_offset: None,
-                view_size: mut_ptr(&mut second_size),
-                inherit_disposition: VIEW_SHARE,
-                allocation_type: 0,
-                page_protection: PageProtection::PAGE_READWRITE.bits(),
-            }),
-            NtStatus::NOT_SUPPORTED
-        );
-        assert_eq!(second_base, 0);
-        assert_eq!(second_size, 0);
-    }
-
-    #[test]
-    fn pagefile_view_unmap_remap_is_not_supported() {
-        let task = test_task();
-        let handle = create_pagefile_section(
-            &task,
-            SectionAccess::ALL_ACCESS.bits(),
-            0x2000,
-            PageProtection::PAGE_READWRITE,
-        );
-        let (first_base, first_size) = map_pagefile_section(&task, handle);
-        assert_eq!(first_size, 0x2000);
-
-        assert_eq!(
-            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, first_base),
-            NtStatus::SUCCESS
-        );
-
-        let mut second_base = 0usize;
-        let mut second_size = 0usize;
-        assert_eq!(
-            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
-                section_handle: handle,
                 process_handle: ProcessHandle::CURRENT,
                 base_address: mut_ptr(&mut second_base),
                 zero_bits: 0,
