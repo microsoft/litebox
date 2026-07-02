@@ -1141,7 +1141,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 process_information,
                 process_information_length,
             } => {
-                let status = Self::sys_nt_set_information_process(
+                let status = self.sys_nt_set_information_process(
                     process_handle,
                     process_information_class,
                     process_information,
