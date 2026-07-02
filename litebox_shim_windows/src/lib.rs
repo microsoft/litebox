@@ -986,6 +986,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtApphelpCacheControl {
+                service_class,
+                service_data,
+            } => {
+                let status = syscalls::apphelp::sys_nt_apphelp_cache_control::<Platform>(
+                    service_class,
+                    service_data,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenKey {
                 key_handle,
                 desired_access,

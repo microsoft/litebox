@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub(crate) mod apphelp;
 pub(crate) mod directory;
 pub(crate) mod event;
 pub(crate) mod file;
@@ -311,6 +312,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         fs_information: Platform::RawMutPointer<u8>,
         length: u32,
         fs_information_class: u32,
+    },
+    NtApphelpCacheControl {
+        service_class: u32,
+        service_data: Option<Platform::RawMutPointer<u8>>,
     },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
@@ -720,6 +725,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 length,
                 fs_information_class,
             })),
+            NtSysno::NtApphelpCacheControl => Some(sys_req!(NtApphelpCacheControl {
+                service_class,
+                service_data:*,
+            })),
             NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
                 key_handle:*,
                 desired_access,
@@ -1035,6 +1044,8 @@ impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
 mod tests {
     use super::*;
 
+    use crate::tests::TestPlatform;
+
     #[test]
     fn handle_encodes_raw_fds_and_rejects_invalid_values() {
         let first_handle = Handle::from_raw_fd(0).expect("raw fd 0 should encode");
@@ -1059,5 +1070,32 @@ mod tests {
 
         assert_eq!(Handle::from_raw_fd(usize::MAX >> HANDLE_SHIFT), None);
         assert_eq!(Handle::from_raw_fd(usize::MAX), None);
+    }
+
+    #[test]
+    fn nt_apphelp_cache_control_decodes_arguments() {
+        let mut service_data = 0u8;
+        let pt_regs = litebox_common_linux::PtRegs {
+            r10: 2,
+            rdx: core::ptr::from_mut(&mut service_data) as usize,
+            orig_rax: NtSysno::NtApphelpCacheControl.as_raw() as usize,
+            ..Default::default()
+        };
+
+        let Some(SyscallRequest::NtApphelpCacheControl {
+            service_class,
+            service_data: decoded_service_data,
+        }) = SyscallRequest::<TestPlatform>::try_from_raw(&pt_regs)
+        else {
+            panic!("NtApphelpCacheControl did not decode");
+        };
+
+        assert_eq!(service_class, 2);
+        assert_eq!(
+            decoded_service_data
+                .expect("service data pointer")
+                .as_usize(),
+            core::ptr::from_mut(&mut service_data) as usize
+        );
     }
 }
