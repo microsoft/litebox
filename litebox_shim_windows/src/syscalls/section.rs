@@ -4,7 +4,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
-use core::mem::size_of;
+use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use int_enum::IntEnum;
@@ -16,7 +16,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes};
+use crate::nt_types::{AccessMask, ObjectAttributes, ProcessEnvironmentBlock};
 use crate::syscalls::mm::{MemoryType, PageProtection, create_pages, parse_page_protection};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsSectionView};
@@ -28,6 +28,8 @@ const MEM_PHYSICAL: u32 = 0x0040_0000;
 const MEM_DIFFERENT_IMAGE_BASE_OK: u32 = 0x0080_0000;
 const SUPPORTED_MAP_ALLOCATION_TYPES: u32 =
     MEM_TOP_DOWN | MEM_PHYSICAL | MEM_DIFFERENT_IMAGE_BASE_OK;
+const WINDOWS_SHARED_SECTION_OBJECT: &str = r"\Windows\SharedSection";
+const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
 
 enum SectionBacking {
     /// LiteBox lacks shared anonymous backing, so a pagefile section is
@@ -40,6 +42,7 @@ enum SectionBacking {
     /// second-concurrent-view and the remap-after-unmap rejects exist. They are
     /// one missing feature, not two unrelated limitations.
     Pagefile,
+    CsrSharedSection,
     ImageFile,
 }
 
@@ -521,6 +524,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 page_protection,
                 permissions,
             ),
+            SectionBacking::CsrSharedSection => self.map_csr_shared_section(
+                request,
+                &section,
+                requested_view_size,
+                section_offset,
+                page_protection,
+                permissions,
+            ),
             SectionBacking::ImageFile => self.map_image_section(request, &section, page_protection),
         }
     }
@@ -624,7 +635,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if section.is_none() {
             namespace.remove(&key);
         }
-        section
+        section.or_else(|| is_windows_shared_section(name).then(windows_shared_section))
     }
 
     fn map_pagefile_section(
@@ -656,7 +667,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         match section.backing {
             SectionBacking::Pagefile => {}
-            SectionBacking::ImageFile => return NtStatus::INVALID_FILE_FOR_SECTION,
+            SectionBacking::CsrSharedSection | SectionBacking::ImageFile => {
+                return NtStatus::INVALID_FILE_FOR_SECTION;
+            }
         }
         if !pagefile_view_protection_is_compatible(section.protection, page_protection) {
             litebox_util_log::debug!(
@@ -690,6 +703,98 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::NO_MEMORY;
         };
         let base = mapping.as_usize();
+        if request.base_address.write_at_offset(0, base).is_none()
+            || request.view_size.write_at_offset(0, view_size).is_none()
+        {
+            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
+            section.pagefile_view_active.store(false, Ordering::Release);
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        self.process.section_views.write().insert(
+            base,
+            WindowsSectionView {
+                size: mapped_size,
+                section_offset,
+                section: Some(Arc::clone(section)),
+            },
+        );
+        self.process.virtual_allocations.write().insert(
+            base,
+            crate::WindowsVirtualAllocation {
+                base,
+                size: mapped_size,
+                allocation_protect: section.protection,
+                type_: MemoryType::MEM_MAPPED,
+                pages: committed_pages(base, mapped_size, page_protection),
+            },
+        );
+        NtStatus::SUCCESS
+    }
+
+    fn map_csr_shared_section(
+        &self,
+        request: MapViewOfSectionParameters<Platform>,
+        section: &Arc<SectionObject<Platform>>,
+        requested_view_size: usize,
+        section_offset: usize,
+        page_protection: PageProtection,
+        permissions: MemoryRegionPermissions,
+    ) -> NtStatus {
+        if section_offset != 0 {
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        let view_size = if requested_view_size == 0 {
+            section.size
+        } else {
+            requested_view_size
+        };
+        if view_size == 0 || view_size > section.size {
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        let Some(mapped_size) = view_size.checked_next_multiple_of(PAGE_SIZE) else {
+            return NtStatus::INVALID_VIEW_SIZE;
+        };
+        let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(mapped_size) else {
+            return NtStatus::INVALID_VIEW_SIZE;
+        };
+        if !pagefile_view_protection_is_compatible(section.protection, page_protection) {
+            return NtStatus::SECTION_PROTECTION;
+        }
+        if section.pagefile_view_active.swap(true, Ordering::AcqRel) {
+            return NtStatus::NOT_SUPPORTED;
+        }
+
+        let csr_server_base = self.csr_server_read_only_shared_memory_base();
+        let Ok(mapping) = create_pages(
+            &self.global.page_manager,
+            None,
+            length,
+            CreatePagesFlags::empty(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            |_| Ok(0),
+        ) else {
+            section.pagefile_view_active.store(false, Ordering::Release);
+            return NtStatus::NO_MEMORY;
+        };
+
+        let base = mapping.as_usize();
+        if crate::loader::initialize_windows_static_server_data_for_server_base::<Platform>(
+            base,
+            csr_server_base.unwrap_or(base),
+        )
+        .is_err()
+        {
+            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
+            section.pagefile_view_active.store(false, Ordering::Release);
+            return NtStatus::NO_MEMORY;
+        }
+        if make_view_permissions(&self.global.page_manager, mapping, mapped_size, permissions)
+            .is_err()
+        {
+            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
+            section.pagefile_view_active.store(false, Ordering::Release);
+            return NtStatus::NO_MEMORY;
+        }
         if request.base_address.write_at_offset(0, base).is_none()
             || request.view_size.write_at_offset(0, view_size).is_none()
         {
@@ -800,6 +905,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    fn csr_server_read_only_shared_memory_base(&self) -> Option<usize> {
+        if self.process.peb_address == 0 {
+            return None;
+        }
+        let address = self.process.peb_address.checked_add(offset_of!(
+            ProcessEnvironmentBlock,
+            csr_server_read_only_shared_memory_base
+        ))?;
+        ConstPtr::<Platform, u64>::from_usize(address)
+            .read_at_offset(0)
+            .and_then(|base| usize::try_from(base).ok())
+            .filter(|base| *base != 0)
+    }
+
     fn read_section_name(
         &self,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
@@ -849,6 +968,33 @@ fn known_dll_section_fs_path(object_path: &str) -> Option<String> {
     let mut fs_path = String::from(fs_directory);
     fs_path.push_str(&dll_name.to_ascii_lowercase());
     Some(fs_path)
+}
+
+fn is_windows_shared_section(object_path: &str) -> bool {
+    object_path.eq_ignore_ascii_case(WINDOWS_SHARED_SECTION_OBJECT)
+        || (strip_case_insensitive_prefix(object_path, r"\Sessions\").is_some_and(|rest| {
+            let mut parts = rest.splitn(2, '\\');
+            parts.next().is_some_and(|session_id| {
+                !session_id.is_empty() && session_id.bytes().all(|byte| byte.is_ascii_digit())
+            }) && parts
+                .next()
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(r"Windows\SharedSection"))
+        }))
+}
+
+fn windows_shared_section<Platform: ShimPlatform>() -> Arc<SectionObject<Platform>> {
+    // CSRSS creates this named section for the CSR client/server contract. LiteBox
+    // synthesizes it from the same static server data shape used for the PEB CSR
+    // pointers instead of exposing a zeroed generic pagefile section.
+    Arc::new(SectionObject {
+        fs_path: None,
+        size: WINDOWS_SHARED_SECTION_SIZE,
+        attributes: SectionAllocationAttributes::SEC_COMMIT,
+        protection: PageProtection::PAGE_READWRITE,
+        backing: SectionBacking::CsrSharedSection,
+        pagefile_view_active: AtomicBool::new(false),
+        _platform: PhantomData,
+    })
 }
 
 fn strip_case_insensitive_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -1052,13 +1198,50 @@ fn remove_view_pages<Platform: ShimPlatform>(
     unsafe { page_manager.remove_pages(ptr, size) }.map_err(|_| ())
 }
 
+fn make_view_permissions<Platform: ShimPlatform>(
+    page_manager: &crate::WindowsPageManager<Platform>,
+    ptr: MutPtr<Platform, u8>,
+    len: usize,
+    permissions: MemoryRegionPermissions,
+) -> Result<(), ()> {
+    // SAFETY: The caller just created this exact mapping and has not exposed it
+    // to the guest yet; this only applies the final requested view protection.
+    unsafe {
+        match permissions {
+            permissions if permissions.is_empty() => page_manager.make_pages_inaccessible(ptr, len),
+            MemoryRegionPermissions::READ => page_manager.make_pages_readable(ptr, len),
+            permissions
+                if permissions
+                    == MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE =>
+            {
+                page_manager.make_pages_writable(ptr, len)
+            }
+            permissions
+                if permissions == MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC =>
+            {
+                page_manager.make_pages_executable(ptr, len)
+            }
+            permissions
+                if permissions
+                    == MemoryRegionPermissions::READ
+                        | MemoryRegionPermissions::WRITE
+                        | MemoryRegionPermissions::EXEC =>
+            {
+                page_manager.make_pages_rwx(ptr, len)
+            }
+            _ => unreachable!("Windows page protection parser produced unsupported permissions"),
+        }
+    }
+    .map_err(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
 
     use core::mem::{size_of, size_of_val};
 
-    use litebox::platform::RawMutPointer as _;
+    use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
@@ -1199,6 +1382,79 @@ mod tests {
             NtStatus::INFO_LENGTH_MISMATCH
         );
         assert_eq!(return_length, 0x5555_5555);
+    }
+
+    #[test]
+    fn nt_open_section_synthesizes_windows_shared_section() {
+        let task = test_task();
+        let name = wide(r"\Windows\SharedSection");
+        let unicode = unicode(&name);
+        let attrs = object_attributes(&unicode);
+        let mut handle = Handle::default();
+
+        assert_eq!(
+            task.sys_nt_open_section(
+                mut_ptr(&mut handle),
+                (SectionAccess::QUERY | SectionAccess::MAP_READ | SectionAccess::MAP_WRITE).bits(),
+                Some(const_ptr(&attrs)),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut info = SectionBasicInformation {
+            base_address: usize::MAX,
+            attributes: u32::MAX,
+            _padding: u32::MAX,
+            size: i64::MAX,
+        };
+        let mut return_length = 0usize;
+        assert_eq!(
+            task.sys_nt_query_section(
+                handle,
+                SectionInformationClass::Basic as u32,
+                mut_byte_ptr(&mut info),
+                size_of::<SectionBasicInformation>(),
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(return_length, size_of::<SectionBasicInformation>());
+        assert_eq!(
+            info.attributes,
+            SectionAllocationAttributes::SEC_COMMIT.bits()
+        );
+        assert_eq!(
+            info.size,
+            i64::try_from(WINDOWS_SHARED_SECTION_SIZE).unwrap()
+        );
+
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_READWRITE.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(view_size, WINDOWS_SHARED_SECTION_SIZE);
+        let base_server_data =
+            ConstPtr::<TestPlatform, usize>::from_usize(base + size_of::<usize>())
+                .read_at_offset(0)
+                .expect("CSR static server data table is readable");
+        assert!((base..base + view_size).contains(&base_server_data));
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
+            NtStatus::SUCCESS
+        );
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

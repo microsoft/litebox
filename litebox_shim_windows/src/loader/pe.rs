@@ -523,10 +523,25 @@ fn initialize_windows_static_server_data<Platform: RawPointerProvider>(
     read_only_static_server_data
         .write_at_offset(
             BASESRV_SERVERDLL_INDEX.cast_signed(),
-            client_base_static_server_data.as_usize(),
+            shared_heap.pointer_address(client_base_static_server_data.as_usize())?,
         )
         .ok_or(PeImageAccessError::MemoryAccess)?;
     Ok(read_only_static_server_data.as_usize())
+}
+
+pub(crate) fn initialize_windows_static_server_data_for_server_base<
+    Platform: RawPointerProvider,
+>(
+    read_only_shared_memory_base: usize,
+    csr_server_read_only_shared_memory_base: usize,
+) -> Result<(), PeImageAccessError> {
+    let mut shared_heap = GuestMemoryAllocator::new_with_pointer_base(
+        read_only_shared_memory_base,
+        WINDOWS_SHARED_SECTION_SIZE,
+        csr_server_read_only_shared_memory_base,
+    )?;
+    initialize_windows_static_server_data::<Platform>(&mut shared_heap)?;
+    Ok(())
 }
 
 fn initialize_static_server_data<Platform: RawPointerProvider>(
@@ -585,7 +600,7 @@ fn initialize_static_server_data<Platform: RawPointerProvider>(
         Platform,
         base_static_server_data,
         ini_file_mapping,
-        ini_file_mapping,
+        shared_heap.pointer_address(ini_file_mapping)?,
     )?;
     write_static_server_data_field!(
         Platform,
@@ -678,16 +693,38 @@ impl RtlCriticalSection {
 struct GuestMemoryAllocator {
     cursor: usize,
     end: usize,
+    pointer_base_delta: isize,
 }
 
 impl GuestMemoryAllocator {
     fn new(base: usize, size: usize) -> Result<Self, PeImageAccessError> {
+        Self::new_with_pointer_base(base, size, base)
+    }
+
+    fn new_with_pointer_base(
+        base: usize,
+        size: usize,
+        pointer_base: usize,
+    ) -> Result<Self, PeImageAccessError> {
         let cursor = base;
         let end = checked_add(base, size)?;
         if cursor > end {
             return Err(PeImageAccessError::AddressOverflow);
         }
-        Ok(Self { cursor, end })
+        let pointer_base_delta = pointer_base
+            .checked_sub(base)
+            .and_then(|delta| isize::try_from(delta).ok())
+            .or_else(|| {
+                base.checked_sub(pointer_base)
+                    .and_then(|delta| isize::try_from(delta).ok())
+                    .map(isize::wrapping_neg)
+            })
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        Ok(Self {
+            cursor,
+            end,
+            pointer_base_delta,
+        })
     }
 
     fn allocate<Platform, T>(&mut self) -> Result<MutPtr<Platform, T>, PeImageAccessError>
@@ -726,6 +763,12 @@ impl GuestMemoryAllocator {
         }
         self.cursor = cursor;
         Ok(address)
+    }
+
+    fn pointer_address(&self, address: usize) -> Result<usize, PeImageAccessError> {
+        address
+            .checked_add_signed(self.pointer_base_delta)
+            .ok_or(PeImageAccessError::AddressOverflow)
     }
 }
 
@@ -1798,7 +1841,7 @@ fn allocate_guest_unicode_string<Platform: RawPointerProvider>(
         length: string.length,
         maximum_length: string.maximum_length,
         padding_0: [0; 4],
-        buffer: buffer.as_usize(),
+        buffer: allocation.pointer_address(buffer.as_usize())?,
     })
 }
 
