@@ -69,13 +69,11 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerObjectRegistry<Platform> {
     pub(crate) fn unregister_pollable(&self, handle: ObjectHandle) {
         self.pollables.lock().remove(&handle);
     }
-}
 
-impl<Platform> BrokerObjectRegistry<Platform>
-where
-    Platform: RawSyncPrimitivesProvider + TimeProvider,
-{
-    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessState) {
+    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessState)
+    where
+        Platform: TimeProvider,
+    {
         let pollee = {
             let mut pollables = self.pollables.lock();
             if let Some(pollee) = pollables.get(&handle).and_then(Weak::upgrade) {
