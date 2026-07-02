@@ -45,6 +45,13 @@ enum ProcessTlsOperation {
     ReplaceVector = 1,
 }
 
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ProcessTlsThreadDataFlags: u32 {
+        const OLD_DATA_WRITTEN = 0x2;
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct ProcessBasicInformation {
@@ -511,7 +518,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     process_information,
                     thread_data_offset + layout.flags_offset(),
                     process_information_length,
-                    0x2,
+                    ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN.bits(),
                 )
                 .is_none()
             {
@@ -586,7 +593,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     process_information,
                     thread_data_offset + layout.flags_offset(),
                     process_information_length,
-                    0x2,
+                    ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN.bits(),
                 )
                 .is_none()
             {
@@ -921,7 +928,10 @@ mod tests {
             );
             assert_eq!(new_tls_vector[7], 0xaaaa);
             assert_eq!(request.entry.tls_data, 0);
-            assert_eq!(request.entry.flags, 0x2);
+            assert_eq!(
+                ProcessTlsThreadDataFlags::from_bits_retain(request.entry.flags),
+                ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN
+            );
         });
     }
 
@@ -961,7 +971,10 @@ mod tests {
             );
             assert_eq!(tls_vector[7], 0x2222);
             assert_eq!(request.entry.tls_data, 0x1111);
-            assert_eq!(request.entry.flags, 0x2);
+            assert_eq!(
+                ProcessTlsThreadDataFlags::from_bits_retain(request.entry.flags),
+                ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN
+            );
 
             request.header.tls_index = TEB_TLS_SLOT_COUNT.trunc();
             assert_eq!(
