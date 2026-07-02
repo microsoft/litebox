@@ -51,11 +51,11 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 }
 
-pub(crate) struct BrokerObjectRegistry<Platform: RawSyncPrimitivesProvider> {
+pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
     pollables: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> BrokerObjectRegistry<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     pub(crate) fn new() -> Self {
         Self {
             pollables: Mutex::new(HashMap::new()),
