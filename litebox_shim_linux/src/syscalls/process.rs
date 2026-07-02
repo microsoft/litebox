@@ -10679,11 +10679,20 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
     files
         .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
     crate::RawFdRef::Fs(fd) => {
-                let descriptors = global.litebox.descriptor_table();
-                let status = files.fs.fd_file_status(fd, &*descriptors).ok();
-                let open_flags = descriptors
-                    .with_metadata(fd, |crate::StdioStatusFlags(flags)| *flags)
-                    .unwrap_or(OFlags::empty());
+                // Scope the descriptor_table() read guard so it drops before the
+                // worker_exec_host_stdio_source_fd calls below, which re-read
+                // descriptor_table() — holding it across them is a re-entrant
+                // read on the writer-preferring RwLock (same class as the
+                // worker_exec_host_stdio_source_fd .or_else fix). The
+                // fs-descriptor-threading base bound this as a live guard.
+                let (status, open_flags) = {
+                    let descriptors = global.litebox.descriptor_table();
+                    let status = files.fs.fd_file_status(fd, &*descriptors).ok();
+                    let open_flags = descriptors
+                        .with_metadata(fd, |crate::StdioStatusFlags(flags)| *flags)
+                        .unwrap_or(OFlags::empty());
+                    (status, open_flags)
+                };
                 let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
                 if open_flags.contains(OFlags::PATH)
                     || (raw_fd == 0 && access == OFlags::WRONLY)
