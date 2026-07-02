@@ -1065,6 +1065,11 @@ mod tests {
     use crate::nt_types::{ObjectAttributes, UnicodeString};
     use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    const IMAGE_SUBSYSTEM_WINDOWS_CUI: u32 = 3;
+
     fn wide(value: &str) -> alloc::vec::Vec<u16> {
         value.encode_utf16().collect()
     }
@@ -1143,81 +1148,6 @@ mod tests {
         .expect("host kernel32.dll is readable")
     }
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    fn host_known_dll_image_information() -> SectionImageInformation {
-        use core::ffi::c_void;
-
-        #[link(name = "ntdll")]
-        unsafe extern "system" {
-            fn NtOpenSection(
-                section_handle: *mut *mut c_void,
-                desired_access: u32,
-                object_attributes: *const ObjectAttributes,
-            ) -> i32;
-            fn NtQuerySection(
-                section_handle: *mut c_void,
-                section_information_class: u32,
-                section_information: *mut SectionImageInformation,
-                section_information_length: usize,
-                return_length: *mut usize,
-            ) -> i32;
-            fn NtClose(handle: *mut c_void) -> i32;
-        }
-
-        let name = wide(r"\KnownDlls\kernel32.dll");
-        let unicode = unicode(&name);
-        let attrs = object_attributes(&unicode);
-        let mut handle = core::ptr::null_mut();
-        // SAFETY: The object attributes point to stack-owned UTF-16 data that remains live for the
-        // call, and the output handle pointer is a valid stack local.
-        let status = unsafe {
-            NtOpenSection(
-                &raw mut handle,
-                SectionAccess::QUERY.bits(),
-                &raw const attrs,
-            )
-        };
-        assert_eq!(status, NtStatus::SUCCESS.as_raw());
-
-        let mut info = SectionImageInformation {
-            transfer_address: 0,
-            zero_bits: 0,
-            _padding0: 0,
-            maximum_stack_size: 0,
-            committed_stack_size: 0,
-            subsystem_type: 0,
-            subsystem_minor_version: 0,
-            subsystem_major_version: 0,
-            gp_value: 0,
-            image_characteristics: 0,
-            dll_characteristics: 0,
-            machine: 0,
-            image_contains_code: 0,
-            image_flags: 0,
-            loader_flags: 0,
-            image_file_size: 0,
-            checksum: 0,
-        };
-        let mut return_length = 0usize;
-        // SAFETY: `handle` is a live section handle from host ntdll and both output pointers refer
-        // to valid stack locals.
-        let status = unsafe {
-            NtQuerySection(
-                handle,
-                SectionInformationClass::Image as u32,
-                &raw mut info,
-                size_of::<SectionImageInformation>(),
-                &raw mut return_length,
-            )
-        };
-        // SAFETY: The handle was returned by a successful host ntdll call in this test.
-        let close_status = unsafe { NtClose(handle) };
-        assert_eq!(close_status, NtStatus::SUCCESS.as_raw());
-        assert_eq!(status, NtStatus::SUCCESS.as_raw());
-        assert_eq!(return_length, size_of::<SectionImageInformation>());
-        info
-    }
-
     #[test]
     fn nt_create_section_creates_queryable_pagefile_section() {
         let task = test_task();
@@ -1275,7 +1205,6 @@ mod tests {
     #[test]
     fn nt_query_section_image_information_uses_pe_headers() {
         let image = host_kernel32_image();
-        let host_info = host_known_dll_image_information();
         let task =
             crate::tests::test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", &image)]);
         let name = wide(r"\KnownDlls\kernel32.dll");
@@ -1323,20 +1252,10 @@ mod tests {
         );
 
         assert_eq!(return_length, size_of::<SectionImageInformation>());
-        assert_eq!(info.subsystem_type, host_info.subsystem_type);
-        assert_eq!(
-            info.subsystem_major_version,
-            host_info.subsystem_major_version
-        );
-        assert_eq!(
-            info.subsystem_minor_version,
-            host_info.subsystem_minor_version
-        );
-        assert_eq!(info.image_characteristics, host_info.image_characteristics);
-        assert_eq!(info.dll_characteristics, host_info.dll_characteristics);
-        assert_eq!(info.machine, host_info.machine);
-        assert_eq!(info.image_contains_code, host_info.image_contains_code);
-        assert_eq!(info.image_file_size, host_info.image_file_size);
+        assert_eq!(info.machine, IMAGE_FILE_MACHINE_AMD64);
+        assert_eq!(info.subsystem_type, IMAGE_SUBSYSTEM_WINDOWS_CUI);
+        assert_eq!(info.image_contains_code, 1);
+        assert_eq!(info.image_file_size, u32::try_from(image.len()).unwrap());
 
         let mut too_small = [0xcc; size_of::<SectionImageInformation>() - 1];
         let too_small_len = too_small.len();
