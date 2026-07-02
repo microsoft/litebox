@@ -56,6 +56,8 @@ struct VirtualDir {
 /// Composer construction errors.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum BuildError {
+    #[error("composer must have at least one mount")]
+    NoMounts,
     #[error("mount paths must be absolute normalized paths")]
     InvalidMountPath,
     #[error("two backends were mounted at the same path")]
@@ -92,6 +94,10 @@ impl ComposerBuilder {
 
     /// Validate mount paths and finalize the composer.
     pub fn build(self) -> Result<Composer, BuildError> {
+        if self.mounts.is_empty() {
+            return Err(BuildError::NoMounts);
+        }
+
         let mut mounts = vec![];
         let mut paths = vec![];
         for (raw, backend) in self.mounts {
