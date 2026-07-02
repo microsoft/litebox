@@ -1,7 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::sync::{Arc, Weak};
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
@@ -51,39 +54,52 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 }
 
-pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
-    pollables: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
+pub(crate) struct BrokerHandleRegistry<Platform: RawSyncPrimitivesProvider> {
+    handles: Mutex<Platform, HashMap<ObjectHandle, BrokerHandleEntry<Platform>>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
     pub(crate) fn new() -> Self {
         Self {
-            pollables: Mutex::new(HashMap::new()),
+            handles: Mutex::new(HashMap::new()),
         }
     }
 
     pub(crate) fn register_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
-        self.pollables.lock().insert(handle, Arc::downgrade(pollee));
+        self.handles
+            .lock()
+            .entry(handle)
+            .or_insert_with(BrokerHandleEntry::new)
+            .register_pollable(pollee);
     }
 
-    pub(crate) fn unregister_pollable(&self, handle: ObjectHandle) {
-        self.pollables.lock().remove(&handle);
+    pub(crate) fn unregister_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
+        let mut handles = self.handles.lock();
+        if let Some(entry) = handles.get_mut(&handle) {
+            entry.unregister_pollable(pollee);
+            if entry.is_empty() {
+                handles.remove(&handle);
+            }
+        }
     }
 
     pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessState)
     where
         Platform: TimeProvider,
     {
-        let pollee = {
-            let mut pollables = self.pollables.lock();
-            if let Some(pollee) = pollables.get(&handle).and_then(Weak::upgrade) {
-                Some(pollee)
+        let pollables = {
+            let mut handles = self.handles.lock();
+            if let Some(entry) = handles.get_mut(&handle) {
+                let pollables = entry.pollables();
+                if entry.is_empty() {
+                    handles.remove(&handle);
+                }
+                pollables
             } else {
-                pollables.remove(&handle);
-                None
+                Vec::new()
             }
         };
-        if let Some(pollee) = pollee {
+        if !pollables.is_empty() {
             let mut events = Events::empty();
             if readiness.read_ready {
                 events |= Events::IN;
@@ -92,9 +108,52 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
                 events |= Events::OUT;
             }
             if !events.is_empty() {
-                pollee.notify_observers(events);
+                for pollee in pollables {
+                    pollee.notify_observers(events);
+                }
             }
         }
+    }
+}
+
+struct BrokerHandleEntry<Platform: RawSyncPrimitivesProvider> {
+    pollables: Vec<Weak<Pollee<Platform>>>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider> BrokerHandleEntry<Platform> {
+    fn new() -> Self {
+        Self {
+            pollables: Vec::new(),
+        }
+    }
+
+    fn register_pollable(&mut self, pollee: &Arc<Pollee<Platform>>) {
+        self.pollables.push(Arc::downgrade(pollee));
+    }
+
+    fn unregister_pollable(&mut self, pollee: &Arc<Pollee<Platform>>) {
+        self.pollables.retain(|registered| {
+            registered
+                .upgrade()
+                .is_some_and(|registered| !Arc::ptr_eq(&registered, pollee))
+        });
+    }
+
+    fn pollables(&mut self) -> Vec<Arc<Pollee<Platform>>> {
+        let mut pollables = Vec::new();
+        self.pollables.retain(|registered| {
+            if let Some(pollee) = registered.upgrade() {
+                pollables.push(pollee);
+                true
+            } else {
+                false
+            }
+        });
+        pollables
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pollables.is_empty()
     }
 }
 

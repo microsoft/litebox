@@ -111,7 +111,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 platform,
                 descriptors,
                 broker: broker_control,
-                broker_pollables: Arc::new(broker::BrokerPollableRegistry::new()),
+                broker_handles: Arc::new(broker::BrokerHandleRegistry::new()),
             }),
         }
     }
@@ -151,8 +151,8 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         self.x.broker.clone()
     }
 
-    pub(crate) fn broker_pollable_registry(&self) -> Arc<broker::BrokerPollableRegistry<Platform>> {
-        Arc::clone(&self.x.broker_pollables)
+    pub(crate) fn broker_handle_registry(&self) -> Arc<broker::BrokerHandleRegistry<Platform>> {
+        Arc::clone(&self.x.broker_handles)
     }
 
     /// Returns a dispatch handle for broker-initiated notifications.
@@ -172,7 +172,7 @@ where
         match notification {
             BrokerNotification::EventReadiness(notification) => self
                 .x
-                .broker_pollables
+                .broker_handles
                 .notify_readiness(notification.handle, notification.readiness),
         }
     }
@@ -183,5 +183,5 @@ pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
     broker: Option<Arc<dyn broker::BrokerControl>>,
-    broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,
+    broker_handles: Arc<broker::BrokerHandleRegistry<Platform>>,
 }
