@@ -36,8 +36,8 @@ const BLOCK_SIZE: usize = 0;
 /// This has no physical backing store, thus any files in memory are erased as soon as this object
 /// is dropped.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
-    #[cfg_attr(not(test), allow(dead_code))]
-    litebox: LiteBox<Platform>,
+    #[cfg(test)]
+    test_box: LiteBox<Platform>,
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
     root: sync::RwLock<Platform, RootDir<Platform>>,
@@ -60,11 +60,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// and the created `FileSystem` handle is expected to be shared across all usage over the
     /// system.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let litebox = litebox.clone();
+    pub fn new(_litebox: &LiteBox<Platform>) -> Self {
         let root = sync::RwLock::new(RootDir::new());
         Self {
-            litebox,
+            #[cfg(test)]
+            test_box: _litebox.clone(),
             root,
             current_user: UserInfo {
                 user: 1000,
@@ -566,7 +566,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(())
     }
 
-    fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {
+    fn chmod(
+        &self,
+        path: impl crate::path::Arg,
+        mode: super::Mode,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
         let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
@@ -602,6 +607,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         path: impl crate::path::Arg,
         user: Option<u16>,
         group: Option<u16>,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
@@ -643,7 +649,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
+    fn unlink(
+        &self,
+        path: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
         let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
@@ -775,7 +785,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(())
     }
 
-    fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
+    fn mkdir(
+        &self,
+        path: impl crate::path::Arg,
+        mode: super::Mode,
+        _descriptors: &Descriptors<Platform>,
+    ) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
         let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
@@ -810,7 +825,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(())
     }
 
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
+    fn rmdir(
+        &self,
+        path: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), RmdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
         let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
@@ -846,6 +865,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         &self,
         target: impl crate::path::Arg,
         linkpath: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<(), super::errors::SymlinkError> {
         let target_str = target
             .as_rust_str()
@@ -887,6 +907,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn read_link(
         &self,
         path: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
         let path = self
             .absolute_path(path)
@@ -908,6 +929,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         &self,
         oldpath: impl crate::path::Arg,
         newpath: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<(), super::errors::LinkError> {
         let old = self
             .absolute_path(oldpath)
@@ -1027,7 +1049,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(entries)
     }
 
-    fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
+    fn file_status(
+        &self,
+        path: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
+    ) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
         let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
@@ -1188,7 +1214,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if follow_symlinks {
             let mut hops = 40usize;
             loop {
-                let status = self.file_status(&*abs)?;
+                let status = <Self as super::FileSystem>::file_status(self, &*abs, descriptors)?;
                 if status.file_type != FileType::Symlink {
                     return Ok(status);
                 }
@@ -1196,8 +1222,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     return Err(super::FileStatusError::SymlinkLoop);
                 }
                 hops -= 1;
-                let target = self
-                    .read_link(&*abs)
+                let target = <Self as super::FileSystem>::read_link(self, &*abs, descriptors)
                     .map_err(|_| super::FileStatusError::Io)?;
                 if target.starts_with('/') {
                     abs = target;
@@ -1211,14 +1236,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 }
             }
         }
-        self.file_status(abs)
+        <Self as super::FileSystem>::file_status(self, abs, descriptors)
     }
 
     fn unlink_at(
         &self,
         dirfd: &FileFd<Platform>,
         rel_path: impl crate::path::Arg,
-        descriptors: &Descriptors<Platform>,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), UnlinkError> {
         let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => UnlinkError::ClosedFd,
@@ -1229,7 +1254,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .as_rust_str()
             .map_err(|e| UnlinkError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(UnlinkError::PathError)?;
-        self.unlink(abs)
+        <Self as super::FileSystem>::unlink(self, abs, descriptors)
     }
 
     fn readlink_at(
@@ -1248,7 +1273,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .map_err(|e| super::errors::ReadLinkError::PathError(e.into()))?;
         let abs =
             Self::resolve_relative(&dir, rel).map_err(super::errors::ReadLinkError::PathError)?;
-        self.read_link(abs)
+        <Self as super::FileSystem>::read_link(self, abs, descriptors)
     }
 
     fn rename_at(
@@ -1309,7 +1334,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .as_rust_str()
             .map_err(|e| MkdirError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(MkdirError::PathError)?;
-        self.mkdir(abs, mode)
+        <Self as super::FileSystem>::mkdir(self, abs, mode, descriptors)
     }
 }
 

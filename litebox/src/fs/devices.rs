@@ -145,7 +145,9 @@ pub struct FileSystem<
         + TimeProvider
         + 'static,
 > {
-    litebox: LiteBox<Platform>,
+    #[cfg(test)]
+    test_box: LiteBox<Platform>,
+    platform: &'static Platform,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
 }
@@ -174,7 +176,9 @@ impl<
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
-            litebox: litebox.clone(),
+            #[cfg(test)]
+            test_box: litebox.clone(),
+            platform: litebox.x.platform,
             current_working_dir: "/".into(),
         }
     }
@@ -350,8 +354,6 @@ impl<
                     .parse()
                     .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
                 if self
-                    .litebox
-                    .x
                     .platform
                     .host_stdin_tty_device_info()
                     .is_some_and(|info| p == info.path)
@@ -420,7 +422,7 @@ impl<
                     return Ok(0);
                 }
                 Device::URandom => {
-                    self.litebox.x.platform.fill_bytes_crng(buf);
+                    self.platform.fill_bytes_crng(buf);
                     return Ok(buf.len());
                 }
             }
@@ -431,9 +433,9 @@ impl<
             return Ok(0);
         }
         let read_result = if nonblocking {
-            self.litebox.x.platform.read_from_stdin_nonblocking(buf)
+            self.platform.read_from_stdin_nonblocking(buf)
         } else {
-            self.litebox.x.platform.read_from_stdin(buf)
+            self.platform.read_from_stdin(buf)
         };
         match read_result {
             Ok(n) => Ok(n),
@@ -469,7 +471,7 @@ impl<
         if buf.is_empty() {
             return Ok(0);
         }
-        match self.litebox.x.platform.write_to(stream, buf) {
+        match self.platform.write_to(stream, buf) {
             Ok(n) => Ok(n),
             Err(StdioWriteError::Closed) => Ok(buf.len()),
         }
@@ -503,7 +505,12 @@ impl<
         Err(TruncateError::IsTerminalDevice)
     }
 
-    fn chmod(&self, path: impl Arg, _mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(
+        &self,
+        path: impl Arg,
+        _mode: Mode,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), ChmodError> {
         // Only accept chmod on PTY paths (/dev/ptmx, /dev/pts/N). This
         // is what dropbear's grantpt() needs when allocating a PTY
         // slave for an incoming SSH session — without it, the sandbox
@@ -531,6 +538,7 @@ impl<
         path: impl Arg,
         _user: Option<u16>,
         _group: Option<u16>,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), ChownError> {
         let path_str = path.as_rust_str().map_err(|_| ChownError::NotTheOwner)?;
         if path_str == "/dev/ptmx" || path_str.starts_with("/dev/pts/") {
@@ -540,7 +548,11 @@ impl<
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
-    fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
+    fn unlink(
+        &self,
+        path: impl Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), UnlinkError> {
         unimplemented!()
     }
 
@@ -553,13 +565,20 @@ impl<
         unimplemented!()
     }
 
-    #[expect(unused_variables, reason = "not supported by device filesystem")]
-    fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
+    fn mkdir(
+        &self,
+        _path: impl Arg,
+        _mode: Mode,
+        _descriptors: &Descriptors<Platform>,
+    ) -> Result<(), MkdirError> {
         Err(MkdirError::Io)
     }
 
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
+    fn rmdir(
+        &self,
+        _path: impl Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), RmdirError> {
         unimplemented!()
     }
 
@@ -572,7 +591,11 @@ impl<
     }
 
     #[allow(clippy::cast_possible_truncation)] // 64-bit only target
-    fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {
+    fn file_status(
+        &self,
+        path: impl Arg,
+        _descriptors: &Descriptors<Platform>,
+    ) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
         let device = match path.as_str() {
             "/dev/stdin" => Device::Stdin,
@@ -600,7 +623,7 @@ impl<
                 let idx: u32 = p["/dev/pts/".len()..]
                     .parse()
                     .map_err(|_| FileStatusError::PathError(PathError::NoSuchFileOrDirectory))?;
-                if let Some(info) = self.litebox.x.platform.host_stdin_tty_device_info()
+                if let Some(info) = self.platform.host_stdin_tty_device_info()
                     && p == info.path
                 {
                     return Ok(FileStatus {
@@ -673,9 +696,9 @@ impl<
         let entry = descriptors.get_entry(fd)?;
         match entry.entry {
             Device::Stdin | Device::Tty => {
-                let litebox = self.litebox.clone();
+                let platform = self.platform;
                 Some(alloc::boxed::Box::new(StdinPollable(Arc::new(move || {
-                    litebox.x.platform.poll_stdin_readable()
+                    platform.poll_stdin_readable()
                 }))))
             }
             _ => None,
@@ -728,7 +751,7 @@ impl<
         &self,
         _dirfd: &FileFd<Platform>,
         _rel_path: impl crate::path::Arg,
-        _descriptors: &Descriptors<Platform>,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::UnlinkError> {
         Err(super::errors::UnlinkError::NotADirectory)
     }

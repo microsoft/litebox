@@ -738,7 +738,8 @@ impl<FS: ShimFS> Task<FS> {
             } else {
                 alloc::format!("{path}/{name}", name = entry.name)
             };
-            if let Ok(status) = files.fs.file_status(child_path.clone()) {
+            let descriptors = self.global.litebox.descriptor_table();
+            if let Ok(status) = files.fs.file_status(child_path.clone(), &*descriptors) {
                 let mut hash = 0u64;
                 if matches!(status.file_type, litebox::fs::FileType::RegularFile)
                     && let Ok(file) = {
@@ -1291,7 +1292,7 @@ impl<FS: ShimFS> Task<FS> {
             .map_err(Errno::from)?;
 
         // Delete the file so it's cleaned up when the fd is closed.
-        let _ = files.fs.unlink(&tmp_path);
+        let _ = files.fs.unlink(&tmp_path, &mut *descriptors);
 
         // Apply CLOEXEC if requested.
         if flags.contains(OFlags::CLOEXEC) {
@@ -1502,12 +1503,16 @@ impl<FS: ShimFS> Task<FS> {
             return result;
         }
         let mode = mode & !self.get_umask();
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
         let existed_before = if flags.contains(OFlags::CREAT) {
-            self.files.borrow().fs.file_status(&*path).is_ok()
+            self.files
+                .borrow()
+                .fs
+                .file_status(&*path, &*descriptors)
+                .is_ok()
         } else {
             true
         };
-        let mut descriptors = self.global.litebox.descriptor_table_mut();
         let file = self
             .files
             .borrow()
@@ -1807,12 +1812,20 @@ impl<FS: ShimFS> Task<FS> {
         match fs_path {
             FsPath::Absolute { path } => {
                 if flags.contains(AtFlags::AT_REMOVEDIR) {
-                    self.files.borrow().fs.rmdir(path).map_err(Errno::from)
+                    let mut descriptors = self.global.litebox.descriptor_table_mut();
+                    self.files
+                        .borrow()
+                        .fs
+                        .rmdir(path, &mut *descriptors)
+                        .map_err(Errno::from)
                 } else {
                     self.files
                         .borrow()
                         .fs
-                        .unlink(path.clone())
+                        .unlink(
+                            path.clone(),
+                            &mut *self.global.litebox.descriptor_table_mut(),
+                        )
                         .map_err(Errno::from)?;
                     if let Ok(path_str) = path.to_str() {
                         self.notify_inotify_path(path_str, IN_DELETE, 0);
@@ -1853,12 +1866,13 @@ impl<FS: ShimFS> Task<FS> {
                             } else {
                                 alloc::format!("{dir_path}/{rel}")
                             };
-                            files.fs.rmdir(abs).map_err(Errno::from)
+                            let mut descriptors = self.global.litebox.descriptor_table_mut();
+                            files.fs.rmdir(abs, &mut *descriptors).map_err(Errno::from)
                         } else {
-                            let descriptors = self.global.litebox.descriptor_table();
+                            let mut descriptors = self.global.litebox.descriptor_table_mut();
                             files
                                 .fs
-                                .unlink_at(dirfd, path, &*descriptors)
+                                .unlink_at(dirfd, path, &mut *descriptors)
                                 .map_err(Errno::from)
                         }
                     }
@@ -1974,7 +1988,14 @@ impl<FS: ShimFS> Task<FS> {
         let new_path = resolve(new)?;
         if flags & RENAME_NOREPLACE != 0 {
             // Check if target exists — RENAME_NOREPLACE fails with EEXIST.
-            if self.files.borrow().fs.file_status(&*new_path).is_ok() {
+            let descriptors = self.global.litebox.descriptor_table();
+            if self
+                .files
+                .borrow()
+                .fs
+                .file_status(&*new_path, &*descriptors)
+                .is_ok()
+            {
                 return Err(Errno::EEXIST);
             }
         }
@@ -3335,10 +3356,11 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
         let pathname = self.resolve_path(pathname)?;
         let mode = Mode::from_bits_retain(mode) & !self.get_umask();
+        let descriptors = self.global.litebox.descriptor_table();
         self.files
             .borrow()
             .fs
-            .mkdir(pathname, mode)
+            .mkdir(pathname, mode, &*descriptors)
             .map_err(Errno::from)
     }
 
@@ -3352,18 +3374,22 @@ impl<FS: ShimFS> Task<FS> {
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         let mode = Mode::from_bits_retain(mode) & !self.get_umask();
         match fs_path {
-            FsPath::Absolute { path } => self
-                .files
-                .borrow()
-                .fs
-                .mkdir(path, mode)
-                .map_err(Errno::from),
-            FsPath::Cwd => self
-                .files
-                .borrow()
-                .fs
-                .mkdir(get_cwd(), mode)
-                .map_err(Errno::from),
+            FsPath::Absolute { path } => {
+                let descriptors = self.global.litebox.descriptor_table();
+                self.files
+                    .borrow()
+                    .fs
+                    .mkdir(path, mode, &*descriptors)
+                    .map_err(Errno::from)
+            }
+            FsPath::Cwd => {
+                let descriptors = self.global.litebox.descriptor_table();
+                self.files
+                    .borrow()
+                    .fs
+                    .mkdir(get_cwd(), mode, &*descriptors)
+                    .map_err(Errno::from)
+            }
             FsPath::Fd(_fd) => Err(Errno::EEXIST),
             FsPath::FdRelative { fd, path } => {
                 let Ok(raw_fd) = usize::try_from(fd) else {
@@ -3434,10 +3460,11 @@ impl<FS: ShimFS> Task<FS> {
     /// Validate that a path resolves to an existing file (follows symlinks).
     pub fn validate_path(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         let path = self.resolve_path(pathname)?;
+        let descriptors = self.global.litebox.descriptor_table();
         self.files
             .borrow()
             .fs
-            .file_status(path)
+            .file_status(path, &*descriptors)
             .map_err(Errno::from)?;
         Ok(())
     }
@@ -3447,16 +3474,20 @@ impl<FS: ShimFS> Task<FS> {
     pub fn validate_path_nofollow(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         let path = self.resolve_path(pathname)?;
         let files = self.files.borrow();
+        let descriptors = self.global.litebox.descriptor_table();
         // If the path resolves via follow (normal stat), it exists.
-        if files.fs.file_status(&path).is_ok() {
+        if files.fs.file_status(&path, &*descriptors).is_ok() {
             return Ok(());
         }
         // The follow-stat failed. Check if it's a symlink (possibly dangling).
-        if files.fs.read_link(&path).is_ok() {
+        if files.fs.read_link(&path, &*descriptors).is_ok() {
             return Ok(());
         }
         // Neither a resolvable path nor a symlink — report the original error.
-        files.fs.file_status(path).map_err(Errno::from)?;
+        files
+            .fs
+            .file_status(path, &*descriptors)
+            .map_err(Errno::from)?;
         Ok(())
     }
 
@@ -3536,23 +3567,31 @@ impl<FS: ShimFS> Task<FS> {
         let get_cwd = || self.fs.borrow().cwd.read().clone();
         let fs_path = FsPath::new(newdirfd, linkpath, get_cwd)?;
         match fs_path {
-            FsPath::Absolute { path } => self
-                .files
-                .borrow()
-                .fs
-                .symlink(target_str, path)
-                .map_err(Errno::from),
-            FsPath::Cwd => self
-                .files
-                .borrow()
-                .fs
-                .symlink(target_str, get_cwd())
-                .map_err(Errno::from),
+            FsPath::Absolute { path } => {
+                let descriptors = self.global.litebox.descriptor_table();
+                self.files
+                    .borrow()
+                    .fs
+                    .symlink(target_str, path, &*descriptors)
+                    .map_err(Errno::from)
+            }
+            FsPath::Cwd => {
+                let descriptors = self.global.litebox.descriptor_table();
+                self.files
+                    .borrow()
+                    .fs
+                    .symlink(target_str, get_cwd(), &*descriptors)
+                    .map_err(Errno::from)
+            }
             FsPath::Fd(_) => Err(Errno::EEXIST),
             FsPath::FdRelative { fd, path } => {
                 let abs = self.resolve_dirfd_path(fd, &path)?;
                 let files = self.files.borrow();
-                files.fs.symlink(target_str, abs).map_err(Errno::from)
+                let descriptors = self.global.litebox.descriptor_table();
+                files
+                    .fs
+                    .symlink(target_str, abs, &*descriptors)
+                    .map_err(Errno::from)
             }
         }
     }
@@ -3573,10 +3612,11 @@ impl<FS: ShimFS> Task<FS> {
 
         let old_abs = self.resolve_fs_path_to_string(old_fs, &get_cwd)?;
         let new_abs = self.resolve_fs_path_to_string(new_fs, &get_cwd)?;
+        let descriptors = self.global.litebox.descriptor_table();
         self.files
             .borrow()
             .fs
-            .link(old_abs, new_abs)
+            .link(old_abs, new_abs, &*descriptors)
             .map_err(Errno::from)
     }
 
@@ -4738,7 +4778,12 @@ impl<FS: ShimFS> Task<FS> {
         mode: litebox_common_linux::AccessFlags,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path(pathname)?;
-        let status = self.files.borrow().fs.file_status(&*pathname)?;
+        let descriptors = self.global.litebox.descriptor_table();
+        let status = self
+            .files
+            .borrow()
+            .fs
+            .file_status(&*pathname, &*descriptors)?;
         Self::check_access_mode(&status, mode)
     }
 
@@ -4763,6 +4808,7 @@ impl<FS: ShimFS> Task<FS> {
         let follow_symlinks = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
 
         let files = self.files.borrow();
+        let descriptors = self.global.litebox.descriptor_table();
         let status = match fs_path {
             FsPath::Absolute { path } => {
                 // Skip client-side symlink resolution when the FS follows
@@ -4770,12 +4816,12 @@ impl<FS: ShimFS> Task<FS> {
                 if follow_symlinks && !files.fs.walks_follow_symlinks() {
                     let path_str = path.to_str().map_err(|_| Errno::EINVAL)?;
                     let resolved = self.canonicalize_path(path_str)?;
-                    files.fs.file_status(&*resolved)?
+                    files.fs.file_status(&*resolved, &*descriptors)?
                 } else {
-                    files.fs.file_status(&*path)?
+                    files.fs.file_status(&*path, &*descriptors)?
                 }
             }
-            FsPath::Cwd => files.fs.file_status(&*get_cwd())?,
+            FsPath::Cwd => files.fs.file_status(&*get_cwd(), &*descriptors)?,
             FsPath::Fd(raw) => {
                 // AT_EMPTY_PATH: check the fd itself. For non-FS fds
                 // (network, pipes, etc.), the fd is valid so F_OK succeeds
@@ -5074,7 +5120,8 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Try the filesystem for symlink resolution
-        let result = self.files.borrow().fs.read_link(fullpath);
+        let descriptors = self.global.litebox.descriptor_table();
+        let result = self.files.borrow().fs.read_link(fullpath, &*descriptors);
         match result {
             Ok(target) => Ok(target),
             Err(e) => {
@@ -5239,7 +5286,12 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
         // — dropbear then exits with "ttyname fails for openpty device".
         let authoritative = Task::<FS>::broker_pty_stat(pty_id, uid, gid);
         let path = alloc::format!("/dev/pts/{pty_id}");
-        let fs_status = task.files.borrow().fs.file_status(path.as_str());
+        let descriptors = task.global.litebox.descriptor_table();
+        let fs_status = task
+            .files
+            .borrow()
+            .fs
+            .file_status(path.as_str(), &*descriptors);
         if let Ok(status) = fs_status {
             let mut stat = FileStat::from(status);
             stat.st_mode = authoritative.st_mode;
@@ -5836,7 +5888,12 @@ impl<FS: ShimFS> Task<FS> {
                     ..Default::default()
                 });
             }
-            let status = self.files.borrow().fs.file_status(exe.as_str())?;
+            let descriptors = self.global.litebox.descriptor_table();
+            let status = self
+                .files
+                .borrow()
+                .fs
+                .file_status(exe.as_str(), &*descriptors)?;
             return Ok(FileStat::from(status));
         }
         // /dev/fd/N and /proc/self/fd/N — stat the underlying fd (like fstat).
@@ -5868,7 +5925,8 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             normalized_path
         };
-        let status = self.files.borrow().fs.file_status(&path)?;
+        let descriptors = self.global.litebox.descriptor_table();
+        let status = self.files.borrow().fs.file_status(&path, &*descriptors)?;
         let mut result = FileStat::from(status);
 
         // Override st_dev/st_ino/st_rdev for the host PTY path so that
@@ -5958,7 +6016,10 @@ impl<FS: ShimFS> Task<FS> {
 
         let fstat: FileStat = match fs_path {
             FsPath::Absolute { path } => self.do_stat(path, follow_symlinks)?,
-            FsPath::Cwd => files.fs.file_status(get_cwd())?.into(),
+            FsPath::Cwd => {
+                let descriptors = self.global.litebox.descriptor_table();
+                files.fs.file_status(get_cwd(), &*descriptors)?.into()
+            }
             FsPath::Fd(fd) => {
                 let Ok(raw_fd) = usize::try_from(fd) else {
                     return Err(Errno::EBADF);
@@ -6076,10 +6137,11 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_statfs(&self, pathname: impl path::Arg) -> Result<StatfsBuf, Errno> {
         // Verify the path exists.
         let path = self.resolve_path(pathname)?;
+        let descriptors = self.global.litebox.descriptor_table();
         self.files
             .borrow()
             .fs
-            .file_status(path)
+            .file_status(path, &*descriptors)
             .map_err(Errno::from)?;
         Ok(Self::synthetic_statfs())
     }
@@ -6122,22 +6184,31 @@ impl<FS: ShimFS> Task<FS> {
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         let mode = litebox::fs::Mode::from_bits_truncate(mode);
         match fs_path {
-            FsPath::Absolute { path } => self
-                .files
-                .borrow()
-                .fs
-                .chmod(path, mode)
-                .map_err(Errno::from),
-            FsPath::Cwd => self
-                .files
-                .borrow()
-                .fs
-                .chmod(get_cwd(), mode)
-                .map_err(Errno::from),
+            FsPath::Absolute { path } => {
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
+                self.files
+                    .borrow()
+                    .fs
+                    .chmod(path, mode, &mut *descriptors)
+                    .map_err(Errno::from)
+            }
+            FsPath::Cwd => {
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
+                self.files
+                    .borrow()
+                    .fs
+                    .chmod(get_cwd(), mode, &mut *descriptors)
+                    .map_err(Errno::from)
+            }
             FsPath::Fd(_fd) => Err(Errno::EINVAL),
             FsPath::FdRelative { fd, path } => {
                 let abs = self.resolve_dirfd_path(fd, &path)?;
-                self.files.borrow().fs.chmod(abs, mode).map_err(Errno::from)
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
+                self.files
+                    .borrow()
+                    .fs
+                    .chmod(abs, mode, &mut *descriptors)
+                    .map_err(Errno::from)
             }
         }
     }
@@ -6527,7 +6598,13 @@ impl<FS: ShimFS> Task<FS> {
         let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
 
         // Verify the path exists and is a directory.
-        match self.files.borrow().fs.file_status(abs_path.as_str()) {
+        let descriptors = self.global.litebox.descriptor_table();
+        match self
+            .files
+            .borrow()
+            .fs
+            .file_status(abs_path.as_str(), &*descriptors)
+        {
             Ok(status) => {
                 if status.file_type != FileType::Directory {
                     return Err(Errno::ENOTDIR);

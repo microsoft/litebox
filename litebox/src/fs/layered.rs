@@ -66,7 +66,8 @@ pub struct FileSystem<
     Upper: super::FileSystem<DescriptorPlatform = Platform> + 'static,
     Lower: super::FileSystem<DescriptorPlatform = Platform> + 'static,
 > {
-    litebox: LiteBox<Platform>,
+    #[cfg(test)]
+    test_box: LiteBox<Platform>,
     upper: Upper,
     lower: Lower,
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
@@ -105,7 +106,7 @@ impl<
     /// Construct a new `FileSystem` instance
     #[must_use]
     pub fn new(
-        litebox: &LiteBox<Platform>,
+        _litebox: &LiteBox<Platform>,
         upper: Upper,
         lower: Lower,
         layering_semantics: LayeringSemantics,
@@ -113,7 +114,8 @@ impl<
         let root = sync::RwLock::new(RootDir::new());
         let node_info_lookup = sync::RwLock::new(HashMap::new());
         Self {
-            litebox: litebox.clone(),
+            #[cfg(test)]
+            test_box: _litebox.clone(),
             upper,
             lower,
             root,
@@ -125,8 +127,14 @@ impl<
 
     /// (private-only) check if the lower level has the path; if there is an I/O or path failure,
     /// propagate the relevant error.
-    fn ensure_lower_contains(&self, path: &str) -> Result<FileType, FileStatusError> {
-        self.lower.file_status(path).map(|stat| stat.file_type)
+    fn ensure_lower_contains(
+        &self,
+        path: &str,
+        descriptors: &Descriptors<Platform>,
+    ) -> Result<FileType, FileStatusError> {
+        self.lower
+            .file_status(path, descriptors)
+            .map(|stat| stat.file_type)
     }
 
     /// Whether this path is hidden because it or one of its ancestors is tombstoned.
@@ -192,7 +200,11 @@ impl<
     ///
     /// NOTE: This is _not_ equivalent to running `mkdir -p {path}` or `mkdir {path}` or anything
     /// like that.
-    fn mkdir_migrating_ancestor_dirs(&self, path: &str) -> Result<(), MkdirError> {
+    fn mkdir_migrating_ancestor_dirs(
+        &self,
+        path: &str,
+        descriptors: &Descriptors<Platform>,
+    ) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         for dir in path.increasing_ancestors().map_err(PathError::from)? {
             if dir == path {
@@ -205,7 +217,7 @@ impl<
             // This handles dirs created on upper in a prior layered mkdir
             // (e.g., a parent that only exists in the in-mem FS because the
             // lower layer couldn't create it).
-            match self.upper.file_status(dir) {
+            match self.upper.file_status(dir, descriptors) {
                 Ok(FileStatus {
                     file_type: FileType::Directory,
                     ..
@@ -227,13 +239,14 @@ impl<
                 }
                 Err(_) => return Err(MkdirError::Io),
             }
-            match self.ensure_lower_contains(dir) {
+            match self.ensure_lower_contains(dir, descriptors) {
                 Ok(FileType::Directory) => {
                     // The dir exists on lower; mirror it on upper.
-                    match self
-                        .upper
-                        .mkdir(dir, self.lower.file_status(dir).unwrap().mode)
-                    {
+                    match self.upper.mkdir(
+                        dir,
+                        self.lower.file_status(dir, descriptors).unwrap().mode,
+                        descriptors,
+                    ) {
                         Ok(()) | Err(MkdirError::AlreadyExists) => {}
                         Err(e) => match e {
                             MkdirError::ReadOnlyFileSystem
@@ -351,7 +364,7 @@ impl<
                         // actually open up the file.
                         //
                         // First, we make sure we've set up the ancestor directories.
-                        match self.mkdir_migrating_ancestor_dirs(path) {
+                        match self.mkdir_migrating_ancestor_dirs(path, descriptors) {
                             Ok(()) => {}
                             Err(_) => return Err(MigrationError::Io),
                         }
@@ -627,7 +640,7 @@ impl<
                 blksize,
             });
         }
-        match self.upper.file_status(&*path) {
+        match self.upper.file_status(&*path, descriptors) {
             Ok(FileStatus {
                 file_type,
                 mode,
@@ -667,7 +680,7 @@ impl<
             owner,
             node_info,
             blksize,
-        } = self.lower.file_status(path)?;
+        } = self.lower.file_status(path, descriptors)?;
         Ok(FileStatus {
             file_type,
             mode,
@@ -688,6 +701,7 @@ impl<
         &self,
         path: String,
         max_hops: usize,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<String, super::FileStatusError> {
         let mut resolved = alloc::string::String::from("/");
         let mut hops_remaining = max_hops;
@@ -719,7 +733,7 @@ impl<
             }
             resolved.push_str(&component);
 
-            if let Ok(t) = <Self as super::FileSystem>::read_link(self, &*resolved) {
+            if let Ok(t) = <Self as super::FileSystem>::read_link(self, &*resolved, descriptors) {
                 if hops_remaining == 0 {
                     return Err(super::FileStatusError::SymlinkLoop);
                 }
@@ -1051,7 +1065,7 @@ impl<
             // (the path or an ancestor simply doesn't exist on upper) allow
             // creation on lower. All other errors — ancestor is a non-dir,
             // no search perms, I/O failures — must propagate.
-            match self.upper.file_status(path.as_str()) {
+            match self.upper.file_status(path.as_str(), descriptors) {
                 Ok(_)
                 | Err(FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -1203,9 +1217,11 @@ impl<
                         // We must check if the lower layer contains all the directories; if it does, we
                         // can create the same directories and then re-trigger the open.
                         let dirname = path.rsplit_once('/').unwrap().0;
-                        if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
+                        if let Ok(FileType::Directory) =
+                            self.ensure_lower_contains(dirname, descriptors)
+                        {
                             // We must migrate the directories above, and then re-trigger the open
-                            match self.mkdir_migrating_ancestor_dirs(&path) {
+                            match self.mkdir_migrating_ancestor_dirs(&path, descriptors) {
                                 Ok(()) => {
                                     return <Self as super::FileSystem>::open(
                                         self,
@@ -1778,9 +1794,14 @@ impl<
         }
     }
 
-    fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(
+        &self,
+        path: impl crate::path::Arg,
+        mode: Mode,
+        descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
-        match self.upper.chmod(path.as_str(), mode) {
+        match self.upper.chmod(path.as_str(), mode, descriptors) {
             Ok(()) => return Ok(()),
             Err(e) => match e {
                 ChmodError::NotTheOwner
@@ -1811,7 +1832,7 @@ impl<
         {
             return Err(ChmodError::PathError(PathError::NoSuchFileOrDirectory));
         }
-        match self.ensure_lower_contains(&path) {
+        match self.ensure_lower_contains(&path, descriptors) {
             Ok(_) => {}
             Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => return Err(ChmodError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChmodError::PathError(e)),
@@ -1821,10 +1842,9 @@ impl<
             self.layering_semantics,
             LayeringSemantics::LowerLayerWritableFiles
         ) {
-            return self.lower.chmod(path.as_str(), mode);
+            return self.lower.chmod(path.as_str(), mode, descriptors);
         }
-        let mut descriptors = self.litebox.descriptor_table_mut();
-        match self.migrate_file_up(&path, true, &mut *descriptors) {
+        match self.migrate_file_up(&path, true, descriptors) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
@@ -1833,8 +1853,7 @@ impl<
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
-        drop(descriptors);
-        self.chmod(path, mode)
+        <Self as super::FileSystem>::chmod(self, path, mode, descriptors)
     }
 
     fn chown(
@@ -1842,9 +1861,10 @@ impl<
         path: impl crate::path::Arg,
         user: Option<u16>,
         group: Option<u16>,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
-        match self.upper.chown(path.as_str(), user, group) {
+        match self.upper.chown(path.as_str(), user, group, descriptors) {
             Ok(()) => return Ok(()),
             Err(e) => match e {
                 ChownError::NotTheOwner
@@ -1875,7 +1895,7 @@ impl<
         {
             return Err(ChownError::PathError(PathError::NoSuchFileOrDirectory));
         }
-        match self.ensure_lower_contains(&path) {
+        match self.ensure_lower_contains(&path, descriptors) {
             Ok(_) => {}
             Err(FileStatusError::Io | FileStatusError::SymlinkLoop) => return Err(ChownError::Io),
             Err(FileStatusError::PathError(e)) => return Err(ChownError::PathError(e)),
@@ -1885,10 +1905,9 @@ impl<
             self.layering_semantics,
             LayeringSemantics::LowerLayerWritableFiles
         ) {
-            return self.lower.chown(path.as_str(), user, group);
+            return self.lower.chown(path.as_str(), user, group, descriptors);
         }
-        let mut descriptors = self.litebox.descriptor_table_mut();
-        match self.migrate_file_up(&path, true, &mut *descriptors) {
+        match self.migrate_file_up(&path, true, descriptors) {
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
@@ -1897,17 +1916,20 @@ impl<
         }
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
-        drop(descriptors);
-        self.chown(path, user, group)
+        <Self as super::FileSystem>::chown(self, path, user, group, descriptors)
     }
 
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
+    fn unlink(
+        &self,
+        path: impl crate::path::Arg,
+        descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
-        match self.upper.unlink(path.as_str()) {
+        match self.upper.unlink(path.as_str(), descriptors) {
             Ok(()) => {
                 // If the lower level contains the file, then we need to place a tombstone in its
                 // path, to prevent the lower level from showing up above.
-                if self.ensure_lower_contains(&path).is_ok() {
+                if self.ensure_lower_contains(&path, descriptors).is_ok() {
                     // fallthrough to place the tombstone
                 } else {
                     // Lower level doesn't contain it, we are done (with success, since we actually
@@ -1934,13 +1956,15 @@ impl<
                 ) => {
                     // We must now check if the lower level contains the file; if it does not, we
                     // must exit with failure. Otherwise, we fallthrough to place the tombstone.
-                    match self.ensure_lower_contains(&path).map_err(|e| match e {
-                        FileStatusError::Io | FileStatusError::SymlinkLoop => UnlinkError::Io,
-                        FileStatusError::PathError(p) => UnlinkError::PathError(p),
-                        FileStatusError::ClosedFd | FileStatusError::NotADirectory => {
-                            unreachable!()
-                        }
-                    })? {
+                    match self
+                        .ensure_lower_contains(&path, descriptors)
+                        .map_err(|e| match e {
+                            FileStatusError::Io | FileStatusError::SymlinkLoop => UnlinkError::Io,
+                            FileStatusError::PathError(p) => UnlinkError::PathError(p),
+                            FileStatusError::ClosedFd | FileStatusError::NotADirectory => {
+                                unreachable!()
+                            }
+                        })? {
                         FileType::RegularFile | FileType::Symlink => {
                             // fallthrough
                         }
@@ -1962,7 +1986,7 @@ impl<
         } else {
             // Writable lower: actually remove from the lower layer so that
             // a subsequent rmdir on the parent directory succeeds.
-            if let Err(e) = self.lower.unlink(path.as_str()) {
+            if let Err(e) = self.lower.unlink(path.as_str(), descriptors) {
                 match e {
                     UnlinkError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -2018,7 +2042,7 @@ impl<
             // Check upper status for both paths, propagating hard ancestor
             // errors (ComponentNotADirectory, NoSearchPerms, etc.) that
             // visible lookup would also reject.
-            let old_on_upper = match self.upper.file_status(&*old) {
+            let old_on_upper = match self.upper.file_status(&*old, descriptors) {
                 Ok(_) => true,
                 Err(FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -2026,7 +2050,7 @@ impl<
                 Err(FileStatusError::PathError(p)) => return Err(RenameError::PathError(p)),
                 Err(_) => return Err(RenameError::Io),
             };
-            let new_on_upper = match self.upper.file_status(&*new) {
+            let new_on_upper = match self.upper.file_status(&*new, descriptors) {
                 Ok(_) => true,
                 Err(FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -2038,7 +2062,7 @@ impl<
             if !old_on_upper {
                 // Source is not on upper — must be on lower.
                 // Verify source exists on lower, propagating hard errors.
-                match self.lower.file_status(&*old) {
+                match self.lower.file_status(&*old, descriptors) {
                     Ok(_) => {}
                     Err(FileStatusError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -2081,35 +2105,35 @@ impl<
                 // lower.rename doesn't validate type/emptiness against an
                 // invisible entry. If the rename fails, restore the hidden
                 // entry from temp so no hidden state is lost.
-                let tombstone_saved = if new_is_tombstoned && self.lower.file_status(&*new).is_ok()
-                {
-                    static TOMB_COUNTER: AtomicUsize = AtomicUsize::new(0);
-                    let parent_dir = {
-                        let p = new.rsplit_once('/').map_or("/", |(p, _)| p);
-                        if p.is_empty() { "/" } else { p }
+                let tombstone_saved =
+                    if new_is_tombstoned && self.lower.file_status(&*new, descriptors).is_ok() {
+                        static TOMB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+                        let parent_dir = {
+                            let p = new.rsplit_once('/').map_or("/", |(p, _)| p);
+                            if p.is_empty() { "/" } else { p }
+                        };
+                        let tmp = loop {
+                            let n = TOMB_COUNTER.fetch_add(1, SeqCst);
+                            let c = alloc::format!("{parent_dir}/.litebox_ts_{n:x}");
+                            if self.lower.file_status(&c, descriptors).is_err() {
+                                break c;
+                            }
+                        };
+                        self.lower
+                            .rename(new.as_str(), &tmp, descriptors)
+                            .ok()
+                            .map(|()| tmp)
+                    } else {
+                        None
                     };
-                    let tmp = loop {
-                        let n = TOMB_COUNTER.fetch_add(1, SeqCst);
-                        let c = alloc::format!("{parent_dir}/.litebox_ts_{n:x}");
-                        if self.lower.file_status(&c).is_err() {
-                            break c;
-                        }
-                    };
-                    self.lower
-                        .rename(new.as_str(), &tmp, descriptors)
-                        .ok()
-                        .map(|()| tmp)
-                } else {
-                    None
-                };
 
                 match self.lower.rename(old.as_str(), new.as_str(), descriptors) {
                     Ok(()) => {
                         // Clean up the saved hidden entry (best-effort).
                         if let Some(ref ts) = tombstone_saved
-                            && self.lower.unlink(ts.as_str()).is_err()
+                            && self.lower.unlink(ts.as_str(), descriptors).is_err()
                         {
-                            let _ = self.lower.rmdir(ts.as_str());
+                            let _ = self.lower.rmdir(ts.as_str(), descriptors);
                         }
                         let mut root = self.root.write();
                         Self::invalidate_cache_tree(&mut root, &old);
@@ -2130,7 +2154,7 @@ impl<
             // cross-layer and needs EXDEV for the same reasons. But skip
             // the check if the destination is tombstoned (visibly absent).
             if !new_on_upper && !new_is_tombstoned {
-                let new_on_lower = match self.lower.file_status(&*new) {
+                let new_on_lower = match self.lower.file_status(&*new, descriptors) {
                     Ok(_) => true,
                     Err(FileStatusError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -2160,7 +2184,12 @@ impl<
         Ok(())
     }
 
-    fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
+    fn mkdir(
+        &self,
+        path: impl crate::path::Arg,
+        mode: Mode,
+        descriptors: &Descriptors<Platform>,
+    ) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         if self.has_tombstoned_ancestor(&path)? {
             return Err(PathError::NoSuchFileOrDirectory)?;
@@ -2174,7 +2203,7 @@ impl<
             self.layering_semantics,
             LayeringSemantics::LowerLayerWritableFiles
         ) {
-            match self.upper.file_status(path.as_str()) {
+            match self.upper.file_status(path.as_str(), descriptors) {
                 Ok(_) => return Err(MkdirError::AlreadyExists),
                 Err(FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -2182,7 +2211,7 @@ impl<
                 Err(FileStatusError::PathError(p)) => return Err(MkdirError::PathError(p)),
                 Err(_) => return Err(MkdirError::Io),
             }
-            match self.lower.mkdir(path.as_str(), mode) {
+            match self.lower.mkdir(path.as_str(), mode, descriptors) {
                 Ok(()) => return Ok(()),
                 Err(
                     MkdirError::PathError(
@@ -2197,12 +2226,12 @@ impl<
                 Err(e) => return Err(e),
             }
         }
-        match self.upper.mkdir(path.as_str(), mode) {
+        match self.upper.mkdir(path.as_str(), mode, descriptors) {
             Ok(()) => {
                 // If we could successfully make the directory, we know that things are "sane" at
                 // the upper level, but we must also check the lower level to make sure that this
                 // directory didn't already exist.
-                if self.ensure_lower_contains(&path).is_ok() {
+                if self.ensure_lower_contains(&path, descriptors).is_ok() {
                     return Err(MkdirError::AlreadyExists);
                 }
                 return Ok(());
@@ -2232,15 +2261,16 @@ impl<
         // We know that at least one of the components is missing. We should check each of the
         // components individually, making directories for any components that already exist at the
         // lower layer, and erroring out if no lower layer component exists of that form.
-        self.mkdir_migrating_ancestor_dirs(&path)?;
+        self.mkdir_migrating_ancestor_dirs(&path, descriptors)?;
         // And then now we can make the upper directory.
-        self.upper.mkdir(path, mode)
+        self.upper.mkdir(path, mode, descriptors)
     }
 
     fn symlink(
         &self,
         target: impl crate::path::Arg,
         linkpath: impl crate::path::Arg,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<(), SymlinkError> {
         let target = target
             .as_rust_str()
@@ -2254,7 +2284,7 @@ impl<
             self.layering_semantics,
             LayeringSemantics::LowerLayerWritableFiles
         ) {
-            match self.upper.file_status(path.as_str()) {
+            match self.upper.file_status(path.as_str(), descriptors) {
                 Ok(_) => return Err(SymlinkError::AlreadyExists),
                 Err(FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -2262,7 +2292,7 @@ impl<
                 Err(FileStatusError::PathError(p)) => return Err(SymlinkError::PathError(p)),
                 Err(_) => return Err(SymlinkError::Io),
             }
-            match self.lower.symlink(target, path.as_str()) {
+            match self.lower.symlink(target, path.as_str(), descriptors) {
                 Ok(()) => {
                     let mut root = self.root.write();
                     Self::invalidate_cache_tree(&mut root, &path);
@@ -2280,7 +2310,7 @@ impl<
             }
         }
 
-        match self.upper.symlink(target, path.as_str()) {
+        match self.upper.symlink(target, path.as_str(), descriptors) {
             Ok(()) => {
                 let mut root = self.root.write();
                 Self::invalidate_cache_tree(&mut root, &path);
@@ -2303,7 +2333,7 @@ impl<
             },
         }
 
-        self.mkdir_migrating_ancestor_dirs(&path)
+        self.mkdir_migrating_ancestor_dirs(&path, descriptors)
             .map_err(|e| match e {
                 MkdirError::AlreadyExists => SymlinkError::AlreadyExists,
                 MkdirError::ReadOnlyFileSystem => SymlinkError::ReadOnlyFileSystem,
@@ -2311,7 +2341,7 @@ impl<
                 MkdirError::Io => SymlinkError::Io,
                 MkdirError::PathError(p) => SymlinkError::PathError(p),
             })?;
-        let result = self.upper.symlink(target, path.as_str());
+        let result = self.upper.symlink(target, path.as_str(), descriptors);
         if result.is_ok() {
             let mut root = self.root.write();
             Self::invalidate_cache_tree(&mut root, &path);
@@ -2319,7 +2349,11 @@ impl<
         result
     }
 
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
+    fn rmdir(
+        &self,
+        path: impl crate::path::Arg,
+        descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), RmdirError> {
         let path = self.absolute_path(path)?;
 
         // Prevent removing root explicitly (even if upper is empty).
@@ -2327,13 +2361,12 @@ impl<
             return Err(RmdirError::Busy);
         }
 
-        let mut descriptors = self.litebox.descriptor_table_mut();
         let dir_fd = match <Self as super::FileSystem>::open(
             self,
             path.as_str(),
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
-            &mut *descriptors,
+            descriptors,
         ) {
             Ok(fd) => fd,
             Err(e) => match e {
@@ -2356,13 +2389,12 @@ impl<
                 }
             },
         };
-        let entries = match <Self as super::FileSystem>::read_dir(self, &dir_fd, &mut *descriptors)
-        {
+        let entries = match <Self as super::FileSystem>::read_dir(self, &dir_fd, descriptors) {
             Ok(entries) => entries,
             Err(ReadDirError::ClosedFd | ReadDirError::NotADirectory) => unreachable!(),
             Err(ReadDirError::Io) => return Err(RmdirError::Io),
         };
-        <Self as super::FileSystem>::close(self, &dir_fd, &mut *descriptors)
+        <Self as super::FileSystem>::close(self, &dir_fd, descriptors)
             .map_err(|_| RmdirError::Io)?;
         // "." and ".." are always present; anything more => not empty.
         if entries.len() > 2 {
@@ -2370,7 +2402,7 @@ impl<
         }
 
         // blindly rmdir at upper layer, suppressing non-existence errors.
-        if let Err(e) = self.upper.rmdir(path.as_str()) {
+        if let Err(e) = self.upper.rmdir(path.as_str(), descriptors) {
             match e {
                 RmdirError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -2397,7 +2429,7 @@ impl<
                 .insert(path, Arc::new(EntryX::Tombstone));
         } else {
             // If lower layer is writable, we can just rmdir there too, suppressing non-existence errors.
-            if let Err(e) = self.lower.rmdir(path.as_str()) {
+            if let Err(e) = self.lower.rmdir(path.as_str(), descriptors) {
                 match e {
                     RmdirError::PathError(
                         PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -2497,9 +2529,12 @@ impl<
         Ok(entries)
     }
 
-    fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
-        let descriptors = self.litebox.descriptor_table();
-        self.file_status_with_descriptors(path, &*descriptors)
+    fn file_status(
+        &self,
+        path: impl crate::path::Arg,
+        descriptors: &Descriptors<Platform>,
+    ) -> Result<FileStatus, FileStatusError> {
+        self.file_status_with_descriptors(path, descriptors)
     }
 
     fn fd_file_status(
@@ -2594,6 +2629,7 @@ impl<
     fn read_link(
         &self,
         path: impl crate::path::Arg,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
         let path = self
             .absolute_path(path)
@@ -2607,9 +2643,9 @@ impl<
             ));
         }
 
-        match self.upper.file_status(&*path) {
+        match self.upper.file_status(&*path, descriptors) {
             Ok(_) => {
-                return match self.upper.read_link(&*path) {
+                return match self.upper.read_link(&*path, descriptors) {
                     Ok(target) => Ok(target),
                     Err(super::errors::ReadLinkError::NotSupported) => {
                         Err(super::errors::ReadLinkError::NotASymlink)
@@ -2639,7 +2675,7 @@ impl<
             }
         }
 
-        self.lower.read_link(path)
+        self.lower.read_link(path, descriptors)
     }
 
     fn open_at(
@@ -2682,7 +2718,7 @@ impl<
         // Relative targets are resolved against the symlink's parent
         // directory, not the process CWD.
         let resolved = if follow_symlinks {
-            self.resolve_follow_symlinks(abs, 40)?
+            self.resolve_follow_symlinks(abs, 40, descriptors)?
         } else {
             abs
         };
@@ -2693,7 +2729,7 @@ impl<
         &self,
         dirfd: &FileFd<Platform, Upper, Lower>,
         rel_path: impl crate::path::Arg,
-        descriptors: &Descriptors<Platform>,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), UnlinkError> {
         let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => UnlinkError::ClosedFd,
@@ -2704,7 +2740,7 @@ impl<
             .as_rust_str()
             .map_err(|e| UnlinkError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(UnlinkError::PathError)?;
-        self.unlink(abs)
+        <Self as super::FileSystem>::unlink(self, abs, descriptors)
     }
 
     fn readlink_at(
@@ -2723,7 +2759,7 @@ impl<
             .map_err(|e| super::errors::ReadLinkError::PathError(e.into()))?;
         let abs =
             Self::resolve_relative(&dir, rel).map_err(super::errors::ReadLinkError::PathError)?;
-        self.read_link(abs)
+        <Self as super::FileSystem>::read_link(self, abs, descriptors)
     }
 
     fn rename_at(
@@ -2784,7 +2820,7 @@ impl<
             .as_rust_str()
             .map_err(|e| MkdirError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(MkdirError::PathError)?;
-        self.mkdir(abs, mode)
+        <Self as super::FileSystem>::mkdir(self, abs, mode, descriptors)
     }
 }
 

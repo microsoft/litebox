@@ -61,8 +61,9 @@ const BLOCK_SIZE: usize = 0;
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
-    #[cfg_attr(not(test), allow(dead_code))]
-    litebox: LiteBox<Platform>,
+    #[cfg(test)]
+    test_box: LiteBox<Platform>,
+    _platform: core::marker::PhantomData<fn() -> Platform>,
     tar_index: TarIndex,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
@@ -88,9 +89,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     ///
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
+    pub fn new(_litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
         Self {
-            litebox: litebox.clone(),
+            #[cfg(test)]
+            test_box: _litebox.clone(),
+            _platform: core::marker::PhantomData,
             tar_index: TarIndex::new(tar_data),
             current_working_dir: "/".into(),
         }
@@ -468,7 +471,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn chmod(&self, path: impl crate::path::Arg, _mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(
+        &self,
+        path: impl crate::path::Arg,
+        _mode: Mode,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];
@@ -485,6 +493,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         path: impl crate::path::Arg,
         _user: Option<u16>,
         _group: Option<u16>,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
@@ -497,7 +506,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
+    fn unlink(
+        &self,
+        path: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         assert!(path.starts_with('/'));
         let path = &path[1..];
@@ -519,13 +532,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Err(RenameError::ReadOnlyFileSystem)
     }
 
-    fn mkdir(&self, _path: impl crate::path::Arg, _mode: Mode) -> Result<(), MkdirError> {
+    fn mkdir(
+        &self,
+        _path: impl crate::path::Arg,
+        _mode: Mode,
+        _descriptors: &Descriptors<Platform>,
+    ) -> Result<(), MkdirError> {
         // TODO: Do we need to do the type of checks that are happening in the other functions, or
         // should the other functions be simplified to this?
         Err(MkdirError::ReadOnlyFileSystem)
     }
 
-    fn rmdir(&self, _path: impl crate::path::Arg) -> Result<(), RmdirError> {
+    fn rmdir(
+        &self,
+        _path: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), RmdirError> {
         // TODO: Do we need to do the type of checks that are happening in the other functions, or
         // should the other functions be simplified to this?
         Err(RmdirError::ReadOnlyFileSystem)
@@ -589,6 +611,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn file_status(
         &self,
         path: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         let path = self.absolute_path(path)?;
         let path = if path.is_empty() {
@@ -707,14 +730,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .as_rust_str()
             .map_err(|e| super::FileStatusError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(super::FileStatusError::PathError)?;
-        self.file_status(abs)
+        <Self as super::FileSystem>::file_status(self, abs, descriptors)
     }
 
     fn unlink_at(
         &self,
         dirfd: &FileFd<Platform>,
         rel_path: impl crate::path::Arg,
-        descriptors: &Descriptors<Platform>,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), UnlinkError> {
         let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => UnlinkError::ClosedFd,
@@ -725,7 +748,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .as_rust_str()
             .map_err(|e| UnlinkError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(UnlinkError::PathError)?;
-        self.unlink(abs)
+        <Self as super::FileSystem>::unlink(self, abs, descriptors)
     }
 
     fn readlink_at(
@@ -744,7 +767,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             .map_err(|e| super::errors::ReadLinkError::PathError(e.into()))?;
         let abs =
             Self::resolve_relative(&dir, rel).map_err(super::errors::ReadLinkError::PathError)?;
-        self.read_link(abs)
+        <Self as super::FileSystem>::read_link(self, abs, descriptors)
     }
 
     fn rename_at(

@@ -1196,15 +1196,23 @@ fn build_initial_fs(
         {
             if prev_user == 0 {
                 in_mem.with_root_privileges(|fs| {
-                    fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
+                    let mut descriptors = litebox.descriptor_table_mut();
+                    fs.mkdir(path.to_str().unwrap(), mode_and_user.0, &*descriptors)
+                        .unwrap();
                     if mode_and_user.1 != 0 {
-                        fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
-                            .unwrap();
+                        fs.chown(
+                            path.to_str().unwrap(),
+                            Some(1000),
+                            Some(1000),
+                            &mut *descriptors,
+                        )
+                        .unwrap();
                     }
                 });
             } else {
+                let descriptors = litebox.descriptor_table();
                 in_mem
-                    .mkdir(path.to_str().unwrap(), mode_and_user.0)
+                    .mkdir(path.to_str().unwrap(), mode_and_user.0, &*descriptors)
                     .unwrap();
             }
             prev_user = mode_and_user.1;
@@ -1233,8 +1241,14 @@ fn build_initial_fs(
             in_mem.with_root_privileges(|fs| {
                 open_file(fs, prog.to_str().unwrap(), last.0);
                 if last.1 != 0 {
-                    fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
-                        .unwrap();
+                    let mut descriptors = litebox.descriptor_table_mut();
+                    fs.chown(
+                        prog.to_str().unwrap(),
+                        Some(1000),
+                        Some(1000),
+                        &mut *descriptors,
+                    )
+                    .unwrap();
                 }
             });
         } else {
@@ -1243,12 +1257,14 @@ fn build_initial_fs(
     }
     in_mem.with_root_privileges(|fs| {
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        if let Err(err) = fs.mkdir("/tmp", mode) {
+        let mut descriptors = litebox.descriptor_table_mut();
+        if let Err(err) = fs.mkdir("/tmp", mode, &*descriptors) {
             // reason: unsupported variants intentionally share this fallback path.
             #[allow(clippy::wildcard_enum_match_arm)]
             match err {
                 litebox::fs::errors::MkdirError::AlreadyExists => {
-                    fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                    fs.chmod("/tmp", mode, &mut *descriptors)
+                        .expect("Failed to call chmod");
                 }
                 _ => panic!(),
             }
@@ -1813,7 +1829,8 @@ fn inject_program_image_into_in_mem(
             .take(ancestors.len().saturating_sub(2))
         {
             let path_str = path.to_str().unwrap_or("/");
-            if let Err(err) = fs.mkdir(path_str, dir_mode)
+            let descriptors = litebox_sys.descriptor_table();
+            if let Err(err) = fs.mkdir(path_str, dir_mode, &*descriptors)
                 && !matches!(err, litebox::fs::errors::MkdirError::AlreadyExists)
             {
                 inject_error = Some(anyhow!(
@@ -1965,7 +1982,8 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem.with_root_privileges(|fs| {
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        let _ = fs.mkdir("/tmp", mode);
+        let descriptors = litebox.descriptor_table();
+        let _ = fs.mkdir("/tmp", mode, &*descriptors);
     });
 
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
@@ -2423,7 +2441,8 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
     let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem.with_root_privileges(|fs| {
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        let _ = fs.mkdir("/tmp", mode);
+        let descriptors = litebox.descriptor_table();
+        let _ = fs.mkdir("/tmp", mode, &*descriptors);
     });
 
     if let Some(program_data) = transferred_exec_image {
@@ -2446,9 +2465,11 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             {
                 let path_str = path.to_str().unwrap_or("/");
                 in_mem.with_root_privileges(|fs| {
+                    let descriptors = litebox.descriptor_table();
                     let _ = fs.mkdir(
                         path_str,
                         Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                        &*descriptors,
                     );
                 });
             }

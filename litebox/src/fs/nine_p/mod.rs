@@ -429,9 +429,8 @@ struct WriteBuffer {
 ///   platform-specific functionality.
 /// - `W`: The transport write half type that implements the `Write` trait.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> {
-    /// Reference to the LiteBox instance
-    #[cfg_attr(not(test), allow(dead_code))]
-    litebox: LiteBox<Platform>,
+    #[cfg(test)]
+    test_box: LiteBox<Platform>,
     /// 9P client for protocol operations
     client: client::Client<Platform, W>,
     /// Root (attached to the root of the remote filesystem)
@@ -508,7 +507,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
     ///
     /// Returns an error if version negotiation or attach fails.
     pub fn new<R: transport::Read>(
-        litebox: &LiteBox<Platform>,
+        _litebox: &LiteBox<Platform>,
         writer: W,
         reader: R,
         msize: u32,
@@ -521,7 +520,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
 
         Ok((
             Self {
-                litebox: litebox.clone(),
+                #[cfg(test)]
+                test_box: _litebox.clone(),
                 client,
                 root: (qid, fid, String::from(path)),
                 current_working_dir: String::from("/"),
@@ -1851,6 +1851,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         &self,
         path: impl crate::path::Arg,
         mode: super::Mode,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::ChmodError> {
         let path = self.absolute_path(path)?;
         let (fid, qid) = self.walk_to_with_qid(&path)?;
@@ -1875,6 +1876,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         path: impl crate::path::Arg,
         user: Option<u16>,
         group: Option<u16>,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::ChownError> {
         let path = self.absolute_path(path)?;
         let (fid, qid) = self.walk_to_with_qid(&path)?;
@@ -1910,7 +1912,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         result.map_err(ChownError::from)
     }
 
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {
+    fn unlink(
+        &self,
+        path: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), super::errors::UnlinkError> {
         let abs_path = self.absolute_path(&path).ok();
         // Get the file's qid before removing so we can invalidate all aliases.
         let qid = abs_path
@@ -2041,7 +2047,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         result.map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)
     }
 
-    fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
+    fn mkdir(
+        &self,
+        path: impl crate::path::Arg,
+        mode: super::Mode,
+        _descriptors: &Descriptors<Platform>,
+    ) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
 
         let (parent_fid, name) = self.walk_to_parent(&path)?;
@@ -2063,6 +2074,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         &self,
         target: impl crate::path::Arg,
         linkpath: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<(), SymlinkError> {
         let target = target
             .as_rust_str()
@@ -2082,7 +2094,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         result.map(|_| ()).map_err(SymlinkError::from)
     }
 
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
+    fn rmdir(
+        &self,
+        path: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), RmdirError> {
         let abs_path = self.absolute_path(&path).ok();
         // Get the directory's qid before removing so we can invalidate all aliases.
         let qid = abs_path
@@ -2150,6 +2166,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
     fn file_status(
         &self,
         path: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<super::FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
 
@@ -2282,6 +2299,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
     fn read_link(
         &self,
         path: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
         let abs = self
             .absolute_path(path)
@@ -2391,14 +2409,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         // `fs::canonicalize` per component), so we can skip the
         // client-side symlink resolution chain. Just pass the path
         // directly — walk_to + getattr will see the target.
-        self.file_status(abs)
+        <Self as super::FileSystem>::file_status(self, abs, descriptors)
     }
 
     fn unlink_at(
         &self,
         dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
-        descriptors: &Descriptors<Platform>,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::UnlinkError> {
         let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => super::errors::UnlinkError::ClosedFd,
@@ -2410,7 +2428,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .map_err(|e| super::errors::UnlinkError::PathError(e.into()))?;
         let abs =
             Self::resolve_relative(&dir, rel).map_err(super::errors::UnlinkError::PathError)?;
-        self.unlink(abs)
+        <Self as super::FileSystem>::unlink(self, abs, descriptors)
     }
 
     fn readlink_at(
@@ -2429,7 +2447,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .map_err(|e| super::errors::ReadLinkError::PathError(e.into()))?;
         let abs =
             Self::resolve_relative(&dir, rel).map_err(super::errors::ReadLinkError::PathError)?;
-        self.read_link(abs)
+        <Self as super::FileSystem>::read_link(self, abs, descriptors)
     }
 
     fn rename_at(
@@ -2492,7 +2510,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .as_rust_str()
             .map_err(|e| MkdirError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(MkdirError::PathError)?;
-        self.mkdir(abs, mode)
+        <Self as super::FileSystem>::mkdir(self, abs, mode, descriptors)
     }
 }
 #[derive(Debug)]
