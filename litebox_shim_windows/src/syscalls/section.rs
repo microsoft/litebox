@@ -1065,9 +1065,6 @@ mod tests {
     use crate::nt_types::{ObjectAttributes, UnicodeString};
     use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    use crate::tests::test_task_with_nls_files;
-
     fn wide(value: &str) -> alloc::vec::Vec<u16> {
         value.encode_utf16().collect()
     }
@@ -1279,7 +1276,8 @@ mod tests {
     fn nt_query_section_image_information_uses_pe_headers() {
         let image = host_kernel32_image();
         let host_info = host_known_dll_image_information();
-        let task = test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", &image)]);
+        let task =
+            crate::tests::test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", &image)]);
         let name = wide(r"\KnownDlls\kernel32.dll");
         let unicode = unicode(&name);
         let attrs = object_attributes(&unicode);
@@ -1362,7 +1360,8 @@ mod tests {
     #[test]
     fn image_section_rejects_writable_view_protection() {
         let image = host_kernel32_image();
-        let task = test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", &image)]);
+        let task =
+            crate::tests::test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", &image)]);
         let name = wide(r"\KnownDlls\kernel32.dll");
         let unicode = unicode(&name);
         let attrs = object_attributes(&unicode);
