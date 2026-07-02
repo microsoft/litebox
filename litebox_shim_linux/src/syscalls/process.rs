@@ -656,6 +656,13 @@ impl<FS: ShimFS> Task<FS> {
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
             #[cfg(target_arch = "x86_64")]
+            {
+                // Validate the user-controlled TLS base before spawning the thread.
+                if !litebox_common_linux::arch::is_valid_user_fs_base(addr) {
+                    return Err(Errno::EPERM);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
             let desc = MutPtr::from_usize(addr);
             Some(desc)
         } else {
