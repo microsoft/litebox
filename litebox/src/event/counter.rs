@@ -45,35 +45,7 @@ pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
     registry: Arc<BrokerEventRegistry<Platform>>,
-    wakeups: Arc<EventCounterWakeups<Platform>>,
-}
-
-pub(crate) struct EventCounterWakeups<Platform: RawSyncPrimitivesProvider> {
-    pollee: Pollee<Platform>,
-}
-
-impl<Platform> EventCounterWakeups<Platform>
-where
-    Platform: RawSyncPrimitivesProvider + TimeProvider,
-{
-    fn new() -> Self {
-        Self {
-            pollee: Pollee::new(),
-        }
-    }
-
-    pub(crate) fn notify_readiness(&self, readiness: ReadinessState) {
-        let mut events = Events::empty();
-        if readiness.read_ready {
-            events |= Events::IN;
-        }
-        if readiness.write_ready {
-            events |= Events::OUT;
-        }
-        if !events.is_empty() {
-            self.pollee.notify_observers(events);
-        }
-    }
+    pollee: Arc<Pollee<Platform>>,
 }
 
 impl<Platform> EventCounter<Platform>
@@ -95,13 +67,13 @@ where
             .map_err(BrokerObjectError::from)
             .map_err(EventCounterError::from)?;
         let registry = litebox.broker_event_registry();
-        let wakeups = Arc::new(EventCounterWakeups::new());
-        registry.register_event(handle, &wakeups);
+        let pollee = Arc::new(Pollee::new());
+        registry.register_event(handle, &pollee);
         Ok(Self {
             broker,
             handle,
             registry,
-            wakeups,
+            pollee,
         })
     }
 
@@ -112,10 +84,10 @@ where
         nonblock: bool,
         mode: EventCounterReadMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
-        self.wakeups.pollee.wait(cx, nonblock, Events::IN, || {
+        self.pollee.wait(cx, nonblock, Events::IN, || {
             let response = self.consume(mode)?;
             if response.readiness.write_ready {
-                self.wakeups.pollee.notify_observers(Events::OUT);
+                self.pollee.notify_observers(Events::OUT);
             }
             Ok(response.value)
         })
@@ -131,10 +103,10 @@ where
         if value == u64::MAX {
             return Err(TryOpError::Other(EventCounterError::InvalidInput));
         }
-        self.wakeups.pollee.wait(cx, nonblock, Events::OUT, || {
+        self.pollee.wait(cx, nonblock, Events::OUT, || {
             let readiness = self.add(value)?;
             if value != 0 && readiness.read_ready {
-                self.wakeups.pollee.notify_observers(Events::IN);
+                self.pollee.notify_observers(Events::IN);
             }
             Ok(core::mem::size_of::<u64>())
         })
@@ -158,7 +130,7 @@ where
     fn broker_request_error(&self, error: BrokerControlError) -> BrokerObjectError {
         let error = error.into();
         if error != BrokerObjectError::WouldBlock {
-            self.wakeups.pollee.notify_observers(Events::ERR);
+            self.pollee.notify_observers(Events::ERR);
         }
         error
     }
@@ -179,7 +151,7 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
-        self.wakeups.pollee.register_observer(observer, mask);
+        self.pollee.register_observer(observer, mask);
     }
 
     fn check_io_events(&self) -> Events {

@@ -9,7 +9,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode, ReadinessState};
 
-use crate::event::counter::EventCounterWakeups;
+use crate::event::{Events, polling::Pollee};
 use crate::platform::TimeProvider;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
@@ -52,7 +52,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 }
 
 pub(crate) struct BrokerEventRegistry<Platform: RawSyncPrimitivesProvider> {
-    events: Mutex<Platform, HashMap<ObjectHandle, Weak<EventCounterWakeups<Platform>>>>,
+    events: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> BrokerEventRegistry<Platform> {
@@ -62,12 +62,8 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerEventRegistry<Platform> {
         }
     }
 
-    pub(crate) fn register_event(
-        &self,
-        handle: ObjectHandle,
-        wakeups: &Arc<EventCounterWakeups<Platform>>,
-    ) {
-        self.events.lock().insert(handle, Arc::downgrade(wakeups));
+    pub(crate) fn register_event(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
+        self.events.lock().insert(handle, Arc::downgrade(pollee));
     }
 
     pub(crate) fn unregister_event(&self, handle: ObjectHandle) {
@@ -80,17 +76,26 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     pub(crate) fn notify_event_readiness(&self, handle: ObjectHandle, readiness: ReadinessState) {
-        let wakeups = {
+        let pollee = {
             let mut events = self.events.lock();
-            if let Some(wakeups) = events.get(&handle).and_then(Weak::upgrade) {
-                Some(wakeups)
+            if let Some(pollee) = events.get(&handle).and_then(Weak::upgrade) {
+                Some(pollee)
             } else {
                 events.remove(&handle);
                 None
             }
         };
-        if let Some(wakeups) = wakeups {
-            wakeups.notify_readiness(readiness);
+        if let Some(pollee) = pollee {
+            let mut events = Events::empty();
+            if readiness.read_ready {
+                events |= Events::IN;
+            }
+            if readiness.write_ready {
+                events |= Events::OUT;
+            }
+            if !events.is_empty() {
+                pollee.notify_observers(events);
+            }
         }
     }
 }
