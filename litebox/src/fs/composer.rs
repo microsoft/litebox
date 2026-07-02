@@ -182,6 +182,11 @@ impl MountRelation {
     }
 }
 
+fn append_components(mut path: Vec<String>, components: &[&str]) -> Vec<String> {
+    path.extend(components.iter().map(|component| (*component).to_string()));
+    path
+}
+
 impl Composer {
     fn mount_relation(&self, path: &[String]) -> MountRelation {
         MountRelation::of(&self.mounts, path)
@@ -193,11 +198,11 @@ impl Composer {
     /// ancestor of a mount point.
     fn checked_child_path<E>(
         &self,
-        mut path: Vec<String>,
+        path: Vec<String>,
         name: &str,
         error: E,
     ) -> Result<Vec<String>, E> {
-        path.push(name.to_string());
+        let path = append_components(path, &[name]);
         if self.mount_relation(&path) != MountRelation::Unrelated {
             // TODO(jayb): Define mutation semantics for exact mount points.
             return Err(error);
@@ -282,7 +287,7 @@ impl Composer {
     fn mounted_walk_prefix_len(&self, path: &[String], components: &[&str]) -> usize {
         let mut next_path = path.to_vec();
         for (idx, component) in components.iter().enumerate() {
-            next_path.push((*component).to_string());
+            next_path = append_components(next_path, &[*component]);
             if self.mount_relation(&next_path) != MountRelation::Unrelated {
                 return idx;
             }
@@ -402,8 +407,8 @@ impl Backend for Composer {
         while index < components.len() {
             let component = components[index];
             match current.inner {
-                ComposerWalkingDirHandleInner::Virtual { mut path } => {
-                    path.push(component.to_string());
+                ComposerWalkingDirHandleInner::Virtual { path } => {
+                    let path = append_components(path, &[component]);
                     if let Some((mount_index, handle)) = self.exact_mount_root(&path) {
                         walked_components.push(BY_BACKEND);
                         current = ComposerWalkingDirHandleInner::Mounted {
@@ -425,8 +430,7 @@ impl Backend for Composer {
                     mount_index,
                     handle,
                 } => {
-                    let mut child_path = path.clone();
-                    child_path.push(component.to_string());
+                    let child_path = append_components(path.clone(), &[component]);
                     if let Some((child_mount_index, child_handle)) =
                         self.exact_mount_root(&child_path)
                     {
@@ -452,14 +456,10 @@ impl Backend for Composer {
                                 );
                                 walked_components.extend(outcome.components);
                                 let last = ComposerWalkingDirHandleInner::Mounted {
-                                    path: path
-                                        .into_iter()
-                                        .chain(
-                                            components[index..index + walked_len]
-                                                .iter()
-                                                .map(ToString::to_string),
-                                        )
-                                        .collect(),
+                                    path: append_components(
+                                        path,
+                                        &components[index..index + walked_len],
+                                    ),
                                     mount_index,
                                     handle: outcome.last,
                                 }
@@ -504,14 +504,7 @@ impl Backend for Composer {
                         );
                         walked_components.extend(outcome.components);
                         let last = ComposerWalkingDirHandleInner::Mounted {
-                            path: path
-                                .into_iter()
-                                .chain(
-                                    components[index..index + walked_len]
-                                        .iter()
-                                        .map(ToString::to_string),
-                                )
-                                .collect(),
+                            path: append_components(path, &components[index..index + walked_len]),
                             mount_index,
                             handle: outcome.last,
                         }
