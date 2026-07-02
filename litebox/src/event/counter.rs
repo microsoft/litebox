@@ -183,13 +183,9 @@ mod tests {
 
     use alloc::sync::Arc;
     use litebox_broker_local::BrokerLocal;
-    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::channel::LocalControlChannel;
     use litebox_broker_protocol::error::ErrorCode;
-    use litebox_broker_protocol::event::{
-        ConsumeEventRequest, CreateEventRequest, CreateEventResponse, EventConsumption,
-        ReadinessState,
-    };
+    use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption, ReadinessState};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
         BrokerResponse, EventReadinessNotification, EventRequest, EventResponse,
@@ -213,9 +209,6 @@ mod tests {
             consume_attempts: consume_attempts.clone(),
             read_ready: read_ready.clone(),
             last_request: None,
-            handshake_response: Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-            }),
         })
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
@@ -236,6 +229,7 @@ mod tests {
             });
         }
         let deadline = Instant::now() + Duration::from_secs(1);
+        // The second consume attempt happens after the waiter has registered its observer.
         while consume_attempts.load(Ordering::SeqCst) < 2 {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
@@ -265,7 +259,6 @@ mod tests {
         consume_attempts: Arc<AtomicUsize>,
         read_ready: Arc<AtomicBool>,
         last_request: Option<BrokerRequest>,
-        handshake_response: Option<BrokerHandshakeResponse>,
     }
 
     impl LocalControlChannel for FakeLocalControlChannel {
@@ -281,7 +274,9 @@ mod tests {
         fn recv_handshake_response(
             &mut self,
         ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-            Ok(self.handshake_response.take())
+            Ok(Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+            }))
         }
 
         fn send_request(
@@ -294,14 +289,14 @@ mod tests {
 
         fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
             let response = match self.last_request.take().unwrap() {
-                BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
-                    initial_count: 0,
-                })) => BrokerResponse::Event(EventResponse::Create(CreateEventResponse {
-                    handle: self.handle,
-                })),
-                BrokerRequest::Event(EventRequest::Consume(ConsumeEventRequest {
-                    handle, ..
-                })) if handle == self.handle => {
+                BrokerRequest::Event(EventRequest::Create(_)) => {
+                    BrokerResponse::Event(EventResponse::Create(CreateEventResponse {
+                        handle: self.handle,
+                    }))
+                }
+                BrokerRequest::Event(EventRequest::Consume(request))
+                    if request.handle == self.handle =>
+                {
                     self.consume_attempts.fetch_add(1, Ordering::SeqCst);
                     if self.read_ready.swap(false, Ordering::SeqCst) {
                         BrokerResponse::Event(EventResponse::Consume(EventConsumption {
