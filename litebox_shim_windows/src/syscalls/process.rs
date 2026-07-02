@@ -418,6 +418,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "Handling ProcessTlsInformation"
         );
 
+        if header.thread_data_count > 1 {
+            // TODO(multi-thread-tls): PROCESS_TLS_INFORMATION entries are positional per-thread
+            // data. The shim currently models only the active TEB, so handling multiple entries
+            // would corrupt prior TLS values by repeatedly writing one TEB's vector.
+            return NtStatus::NOT_SUPPORTED;
+        }
+
         match ProcessTlsOperation::try_from(header.operation_type) {
             Ok(ProcessTlsOperation::ReplaceVector) => self.replace_tls_vector(
                 process_information,
@@ -713,6 +720,12 @@ mod tests {
         entry: ProcessTlsThreadDataSimple,
     }
 
+    #[repr(C)]
+    struct ProcessTlsTwoEntryRequest {
+        header: ProcessTlsInformationHeader,
+        entries: [ProcessTlsThreadDataSimple; 2],
+    }
+
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
         let _ = crate::tests::test_platform();
         <TestPlatform as ThreadProvider>::run_test_thread(f)
@@ -962,6 +975,67 @@ mod tests {
                 ),
                 NtStatus::INVALID_PARAMETER
             );
+        });
+    }
+
+    #[test]
+    fn nt_set_information_process_tls_rejects_multi_thread_entries_without_mutating_teb() {
+        run_with_test_platform_pointers(|| {
+            let mut task = crate::tests::test_task();
+            let mut teb = <ThreadEnvironmentBlock as zerocopy::FromZeros>::new_zeroed();
+            let mut tls_vector = [0usize; TEB_TLS_SLOT_COUNT];
+            tls_vector[7] = 0x1111;
+            teb.thread_local_storage_pointer = tls_vector.as_mut_ptr() as usize;
+            task.teb_address = core::ptr::from_mut(&mut teb) as usize;
+
+            let entry = ProcessTlsThreadDataSimple {
+                flags: 0,
+                _padding0: 0,
+                tls_data: 0x2222,
+                _reserved: 0,
+            };
+            let mut request = ProcessTlsTwoEntryRequest {
+                header: ProcessTlsInformationHeader {
+                    flags: 0,
+                    operation_type: ProcessTlsOperation::ReplaceIndex as u32,
+                    thread_data_count: 2,
+                    tls_index: 7,
+                },
+                entries: [entry, entry],
+            };
+
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::TlsInformation as u32,
+                    const_byte_mut_ptr(&mut request),
+                    size_of::<ProcessTlsTwoEntryRequest>().trunc(),
+                ),
+                NtStatus::NOT_SUPPORTED
+            );
+            assert_eq!(tls_vector[7], 0x1111);
+            assert_eq!(request.entries[0].tls_data, 0x2222);
+            assert_eq!(request.entries[1].tls_data, 0x2222);
+            assert_eq!(request.entries[0].flags, 0);
+            assert_eq!(request.entries[1].flags, 0);
+
+            request.header.operation_type = ProcessTlsOperation::ReplaceVector as u32;
+            let original_tls_pointer = teb.thread_local_storage_pointer;
+            let mut replacement_vector = [0usize; TEB_TLS_SLOT_COUNT];
+            request.entries[0].tls_data = replacement_vector.as_mut_ptr() as usize;
+            request.entries[1].tls_data = replacement_vector.as_mut_ptr() as usize;
+
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::TlsInformation as u32,
+                    const_byte_mut_ptr(&mut request),
+                    size_of::<ProcessTlsTwoEntryRequest>().trunc(),
+                ),
+                NtStatus::NOT_SUPPORTED
+            );
+            assert_eq!(teb.thread_local_storage_pointer, original_tls_pointer);
+            assert_eq!(replacement_vector[7], 0);
         });
     }
 
