@@ -439,10 +439,55 @@ impl Backend for Composer {
                         .into();
                         index += 1;
                     } else if self.mount_relation(&child_path) == MountRelation::AncestorOfMount {
-                        walked_components.push(BY_BACKEND);
-                        current =
-                            ComposerWalkingDirHandleInner::Virtual { path: child_path }.into();
-                        index += 1;
+                        match self.mounts[mount_index]
+                            .backend
+                            .walk_directories(handle, &[component])
+                        {
+                            Ok(outcome) => {
+                                let walked_len = outcome.components.len();
+                                assert!(walked_len <= 1);
+                                assert!(
+                                    outcome.stop_reason != WalkStopReason::CompleteDirectory
+                                        || walked_len == 1
+                                );
+                                walked_components.extend(outcome.components);
+                                let last = ComposerWalkingDirHandleInner::Mounted {
+                                    path: path
+                                        .into_iter()
+                                        .chain(
+                                            components[index..index + walked_len]
+                                                .iter()
+                                                .map(ToString::to_string),
+                                        )
+                                        .collect(),
+                                    mount_index,
+                                    handle: outcome.last,
+                                }
+                                .into();
+                                match outcome.stop_reason {
+                                    WalkStopReason::CompleteDirectory => {
+                                        index += walked_len;
+                                        current = last;
+                                    }
+                                    WalkStopReason::StoppedAtNonDirectory
+                                    | WalkStopReason::Continue => {
+                                        return Ok(WalkOutcome {
+                                            components: walked_components,
+                                            last: WalkingDirHandle::from_typed::<Self>(last),
+                                            stop_reason: outcome.stop_reason,
+                                        });
+                                    }
+                                }
+                            }
+                            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                                walked_components.push(BY_BACKEND);
+                                current =
+                                    ComposerWalkingDirHandleInner::Virtual { path: child_path }
+                                        .into();
+                                index += 1;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     } else {
                         // TODO(jayb): Decide whether future backends need absolute-ish namespace
                         // views instead of this mount-root-relative suffix view. POSIX `..` across
