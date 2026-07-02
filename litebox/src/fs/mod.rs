@@ -24,6 +24,264 @@ pub mod tar_ro;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+macro_rules! impl_test_descriptor_compat {
+    () => {
+        pub fn open(
+            &self,
+            path: impl $crate::path::Arg,
+            flags: $crate::fs::OFlags,
+            mode: $crate::fs::Mode,
+        ) -> Result<$crate::fd::TypedFd<Self>, $crate::fs::OpenError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::open(self, path, flags, mode, &mut *descriptors)
+        }
+
+        pub fn close(&self, fd: &$crate::fd::TypedFd<Self>) -> Result<(), $crate::fs::CloseError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::close(self, fd, &mut *descriptors)
+        }
+
+        pub fn read(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            buf: &mut [u8],
+            offset: Option<usize>,
+        ) -> Result<usize, $crate::fs::ReadError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::read(self, fd, buf, offset, &*descriptors)
+        }
+
+        pub fn write(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            buf: &[u8],
+            offset: Option<usize>,
+        ) -> Result<usize, $crate::fs::WriteError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::write(self, fd, buf, offset, &mut *descriptors)
+        }
+
+        pub fn seek(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            offset: isize,
+            whence: $crate::fs::SeekWhence,
+        ) -> Result<usize, $crate::fs::SeekError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::seek(self, fd, offset, whence, &*descriptors)
+        }
+
+        pub fn truncate(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            length: usize,
+            reset_offset: bool,
+        ) -> Result<(), $crate::fs::TruncateError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::truncate(
+                self,
+                fd,
+                length,
+                reset_offset,
+                &mut *descriptors,
+            )
+        }
+
+        pub fn chmod(
+            &self,
+            path: impl $crate::path::Arg,
+            mode: $crate::fs::Mode,
+        ) -> Result<(), $crate::fs::ChmodError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::chmod(self, path, mode, &mut *descriptors)
+        }
+
+        pub fn chown(
+            &self,
+            path: impl $crate::path::Arg,
+            user: Option<u16>,
+            group: Option<u16>,
+        ) -> Result<(), $crate::fs::ChownError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::chown(self, path, user, group, &mut *descriptors)
+        }
+
+        pub fn unlink(&self, path: impl $crate::path::Arg) -> Result<(), $crate::fs::UnlinkError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::unlink(self, path, &mut *descriptors)
+        }
+
+        pub fn rename(
+            &self,
+            old_path: impl $crate::path::Arg,
+            new_path: impl $crate::path::Arg,
+        ) -> Result<(), $crate::fs::RenameError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::rename(self, old_path, new_path, &mut *descriptors)
+        }
+
+        pub fn mkdir(
+            &self,
+            path: impl $crate::path::Arg,
+            mode: $crate::fs::Mode,
+        ) -> Result<(), $crate::fs::MkdirError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::mkdir(self, path, mode, &*descriptors)
+        }
+
+        pub fn rmdir(&self, path: impl $crate::path::Arg) -> Result<(), $crate::fs::RmdirError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::rmdir(self, path, &mut *descriptors)
+        }
+
+        pub fn read_dir(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+        ) -> Result<alloc::vec::Vec<$crate::fs::DirEntry>, $crate::fs::ReadDirError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::read_dir(self, fd, &mut *descriptors)
+        }
+
+        pub fn file_status(
+            &self,
+            path: impl $crate::path::Arg,
+        ) -> Result<$crate::fs::FileStatus, $crate::fs::FileStatusError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::file_status(self, path, &*descriptors)
+        }
+
+        pub fn fd_file_status(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+        ) -> Result<$crate::fs::FileStatus, $crate::fs::FileStatusError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::fd_file_status(self, fd, &*descriptors)
+        }
+
+        pub fn get_static_backing_data(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+        ) -> Option<&'static [u8]> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::get_static_backing_data(self, fd, &*descriptors)
+        }
+
+        pub fn set_open_status_flags(
+            &self,
+            fd: &$crate::fd::TypedFd<Self>,
+            flags: $crate::fs::OFlags,
+        ) -> Result<(), $crate::fd::MetadataError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::set_open_status_flags(
+                self,
+                fd,
+                flags,
+                &mut *descriptors,
+            )
+        }
+
+        pub fn read_link(
+            &self,
+            path: impl $crate::path::Arg,
+        ) -> Result<alloc::string::String, $crate::fs::errors::ReadLinkError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::read_link(self, path, &*descriptors)
+        }
+
+        pub fn symlink(
+            &self,
+            target: impl $crate::path::Arg,
+            linkpath: impl $crate::path::Arg,
+        ) -> Result<(), $crate::fs::errors::SymlinkError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::symlink(self, target, linkpath, &*descriptors)
+        }
+
+        pub fn link(
+            &self,
+            oldpath: impl $crate::path::Arg,
+            newpath: impl $crate::path::Arg,
+        ) -> Result<(), $crate::fs::errors::LinkError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::link(self, oldpath, newpath, &*descriptors)
+        }
+
+        pub fn open_at(
+            &self,
+            dirfd: &$crate::fd::TypedFd<Self>,
+            rel_path: impl $crate::path::Arg,
+            flags: $crate::fs::OFlags,
+            mode: $crate::fs::Mode,
+        ) -> Result<$crate::fd::TypedFd<Self>, $crate::fs::OpenError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::open_at(
+                self,
+                dirfd,
+                rel_path,
+                flags,
+                mode,
+                &mut *descriptors,
+            )
+        }
+
+        pub fn stat_at(
+            &self,
+            dirfd: &$crate::fd::TypedFd<Self>,
+            rel_path: impl $crate::path::Arg,
+            follow_symlinks: bool,
+        ) -> Result<$crate::fs::FileStatus, $crate::fs::FileStatusError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::stat_at(
+                self,
+                dirfd,
+                rel_path,
+                follow_symlinks,
+                &*descriptors,
+            )
+        }
+
+        pub fn unlink_at(
+            &self,
+            dirfd: &$crate::fd::TypedFd<Self>,
+            rel_path: impl $crate::path::Arg,
+        ) -> Result<(), $crate::fs::UnlinkError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::unlink_at(self, dirfd, rel_path, &mut *descriptors)
+        }
+
+        pub fn readlink_at(
+            &self,
+            dirfd: &$crate::fd::TypedFd<Self>,
+            rel_path: impl $crate::path::Arg,
+        ) -> Result<alloc::string::String, $crate::fs::errors::ReadLinkError> {
+            let descriptors = self.test_box.descriptor_table();
+            <Self as $crate::fs::FileSystem>::readlink_at(self, dirfd, rel_path, &*descriptors)
+        }
+
+        pub fn rename_at(
+            &self,
+            old_dirfd: &$crate::fd::TypedFd<Self>,
+            old_rel: impl $crate::path::Arg,
+            new_dirfd: &$crate::fd::TypedFd<Self>,
+            new_rel: impl $crate::path::Arg,
+        ) -> Result<(), $crate::fs::RenameError> {
+            let mut descriptors = self.test_box.descriptor_table_mut();
+            <Self as $crate::fs::FileSystem>::rename_at(
+                self,
+                old_dirfd,
+                old_rel,
+                new_dirfd,
+                new_rel,
+                &mut *descriptors,
+            )
+        }
+    };
+}
+
+#[cfg(test)]
+pub(crate) use impl_test_descriptor_compat;
+
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
     ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
@@ -82,6 +340,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         path: impl path::Arg,
         flags: OFlags,
         mode: Mode,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
     ) -> Result<TypedFd<Self>, OpenError>;
 
     /// Create an anonymous regular file that has no namespace entry.
@@ -94,6 +353,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         &self,
         name: &str,
         mode: Mode,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
     ) -> Result<TypedFd<Self>, errors::CreateAnonymousFileError> {
         Err(errors::CreateAnonymousFileError::NotSupported)
     }
@@ -139,6 +399,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         remote_fid: u32,
         path: &str,
         status_flags: OFlags,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
     ) -> Result<TypedFd<Self>, errors::OpenError> {
         Err(errors::OpenError::Io)
     }
@@ -157,14 +418,22 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// expose externally-routable fid numbers (e.g. the in-memory
     /// test FS) opt out by inheriting the default.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn descriptor_backend_fid(&self, fd: &TypedFd<Self>) -> Option<u32> {
+    fn descriptor_backend_fid(
+        &self,
+        fd: &TypedFd<Self>,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
+    ) -> Option<u32> {
         None
     }
 
     /// Close the file at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError>;
+    fn close(
+        &self,
+        fd: &TypedFd<Self>,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<(), CloseError>;
 
     /// Read from a file descriptor at `offset` into a buffer
     ///
@@ -176,6 +445,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         fd: &TypedFd<Self>,
         buf: &mut [u8],
         offset: Option<usize>,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
     ) -> Result<usize, ReadError>;
 
     /// Write from a buffer to a file descriptor at `offset`
@@ -188,6 +458,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         fd: &TypedFd<Self>,
         buf: &[u8],
         offset: Option<usize>,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
     ) -> Result<usize, WriteError>;
 
     /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
@@ -198,6 +469,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         fd: &TypedFd<Self>,
         offset: isize,
         whence: SeekWhence,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
     ) -> Result<usize, SeekError>;
 
     /// Truncate the file to the specified length.
@@ -211,10 +483,16 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         fd: &TypedFd<Self>,
         length: usize,
         reset_offset: bool,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
     ) -> Result<(), TruncateError>;
 
     /// Change the permissions of a file
-    fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
+    fn chmod(
+        &self,
+        path: impl path::Arg,
+        mode: Mode,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<(), ChmodError>;
 
     /// Change the owner of a file
     fn chown(
@@ -222,31 +500,61 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         path: impl path::Arg,
         user: Option<u16>,
         group: Option<u16>,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
     ) -> Result<(), ChownError>;
 
     /// Unlink a file
-    fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
+    fn unlink(
+        &self,
+        path: impl path::Arg,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<(), UnlinkError>;
 
     /// Rename (move) a file or directory
-    fn rename(&self, old_path: impl path::Arg, new_path: impl path::Arg)
-    -> Result<(), RenameError>;
+    fn rename(
+        &self,
+        old_path: impl path::Arg,
+        new_path: impl path::Arg,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<(), RenameError>;
 
     /// Create a new directory
-    fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
+    fn mkdir(
+        &self,
+        path: impl path::Arg,
+        mode: Mode,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<(), MkdirError>;
 
     /// Remove a directory
-    fn rmdir(&self, path: impl path::Arg) -> Result<(), RmdirError>;
+    fn rmdir(
+        &self,
+        path: impl path::Arg,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<(), RmdirError>;
 
     /// Read directory entries from a directory file descriptor.
     ///
     /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
-    fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError>;
+    fn read_dir(
+        &self,
+        fd: &TypedFd<Self>,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<Vec<DirEntry>, ReadDirError>;
 
     /// Obtain the status of a file/directory/... on the file-system.
-    fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
+    fn file_status(
+        &self,
+        path: impl path::Arg,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<FileStatus, FileStatusError>;
 
     /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
-    fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
+    fn fd_file_status(
+        &self,
+        fd: &TypedFd<Self>,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<FileStatus, FileStatusError>;
 
     /// Get static backing data for a file, if available and supported.
     ///
@@ -255,7 +563,11 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     ///
     /// Returns `None` if indicating no static backing data is available/supported.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+    fn get_static_backing_data(
+        &self,
+        fd: &TypedFd<Self>,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
+    ) -> Option<&'static [u8]> {
         None
     }
 
@@ -265,7 +577,11 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// This is a pure metadata query with no I/O side effects. The default
     /// implementation conservatively returns `true`.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn is_writable(&self, fd: &TypedFd<Self>) -> bool {
+    fn is_writable(
+        &self,
+        fd: &TypedFd<Self>,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
+    ) -> bool {
         true
     }
 
@@ -280,6 +596,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         &self,
         fd: &TypedFd<Self>,
         flags: OFlags,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
     ) -> Result<(), MetadataError> {
         Ok(())
     }
@@ -289,7 +606,11 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Returns `Some(pollable)` for device types with async event support,
     /// or `None` for regular files that don't support async I/O notifications.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn get_io_pollable(&self, fd: &TypedFd<Self>) -> Option<alloc::boxed::Box<dyn IOPollable>> {
+    fn get_io_pollable(
+        &self,
+        fd: &TypedFd<Self>,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
+    ) -> Option<alloc::boxed::Box<dyn IOPollable>> {
         None
     }
 
@@ -297,6 +618,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     fn read_link(
         &self,
         path: impl path::Arg,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
     ) -> Result<alloc::string::String, errors::ReadLinkError> {
         Err(errors::ReadLinkError::NotSupported)
     }
@@ -312,6 +634,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         &self,
         target: impl path::Arg,
         linkpath: impl path::Arg,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
     ) -> Result<(), errors::SymlinkError> {
         Err(errors::SymlinkError::NotSupported)
     }
@@ -326,6 +649,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         &self,
         oldpath: impl path::Arg,
         newpath: impl path::Arg,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
     ) -> Result<(), errors::LinkError> {
         Err(errors::LinkError::NotSupported)
     }
@@ -343,6 +667,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         rel_path: impl path::Arg,
         flags: OFlags,
         mode: Mode,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
     ) -> Result<TypedFd<Self>, OpenError>;
 
     /// Obtain the status of a file relative to a directory fd.
@@ -351,17 +676,23 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         dirfd: &TypedFd<Self>,
         rel_path: impl path::Arg,
         follow_symlinks: bool,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
     ) -> Result<FileStatus, FileStatusError>;
 
     /// Unlink a file relative to a directory fd.
-    fn unlink_at(&self, dirfd: &TypedFd<Self>, rel_path: impl path::Arg)
-    -> Result<(), UnlinkError>;
+    fn unlink_at(
+        &self,
+        dirfd: &TypedFd<Self>,
+        rel_path: impl path::Arg,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<(), UnlinkError>;
 
     /// Read a symbolic link relative to a directory fd.
     fn readlink_at(
         &self,
         dirfd: &TypedFd<Self>,
         rel_path: impl path::Arg,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
     ) -> Result<alloc::string::String, errors::ReadLinkError>;
 
     /// Rename a file, with source and destination relative to directory fds.
@@ -371,6 +702,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         old_rel: impl path::Arg,
         new_dirfd: &TypedFd<Self>,
         new_rel: impl path::Arg,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
     ) -> Result<(), RenameError>;
 
     /// Create a directory relative to a directory fd.
@@ -379,6 +711,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         dirfd: &TypedFd<Self>,
         rel_path: impl path::Arg,
         mode: Mode,
+        descriptors: &Descriptors<Self::DescriptorPlatform>,
     ) -> Result<(), MkdirError>;
 
     /// Get the path associated with an open file descriptor, if available.

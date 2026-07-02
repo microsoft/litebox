@@ -39,7 +39,8 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
     let litebox = shim_builder.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
-        fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        let mut descriptors = litebox.descriptor_table_mut();
+        fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO, &mut *descriptors)
             .expect("Failed to set permissions on root");
     });
     let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());

@@ -429,8 +429,8 @@ struct WriteBuffer {
 ///   platform-specific functionality.
 /// - `W`: The transport write half type that implements the `Write` trait.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> {
-    /// Reference to the LiteBox instance
-    litebox: LiteBox<Platform>,
+    #[cfg(test)]
+    test_box: LiteBox<Platform>,
     /// 9P client for protocol operations
     client: client::Client<Platform, W>,
     /// Root (attached to the root of the remote filesystem)
@@ -477,6 +477,11 @@ pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider, W: transport::W
     cache_generation: AtomicUsize,
 }
 
+#[cfg(test)]
+impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<Platform, W> {
+    super::impl_test_descriptor_compat!();
+}
+
 impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<Platform, W> {
     /// Construct a new `FileSystem` instance
     ///
@@ -501,6 +506,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
     /// # Errors
     ///
     /// Returns an error if version negotiation or attach fails.
+    #[cfg_attr(not(test), allow(unused_variables))]
     pub fn new<R: transport::Read>(
         litebox: &LiteBox<Platform>,
         writer: W,
@@ -515,7 +521,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
 
         Ok((
             Self {
-                litebox: litebox.clone(),
+                #[cfg(test)]
+                test_box: litebox.clone(),
                 client,
                 root: (qid, fid, String::from(path)),
                 current_working_dir: String::from("/"),
@@ -857,9 +864,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
     fn dir_fd_path(
         &self,
         dirfd: &FileFd<Platform, W>,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<alloc::string::String, super::DirFdError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table
+        let entry = descriptors
             .get_entry(dirfd)
             .ok_or(super::DirFdError::ClosedFd)?;
         if entry.entry.qid.typ.contains(fcall::QidType::DIR) {
@@ -1245,6 +1252,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         remote_fid: u32,
         path: &str,
         status_flags: super::OFlags,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<FileFd<Platform, W>, super::errors::OpenError> {
         use fcall::GetattrMask;
 
@@ -1261,14 +1269,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             direct_write: status_flags.intersects(OFlags::SYNC | OFlags::DSYNC | OFlags::APPEND),
         };
 
-        let fd = self.litebox.descriptor_table_mut().insert(descriptor);
+        let fd = descriptors.insert(descriptor);
         Ok(fd)
     }
 
-    fn descriptor_backend_fid(&self, fd: &FileFd<Platform, W>) -> Option<u32> {
-        self.litebox
-            .descriptor_table()
-            .with_entry(fd, |desc| desc.entry.fid)
+    fn descriptor_backend_fid(
+        &self,
+        fd: &FileFd<Platform, W>,
+        descriptors: &Descriptors<Platform>,
+    ) -> Option<u32> {
+        descriptors.with_entry(fd, |desc| desc.entry.fid)
     }
 
     #[allow(clippy::similar_names)]
@@ -1277,6 +1287,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         path: impl crate::path::Arg,
         flags: super::OFlags,
         mode: super::Mode,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<FileFd<Platform, W>, super::errors::OpenError> {
         // TODO: we don't support non-blocking, so ignore that flag instead of returning an error
         let flags = flags - OFlags::NONBLOCK - OFlags::PATH;
@@ -1470,12 +1481,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             direct_write: flags.intersects(OFlags::SYNC | OFlags::DSYNC | OFlags::APPEND),
         };
 
-        let fd = self.litebox.descriptor_table_mut().insert(descriptor);
+        let fd = descriptors.insert(descriptor);
         Ok(fd)
     }
 
-    fn close(&self, fd: &FileFd<Platform, W>) -> Result<(), super::errors::CloseError> {
-        let entry = self.litebox.descriptor_table_mut().remove(fd);
+    fn close(
+        &self,
+        fd: &FileFd<Platform, W>,
+        descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), super::errors::CloseError> {
+        let entry = descriptors.remove(fd);
         if let Some(entry) = entry {
             // Flush any pending write-behind data before releasing the fid.
             // Propagate flush errors so callers know about data loss.
@@ -1500,12 +1515,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         fd: &FileFd<Platform, W>,
         buf: &mut [u8],
         offset: Option<usize>,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<usize, super::errors::ReadError> {
         // Extract fid, current offset, and qid, releasing the descriptor
         // table lock before performing potentially blocking I/O.
-        let (fid, current_offset, qid_path) = self
-            .litebox
-            .descriptor_table()
+        let (fid, current_offset, qid_path) = descriptors
             .with_entry(fd, |desc| {
                 (
                     desc.entry.fid,
@@ -1535,7 +1549,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
                     let n = buf.len().min(available);
                     buf[..n].copy_from_slice(&rb.data[start..start + n]);
                     if offset.is_none() {
-                        self.litebox.descriptor_table().with_entry(fd, |desc| {
+                        descriptors.with_entry(fd, |desc| {
                             desc.entry.offset.fetch_add(n, Ordering::SeqCst);
                         });
                     }
@@ -1613,7 +1627,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
 
         // Update offset if not using explicit offset.
         if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
+            descriptors.with_entry(fd, |desc| {
                 desc.entry.offset.fetch_add(n, Ordering::SeqCst);
             });
         }
@@ -1626,12 +1640,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         fd: &FileFd<Platform, W>,
         buf: &[u8],
         offset: Option<usize>,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<usize, super::errors::WriteError> {
         // Extract fid, current offset, sync flag, and qid from the
         // descriptor, releasing the table lock before any I/O.
-        let (fid, current_offset, direct_write, qid_path) = self
-            .litebox
-            .descriptor_table()
+        let (fid, current_offset, direct_write, qid_path) = descriptors
             .with_entry(fd, |desc| {
                 (
                     desc.entry.fid,
@@ -1676,7 +1689,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
                 written += n;
             }
             if offset.is_none() {
-                self.litebox.descriptor_table().with_entry(fd, |desc| {
+                descriptors.with_entry(fd, |desc| {
                     desc.entry.offset.fetch_add(written, Ordering::SeqCst);
                 });
             }
@@ -1694,7 +1707,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
                 wb.data.extend_from_slice(buf);
                 drop(buffers);
                 if offset.is_none() {
-                    self.litebox.descriptor_table().with_entry(fd, |desc| {
+                    descriptors.with_entry(fd, |desc| {
                         desc.entry.offset.fetch_add(total, Ordering::SeqCst);
                     });
                 }
@@ -1719,7 +1732,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
                 },
             );
             if offset.is_none() {
-                self.litebox.descriptor_table().with_entry(fd, |desc| {
+                descriptors.with_entry(fd, |desc| {
                     desc.entry.offset.fetch_add(total, Ordering::SeqCst);
                 });
             }
@@ -1739,7 +1752,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         }
 
         if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
+            descriptors.with_entry(fd, |desc| {
                 desc.entry.offset.fetch_add(written, Ordering::SeqCst);
             });
         }
@@ -1752,12 +1765,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         fd: &FileFd<Platform, W>,
         offset: isize,
         whence: super::SeekWhence,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<usize, SeekError> {
         // Extract fid and current offset, releasing the descriptor table lock
         // before performing potentially blocking I/O (getattr for SeekWhence::RelativeToEnd).
-        let (fid, current_offset, qid_path) = self
-            .litebox
-            .descriptor_table()
+        let (fid, current_offset, qid_path) = descriptors
             .with_entry(fd, |desc| {
                 (
                     desc.entry.fid,
@@ -1783,7 +1795,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .checked_add_signed(offset)
             .ok_or(SeekError::InvalidOffset)?;
 
-        self.litebox.descriptor_table().with_entry(fd, |desc| {
+        descriptors.with_entry(fd, |desc| {
             desc.entry.offset.store(new_offset, Ordering::SeqCst);
         });
         Ok(new_offset)
@@ -1794,12 +1806,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         fd: &FileFd<Platform, W>,
         length: usize,
         reset_offset: bool,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::TruncateError> {
         // Extract fid and qid, releasing the descriptor table lock
         // before performing potentially blocking I/O.
-        let (fid, qid) = self
-            .litebox
-            .descriptor_table()
+        let (fid, qid) = descriptors
             .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
             .ok_or(super::errors::TruncateError::ClosedFd)?;
 
@@ -1829,7 +1840,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         self.client.setattr(fid, fcall::SetattrMask::SIZE, stat)?;
 
         if reset_offset {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
+            descriptors.with_entry(fd, |desc| {
                 desc.entry.offset.store(0, Ordering::SeqCst);
             });
         }
@@ -1841,6 +1852,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         &self,
         path: impl crate::path::Arg,
         mode: super::Mode,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::ChmodError> {
         let path = self.absolute_path(path)?;
         let (fid, qid) = self.walk_to_with_qid(&path)?;
@@ -1865,6 +1877,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         path: impl crate::path::Arg,
         user: Option<u16>,
         group: Option<u16>,
+        _descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::ChownError> {
         let path = self.absolute_path(path)?;
         let (fid, qid) = self.walk_to_with_qid(&path)?;
@@ -1900,7 +1913,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         result.map_err(ChownError::from)
     }
 
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {
+    fn unlink(
+        &self,
+        path: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), super::errors::UnlinkError> {
         let abs_path = self.absolute_path(&path).ok();
         // Get the file's qid before removing so we can invalidate all aliases.
         let qid = abs_path
@@ -1930,6 +1947,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         &self,
         old: impl crate::path::Arg,
         new: impl crate::path::Arg,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::RenameError> {
         let old_path = self
             .absolute_path(old)
@@ -2020,8 +2038,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             // Descriptor.path accurate for debugging/tracing. Write-behind
             // buffer matching uses qid_path (file identity), so renames
             // are transparent to cross-fid flush logic.
-            let table = self.litebox.descriptor_table();
-            for (_, mut desc) in table.iter_mut::<Self>() {
+            for (_, mut desc) in descriptors.iter_mut::<Self>() {
                 if let Some(new) = Self::rebase_path(&desc.entry.path, &old_path, &new_path) {
                     desc.entry.path = new;
                 }
@@ -2031,7 +2048,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         result.map_err(|_| super::errors::RenameError::ReadOnlyFileSystem)
     }
 
-    fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
+    fn mkdir(
+        &self,
+        path: impl crate::path::Arg,
+        mode: super::Mode,
+        _descriptors: &Descriptors<Platform>,
+    ) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
 
         let (parent_fid, name) = self.walk_to_parent(&path)?;
@@ -2053,6 +2075,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         &self,
         target: impl crate::path::Arg,
         linkpath: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<(), SymlinkError> {
         let target = target
             .as_rust_str()
@@ -2072,7 +2095,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         result.map(|_| ()).map_err(SymlinkError::from)
     }
 
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
+    fn rmdir(
+        &self,
+        path: impl crate::path::Arg,
+        _descriptors: &mut Descriptors<Platform>,
+    ) -> Result<(), RmdirError> {
         let abs_path = self.absolute_path(&path).ok();
         // Get the directory's qid before removing so we can invalidate all aliases.
         let qid = abs_path
@@ -2104,12 +2131,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
     fn read_dir(
         &self,
         fd: &FileFd<Platform, W>,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<Vec<crate::fs::DirEntry>, super::errors::ReadDirError> {
         // Extract fid and qid, releasing the descriptor table lock
         // before performing potentially blocking I/O.
-        let (fid, qid) = self
-            .litebox
-            .descriptor_table()
+        let (fid, qid) = descriptors
             .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
             .ok_or(super::errors::ReadDirError::ClosedFd)?;
 
@@ -2141,6 +2167,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
     fn file_status(
         &self,
         path: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<super::FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
 
@@ -2226,11 +2253,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
     fn fd_file_status(
         &self,
         fd: &FileFd<Platform, W>,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         // Extract fid, qid, and path from the descriptor.
-        let (fid, qid_path, path) = self
-            .litebox
-            .descriptor_table()
+        let (fid, qid_path, path) = descriptors
             .with_entry(fd, |desc| {
                 (desc.entry.fid, desc.entry.qid.path, desc.entry.path.clone())
             })
@@ -2274,6 +2300,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
     fn read_link(
         &self,
         path: impl crate::path::Arg,
+        _descriptors: &Descriptors<Platform>,
     ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
         let abs = self
             .absolute_path(path)
@@ -2342,8 +2369,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         rel_path: impl crate::path::Arg,
         flags: super::OFlags,
         mode: super::Mode,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<FileFd<Platform, W>, super::errors::OpenError> {
-        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+        let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => super::errors::OpenError::ClosedFd,
             super::DirFdError::NotADirectory => super::errors::OpenError::NotADirectory,
             super::DirFdError::Io => super::errors::OpenError::Io,
@@ -2352,7 +2380,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .as_rust_str()
             .map_err(|e| super::errors::OpenError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(super::errors::OpenError::PathError)?;
-        self.open(abs, flags, mode)
+        <Self as super::FileSystem>::open(self, abs, flags, mode, descriptors)
     }
 
     /// Note: `_follow_symlinks` is currently ignored because
@@ -2367,8 +2395,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
         _follow_symlinks: bool,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<super::FileStatus, super::FileStatusError> {
-        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+        let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => super::FileStatusError::ClosedFd,
             super::DirFdError::NotADirectory => super::FileStatusError::NotADirectory,
             super::DirFdError::Io => super::FileStatusError::Io,
@@ -2381,15 +2410,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         // `fs::canonicalize` per component), so we can skip the
         // client-side symlink resolution chain. Just pass the path
         // directly — walk_to + getattr will see the target.
-        self.file_status(abs)
+        <Self as super::FileSystem>::file_status(self, abs, descriptors)
     }
 
     fn unlink_at(
         &self,
         dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::UnlinkError> {
-        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+        let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => super::errors::UnlinkError::ClosedFd,
             super::DirFdError::NotADirectory => super::errors::UnlinkError::NotADirectory,
             super::DirFdError::Io => super::errors::UnlinkError::Io,
@@ -2399,15 +2429,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .map_err(|e| super::errors::UnlinkError::PathError(e.into()))?;
         let abs =
             Self::resolve_relative(&dir, rel).map_err(super::errors::UnlinkError::PathError)?;
-        self.unlink(abs)
+        <Self as super::FileSystem>::unlink(self, abs, descriptors)
     }
 
     fn readlink_at(
         &self,
         dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<alloc::string::String, super::errors::ReadLinkError> {
-        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+        let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::ClosedFd => super::errors::ReadLinkError::ClosedFd,
             super::DirFdError::NotADirectory => super::errors::ReadLinkError::NotADirectory,
             super::DirFdError::Io => super::errors::ReadLinkError::Io,
@@ -2417,7 +2448,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .map_err(|e| super::errors::ReadLinkError::PathError(e.into()))?;
         let abs =
             Self::resolve_relative(&dir, rel).map_err(super::errors::ReadLinkError::PathError)?;
-        self.read_link(abs)
+        <Self as super::FileSystem>::read_link(self, abs, descriptors)
     }
 
     fn rename_at(
@@ -2426,28 +2457,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         old_rel: impl crate::path::Arg,
         new_dirfd: &FileFd<Platform, W>,
         new_rel: impl crate::path::Arg,
+        descriptors: &mut Descriptors<Platform>,
     ) -> Result<(), super::errors::RenameError> {
-        let old_dir = self.dir_fd_path(old_dirfd).map_err(|e| match e {
-            super::DirFdError::ClosedFd => super::errors::RenameError::ClosedFd,
-            super::DirFdError::NotADirectory => super::errors::RenameError::NotADirectory,
-            super::DirFdError::Io => super::errors::RenameError::Io,
-        })?;
+        let old_dir = self
+            .dir_fd_path(old_dirfd, descriptors)
+            .map_err(|e| match e {
+                super::DirFdError::ClosedFd => super::errors::RenameError::ClosedFd,
+                super::DirFdError::NotADirectory => super::errors::RenameError::NotADirectory,
+                super::DirFdError::Io => super::errors::RenameError::Io,
+            })?;
         let old_r = old_rel
             .as_rust_str()
             .map_err(|e| super::errors::RenameError::PathError(e.into()))?;
         let old_abs = Self::resolve_relative(&old_dir, old_r)
             .map_err(super::errors::RenameError::PathError)?;
-        let new_dir = self.dir_fd_path(new_dirfd).map_err(|e| match e {
-            super::DirFdError::ClosedFd => super::errors::RenameError::ClosedFd,
-            super::DirFdError::NotADirectory => super::errors::RenameError::NotADirectory,
-            super::DirFdError::Io => super::errors::RenameError::Io,
-        })?;
+        let new_dir = self
+            .dir_fd_path(new_dirfd, descriptors)
+            .map_err(|e| match e {
+                super::DirFdError::ClosedFd => super::errors::RenameError::ClosedFd,
+                super::DirFdError::NotADirectory => super::errors::RenameError::NotADirectory,
+                super::DirFdError::Io => super::errors::RenameError::Io,
+            })?;
         let new_r = new_rel
             .as_rust_str()
             .map_err(|e| super::errors::RenameError::PathError(e.into()))?;
         let new_abs = Self::resolve_relative(&new_dir, new_r)
             .map_err(super::errors::RenameError::PathError)?;
-        self.rename(old_abs, new_abs)
+        <Self as super::FileSystem>::rename(self, old_abs, new_abs, descriptors)
     }
 
     fn fd_path(
@@ -2463,8 +2499,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         dirfd: &FileFd<Platform, W>,
         rel_path: impl crate::path::Arg,
         mode: super::Mode,
+        descriptors: &Descriptors<Platform>,
     ) -> Result<(), MkdirError> {
-        let dir = self.dir_fd_path(dirfd).map_err(|e| match e {
+        let dir = self.dir_fd_path(dirfd, descriptors).map_err(|e| match e {
             super::DirFdError::NotADirectory => {
                 MkdirError::PathError(PathError::ComponentNotADirectory)
             }
@@ -2474,7 +2511,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
             .as_rust_str()
             .map_err(|e| MkdirError::PathError(e.into()))?;
         let abs = Self::resolve_relative(&dir, rel).map_err(MkdirError::PathError)?;
-        self.mkdir(abs, mode)
+        <Self as super::FileSystem>::mkdir(self, abs, mode, descriptors)
     }
 }
 #[derive(Debug)]

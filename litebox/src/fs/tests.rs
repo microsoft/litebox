@@ -4,7 +4,7 @@
 mod in_mem {
     use crate::LiteBox;
     use crate::fs::in_mem;
-    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -861,6 +861,7 @@ mod in_mem {
 mod tar_ro {
     use crate::LiteBox;
     use crate::fs::tar_ro;
+    #[allow(unused_imports)]
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
@@ -1013,7 +1014,7 @@ mod tar_ro {
 
 mod layered {
     use crate::LiteBox;
-    use crate::fs::{FileSystem as _, FileType, Mode, OFlags};
+    use crate::fs::{FileType, Mode, OFlags};
     use crate::fs::{in_mem, layered, tar_ro};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
@@ -2196,6 +2197,7 @@ mod layered {
 
 mod stdio {
     use crate::LiteBox;
+    #[allow(unused_imports)]
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
@@ -2267,7 +2269,7 @@ mod layered_stdio {
     use crate::LiteBox;
     use crate::fs::errors::ReadError;
     use crate::fs::layered::LayeringSemantics;
-    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{Mode, OFlags};
     use crate::fs::{devices, in_mem, layered};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;

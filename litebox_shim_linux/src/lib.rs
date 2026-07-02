@@ -434,7 +434,8 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         // leaking descriptor-table entries.
         if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
             drop(rds);
-            let _ = files.fs.close(&old_fs);
+            let mut descriptors = self.task.global.litebox.descriptor_table_mut();
+            let _ = files.fs.close(&old_fs, &mut *descriptors);
             rds = files.raw_descriptor_store.write();
         } else if let Ok(old_sock) =
             rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
@@ -524,7 +525,8 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         }
         if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
             drop(rds);
-            let _ = files.fs.close(&old_fs);
+            let mut descriptors = self.task.global.litebox.descriptor_table_mut();
+            let _ = files.fs.close(&old_fs, &mut *descriptors);
         } else if let Ok(old_unix) =
             rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
         {
@@ -1196,7 +1198,7 @@ impl LinuxShimBuilder {
             boot_time: self.platform.now(),
             load_filter: self.load_filter,
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
-            litebox: self.litebox,
+            litebox: alloc::boxed::Box::leak(alloc::boxed::Box::new(self.litebox)),
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
             pgrp_signal_subscriptions: litebox::sync::Mutex::new(BTreeMap::new()),
@@ -1916,29 +1918,37 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                 continue;
                             };
 
-                            let Ok(fd_handle) = child_files.fs.open(path, flags, Mode::empty())
+                            let mut descriptors = self.global.litebox.descriptor_table_mut();
+                            let Ok(fd_handle) =
+                                child_files
+                                    .fs
+                                    .open(path, flags, Mode::empty(), &mut *descriptors)
                             else {
                                 continue;
                             };
 
                             // Attach metadata markers matching the snapshot.
-                            let mut dt = self.global.litebox.descriptor_table_mut();
                             let mut rds = child_files.raw_descriptor_store.write();
                             let status_flags = OFlags::APPEND | flags;
-                            dt.set_entry_metadata(&fd_handle, StdioStatusFlags(status_flags));
+                            descriptors
+                                .set_entry_metadata(&fd_handle, StdioStatusFlags(status_flags));
                             if meta.is_host_tty_alias {
-                                dt.set_entry_metadata(&fd_handle, HostTtyAlias);
+                                descriptors.set_entry_metadata(&fd_handle, HostTtyAlias);
                             }
                             if meta.is_host_pty_device {
-                                dt.set_entry_metadata(&fd_handle, syscalls::file::HostPtyDeviceFd);
+                                descriptors.set_entry_metadata(
+                                    &fd_handle,
+                                    syscalls::file::HostPtyDeviceFd,
+                                );
                             }
                             if let Some(source_fd) = meta.host_stdio_source_fd {
-                                dt.set_entry_metadata(&fd_handle, HostStdioSourceFd(source_fd));
+                                descriptors
+                                    .set_entry_metadata(&fd_handle, HostStdioSourceFd(source_fd));
                             }
                             let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
                             debug_assert!(success, "fd slot {} already occupied", entry.fd);
                             drop(rds);
-                            drop(dt);
+                            drop(descriptors);
                         } else {
                             // Restore non-terminal FilesystemFd entries.  Reopen by path
                             // if available, fall back to /dev/null.  For stdio slots (0-2),
@@ -1956,22 +1966,33 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                 2 => OFlags::RDWR,
                                 _ => OFlags::RDONLY,
                             };
-                            let Ok(fd_handle) = child_files
-                                .fs
-                                .open(path, flags, Mode::empty())
-                                .or_else(|_| {
-                                    // Try RDONLY if the original mode failed.
-                                    child_files.fs.open(path, OFlags::RDONLY, Mode::empty())
-                                })
-                                .or_else(|_| {
-                                    child_files
-                                        .fs
-                                        .open("/dev/null", OFlags::RDWR, Mode::empty())
-                                })
-                            else {
-                                continue;
+                            let mut descriptors = self.global.litebox.descriptor_table_mut();
+                            let fd_handle = match child_files.fs.open(
+                                path,
+                                flags,
+                                Mode::empty(),
+                                &mut *descriptors,
+                            ) {
+                                Ok(fd_handle) => fd_handle,
+                                Err(_) => match child_files.fs.open(
+                                    path,
+                                    OFlags::RDONLY,
+                                    Mode::empty(),
+                                    &mut *descriptors,
+                                ) {
+                                    Ok(fd_handle) => fd_handle,
+                                    Err(_) => match child_files.fs.open(
+                                        "/dev/null",
+                                        OFlags::RDWR,
+                                        Mode::empty(),
+                                        &mut *descriptors,
+                                    ) {
+                                        Ok(fd_handle) => fd_handle,
+                                        Err(_) => continue,
+                                    },
+                                },
                             };
-
+                            drop(descriptors);
                             // For stdio slots, consume the pre-populated entry.
                             // For higher fds, the slot is empty.
                             let mut rds = child_files.raw_descriptor_store.write();
@@ -2684,24 +2705,24 @@ pub(crate) struct PipeNonblockEagainOnce(pub bool);
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
         use litebox::fs::{Mode, OFlags};
+        let mut dt = global.litebox.descriptor_table_mut();
         let stdin = self
             .fs
-            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open("/dev/stdin", OFlags::RDONLY, Mode::empty(), &mut *dt)
             .unwrap();
         let stdout = self
             .fs
-            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open("/dev/stdout", OFlags::WRONLY, Mode::empty(), &mut *dt)
             .unwrap();
         let stderr = self
             .fs
-            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open("/dev/stderr", OFlags::WRONLY, Mode::empty(), &mut *dt)
             .unwrap();
         let stdio_object_ids = [
             Some(stdin.object_id()),
             Some(stdout.object_id()),
             Some(stderr.object_id()),
         ];
-        let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
         for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
             let status_flags = OFlags::APPEND | OFlags::RDWR;
@@ -3463,7 +3484,8 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                 crate::RawFdRef::Fs(file_fd) => {
-                    let status = files.fs.fd_file_status(file_fd).ok();
+                    let descriptors = self.global.litebox.descriptor_table();
+                    let status = files.fs.fd_file_status(file_fd, &*descriptors).ok();
                     match status
                         .and_then(|status| status.node_info.rdev.map(core::num::NonZero::get))
                     {
@@ -5105,7 +5127,7 @@ struct GlobalState<FS: ShimFS> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
-    litebox: litebox::LiteBox<Platform>,
+    litebox: &'static litebox::LiteBox<Platform>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The optional worker-local network subsystem.

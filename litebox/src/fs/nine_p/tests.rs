@@ -12,7 +12,7 @@ use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
     TruncateError, UnlinkError, WriteError,
 };
-use crate::fs::{FileSystem as _, Mode, OFlags};
+use crate::fs::{Mode, OFlags};
 use crate::platform::mock::MockPlatform;
 
 use super::transport;

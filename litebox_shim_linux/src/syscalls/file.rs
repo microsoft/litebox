@@ -713,13 +713,24 @@ impl<FS: ShimFS> Task<FS> {
 
     fn inotify_dir_snapshot(&self, path: &str) -> BTreeMap<String, (usize, usize, u64)> {
         let files = self.files.borrow();
-        let Ok(dir) = files
-            .fs
-            .open(path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
-        else {
+        let Ok(dir) = ({
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            files.fs.open(
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+                &mut *descriptors,
+            )
+        }) else {
             return BTreeMap::new();
         };
-        let entries = files.fs.read_dir(&dir).unwrap_or_default();
+        let entries = {
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            files
+                .fs
+                .read_dir(&dir, &mut *descriptors)
+                .unwrap_or_default()
+        };
         let mut snapshot = BTreeMap::new();
         for entry in entries {
             let child_path = if path == "/" {
@@ -727,23 +738,37 @@ impl<FS: ShimFS> Task<FS> {
             } else {
                 alloc::format!("{path}/{name}", name = entry.name)
             };
-            if let Ok(status) = files.fs.file_status(child_path.clone()) {
+            let descriptors = self.global.litebox.descriptor_table();
+            if let Ok(status) = files.fs.file_status(child_path.clone(), &*descriptors) {
                 let mut hash = 0u64;
                 if matches!(status.file_type, litebox::fs::FileType::RegularFile)
-                    && let Ok(file) = files.fs.open(&child_path, OFlags::RDONLY, Mode::empty())
+                    && let Ok(file) = {
+                        let mut descriptors = self.global.litebox.descriptor_table_mut();
+                        files.fs.open(
+                            &child_path,
+                            OFlags::RDONLY,
+                            Mode::empty(),
+                            &mut *descriptors,
+                        )
+                    }
                 {
                     let mut buf = [0u8; 4096];
-                    if let Ok(n) = files.fs.read(&file, &mut buf, Some(0)) {
+                    if let Ok(n) = {
+                        let descriptors = self.global.litebox.descriptor_table();
+                        files.fs.read(&file, &mut buf, Some(0), &*descriptors)
+                    } {
                         for &byte in &buf[..n] {
                             hash = hash.wrapping_mul(16_777_619) ^ u64::from(byte);
                         }
                     }
-                    let _ = files.fs.close(&file);
+                    let mut descriptors = self.global.litebox.descriptor_table_mut();
+                    let _ = files.fs.close(&file, &mut *descriptors);
                 }
                 snapshot.insert(entry.name, (status.size, status.node_info.ino, hash));
             }
         }
-        let _ = files.fs.close(&dir);
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
+        let _ = files.fs.close(&dir, &mut *descriptors);
         snapshot
     }
 
@@ -876,7 +901,8 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                 crate::RawFdRef::Fs(fd) => {
-                    let status = files.fs.fd_file_status(fd).ok()?;
+                    let descriptors = self.global.litebox.descriptor_table();
+                    let status = files.fs.fd_file_status(fd, &*descriptors).ok()?;
                     let rdev = status.node_info.rdev?.get();
                     ((rdev >> 8) == 136).then_some(rdev)
                 }
@@ -1236,38 +1262,50 @@ impl<FS: ShimFS> Task<FS> {
         let tmp_path = alloc::format!("/tmp/.proc_synthetic_{n}");
 
         // Create, write, close, then reopen read-only.
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
         let write_fd = files
             .fs
             .open(
                 &tmp_path,
                 OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC,
                 litebox::fs::Mode::RWXU,
+                &mut *descriptors,
             )
             .map_err(Errno::from)?;
         files
             .fs
-            .write(&write_fd, contents.as_bytes(), None)
+            .write(&write_fd, contents.as_bytes(), None, &mut *descriptors)
             .map_err(Errno::from)?;
-        files.fs.close(&write_fd).map_err(Errno::from)?;
+        files
+            .fs
+            .close(&write_fd, &mut *descriptors)
+            .map_err(Errno::from)?;
 
         let read_fd = files
             .fs
-            .open(&tmp_path, OFlags::RDONLY, litebox::fs::Mode::empty())
+            .open(
+                &tmp_path,
+                OFlags::RDONLY,
+                litebox::fs::Mode::empty(),
+                &mut *descriptors,
+            )
             .map_err(Errno::from)?;
 
         // Delete the file so it's cleaned up when the fd is closed.
-        let _ = files.fs.unlink(&tmp_path);
+        let _ = files.fs.unlink(&tmp_path, &mut *descriptors);
 
         // Apply CLOEXEC if requested.
         if flags.contains(OFlags::CLOEXEC) {
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let None = dt.set_fd_metadata(&read_fd, FileDescriptorFlags::FD_CLOEXEC) else {
+            let None = descriptors.set_fd_metadata(&read_fd, FileDescriptorFlags::FD_CLOEXEC)
+            else {
                 unreachable!()
             };
         }
+        drop(descriptors);
 
         let raw_fd = files.insert_raw_fd(read_fd).map_err(|read_fd| {
-            files.fs.close(&read_fd).ok();
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            files.fs.close(&read_fd, &mut *descriptors).ok();
             Errno::EMFILE
         })?;
         Ok(u32::try_from(raw_fd).unwrap())
@@ -1465,8 +1503,13 @@ impl<FS: ShimFS> Task<FS> {
             return result;
         }
         let mode = mode & !self.get_umask();
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
         let existed_before = if flags.contains(OFlags::CREAT) {
-            self.files.borrow().fs.file_status(&*path).is_ok()
+            self.files
+                .borrow()
+                .fs
+                .file_status(&*path, &*descriptors)
+                .is_ok()
         } else {
             true
         };
@@ -1474,7 +1517,7 @@ impl<FS: ShimFS> Task<FS> {
             .files
             .borrow()
             .fs
-            .open(&*path, flags - OFlags::CLOEXEC, mode)
+            .open(&*path, flags - OFlags::CLOEXEC, mode, &mut *descriptors)
             .map_err(Errno::from)?;
         if flags.contains(OFlags::CREAT)
             && !existed_before
@@ -1484,26 +1527,28 @@ impl<FS: ShimFS> Task<FS> {
         }
         let status = flags & OFlags::STATUS_FLAGS_MASK;
         {
-            let mut dt = self.global.litebox.descriptor_table_mut();
             if flags.contains(OFlags::CLOEXEC) {
-                let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC) else {
+                let None = descriptors.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+                else {
                     unreachable!()
                 };
             }
             // Store access mode + status flags so F_GETFL can return them.
-            let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
+            let None = descriptors.set_entry_metadata(&file, crate::StdioStatusFlags(status))
+            else {
                 unreachable!()
             };
             if let Ok(path_str) = path.to_str()
                 && let Some(source_fd) = host_stdio_source_for_path(path_str)
             {
-                let old = dt.set_entry_metadata(&file, crate::HostStdioSourceFd(source_fd));
+                let old =
+                    descriptors.set_entry_metadata(&file, crate::HostStdioSourceFd(source_fd));
                 assert!(old.is_none());
             }
             if let Ok(path_str) = path.to_str()
                 && is_host_tty_path(path_str)
             {
-                let old = dt.set_entry_metadata(&file, crate::HostTtyAlias);
+                let old = descriptors.set_entry_metadata(&file, crate::HostTtyAlias);
                 assert!(old.is_none());
             }
             // Tag fds opened via the host PTY device path (e.g., /dev/pts/156)
@@ -1517,12 +1562,12 @@ impl<FS: ShimFS> Task<FS> {
                     .files
                     .borrow()
                     .fs
-                    .fd_file_status(&file)
+                    .fd_file_status(&file, &*descriptors)
                     .ok()
                     .and_then(|s| s.node_info.rdev)
                     .is_some_and(|rdev| (rdev.get() >> 8) >= 136);
                 if !is_sandbox_pty {
-                    let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
+                    let old = descriptors.set_entry_metadata(&file, HostPtyDeviceFd);
                     assert!(old.is_none());
                 }
             }
@@ -1530,13 +1575,15 @@ impl<FS: ShimFS> Task<FS> {
         self.files
             .borrow()
             .fs
-            .set_open_status_flags(&file, status)
+            .set_open_status_flags(&file, status, &mut *descriptors)
             .map_err(|_| Errno::EBADF)?;
+        drop(descriptors);
         #[cfg(feature = "trace_syscalls")]
         let object_id = file.object_id().as_u64();
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
-            files.fs.close(&file).unwrap();
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            files.fs.close(&file, &mut *descriptors).unwrap();
             Errno::EMFILE
         })?;
         #[cfg(feature = "trace_syscalls")]
@@ -1598,10 +1645,17 @@ impl<FS: ShimFS> Task<FS> {
 
                 let abs_path = self.resolve_dirfd_path(fd, &path).ok();
                 let files = self.files.borrow();
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
                 let file = files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                     crate::RawFdRef::Fs(dirfd) => files
                         .fs
-                        .open_at(dirfd, path, flags - OFlags::CLOEXEC, mode)
+                        .open_at(
+                            dirfd,
+                            path,
+                            flags - OFlags::CLOEXEC,
+                            mode,
+                            &mut *descriptors,
+                        )
                         .map_err(Errno::from),
                     #[cfg(feature = "worker_local_inet")]
                     crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -1624,24 +1678,27 @@ impl<FS: ShimFS> Task<FS> {
                 })?;
                 let file = file?;
                 {
-                    let mut dt = self.global.litebox.descriptor_table_mut();
                     if flags.contains(OFlags::CLOEXEC) {
-                        let None = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
+                        let None =
+                            descriptors.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC)
                         else {
                             unreachable!()
                         };
                     }
-                    let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
+                    let None =
+                        descriptors.set_entry_metadata(&file, crate::StdioStatusFlags(status))
+                    else {
                         unreachable!()
                     };
                     if let Some(source_fd) =
                         abs_path.as_deref().and_then(host_stdio_source_for_path)
                     {
-                        let old = dt.set_entry_metadata(&file, crate::HostStdioSourceFd(source_fd));
+                        let old = descriptors
+                            .set_entry_metadata(&file, crate::HostStdioSourceFd(source_fd));
                         assert!(old.is_none());
                     }
                     if abs_path.as_deref().is_some_and(is_host_tty_path) {
-                        let old = dt.set_entry_metadata(&file, crate::HostTtyAlias);
+                        let old = descriptors.set_entry_metadata(&file, crate::HostTtyAlias);
                         assert!(old.is_none());
                     }
                     if abs_path
@@ -1650,24 +1707,26 @@ impl<FS: ShimFS> Task<FS> {
                     {
                         let is_sandbox_pty = files
                             .fs
-                            .fd_file_status(&file)
+                            .fd_file_status(&file, &*descriptors)
                             .ok()
                             .and_then(|s| s.node_info.rdev)
                             .is_some_and(|rdev| (rdev.get() >> 8) >= 136);
                         if !is_sandbox_pty {
-                            let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
+                            let old = descriptors.set_entry_metadata(&file, HostPtyDeviceFd);
                             assert!(old.is_none());
                         }
                     }
                 }
                 files
                     .fs
-                    .set_open_status_flags(&file, status)
+                    .set_open_status_flags(&file, status, &mut *descriptors)
                     .map_err(|_| Errno::EBADF)?;
+                drop(descriptors);
                 #[cfg(feature = "trace_syscalls")]
                 let object_id = file.object_id().as_u64();
                 let guest_raw = files.insert_raw_fd(file).map_err(|file| {
-                    files.fs.close(&file).unwrap();
+                    let mut descriptors = self.global.litebox.descriptor_table_mut();
+                    files.fs.close(&file, &mut *descriptors).unwrap();
                     Errno::EMFILE
                 })?;
                 #[cfg(feature = "trace_syscalls")]
@@ -1696,7 +1755,11 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                 crate::RawFdRef::Fs(fd) => {
-                    files.fs.truncate(fd, length, false).map_err(Errno::from)
+                    let mut descriptors = self.global.litebox.descriptor_table_mut();
+                    files
+                        .fs
+                        .truncate(fd, length, false, &mut *descriptors)
+                        .map_err(Errno::from)
                 }
                 #[cfg(feature = "worker_local_inet")]
                 crate::RawFdRef::Net(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
@@ -1749,12 +1812,20 @@ impl<FS: ShimFS> Task<FS> {
         match fs_path {
             FsPath::Absolute { path } => {
                 if flags.contains(AtFlags::AT_REMOVEDIR) {
-                    self.files.borrow().fs.rmdir(path).map_err(Errno::from)
+                    let mut descriptors = self.global.litebox.descriptor_table_mut();
+                    self.files
+                        .borrow()
+                        .fs
+                        .rmdir(path, &mut *descriptors)
+                        .map_err(Errno::from)
                 } else {
                     self.files
                         .borrow()
                         .fs
-                        .unlink(path.clone())
+                        .unlink(
+                            path.clone(),
+                            &mut *self.global.litebox.descriptor_table_mut(),
+                        )
                         .map_err(Errno::from)?;
                     if let Ok(path_str) = path.to_str() {
                         self.notify_inotify_path(path_str, IN_DELETE, 0);
@@ -1775,7 +1846,11 @@ impl<FS: ShimFS> Task<FS> {
                         if is_rmdir {
                             // rmdir doesn't have an _at variant yet; resolve manually.
                             // Verify dirfd refers to a directory.
-                            let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
+                            let descriptors = self.global.litebox.descriptor_table();
+                            let status = files
+                                .fs
+                                .fd_file_status(dirfd, &*descriptors)
+                                .map_err(Errno::from)?;
                             if !matches!(status.file_type, litebox::fs::FileType::Directory) {
                                 return Err(Errno::ENOTDIR);
                             }
@@ -1791,9 +1866,14 @@ impl<FS: ShimFS> Task<FS> {
                             } else {
                                 alloc::format!("{dir_path}/{rel}")
                             };
-                            files.fs.rmdir(abs).map_err(Errno::from)
+                            let mut descriptors = self.global.litebox.descriptor_table_mut();
+                            files.fs.rmdir(abs, &mut *descriptors).map_err(Errno::from)
                         } else {
-                            files.fs.unlink_at(dirfd, path).map_err(Errno::from)
+                            let mut descriptors = self.global.litebox.descriptor_table_mut();
+                            files
+                                .fs
+                                .unlink_at(dirfd, path, &mut *descriptors)
+                                .map_err(Errno::from)
                         }
                     }
                     #[cfg(feature = "worker_local_inet")]
@@ -1856,7 +1936,11 @@ impl<FS: ShimFS> Task<FS> {
                     files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                         crate::RawFdRef::Fs(dirfd) => {
                             // Verify dirfd refers to a directory.
-                            let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
+                            let descriptors = self.global.litebox.descriptor_table();
+                            let status = files
+                                .fs
+                                .fd_file_status(dirfd, &*descriptors)
+                                .map_err(Errno::from)?;
                             if !matches!(status.file_type, litebox::fs::FileType::Directory) {
                                 return Err(Errno::ENOTDIR);
                             }
@@ -1904,15 +1988,25 @@ impl<FS: ShimFS> Task<FS> {
         let new_path = resolve(new)?;
         if flags & RENAME_NOREPLACE != 0 {
             // Check if target exists — RENAME_NOREPLACE fails with EEXIST.
-            if self.files.borrow().fs.file_status(&*new_path).is_ok() {
+            let descriptors = self.global.litebox.descriptor_table();
+            if self
+                .files
+                .borrow()
+                .fs
+                .file_status(&*new_path, &*descriptors)
+                .is_ok()
+            {
                 return Err(Errno::EEXIST);
             }
         }
-        self.files
-            .borrow()
-            .fs
-            .rename(old_path.clone(), new_path.clone())
-            .map_err(Errno::from)?;
+        {
+            let files = self.files.borrow();
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            files
+                .fs
+                .rename(old_path.clone(), new_path.clone(), &mut *descriptors)
+                .map_err(Errno::from)?;
+        }
         let cookie = Self::next_inotify_cookie();
         if let Ok(old_path) = old_path.to_str() {
             self.notify_inotify_path(old_path, IN_MOVED_FROM, cookie);
@@ -2154,21 +2248,25 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Fs(fd) => {
                     let _position_guard = if offset.is_none()
                         && matches!(
-                            files.fs.fd_file_status(fd),
+                            {
+                                let descriptors = self.global.litebox.descriptor_table();
+                                files.fs.fd_file_status(fd, &*descriptors)
+                            },
                             Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
                         ) {
                         Some(files.file_position_lock.lock())
                     } else {
                         None
                     };
-                    let result = files
-                        .fs
-                        .read(fd, &mut buf.borrow_mut(), offset)
-                        .map_err(Errno::from);
-                    let nonblocking = self
-                        .global
-                        .litebox
-                        .descriptor_table()
+                    let result = {
+                        let descriptors = self.global.litebox.descriptor_table();
+                        files
+                            .fs
+                            .read(fd, &mut buf.borrow_mut(), offset, &*descriptors)
+                            .map_err(Errno::from)
+                    };
+                    let descriptors = self.global.litebox.descriptor_table();
+                    let nonblocking = descriptors
                         .with_metadata(fd, |crate::StdioStatusFlags(flags)| {
                             flags.contains(OFlags::NONBLOCK)
                         })
@@ -2179,9 +2277,10 @@ impl<FS: ShimFS> Task<FS> {
                     // return EAGAIN immediately for epoll-driven callers.
                     if let Err(Errno::EAGAIN) = result
                         && !nonblocking
-                        && let Some(pollable) = files.fs.get_io_pollable(fd)
+                        && let Some(pollable) = files.fs.get_io_pollable(fd, &*descriptors)
                         && pollable.should_block_read()
                     {
+                        drop(descriptors);
                         loop {
                             // vfork parking needs blocked host-side loops
                             // to break out so prepare_to_run_guest() can
@@ -2194,7 +2293,13 @@ impl<FS: ShimFS> Task<FS> {
                                 return Ok(0); // EOF — master closed
                             }
                             if events.contains(Events::IN) {
-                                match files.fs.read(fd, &mut buf.borrow_mut(), offset) {
+                                let descriptors = self.global.litebox.descriptor_table();
+                                match files.fs.read(
+                                    fd,
+                                    &mut buf.borrow_mut(),
+                                    offset,
+                                    &*descriptors,
+                                ) {
                                     Ok(n) => return Ok(n),
                                     Err(litebox::fs::errors::ReadError::WouldBlock) => {
                                         core::hint::spin_loop();
@@ -2452,20 +2557,30 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     let _position_guard = if offset.is_none()
                         && matches!(
-                            files.fs.fd_file_status(fd),
+                            {
+                                let descriptors = self.global.litebox.descriptor_table();
+                                files.fs.fd_file_status(fd, &*descriptors)
+                            },
                             Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
                         ) {
                         Some(files.file_position_lock.lock())
                     } else {
                         None
                     };
-                    let result = files.fs.write(fd, buf, offset).map_err(Errno::from);
-                    if matches!(result, Ok(n) if n > 0)
-                        && let Some(path) = {
-                            let descriptors = self.global.litebox.descriptor_table();
+                    let (result, modified_path) = {
+                        let mut descriptors = self.global.litebox.descriptor_table_mut();
+                        let result = files
+                            .fs
+                            .write(fd, buf, offset, &mut *descriptors)
+                            .map_err(Errno::from);
+                        let modified_path = if matches!(result, Ok(n) if n > 0) {
                             files.fs.fd_path(fd, &*descriptors)
-                        }
-                    {
+                        } else {
+                            None
+                        };
+                        (result, modified_path)
+                    };
+                    if let Some(path) = modified_path {
                         self.notify_inotify_path(&path, IN_MODIFY, 0);
                     }
                     result
@@ -2636,7 +2751,11 @@ impl<FS: ShimFS> Task<FS> {
         need_read: bool,
         need_write: bool,
     ) -> Result<litebox::fs::FileStatus, Errno> {
-        let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
+        let descriptors = self.global.litebox.descriptor_table();
+        let status = files
+            .fs
+            .fd_file_status(typed_fd, &*descriptors)
+            .map_err(Errno::from)?;
         // reason: unsupported variants intentionally share this fallback path.
         #[allow(clippy::wildcard_enum_match_arm)]
         match status.file_type {
@@ -2774,18 +2893,30 @@ impl<FS: ShimFS> Task<FS> {
             // I/O on the same shared file description, but never park while
             // holding that mutex or vfork parking can deadlock on it.
             let _position_guard = use_position_lock.then(|| files.file_position_lock.lock());
-            let start_in = explicit_in_pos.unwrap_or(
+            let start_in = explicit_in_pos.unwrap_or({
+                let descriptors = self.global.litebox.descriptor_table();
                 files
                     .fs
-                    .seek(&*src_fd, 0, SeekWhence::RelativeToCurrentOffset)
-                    .map_err(Errno::from)?,
-            );
-            let start_out = explicit_out_pos.unwrap_or(
+                    .seek(
+                        &*src_fd,
+                        0,
+                        SeekWhence::RelativeToCurrentOffset,
+                        &*descriptors,
+                    )
+                    .map_err(Errno::from)?
+            });
+            let start_out = explicit_out_pos.unwrap_or({
+                let descriptors = self.global.litebox.descriptor_table();
                 files
                     .fs
-                    .seek(&*dst_fd, 0, SeekWhence::RelativeToCurrentOffset)
-                    .map_err(Errno::from)?,
-            );
+                    .seek(
+                        &*dst_fd,
+                        0,
+                        SeekWhence::RelativeToCurrentOffset,
+                        &*descriptors,
+                    )
+                    .map_err(Errno::from)?
+            });
             let same_file = src_status.node_info.dev == dst_status.node_info.dev
                 && src_status.node_info.ino == dst_status.node_info.ino;
             let copy_len = core::cmp::min(len, src_status.size.saturating_sub(start_in));
@@ -2804,11 +2935,18 @@ impl<FS: ShimFS> Task<FS> {
             let mut out_pos = start_out;
             while copied < copy_len {
                 let chunk_len = core::cmp::min(copy_len - copied, buf.len());
-                let read = match files
-                    .fs
-                    .read(&*src_fd, &mut buf[..chunk_len], explicit_in_pos)
-                    .map_err(Errno::from)
-                {
+                let read = match {
+                    let descriptors = self.global.litebox.descriptor_table();
+                    files
+                        .fs
+                        .read(
+                            &*src_fd,
+                            &mut buf[..chunk_len],
+                            explicit_in_pos,
+                            &*descriptors,
+                        )
+                        .map_err(Errno::from)
+                } {
                     Ok(n) => n,
                     Err(err) if copied == 0 => return Err(err),
                     Err(_) => break,
@@ -2823,19 +2961,28 @@ impl<FS: ShimFS> Task<FS> {
                 let mut written = 0usize;
                 let mut stop_after_chunk = false;
                 while written < read {
-                    let wrote = match files
-                        .fs
-                        .write(&*dst_fd, &buf[written..read], Some(out_pos))
-                        .map_err(Errno::from)
-                    {
+                    let wrote = match {
+                        let mut descriptors = self.global.litebox.descriptor_table_mut();
+                        files
+                            .fs
+                            .write(
+                                &*dst_fd,
+                                &buf[written..read],
+                                Some(out_pos),
+                                &mut *descriptors,
+                            )
+                            .map_err(Errno::from)
+                    } {
                         Ok(0) if copied == 0 && written == 0 => {
                             if explicit_in_pos.is_none() {
+                                let descriptors = self.global.litebox.descriptor_table();
                                 files
                                     .fs
                                     .seek(
                                         &*src_fd,
                                         -isize::try_from(read).map_err(|_| Errno::EOVERFLOW)?,
                                         SeekWhence::RelativeToCurrentOffset,
+                                        &*descriptors,
                                     )
                                     .map_err(Errno::from)?;
                             }
@@ -2848,12 +2995,14 @@ impl<FS: ShimFS> Task<FS> {
                         Ok(n) => n,
                         Err(err) if copied == 0 && written == 0 => {
                             if explicit_in_pos.is_none() {
+                                let descriptors = self.global.litebox.descriptor_table();
                                 files
                                     .fs
                                     .seek(
                                         &*src_fd,
                                         -isize::try_from(read).map_err(|_| Errno::EOVERFLOW)?,
                                         SeekWhence::RelativeToCurrentOffset,
+                                        &*descriptors,
                                     )
                                     .map_err(Errno::from)?;
                             }
@@ -2867,12 +3016,14 @@ impl<FS: ShimFS> Task<FS> {
                     written = written.checked_add(wrote).ok_or(Errno::EOVERFLOW)?;
                     out_pos = out_pos.checked_add(wrote).ok_or(Errno::EOVERFLOW)?;
                     if explicit_out_pos.is_none() {
+                        let descriptors = self.global.litebox.descriptor_table();
                         files
                             .fs
                             .seek(
                                 &*dst_fd,
                                 isize::try_from(out_pos).map_err(|_| Errno::EOVERFLOW)?,
                                 SeekWhence::RelativeToBeginning,
+                                &*descriptors,
                             )
                             .map_err(Errno::from)?;
                     }
@@ -2882,12 +3033,14 @@ impl<FS: ShimFS> Task<FS> {
                 }
 
                 if explicit_in_pos.is_none() && written < read {
+                    let descriptors = self.global.litebox.descriptor_table();
                     files
                         .fs
                         .seek(
                             &*src_fd,
                             -isize::try_from(read - written).map_err(|_| Errno::EOVERFLOW)?,
                             SeekWhence::RelativeToCurrentOffset,
+                            &*descriptors,
                         )
                         .map_err(Errno::from)?;
                 }
@@ -2945,14 +3098,21 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                 crate::RawFdRef::Fs(fd) => {
                     let _position_guard = if matches!(
-                        files.fs.fd_file_status(fd),
+                        {
+                            let descriptors = self.global.litebox.descriptor_table();
+                            files.fs.fd_file_status(fd, &*descriptors)
+                        },
                         Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
                     ) {
                         Some(files.file_position_lock.lock())
                     } else {
                         None
                     };
-                    files.fs.seek(fd, offset, whence).map_err(Errno::from)
+                    let descriptors = self.global.litebox.descriptor_table();
+                    files
+                        .fs
+                        .seek(fd, offset, whence, &*descriptors)
+                        .map_err(Errno::from)
                 }
                 #[cfg(feature = "worker_local_inet")]
                 crate::RawFdRef::Net(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
@@ -2984,12 +3144,14 @@ impl<FS: ShimFS> Task<FS> {
         status_flags_bits: u32,
     ) -> Result<(), Errno> {
         let status_flags = OFlags::from_bits_retain(status_flags_bits) & OFlags::STATUS_FLAGS_MASK;
-        let file = self
-            .files
-            .borrow()
+        let files = self.files.borrow();
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
+        let file = files
             .fs
-            .open(path, status_flags, Mode::empty())
+            .open(path, status_flags, Mode::empty(), &mut *descriptors)
             .map_err(Errno::from)?;
+        drop(descriptors);
+        drop(files);
 
         self.install_brokerfile_finalize(guest_fd, file, position, status_flags)
     }
@@ -3044,12 +3206,14 @@ impl<FS: ShimFS> Task<FS> {
         status_flags_bits: u32,
     ) -> Result<(), Errno> {
         let status_flags = OFlags::from_bits_retain(status_flags_bits) & OFlags::STATUS_FLAGS_MASK;
-        let file = self
-            .files
-            .borrow()
+        let files = self.files.borrow();
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
+        let file = files
             .fs
-            .wrap_existing_fid(remote_fid, path, status_flags)
+            .wrap_existing_fid(remote_fid, path, status_flags, &mut *descriptors)
             .map_err(Errno::from)?;
+        drop(descriptors);
+        drop(files);
 
         self.install_brokerfile_finalize(guest_fd, file, position, status_flags)
     }
@@ -3061,16 +3225,17 @@ impl<FS: ShimFS> Task<FS> {
         position: usize,
         status_flags: OFlags,
     ) -> Result<(), Errno> {
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
         {
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status_flags)) else {
+            let None = descriptors.set_entry_metadata(&file, crate::StdioStatusFlags(status_flags))
+            else {
                 unreachable!()
             };
         }
         self.files
             .borrow()
             .fs
-            .set_open_status_flags(&file, status_flags)
+            .set_open_status_flags(&file, status_flags, &mut *descriptors)
             .map_err(|_| Errno::EBADF)?;
         if position != 0 {
             self.files
@@ -3080,9 +3245,11 @@ impl<FS: ShimFS> Task<FS> {
                     &file,
                     isize::try_from(position).map_err(|_| Errno::EINVAL)?,
                     SeekWhence::RelativeToBeginning,
+                    &*descriptors,
                 )
                 .map_err(Errno::from)?;
         }
+        drop(descriptors);
 
         if self
             .files
@@ -3189,10 +3356,11 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
         let pathname = self.resolve_path(pathname)?;
         let mode = Mode::from_bits_retain(mode) & !self.get_umask();
+        let descriptors = self.global.litebox.descriptor_table();
         self.files
             .borrow()
             .fs
-            .mkdir(pathname, mode)
+            .mkdir(pathname, mode, &*descriptors)
             .map_err(Errno::from)
     }
 
@@ -3206,18 +3374,22 @@ impl<FS: ShimFS> Task<FS> {
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         let mode = Mode::from_bits_retain(mode) & !self.get_umask();
         match fs_path {
-            FsPath::Absolute { path } => self
-                .files
-                .borrow()
-                .fs
-                .mkdir(path, mode)
-                .map_err(Errno::from),
-            FsPath::Cwd => self
-                .files
-                .borrow()
-                .fs
-                .mkdir(get_cwd(), mode)
-                .map_err(Errno::from),
+            FsPath::Absolute { path } => {
+                let descriptors = self.global.litebox.descriptor_table();
+                self.files
+                    .borrow()
+                    .fs
+                    .mkdir(path, mode, &*descriptors)
+                    .map_err(Errno::from)
+            }
+            FsPath::Cwd => {
+                let descriptors = self.global.litebox.descriptor_table();
+                self.files
+                    .borrow()
+                    .fs
+                    .mkdir(get_cwd(), mode, &*descriptors)
+                    .map_err(Errno::from)
+            }
             FsPath::Fd(_fd) => Err(Errno::EEXIST),
             FsPath::FdRelative { fd, path } => {
                 let Ok(raw_fd) = usize::try_from(fd) else {
@@ -3226,7 +3398,11 @@ impl<FS: ShimFS> Task<FS> {
                 let files = self.files.borrow();
                 files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                     crate::RawFdRef::Fs(dirfd) => {
-                        files.fs.mkdir_at(dirfd, path, mode).map_err(Errno::from)
+                        let descriptors = self.global.litebox.descriptor_table();
+                        files
+                            .fs
+                            .mkdir_at(dirfd, path, mode, &*descriptors)
+                            .map_err(Errno::from)
                     }
                     #[cfg(feature = "worker_local_inet")]
                     crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -3284,10 +3460,11 @@ impl<FS: ShimFS> Task<FS> {
     /// Validate that a path resolves to an existing file (follows symlinks).
     pub fn validate_path(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         let path = self.resolve_path(pathname)?;
+        let descriptors = self.global.litebox.descriptor_table();
         self.files
             .borrow()
             .fs
-            .file_status(path)
+            .file_status(path, &*descriptors)
             .map_err(Errno::from)?;
         Ok(())
     }
@@ -3297,16 +3474,20 @@ impl<FS: ShimFS> Task<FS> {
     pub fn validate_path_nofollow(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         let path = self.resolve_path(pathname)?;
         let files = self.files.borrow();
+        let descriptors = self.global.litebox.descriptor_table();
         // If the path resolves via follow (normal stat), it exists.
-        if files.fs.file_status(&path).is_ok() {
+        if files.fs.file_status(&path, &*descriptors).is_ok() {
             return Ok(());
         }
         // The follow-stat failed. Check if it's a symlink (possibly dangling).
-        if files.fs.read_link(&path).is_ok() {
+        if files.fs.read_link(&path, &*descriptors).is_ok() {
             return Ok(());
         }
         // Neither a resolvable path nor a symlink — report the original error.
-        files.fs.file_status(path).map_err(Errno::from)?;
+        files
+            .fs
+            .file_status(path, &*descriptors)
+            .map_err(Errno::from)?;
         Ok(())
     }
 
@@ -3330,7 +3511,11 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
             crate::RawFdRef::Fs(dirfd) => {
-                let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
+                let descriptors = self.global.litebox.descriptor_table();
+                let status = files
+                    .fs
+                    .fd_file_status(dirfd, &*descriptors)
+                    .map_err(Errno::from)?;
                 if !matches!(status.file_type, litebox::fs::FileType::Directory) {
                     return Err(Errno::ENOTDIR);
                 }
@@ -3382,23 +3567,31 @@ impl<FS: ShimFS> Task<FS> {
         let get_cwd = || self.fs.borrow().cwd.read().clone();
         let fs_path = FsPath::new(newdirfd, linkpath, get_cwd)?;
         match fs_path {
-            FsPath::Absolute { path } => self
-                .files
-                .borrow()
-                .fs
-                .symlink(target_str, path)
-                .map_err(Errno::from),
-            FsPath::Cwd => self
-                .files
-                .borrow()
-                .fs
-                .symlink(target_str, get_cwd())
-                .map_err(Errno::from),
+            FsPath::Absolute { path } => {
+                let descriptors = self.global.litebox.descriptor_table();
+                self.files
+                    .borrow()
+                    .fs
+                    .symlink(target_str, path, &*descriptors)
+                    .map_err(Errno::from)
+            }
+            FsPath::Cwd => {
+                let descriptors = self.global.litebox.descriptor_table();
+                self.files
+                    .borrow()
+                    .fs
+                    .symlink(target_str, get_cwd(), &*descriptors)
+                    .map_err(Errno::from)
+            }
             FsPath::Fd(_) => Err(Errno::EEXIST),
             FsPath::FdRelative { fd, path } => {
                 let abs = self.resolve_dirfd_path(fd, &path)?;
                 let files = self.files.borrow();
-                files.fs.symlink(target_str, abs).map_err(Errno::from)
+                let descriptors = self.global.litebox.descriptor_table();
+                files
+                    .fs
+                    .symlink(target_str, abs, &*descriptors)
+                    .map_err(Errno::from)
             }
         }
     }
@@ -3419,10 +3612,11 @@ impl<FS: ShimFS> Task<FS> {
 
         let old_abs = self.resolve_fs_path_to_string(old_fs, &get_cwd)?;
         let new_abs = self.resolve_fs_path_to_string(new_fs, &get_cwd)?;
+        let descriptors = self.global.litebox.descriptor_table();
         self.files
             .borrow()
             .fs
-            .link(old_abs, new_abs)
+            .link(old_abs, new_abs, &*descriptors)
             .map_err(Errno::from)
     }
 
@@ -3469,7 +3663,8 @@ impl<FS: ShimFS> Task<FS> {
                     );
                 }
                 drop(rds);
-                return files.fs.close(&fd).map_err(Errno::from);
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
+                return files.fs.close(&fd, &mut *descriptors).map_err(Errno::from);
             }
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
                 return Err(Errno::EBADF);
@@ -3925,8 +4120,9 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                 crate::RawFdRef::Fs(fd) => {
+                    let descriptors = self.global.litebox.descriptor_table();
                     let needs_position_lock = matches!(
-                        files.fs.fd_file_status(fd),
+                        files.fs.fd_file_status(fd, &*descriptors),
                         Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
                     );
                     let mut total_read = 0;
@@ -3950,12 +4146,12 @@ impl<FS: ShimFS> Task<FS> {
                             let _position_guard = files.file_position_lock.lock();
                             files
                                 .fs
-                                .read(fd, &mut kernel_buffer.borrow_mut(), None)
+                                .read(fd, &mut kernel_buffer.borrow_mut(), None, &*descriptors)
                                 .map_err(Errno::from)?
                         } else {
                             files
                                 .fs
-                                .read(fd, &mut kernel_buffer.borrow_mut(), None)
+                                .read(fd, &mut kernel_buffer.borrow_mut(), None, &*descriptors)
                                 .map_err(Errno::from)?
                         };
                         self.park_if_deferred();
@@ -4154,9 +4350,9 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-fn write_to_iovec<F>(iovs: &[IoWriteVec<ConstPtr<u8>>], write_fn: F) -> Result<usize, Errno>
+fn write_to_iovec<F>(iovs: &[IoWriteVec<ConstPtr<u8>>], mut write_fn: F) -> Result<usize, Errno>
 where
-    F: Fn(&[u8]) -> Result<usize, Errno>,
+    F: FnMut(&[u8]) -> Result<usize, Errno>,
 {
     let mut total_written = 0;
     for iov in iovs {
@@ -4418,8 +4614,9 @@ impl<FS: ShimFS> Task<FS> {
         let res = files
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                 crate::RawFdRef::Fs(fd) => {
+                    let mut descriptors = self.global.litebox.descriptor_table_mut();
                     let _position_guard = if matches!(
-                        files.fs.fd_file_status(fd),
+                        files.fs.fd_file_status(fd, &*descriptors),
                         Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
                     ) {
                         Some(files.file_position_lock.lock())
@@ -4427,7 +4624,10 @@ impl<FS: ShimFS> Task<FS> {
                         None
                     };
                     write_to_iovec(iovs, |buf: &[u8]| {
-                        files.fs.write(fd, buf, None).map_err(Errno::from)
+                        files
+                            .fs
+                            .write(fd, buf, None, &mut *descriptors)
+                            .map_err(Errno::from)
                     })
                 }
                 #[cfg(feature = "worker_local_inet")]
@@ -4578,7 +4778,12 @@ impl<FS: ShimFS> Task<FS> {
         mode: litebox_common_linux::AccessFlags,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path(pathname)?;
-        let status = self.files.borrow().fs.file_status(&*pathname)?;
+        let descriptors = self.global.litebox.descriptor_table();
+        let status = self
+            .files
+            .borrow()
+            .fs
+            .file_status(&*pathname, &*descriptors)?;
         Self::check_access_mode(&status, mode)
     }
 
@@ -4603,6 +4808,7 @@ impl<FS: ShimFS> Task<FS> {
         let follow_symlinks = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
 
         let files = self.files.borrow();
+        let descriptors = self.global.litebox.descriptor_table();
         let status = match fs_path {
             FsPath::Absolute { path } => {
                 // Skip client-side symlink resolution when the FS follows
@@ -4610,12 +4816,12 @@ impl<FS: ShimFS> Task<FS> {
                 if follow_symlinks && !files.fs.walks_follow_symlinks() {
                     let path_str = path.to_str().map_err(|_| Errno::EINVAL)?;
                     let resolved = self.canonicalize_path(path_str)?;
-                    files.fs.file_status(&*resolved)?
+                    files.fs.file_status(&*resolved, &*descriptors)?
                 } else {
-                    files.fs.file_status(&*path)?
+                    files.fs.file_status(&*path, &*descriptors)?
                 }
             }
-            FsPath::Cwd => files.fs.file_status(&*get_cwd())?,
+            FsPath::Cwd => files.fs.file_status(&*get_cwd(), &*descriptors)?,
             FsPath::Fd(raw) => {
                 // AT_EMPTY_PATH: check the fd itself. For non-FS fds
                 // (network, pipes, etc.), the fd is valid so F_OK succeeds
@@ -4623,7 +4829,11 @@ impl<FS: ShimFS> Task<FS> {
                 let raw = usize::try_from(raw).map_err(|_| Errno::EBADF)?;
                 return files.run_on_raw_fd(raw, |raw_fd_ref| match raw_fd_ref {
                     crate::RawFdRef::Fs(fd) => {
-                        let s = files.fs.fd_file_status(fd).map_err(Errno::from)?;
+                        let descriptors = self.global.litebox.descriptor_table();
+                        let s = files
+                            .fs
+                            .fd_file_status(fd, &*descriptors)
+                            .map_err(Errno::from)?;
                         Self::check_access_mode(&s, mode)
                     }
                     #[cfg(feature = "worker_local_inet")]
@@ -4651,9 +4861,10 @@ impl<FS: ShimFS> Task<FS> {
                 let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
                 return files.run_on_raw_fd(raw, |raw_fd_ref| match raw_fd_ref {
                     crate::RawFdRef::Fs(dirfd) => {
+                        let descriptors = self.global.litebox.descriptor_table();
                         let s = files
                             .fs
-                            .stat_at(dirfd, path, follow_symlinks)
+                            .stat_at(dirfd, path, follow_symlinks, &*descriptors)
                             .map_err(Errno::from)?;
                         Self::check_access_mode(&s, mode)
                     }
@@ -4909,7 +5120,8 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Try the filesystem for symlink resolution
-        let result = self.files.borrow().fs.read_link(fullpath);
+        let descriptors = self.global.litebox.descriptor_table();
+        let result = self.files.borrow().fs.read_link(fullpath, &*descriptors);
         match result {
             Ok(target) => Ok(target),
             Err(e) => {
@@ -4987,14 +5199,20 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Fs(dirfd) => {
                         // reason: unsupported variants intentionally share this fallback path.
                         #[allow(clippy::wildcard_enum_match_arm)]
-                        files.fs.readlink_at(dirfd, path).map_err(|e| match e {
-                            litebox::fs::errors::ReadLinkError::NotASymlink
-                            | litebox::fs::errors::ReadLinkError::NotSupported => Errno::EINVAL,
-                            litebox::fs::errors::ReadLinkError::ClosedFd => Errno::EBADF,
-                            litebox::fs::errors::ReadLinkError::NotADirectory => Errno::ENOTDIR,
-                            litebox::fs::errors::ReadLinkError::PathError(pe) => Errno::from(pe),
-                            _ => Errno::EIO,
-                        })
+                        let descriptors = self.global.litebox.descriptor_table();
+                        files
+                            .fs
+                            .readlink_at(dirfd, path, &*descriptors)
+                            .map_err(|e| match e {
+                                litebox::fs::errors::ReadLinkError::NotASymlink
+                                | litebox::fs::errors::ReadLinkError::NotSupported => Errno::EINVAL,
+                                litebox::fs::errors::ReadLinkError::ClosedFd => Errno::EBADF,
+                                litebox::fs::errors::ReadLinkError::NotADirectory => Errno::ENOTDIR,
+                                litebox::fs::errors::ReadLinkError::PathError(pe) => {
+                                    Errno::from(pe)
+                                }
+                                _ => Errno::EIO,
+                            })
                     }
                     #[cfg(feature = "worker_local_inet")]
                     crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -5068,7 +5286,12 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
         // — dropbear then exits with "ttyname fails for openpty device".
         let authoritative = Task::<FS>::broker_pty_stat(pty_id, uid, gid);
         let path = alloc::format!("/dev/pts/{pty_id}");
-        let fs_status = task.files.borrow().fs.file_status(path.as_str());
+        let descriptors = task.global.litebox.descriptor_table();
+        let fs_status = task
+            .files
+            .borrow()
+            .fs
+            .file_status(path.as_str(), &*descriptors);
         if let Ok(status) = fs_status {
             let mut stat = FileStat::from(status);
             stat.st_mode = authoritative.st_mode;
@@ -5091,7 +5314,7 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                 .files
                 .borrow()
                 .fs
-                .fd_file_status(fd)
+                .fd_file_status(fd, &*task.global.litebox.descriptor_table())
                 .map(FileStat::from)
                 .map_err(Errno::from),
             #[cfg(feature = "worker_local_inet")]
@@ -5665,7 +5888,12 @@ impl<FS: ShimFS> Task<FS> {
                     ..Default::default()
                 });
             }
-            let status = self.files.borrow().fs.file_status(exe.as_str())?;
+            let descriptors = self.global.litebox.descriptor_table();
+            let status = self
+                .files
+                .borrow()
+                .fs
+                .file_status(exe.as_str(), &*descriptors)?;
             return Ok(FileStat::from(status));
         }
         // /dev/fd/N and /proc/self/fd/N — stat the underlying fd (like fstat).
@@ -5697,7 +5925,8 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             normalized_path
         };
-        let status = self.files.borrow().fs.file_status(&path)?;
+        let descriptors = self.global.litebox.descriptor_table();
+        let status = self.files.borrow().fs.file_status(&path, &*descriptors)?;
         let mut result = FileStat::from(status);
 
         // Override st_dev/st_ino/st_rdev for the host PTY path so that
@@ -5787,7 +6016,10 @@ impl<FS: ShimFS> Task<FS> {
 
         let fstat: FileStat = match fs_path {
             FsPath::Absolute { path } => self.do_stat(path, follow_symlinks)?,
-            FsPath::Cwd => files.fs.file_status(get_cwd())?.into(),
+            FsPath::Cwd => {
+                let descriptors = self.global.litebox.descriptor_table();
+                files.fs.file_status(get_cwd(), &*descriptors)?.into()
+            }
             FsPath::Fd(fd) => {
                 let Ok(raw_fd) = usize::try_from(fd) else {
                     return Err(Errno::EBADF);
@@ -5811,11 +6043,14 @@ impl<FS: ShimFS> Task<FS> {
                 }
 
                 files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
-                    crate::RawFdRef::Fs(dirfd) => files
-                        .fs
-                        .stat_at(dirfd, path, follow_symlinks)
-                        .map(FileStat::from)
-                        .map_err(Errno::from),
+                    crate::RawFdRef::Fs(dirfd) => {
+                        let descriptors = self.global.litebox.descriptor_table();
+                        files
+                            .fs
+                            .stat_at(dirfd, path, follow_symlinks, &*descriptors)
+                            .map(FileStat::from)
+                            .map_err(Errno::from)
+                    }
                     #[cfg(feature = "worker_local_inet")]
                     crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -5902,10 +6137,11 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_statfs(&self, pathname: impl path::Arg) -> Result<StatfsBuf, Errno> {
         // Verify the path exists.
         let path = self.resolve_path(pathname)?;
+        let descriptors = self.global.litebox.descriptor_table();
         self.files
             .borrow()
             .fs
-            .file_status(path)
+            .file_status(path, &*descriptors)
             .map_err(Errno::from)?;
         Ok(Self::synthetic_statfs())
     }
@@ -5948,22 +6184,31 @@ impl<FS: ShimFS> Task<FS> {
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         let mode = litebox::fs::Mode::from_bits_truncate(mode);
         match fs_path {
-            FsPath::Absolute { path } => self
-                .files
-                .borrow()
-                .fs
-                .chmod(path, mode)
-                .map_err(Errno::from),
-            FsPath::Cwd => self
-                .files
-                .borrow()
-                .fs
-                .chmod(get_cwd(), mode)
-                .map_err(Errno::from),
+            FsPath::Absolute { path } => {
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
+                self.files
+                    .borrow()
+                    .fs
+                    .chmod(path, mode, &mut *descriptors)
+                    .map_err(Errno::from)
+            }
+            FsPath::Cwd => {
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
+                self.files
+                    .borrow()
+                    .fs
+                    .chmod(get_cwd(), mode, &mut *descriptors)
+                    .map_err(Errno::from)
+            }
             FsPath::Fd(_fd) => Err(Errno::EINVAL),
             FsPath::FdRelative { fd, path } => {
                 let abs = self.resolve_dirfd_path(fd, &path)?;
-                self.files.borrow().fs.chmod(abs, mode).map_err(Errno::from)
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
+                self.files
+                    .borrow()
+                    .fs
+                    .chmod(abs, mode, &mut *descriptors)
+                    .map_err(Errno::from)
             }
         }
     }
@@ -6055,10 +6300,8 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 files.run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
                     crate::RawFdRef::Fs(fd) => {
-                        let new_flags = self
-                            .global
-                            .litebox
-                            .descriptor_table_mut()
+                        let mut descriptors = self.global.litebox.descriptor_table_mut();
+                        let new_flags = descriptors
                             .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
                                 let diff = (*f & setfl_mask) ^ flags;
                                 if diff
@@ -6076,7 +6319,7 @@ impl<FS: ShimFS> Task<FS> {
                             })?;
                         files
                             .fs
-                            .set_open_status_flags(fd, new_flags)
+                            .set_open_status_flags(fd, new_flags, &mut *descriptors)
                             .map_err(|_| Errno::EBADF)
                     }
                     #[cfg(feature = "worker_local_inet")]
@@ -6355,7 +6598,13 @@ impl<FS: ShimFS> Task<FS> {
         let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
 
         // Verify the path exists and is a directory.
-        match self.files.borrow().fs.file_status(abs_path.as_str()) {
+        let descriptors = self.global.litebox.descriptor_table();
+        match self
+            .files
+            .borrow()
+            .fs
+            .file_status(abs_path.as_str(), &*descriptors)
+        {
             Ok(status) => {
                 if status.file_type != FileType::Directory {
                     return Err(Errno::ENOTDIR);
@@ -6392,11 +6641,14 @@ impl<FS: ShimFS> Task<FS> {
         // Get the path and verify it's a directory.
         let dir_path = files.run_on_raw_fd(raw, |raw_fd_ref| match raw_fd_ref {
             crate::RawFdRef::Fs(typed_fd) => {
-                let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
+                let descriptors = self.global.litebox.descriptor_table();
+                let status = files
+                    .fs
+                    .fd_file_status(typed_fd, &*descriptors)
+                    .map_err(Errno::from)?;
                 if status.file_type != FileType::Directory {
                     return Err(Errno::ENOTDIR);
                 }
-                let descriptors = self.global.litebox.descriptor_table();
                 files
                     .fs
                     .fd_path(typed_fd, &*descriptors)
@@ -6600,9 +6852,10 @@ impl<FS: ShimFS> Task<FS> {
             litebox::fs::Mode::from_bits_truncate(0o777)
         };
         let files = self.files.borrow();
+        let mut descriptors = self.global.litebox.descriptor_table_mut();
         let file = files
             .fs
-            .create_anonymous_file(&name_str, mode)
+            .create_anonymous_file(&name_str, mode, &mut *descriptors)
             .map_err(|e| match e {
                 CreateAnonymousFileError::NotSupported => {
                     todo!("ENOSYS audit: memfd_create on filesystem without anonymous-file support; reachable but not implemented")
@@ -6610,19 +6863,21 @@ impl<FS: ShimFS> Task<FS> {
                 CreateAnonymousFileError::Io | _ => Errno::EIO,
             })?;
         {
-            let mut dt = self.global.litebox.descriptor_table_mut();
             if flags.contains(MemfdFlags::CLOEXEC) {
-                let old = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
+                let old = descriptors.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
                 assert!(old.is_none());
             }
             let status = OFlags::RDWR | OFlags::LARGEFILE;
-            let old = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status));
+            let old = descriptors.set_entry_metadata(&file, crate::StdioStatusFlags(status));
             assert!(old.is_none());
         }
-        let raw_fd = files.insert_raw_fd(file).map_err(|file| {
-            files.fs.close(&file).unwrap();
-            Errno::EMFILE
-        })?;
+        let raw_fd = match files.insert_raw_fd(file) {
+            Ok(raw_fd) => raw_fd,
+            Err(file) => {
+                files.fs.close(&file, &mut *descriptors).unwrap();
+                return Err(Errno::EMFILE);
+            }
+        };
         Ok(raw_fd.try_into().unwrap())
     }
 
@@ -6833,7 +7088,10 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<litebox::platform::StdioStream, Errno> {
         use litebox::platform::StdioStream;
 
-        let status = fs.fd_file_status(fd).map_err(|_| Errno::EBADF)?;
+        let descriptors = self.global.litebox.descriptor_table();
+        let status = fs
+            .fd_file_status(fd, &*descriptors)
+            .map_err(|_| Errno::EBADF)?;
         let preferred = match status.node_info.ino {
             9 | 12 => StdioStream::Stdin,
             10 => StdioStream::Stdout,
@@ -7270,7 +7528,8 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Classify a file descriptor as a host stdio device, PTY device, or neither.
     fn classify_terminal(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<TerminalKind, Errno> {
-        match fs.fd_file_status(fd) {
+        let descriptors = self.global.litebox.descriptor_table();
+        match fs.fd_file_status(fd, &*descriptors) {
             Ok(status) => {
                 if status.file_type != litebox::fs::FileType::CharacterDevice {
                     return Ok(TerminalKind::NotTerminal);
@@ -7501,10 +7760,8 @@ impl<FS: ShimFS> Task<FS> {
                 files
                     .run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
                         crate::RawFdRef::Fs(file_fd) => {
-                            let result = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
+                            let mut descriptors = self.global.litebox.descriptor_table_mut();
+                            let result = descriptors
                                 .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
                                     flags.set(OFlags::NONBLOCK, val != 0);
                                     *flags
@@ -7512,7 +7769,7 @@ impl<FS: ShimFS> Task<FS> {
                             match result {
                                 Ok(new_flags) => files
                                     .fs
-                                    .set_open_status_flags(file_fd, new_flags)
+                                    .set_open_status_flags(file_fd, new_flags, &mut *descriptors)
                                     .map_err(|_| Errno::EBADF)?,
                                 Err(MetadataError::ClosedFd) => return Err(Errno::EBADF),
                                 Err(MetadataError::NoSuchMetadata) => {
@@ -8001,7 +8258,11 @@ impl<FS: ShimFS> Task<FS> {
                 let pty_idx = files.run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
                     crate::RawFdRef::Fs(file_fd) => {
                         // Check the fd is a PTY master (major 136).
-                        let status = files.fs.fd_file_status(file_fd).map_err(|_| Errno::EBADF)?;
+                        let descriptors = self.global.litebox.descriptor_table();
+                        let status = files
+                            .fs
+                            .fd_file_status(file_fd, &*descriptors)
+                            .map_err(|_| Errno::EBADF)?;
                         let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
                         let major = rdev.get() >> 8;
                         if major != 136 {
@@ -9116,16 +9377,14 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         files.run_on_raw_fd(fd, |raw_fd_ref| match raw_fd_ref {
             crate::RawFdRef::Fs(file) => {
-                let dir_off: Diroff = self
-                    .global
-                    .litebox
-                    .descriptor_table()
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
+                let dir_off: Diroff = descriptors
                     .with_metadata(file, |off: &Diroff| *off)
                     .unwrap_or_default();
                 let mut dir_off = dir_off.0;
                 let mut nbytes = 0;
 
-                let mut entries = files.fs.read_dir(file)?;
+                let mut entries = files.fs.read_dir(file, &mut *descriptors)?;
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
 
                 // Buffer all dirent64 entries into a kernel-side Vec<u8> before
@@ -9190,11 +9449,7 @@ impl<FS: ShimFS> Task<FS> {
                         .ok_or(Errno::EFAULT)?;
                 }
 
-                let _old = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
-                    .set_fd_metadata(file, Diroff(dir_off));
+                let _old = descriptors.set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             }
             #[cfg(feature = "worker_local_inet")]
