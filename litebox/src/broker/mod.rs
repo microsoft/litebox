@@ -87,31 +87,25 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
     where
         Platform: TimeProvider,
     {
-        let pollables = {
-            let mut handles = self.handles.lock();
-            if let Some(entry) = handles.get_mut(&handle) {
-                let pollables = entry.pollables();
-                if entry.is_empty() {
-                    handles.remove(&handle);
-                }
-                pollables
-            } else {
-                Vec::new()
-            }
+        let mut handles = self.handles.lock();
+        let Some(entry) = handles.get_mut(&handle) else {
+            return;
         };
-        if !pollables.is_empty() {
-            let mut events = Events::empty();
-            if readiness.read_ready {
-                events |= Events::IN;
-            }
-            if readiness.write_ready {
-                events |= Events::OUT;
-            }
-            if !events.is_empty() {
-                for pollee in pollables {
-                    pollee.notify_observers(events);
-                }
-            }
+        entry.prune_stale_pollables();
+        if entry.is_empty() {
+            handles.remove(&handle);
+            return;
+        }
+
+        let mut events = Events::empty();
+        if readiness.read_ready {
+            events |= Events::IN;
+        }
+        if readiness.write_ready {
+            events |= Events::OUT;
+        }
+        if !events.is_empty() {
+            entry.notify_pollables(events);
         }
     }
 }
@@ -139,24 +133,26 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleEntry<Platform> {
         });
     }
 
-    fn pollables(&mut self) -> Vec<Arc<Pollee<Platform>>> {
-        let mut pollables = Vec::new();
-        self.pollables.retain(|registered| {
+    fn prune_stale_pollables(&mut self) {
+        self.pollables
+            .retain(|registered| registered.strong_count() > 0);
+    }
+
+    fn notify_pollables(&self, events: Events)
+    where
+        Platform: TimeProvider,
+    {
+        for registered in &self.pollables {
             if let Some(pollee) = registered.upgrade() {
-                pollables.push(pollee);
-                true
-            } else {
-                false
+                pollee.notify_observers(events);
             }
-        });
-        pollables
+        }
     }
 
     fn is_empty(&self) -> bool {
         self.pollables.is_empty()
     }
 }
-
 pub(crate) struct BrokerLocalControl<
     Platform: RawSyncPrimitivesProvider,
     Channel: LocalControlChannel + Send,
