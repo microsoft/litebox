@@ -1146,6 +1146,20 @@ impl From<TeeResult> for u32 {
     }
 }
 
+impl From<Errno> for TeeResult {
+    fn from(err: Errno) -> Self {
+        match err {
+            Errno::ENOSYS => Self::NotSupported,
+            Errno::EINVAL | Errno::EFAULT => Self::BadParameters,
+            Errno::EPERM | Errno::EACCES => Self::AccessDenied,
+            Errno::ENOMEM => Self::OutOfMemory,
+            Errno::EOVERFLOW => Self::Overflow,
+            Errno::EBUSY => Self::Busy,
+            _ => Self::GenericError,
+        }
+    }
+}
+
 const UTEE_ENTRY_FUNC_OPEN_SESSION: u32 = 0;
 const UTEE_ENTRY_FUNC_CLOSE_SESSION: u32 = 1;
 const UTEE_ENTRY_FUNC_INVOKE_COMMAND: u32 = 2;
