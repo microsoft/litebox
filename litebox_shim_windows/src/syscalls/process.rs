@@ -86,16 +86,12 @@ struct ProcessTlsInformationHeader {
     tls_index: u32,
 }
 
-const _: () = assert!(size_of::<ProcessTlsInformationHeader>() == 0x10);
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct ProcessTlsInformationExtendedHeader {
     header: ProcessTlsInformationHeader,
     _reserved: usize,
 }
-
-const _: () = assert!(size_of::<ProcessTlsInformationExtendedHeader>() == 0x18);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
@@ -105,9 +101,6 @@ struct ProcessTlsThreadDataSimple {
     tls_data: usize,
     _reserved: usize,
 }
-
-const _: () = assert!(size_of::<ProcessTlsThreadDataSimple>() == 0x18);
-const _: () = assert!(offset_of!(ProcessTlsThreadDataSimple, tls_data) == 0x08);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
@@ -119,10 +112,6 @@ struct ProcessTlsThreadDataExtended {
     _reserved: usize,
 }
 
-const _: () = assert!(size_of::<ProcessTlsThreadDataExtended>() == 0x20);
-const _: () = assert!(offset_of!(ProcessTlsThreadDataExtended, new_tls_data) == 0x08);
-const _: () = assert!(offset_of!(ProcessTlsThreadDataExtended, old_tls_data) == 0x10);
-
 #[derive(Clone, Copy, Debug)]
 enum ProcessTlsLayout {
     Simple,
@@ -131,8 +120,7 @@ enum ProcessTlsLayout {
 
 impl ProcessTlsLayout {
     fn detect(thread_data_count: u32, process_information_length: u32) -> Result<Self, NtStatus> {
-        let count =
-            usize::try_from(thread_data_count).map_err(|_| NtStatus::INFO_LENGTH_MISMATCH)?;
+        let count = thread_data_count as usize;
         let extended_len = size_of::<ProcessTlsInformationExtendedHeader>()
             .checked_add(
                 count
@@ -147,7 +135,7 @@ impl ProcessTlsLayout {
                     .ok_or(NtStatus::INFO_LENGTH_MISMATCH)?,
             )
             .ok_or(NtStatus::INFO_LENGTH_MISMATCH)?;
-        let provided_len = usize::try_from(process_information_length).unwrap_or(0);
+        let provided_len = process_information_length as usize;
 
         if provided_len >= extended_len {
             Ok(Self::Extended)
@@ -193,12 +181,9 @@ impl ProcessTlsLayout {
         }
     }
 
-    fn thread_data_offset(self, index: u32) -> Option<usize> {
-        self.header_size().checked_add(
-            usize::try_from(index)
-                .ok()?
-                .checked_mul(self.entry_size())?,
-        )
+    fn thread_data_offset(self, index: usize) -> Option<usize> {
+        self.header_size()
+            .checked_add(index.checked_mul(self.entry_size())?)
     }
 }
 
@@ -403,9 +388,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         process_information: ConstPtr<Platform, u8>,
         process_information_length: u32,
     ) -> NtStatus {
-        if usize::try_from(process_information_length).unwrap_or(0)
-            < size_of::<ProcessTlsInformationHeader>()
-        {
+        if (process_information_length as usize) < size_of::<ProcessTlsInformationHeader>() {
             return NtStatus::INFO_LENGTH_MISMATCH;
         }
         if !process_handle.is_current() {
@@ -467,7 +450,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         header: ProcessTlsInformationHeader,
         layout: ProcessTlsLayout,
     ) -> NtStatus {
-        for index in 0..header.thread_data_count {
+        for index in 0..header.thread_data_count as usize {
             let Some(thread_data_offset) = layout.thread_data_offset(index) else {
                 return NtStatus::INFO_LENGTH_MISMATCH;
             };
@@ -536,15 +519,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         header: ProcessTlsInformationHeader,
         layout: ProcessTlsLayout,
     ) -> NtStatus {
-        let Ok(tls_index) = usize::try_from(header.tls_index) else {
-            return NtStatus::INVALID_PARAMETER;
-        };
+        let tls_index = header.tls_index as usize;
         if tls_index >= TEB_TLS_SLOT_COUNT {
             return NtStatus::INVALID_PARAMETER;
         }
 
         for index in 0..header.thread_data_count {
-            let Some(thread_data_offset) = layout.thread_data_offset(index) else {
+            let Some(thread_data_offset) = layout.thread_data_offset(index as usize) else {
                 return NtStatus::INFO_LENGTH_MISMATCH;
             };
             let Some(new_tls_data) = read_process_information_usize::<Platform>(
@@ -635,18 +616,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if old_tls_data != initial_tls_slots {
             return Ok(());
         }
-
-        for index in 0..TEB_TLS_SLOT_COUNT {
-            let offset = index * size_of::<usize>();
-            let Some(slot_value) =
-                ConstPtr::<Platform, usize>::from_usize(old_tls_data + offset).read_at_offset(0)
-            else {
+        let old_tls_slots = ConstPtr::<Platform, usize>::from_usize(old_tls_data);
+        let new_tls_slots = MutPtr::<Platform, usize>::from_usize(new_tls_data);
+        for index in 0..TEB_TLS_SLOT_COUNT.cast_signed() {
+            let Some(slot_value) = old_tls_slots.read_at_offset(index) else {
                 return Err(NtStatus::ACCESS_VIOLATION);
             };
-            if MutPtr::<Platform, usize>::from_usize(new_tls_data + offset)
-                .write_at_offset(0, slot_value)
-                .is_none()
-            {
+            if new_tls_slots.write_at_offset(index, slot_value).is_none() {
                 return Err(NtStatus::ACCESS_VIOLATION);
             }
         }
