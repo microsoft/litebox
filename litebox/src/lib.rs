@@ -31,7 +31,7 @@ pub mod tls;
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the
 // code cleaner.
 mod litebox;
-pub use litebox::{BrokerNotificationSink, LiteBox};
+pub use litebox::LiteBox;
 
 // Explicitly-private, the utilities are not exposed to users of LiteBox, and are intended entirely
 // to contain implementation-internal code.

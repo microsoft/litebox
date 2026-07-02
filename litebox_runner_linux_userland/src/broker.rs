@@ -60,7 +60,7 @@ pub(crate) fn connect(
 
 pub(crate) fn start_notification_receiver<Platform>(
     mut notifications: Notifications,
-    sink: litebox::BrokerNotificationSink<Platform>,
+    litebox: litebox::LiteBox<Platform>,
 ) -> Result<()>
 where
     Platform: litebox::sync::RawSyncPrimitivesProvider + litebox::platform::TimeProvider + 'static,
@@ -70,7 +70,7 @@ where
         .spawn(move || {
             loop {
                 match notifications.recv_notification() {
-                    Ok(Some(notification)) => sink.dispatch(notification),
+                    Ok(Some(notification)) => litebox.dispatch_broker_notification(notification),
                     Ok(None) => break,
                     Err(error) => {
                         eprintln!("failed to receive broker notification: {error}");

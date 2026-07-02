@@ -28,15 +28,6 @@ pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
     pub(crate) x: Arc<LiteBoxX<Platform>>,
 }
 
-/// Dispatch handle for broker-initiated notifications into a [`LiteBox`] instance.
-///
-/// Deployment code that owns a broker notification transport can move this
-/// handle into its receive loop without cloning or exposing the whole
-/// [`LiteBox`] object.
-pub struct BrokerNotificationSink<Platform: RawSyncPrimitivesProvider> {
-    x: Arc<LiteBoxX<Platform>>,
-}
-
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Create a new (empty) [`LiteBox`] instance for the given `platform`.
     ///
@@ -117,16 +108,15 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// An explicitly-crate-internal clone method to prevent outside users from cloning the
-    /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
-    /// only create it via [`Self::new`].
-    pub(crate) fn clone(&self) -> Self {
+impl<Platform: RawSyncPrimitivesProvider> Clone for LiteBox<Platform> {
+    fn clone(&self) -> Self {
         Self {
             x: Arc::clone(&self.x),
         }
     }
+}
 
+impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Access to the file descriptor table.
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
@@ -155,20 +145,11 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         Arc::clone(&self.x.broker_handles)
     }
 
-    /// Returns a dispatch handle for broker-initiated notifications.
-    pub fn broker_notification_sink(&self) -> BrokerNotificationSink<Platform> {
-        BrokerNotificationSink {
-            x: Arc::clone(&self.x),
-        }
-    }
-}
-
-impl<Platform> BrokerNotificationSink<Platform>
-where
-    Platform: RawSyncPrimitivesProvider + TimeProvider,
-{
     /// Dispatches one broker notification to the matching local-core object.
-    pub fn dispatch(&self, notification: BrokerNotification) {
+    pub fn dispatch_broker_notification(&self, notification: BrokerNotification)
+    where
+        Platform: TimeProvider,
+    {
         match notification {
             BrokerNotification::EventReadiness(notification) => self
                 .x

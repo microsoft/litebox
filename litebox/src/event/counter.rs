@@ -212,7 +212,6 @@ mod tests {
         })
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
-        let sink = litebox.broker_notification_sink();
         let counter = Arc::new(EventCounter::new(&litebox, 0).unwrap());
 
         let (result_sender, result_receiver) = std::sync::mpsc::channel();
@@ -235,7 +234,7 @@ mod tests {
             std::thread::yield_now();
         }
         read_ready.store(true, Ordering::SeqCst);
-        sink.dispatch(BrokerNotification::EventReadiness(
+        litebox.dispatch_broker_notification(BrokerNotification::EventReadiness(
             EventReadinessNotification {
                 handle,
                 readiness: ReadinessState {
