@@ -1054,6 +1054,8 @@ fn remove_view_pages<Platform: ShimPlatform>(
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use core::mem::{size_of, size_of_val};
 
     use litebox::platform::RawMutPointer as _;
@@ -1061,20 +1063,10 @@ mod tests {
 
     use super::*;
     use crate::nt_types::{ObjectAttributes, UnicodeString};
-    use crate::tests::{
-        TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task, test_task_with_nls_files,
-    };
+    use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
 
-    const TEST_PE_IMAGE_BASE: usize = 0x1800_0000;
-    const TEST_PE_ENTRY_RVA: u32 = 0x1000;
-    const TEST_PE_IMAGE_SIZE: u32 = 0x2000;
-    const TEST_PE_FILE_SIZE: u32 = 0x400;
-    const TEST_PE_SUBSYSTEM: u16 = 3;
-    const TEST_PE_MAJOR_SUBSYSTEM_VERSION: u16 = 10;
-    const TEST_PE_MINOR_SUBSYSTEM_VERSION: u16 = 0;
-    const TEST_PE_CHARACTERISTICS: u16 = 0x2022;
-    const TEST_PE_DLL_CHARACTERISTICS: u16 = 0x8160;
-    const TEST_PE_MACHINE: u16 = 0x8664;
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    use crate::tests::test_task_with_nls_files;
 
     fn wide(value: &str) -> alloc::vec::Vec<u16> {
         value.encode_utf16().collect()
@@ -1143,56 +1135,90 @@ mod tests {
         (base, view_size)
     }
 
-    fn minimal_pe_image() -> alloc::vec::Vec<u8> {
-        let mut image = alloc::vec![0; usize::try_from(TEST_PE_FILE_SIZE).unwrap()];
-        write_u16(&mut image, 0x00, 0x5a4d);
-        write_u32(&mut image, 0x3c, 0x80);
-        write_u32(&mut image, 0x80, 0x0000_4550);
-
-        let file_header = 0x84;
-        write_u16(&mut image, file_header, TEST_PE_MACHINE);
-        write_u16(&mut image, file_header + 2, 1);
-        write_u16(&mut image, file_header + 16, 0xf0);
-        write_u16(&mut image, file_header + 18, TEST_PE_CHARACTERISTICS);
-
-        let optional = 0x98;
-        write_u16(&mut image, optional, 0x20b);
-        write_u32(&mut image, optional + 16, TEST_PE_ENTRY_RVA);
-        write_u64(&mut image, optional + 24, TEST_PE_IMAGE_BASE as u64);
-        write_u32(&mut image, optional + 32, u32::try_from(PAGE_SIZE).unwrap());
-        write_u32(&mut image, optional + 36, 0x200);
-        write_u16(&mut image, optional + 48, TEST_PE_MAJOR_SUBSYSTEM_VERSION);
-        write_u16(&mut image, optional + 50, TEST_PE_MINOR_SUBSYSTEM_VERSION);
-        write_u32(&mut image, optional + 56, TEST_PE_IMAGE_SIZE);
-        write_u32(&mut image, optional + 60, TEST_PE_FILE_SIZE);
-        write_u16(&mut image, optional + 68, TEST_PE_SUBSYSTEM);
-        write_u16(&mut image, optional + 70, TEST_PE_DLL_CHARACTERISTICS);
-        write_u64(&mut image, optional + 72, 0x100000);
-        write_u64(&mut image, optional + 80, 0x1000);
-        write_u64(&mut image, optional + 88, 0x100000);
-        write_u64(&mut image, optional + 96, 0x1000);
-        write_u32(&mut image, optional + 108, 16);
-
-        let section = 0x188;
-        image[section..section + 5].copy_from_slice(b".text");
-        write_u32(&mut image, section + 8, 1);
-        write_u32(&mut image, section + 12, TEST_PE_ENTRY_RVA);
-        write_u32(&mut image, section + 16, 0x200);
-        write_u32(&mut image, section + 20, 0x200);
-        write_u32(&mut image, section + 36, 0x6000_0020);
-        image
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn host_kernel32_image() -> std::vec::Vec<u8> {
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
+        std::fs::read(
+            std::path::PathBuf::from(system_root)
+                .join("System32")
+                .join("kernel32.dll"),
+        )
+        .expect("host kernel32.dll is readable")
     }
 
-    fn write_u16(output: &mut [u8], offset: usize, value: u16) {
-        output[offset..offset + size_of::<u16>()].copy_from_slice(&value.to_le_bytes());
-    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn host_known_dll_image_information() -> SectionImageInformation {
+        use core::ffi::c_void;
 
-    fn write_u32(output: &mut [u8], offset: usize, value: u32) {
-        output[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
-    }
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtOpenSection(
+                section_handle: *mut *mut c_void,
+                desired_access: u32,
+                object_attributes: *const ObjectAttributes,
+            ) -> i32;
+            fn NtQuerySection(
+                section_handle: *mut c_void,
+                section_information_class: u32,
+                section_information: *mut SectionImageInformation,
+                section_information_length: usize,
+                return_length: *mut usize,
+            ) -> i32;
+            fn NtClose(handle: *mut c_void) -> i32;
+        }
 
-    fn write_u64(output: &mut [u8], offset: usize, value: u64) {
-        output[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+        let name = wide(r"\KnownDlls\kernel32.dll");
+        let unicode = unicode(&name);
+        let attrs = object_attributes(&unicode);
+        let mut handle = core::ptr::null_mut();
+        // SAFETY: The object attributes point to stack-owned UTF-16 data that remains live for the
+        // call, and the output handle pointer is a valid stack local.
+        let status = unsafe {
+            NtOpenSection(
+                &raw mut handle,
+                SectionAccess::QUERY.bits(),
+                &raw const attrs,
+            )
+        };
+        assert_eq!(status, NtStatus::SUCCESS.as_raw());
+
+        let mut info = SectionImageInformation {
+            transfer_address: 0,
+            zero_bits: 0,
+            _padding0: 0,
+            maximum_stack_size: 0,
+            committed_stack_size: 0,
+            subsystem_type: 0,
+            subsystem_minor_version: 0,
+            subsystem_major_version: 0,
+            gp_value: 0,
+            image_characteristics: 0,
+            dll_characteristics: 0,
+            machine: 0,
+            image_contains_code: 0,
+            image_flags: 0,
+            loader_flags: 0,
+            image_file_size: 0,
+            checksum: 0,
+        };
+        let mut return_length = 0usize;
+        // SAFETY: `handle` is a live section handle from host ntdll and both output pointers refer
+        // to valid stack locals.
+        let status = unsafe {
+            NtQuerySection(
+                handle,
+                SectionInformationClass::Image as u32,
+                &raw mut info,
+                size_of::<SectionImageInformation>(),
+                &raw mut return_length,
+            )
+        };
+        // SAFETY: The handle was returned by a successful host ntdll call in this test.
+        let close_status = unsafe { NtClose(handle) };
+        assert_eq!(close_status, NtStatus::SUCCESS.as_raw());
+        assert_eq!(status, NtStatus::SUCCESS.as_raw());
+        assert_eq!(return_length, size_of::<SectionImageInformation>());
+        info
     }
 
     #[test]
@@ -1248,9 +1274,11 @@ mod tests {
         assert_eq!(return_length, 0x5555_5555);
     }
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     #[test]
     fn nt_query_section_image_information_uses_pe_headers() {
-        let image = minimal_pe_image();
+        let image = host_kernel32_image();
+        let host_info = host_known_dll_image_information();
         let task = test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", &image)]);
         let name = wide(r"\KnownDlls\kernel32.dll");
         let unicode = unicode(&name);
@@ -1297,24 +1325,20 @@ mod tests {
         );
 
         assert_eq!(return_length, size_of::<SectionImageInformation>());
-        assert_eq!(
-            info.transfer_address,
-            TEST_PE_IMAGE_BASE + TEST_PE_ENTRY_RVA as usize
-        );
-        assert_eq!(info.subsystem_type, u32::from(TEST_PE_SUBSYSTEM));
+        assert_eq!(info.subsystem_type, host_info.subsystem_type);
         assert_eq!(
             info.subsystem_major_version,
-            TEST_PE_MAJOR_SUBSYSTEM_VERSION
+            host_info.subsystem_major_version
         );
         assert_eq!(
             info.subsystem_minor_version,
-            TEST_PE_MINOR_SUBSYSTEM_VERSION
+            host_info.subsystem_minor_version
         );
-        assert_eq!(info.image_characteristics, TEST_PE_CHARACTERISTICS);
-        assert_eq!(info.dll_characteristics, TEST_PE_DLL_CHARACTERISTICS);
-        assert_eq!(info.machine, TEST_PE_MACHINE);
-        assert_eq!(info.image_contains_code, 1);
-        assert_eq!(info.image_file_size, TEST_PE_FILE_SIZE);
+        assert_eq!(info.image_characteristics, host_info.image_characteristics);
+        assert_eq!(info.dll_characteristics, host_info.dll_characteristics);
+        assert_eq!(info.machine, host_info.machine);
+        assert_eq!(info.image_contains_code, host_info.image_contains_code);
+        assert_eq!(info.image_file_size, host_info.image_file_size);
 
         let mut too_small = [0xcc; size_of::<SectionImageInformation>() - 1];
         let too_small_len = too_small.len();
@@ -1334,9 +1358,10 @@ mod tests {
         assert_eq!(return_length, 0x5555_5555);
     }
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     #[test]
     fn image_section_rejects_writable_view_protection() {
-        let image = minimal_pe_image();
+        let image = host_kernel32_image();
         let task = test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", &image)]);
         let name = wide(r"\KnownDlls\kernel32.dll");
         let unicode = unicode(&name);
