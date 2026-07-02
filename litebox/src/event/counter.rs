@@ -141,7 +141,7 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn drop(&mut self) {
-        self.registry.unregister(self.handle);
+        self.registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
     }
 }

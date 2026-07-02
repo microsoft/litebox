@@ -66,7 +66,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerObjectRegistry<Platform> {
         self.pollables.lock().insert(handle, Arc::downgrade(pollee));
     }
 
-    pub(crate) fn unregister(&self, handle: ObjectHandle) {
+    pub(crate) fn unregister_pollable(&self, handle: ObjectHandle) {
         self.pollables.lock().remove(&handle);
     }
 }
