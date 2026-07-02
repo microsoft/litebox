@@ -51,37 +51,37 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 }
 
-pub(crate) struct BrokerEventRegistry<Platform: RawSyncPrimitivesProvider> {
-    events: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
+pub(crate) struct BrokerObjectRegistry<Platform: RawSyncPrimitivesProvider> {
+    pollables: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> BrokerEventRegistry<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> BrokerObjectRegistry<Platform> {
     pub(crate) fn new() -> Self {
         Self {
-            events: Mutex::new(HashMap::new()),
+            pollables: Mutex::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn register_event(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
-        self.events.lock().insert(handle, Arc::downgrade(pollee));
+    pub(crate) fn register_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
+        self.pollables.lock().insert(handle, Arc::downgrade(pollee));
     }
 
-    pub(crate) fn unregister_event(&self, handle: ObjectHandle) {
-        self.events.lock().remove(&handle);
+    pub(crate) fn unregister(&self, handle: ObjectHandle) {
+        self.pollables.lock().remove(&handle);
     }
 }
 
-impl<Platform> BrokerEventRegistry<Platform>
+impl<Platform> BrokerObjectRegistry<Platform>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
-    pub(crate) fn notify_event_readiness(&self, handle: ObjectHandle, readiness: ReadinessState) {
+    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessState) {
         let pollee = {
-            let mut events = self.events.lock();
-            if let Some(pollee) = events.get(&handle).and_then(Weak::upgrade) {
+            let mut pollables = self.pollables.lock();
+            if let Some(pollee) = pollables.get(&handle).and_then(Weak::upgrade) {
                 Some(pollee)
             } else {
-                events.remove(&handle);
+                pollables.remove(&handle);
                 None
             }
         };

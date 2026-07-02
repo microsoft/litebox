@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::{
     LiteBox,
     broker::{
-        BrokerControl, BrokerEventRegistry,
+        BrokerControl, BrokerObjectRegistry,
         error::{BrokerControlError, BrokerObjectError},
     },
     event::{
@@ -44,7 +44,7 @@ pub enum EventCounterError {
 pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
-    registry: Arc<BrokerEventRegistry<Platform>>,
+    registry: Arc<BrokerObjectRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
 }
 
@@ -66,9 +66,9 @@ where
             .create_event_with_count(initial_count)
             .map_err(BrokerObjectError::from)
             .map_err(EventCounterError::from)?;
-        let registry = litebox.broker_event_registry();
+        let registry = litebox.broker_object_registry();
         let pollee = Arc::new(Pollee::new());
-        registry.register_event(handle, &pollee);
+        registry.register_pollable(handle, &pollee);
         Ok(Self {
             broker,
             handle,
@@ -141,7 +141,7 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn drop(&mut self) {
-        self.registry.unregister_event(self.handle);
+        self.registry.unregister(self.handle);
         let _ = self.broker.close_object(self.handle);
     }
 }
