@@ -237,15 +237,17 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_GENERAL,
         );
     };
-    let dev_stdio = litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::composer::Composer::builder()
-            .mount("/dev", |allocator| {
-                litebox::fs::devices::Devices::new(litebox, allocator)
-            })
-            .build()
-            .unwrap(),
-    );
+    let dev_stdio_composer = litebox::fs::composer::Composer::builder()
+        .mount("/dev", |allocator| {
+            litebox::fs::devices::Devices::new(litebox, allocator)
+        })
+        .build()
+        .unwrap_or_else(
+            |(litebox::fs::composer::BuildError::NoMounts
+             | litebox::fs::composer::BuildError::InvalidMountPath
+             | litebox::fs::composer::BuildError::DuplicateMountPath)| unreachable!(),
+        );
+    let dev_stdio = litebox::fs::resolver::Resolver::new(litebox, dev_stdio_composer);
     let default_fs = litebox::fs::layered::FileSystem::new(
         litebox,
         in_mem_fs,
