@@ -35,7 +35,7 @@ enum EventFileCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
         count: Mutex<Platform, u64>,
         pollee: Pollee<Platform>,
     },
-    LocalCore(EventCounter<Platform>),
+    BrokerBacked(EventCounter<Platform>),
 }
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -65,7 +65,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
                     Self::try_read_local(count, pollee, semaphore)
                 })
                 .map_err(Errno::from),
-            Self::LocalCore(counter) => counter
+            Self::BrokerBacked(counter) => counter
                 .read(
                     cx,
                     nonblock,
@@ -91,7 +91,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
                     Self::try_write_local(count, pollee, value)
                 })
                 .map_err(Errno::from),
-            Self::LocalCore(counter) => counter.write(cx, nonblock, value).map_err(Errno::from),
+            Self::BrokerBacked(counter) => counter.write(cx, nonblock, value).map_err(Errno::from),
         }
     }
 
@@ -148,14 +148,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
                 }
                 events
             }
-            Self::LocalCore(counter) => counter.check_io_events(),
+            Self::BrokerBacked(counter) => counter.check_io_events(),
         }
     }
 
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
         match self {
             Self::ShimLocal { pollee, .. } => pollee.register_observer(observer, mask),
-            Self::LocalCore(counter) => counter.register_observer(observer, mask),
+            Self::BrokerBacked(counter) => counter.register_observer(observer, mask),
         }
     }
 }
@@ -210,7 +210,7 @@ impl<FS: ShimFS> GlobalState<FS> {
 
         let count = u64::from(initval);
         let counter = match EventCounter::new(&self.litebox, count) {
-            Ok(counter) => EventFileCounter::LocalCore(counter),
+            Ok(counter) => EventFileCounter::BrokerBacked(counter),
             Err(EventCounterError::Unavailable) => EventFileCounter::shim_local(count),
             Err(error) => return Err(error.into()),
         };
@@ -307,21 +307,33 @@ mod tests {
     }
 
     #[test]
-    fn test_nonblocking_eventfd_uses_shim_local_without_broker_control() {
+    fn test_eventfd_uses_shim_local_without_broker_control() {
         let task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = task
+        let nonblocking_eventfd = task
             .global
             .create_linux_eventfd(0, EfdFlags::NONBLOCK)
             .unwrap();
         assert_eq!(
-            eventfd.read(&WaitState::new(platform()).context()),
+            nonblocking_eventfd.read(&WaitState::new(platform()).context()),
             Err(Errno::EAGAIN)
         );
         assert_eq!(
-            eventfd.write(&WaitState::new(platform()).context(), 1),
+            nonblocking_eventfd.write(&WaitState::new(platform()).context(), 1),
             Ok(8)
         );
-        assert_eq!(eventfd.read(&WaitState::new(platform()).context()), Ok(1));
+        assert_eq!(
+            nonblocking_eventfd.read(&WaitState::new(platform()).context()),
+            Ok(1)
+        );
+
+        let blocking_eventfd = task
+            .global
+            .create_linux_eventfd(1, EfdFlags::empty())
+            .unwrap();
+        assert_eq!(
+            blocking_eventfd.read(&WaitState::new(platform()).context()),
+            Ok(1)
+        );
     }
 }
