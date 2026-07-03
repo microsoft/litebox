@@ -4,7 +4,7 @@
 // Test execve behavior:
 //
 // Phase 1:
-//   - Create two eventfds: one with EFD_CLOEXEC, one without.
+//   - Create two pipe descriptors: one with O_CLOEXEC, one without.
 //   - Exec self, passing their numeric values as argv[1] (cloexec) and argv[2] (keep).
 // Phase 2 (after exec):
 //   - Verify the CLOEXEC fd is closed (fcntl -> EBADF).
@@ -19,7 +19,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/eventfd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -39,10 +38,12 @@ int main(int argc, char *argv[], char *envp[]) {
 
     if (!phase) {
         // Phase 1: set up descriptors and exec self.
-        int fd_clo = eventfd(0, EFD_CLOEXEC);
-        if (fd_clo < 0) die("eventfd cloexec");
-        int fd_keep = eventfd(0, 0);
-        if (fd_keep < 0) die("eventfd keep");
+        int clo_pipe[2];
+        if (pipe2(clo_pipe, O_CLOEXEC) != 0) die("pipe2 cloexec");
+        int keep_pipe[2];
+        if (pipe(keep_pipe) != 0) die("pipe keep");
+        int fd_clo = clo_pipe[0];
+        int fd_keep = keep_pipe[0];
 
         char clo_buf[32], keep_buf[32];
         snprintf(clo_buf, sizeof clo_buf, "%d", fd_clo);

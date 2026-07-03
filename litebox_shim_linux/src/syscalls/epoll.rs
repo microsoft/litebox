@@ -617,7 +617,7 @@ mod test {
     use alloc::sync::Arc;
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
-    use litebox_common_linux::{EfdFlags, EpollEvent};
+    use litebox_common_linux::EpollEvent;
     use litebox_platform_multiplex::platform;
 
     use super::EpollFile;
@@ -630,58 +630,6 @@ mod test {
 
         let epoll = EpollFile::new();
         (task, epoll)
-    }
-
-    #[test]
-    fn test_epoll_with_eventfd() {
-        let (task, epoll) = setup_epoll();
-        let eventfd = task
-            .global
-            .create_linux_eventfd(0, EfdFlags::CLOEXEC)
-            .unwrap();
-        let typed = task
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
-        let files = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
-        let Ok(raw_fd) = files.insert_raw_fd(typed) else {
-            unreachable!()
-        };
-        let descriptor = super::EpollDescriptor::try_from(&files, raw_fd).unwrap();
-        epoll
-            .add_interest(
-                &task.global,
-                10,
-                &descriptor,
-                EpollEvent {
-                    events: Events::IN.bits(),
-                    data: 0,
-                },
-            )
-            .unwrap();
-
-        let writer = {
-            let global = task.global.clone();
-            let files = Arc::clone(&files);
-            std::thread::spawn(move || {
-                let typed = files
-                    .raw_descriptor_store
-                    .read()
-                    .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
-                    .unwrap();
-                let _ = global
-                    .litebox
-                    .descriptor_table()
-                    .with_entry(&typed, |entry| {
-                        entry.write(&WaitState::new(platform()).context(), 1)
-                    });
-            })
-        };
-        epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
-            .unwrap();
-        writer.join().unwrap();
     }
 
     #[test]
@@ -733,23 +681,14 @@ mod test {
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
-        let eventfd = task
-            .global
-            .create_linux_eventfd(0, EfdFlags::empty())
-            .unwrap();
-
-        let typed = task
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<crate::syscalls::eventfd::EventfdSubsystem>(eventfd);
+        let (rfd_u, wfd_u) = task
+            .sys_pipe2(litebox::fs::OFlags::empty())
+            .expect("pipe2 failed");
+        let rfd = i32::try_from(rfd_u).unwrap();
+        let wfd = i32::try_from(wfd_u).unwrap();
         let no_fds = FilesState::new(task.files.borrow().fs.clone());
-        let fds = Arc::new(FilesState::new(task.files.borrow().fs.clone()));
-        let Ok(raw_fd) = fds.insert_raw_fd(typed) else {
-            unreachable!()
-        };
-        let fd = i32::try_from(raw_fd).unwrap();
-        set.add_fd(fd, Events::IN);
+        let fds = task.files.borrow().clone();
+        set.add_fd(rfd, Events::IN);
 
         let revents = |set: &super::PollSet| {
             let revents: std::vec::Vec<_> = set.revents().collect();
@@ -761,36 +700,14 @@ mod test {
             .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
-        {
-            let typed = fds
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
-                .unwrap();
-            task.global
-                .litebox
-                .descriptor_table()
-                .with_entry(&typed, |entry| {
-                    entry.write(&WaitState::new(platform()).context(), 1)
-                });
-        }
+        task.sys_write(wfd, &[1], None).unwrap();
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
-        {
-            let typed = fds
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
-                .unwrap();
-            task.global
-                .litebox
-                .descriptor_table()
-                .with_entry(&typed, |entry| {
-                    entry.read(&WaitState::new(platform()).context())
-                });
-        }
+        let mut buf = [0; 1];
+        assert_eq!(task.sys_read(rfd, &mut buf, None).unwrap(), 1);
+        assert_eq!(buf, [1]);
         set.wait(
             &task.global,
             &WaitState::new(platform())
@@ -801,27 +718,17 @@ mod test {
         .unwrap_err();
         assert!(revents(&set).is_empty());
 
-        // spawn a thread to write to the eventfd
-        let global = task.global.clone();
-        let fds_for_thread = Arc::clone(&fds);
-        std::thread::spawn(move || {
-            let typed = fds_for_thread
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
-                .unwrap();
-            let handle = global
-                .litebox
-                .descriptor_table()
-                .entry_handle(&typed)
-                .unwrap();
-            let _ =
-                handle.with_entry(|entry| entry.write(&WaitState::new(platform()).context(), 1));
+        task.spawn_clone_for_test(move |task| {
+            std::thread::sleep(core::time::Duration::from_millis(100));
+            assert_eq!(task.sys_write(wfd, &[1], None).unwrap(), 1);
         });
 
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
+
+        let _ = task.sys_close(rfd);
+        let _ = task.sys_close(wfd);
     }
 
     #[test]

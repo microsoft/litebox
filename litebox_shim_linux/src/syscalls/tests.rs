@@ -86,15 +86,14 @@ fn test_fcntl() {
     let write_fd = i32::try_from(write_fd).unwrap();
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
 
-    // Test eventfd
-    let eventfd = task
-        .sys_eventfd2(
+    // Eventfd requires broker control in this shim configuration.
+    assert_eq!(
+        task.sys_eventfd2(
             0,
             EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
-        )
-        .expect("Failed to create eventfd");
-    let eventfd = i32::try_from(eventfd).unwrap();
-    check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+        ),
+        Err(Errno::EIO)
+    );
 
     // Test fcntl with DUPFD
     let fd = task
