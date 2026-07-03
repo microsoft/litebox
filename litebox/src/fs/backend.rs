@@ -211,7 +211,10 @@ impl<'a> WalkingDirHandle<'a> {
         }
     }
 
-    /// Recover the concrete walking handle stored in this erased handle for `B`.
+    /// Recover the concrete handle stored in this erased handle.
+    ///
+    /// Intended to be called by backend implementations as `handle.into_typed::<Self>()` on
+    /// handles that the resolver passed back to the same backend; it may panic otherwise.
     pub(super) fn into_typed<B: BackendHandles + 'static>(self) -> B::WalkingDirHandle<'a> {
         assert_eq!(
             self.backend_type,
@@ -234,6 +237,10 @@ impl FileHandle {
         }
     }
 
+    /// Borrow the concrete handle stored in this erased handle.
+    ///
+    /// Intended to be called by backend implementations as `handle.get_typed::<Self>()` on handles
+    /// that the resolver passed back to the same backend; it may panic otherwise.
     pub(super) fn get_typed<B: BackendHandles>(&self) -> &B::FileHandle {
         (&*self.raw as &dyn Any)
             .downcast_ref::<B::FileHandle>()
@@ -248,12 +255,20 @@ impl DirHandle {
         }
     }
 
+    /// Borrow the concrete handle stored in this erased handle.
+    ///
+    /// Intended to be called by backend implementations as `handle.get_typed::<Self>()` on handles
+    /// that the resolver passed back to the same backend; it may panic otherwise.
     pub(super) fn get_typed<B: BackendHandles>(&self) -> &B::DirHandle {
         (&*self.raw as &dyn Any)
             .downcast_ref::<B::DirHandle>()
             .expect("backend directory handle type mismatch")
     }
 
+    /// Recover the concrete handle stored in this erased handle.
+    ///
+    /// Intended to be called by backend implementations as `handle.into_typed::<Self>()` on
+    /// handles that the resolver passed back to the same backend; it may panic otherwise.
     pub(super) fn into_typed<B: BackendHandles>(self) -> B::DirHandle {
         let raw: Box<dyn Any> = self.raw;
         *raw.downcast::<B::DirHandle>()
