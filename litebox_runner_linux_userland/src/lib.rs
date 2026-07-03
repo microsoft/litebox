@@ -241,7 +241,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let shim_builder = if let Some(broker_connection) = broker_connection {
-        let (broker_local, broker_notifications) = broker_connection.into_parts();
+        let (broker_local, broker_notifications) = broker_connection;
         let litebox = litebox::LiteBox::new_with_broker_local(
             litebox_platform_multiplex::platform(),
             broker_local,

@@ -16,15 +16,13 @@ use litebox_broker_transport::unix_socket::{
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
-pub(crate) struct BrokerConnection {
-    local: BrokerLocal<UnixStreamLocalControlChannel>,
-    notifications: BrokerNotifications<UnixStreamLocalNotificationChannel>,
-}
-
 pub(crate) fn connect(
     control_socket_path: &Path,
     notification_socket_path: &Path,
-) -> Result<BrokerConnection> {
+) -> Result<(
+    BrokerLocal<UnixStreamLocalControlChannel>,
+    BrokerNotifications<UnixStreamLocalNotificationChannel>,
+)> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let control_channel = connect_with_retry(
         control_socket_path,
@@ -51,10 +49,7 @@ pub(crate) fn connect(
         )
     })?;
     let local = BrokerLocal::negotiate(control_channel).context("broker negotiation failed")?;
-    Ok(BrokerConnection {
-        local,
-        notifications: BrokerNotifications::new(notification_channel),
-    })
+    Ok((local, BrokerNotifications::new(notification_channel)))
 }
 
 pub(crate) fn start_notification_receiver(
@@ -77,17 +72,6 @@ pub(crate) fn start_notification_receiver(
         })
         .context("failed to start broker notification receiver")?;
     Ok(())
-}
-
-impl BrokerConnection {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        BrokerLocal<UnixStreamLocalControlChannel>,
-        BrokerNotifications<UnixStreamLocalNotificationChannel>,
-    ) {
-        (self.local, self.notifications)
-    }
 }
 
 fn connect_with_retry<Channel>(
