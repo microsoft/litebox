@@ -106,17 +106,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             }),
         }
     }
-}
-
-impl<Platform: RawSyncPrimitivesProvider> Clone for LiteBox<Platform> {
-    fn clone(&self) -> Self {
-        Self {
-            x: Arc::clone(&self.x),
-        }
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Access to the file descriptor table.
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
@@ -155,6 +144,14 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 .x
                 .broker_handles
                 .notify_readiness(notification.handle, notification.readiness),
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Clone for LiteBox<Platform> {
+    fn clone(&self) -> Self {
+        Self {
+            x: Arc::clone(&self.x),
         }
     }
 }
