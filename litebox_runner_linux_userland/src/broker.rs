@@ -15,12 +15,10 @@ use litebox_broker_transport::unix_socket::{
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
-type Local = BrokerLocal<UnixStreamLocalControlChannel>;
-type Notifications = BrokerNotifications<UnixStreamLocalNotificationChannel>;
 
 pub(crate) struct BrokerConnection {
-    local: Local,
-    notifications: Notifications,
+    local: BrokerLocal<UnixStreamLocalControlChannel>,
+    notifications: BrokerNotifications<UnixStreamLocalNotificationChannel>,
 }
 
 pub(crate) fn connect(
@@ -60,7 +58,7 @@ pub(crate) fn connect(
 }
 
 pub(crate) fn start_notification_receiver(
-    mut notifications: Notifications,
+    mut notifications: BrokerNotifications<UnixStreamLocalNotificationChannel>,
     dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
 ) -> Result<()> {
     std::thread::Builder::new()
@@ -82,7 +80,12 @@ pub(crate) fn start_notification_receiver(
 }
 
 impl BrokerConnection {
-    pub(crate) fn into_parts(self) -> (Local, Notifications) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        BrokerLocal<UnixStreamLocalControlChannel>,
+        BrokerNotifications<UnixStreamLocalNotificationChannel>,
+    ) {
         (self.local, self.notifications)
     }
 }
