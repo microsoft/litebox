@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
+use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
 };
@@ -58,19 +59,16 @@ pub(crate) fn connect(
     })
 }
 
-pub(crate) fn start_notification_receiver<Platform>(
+pub(crate) fn start_notification_receiver(
     mut notifications: Notifications,
-    litebox: litebox::LiteBox<Platform>,
-) -> Result<()>
-where
-    Platform: litebox::sync::RawSyncPrimitivesProvider + litebox::platform::TimeProvider + 'static,
-{
+    dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
+) -> Result<()> {
     std::thread::Builder::new()
         .name("litebox-broker-notifications".to_owned())
         .spawn(move || {
             loop {
                 match notifications.recv_notification() {
-                    Ok(Some(notification)) => litebox.dispatch_broker_notification(notification),
+                    Ok(Some(notification)) => dispatch_notification(notification),
                     Ok(None) => break,
                     Err(error) => {
                         eprintln!("failed to receive broker notification: {error}");

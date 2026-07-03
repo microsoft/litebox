@@ -246,7 +246,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             litebox_platform_multiplex::platform(),
             broker_local,
         );
-        broker::start_notification_receiver(broker_notifications, litebox.clone())?;
+        broker::start_notification_receiver(
+            broker_notifications,
+            litebox.broker_notification_dispatcher(),
+        )?;
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(litebox)
     } else {
         litebox_shim_linux::LinuxShimBuilder::new()

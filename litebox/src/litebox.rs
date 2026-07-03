@@ -106,6 +106,16 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             }),
         }
     }
+
+    /// An explicitly-crate-internal clone method to prevent outside users from cloning the
+    /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
+    /// only create it via [`Self::new`].
+    pub(crate) fn clone(&self) -> Self {
+        Self {
+            x: Arc::clone(&self.x),
+        }
+    }
+
     /// Access to the file descriptor table.
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
@@ -146,12 +156,15 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 .notify_readiness(notification.handle, notification.readiness),
         }
     }
-}
 
-impl<Platform: RawSyncPrimitivesProvider> Clone for LiteBox<Platform> {
-    fn clone(&self) -> Self {
-        Self {
-            x: Arc::clone(&self.x),
+    /// Returns a narrow dispatcher for moving broker notification handling into deployment code.
+    pub fn broker_notification_dispatcher(&self) -> impl Fn(BrokerNotification) + Send + 'static
+    where
+        Platform: TimeProvider + 'static,
+    {
+        let litebox = self.clone();
+        move |notification| {
+            litebox.dispatch_broker_notification(notification);
         }
     }
 }
