@@ -1115,7 +1115,7 @@ where
     Struct: FromBytes + IntoBytes,
     Field: FromBytes + IntoBytes,
 {
-    crate::write_field_at_offset::<Platform, Struct, Field>(base, field_offset, value)
+    crate::write_field_at_offset::<Platform, Field>(base.as_usize(), field_offset, value)
         .ok_or(PeImageAccessError::MemoryAccess)
 }
 

@@ -389,7 +389,7 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtSetInformationProcess {
         process_handle: ProcessHandle,
         process_information_class: u32,
-        process_information: Platform::RawConstPointer<u8>,
+        process_information: Platform::RawMutPointer<u8>,
         process_information_length: u32,
     },
     NtSetInformationThread {
