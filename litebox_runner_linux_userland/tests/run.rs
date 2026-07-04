@@ -484,8 +484,8 @@ fn test_runner_broker_integration_with_rewriter() {
     Runner::new(&target, "broker_eventfd_rewriter")
         .broker_sockets(&control_socket_path, &notification_socket_path)
         .run();
-    // eventfd.c creates twelve eventfd objects; each should release one broker object.
-    assert_eq!(broker_thread.next_close_object_count(), 12);
+    // eventfd.c creates thirteen eventfd objects; each should release one broker object.
+    assert_eq!(broker_thread.next_close_object_count(), 13);
 
     broker_thread.join();
 }

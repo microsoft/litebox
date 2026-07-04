@@ -95,6 +95,14 @@ static int expect_nonblock(int fd, int expected) {
     return ((flags & O_NONBLOCK) != 0) == expected ? 0 : 2;
 }
 
+static int expect_cloexec(int fd, int expected) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) {
+        return 1;
+    }
+    return ((flags & FD_CLOEXEC) != 0) == expected ? 0 : 2;
+}
+
 static int expect_ebadf_close(int fd) {
     errno = 0;
     if (close(fd) != -1) {
@@ -256,6 +264,23 @@ static int test_sendfile_in_fd(void) {
     }
     unlink(SENDFILE_DST_PATH);
     return expect_close(fd) == 0 ? 0 : 6;
+}
+
+static int test_cloexec_flag(void) {
+    int fd = eventfd(0, EFD_CLOEXEC);
+    if (fd < 0) {
+        return 1;
+    }
+    if (expect_cloexec(fd, 1) != 0) {
+        return 2;
+    }
+    if (fcntl(fd, F_SETFD, 0) != 0) {
+        return 3;
+    }
+    if (expect_cloexec(fd, 0) != 0) {
+        return 4;
+    }
+    return expect_close(fd) == 0 ? 0 : 5;
 }
 
 int main(void) {
@@ -502,6 +527,9 @@ int main(void) {
     }
     if (test_sendfile_in_fd() != 0) {
         return 143;
+    }
+    if (test_cloexec_flag() != 0) {
+        return 144;
     }
 
     alarm(0);
