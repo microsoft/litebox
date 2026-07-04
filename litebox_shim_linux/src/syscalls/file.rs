@@ -8533,7 +8533,13 @@ impl<FS: ShimFS> Task<FS> {
                     // If only default-ignore signals are pending,
                     // this was a spurious wake — retry. If any
                     // deliverable signal is pending, propagate EINTR.
-                    if self.pending_signals_all_ignored() {
+                    //
+                    // Vfork/fork quiescing also interrupts epoll waiters by
+                    // marking them suspended. Do not swallow that interrupt:
+                    // the caller must return to the guest boundary so
+                    // prepare_to_run_guest can park the sibling before the
+                    // forking thread snapshots or restores shared state.
+                    if !self.is_suspended() && self.pending_signals_all_ignored() {
                         // drain (clear) the ignored pending signals
                         // so we don't infinite-loop on them.
                         self.drain_ignored_pending();

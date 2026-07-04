@@ -7249,16 +7249,17 @@ impl<FS: ShimFS> Task<FS> {
                 .notify_waiters(self.process_id);
             self.thread.process.nr_threads.wake_all();
             // ThreadHandle::interrupt is edge-triggered while the target is
-            // running in host/shim code. Re-arm it on a conservative timeout
-            // so a sibling that enters a guest futex wait after the initial
-            // interrupt still breaks out and reaches the park checkpoint.
+            // running in host/shim code. Re-arm it on a short bounded timeout
+            // so a sibling that enters a guest futex/epoll wait after the
+            // initial interrupt still breaks out and reaches the park
+            // checkpoint without accumulating multi-second fork latency.
             for thread in threads_to_interrupt {
                 thread.interrupt();
             }
             let _ = ps
                 .vfork_parking
                 .parked_count
-                .block_or_timeout(n, core::time::Duration::from_millis(50));
+                .block_or_timeout(n, core::time::Duration::from_millis(5));
         }
         Ok(true)
     }
