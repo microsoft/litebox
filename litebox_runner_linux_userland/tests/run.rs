@@ -463,7 +463,15 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn test_runner_broker_integration_with_rewriter() {
+    const HELLO_WORLD_JS: &str = r"
+const fs = require('node:fs');
+
+const content = 'Hello World!';
+console.log(content);
+";
+
     let true_path = run_which("true");
+    let node_path = run_which("node");
     let target = common::compile("./tests/eventfd.c", "broker_eventfd_rewriter", false, false);
     let control_socket_path = unique_test_socket_path("runner-broker-control");
     let notification_socket_path = unique_test_socket_path("runner-broker-notification");
@@ -473,7 +481,7 @@ fn test_runner_broker_integration_with_rewriter() {
         litebox_broker_core::PolicyEngine::with_unauthenticated_rights(
             litebox_broker_core::PrincipalRights::all(),
         ),
-        2,
+        3,
     );
 
     Runner::new(&true_path, "broker_true_rewriter")
@@ -487,27 +495,16 @@ fn test_runner_broker_integration_with_rewriter() {
     // eventfd.c creates thirteen eventfd objects; each should release one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 13);
 
-    broker_thread.join();
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_node_with_rewriter() {
-    const HELLO_WORLD_JS: &str = r"
-const fs = require('node:fs');
-
-const content = 'Hello World!';
-console.log(content);
-";
-
-    let node_path = run_which("node");
-    Runner::new(&node_path, "hello_node_rewriter")
+    Runner::new(&node_path, "hello_node_broker_rewriter")
+        .broker_sockets(&control_socket_path, &notification_socket_path)
         .arg("/out/hello_world.js")
         .with_fs_path(|out_dir| {
-            // write the test js file to the output directory
             std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
         })
         .run();
+    assert!(broker_thread.next_close_object_count() > 0);
+
+    broker_thread.join();
 }
 
 #[cfg(target_arch = "x86_64")]
