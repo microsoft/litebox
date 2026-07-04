@@ -445,7 +445,11 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             EpollDescriptor::BrokerPipe(_) => false,
             EpollDescriptor::BrokerPty(_) => false,
             EpollDescriptor::BrokerSocketPair(_) => false,
-            EpollDescriptor::BrokerTcpConn(_) => false,
+            // Broker TCP connect completion is produced by a broker-side helper
+            // thread. Notifications are still the fast path, but epoll must also
+            // periodically re-query the broker so a missed/lost wake cannot leave
+            // a nonblocking connect stuck in EINPROGRESS until user timeout.
+            EpollDescriptor::BrokerTcpConn(_) => true,
             EpollDescriptor::BrokerUnixStream(_) => false,
             #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(_) => false,
