@@ -3204,10 +3204,25 @@ fn handle_inet_listener_listen(
         Err(r) => return r,
     };
     match state.listen(backlog) {
-        Ok(()) => HandlerResult {
-            frame: build_inet_listener_listen_response_ok(),
-            out_fd: None,
-        },
+        Ok(()) => {
+            if state.reuse_port_enabled()
+                && let Some(addr) = state.bound_addr()
+                && addr.port() != 0
+                && registry
+                    .register_broker_held_inet_listener(
+                        addr.port(),
+                        state.family(),
+                        StateHandle::from_id(handle_id),
+                    )
+                    .is_err()
+            {
+                return status_err(Opcode::InetListenerListenResponse, StatusCode::InvalidValue);
+            }
+            HandlerResult {
+                frame: build_inet_listener_listen_response_ok(),
+                out_fd: None,
+            }
+        }
         Err(InetListenerError::NotBound | InetListenerError::AlreadyListening) => {
             status_err(Opcode::InetListenerListenResponse, StatusCode::InvalidValue)
         }
