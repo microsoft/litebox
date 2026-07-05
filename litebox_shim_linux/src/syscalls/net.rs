@@ -3956,18 +3956,9 @@ impl<FS: ShimFS> Task<FS> {
                     }
                 }
 
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-
-                let passed = rds
-                    .duplicate_for_passing(raw_fd, &mut dt)
-                    .ok_or(Errno::EBADF)?;
-                drop(rds);
-                drop(files);
-
                 {
                     let files = self.files.borrow();
+                    let dt = self.global.litebox.descriptor_table();
                     let broker_dgram = files
                         .raw_descriptor_store
                         .read()
@@ -3998,6 +3989,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
 
                 let files = self.files.borrow();
+                let dt = self.global.litebox.descriptor_table();
                 let sent_broker_token = files.run_on_raw_fd(raw_fd, |raw_fd_ref| -> Result<bool, Errno> {
                     match raw_fd_ref {
                         crate::RawFdRef::Fs(_) => Ok(false),
@@ -4219,6 +4211,15 @@ impl<FS: ShimFS> Task<FS> {
                 drop(files);
 
                 if !sent_broker_token {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let files = self.files.borrow();
+                    let rds = files.raw_descriptor_store.read();
+                    let passed = rds
+                        .duplicate_for_passing(raw_fd, &mut dt)
+                        .ok_or(Errno::EBADF)?;
+                    drop(rds);
+                    drop(files);
+
                     // Compile-time-exhaustive diagnosis (see `scm_passed_fd_kind`):
                     // a broker-backed fd that reaches this raw-`PassedFd`
                     // fallthrough was NOT tokenized, so the receiver gets a dead
