@@ -143,7 +143,8 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
         // outlives it.
         let unix = {
             let rds = self.raw_descriptor_store.read();
-            match rds.fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd) {
+            match rds.fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
+            {
                 Ok(fd) => fd,
                 Err(litebox::fd::ErrRawIntFd::NotFound) => return Err(Errno::EBADF),
                 Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
