@@ -15,6 +15,12 @@ pub(super) struct InboundForward {
     pub(super) guest_port: u16,
 }
 
+pub(super) enum BrokerHeldAccept {
+    Delivered,
+    NoListener(TcpStream),
+    Rejected,
+}
+
 pub(super) fn setup_inbound_listeners(
     inbound_forwards: &[(u16, Ipv4Addr, u16)],
     state_registry: Option<&BrokerStateRegistry>,
@@ -53,21 +59,21 @@ pub(super) fn try_accept_broker_held(
     stream: TcpStream,
     peer: SocketAddr,
     state_registry: Option<&BrokerStateRegistry>,
-) -> Option<TcpStream> {
+) -> BrokerHeldAccept {
     if let Some(listener) = state_registry
         .and_then(|registry| registry.resolve_broker_held_inet_listener_for_inbound(fwd.guest_port))
     {
         match listener.accept_inbound(stream, peer) {
-            Ok(()) => None,
+            Ok(()) => BrokerHeldAccept::Delivered,
             Err(e) => {
                 warn!(
                     "broker-held listener rejected host-inbound stream for port {}: {e}",
                     fwd.guest_port
                 );
-                None
+                BrokerHeldAccept::Rejected
             }
         }
     } else {
-        Some(stream)
+        BrokerHeldAccept::NoListener(stream)
     }
 }

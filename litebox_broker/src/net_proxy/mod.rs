@@ -15,22 +15,22 @@ mod lbnp_handshake;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audit::AuditLog;
 use crate::sandbox_policy::SandboxPolicy;
 use crate::sock_compat::{
-    self, AsRawSock, IpcListener, IpcStream, POLLERR, POLLHUP, POLLIN, PollFd, RawSock,
+    self, AsRawSock, IpcListener, IpcStream, PollFd, RawSock, POLLERR, POLLHUP, POLLIN,
 };
 use crate::state_registry::BrokerStateRegistry;
 
-use device::{DEVICE_MTU, IpcDrainResult};
+use device::{IpcDrainResult, DEVICE_MTU};
 use lb9p_handshake::{PendingLb9pResult, RingServiceSpawner};
 use lbnp_handshake::{
-    HANDSHAKE_MAGIC, HANDSHAKE_VERSION, perform_handshake, send_handshake_response,
-    validate_handshake_request,
+    perform_handshake, send_handshake_response, validate_handshake_request, HANDSHAKE_MAGIC,
+    HANDSHAKE_VERSION,
 };
 use tracing::{debug, info, warn};
 
@@ -44,6 +44,13 @@ struct PendingHandshake {
     deadline: Instant,
 }
 
+struct PendingInbound {
+    fwd_index: usize,
+    stream: Option<std::net::TcpStream>,
+    peer: std::net::SocketAddr,
+    deadline: Instant,
+}
+
 /// Timeout for the LB9P handshake on an accepted connection.
 const HANDSHAKE_ACCEPT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -54,6 +61,8 @@ const MAX_ADDITIONAL_LBNP_SESSIONS: usize = 32;
 /// Maximum accepted-but-not-yet-classified listener sockets kept in the
 /// pending handshake queue at once.
 const MAX_PENDING_ACCEPTED_HANDSHAKES: usize = 32;
+const MAX_PENDING_INBOUND_STREAMS: usize = 32;
+const INBOUND_LISTENER_GRACE: Duration = Duration::from_secs(30);
 
 /// Parse a port-forward spec: "HOST_PORT:GUEST_IP:GUEST_PORT".
 pub fn parse_forward_spec(spec: &str) -> Option<(u16, Ipv4Addr, u16)> {
@@ -223,6 +232,7 @@ fn run_inner(
         inbound_forward::setup_inbound_listeners(&inbound_forwards, state_registry.as_deref());
     let _host_dns = host_dns::discover_host_dns();
     let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
+    let mut pending_inbound: Vec<PendingInbound> = Vec::new();
 
     info!("network proxy ready, entering event loop");
 
@@ -275,7 +285,13 @@ fn run_inner(
             state_registry.clone(),
         );
 
-        for fwd in &inbound_listeners {
+        drain_pending_inbound(
+            &mut pending_inbound,
+            &inbound_listeners,
+            state_registry.as_deref(),
+        );
+
+        for (fwd_index, fwd) in inbound_listeners.iter().enumerate() {
             loop {
                 match fwd.listener.accept() {
                     Ok((stream, peer)) => {
@@ -285,18 +301,37 @@ fn run_inner(
                             fwd.guest_ip, fwd.guest_port
                         );
 
-                        if inbound_forward::try_accept_broker_held(
+                        match inbound_forward::try_accept_broker_held(
                             fwd,
                             stream,
                             peer,
                             state_registry.as_deref(),
-                        )
-                        .is_some()
-                        {
-                            warn!(
-                                "inbound TCP: no broker-held listener for {}:{}, dropping host stream",
-                                fwd.guest_ip, fwd.guest_port
-                            );
+                        ) {
+                            inbound_forward::BrokerHeldAccept::Delivered
+                            | inbound_forward::BrokerHeldAccept::Rejected => {}
+                            inbound_forward::BrokerHeldAccept::NoListener(stream) => {
+                                if pending_inbound.len() >= MAX_PENDING_INBOUND_STREAMS {
+                                    warn!(
+                                        limit = MAX_PENDING_INBOUND_STREAMS,
+                                        "too many host-inbound streams awaiting guest listener; \
+                                         dropping connection for {}:{}",
+                                        fwd.guest_ip,
+                                        fwd.guest_port
+                                    );
+                                } else {
+                                    debug!(
+                                        "inbound TCP: guest listener for {}:{} is not registered yet; \
+                                         holding host stream from {peer}",
+                                        fwd.guest_ip, fwd.guest_port
+                                    );
+                                    pending_inbound.push(PendingInbound {
+                                        fwd_index,
+                                        stream: Some(stream),
+                                        peer,
+                                        deadline: Instant::now() + INBOUND_LISTENER_GRACE,
+                                    });
+                                }
+                            }
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -362,6 +397,40 @@ fn run_inner(
     device::send_shutdown(ipc_raw);
     info!("network proxy shut down");
     Ok(())
+}
+
+fn drain_pending_inbound(
+    pending_inbound: &mut Vec<PendingInbound>,
+    inbound_listeners: &[inbound_forward::InboundForward],
+    state_registry: Option<&BrokerStateRegistry>,
+) {
+    pending_inbound.retain_mut(|pending| {
+        if Instant::now() >= pending.deadline {
+            if let Some(fwd) = inbound_listeners.get(pending.fwd_index) {
+                warn!(
+                    "timed out waiting for guest listener {}:{}, dropping held host stream from {}",
+                    fwd.guest_ip, fwd.guest_port, pending.peer
+                );
+            }
+            return false;
+        }
+
+        let Some(fwd) = inbound_listeners.get(pending.fwd_index) else {
+            return false;
+        };
+        let Some(stream) = pending.stream.take() else {
+            return false;
+        };
+
+        match inbound_forward::try_accept_broker_held(fwd, stream, pending.peer, state_registry) {
+            inbound_forward::BrokerHeldAccept::Delivered
+            | inbound_forward::BrokerHeldAccept::Rejected => false,
+            inbound_forward::BrokerHeldAccept::NoListener(stream) => {
+                pending.stream = Some(stream);
+                true
+            }
+        }
+    });
 }
 
 enum IpcLoopState {
@@ -681,8 +750,8 @@ mod tests {
     use std::io::{Read as _, Write as _};
     #[cfg(windows)]
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
     };
     use std::time::Duration;
 
