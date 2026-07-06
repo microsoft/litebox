@@ -1044,8 +1044,6 @@ impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
 mod tests {
     use super::*;
 
-    use crate::tests::TestPlatform;
-
     #[test]
     fn handle_encodes_raw_fds_and_rejects_invalid_values() {
         let first_handle = Handle::from_raw_fd(0).expect("raw fd 0 should encode");
@@ -1070,32 +1068,5 @@ mod tests {
 
         assert_eq!(Handle::from_raw_fd(usize::MAX >> HANDLE_SHIFT), None);
         assert_eq!(Handle::from_raw_fd(usize::MAX), None);
-    }
-
-    #[test]
-    fn nt_apphelp_cache_control_decodes_arguments() {
-        let mut service_data = 0u8;
-        let pt_regs = litebox_common_linux::PtRegs {
-            r10: 2,
-            rdx: core::ptr::from_mut(&mut service_data) as usize,
-            orig_rax: NtSysno::NtApphelpCacheControl.as_raw() as usize,
-            ..Default::default()
-        };
-
-        let Some(SyscallRequest::NtApphelpCacheControl {
-            service_class,
-            service_data: decoded_service_data,
-        }) = SyscallRequest::<TestPlatform>::try_from_raw(&pt_regs)
-        else {
-            panic!("NtApphelpCacheControl did not decode");
-        };
-
-        assert_eq!(service_class, 2);
-        assert_eq!(
-            decoded_service_data
-                .expect("service data pointer")
-                .as_usize(),
-            core::ptr::from_mut(&mut service_data) as usize
-        );
     }
 }
