@@ -43,6 +43,7 @@ Override:
 ```
 dashboard.py render                          # write summary.md once
 dashboard.py status [--format text|md|sql]   # terminal-friendly summary
+dashboard.py flaky [--mode litebox|native|both]  # recent flake leaderboard
 dashboard.py track <ref> <ci_worktree>       # register a tracked ref
 dashboard.py untrack <ref>                   # remove a tracked ref
 dashboard.py refs                            # list tracked refs
@@ -172,6 +173,27 @@ Schema-version compatibility: bumped on breaking changes. On
 mismatch the Rust producer panics with a remediation pointer;
 the user is consulted before any bump (stopping every coding-agent
 session is a coordination cost).
+
+### Flake leaderboard
+
+`dashboard.py flaky` ranks recent clean, definitive (`pass`/`fail`)
+results from `.dashboard/results.sqlite` over the same 30-day window the
+regression classifier uses. It shows per-test pass/fail counts and fail
+rates, plus two triage signals:
+
+- `load-sensitive` — the test fails materially more often from
+  `.dashboard/shadows/...` worktrees than from dedicated worktrees,
+  which points at high parallel-build load as the reproduction shape.
+- `substrate-bug?` — native is solid while litebox flakes/fails,
+  suggesting the bug is in the litebox substrate rather than the test.
+
+Examples:
+
+```
+dashboard.py flaky --limit 15
+dashboard.py flaky --mode both --pattern pidfd --min-rate 0.10
+dashboard.py flaky --format sql
+```
 
 ### Cross-session concurrency coordination
 

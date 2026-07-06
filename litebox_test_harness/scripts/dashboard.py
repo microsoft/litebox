@@ -120,7 +120,9 @@ def resolve_state_dir(arg: Optional[str]) -> Path:
 
 
 def open_db(state_dir: Path, *, bootstrap: bool = False,
-            with_state_views: bool = True) -> sqlite3.Connection:
+            with_state_views: bool = True,
+            with_classification_schema: bool = True,
+            read_only: bool = False) -> sqlite3.Connection:
     """Open the dashboard sqlite store.
 
     `bootstrap=True` initializes an empty store + schema if the file
@@ -135,6 +137,9 @@ def open_db(state_dir: Path, *, bootstrap: bool = False,
     cache tables / raw `run_results` (e.g. `regressions`, the
     supervisor's per-cycle ref read + classification refresh) pass it
     to avoid a multi-second cost they'd never use.
+
+    `with_classification_schema=False` and `read_only=True` are for
+    read-only reporting commands that query raw result tables directly.
     """
     db_path = state_dir / "results.sqlite"
     if not db_path.exists():
@@ -146,8 +151,13 @@ def open_db(state_dir: Path, *, bootstrap: bool = False,
                 "  or `dashboard.py track …` (auto-creates the store)."
             )
         state_dir.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
-    conn.execute("PRAGMA journal_mode = WAL")
+    if read_only:
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro", isolation_level=None, uri=True,
+        )
+    else:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.row_factory = sqlite3.Row
     if bootstrap:
@@ -155,7 +165,8 @@ def open_db(state_dir: Path, *, bootstrap: bool = False,
     check_schema(conn)
     if with_state_views:
         _ensure_views(conn)
-    _ensure_classification_schema(conn)
+    if with_classification_schema:
+        _ensure_classification_schema(conn)
     return conn
 
 
@@ -2396,6 +2407,221 @@ def write_summary(conn: sqlite3.Connection, state_dir: Path) -> Path:
 # ─── Subcommands ─────────────────────────────────────────────────────
 
 
+def _flaky_rows(
+    conn: sqlite3.Connection,
+    *,
+    mode: str = "litebox",
+    pattern: Optional[str] = None,
+    suite: Optional[str] = None,
+    group: Optional[str] = None,
+    min_rate: float = 0.0,
+    limit: int = 40,
+) -> list[sqlite3.Row]:
+    """Return recent flake-leaderboard rows.
+
+    All rates, cross-mode comparisons, load-sensitivity flags, filters,
+    and ranking are computed in one SQL query; Python only supplies
+    parameters and formats the result.
+    """
+    mode_filter = ""
+    params: dict[str, object] = {
+        "window_ms": _RECENT_FLAKE_WINDOW_MS,
+        "soft_flake_rate": _SOFT_FLAKE_RATE,
+        "substrate_native_rate": 0.02,
+        "min_rate": min_rate,
+        "limit": limit,
+    }
+    if mode != "both":
+        mode_filter = "AND m.mode = :mode"
+        params["mode"] = mode
+    filter_sql = ""
+    if pattern is not None:
+        filter_sql += " AND rr.test_id LIKE :pattern"
+        params["pattern"] = f"%{pattern}%"
+    if suite is not None:
+        filter_sql += " AND rr.suite = :suite"
+        params["suite"] = suite
+    if group is not None:
+        filter_sql += ' AND rr."group" = :group'
+        params["group"] = group
+    query = f"""
+    WITH recent AS (
+        SELECT
+            rr.test_id,
+            rr.mode,
+            rr.suite,
+            rr."group" AS group_name,
+            rr.verdict,
+            CASE WHEN r.worktree_path LIKE '%/shadows/%'
+                 THEN 1 ELSE 0 END AS is_shadow
+          FROM run_results rr
+          JOIN runs r ON r.run_id = rr.run_id
+         WHERE r.dirty_hash IS NULL
+           AND rr.verdict IN ('pass','fail')
+           AND rr.finished_ts_ms >
+               (CAST(strftime('%s','now') AS INTEGER) * 1000 - :window_ms)
+           {filter_sql}
+    ),
+    mode_stats AS (
+        SELECT
+            test_id,
+            mode,
+            MAX(suite) AS suite,
+            MAX(group_name) AS group_name,
+            SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
+            SUM(CASE WHEN verdict = 'fail' THEN 1 ELSE 0 END) AS n_fail,
+            SUM(CASE WHEN is_shadow = 1 AND verdict = 'pass'
+                     THEN 1 ELSE 0 END) AS shadow_pass,
+            SUM(CASE WHEN is_shadow = 1 AND verdict = 'fail'
+                     THEN 1 ELSE 0 END) AS shadow_fail,
+            SUM(CASE WHEN is_shadow = 0 AND verdict = 'pass'
+                     THEN 1 ELSE 0 END) AS dedicated_pass,
+            SUM(CASE WHEN is_shadow = 0 AND verdict = 'fail'
+                     THEN 1 ELSE 0 END) AS dedicated_fail,
+            SUM(CASE WHEN verdict = 'fail' THEN 1.0 ELSE 0.0 END)
+                / COUNT(*) AS fail_rate,
+            SUM(CASE WHEN is_shadow = 1 AND verdict = 'fail'
+                     THEN 1.0 ELSE 0.0 END)
+                / NULLIF(SUM(CASE WHEN is_shadow = 1 THEN 1 ELSE 0 END), 0)
+                AS shadow_rate,
+            SUM(CASE WHEN is_shadow = 0 AND verdict = 'fail'
+                     THEN 1.0 ELSE 0.0 END)
+                / NULLIF(SUM(CASE WHEN is_shadow = 0 THEN 1 ELSE 0 END), 0)
+                AS dedicated_rate
+          FROM recent
+         GROUP BY test_id, mode
+    ),
+    paired AS (
+        SELECT
+            m.*,
+            l.fail_rate AS litebox_fail_rate,
+            n.fail_rate AS native_fail_rate,
+            CASE WHEN m.shadow_fail + m.shadow_pass > 0
+                   AND m.dedicated_fail + m.dedicated_pass > 0
+                   AND COALESCE(m.shadow_rate, 0.0) >= :soft_flake_rate
+                   AND COALESCE(m.shadow_rate, 0.0)
+                       >= 2.0 * COALESCE(m.dedicated_rate, 0.0)
+                 THEN 1 ELSE 0 END AS load_sensitive,
+            CASE WHEN m.mode = 'litebox'
+                   AND COALESCE(n.n_pass, 0) + COALESCE(n.n_fail, 0) > 0
+                   AND COALESCE(n.fail_rate, 0.0) < :substrate_native_rate
+                   AND COALESCE(l.fail_rate, 0.0) >= :soft_flake_rate
+                 THEN 1 ELSE 0 END AS substrate_bug
+          FROM mode_stats m
+          LEFT JOIN mode_stats l
+                 ON l.test_id = m.test_id AND l.mode = 'litebox'
+          LEFT JOIN mode_stats n
+                 ON n.test_id = m.test_id AND n.mode = 'native'
+    )
+    SELECT
+        test_id, mode, suite, group_name,
+        n_pass, n_fail, fail_rate,
+        shadow_pass, shadow_fail, shadow_rate,
+        dedicated_pass, dedicated_fail, dedicated_rate,
+        load_sensitive, substrate_bug,
+        litebox_fail_rate, native_fail_rate
+      FROM paired m
+     WHERE m.fail_rate >= :min_rate
+       {mode_filter}
+     ORDER BY COALESCE(m.litebox_fail_rate, m.fail_rate) DESC,
+              CASE m.mode WHEN 'litebox' THEN 0 ELSE 1 END,
+              m.fail_rate DESC,
+              m.test_id
+     LIMIT :limit
+    """
+    return conn.execute(query, params).fetchall()
+
+
+def _format_rate(v: Optional[float]) -> str:
+    return "n/a" if v is None else f"{v:.1%}"
+
+
+def cmd_flaky(args: argparse.Namespace) -> int:
+    """Rank recent flaky tests, with load-sensitivity and substrate-bug
+    signals computed directly from the dashboard store."""
+    state_dir = resolve_state_dir(args.state_dir)
+    conn = open_db(
+        state_dir,
+        with_state_views=False,
+        with_classification_schema=False,
+        read_only=True,
+    )
+    try:
+        rows = _flaky_rows(
+            conn,
+            mode=args.mode,
+            pattern=args.pattern,
+            suite=args.suite,
+            group=args.group,
+            min_rate=args.min_rate,
+            limit=args.limit,
+        )
+        if args.format == "sql":
+            for r in rows:
+                shadow_rate = (
+                    "" if r["shadow_rate"] is None
+                    else f"{r['shadow_rate']:.6f}"
+                )
+                dedicated_rate = (
+                    "" if r["dedicated_rate"] is None
+                    else f"{r['dedicated_rate']:.6f}"
+                )
+                print(
+                    f"{r['mode']}\t{r['test_id']}\t{r['n_pass']}\t{r['n_fail']}"
+                    f"\t{r['fail_rate']:.6f}\t"
+                    f"{1 if r['load_sensitive'] else 0}\t"
+                    f"{1 if r['substrate_bug'] else 0}\t"
+                    f"{r['suite'] or ''}\t{r['group_name'] or ''}\t"
+                    f"{shadow_rate}\t{dedicated_rate}"
+                )
+            return 0
+        cols = [
+            ("test_id", "test_id"),
+            ("mode", "mode"),
+            ("pass/fail", "pf"),
+            ("rate", "rate"),
+            ("load-sens", "load"),
+            ("substrate?", "sub"),
+            ("shadow", "shadow"),
+            ("dedicated", "ded"),
+            ("suite/group", "sg"),
+        ]
+        data = []
+        for r in rows:
+            data.append({
+                "test_id": r["test_id"],
+                "mode": r["mode"],
+                "pf": f"{r['n_pass']}/{r['n_fail']}",
+                "rate": _format_rate(r["fail_rate"]),
+                "load": "load-sensitive" if r["load_sensitive"] else "",
+                "sub": "substrate-bug?" if r["substrate_bug"] else "",
+                "shadow": (
+                    f"{r['shadow_pass']}/{r['shadow_fail']} "
+                    f"{_format_rate(r['shadow_rate'])}"
+                ),
+                "ded": (
+                    f"{r['dedicated_pass']}/{r['dedicated_fail']} "
+                    f"{_format_rate(r['dedicated_rate'])}"
+                ),
+                "sg": f"{r['suite'] or ''}/{r['group_name'] or ''}",
+            })
+        if not data:
+            print("no flaky rows matched")
+            return 0
+        widths = {
+            key: max(len(label), *(len(str(row[key])) for row in data))
+            for label, key in cols
+        }
+        print(" | ".join(label.ljust(widths[key]) for label, key in cols))
+        print("-+-".join("-" * widths[key] for _, key in cols))
+        for row in data:
+            print(" | ".join(str(row[key]).ljust(widths[key])
+                             for _, key in cols))
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_regressions(args: argparse.Namespace) -> int:
     """Standardized regression classification for a branch, read from
     the `regression_class` view. Buckets each (test, mode) as
@@ -3971,6 +4197,24 @@ def build_parser() -> argparse.ArgumentParser:
                         help="canonical clone root for git queries "
                              "(default: state-dir's parent)")
     p_regr.set_defaults(func=cmd_regressions)
+
+    p_flaky = sub.add_parser(
+        "flaky",
+        help="rank recent flaky tests and flag load-sensitive/substrate flakes",
+    )
+    p_flaky.add_argument("--mode", choices=("litebox", "native", "both"),
+                         default="litebox")
+    p_flaky.add_argument("--pattern", help="SQL LIKE substring for test_id")
+    p_flaky.add_argument("--suite", help="filter by run_results.suite")
+    p_flaky.add_argument("--group", help="filter by run_results.group")
+    p_flaky.add_argument("--min-rate", type=float, default=0.0,
+                         help="minimum fail rate to show (default 0.0)")
+    p_flaky.add_argument("--limit", type=int, default=40,
+                         help="max rows to show (default 40)")
+    p_flaky.add_argument("--format", choices=("table", "sql"), default="table")
+    p_flaky.add_argument("--canonical-worktree", default=None,
+                         help=argparse.SUPPRESS)
+    p_flaky.set_defaults(func=cmd_flaky)
 
     p_track = sub.add_parser(
         "track",

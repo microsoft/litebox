@@ -17,6 +17,9 @@ import unittest
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+TEST_TMP_DIR = SCRIPTS_DIR.parents[1] / "target" / "dashboard-py-tests"
+TEST_TMP_DIR.mkdir(parents=True, exist_ok=True)
+tempfile.tempdir = str(TEST_TMP_DIR)
 sys.path.insert(0, str(SCRIPTS_DIR))
 import dashboard  # type: ignore
 
@@ -1089,6 +1092,94 @@ class RegressionClassTests(unittest.TestCase):
         self._upstream("BASE", "T", "pass")
         self._branch("BRANCH", "T", "fail")
         self.assertEqual(self._classify()["T"], ("hard_regression", "medium"))
+
+
+class FlakyLeaderboardTests(unittest.TestCase):
+    """The flaky leaderboard is SQL-first: the helper returns rows from
+    one aggregate query, and Python only formats them."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-flaky-")
+        self.db = Path(self.tmp) / "results.sqlite"
+        self.conn = _init_db(self.db)
+        self.now = dashboard.now_ms()
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _result(self, test_id, mode, verdict, *, worktree="/ci",
+                suite="vscode", group="pidfd", dt=0):
+        rid = _add_run(self.conn, worktree=worktree,
+                       started_ts_ms=self.now - dt)
+        _add_result(self.conn, run_id=rid, test_id=test_id, pass_=mode,
+                    verdict=verdict, ts_ms=self.now - dt,
+                    suite=suite, group=group)
+
+    def _rows(self, **kwargs):
+        defaults = {
+            "mode": "litebox",
+            "pattern": None,
+            "suite": None,
+            "group": None,
+            "min_rate": 0.0,
+            "limit": 40,
+        }
+        defaults.update(kwargs)
+        return dashboard._flaky_rows(self.conn, **defaults)
+
+    def test_genuinely_flaky_ranked_with_correct_rate(self):
+        self._result("T_flaky", "litebox", "pass", dt=3)
+        self._result("T_flaky", "litebox", "fail", dt=2)
+        self._result("T_solid", "litebox", "pass", dt=1)
+        rows = self._rows()
+        self.assertEqual(rows[0]["test_id"], "T_flaky")
+        self.assertEqual(rows[0]["n_pass"], 1)
+        self.assertEqual(rows[0]["n_fail"], 1)
+        self.assertAlmostEqual(rows[0]["fail_rate"], 0.5)
+
+    def test_load_sensitive_flag(self):
+        self._result("T_load", "litebox", "pass", worktree="/ci", dt=2)
+        self._result("T_load", "litebox", "fail",
+                     worktree="/repo/.dashboard/shadows/T_load", dt=1)
+        row = self._rows()[0]
+        self.assertEqual(row["test_id"], "T_load")
+        self.assertEqual(row["load_sensitive"], 1)
+        self.assertAlmostEqual(row["shadow_rate"], 1.0)
+        self.assertAlmostEqual(row["dedicated_rate"], 0.0)
+
+    def test_substrate_bug_flag(self):
+        self._result("T_substrate", "native", "pass", dt=4)
+        self._result("T_substrate", "native", "pass", dt=3)
+        self._result("T_substrate", "litebox", "pass", dt=2)
+        self._result("T_substrate", "litebox", "fail", dt=1)
+        row = self._rows()[0]
+        self.assertEqual(row["test_id"], "T_substrate")
+        self.assertEqual(row["substrate_bug"], 1)
+
+    def test_min_rate_filters(self):
+        self._result("T_low", "litebox", "pass", dt=4)
+        self._result("T_low", "litebox", "fail", dt=3)
+        self._result("T_low", "litebox", "pass", dt=2)
+        self._result("T_high", "litebox", "fail", dt=1)
+        rows = self._rows(min_rate=0.6)
+        self.assertEqual([r["test_id"] for r in rows], ["T_high"])
+
+    def test_pattern_filters(self):
+        self._result("alpha_match", "litebox", "fail", dt=2)
+        self._result("beta_other", "litebox", "fail", dt=1)
+        rows = self._rows(pattern="match")
+        self.assertEqual([r["test_id"] for r in rows], ["alpha_match"])
+
+    def test_no_result_rows_do_not_inflate_rate(self):
+        self._result("T_noresult", "litebox", "pass", dt=3)
+        self._result("T_noresult", "litebox", "fail", dt=2)
+        self._result("T_noresult", "litebox", "no_result", dt=1)
+        row = self._rows()[0]
+        self.assertEqual(row["n_pass"], 1)
+        self.assertEqual(row["n_fail"], 1)
+        self.assertAlmostEqual(row["fail_rate"], 0.5)
 
 
 if __name__ == "__main__":
