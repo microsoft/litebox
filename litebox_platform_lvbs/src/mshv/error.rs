@@ -83,6 +83,9 @@ pub enum VsmError {
     #[error("invalid module token")]
     ModuleTokenInvalid,
 
+    #[error("physical frames overlap already-protected or reserved memory")]
+    ProtectedFrameOverlap,
+
     // Kernel Symbol Table Errors
     #[error("no kernel symbol table found")]
     KernelSymbolTableNotFound,
@@ -212,6 +215,7 @@ impl From<VsmError> for Errno {
             | VsmError::ModuleMemoryTypeInvalid
             | VsmError::ModuleRelocationInvalid
             | VsmError::ModuleTokenInvalid
+            | VsmError::ProtectedFrameOverlap
             | VsmError::KexecTypeInvalid
             | VsmError::KexecImageSegmentsInvalid
             | VsmError::SymbolTableEmpty

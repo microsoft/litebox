@@ -15,6 +15,15 @@ pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
+type Vtl0PhysConstPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, crate::Vmap>;
+
+/// Mutable VTL0 pointer reserved for the HEKI text patching (validated) and log ring
+/// buffer (fixed address). It bypasses `protected_frames` rejection and locking.
+/// DO NOT USE IT for other VTL0 destinations which could enable confused-deputy writes.
+type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, crate::PrivilegedVmap>;
+
 use crate::arch::MAX_CORES;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use modular_bitfield::prelude::*;

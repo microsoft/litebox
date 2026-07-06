@@ -42,6 +42,20 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
         Err(PhysPointerError::UnsupportedOperation)
     }
 
+    /// Map pages without the platform's mutable-access checks for trusted callers. Ordinary
+    /// [`Self::vmap`] may delegate here after performing its checks. The default is deny.
+    ///
+    /// # Safety
+    ///
+    /// This method has the same raw-mapping requirements as [`Self::vmap`].
+    unsafe fn vmap_privileged(
+        &self,
+        _pages: &PhysPageAddrArray<ALIGN>,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<Self::MapInfo, PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
+    }
+
     /// Unmap the previously mapped virtually contiguous addresses ([`Self::MapInfo`]).
     ///
     /// This function is analogous to Linux kernel's `vunmap()`.

@@ -46,15 +46,21 @@ pub mod mshv;
 
 pub mod syscall_entry;
 
-/// Mapping info returned by [`LinuxKernel`]'s [`VmapManager::vmap`].
+/// Mapping info returned by LVBS vmap paths. Ordinary writable mappings retain their
+/// `protected_frames` guard here until unmap.
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
+    protected_frames_guard: Option<spin::rwlock::RwLockReadGuard<'static, rangemap::RangeSet<u64>>>,
 }
 
 impl LvbsPhysPageMapInfo {
     fn new(base: *mut u8, size: usize) -> Self {
-        Self { base, size }
+        Self {
+            base,
+            size,
+            protected_frames_guard: None,
+        }
     }
 }
 
@@ -447,6 +453,9 @@ type UserMutPtr<T> =
 /// Type-level marker for the VTL0 physical-pointer provider.
 pub enum Vmap {}
 
+/// Type-level marker for MSHV operations authorized to modify protected VTL0 frames.
+pub(crate) struct PrivilegedVmap;
+
 impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
     type Manager = crate::host::LvbsLinuxKernel;
     fn manager() -> &'static Self::Manager {
@@ -454,10 +463,53 @@ impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
     }
 }
 
-pub type Vtl0PhysConstPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, Vmap>;
-pub type Vtl0PhysMutPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, Vmap>;
+impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for PrivilegedVmap {
+    type Manager = PrivilegedVmap;
+    fn manager() -> &'static Self::Manager {
+        &PrivilegedVmap
+    }
+}
+
+unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
+    type MapInfo = LvbsPhysPageMapInfo;
+
+    unsafe fn vmap(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<Self::MapInfo, PhysPointerError> {
+        // SAFETY: callers uphold the raw mapping contract. This provider is used only
+        // for independently authorized HEKI patch and ring-buffer writes.
+        unsafe { crate::platform_low().vmap_privileged(pages, perms) }
+    }
+
+    unsafe fn vunmap(
+        &self,
+        map_info: Self::MapInfo,
+    ) -> Result<(), (PhysPointerError, Self::MapInfo)> {
+        // SAFETY: `map_info` came from the same LVBS platform mapper and has no outstanding uses
+        // beyond the physical-pointer guard that is dropping it.
+        unsafe {
+            <crate::host::LvbsLinuxKernel as VmapManager<ALIGN>>::vunmap(
+                crate::platform_low(),
+                map_info,
+            )
+        }
+    }
+
+    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
+        crate::platform_low().validate_unowned(pages)
+    }
+
+    unsafe fn protect(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<(), PhysPointerError> {
+        // SAFETY: callers uphold `VmapManager::protect`; this forwards unchanged to LVBS.
+        unsafe { crate::platform_low().protect(pages, perms) }
+    }
+}
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
@@ -1125,6 +1177,28 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
     type MapInfo = LvbsPhysPageMapInfo;
 
     unsafe fn vmap(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<Self::MapInfo, PhysPointerError> {
+        let protected_frames = if perms.contains(PhysPageMapPermissions::WRITE) {
+            // This shared guard spans map/copy/unmap. It permits concurrent foreign-memory writes
+            // but does not support re-entry into a VTL protection change.
+            let guard = crate::mshv::vsm::protected_frames().read();
+            crate::mshv::vsm::validate_mutable_vtl0_pages(&guard, pages)?;
+            Some(guard)
+        } else {
+            None
+        };
+        // SAFETY: ordinary writable mappings were checked against protected and in-flight frames;
+        // the guard is retained through map, access, and unmap. `vmap_privileged` provides the
+        // shared raw mapping implementation.
+        let mut map_info = unsafe { self.vmap_privileged(pages, perms)? };
+        map_info.protected_frames_guard = protected_frames;
+        Ok(map_info)
+    }
+
+    unsafe fn vmap_privileged(
         &self,
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,

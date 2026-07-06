@@ -3,7 +3,7 @@
 
 //! RingBuffer implementation and functions
 
-use crate::Vtl0PhysMutPtr;
+use super::PrivilegedVtl0PhysMutPtr;
 use core::fmt;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::utils::TruncateExt;
@@ -96,7 +96,7 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
         span.push(addr);
     }
 
-    let Ok(ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::new(&span, in_page_offset) else {
+    let Ok(ptr) = PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::new(&span, in_page_offset) else {
         return advance_offset(size, write_offset, buf.len());
     };
     let _ = ptr.write_slice_at_offset(0, buf);
@@ -108,9 +108,12 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
 /// after attempting the write.
 fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> usize {
     let write_slice = |pa: PhysAddr, slice: &[u8]| -> bool {
-        Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(pa.as_u64().trunc(), slice.len())
-            .and_then(|ptr| ptr.write_slice_at_offset(0, slice))
-            .is_ok()
+        PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+            pa.as_u64().trunc(),
+            slice.len(),
+        )
+        .and_then(|ptr| ptr.write_slice_at_offset(0, slice))
+        .is_ok()
     };
 
     if buf.len() >= size {
