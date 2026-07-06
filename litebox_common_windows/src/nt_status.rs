@@ -204,6 +204,7 @@ impl NtStatus {
             0xC0000184 => "STATUS_INVALID_DEVICE_STATE: Invalid device state",
             0xC0000201 => "STATUS_NETWORK_OPEN_RESTRICTION: Network open restriction",
             0xC0000202 => "STATUS_NO_USER_SESSION_KEY: No user session key",
+            0xC0000225 => "STATUS_NOT_FOUND: Not found",
             0xC000022D => "STATUS_RETRY: The operation should be retried",
             0xC00002DF => "STATUS_SAM_NEED_BOOTKEY_PASSWORD: SAM needs boot key password",
             0xC00002E0 => "STATUS_SAM_NEED_BOOTKEY_FLOPPY: SAM needs boot key floppy",
@@ -580,6 +581,9 @@ impl NtStatus {
 
     /// STATUS_NO_USER_SESSION_KEY
     pub const NO_USER_SESSION_KEY: Self = Self::from_raw(0xC0000202);
+
+    /// STATUS_NOT_FOUND
+    pub const NOT_FOUND: Self = Self::from_raw(0xC0000225);
 
     /// STATUS_RETRY
     pub const RETRY: Self = Self::from_raw(0xC000022D);
