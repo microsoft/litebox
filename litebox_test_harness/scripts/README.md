@@ -549,6 +549,37 @@ sqlite3 <main-worktree>/.dashboard/results.sqlite \
   "SELECT value FROM meta WHERE key='schema_version'"
 ```
 
+### `dashboard.py stress` — generate samples to validate a flake fix
+
+Fixing a flaky test needs *many* runs of the reproducing test at your fix
+sha — the auto supervisor's broad round-robin gets there slowly, and a
+single lucky pass proves nothing for a 2–5% flake. `stress` runs a
+targeted test (family) repeatedly at a worktree's HEAD and publishes every
+result to the store, so `dashboard.py validate` has real samples to judge.
+
+```sh
+# 20 runs of the RL family at the current worktree's HEAD:
+dashboard.py stress RL.subscriber_exits_first --iters 20
+
+# Reproduce a LOAD-SENSITIVE flake (passes in isolation, fails under the
+# parallel-build/broker-contention load the agent-coverage shadows have):
+dashboard.py stress RL.subscriber_exits_first --iters 40 --under-load
+
+# then judge it with confidence:
+dashboard.py validate RL.subscriber_exits_first --sha <HEAD>
+```
+
+- Runs in **dedicated** worktrees under `<state-dir>/stress/` — never the
+  supervisor's per-branch shadow, so it can't race `target/` / `docker
+  build`.
+- `--parallel K` (or `--under-load` = `--parallel 4`) runs K copies
+  concurrently; the concurrency *is* the load that surfaces the flake
+  class litebox keeps hitting (broker/coordination timeouts under load).
+- Uses a plain positional filter, not `--fill`, so each iteration re-runs
+  the test for a fresh sample (rather than skipping already-covered ones).
+- `--dry-run` prints the plan (worktrees + cargo argv) without spawning
+  cargo. Exits non-zero if any stressed run failed.
+
 ### Standardized regression classification (`regression_class` view)
 
 Instead of hand-rolling "is this test regressing on my branch?"
