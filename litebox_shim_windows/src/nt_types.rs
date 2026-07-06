@@ -281,6 +281,34 @@ impl UnicodeString {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct AhcServiceLookupCdb {
+    pub(crate) name: UnicodeString,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct AhcServiceData {
+    // TODO(ahc-service-data): model the full Win11 AHC_SERVICE_DATA sub-structs
+    // once their live boundaries are probed; phnt's ntmisc.h layout diverges
+    // from the observed guest layout before the verified fields below.
+    pub(crate) reserved_0: [u8; 0xf8],
+    pub(crate) lookup_cdb: AhcServiceLookupCdb,
+    pub(crate) reserved_1: [u8; 0x68],
+    pub(crate) driver_status: i32,
+    pub(crate) reserved_2: [u8; 4],
+    pub(crate) params_out: usize,
+    pub(crate) params_out_size: u32,
+    pub(crate) reserved_3: [u8; 4],
+}
+
+const _: () = assert!(offset_of!(AhcServiceData, lookup_cdb) == 0xf8);
+const _: () = assert!(offset_of!(AhcServiceData, driver_status) == 0x170);
+const _: () = assert!(offset_of!(AhcServiceData, params_out) == 0x178);
+const _: () = assert!(offset_of!(AhcServiceData, params_out_size) == 0x180);
+const _: () = assert!(core::mem::size_of::<AhcServiceData>() == 0x188);
+
 bitflags::bitflags! {
     /// Packed process flags stored in `PEB.BitField`.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
