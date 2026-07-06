@@ -7,8 +7,6 @@
 
 extern crate alloc;
 
-use int_enum::IntEnum;
-
 pub mod loader;
 pub mod nt_status;
 
@@ -50,23 +48,6 @@ macro_rules! nt_sysnos {
             }
         }
     };
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
-#[repr(u32)]
-pub enum AhcServiceClass {
-    Lookup = 0,
-    Remove = 1,
-    Update = 2,
-    Clear = 3,
-    SnapStatistics = 4,
-    SnapCache = 5,
-    LookupCdb = 6,
-    RefreshCdb = 7,
-    MapQuirks = 8,
-    HwIdQuery = 9,
-    InitProcessData = 10,
-    LookupAndWriteToProcess = 11,
 }
 
 nt_sysnos! {

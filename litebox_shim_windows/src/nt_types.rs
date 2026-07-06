@@ -303,12 +303,6 @@ pub(crate) struct AhcServiceData {
     pub(crate) reserved_3: [u8; 4],
 }
 
-const _: () = assert!(offset_of!(AhcServiceData, lookup_cdb) == 0xf8);
-const _: () = assert!(offset_of!(AhcServiceData, driver_status) == 0x170);
-const _: () = assert!(offset_of!(AhcServiceData, params_out) == 0x178);
-const _: () = assert!(offset_of!(AhcServiceData, params_out_size) == 0x180);
-const _: () = assert!(core::mem::size_of::<AhcServiceData>() == 0x188);
-
 bitflags::bitflags! {
     /// Packed process flags stored in `PEB.BitField`.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

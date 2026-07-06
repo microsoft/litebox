@@ -315,7 +315,7 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     },
     NtApphelpCacheControl {
         service_class: u32,
-        service_data: Option<Platform::RawMutPointer<u8>>,
+        service_data: Option<Platform::RawMutPointer<nt_types::AhcServiceData>>,
     },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
