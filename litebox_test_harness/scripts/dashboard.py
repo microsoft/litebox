@@ -2537,6 +2537,149 @@ def cmd_regressions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _git_out(cwd: Path, *args: str) -> Optional[str]:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(cwd), *args],
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def cmd_stress(args: argparse.Namespace) -> int:
+    """Repeatedly run a *targeted* test (or family) at a worktree's HEAD
+    and publish every result to the store, so `dashboard.py validate`
+    has real samples to judge a flake fix against — instead of waiting
+    for the auto supervisor's broad round-robin, or reading a single
+    lucky pass as confirmation.
+
+    Runs in dedicated worktrees under `<state-dir>/stress/` (never the
+    supervisor's shadow — no `target/` race). `--parallel K` (or
+    `--under-load`) runs K copies concurrently, which reproduces the
+    parallel-build / broker-contention load that many litebox flakes
+    only fail under (they pass in isolation)."""
+    state_dir = resolve_state_dir(args.state_dir)
+    target = Path(args.worktree).resolve() if args.worktree else Path.cwd()
+    top = _git_out(target, "rev-parse", "--show-toplevel")
+    if top is None:
+        print(f"stress: {target} is not inside a git worktree", file=sys.stderr)
+        return 2
+    target = Path(top)
+    head = _git_out(target, "rev-parse", "HEAD")
+    branch = _git_out(target, "symbolic-ref", "--quiet", "--short", "HEAD") \
+        or f"detached-{(head or '')[:8]}"
+    if head is None:
+        print("stress: could not resolve HEAD", file=sys.stderr)
+        return 2
+
+    patterns = list(args.pattern)
+    parallel = args.parallel if args.parallel else (4 if args.under_load else 1)
+    parallel = max(1, parallel)
+    dist = _stress_distribute(args.iters, parallel)
+    dist = [n for n in dist if n > 0] or [1]
+    parallel = len(dist)
+    argv = _stress_cargo_argv(patterns)
+    root = _stress_worktrees_root(state_dir) / branch
+
+    print(f"# stress: {'/'.join(patterns)} @ {short_sha(head)} "
+          f"(branch {branch})")
+    print(f"#   {sum(dist)} run(s) across {parallel} worker(s) "
+          f"[{'+'.join(map(str, dist))}]"
+          f"{'  UNDER LOAD (concurrent)' if parallel > 1 else ''}")
+    print(f"#   cargo: {' '.join(argv)}")
+    if args.jobs:
+        print(f"#   LITEBOX_TEST_JOBS={args.jobs}")
+    if args.dry_run:
+        print("# (dry-run — not spawning cargo)")
+        for i, n in enumerate(dist):
+            print(f"#   worker {i}: {n} iters in {root / str(i)}")
+        return 0
+
+    env = os.environ.copy()
+    env["LITEBOX_DASHBOARD_DIR"] = str(state_dir)
+    env["LITEBOX_DASHBOARD_REF"] = branch
+    if args.jobs:
+        env["LITEBOX_TEST_JOBS"] = str(args.jobs)
+
+    start_ms = now_ms()
+    stop = threading.Event()
+    worktrees: list[Path] = []
+    counts = {"done": 0, "iters": sum(dist)}
+    counts_lock = threading.Lock()
+
+    def _worker(idx: int, n_iters: int) -> None:
+        wt = root / str(idx)
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        if wt.exists():
+            subprocess.run(["git", "-C", str(target), "worktree", "remove",
+                            "--force", str(wt)], check=False,
+                           capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["git", "-C", str(target), "worktree", "add",
+                            "--detach", str(wt), head], check=False,
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print(f"stress: worker {idx} worktree setup failed: "
+                  f"{r.stderr.strip()}", file=sys.stderr)
+            return
+        worktrees.append(wt)
+        for _ in range(n_iters):
+            if stop.is_set():
+                break
+            subprocess.run(argv, cwd=str(wt), env=env,
+                           start_new_session=True, check=False)
+            with counts_lock:
+                counts["done"] += 1
+                print(f"[stress] {counts['done']}/{counts['iters']} runs done",
+                      file=sys.stderr)
+
+    threads = [threading.Thread(target=_worker, args=(i, n), daemon=True)
+               for i, n in enumerate(dist)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            while t.is_alive():
+                t.join(timeout=1.0)
+    except KeyboardInterrupt:
+        print("\n[stress] interrupted — stopping after in-flight runs",
+              file=sys.stderr)
+        stop.set()
+        for t in threads:
+            t.join(timeout=30)
+    finally:
+        if not args.keep:
+            for wt in worktrees:
+                subprocess.run(["git", "-C", str(target), "worktree", "remove",
+                                "--force", str(wt)], check=False,
+                               capture_output=True, text=True, timeout=60)
+
+    conn = open_db(state_dir, with_state_views=False)
+    try:
+        rows = _stress_target_summary(conn, head, patterns,
+                                      args.mode, start_ms)
+    finally:
+        conn.close()
+    print(f"\n# results at {short_sha(head)} (this run):")
+    if not rows:
+        print("#   (no results recorded — did the filter match any test? "
+              "check the pattern / that the build succeeded)")
+    tot_f = 0
+    for r in rows:
+        tot = r["n_pass"] + r["n_fail"] + r["n_other"]
+        rate = r["n_fail"] / (r["n_pass"] + r["n_fail"]) if (
+            r["n_pass"] + r["n_fail"]) else 0.0
+        tot_f += r["n_fail"]
+        flag = "  <-- STILL FAILING" if r["n_fail"] else ""
+        print(f"  {r['test_id']:52s} {r['mode']:7s} "
+              f"pass={r['n_pass']} fail={r['n_fail']} "
+              f"no_result={r['n_other']}  rate={rate:.0%}{flag}")
+    print(f"\n# next: dashboard.py validate '{patterns[0]}' "
+          f"--sha {short_sha(head)}"
+          f"{'' if args.mode is None else ' --mode ' + args.mode}"
+          f"   (to judge with statistical confidence)")
+    return 1 if tot_f else 0
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     """Lossless in-place schema migration (v3 → v4). Opens the store
     raw (bypassing the strict version check, which would reject a v3
@@ -3125,6 +3268,63 @@ def _branch_from_shadow_path(state_dir: Path, shadow: Path) -> Optional[str]:
     if not parts:
         return None
     return "/".join(parts)
+
+
+def _stress_worktrees_root(state_dir: Path) -> Path:
+    """Root for `stress`'s dedicated worktrees. Deliberately separate
+    from `shadows/` so a `stress` run never races the auto supervisor's
+    per-branch shadow on `target/` / `docker build` for the same branch."""
+    return state_dir / "stress"
+
+
+def _stress_distribute(iters: int, workers: int) -> list[int]:
+    """Split `iters` runs across `workers` as evenly as possible.
+    `_stress_distribute(20, 3) == [7, 7, 6]`. Pure — unit-tested."""
+    workers = max(1, workers)
+    iters = max(0, iters)
+    base, extra = divmod(iters, workers)
+    return [base + (1 if i < extra else 0) for i in range(workers)]
+
+
+def _stress_cargo_argv(patterns: list[str]) -> list[str]:
+    """The cargo argv for one stress iteration: run the harness filtered
+    to `patterns` (OR-matched substrings, once each). A plain positional
+    filter — NOT `--fill` — so each invocation re-runs the matching
+    tests regardless of prior coverage at HEAD (that's what gives us
+    repeated samples). Pure — unit-tested."""
+    return ["cargo", "test", "-p", "litebox_test_harness",
+            "--test", "integration", "--", *patterns]
+
+
+def _stress_target_summary(conn: sqlite3.Connection, commit_sha: str,
+                           patterns: list[str], mode: Optional[str],
+                           since_ts_ms: int) -> list[sqlite3.Row]:
+    """SQL summary of the stressed tests at `commit_sha` since the run
+    started: per (test_id, mode) pass/fail/no_result counts over clean
+    rows. SQL-first — the aggregation is one grouped query."""
+    like = " OR ".join(["rr.test_id LIKE ?"] * len(patterns)) or "1=0"
+    params: list = [commit_sha, since_ts_ms]
+    params += [f"%{p}%" for p in patterns]
+    mode_clause = ""
+    if mode:
+        mode_clause = " AND rr.mode = ? "
+        params.append(mode)
+    return conn.execute(
+        f"""
+        SELECT rr.test_id, rr.mode,
+               SUM(CASE WHEN rr.verdict='pass' THEN 1 ELSE 0 END) AS n_pass,
+               SUM(CASE WHEN rr.verdict='fail' THEN 1 ELSE 0 END) AS n_fail,
+               SUM(CASE WHEN rr.verdict NOT IN ('pass','fail')
+                        THEN 1 ELSE 0 END)                        AS n_other
+          FROM run_results rr JOIN runs r ON r.run_id = rr.run_id
+         WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+           AND rr.finished_ts_ms >= ?
+           AND ({like}) {mode_clause}
+         GROUP BY rr.test_id, rr.mode
+         ORDER BY n_fail DESC, rr.test_id, rr.mode
+        """,
+        params,
+    ).fetchall()
 
 
 def _gc_shadow_worktrees(canonical: Path, state_dir: Path,
@@ -3971,6 +4171,40 @@ def build_parser() -> argparse.ArgumentParser:
                         help="canonical clone root for git queries "
                              "(default: state-dir's parent)")
     p_regr.set_defaults(func=cmd_regressions)
+
+    p_stress = sub.add_parser(
+        "stress",
+        help="repeatedly run a targeted test (family) at a worktree's "
+             "HEAD and publish every result — generates the samples "
+             "`validate` needs to judge a flake fix.",
+    )
+    p_stress.add_argument("pattern", nargs="+",
+                          help="test_id substring(s), OR-matched "
+                               "(e.g. RL.subscriber_exits_first)")
+    p_stress.add_argument("--iters", type=int, default=20,
+                          help="total runs to perform (default 20)")
+    p_stress.add_argument("--parallel", type=int, default=0,
+                          help="concurrent workers (default 1, or 4 with "
+                               "--under-load); >1 reproduces load-sensitive "
+                               "flakes via concurrent build/docker load")
+    p_stress.add_argument("--under-load", action="store_true",
+                          help="shorthand for --parallel 4: run concurrently "
+                               "so load-sensitive flakes (pass in isolation) "
+                               "reproduce")
+    p_stress.add_argument("--worktree", default=None,
+                          help="worktree whose HEAD to stress "
+                               "(default: current directory)")
+    p_stress.add_argument("--mode", choices=("native", "litebox"),
+                          default=None, help="restrict the summary to a mode")
+    p_stress.add_argument("--jobs", type=int, default=None,
+                          help="LITEBOX_TEST_JOBS for each worker")
+    p_stress.add_argument("--keep", action="store_true",
+                          help="keep the dedicated stress worktrees "
+                               "(default: remove them after)")
+    p_stress.add_argument("--dry-run", action="store_true",
+                          help="print the plan (worktrees, cargo argv) "
+                               "without spawning cargo")
+    p_stress.set_defaults(func=cmd_stress)
 
     p_track = sub.add_parser(
         "track",

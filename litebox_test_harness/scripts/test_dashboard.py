@@ -1091,5 +1091,62 @@ class RegressionClassTests(unittest.TestCase):
         self.assertEqual(self._classify()["T"], ("hard_regression", "medium"))
 
 
+class StressHelperTests(unittest.TestCase):
+    """Pure helpers behind `dashboard.py stress` + its SQL summary."""
+
+    def test_distribute_even_and_remainder(self):
+        self.assertEqual(dashboard._stress_distribute(20, 4), [5, 5, 5, 5])
+        self.assertEqual(dashboard._stress_distribute(20, 3), [7, 7, 6])
+        self.assertEqual(dashboard._stress_distribute(5, 1), [5])
+        self.assertEqual(dashboard._stress_distribute(0, 3), [0, 0, 0])
+        self.assertEqual(dashboard._stress_distribute(2, 5), [1, 1, 0, 0, 0])
+
+    def test_cargo_argv_is_positional_filter_not_fill(self):
+        argv = dashboard._stress_cargo_argv(["RL.subscriber", "F.fork"])
+        self.assertEqual(argv[:6], ["cargo", "test", "-p",
+                                    "litebox_test_harness", "--test",
+                                    "integration"])
+        self.assertEqual(argv[6], "--")
+        self.assertEqual(argv[7:], ["RL.subscriber", "F.fork"])
+        # Must NOT use --fill (that would skip already-covered tests
+        # instead of re-running them for fresh samples).
+        self.assertNotIn("--fill", " ".join(argv))
+
+    def test_target_summary_groups_and_windows(self):
+        tmp = tempfile.mkdtemp(prefix="dash-stress-")
+        try:
+            conn = _init_db(Path(tmp) / "results.sqlite")
+            # 2 pass + 1 fail + 1 no_result at sha S, plus a pre-window
+            # pass that must be excluded, plus a different sha / dirty row.
+            for v, dt in [("pass", 0), ("pass", 10), ("fail", 20),
+                          ("no_result", 30)]:
+                rid = _add_run(conn, worktree="/s", commit="S",
+                               dirty_hash=None, started_ts_ms=1000)
+                _add_result(conn, run_id=rid, test_id="RL.sub", pass_="litebox",
+                            verdict=v, ts_ms=1000 + dt)
+            pre = _add_run(conn, worktree="/s", commit="S", dirty_hash=None,
+                           started_ts_ms=1)
+            _add_result(conn, run_id=pre, test_id="RL.sub", pass_="litebox",
+                        verdict="pass", ts_ms=1)          # before window
+            oth = _add_run(conn, worktree="/s", commit="OTHER",
+                           dirty_hash=None, started_ts_ms=1000)
+            _add_result(conn, run_id=oth, test_id="RL.sub", pass_="litebox",
+                        verdict="fail", ts_ms=1005)       # different sha
+            rows = dashboard._stress_target_summary(
+                conn, "S", ["RL.sub"], "litebox", since_ts_ms=1000)
+            self.assertEqual(len(rows), 1)
+            r = rows[0]
+            self.assertEqual((r["n_pass"], r["n_fail"], r["n_other"]),
+                             (2, 1, 1))
+            # Pattern that matches nothing → no rows.
+            self.assertEqual(
+                dashboard._stress_target_summary(
+                    conn, "S", ["NOPE"], "litebox", 1000), [])
+            conn.close()
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
