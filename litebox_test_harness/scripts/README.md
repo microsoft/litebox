@@ -44,11 +44,30 @@ Override:
 dashboard.py render                          # write summary.md once
 dashboard.py status [--format text|md|sql]   # terminal-friendly summary
 dashboard.py flaky [--mode litebox|native|both]  # recent flake leaderboard
+dashboard.py validate <test-pattern>         # confirm a fix with clean live runs
+dashboard.py stress <test-pattern> [--under-load]  # run a test repeatedly to sample it
 dashboard.py track <ref> <ci_worktree>       # register a tracked ref
 dashboard.py untrack <ref>                   # remove a tracked ref
 dashboard.py refs                            # list tracked refs
 dashboard.py auto [--interval SECS]          # autonomous fill driver
 dashboard.py stop                            # stop auto + reap descendants
+```
+
+### `dashboard.py validate`
+
+`validate <test-pattern>` answers whether the live store has actually
+validated a fix for a flaky/failing test at a target SHA. A missing row is
+reported as `NOT_RUN`, never as pass/clean: if the test simply has not run
+at that SHA, the command exits non-zero and tells you to run it.
+
+For clean passes with zero fails, validation is statistical. To rule out a
+true flake rate `p` at confidence `c`, the command requires
+`N = ceil(ln(1-c) / ln(1-p))` consecutive clean passes (about `3/p` at
+95% confidence). Example:
+
+```
+dashboard.py validate RL.subscriber_exits_first \
+  --sha a863a31f --mode litebox --assume-flake-rate 0.05
 ```
 
 ### Auto-driver lifecycle & cleanup contract

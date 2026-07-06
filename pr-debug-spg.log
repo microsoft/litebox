@@ -1,0 +1,187 @@
+[HypB-diag] ts=1781387589852376868 EDGE SEND OK sub_id=42949672961 mask=0x4 wpos=24
+[epoll-diag] ADD fd=5 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781387589854738945 EDGE SEND OK sub_id=42949672962 mask=0x4 wpos=48
+[epoll-diag] ADD fd=9 type=BrokerSocketPair mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-close-timing] host_pid=10 handle=5 dir=Write t_ns=23438926289668
+[HypB-close-timing] host_pid=10 handle=4 dir=Read t_ns=23438926811907
+[HypB-close-timing] host_pid=10 handle=7 dir=Write t_ns=23438927102229
+[HypB-close-timing] host_pid=10 handle=6 dir=Read t_ns=23438927367449
+[HypB-close-timing] host_pid=10 handle=4 dir=Read t_ns=23439098817575
+[HypB-close-timing] host_pid=10 handle=7 dir=Write t_ns=23439099328313
+[epoll-diag] ADD fd=10 type=BrokerPipe mask=Events(IN | OUT | RDHUP | 0x80000000) events=Events(OUT) host_poll=false ready=true
+[HypB-diag] ts=1781387590861038730 PIPE READ-END SUBSCRIBE handle=6 inner_addr=0x749770221880 sub_id=42949672963 mask=0x19 now=0x0
+[epoll-diag] ADD fd=13 type=BrokerPipe mask=Events(IN | OUT | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[epoll-diag] ADD fd=11 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781387590863818838 EDGE SEND OK sub_id=42949672961 mask=0x5 wpos=72
+[HypB-diag] ts=1781387590865238444 EDGE SEND OK sub_id=42949672965 mask=0x4 wpos=96
+[HypB-diag] ts=1781387590865519965 WRITE-PIPE-RPC handle=5 bytes=109
+[HypB-diag] ts=1781387590865573769 PIPE WRITE inner_addr=0x749770121570 n=109 has_data=true subs=0
+[HypB-diag] ts=1781387590865990500 EDGE SEND OK sub_id=42949672961 mask=0x5 wpos=120
+[HypB-diag] ts=1781387590931152775 PIPE READ-END SUBSCRIBE handle=4 inner_addr=0x749770121570 sub_id=42949672966 mask=0x19 now=0x1
+[HypB-diag] ts=1781387590931314887 EDGE SEND OK sub_id=42949672966 mask=0x1 wpos=144
+[HypB-diag] ts=1781387590951509898 EDGE SEND OK sub_id=42949672967 mask=0x4 wpos=168
+[epoll-diag] ADD fd=5 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781387590952979408 EDGE SEND OK sub_id=42949672968 mask=0x4 wpos=192
+[epoll-diag] ADD fd=9 type=BrokerSocketPair mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-read-entry] host_pid=10 handle=4 t_ns=23439195021873
+[HypB-diag] ts=1781387590955553101 EDGE SEND OK sub_id=42949672965 mask=0x4 wpos=216
+[HypB-diag] ts=1781387590955911727 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=240
+[HypB-close-timing] host_pid=10 handle=4 dir=Read t_ns=23439201772178
+[HypB-close-timing] host_pid=10 handle=7 dir=Write t_ns=23439202283816
+[HypB-close-timing] host_pid=10 handle=12 dir=Write t_ns=23439402069162
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23439402387486
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23439402741313
+[HypB-close-timing] host_pid=10 handle=13 dir=Read t_ns=23439403118541
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23439619540132
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23439619931961
+[HypB-diag] ts=1781387591381007630 PIPE READ-END SUBSCRIBE handle=11 inner_addr=0x749770342960 sub_id=42949672969 mask=0x19 now=0x0
+[epoll-diag] ADD fd=10 type=BrokerPipe mask=Events(IN | OUT | RDHUP | 0x80000000) events=Events(OUT) host_poll=false ready=true
+[HypB-diag] ts=1781387591381749686 PIPE READ-END SUBSCRIBE handle=13 inner_addr=0x749770442ae0 sub_id=42949672970 mask=0x19 now=0x0
+[epoll-diag] ADD fd=13 type=BrokerPipe mask=Events(IN | OUT | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[epoll-diag] ADD fd=11 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781387591385147840 EDGE SEND OK sub_id=42949672972 mask=0x4 wpos=264
+[HypB-diag] ts=1781387591385456963 WRITE-PIPE-RPC handle=7 bytes=89
+[HypB-diag] ts=1781387591385515967 PIPE WRITE inner_addr=0x749770221880 n=89 has_data=true subs=1
+[HypB-diag] ts=1781387591385577472 EDGE SEND OK sub_id=42949672963 mask=0x1 wpos=288
+[HypB-diag] ts=1781387591386558145 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=312
+[HypB-read-entry] host_pid=10 handle=6 t_ns=23439626418947
+[HypB-diag] ts=1781387591387524318 EDGE SEND OK sub_id=42949672972 mask=0x4 wpos=336
+[HypB-diag] ts=1781387591388400283 WRITE-PIPE-RPC handle=5 bytes=195
+[HypB-diag] ts=1781387591388473389 PIPE WRITE inner_addr=0x749770121570 n=195 has_data=true subs=1
+[HypB-diag] ts=1781387591388544194 EDGE SEND OK sub_id=42949672966 mask=0x1 wpos=360
+[HypB-diag] ts=1781387591389010729 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=384
+[HypB-read-entry] host_pid=10 handle=4 t_ns=23439630146426
+[HypB-diag] ts=1781387591390750759 EDGE SEND OK sub_id=42949672965 mask=0x4 wpos=408
+[HypB-diag] ts=1781387591391234395 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=432
+[HypB-diag] ts=1781387591392716406 EDGE SEND OK sub_id=42949672973 mask=0x4 wpos=456
+[HypB-diag] ts=1781387591393800087 WRITE-PIPE-RPC handle=12 bytes=127
+[HypB-diag] ts=1781387591393855791 PIPE WRITE inner_addr=0x749770342960 n=127 has_data=true subs=1
+[HypB-diag] ts=1781387591393915796 EDGE SEND OK sub_id=42949672969 mask=0x1 wpos=480
+[HypB-diag] ts=1781387591394569445 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=504
+[HypB-diag] ts=1781387591409007625 EDGE SEND OK sub_id=42949672974 mask=0x4 wpos=528
+[epoll-diag] ADD fd=5 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781387591410719153 EDGE SEND OK sub_id=42949672975 mask=0x4 wpos=552
+[epoll-diag] ADD fd=9 type=BrokerSocketPair mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-read-entry] host_pid=10 handle=11 t_ns=23439653456570
+[HypB-diag] ts=1781387591414040201 EDGE SEND OK sub_id=42949672973 mask=0x4 wpos=576
+[HypB-diag] ts=1781387591414648247 EDGE SEND OK sub_id=42949672974 mask=0x5 wpos=600
+[DELAYED-FORK-DIAG] pid=10 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23440268669596
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23440268992020
+[DELAYED-FORK-DIAG] pid=11 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23440673506983
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23440673841508
+[DELAYED-FORK-DIAG] pid=12 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23441113400893
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23441113725417
+[DELAYED-FORK-DIAG] pid=16 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23441548814067
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23441549208597
+[DELAYED-FORK-DIAG] pid=17 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23441966608294
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23441966906316
+[DELAYED-FORK-DIAG] pid=18 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23442392924757
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23442393247681
+[DELAYED-FORK-DIAG] pid=22 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23442823601941
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23442824122779
+[DELAYED-FORK-DIAG] pid=23 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23443248172076
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23443248549003
+[DELAYED-FORK-DIAG] pid=24 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23443670084515
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23443670356735
+[DELAYED-FORK-DIAG] pid=28 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23444098884360
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23444099236286
+[DELAYED-FORK-DIAG] pid=29 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23444526204097
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23444526523821
+[DELAYED-FORK-DIAG] pid=30 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23444951421779
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23444951803807
+[DELAYED-FORK-DIAG] pid=34 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23445400714933
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23445401086460
+[DELAYED-FORK-DIAG] pid=35 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23445823151310
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23445823407829
+[DELAYED-FORK-DIAG] pid=36 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23446252001260
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23446252423291
+[DELAYED-FORK-DIAG] pid=40 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23446670724864
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23446671137294
+[DELAYED-FORK-DIAG] pid=41 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23447090448142
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23447090809569
+[DELAYED-FORK-DIAG] pid=42 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23447517328846
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23447517622668
+[DELAYED-FORK-DIAG] pid=46 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23447931771736
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23447932101060
+[DELAYED-FORK-DIAG] pid=47 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23448349959501
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23448350472139
+[DELAYED-FORK-DIAG] pid=48 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23448771758432
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23448772299371
+[DELAYED-FORK-DIAG] pid=52 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23449196302564
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23449196607587
+[DELAYED-FORK-DIAG] pid=53 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23449623519694
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23449623824916
+[DELAYED-FORK-DIAG] pid=54 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23450056720438
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23450057020053
+[DELAYED-FORK-DIAG] pid=58 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23450478081462
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23450478417479
+[DELAYED-FORK-DIAG] pid=59 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23450959920246
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23450960281565
+[DELAYED-FORK-DIAG] pid=60 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23451462921202
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23451463283620
+[DELAYED-FORK-DIAG] pid=64 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23451904258437
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23451904821466
+[DELAYED-FORK-DIAG] pid=65 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23452299778753
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23452300268878
+[DELAYED-FORK-DIAG] pid=66 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23452719353787
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23452719709305
+[DELAYED-FORK-DIAG] pid=70 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23453116969509
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23453117403731
+[DELAYED-FORK-DIAG] pid=71 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23453503892191
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23453504425518
+[DELAYED-FORK-DIAG] pid=72 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23453919530025
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23453919839541
+[DELAYED-FORK-DIAG] pid=76 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=23454318090195
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=23454318480515
+[HypB-close-timing] host_pid=10 handle=4 dir=Read t_ns=23454630453802
+[HypB-diag] ts=1781387606389023278 EDGE SEND OK sub_id=42949672965 mask=0x8 wpos=624
+[HypB-close-timing] host_pid=10 handle=7 dir=Write t_ns=23454631717466
+[HypB-diag] ts=1781387606390037829 EDGE SEND OK sub_id=42949672963 mask=0x11 wpos=648
+[HypB-close-timing] host_pid=10 handle=5 dir=Write t_ns=23454633118337
+[HypB-diag] ts=1781387606391793618 EDGE SEND OK sub_id=42949672966 mask=0x11 wpos=672
+[PE.10-diag] BrokerSocketPair Drop: endpoint=B a_open=true b_open=true
+[HypB-diag] ts=1781387606392708064 EDGE SEND OK sub_id=42949672968 mask=0x19 wpos=696
+[PE.10-diag] BrokerSocketPair Drop: endpoint=A a_open=true b_open=false
+[HypB-close-timing] host_pid=10 handle=6 dir=Read t_ns=23454635257545
+[HypB-diag] ts=1781387606393643211 EDGE SEND OK sub_id=42949672972 mask=0x8 wpos=720
+[HypB-close-timing] host_pid=10 handle=12 dir=Write t_ns=23454635719769
+[HypB-diag] ts=1781387606394292444 EDGE SEND OK sub_id=42949672969 mask=0x11 wpos=744
+[HypB-close-timing] host_pid=10 handle=13 dir=Read t_ns=23454636890028
+[PE.10-diag] BrokerSocketPair Drop: endpoint=A a_open=true b_open=true
+[PE.10-diag] BrokerSocketPair Drop: endpoint=B a_open=false b_open=true
+[HypB-diag] ts=1781387606402016835 EDGE SEND OK sub_id=42949672962 mask=0x19 wpos=768
+[DELAYED-FORK-DIAG] pid=77 REJECTED: unsupported fd 4 class Epoll; unsupported fd 6 class Epoll

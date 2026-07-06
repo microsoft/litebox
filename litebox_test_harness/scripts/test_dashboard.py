@@ -157,6 +157,86 @@ class CoverageFiltersDirtyTests(unittest.TestCase):
         self.assertEqual(n_fail, 0)
 
 
+class ValidateCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-val-")
+        self.state_dir = Path(self.tmp)
+        self.db = self.state_dir / "results.sqlite"
+        self.conn = _init_db(self.db)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_validate(self, *argv):
+        import contextlib
+        import io
+        args = dashboard.build_parser().parse_args(
+            ["validate", "RL.case", "--sha", "fixsha", "--mode", "litebox",
+             "--state-dir", str(self.state_dir), *argv]
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = dashboard.cmd_validate(args)
+        return status, out.getvalue()
+
+    def _add_trials(self, *, commit, n_pass=0, n_fail=0, n_no_result=0,
+                    test_id="RL.case"):
+        ts = 1000
+        for verdict, count in (("pass", n_pass), ("fail", n_fail),
+                               ("no_result", n_no_result)):
+            for _ in range(count):
+                run = _add_run(self.conn, commit=commit, started_ts_ms=ts)
+                _add_result(self.conn, run_id=run, test_id=test_id,
+                            pass_="litebox", verdict=verdict, ts_ms=ts + 1)
+                ts += 10
+
+    def test_runs_needed(self):
+        self.assertEqual(dashboard._runs_needed(0.05, 0.95), 59)
+        self.assertEqual(dashboard._runs_needed(0.01, 0.95), 299)
+        self.assertEqual(dashboard._runs_needed(0.5, 0.95), 5)
+
+    def test_not_run_is_loud_and_nonzero(self):
+        self._add_trials(commit="othersha", n_pass=1)
+        status, out = self._run_validate()
+        self.assertNotEqual(status, 0)
+        self.assertIn("NOT VALIDATED", out)
+        self.assertIn("NOT_RUN", out)
+        self.assertNotIn("VALIDATED (", out)
+        self.assertNotIn("passing", out.lower())
+
+    def test_still_failing_if_any_fail(self):
+        self._add_trials(commit="fixsha", n_pass=2, n_fail=1)
+        status, out = self._run_validate()
+        self.assertNotEqual(status, 0)
+        self.assertIn("STILL FAILING", out)
+        self.assertIn("1 fails / 3 clean runs", out)
+
+    def test_insufficient_clean_passes(self):
+        self._add_trials(commit="fixsha", n_pass=10)
+        status, out = self._run_validate("--assume-flake-rate", "0.05")
+        self.assertNotEqual(status, 0)
+        self.assertIn("INSUFFICIENT", out)
+        self.assertIn("10 clean of 59 needed", out)
+        self.assertIn("need 49 more", out)
+
+    def test_validated_with_enough_clean_passes(self):
+        self._add_trials(commit="fixsha", n_pass=60)
+        status, out = self._run_validate("--assume-flake-rate", "0.05")
+        self.assertEqual(status, 0)
+        self.assertIn("VALIDATED", out)
+        self.assertIn("60 clean, 0 fail", out)
+
+    def test_vs_baseline_prints_contrast(self):
+        self._add_trials(commit="basesha", n_pass=3, n_fail=1)
+        self._add_trials(commit="fixsha", n_pass=12)
+        status, out = self._run_validate("--vs-baseline", "basesha")
+        self.assertEqual(status, 0)
+        self.assertIn("baseline was 25.0% (1/4)", out)
+        self.assertIn("VALIDATED", out)
+
+
 class TrackedRefsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="dash-tr-")

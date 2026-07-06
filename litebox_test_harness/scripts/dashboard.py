@@ -79,6 +79,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import os
 import signal
 import sqlite3
@@ -2834,6 +2835,278 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _runs_needed(p: float, confidence: float) -> int:
+    """Clean consecutive passes needed to rule out flake rate ``p``."""
+    if not (0.0 < p < 1.0):
+        raise ValueError("flake rate must be between 0 and 1")
+    if not (0.0 < confidence < 1.0):
+        raise ValueError("confidence must be between 0 and 1")
+    return math.ceil(math.log(1.0 - confidence) / math.log(1.0 - p))
+
+
+def _resolve_validate_sha(args: argparse.Namespace, state_dir: Path) -> Optional[str]:
+    if args.sha:
+        return args.sha.strip()
+    if args.branch:
+        canonical = _canonical_worktree(args, state_dir)
+        for rev in (args.branch, f"refs/heads/{args.branch}",
+                    f"origin/{args.branch}"):
+            try:
+                out = subprocess.run(
+                    ["git", "-C", str(canonical), "rev-parse", "--verify",
+                     f"{rev}^{{commit}}"],
+                    check=True, capture_output=True, text=True, timeout=15,
+                )
+                return out.stdout.strip()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    FileNotFoundError):
+                pass
+        for wt in _list_worktrees(canonical):
+            if wt.get("branch") == args.branch and wt.get("head"):
+                return wt["head"]
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        return out.stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError):
+        return None
+
+
+def _validate_counts(conn: sqlite3.Connection, *, pattern: str, mode: str,
+                     sha: str, baseline_sha: Optional[str]) -> list[sqlite3.Row]:
+    like_pattern = f"%{pattern}%"
+    return conn.execute(
+        """
+        WITH universe AS (
+            SELECT DISTINCT rr.test_id
+              FROM run_results rr
+             WHERE rr.test_id LIKE ?
+        ),
+        target AS (
+            SELECT rr.test_id,
+                   SUM(CASE WHEN rr.verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
+                   SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END) AS n_fail,
+                   SUM(CASE WHEN rr.verdict = 'no_result' THEN 1 ELSE 0 END) AS n_no_result
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.dirty_hash IS NULL
+               AND r.commit_sha LIKE ?
+               AND rr.mode = ?
+               AND rr.test_id LIKE ?
+             GROUP BY rr.test_id
+        ),
+        baseline AS (
+            SELECT rr.test_id,
+                   SUM(CASE WHEN rr.verdict = 'pass' THEN 1 ELSE 0 END) AS baseline_pass,
+                   SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END) AS baseline_fail
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE ? IS NOT NULL
+               AND r.dirty_hash IS NULL
+               AND r.commit_sha LIKE ?
+               AND rr.mode = ?
+               AND rr.test_id LIKE ?
+             GROUP BY rr.test_id
+        ),
+        per_test AS (
+            SELECT 'test' AS row_kind,
+                   u.test_id,
+                   COALESCE(t.n_pass, 0) AS n_pass,
+                   COALESCE(t.n_fail, 0) AS n_fail,
+                   COALESCE(t.n_no_result, 0) AS n_no_result,
+                   COALESCE(b.baseline_pass, 0) AS baseline_pass,
+                   COALESCE(b.baseline_fail, 0) AS baseline_fail,
+                   COALESCE(f.n_pass, 0) AS hist_pass,
+                   COALESCE(f.n_fail, 0) AS hist_fail
+              FROM universe u
+              LEFT JOIN target t ON t.test_id = u.test_id
+              LEFT JOIN baseline b ON b.test_id = u.test_id
+              LEFT JOIN test_flake_stats f
+                     ON f.mode = ? AND f.test_id = u.test_id
+        )
+        SELECT * FROM per_test
+        UNION ALL
+        SELECT 'family' AS row_kind,
+               ? AS test_id,
+               COALESCE(SUM(n_pass), 0) AS n_pass,
+               COALESCE(SUM(n_fail), 0) AS n_fail,
+               COALESCE(SUM(n_no_result), 0) AS n_no_result,
+               COALESCE(SUM(baseline_pass), 0) AS baseline_pass,
+               COALESCE(SUM(baseline_fail), 0) AS baseline_fail,
+               COALESCE(SUM(hist_pass), 0) AS hist_pass,
+               COALESCE(SUM(hist_fail), 0) AS hist_fail
+          FROM per_test
+         ORDER BY row_kind DESC, test_id
+        """,
+        (like_pattern, f"{sha}%", mode, like_pattern,
+         baseline_sha, f"{baseline_sha or ''}%", mode, like_pattern,
+         mode, pattern),
+    ).fetchall()
+
+
+def _assumed_flake_rate(row: sqlite3.Row,
+                        explicit: Optional[float]) -> tuple[float, str]:
+    if explicit is not None:
+        return explicit, "assumed"
+    baseline_total = row["baseline_pass"] + row["baseline_fail"]
+    if baseline_total > 0 and row["baseline_fail"] > 0:
+        return row["baseline_fail"] / baseline_total, "baseline"
+    hist_total = row["hist_pass"] + row["hist_fail"]
+    if hist_total > 0 and row["hist_fail"] > 0:
+        return row["hist_fail"] / hist_total, "history"
+    return 0.05, "default"
+
+
+def _validate_verdict(row: sqlite3.Row, confidence: float,
+                      explicit_p: Optional[float]) -> dict:
+    definitive = row["n_pass"] + row["n_fail"]
+    clean = definitive + row["n_no_result"]
+    if clean == 0:
+        return {"verdict": "NOT_RUN", "p": None, "needed": None, "more": None}
+    if row["n_fail"] > 0:
+        return {"verdict": "STILL FAILING", "p": None,
+                "needed": None, "more": None}
+    p, source = _assumed_flake_rate(row, explicit_p)
+    needed = _runs_needed(p, confidence)
+    if row["n_pass"] >= needed:
+        verdict = "VALIDATED"
+        more = 0
+    else:
+        verdict = "INSUFFICIENT"
+        more = needed - row["n_pass"]
+    return {"verdict": verdict, "p": p, "p_source": source,
+            "needed": needed, "more": more}
+
+
+def _format_pct(p: float) -> str:
+    return f"{p * 100:.1f}%"
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    state_dir = resolve_state_dir(args.state_dir)
+    sha = _resolve_validate_sha(args, state_dir)
+    if sha is None:
+        print("validate: could not resolve target sha", file=sys.stderr)
+        return 2
+    explicit_p = args.assume_flake_rate
+    if explicit_p is not None and not (0.0 < explicit_p < 1.0):
+        print("validate: --assume-flake-rate must be between 0 and 1",
+              file=sys.stderr)
+        return 2
+    if not (0.0 < args.confidence < 1.0):
+        print("validate: --confidence must be between 0 and 1",
+              file=sys.stderr)
+        return 2
+    conn = open_db(state_dir, with_state_views=False)
+    try:
+        rows = _validate_counts(
+            conn, pattern=args.test_pattern, mode=args.mode, sha=sha,
+            baseline_sha=args.vs_baseline,
+        )
+    finally:
+        conn.close()
+
+    if args.format == "sql":
+        status = 0
+        for row in rows:
+            info = _validate_verdict(row, args.confidence, explicit_p)
+            if info["verdict"] in ("NOT_RUN", "STILL FAILING", "INSUFFICIENT"):
+                status = 1
+            print(
+                f"{row['row_kind']}\t{row['test_id']}\t{args.mode}\t{sha}\t"
+                f"{info['verdict']}\t{row['n_pass']}\t{row['n_fail']}\t"
+                f"{row['n_no_result']}\t{info.get('needed') or ''}\t"
+                f"{info.get('p') or ''}\t{args.confidence}\t"
+                f"{row['baseline_pass']}\t{row['baseline_fail']}\t"
+                f"{info.get('more') if info.get('more') is not None else ''}"
+            )
+        return status
+
+    print(f"# Validate — {args.test_pattern} @ {short_sha(sha)} ({args.mode})")
+    status = 0
+    test_rows = [r for r in rows if r["row_kind"] == "test"]
+    family_row = next((r for r in rows if r["row_kind"] == "family"), None)
+    verdict_counts: dict[str, int] = {}
+    for row in test_rows:
+        label = row["test_id"]
+        info = _validate_verdict(row, args.confidence, explicit_p)
+        verdict_counts[info["verdict"]] = verdict_counts.get(info["verdict"], 0) + 1
+        definitive = row["n_pass"] + row["n_fail"]
+        clean = definitive + row["n_no_result"]
+        if info["verdict"] == "NOT_RUN":
+            status = 1
+            print(
+                f"{label}: NOT VALIDATED — NOT_RUN: 0 runs at {short_sha(sha)} "
+                f"({args.mode}). The dashboard cannot confirm this fix; "
+                "you need to run it (`dashboard.py stress ...` or a targeted "
+                "cargo test)."
+            )
+            continue
+        if info["verdict"] == "STILL FAILING":
+            status = 1
+            extra = (f", {row['n_no_result']} no_result"
+                     if row["n_no_result"] else "")
+            print(f"{label}: STILL FAILING ({row['n_fail']} fails / "
+                  f"{clean} clean runs{extra})")
+            continue
+        p = info["p"]
+        needed = info["needed"]
+        baseline = ""
+        baseline_total = row["baseline_pass"] + row["baseline_fail"]
+        if args.vs_baseline and baseline_total > 0:
+            baseline_p = row["baseline_fail"] / baseline_total
+            baseline = (f"; baseline was {_format_pct(baseline_p)} "
+                        f"({row['baseline_fail']}/{baseline_total})")
+        if info["verdict"] == "VALIDATED":
+            print(
+                f"{label}: VALIDATED (rules out a >={_format_pct(p)} flake "
+                f"at {args.confidence:.2f} confidence: {row['n_pass']} clean, "
+                f"0 fail{baseline})"
+            )
+        else:
+            status = 1
+            print(
+                f"{label}: INSUFFICIENT: {row['n_pass']} clean of {needed} "
+                f"needed for {args.confidence:.2f} confidence at assumed "
+                f"rate {_format_pct(p)} → need {info['more']} more{baseline}."
+            )
+
+    if family_row is None or not test_rows:
+        status = 1
+        print(
+            f"family summary: NOT VALIDATED — NOT_RUN: 0 matching tests for "
+            f"{args.test_pattern!r} in the dashboard store."
+        )
+        return status
+
+    total_tests = len(test_rows)
+    agg = (f"aggregate {family_row['n_pass']} pass / "
+           f"{family_row['n_fail']} fail / "
+           f"{family_row['n_no_result']} no_result")
+    if verdict_counts.get("NOT_RUN", 0):
+        status = 1
+        print(f"family summary: NOT VALIDATED — "
+              f"{verdict_counts['NOT_RUN']}/{total_tests} tests NOT_RUN; {agg}.")
+    elif verdict_counts.get("STILL FAILING", 0):
+        status = 1
+        print(f"family summary: STILL FAILING — "
+              f"{verdict_counts['STILL FAILING']}/{total_tests} tests failing; "
+              f"{agg}.")
+    elif verdict_counts.get("INSUFFICIENT", 0):
+        status = 1
+        print(f"family summary: INSUFFICIENT — "
+              f"{verdict_counts['INSUFFICIENT']}/{total_tests} tests need more "
+              f"clean passes; {agg}.")
+    else:
+        print(f"family summary: VALIDATED — all {total_tests} tests validated; "
+              f"{agg}.")
+    return status
+
+
 def cmd_track(args: argparse.Namespace) -> int:
     state_dir = resolve_state_dir(args.state_dir)
     conn = open_db(state_dir, bootstrap=True)
@@ -4215,6 +4488,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_flaky.add_argument("--canonical-worktree", default=None,
                          help=argparse.SUPPRESS)
     p_flaky.set_defaults(func=cmd_flaky)
+
+    p_val = sub.add_parser(
+        "validate",
+        help="check whether clean dashboard runs validate a flaky/failing "
+             "test fix with statistical confidence",
+    )
+    p_val.add_argument("test_pattern",
+                       help="SQL LIKE substring matched against test_id")
+    p_val.add_argument("--sha", default=None,
+                       help="target commit sha or prefix (default: HEAD)")
+    p_val.add_argument("--branch", default=None,
+                       help="resolve this branch/worktree HEAD as target sha")
+    p_val.add_argument("--mode", choices=("native", "litebox"),
+                       default="litebox")
+    p_val.add_argument("--confidence", type=float, default=0.95)
+    p_val.add_argument("--assume-flake-rate", type=float, default=None,
+                       help="assumed true fail probability to rule out")
+    p_val.add_argument("--vs-baseline", default=None,
+                       help="baseline commit sha/prefix for contrast and "
+                            "flake-rate inference")
+    p_val.add_argument("--format", choices=("text", "sql"), default="text")
+    p_val.add_argument("--state-dir", default=argparse.SUPPRESS,
+                       help="override dashboard state directory")
+    p_val.add_argument("--canonical-worktree", default=None,
+                       help="canonical clone root for git queries "
+                            "(default: state-dir's parent)")
+    p_val.set_defaults(func=cmd_validate)
 
     p_track = sub.add_parser(
         "track",
