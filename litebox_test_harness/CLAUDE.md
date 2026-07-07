@@ -1367,11 +1367,13 @@ for forensics.
 - `litebox_test_harness/tests/integration.rs` — `mod copilot` and
   conditional registration in `main()`.
 
-**Out of scope (deferred):** sandbox policy / allow / deny
-coverage. The agent-sandbox-demo branch
-(`experiments/agent-sandbox-demo/`) retains the interactive
-hand-driven demo with policy enforcement; this suite is the
-automated companion for repeatable validation.
+**Sandbox policy coverage:** network egress enforcement now has an
+automated end-to-end trial — `vscode::network_policy` (see the VS Code
+scenario table below) runs the sandbox under a real deny-all policy and
+asserts a non-allowlisted connect is blocked with `EPERM`. The
+interactive hand-driven demo lives in
+`litebox_tool_executor/demo-vscode-server/` (policy on by default, with
+the `litebox_audit_query watch --tree` frontier viewer).
 
 ## VS Code Server integration scenarios
 
@@ -1385,7 +1387,6 @@ node already flipped to ✅.
 
 **Trial namespace:** `vscode::<scenario>`. Each registers as
 `native::vscode::<scenario>` and `litebox::vscode::<scenario>`.
-5 scenarios × 2 passes = 10 trials.
 
 | Scenario              | What it exercises                                                                                            |
 |-----------------------|--------------------------------------------------------------------------------------------------------------|
@@ -1394,6 +1395,7 @@ node already flipped to ✅.
 | `connect_loopback`    | Same SSH session as `server_listen`, plus a TCP 3-way handshake to the captured port via bash's `/dev/tcp/127.0.0.1/$PORT`. Validates loopback TCP delivery inside the sandbox. |
 | `connect_cross_ssh`   | Two independent SSH sessions: session A starts the CLI and emits the captured port; session B (separate dropbear → bash worker tree) does the connect. Mirrors the VS Code Remote-SSH SOCKS-proxy pattern; under litebox exercises broker cross-worker loopback TCP. |
 | `extension_host_steady` | Replays the captured bootstrap, starts the production `code-server --start-server --socket-path=/tmp/code-*.sock` invocation, opens a Remote-SSH-shaped WebSocket to the Unix socket from a fresh SSH session, and asserts the connection stays alive for 60 s. |
+| `network_policy`      | **Sandbox egress enforcement.** litebox pass runs the SSH server under a deny-all-except-`127.0.0.1:9` policy (`--policy` instead of `--record-baseline`, staged into the fixture dir); over SSH it probes a denied port (`:19`) and an allowed port (`:9`) via bash `/dev/tcp` and classifies each connect as `BLOCKED` (`EPERM` / "Operation not permitted") or `PERMITTED` (any other outcome — both ports are closed). litebox expects deny=BLOCKED, allow=PERMITTED; **native is the control** (no sandbox → both PERMITTED / "Connection refused"), proving the litebox `EPERM` is policy, not the environment. Controlled + deterministic: no external egress. |
 
 **No token required** — VS Code's `--connection-token` is
 locally-generated and never validated externally. (Unlike

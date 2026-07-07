@@ -4403,6 +4403,7 @@ mod vscode {
         "connect_cross_ssh",
         "extension_host_steady",
         "extension_host_spawn",
+        "network_policy",
     ];
 
     /// Register every `vscode::<scenario>` Trial pair. Called
@@ -4433,6 +4434,7 @@ mod vscode {
             "connect_cross_ssh" => run_connect_cross_ssh(pass),
             "extension_host_steady" => run_extension_host_steady(pass),
             "extension_host_spawn" => run_extension_host_spawn(pass),
+            "network_policy" => run_network_policy(pass),
             other => Err(Failed::from(format!("unknown vscode scenario: {other}"))),
         }
     }
@@ -5420,6 +5422,172 @@ mod vscode {
 
     /// Per-trial fixture directory. Cleared and recreated at the
     /// start of each scenario so a re-run sees a fresh `/workspace`.
+    // ───────────────────────────────────────────────────────────────
+    // network_policy — sandbox egress enforcement (controlled, in-container)
+    // ───────────────────────────────────────────────────────────────
+
+    /// Same container as `build_vscode_spec`, but the litebox pass runs the
+    /// sandbox under an enforcing policy staged into the fixture dir
+    /// (bind-mounted at `/workspace`) instead of the allow-all
+    /// `--record-baseline`. The native pass is unchanged (plain dropbear).
+    fn build_network_policy_spec(
+        pass: &str,
+        fixture_dir: &Path,
+    ) -> super::framework::ContainerSpec {
+        let mut spec = build_vscode_spec(pass, fixture_dir);
+        if pass == "litebox" {
+            spec.command = vec![
+                "/opt/litebox/litebox_tool_executor".into(),
+                "--rootfs".into(),
+                "/".into(),
+                "--policy".into(),
+                "/workspace/policy.json".into(),
+                "--ssh".into(),
+                "--ssh-port".into(),
+                "22".into(),
+            ];
+        }
+        spec
+    }
+
+    /// In-container probe: attempt a loopback TCP connect to a denied port
+    /// (`:19`, not in the allowlist) and an allowed port (`:9`, allowlisted).
+    /// Both ports are closed, so a *permitted* connect merely fails to
+    /// establish (refused / invalid); only a *policy-blocked* connect yields
+    /// `EPERM` ("Operation not permitted"). We classify purely on that, which
+    /// is robust to the exact errno a permitted-but-failed connect returns.
+    fn build_network_policy_probe_cmd() -> String {
+        "set +e; \
+         classify() { \
+            msg=$(timeout 5 bash -c \"exec 3<>/dev/tcp/127.0.0.1/$1\" 2>&1); \
+            echo \"PROBE port=$1 msg=[$msg]\" >&2; \
+            if printf '%s' \"$msg\" | grep -qi 'not permitted'; then \
+                echo BLOCKED; \
+            else \
+                echo PERMITTED; \
+            fi; \
+         }; \
+         echo \"DENY_VERDICT=$(classify 19)\"; \
+         echo \"ALLOW_VERDICT=$(classify 9)\""
+            .to_string()
+    }
+
+    /// First `KEY=value` marker line, trimmed.
+    fn parse_marker(output: &str, key: &str) -> Option<String> {
+        output
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
+    }
+
+    /// `sandbox`/policy enforcement end-to-end. Runs the sandboxed SSH server
+    /// under a deny-all-except-`127.0.0.1:9` policy, then from inside the
+    /// sandbox (over SSH) probes a denied and an allowed loopback port:
+    ///
+    /// - **litebox**: the denied port is blocked (`EPERM`) and the allowed
+    ///   port is permitted — the sandbox is enforcing.
+    /// - **native**: no sandbox, so both connects are simply permitted. This
+    ///   is the control that proves the litebox `EPERM` is policy, not the
+    ///   environment.
+    fn run_network_policy(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "network_policy").map_err(Failed::from)?;
+        std::fs::write(
+            fixture_dir.join("policy.json"),
+            r#"{"network":{"deny_all":true,"allow_connect":["127.0.0.1:9"]}}"#,
+        )
+        .map_err(|e| Failed::from(format!("write policy.json: {e}")))?;
+        ensure_vscode_image(&super::workspace_root());
+
+        let test_id = "vscode::network_policy".to_string();
+        let spec = build_network_policy_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "network_policy",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let output =
+                    match run_remote_command_retry(port, &build_network_policy_probe_cmd(), 90) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            return drive_fail(
+                                format!("run_remote_command_retry: {e}"),
+                                t_docker_start_ms,
+                                t_useful_start.elapsed().as_millis(),
+                            );
+                        }
+                    };
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-network_policy");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &output);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+                let stripped = copilot::strip_ansi(&output);
+                let deny = parse_marker(&stripped, "DENY_VERDICT=");
+                let allow = parse_marker(&stripped, "ALLOW_VERDICT=");
+
+                // litebox enforces (deny blocked, allow permitted); native has
+                // no sandbox so both are permitted.
+                let ok = match pass {
+                    "litebox" => {
+                        deny.as_deref() == Some("BLOCKED") && allow.as_deref() == Some("PERMITTED")
+                    }
+                    _ => {
+                        deny.as_deref() == Some("PERMITTED")
+                            && allow.as_deref() == Some("PERMITTED")
+                    }
+                };
+
+                if ok {
+                    super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    }
+                } else {
+                    let preview: String = stripped.chars().take(1500).collect();
+                    drive_fail(
+                        format!(
+                            "network_policy {pass} failed: deny={deny:?} allow={allow:?} \
+                             (litebox expects deny=BLOCKED allow=PERMITTED; native expects both \
+                             PERMITTED). raw log: {}\nfirst 1500 chars:\n{preview}",
+                            log_dir.join(format!("{safe}.raw.log")).display(),
+                        ),
+                        t_docker_start_ms,
+                        t_useful_ms,
+                    )
+                }
+            },
+        )
+    }
+
     fn vscode_fixture_dir(pass: &str, scenario_id: &str) -> std::path::PathBuf {
         super::target_dir()
             .join("vscode-fixtures")
