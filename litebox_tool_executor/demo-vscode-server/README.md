@@ -88,6 +88,11 @@ Broker policy decisions are appended as JSONL to the bind-mounted
   live-updating tree of allowed (green) vs denied (red) filesystem
   paths and network endpoints. As the agent works the tree grows to
   show the *frontier* of what it actually reached.
+- **`LiteBox: Watch Sandbox Trace`** — a scrolling live trace of the
+  same events (broker policy decisions; plus per-syscall events if the
+  runner was built with `--features audit_log`).
+- **`LiteBox: Watch Sandbox (Tree + Trace)`** — opens both of the above
+  side by side in dedicated terminal panels.
 
 Or from any shell in the worktree:
 

@@ -137,6 +137,34 @@
             }
         },
         {
+            // Scrolling live trace of sandbox activity: broker policy
+            // decisions (tcp/udp/fs/dns) and, if the runner was built with
+            // `--features audit_log`, per-syscall events too. This is the
+            // cross-platform successor to the old View-AuditLog.ps1 viewer.
+            "label": "LiteBox: Watch Sandbox Trace",
+            "type": "shell",
+            "command": "cd ${workspaceFolder}/../.. && cargo build -q -p litebox_audit_query && ./target/debug/litebox_audit_query watch target/litebox-audit",
+            "problemMatcher": [],
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
+            // Open both visualizers side by side (parallel dependsOn opens two
+            // dedicated terminal panels): the frontier tree + the scrolling
+            // trace. Run this after the server task is up.
+            "label": "LiteBox: Watch Sandbox (Tree + Trace)",
+            "dependsOn": [
+                "LiteBox: Watch Sandbox Frontier",
+                "LiteBox: Watch Sandbox Trace"
+            ],
+            "problemMatcher": []
+        },
+        {
             "label": "LiteBox: Run Integration Tests (vscode::*)",
             "type": "shell",
             "command": "cd ${workspaceFolder}/../.. && cargo test -p litebox_test_harness --test integration -- 'vscode::'",
