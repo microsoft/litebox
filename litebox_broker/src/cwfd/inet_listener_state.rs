@@ -91,6 +91,25 @@ impl InetListenerState {
             .expect("InetListenerState bound_addr poisoned")
     }
 
+    pub fn reuse_port_enabled(&self) -> bool {
+        self.pending_sockopts
+            .lock()
+            .expect("InetListenerState pending_sockopts poisoned")
+            .iter()
+            .any(|opt| {
+                opt.level == libc::SOL_SOCKET
+                    && opt.optname == libc::SO_REUSEPORT
+                    && opt
+                        .value
+                        .get(..std::mem::size_of::<libc::c_int>())
+                        .is_some_and(|value| {
+                            let mut raw = [0u8; std::mem::size_of::<libc::c_int>()];
+                            raw.copy_from_slice(value);
+                            libc::c_int::from_ne_bytes(raw) != 0
+                        })
+            })
+    }
+
     pub fn getsockname(&self) -> Result<[u8; SOCKADDR_WIRE_LEN], InetListenerError> {
         let addr = self.bound_addr().ok_or(InetListenerError::NotBound)?;
         encode_sockaddr(addr)
