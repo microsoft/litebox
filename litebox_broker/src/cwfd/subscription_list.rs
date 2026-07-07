@@ -59,11 +59,13 @@
 //! a reader receiving one — it polls current state and acts on it.
 //!
 //! Therefore edge notifications **coalesce**. Rapid `notify(IN)` calls
-//! OR their bits into a per-subscription `pending_mask`; at most one
-//! frame is in flight in the ring per subscription. When the
-//! subscriber drains that frame (signalled by `reader_pos` advancing
-//! past `last_send_writer_pos`), the next `notify` or `try_flush`
-//! emits a fresh frame carrying whatever bits accumulated.
+//! OR their bits into a per-subscription `pending_mask`; redundant bits
+//! already represented by an in-flight frame stay coalesced, while a newly
+//! asserted bit may emit one supplemental frame so an initial `OUT` wake cannot
+//! starve a later `IN` wake. When the subscriber drains through the latest
+//! frame (signalled by `reader_pos` advancing past `last_send_writer_pos`), the
+//! next `notify` or `try_flush` emits a fresh frame carrying whatever bits
+//! accumulated.
 //!
 //! ## Payload channel (signalfd siginfos, future datagram boundaries,
 //! AF_UNIX SCM credentials, ...)
@@ -96,8 +98,7 @@
 //! - **I3 Idempotence (edge channel).** Receiving N edge notifications
 //!   with overlapping mask bits is observationally identical to
 //!   receiving 1 notification with the OR of those masks. *Enforced
-//!   by:* per-subscription `pending_mask` accumulator and at-most-1
-//!   frame in flight.
+//!   by:* per-subscription `pending_mask`/`in_flight_mask` accumulators.
 //!
 //! - **I4 No loss on saturation.** A `WouldBlock` from the ring
 //!   never discards an event. Edge bits remain in `pending_mask`;
@@ -159,9 +160,10 @@
 //!   [`NotificationSender::try_send_and_capture_writer_pos`] doing
 //!   both operations behind the same sender lock.
 //!
-//! - **A6 In-flight Bound per Subscription.** At most ONE frame per
-//!   subscription is in flight in the ring at any time. *Enforced
-//!   by:* the "if `frame_in_flight`, defer" check before each send.
+//! - **A6 In-flight Bound per Subscription.** At most one in-flight frame per
+//!   distinct edge bit per subscription is needed: duplicate bits coalesce, but
+//!   a new bit can bypass an older in-flight frame. *Enforced by:* the
+//!   `in_flight_mask` check before each send.
 //!
 //! - **A7 Ring-fill Bound per Worker.** A worker with N subscriptions
 //!   on a single notification ring has at most N edge frames + N
@@ -266,6 +268,10 @@ struct Subscription {
     /// `last_send_writer_pos == 0` to mean "no prior send" without
     /// ambiguity against the initial-ring state.
     edge_frame_in_flight: bool,
+    /// OR of edge bits already represented by not-yet-consumed in-flight
+    /// frames. A new bit that is not in this mask may be sent as a supplemental
+    /// frame even while an older frame is still queued.
+    in_flight_mask: u32,
 
     // ---------- Payload channel state ----------
     /// FIFO queue of payload events awaiting delivery. Head is drained
@@ -328,6 +334,7 @@ impl SubscriptionList {
             pending_mask: 0,
             last_send_writer_pos: 0,
             edge_frame_in_flight: false,
+            in_flight_mask: 0,
             pending_payloads: VecDeque::new(),
         });
         Ok(())
@@ -356,10 +363,9 @@ impl SubscriptionList {
     /// subscription's `pending_mask` and we then attempt to flush
     /// any pending edges to the ring (see [`Self::try_flush`]).
     ///
-    /// Multiple rapid `notify` calls coalesce: only one frame per
-    /// subscription is in flight at any time. The OR'd mask of every
-    /// `notify` call between successful sends is delivered when the
-    /// previous frame is observed consumed.
+    /// Multiple rapid `notify` calls coalesce per edge bit: duplicate
+    /// bits already represented by in-flight frames defer, while a
+    /// newly asserted bit can be delivered as a supplemental frame.
     ///
     /// Errors writing to a sender are absorbed:
     /// - `WouldBlock`: bit stays in `pending_mask` for retry on the
@@ -452,64 +458,38 @@ impl SubscriptionList {
         }
         let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
 
-        // A6 in-flight bound: if our previous frame hasn't been
-        // consumed yet, defer. Pending bits stay in pending_mask.
-        if sub.edge_frame_in_flight
-            && !frame_consumed(sub.last_send_writer_pos, sender.reader_pos())
-        {
+        let send_mask = if sub.edge_frame_in_flight {
+            if frame_consumed(sub.last_send_writer_pos, sender.reader_pos()) {
+                sub.edge_frame_in_flight = false;
+                sub.in_flight_mask = 0;
+                sub.pending_mask
+            } else {
+                let new_bits = sub.pending_mask & !sub.in_flight_mask;
+                if new_bits == 0 {
+                    return;
+                }
+                new_bits
+            }
+        } else {
+            sub.pending_mask
+        };
+        if send_mask == 0 {
             return;
         }
 
-        // Build a frame carrying the full pending mask.
-        let frame = NotificationFrame::fixed(sub.id, sub.pending_mask);
+        let frame = NotificationFrame::fixed(sub.id, send_mask);
 
         match sender.try_send_and_capture_writer_pos(&frame) {
             Ok(post_writer_pos) => {
                 // A5 post-send cursor capture: under sender lock.
                 sub.last_send_writer_pos = post_writer_pos;
                 sub.edge_frame_in_flight = true;
-                sub.pending_mask = 0;
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0);
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/rst-diag.log")
-                    {
-                        let _ = writeln!(
-                            f,
-                            "[HypB-diag] ts={ts} EDGE SEND OK sub_id={} mask={:#x} wpos={post_writer_pos}",
-                            sub.id,
-                            frame.events()
-                        );
-                    }
-                }
+                sub.in_flight_mask |= send_mask;
+                sub.pending_mask &= !send_mask;
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 // I4: ring full. Leave pending_mask intact; next
                 // try_flush will retry.
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0);
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/rst-diag.log")
-                    {
-                        let _ = writeln!(
-                            f,
-                            "[HypB-diag] ts={ts} EDGE SEND WouldBlock sub_id={} pending={:#x}",
-                            sub.id, sub.pending_mask
-                        );
-                    }
-                }
             }
             Err(err) if is_peer_gone(&err) => {
                 tracing::warn!(
@@ -517,24 +497,6 @@ impl SubscriptionList {
                     error = %err,
                     "edge notification send failed (peer gone); removing subscription",
                 );
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0);
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/rst-diag.log")
-                    {
-                        let _ = writeln!(
-                            f,
-                            "[HypB-diag] ts={ts} EDGE SEND PEER-GONE sub_id={} err={err}",
-                            sub.id
-                        );
-                    }
-                }
                 to_remove.push(sub.id);
             }
             Err(err) => {
@@ -820,13 +782,10 @@ mod tests {
 
     #[test]
     fn i3_burst_notify_coalesces_into_at_most_one_in_flight_frame() {
-        // 1000 rapid notify(IN) calls against a non-draining
-        // receiver must produce AT MOST 2 frames in the ring (1
-        // initial + 1 coalesced follow-up). With max-1-in-flight,
-        // calls 2..=1000 all defer and accumulate into pending_mask;
-        // when we drain the first frame and re-flush, the union
-        // (just IN) is emitted as one more frame. Pending then is
-        // empty.
+        // 1000 rapid notify(IN) calls against a non-draining receiver must
+        // produce AT MOST 2 frames in the ring (1 initial + 1 coalesced
+        // follow-up). Repeated IN bits are deferred while IN is already
+        // represented in-flight, then emitted once after the first frame drains.
         let list = SubscriptionList::new();
         let (sender, mut receiver) = make_pair();
         list.add(1, NOTIFY_EVENT_IN, sender).unwrap();
@@ -839,8 +798,8 @@ mod tests {
         let f1 = receiver.recv().expect("first frame");
         assert_eq!(f1.events(), NOTIFY_EVENT_IN);
 
-        // try_flush picks up the accumulated pending_mask (IN) and
-        // sends exactly ONE more frame.
+        // try_flush picks up the accumulated pending_mask (IN) and sends
+        // exactly ONE more frame.
         thread::sleep(Duration::from_millis(2));
         list.try_flush();
         let f2 = receiver.recv().expect("coalesced follow-up frame");
@@ -864,11 +823,9 @@ mod tests {
 
     #[test]
     fn i3_burst_notify_with_mixed_bits_coalesces_into_union_mask() {
-        // notify(IN) then notify(OUT) before draining should result in
-        // ONE frame in flight (the IN one), and after we drain it +
-        // try_flush, ONE more frame carrying OUT alone — because OUT
-        // arrived after IN was already in flight. The pending_mask
-        // accumulator preserves OUT and emits it on the next opportunity.
+        // notify(IN) then notify(OUT) before draining should not let an
+        // uninteresting first bit starve a later distinct bit. OUT is emitted
+        // as a supplemental frame even while the IN frame is still queued.
         let list = SubscriptionList::new();
         let (sender, mut receiver) = make_pair();
         list.add(1, NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT, sender)
@@ -879,24 +836,15 @@ mod tests {
 
         let f1 = receiver.recv().expect("first");
         assert_eq!(f1.events(), NOTIFY_EVENT_IN);
-
-        // Receiver has drained → reader_pos advanced. try_flush picks
-        // up the deferred OUT.
-        thread::sleep(Duration::from_millis(2));
-        list.try_flush();
         let f2 = receiver.recv().expect("second");
         assert_eq!(f2.events(), NOTIFY_EVENT_OUT);
     }
 
     #[test]
     fn i3_two_notifies_before_drain_collapse_into_one_frame_with_or_mask() {
-        // Stronger variant: notify(IN), notify(OUT), notify(IN), all
-        // before any drain. ONLY the first should make it through;
-        // the rest accumulate. When we drain + try_flush, exactly
-        // one more frame appears carrying the OR'd remainder (just
-        // OUT, since IN was already in the first frame; pending after
-        // first send is 0, then OUT is OR'd in, then IN is OR'd in,
-        // so pending = IN|OUT, which gets sent as one frame).
+        // Stronger variant: notify(IN), notify(OUT), notify(IN), all before
+        // any drain. IN and OUT each get one immediate in-flight frame; the
+        // repeated IN is deferred and emitted once after those drain.
         let list = SubscriptionList::new();
         let (sender, mut receiver) = make_pair();
         list.add(1, NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT, sender)
@@ -908,20 +856,18 @@ mod tests {
 
         let f1 = receiver.recv().expect("first");
         assert_eq!(f1.events(), NOTIFY_EVENT_IN);
+        let f2 = receiver.recv().expect("second");
+        assert_eq!(f2.events(), NOTIFY_EVENT_OUT);
 
         thread::sleep(Duration::from_millis(2));
         list.try_flush();
-        let f2 = receiver.recv().expect("second");
-        assert_eq!(
-            f2.events(),
-            NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT,
-            "second frame should carry OR of deferred bits"
-        );
+        let f3 = receiver.recv().expect("third");
+        assert_eq!(f3.events(), NOTIFY_EVENT_IN);
 
-        // No third frame.
+        // No fourth frame.
         list.try_flush();
         let (frames, _r) = drain_with_timeout(receiver, 1, Duration::from_millis(50));
-        assert_eq!(frames.len(), 0, "expected no third frame, got {frames:?}");
+        assert_eq!(frames.len(), 0, "expected no fourth frame, got {frames:?}");
     }
 
     // ============================================================
