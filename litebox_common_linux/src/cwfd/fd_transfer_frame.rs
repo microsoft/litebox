@@ -106,9 +106,6 @@ use alloc::vec::Vec;
 pub enum SubsystemTag {
     /// Linux `eventfd2(2)`-created fd. Wire value `1`.
     Eventfd,
-    /// Linux `eventfd2(2)` fd whose open-file-description status has
-    /// `O_NONBLOCK` set. Wire value `21`.
-    EventfdNonblock,
     /// Connected TCP socket. Wire value `2`. (Phase 3c-ii: includes
     /// `SOCK_STREAM` AF_INET / AF_INET6 sockets. Listening sockets are
     /// distinguished only after materialisation via `SO_ACCEPTCONN`.)
@@ -176,7 +173,6 @@ impl SubsystemTag {
     pub fn as_u8(self) -> u8 {
         match self {
             SubsystemTag::Eventfd => 1,
-            SubsystemTag::EventfdNonblock => 21,
             SubsystemTag::TcpSocket => 2,
             SubsystemTag::Pidfd => 3,
             SubsystemTag::UnixSocket => 4,
@@ -206,7 +202,6 @@ impl SubsystemTag {
     pub fn from_u8(raw: u8) -> Self {
         match raw {
             1 => SubsystemTag::Eventfd,
-            21 => SubsystemTag::EventfdNonblock,
             2 => SubsystemTag::TcpSocket,
             3 => SubsystemTag::Pidfd,
             4 => SubsystemTag::UnixSocket,
@@ -1208,11 +1203,7 @@ mod tests {
 
     #[test]
     fn passed_token_tag_and_id_round_trip() {
-        for &tag in &[
-            SubsystemTag::Eventfd,
-            SubsystemTag::EventfdNonblock,
-            SubsystemTag::TcpSocket,
-        ] {
+        for &tag in &[SubsystemTag::Eventfd, SubsystemTag::TcpSocket] {
             for &id in &[0u64, 1, 42, 0xff, 0x100, PASSED_TOKEN_MAX_ID] {
                 let t = PassedToken::new(tag, id).unwrap();
                 assert_eq!(t.tag(), tag);
@@ -1244,7 +1235,6 @@ mod tests {
             match tag {
                 SubsystemTag::Unknown(v) => assert_eq!(v, raw),
                 SubsystemTag::Eventfd
-                | SubsystemTag::EventfdNonblock
                 | SubsystemTag::TcpSocket
                 | SubsystemTag::Pidfd
                 | SubsystemTag::UnixSocket
@@ -1285,10 +1275,8 @@ mod tests {
         assert_eq!(SubsystemTag::SocketPairA.as_u8(), 18);
         assert_eq!(SubsystemTag::SocketPairB.as_u8(), 19);
         assert_eq!(SubsystemTag::UnixStream.as_u8(), 20);
-        assert_eq!(SubsystemTag::EventfdNonblock.as_u8(), 21);
         for tag in [
             SubsystemTag::Eventfd,
-            SubsystemTag::EventfdNonblock,
             SubsystemTag::TcpSocket,
             SubsystemTag::Pidfd,
             SubsystemTag::UnixSocket,

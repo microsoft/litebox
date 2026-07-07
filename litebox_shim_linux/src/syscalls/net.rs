@@ -4022,15 +4022,9 @@ impl<FS: ShimFS> Task<FS> {
                                 // to dup a transit ref so the handle survives
                                 // until the receiver materialises its own ref.
                                 provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
-                                let status = entry_handle.with_entry(|e| e.get_status());
-                                let tag = if status.contains(litebox::fs::OFlags::NONBLOCK) {
-                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::EventfdNonblock
-                                } else {
-                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd
-                                };
                                 passed_tokens.push(
                                     litebox_common_linux::fd_transfer_frame::PassedToken::new(
-                                        tag,
+                                        litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd,
                                         handle_id,
                                     )
                                     .map_err(|_| Errno::EINVAL)?,
@@ -5040,7 +5034,6 @@ impl<FS: ShimFS> Task<FS> {
                                 litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::B
                             }
                             SubsystemTag::Eventfd
-                            | SubsystemTag::EventfdNonblock
                             | SubsystemTag::TcpSocket
                             | SubsystemTag::Pidfd
                             | SubsystemTag::UnixSocket
@@ -5129,7 +5122,7 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                     }
-                    SubsystemTag::Eventfd | SubsystemTag::EventfdNonblock => {
+                    SubsystemTag::Eventfd => {
                         let Some(provider) = super::eventfd::broker_eventfd_provider() else {
                             // No provider on this worker — drop the
                             // token; broker will eventually release
@@ -5151,12 +5144,11 @@ impl<FS: ShimFS> Task<FS> {
                         // Apply MSG_CMSG_CLOEXEC right at construction
                         // (matches Linux recvmsg semantics where the
                         // received fd is created with CLOEXEC atomically).
-                        let mut efd_flags = litebox_common_linux::EfdFlags::empty();
-                        efd_flags.set(litebox_common_linux::EfdFlags::CLOEXEC, cloexec);
-                        efd_flags.set(
-                            litebox_common_linux::EfdFlags::NONBLOCK,
-                            matches!(token.tag(), SubsystemTag::EventfdNonblock),
-                        );
+                        let efd_flags = if cloexec {
+                            litebox_common_linux::EfdFlags::CLOEXEC
+                        } else {
+                            litebox_common_linux::EfdFlags::empty()
+                        };
                         let eventfd = super::eventfd::EventFile::new_broker_backed(
                             provider, handle_id, efd_flags,
                         );
@@ -5326,7 +5318,6 @@ impl<FS: ShimFS> Task<FS> {
                                 litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write
                             }
                             SubsystemTag::Eventfd
-                            | SubsystemTag::EventfdNonblock
                             | SubsystemTag::TcpSocket
                             | SubsystemTag::Pidfd
                             | SubsystemTag::UnixSocket
