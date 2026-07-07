@@ -95,6 +95,8 @@ pub(crate) type WindowsVirtualAllocations<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
 pub(crate) type WindowsSectionNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Weak<SectionObject<Platform>>>>;
+pub(crate) type WindowsPersistentSections<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<String, Arc<SectionObject<Platform>>>>;
 pub(crate) type WindowsSectionViews<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsSectionView<Platform>>>;
 pub(crate) type WindowsEventNamespace<Platform> =
@@ -376,6 +378,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             directory_namespace,
             event_namespace: WindowsEventNamespace::<Platform>::new(BTreeMap::new()),
             section_namespace: WindowsSectionNamespace::<Platform>::new(BTreeMap::new()),
+            persistent_sections: WindowsPersistentSections::<Platform>::new(BTreeMap::new()),
             section_views: WindowsSectionViews::<Platform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
             virtual_allocations: load_info.virtual_allocations,
@@ -422,6 +425,7 @@ pub struct Process<Platform: ShimPlatform> {
     directory_namespace: WindowsDirectoryNamespace<Platform>,
     event_namespace: WindowsEventNamespace<Platform>,
     section_namespace: WindowsSectionNamespace<Platform>,
+    persistent_sections: WindowsPersistentSections<Platform>,
     section_views: WindowsSectionViews<Platform>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,

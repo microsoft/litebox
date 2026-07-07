@@ -42,8 +42,9 @@ enum SectionBacking {
     /// second-concurrent-view and the remap-after-unmap rejects exist. They are
     /// one missing feature, not two unrelated limitations.
     Pagefile,
-    /// CSR shared-section contents are synthesized on map and likewise limited
-    /// to one live view until `TODO(section-subsystem)` adds shared backing.
+    /// The CSR client maps the session-global server data once; LiteBox pins the
+    /// section object for the process and permanently rejects remaps instead of
+    /// reinitializing this persistent region.
     CsrSharedSection,
     ImageFile,
 }
@@ -632,16 +633,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn named_section(&self, name: &str) -> Option<Arc<SectionObject<Platform>>> {
         let key = section_key(name);
-        let mut namespace = self.process.section_namespace.write();
-        if let Some(section) = namespace.get(&key).and_then(alloc::sync::Weak::upgrade) {
-            return Some(section);
+        {
+            let mut namespace = self.process.section_namespace.write();
+            if let Some(section) = namespace.get(&key).and_then(alloc::sync::Weak::upgrade) {
+                return Some(section);
+            }
+            namespace.remove(&key);
         }
-        namespace.remove(&key);
         if !is_windows_shared_section(name) {
             return None;
         }
-        let section = windows_shared_section();
-        namespace.insert(key, Arc::downgrade(&section));
+        let section = {
+            let mut persistent_sections = self.process.persistent_sections.write();
+            persistent_sections
+                .entry(key.clone())
+                .or_insert_with(windows_shared_section)
+                .clone()
+        };
+        self.process
+            .section_namespace
+            .write()
+            .insert(key, Arc::downgrade(&section));
         Some(section)
     }
 
@@ -1496,6 +1508,111 @@ mod tests {
             NtStatus::OBJECT_NAME_EXISTS
         );
         assert_eq!(created, Handle::from_raw(0xffff_ffff));
+    }
+
+    #[test]
+    fn nt_open_section_pins_synthesized_windows_shared_section_after_close() {
+        let task = test_task();
+        let name = wide(r"\Sessions\0\Windows\SharedSection");
+        let unicode = unicode(&name);
+        let attrs = object_attributes(&unicode);
+        let mut opened = Handle::default();
+
+        assert_eq!(
+            task.sys_nt_open_section(
+                mut_ptr(&mut opened),
+                SectionAccess::QUERY.bits(),
+                Some(const_ptr(&attrs)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
+
+        let size = 0x1000_i64;
+        let mut created = Handle::from_raw(0xffff_ffff);
+        assert_eq!(
+            task.sys_nt_create_section(
+                mut_ptr(&mut created),
+                SectionAccess::ALL_ACCESS.bits(),
+                Some(const_ptr(&attrs)),
+                Some(const_ptr(&size)),
+                PageProtection::PAGE_READWRITE.bits(),
+                SectionAllocationAttributes::SEC_COMMIT.bits(),
+                Handle::default(),
+            ),
+            NtStatus::OBJECT_NAME_EXISTS
+        );
+        assert_eq!(created, Handle::from_raw(0xffff_ffff));
+    }
+
+    #[test]
+    fn nt_map_view_of_windows_shared_section_rejects_remap_after_close() {
+        let task = test_task();
+        let name = wide(r"\Windows\SharedSection");
+        let unicode = unicode(&name);
+        let attrs = object_attributes(&unicode);
+        let mut opened = Handle::default();
+
+        assert_eq!(
+            task.sys_nt_open_section(
+                mut_ptr(&mut opened),
+                (SectionAccess::MAP_READ | SectionAccess::MAP_WRITE).bits(),
+                Some(const_ptr(&attrs)),
+            ),
+            NtStatus::SUCCESS
+        );
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: opened,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_READWRITE.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
+
+        let mut reopened = Handle::default();
+        assert_eq!(
+            task.sys_nt_open_section(
+                mut_ptr(&mut reopened),
+                (SectionAccess::MAP_READ | SectionAccess::MAP_WRITE).bits(),
+                Some(const_ptr(&attrs)),
+            ),
+            NtStatus::SUCCESS
+        );
+        let mut remap_base = 0usize;
+        let mut remap_view_size = 0usize;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: reopened,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut remap_base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut remap_view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_READWRITE.bits(),
+            }),
+            NtStatus::NOT_SUPPORTED
+        );
+        assert_eq!(remap_base, 0);
+        assert_eq!(remap_view_size, 0);
+        assert_eq!(task.sys_nt_close(reopened), NtStatus::SUCCESS);
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
