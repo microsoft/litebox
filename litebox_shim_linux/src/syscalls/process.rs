@@ -2166,12 +2166,12 @@ impl<FS: ShimFS> Task<FS> {
                     if self.is_exiting() {
                         return Err(Errno::EINTR);
                     }
-                    // Count ourselves as a fork-gate waiter. We are stopped in
-                    // shim-side fork serialization code rather than running
-                    // guest code, so the active forker can exclude us from the
-                    // parked checkpoint without waiting for a normal park.
+                    // Count ourselves as parked so the active forker
+                    // can satisfy its `parked_count == expected` wait
+                    // and proceed.
                     ps.vfork_parking
-                        .fork_waiter_count
+                        .parked_count
+                        .underlying_atomic()
                         .fetch_add(1, Ordering::Release);
                     ps.vfork_parking.parked_count.wake_all();
                     let v = parking_atomic.load(Ordering::Acquire);
@@ -2179,7 +2179,8 @@ impl<FS: ShimFS> Task<FS> {
                         let _ = ps.vfork_parking.park.block(v);
                     }
                     ps.vfork_parking
-                        .fork_waiter_count
+                        .parked_count
+                        .underlying_atomic()
                         .fetch_sub(1, Ordering::Release);
                     ps.vfork_parking.parked_count.wake_all();
                 }
@@ -2898,7 +2899,6 @@ impl<FS: ShimFS> Task<FS> {
                 vfork_parking: Arc::new(crate::VforkParking {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
-                    fork_waiter_count: core::sync::atomic::AtomicU32::new(0),
                     deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                 }),
             });
@@ -7185,7 +7185,8 @@ impl<FS: ShimFS> Task<FS> {
                 .load(Ordering::Acquire);
             if park_v != 0 {
                 ps.vfork_parking
-                    .fork_waiter_count
+                    .parked_count
+                    .underlying_atomic()
                     .fetch_add(1, Ordering::Release);
                 ps.vfork_parking.parked_count.wake_all();
                 loop {
@@ -7200,7 +7201,8 @@ impl<FS: ShimFS> Task<FS> {
                     let _ = ps.vfork_parking.park.block(v);
                 }
                 ps.vfork_parking
-                    .fork_waiter_count
+                    .parked_count
+                    .underlying_atomic()
                     .fetch_sub(1, Ordering::Release);
                 ps.vfork_parking.parked_count.wake_all();
             } else {
@@ -7224,7 +7226,7 @@ impl<FS: ShimFS> Task<FS> {
                 .load(Ordering::Acquire);
             let (expected_now, threads_to_interrupt) = {
                 let inner = self.thread.process.inner.lock();
-                let thread_peers = u32::try_from(
+                let expected_now = u32::try_from(
                     inner
                         .threads
                         .len()
@@ -7232,8 +7234,6 @@ impl<FS: ShimFS> Task<FS> {
                         .expect("calling thread must be in the map"),
                 )
                 .expect("thread count must fit in u32");
-                let fork_waiters = ps.vfork_parking.fork_waiter_count.load(Ordering::Acquire);
-                let expected_now = thread_peers.saturating_sub(fork_waiters);
                 let threads_to_interrupt = inner
                     .threads
                     .iter()
@@ -8532,29 +8532,13 @@ impl<FS: ShimFS> Task<FS> {
                 // without that infrastructure, plain EINTR is the safe
                 // choice (restarting would replay the original timeout,
                 // losing elapsed time).
-                match self.global.futex_manager.wait(
+                self.global.futex_manager.wait(
                     &self.wait_cx().with_timeout(timeout),
                     addr,
                     val,
                     None,
                     0,
-                ) {
-                    Ok(()) => {}
-                    Err(litebox::sync::futex::FutexError::WaitError(
-                        litebox::event::wait::WaitError::Interrupted,
-                    )) => {
-                        // Fork/vfork quiesce is an internal stop-the-world
-                        // interrupt, not a guest-visible signal. Restart the
-                        // futex wait after parking so glibc pthread locks
-                        // cannot observe a spurious EINTR while several
-                        // threads race fork().
-                        if self.is_suspended() {
-                            self.syscall_restartable.set(true);
-                        }
-                        return Err(Errno::EINTR);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+                )?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
@@ -9382,7 +9366,6 @@ impl<FS: ShimFS> Task<FS> {
                         park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                         parked_count:
                             <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
-                        fork_waiter_count: core::sync::atomic::AtomicU32::new(0),
                         deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                     }),
                 });
@@ -9467,7 +9450,6 @@ impl<FS: ShimFS> Task<FS> {
                 vfork_parking: Arc::new(crate::VforkParking {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
-                    fork_waiter_count: core::sync::atomic::AtomicU32::new(0),
                     deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                 }),
             });
