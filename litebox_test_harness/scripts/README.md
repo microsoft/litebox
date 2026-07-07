@@ -43,11 +43,31 @@ Override:
 ```
 dashboard.py render                          # write summary.md once
 dashboard.py status [--format text|md|sql]   # terminal-friendly summary
+dashboard.py flaky [--mode litebox|native|both]  # recent flake leaderboard
+dashboard.py validate <test-pattern>         # confirm a fix with clean live runs
+dashboard.py stress <test-pattern> [--under-load]  # run a test repeatedly to sample it
 dashboard.py track <ref> <ci_worktree>       # register a tracked ref
 dashboard.py untrack <ref>                   # remove a tracked ref
 dashboard.py refs                            # list tracked refs
 dashboard.py auto [--interval SECS]          # autonomous fill driver
 dashboard.py stop                            # stop auto + reap descendants
+```
+
+### `dashboard.py validate`
+
+`validate <test-pattern>` answers whether the live store has actually
+validated a fix for a flaky/failing test at a target SHA. A missing row is
+reported as `NOT_RUN`, never as pass/clean: if the test simply has not run
+at that SHA, the command exits non-zero and tells you to run it.
+
+For clean passes with zero fails, validation is statistical. To rule out a
+true flake rate `p` at confidence `c`, the command requires
+`N = ceil(ln(1-c) / ln(1-p))` consecutive clean passes (about `3/p` at
+95% confidence). Example:
+
+```
+dashboard.py validate RL.subscriber_exits_first \
+  --sha a863a31f --mode litebox --assume-flake-rate 0.05
 ```
 
 ### Auto-driver lifecycle & cleanup contract
@@ -172,6 +192,27 @@ Schema-version compatibility: bumped on breaking changes. On
 mismatch the Rust producer panics with a remediation pointer;
 the user is consulted before any bump (stopping every coding-agent
 session is a coordination cost).
+
+### Flake leaderboard
+
+`dashboard.py flaky` ranks recent clean, definitive (`pass`/`fail`)
+results from `.dashboard/results.sqlite` over the same 30-day window the
+regression classifier uses. It shows per-test pass/fail counts and fail
+rates, plus two triage signals:
+
+- `load-sensitive` — the test fails materially more often from
+  `.dashboard/shadows/...` worktrees than from dedicated worktrees,
+  which points at high parallel-build load as the reproduction shape.
+- `substrate-bug?` — native is solid while litebox flakes/fails,
+  suggesting the bug is in the litebox substrate rather than the test.
+
+Examples:
+
+```
+dashboard.py flaky --limit 15
+dashboard.py flaky --mode both --pattern pidfd --min-rate 0.10
+dashboard.py flaky --format sql
+```
 
 ### Cross-session concurrency coordination
 
@@ -507,6 +548,37 @@ SQL
 sqlite3 <main-worktree>/.dashboard/results.sqlite \
   "SELECT value FROM meta WHERE key='schema_version'"
 ```
+
+### `dashboard.py stress` — generate samples to validate a flake fix
+
+Fixing a flaky test needs *many* runs of the reproducing test at your fix
+sha — the auto supervisor's broad round-robin gets there slowly, and a
+single lucky pass proves nothing for a 2–5% flake. `stress` runs a
+targeted test (family) repeatedly at a worktree's HEAD and publishes every
+result to the store, so `dashboard.py validate` has real samples to judge.
+
+```sh
+# 20 runs of the RL family at the current worktree's HEAD:
+dashboard.py stress RL.subscriber_exits_first --iters 20
+
+# Reproduce a LOAD-SENSITIVE flake (passes in isolation, fails under the
+# parallel-build/broker-contention load the agent-coverage shadows have):
+dashboard.py stress RL.subscriber_exits_first --iters 40 --under-load
+
+# then judge it with confidence:
+dashboard.py validate RL.subscriber_exits_first --sha <HEAD>
+```
+
+- Runs in **dedicated** worktrees under `<state-dir>/stress/` — never the
+  supervisor's per-branch shadow, so it can't race `target/` / `docker
+  build`.
+- `--parallel K` (or `--under-load` = `--parallel 4`) runs K copies
+  concurrently; the concurrency *is* the load that surfaces the flake
+  class litebox keeps hitting (broker/coordination timeouts under load).
+- Uses a plain positional filter, not `--fill`, so each iteration re-runs
+  the test for a fresh sample (rather than skipping already-covered ones).
+- `--dry-run` prints the plan (worktrees + cargo argv) without spawning
+  cargo. Exits non-zero if any stressed run failed.
 
 ### Standardized regression classification (`regression_class` view)
 

@@ -617,7 +617,8 @@ struct Entry {
 struct State {
     next_id: u64,
     table: HashMap<u64, Entry>,
-    broker_held_inet_listeners: HashMap<(u16, AddressFamily), u64>,
+    broker_held_inet_listeners: HashMap<(u16, AddressFamily), Vec<u64>>,
+    broker_held_inet_listener_cursor: HashMap<(u16, AddressFamily), usize>,
     /// Ports already owned by the broker's `net_proxy` inbound forwarders.
     /// Worker-side `bind(port)` requests for these ports use a virtual bind
     /// (no host `bind()` call) because the broker already owns the host
@@ -659,6 +660,7 @@ impl BrokerStateRegistry {
                 next_id: 1,
                 table: HashMap::new(),
                 broker_held_inet_listeners: HashMap::new(),
+                broker_held_inet_listener_cursor: HashMap::new(),
                 inbound_forwarded_ports: HashSet::new(),
             }),
         }
@@ -814,7 +816,7 @@ impl BrokerStateRegistry {
         let s = self.state.lock().expect("BrokerStateRegistry poisoned");
         s.broker_held_inet_listeners
             .get(&(port, family))
-            .is_some_and(|handle| *handle != except.0)
+            .is_some_and(|handles| handles.iter().any(|handle| *handle != except.0))
     }
 
     pub fn register_broker_held_inet_listener(
@@ -824,12 +826,6 @@ impl BrokerStateRegistry {
         handle: StateHandle,
     ) -> Result<(), StateRegistryError> {
         let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
-        if s.broker_held_inet_listeners
-            .get(&(port, family))
-            .is_some_and(|registered| *registered != handle.0)
-        {
-            return Err(StateRegistryError::RefcountOverflow(handle));
-        }
         let entry = s
             .table
             .get(&handle.0)
@@ -862,8 +858,12 @@ impl BrokerStateRegistry {
                 });
             }
         }
-        s.broker_held_inet_listeners
-            .insert((port, family), handle.0);
+        let key = (port, family);
+        let handles = s.broker_held_inet_listeners.entry(key).or_default();
+        if !handles.contains(&handle.0) {
+            handles.push(handle.0);
+        }
+        s.broker_held_inet_listener_cursor.entry(key).or_default();
         Ok(())
     }
 
@@ -872,8 +872,16 @@ impl BrokerStateRegistry {
         port: u16,
         family: AddressFamily,
     ) -> Option<Arc<InetListenerState>> {
-        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
-        let handle = *s.broker_held_inet_listeners.get(&(port, family))?;
+        let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        let key = (port, family);
+        let handles = s.broker_held_inet_listeners.get(&key)?;
+        if handles.is_empty() {
+            return None;
+        }
+        let index = *s.broker_held_inet_listener_cursor.get(&key).unwrap_or(&0) % handles.len();
+        let handle = handles[index];
+        let next = (index + 1) % handles.len();
+        s.broker_held_inet_listener_cursor.insert(key, next);
         let entry = s.table.get(&handle)?;
         Some(Self::inet_listener_from_entry_or_panic(
             entry, handle, port, family,
@@ -884,9 +892,18 @@ impl BrokerStateRegistry {
         &self,
         port: u16,
     ) -> Option<Arc<InetListenerState>> {
-        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
         for family in [AddressFamily::V4, AddressFamily::V6] {
-            if let Some(handle) = s.broker_held_inet_listeners.get(&(port, family)).copied() {
+            let key = (port, family);
+            if let Some(handles) = s.broker_held_inet_listeners.get(&key) {
+                if handles.is_empty() {
+                    continue;
+                }
+                let index =
+                    *s.broker_held_inet_listener_cursor.get(&key).unwrap_or(&0) % handles.len();
+                let handle = handles[index];
+                let next = (index + 1) % handles.len();
+                s.broker_held_inet_listener_cursor.insert(key, next);
                 let entry = s.table.get(&handle)?;
                 return Some(Self::inet_listener_from_entry_or_panic(
                     entry, handle, port, family,
@@ -1018,8 +1035,14 @@ impl BrokerStateRegistry {
         let tag = entry.state.subsystem_tag();
         if new_rc == 0 {
             s.table.remove(&handle.0);
-            s.broker_held_inet_listeners
-                .retain(|_, registered| *registered != handle.0);
+            s.broker_held_inet_listeners.retain(|_, registered| {
+                registered.retain(|registered_handle| *registered_handle != handle.0);
+                !registered.is_empty()
+            });
+            let active_listener_keys: Vec<_> =
+                s.broker_held_inet_listeners.keys().copied().collect();
+            s.broker_held_inet_listener_cursor
+                .retain(|key, _| active_listener_keys.contains(key));
         }
         drop(s);
         // PE.10 diag: log every release with the new rc. Opt-in via
@@ -1288,6 +1311,40 @@ mod tests {
             reg.resolve_broker_held_inet_listener_for_inbound(22)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn inet_listener_registry_round_robins_same_port_group() {
+        let reg = BrokerStateRegistry::new();
+        let first = InetListenerState::new(AddressFamily::V4);
+        let second = InetListenerState::new(AddressFamily::V4);
+        let h1 = reg.register(Arc::clone(&first));
+        let h2 = reg.register(Arc::clone(&second));
+
+        reg.register_broker_held_inet_listener(8080, AddressFamily::V4, h1)
+            .unwrap();
+        reg.register_broker_held_inet_listener(8080, AddressFamily::V4, h2)
+            .unwrap();
+
+        let resolved = [
+            reg.resolve_broker_held_inet_listener(8080, AddressFamily::V4)
+                .unwrap(),
+            reg.resolve_broker_held_inet_listener(8080, AddressFamily::V4)
+                .unwrap(),
+            reg.resolve_broker_held_inet_listener(8080, AddressFamily::V4)
+                .unwrap(),
+        ];
+        assert!(Arc::ptr_eq(&resolved[0], &first));
+        assert!(Arc::ptr_eq(&resolved[1], &second));
+        assert!(Arc::ptr_eq(&resolved[2], &first));
+
+        reg.release(h1).unwrap();
+        let remaining = reg
+            .resolve_broker_held_inet_listener(8080, AddressFamily::V4)
+            .unwrap();
+        assert!(Arc::ptr_eq(&remaining, &second));
+
+        reg.release(h2).unwrap();
     }
 
     #[test]

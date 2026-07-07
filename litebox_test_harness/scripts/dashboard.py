@@ -79,6 +79,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import os
 import signal
 import sqlite3
@@ -120,7 +121,9 @@ def resolve_state_dir(arg: Optional[str]) -> Path:
 
 
 def open_db(state_dir: Path, *, bootstrap: bool = False,
-            with_state_views: bool = True) -> sqlite3.Connection:
+            with_state_views: bool = True,
+            with_classification_schema: bool = True,
+            read_only: bool = False) -> sqlite3.Connection:
     """Open the dashboard sqlite store.
 
     `bootstrap=True` initializes an empty store + schema if the file
@@ -135,6 +138,9 @@ def open_db(state_dir: Path, *, bootstrap: bool = False,
     cache tables / raw `run_results` (e.g. `regressions`, the
     supervisor's per-cycle ref read + classification refresh) pass it
     to avoid a multi-second cost they'd never use.
+
+    `with_classification_schema=False` and `read_only=True` are for
+    read-only reporting commands that query raw result tables directly.
     """
     db_path = state_dir / "results.sqlite"
     if not db_path.exists():
@@ -146,8 +152,13 @@ def open_db(state_dir: Path, *, bootstrap: bool = False,
                 "  or `dashboard.py track …` (auto-creates the store)."
             )
         state_dir.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
-    conn.execute("PRAGMA journal_mode = WAL")
+    if read_only:
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro", isolation_level=None, uri=True,
+        )
+    else:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.row_factory = sqlite3.Row
     if bootstrap:
@@ -155,7 +166,8 @@ def open_db(state_dir: Path, *, bootstrap: bool = False,
     check_schema(conn)
     if with_state_views:
         _ensure_views(conn)
-    _ensure_classification_schema(conn)
+    if with_classification_schema:
+        _ensure_classification_schema(conn)
     return conn
 
 
@@ -2396,6 +2408,221 @@ def write_summary(conn: sqlite3.Connection, state_dir: Path) -> Path:
 # ─── Subcommands ─────────────────────────────────────────────────────
 
 
+def _flaky_rows(
+    conn: sqlite3.Connection,
+    *,
+    mode: str = "litebox",
+    pattern: Optional[str] = None,
+    suite: Optional[str] = None,
+    group: Optional[str] = None,
+    min_rate: float = 0.0,
+    limit: int = 40,
+) -> list[sqlite3.Row]:
+    """Return recent flake-leaderboard rows.
+
+    All rates, cross-mode comparisons, load-sensitivity flags, filters,
+    and ranking are computed in one SQL query; Python only supplies
+    parameters and formats the result.
+    """
+    mode_filter = ""
+    params: dict[str, object] = {
+        "window_ms": _RECENT_FLAKE_WINDOW_MS,
+        "soft_flake_rate": _SOFT_FLAKE_RATE,
+        "substrate_native_rate": 0.02,
+        "min_rate": min_rate,
+        "limit": limit,
+    }
+    if mode != "both":
+        mode_filter = "AND m.mode = :mode"
+        params["mode"] = mode
+    filter_sql = ""
+    if pattern is not None:
+        filter_sql += " AND rr.test_id LIKE :pattern"
+        params["pattern"] = f"%{pattern}%"
+    if suite is not None:
+        filter_sql += " AND rr.suite = :suite"
+        params["suite"] = suite
+    if group is not None:
+        filter_sql += ' AND rr."group" = :group'
+        params["group"] = group
+    query = f"""
+    WITH recent AS (
+        SELECT
+            rr.test_id,
+            rr.mode,
+            rr.suite,
+            rr."group" AS group_name,
+            rr.verdict,
+            CASE WHEN r.worktree_path LIKE '%/shadows/%'
+                 THEN 1 ELSE 0 END AS is_shadow
+          FROM run_results rr
+          JOIN runs r ON r.run_id = rr.run_id
+         WHERE r.dirty_hash IS NULL
+           AND rr.verdict IN ('pass','fail')
+           AND rr.finished_ts_ms >
+               (CAST(strftime('%s','now') AS INTEGER) * 1000 - :window_ms)
+           {filter_sql}
+    ),
+    mode_stats AS (
+        SELECT
+            test_id,
+            mode,
+            MAX(suite) AS suite,
+            MAX(group_name) AS group_name,
+            SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
+            SUM(CASE WHEN verdict = 'fail' THEN 1 ELSE 0 END) AS n_fail,
+            SUM(CASE WHEN is_shadow = 1 AND verdict = 'pass'
+                     THEN 1 ELSE 0 END) AS shadow_pass,
+            SUM(CASE WHEN is_shadow = 1 AND verdict = 'fail'
+                     THEN 1 ELSE 0 END) AS shadow_fail,
+            SUM(CASE WHEN is_shadow = 0 AND verdict = 'pass'
+                     THEN 1 ELSE 0 END) AS dedicated_pass,
+            SUM(CASE WHEN is_shadow = 0 AND verdict = 'fail'
+                     THEN 1 ELSE 0 END) AS dedicated_fail,
+            SUM(CASE WHEN verdict = 'fail' THEN 1.0 ELSE 0.0 END)
+                / COUNT(*) AS fail_rate,
+            SUM(CASE WHEN is_shadow = 1 AND verdict = 'fail'
+                     THEN 1.0 ELSE 0.0 END)
+                / NULLIF(SUM(CASE WHEN is_shadow = 1 THEN 1 ELSE 0 END), 0)
+                AS shadow_rate,
+            SUM(CASE WHEN is_shadow = 0 AND verdict = 'fail'
+                     THEN 1.0 ELSE 0.0 END)
+                / NULLIF(SUM(CASE WHEN is_shadow = 0 THEN 1 ELSE 0 END), 0)
+                AS dedicated_rate
+          FROM recent
+         GROUP BY test_id, mode
+    ),
+    paired AS (
+        SELECT
+            m.*,
+            l.fail_rate AS litebox_fail_rate,
+            n.fail_rate AS native_fail_rate,
+            CASE WHEN m.shadow_fail + m.shadow_pass > 0
+                   AND m.dedicated_fail + m.dedicated_pass > 0
+                   AND COALESCE(m.shadow_rate, 0.0) >= :soft_flake_rate
+                   AND COALESCE(m.shadow_rate, 0.0)
+                       >= 2.0 * COALESCE(m.dedicated_rate, 0.0)
+                 THEN 1 ELSE 0 END AS load_sensitive,
+            CASE WHEN m.mode = 'litebox'
+                   AND COALESCE(n.n_pass, 0) + COALESCE(n.n_fail, 0) > 0
+                   AND COALESCE(n.fail_rate, 0.0) < :substrate_native_rate
+                   AND COALESCE(l.fail_rate, 0.0) >= :soft_flake_rate
+                 THEN 1 ELSE 0 END AS substrate_bug
+          FROM mode_stats m
+          LEFT JOIN mode_stats l
+                 ON l.test_id = m.test_id AND l.mode = 'litebox'
+          LEFT JOIN mode_stats n
+                 ON n.test_id = m.test_id AND n.mode = 'native'
+    )
+    SELECT
+        test_id, mode, suite, group_name,
+        n_pass, n_fail, fail_rate,
+        shadow_pass, shadow_fail, shadow_rate,
+        dedicated_pass, dedicated_fail, dedicated_rate,
+        load_sensitive, substrate_bug,
+        litebox_fail_rate, native_fail_rate
+      FROM paired m
+     WHERE m.fail_rate >= :min_rate
+       {mode_filter}
+     ORDER BY COALESCE(m.litebox_fail_rate, m.fail_rate) DESC,
+              CASE m.mode WHEN 'litebox' THEN 0 ELSE 1 END,
+              m.fail_rate DESC,
+              m.test_id
+     LIMIT :limit
+    """
+    return conn.execute(query, params).fetchall()
+
+
+def _format_rate(v: Optional[float]) -> str:
+    return "n/a" if v is None else f"{v:.1%}"
+
+
+def cmd_flaky(args: argparse.Namespace) -> int:
+    """Rank recent flaky tests, with load-sensitivity and substrate-bug
+    signals computed directly from the dashboard store."""
+    state_dir = resolve_state_dir(args.state_dir)
+    conn = open_db(
+        state_dir,
+        with_state_views=False,
+        with_classification_schema=False,
+        read_only=True,
+    )
+    try:
+        rows = _flaky_rows(
+            conn,
+            mode=args.mode,
+            pattern=args.pattern,
+            suite=args.suite,
+            group=args.group,
+            min_rate=args.min_rate,
+            limit=args.limit,
+        )
+        if args.format == "sql":
+            for r in rows:
+                shadow_rate = (
+                    "" if r["shadow_rate"] is None
+                    else f"{r['shadow_rate']:.6f}"
+                )
+                dedicated_rate = (
+                    "" if r["dedicated_rate"] is None
+                    else f"{r['dedicated_rate']:.6f}"
+                )
+                print(
+                    f"{r['mode']}\t{r['test_id']}\t{r['n_pass']}\t{r['n_fail']}"
+                    f"\t{r['fail_rate']:.6f}\t"
+                    f"{1 if r['load_sensitive'] else 0}\t"
+                    f"{1 if r['substrate_bug'] else 0}\t"
+                    f"{r['suite'] or ''}\t{r['group_name'] or ''}\t"
+                    f"{shadow_rate}\t{dedicated_rate}"
+                )
+            return 0
+        cols = [
+            ("test_id", "test_id"),
+            ("mode", "mode"),
+            ("pass/fail", "pf"),
+            ("rate", "rate"),
+            ("load-sens", "load"),
+            ("substrate?", "sub"),
+            ("shadow", "shadow"),
+            ("dedicated", "ded"),
+            ("suite/group", "sg"),
+        ]
+        data = []
+        for r in rows:
+            data.append({
+                "test_id": r["test_id"],
+                "mode": r["mode"],
+                "pf": f"{r['n_pass']}/{r['n_fail']}",
+                "rate": _format_rate(r["fail_rate"]),
+                "load": "load-sensitive" if r["load_sensitive"] else "",
+                "sub": "substrate-bug?" if r["substrate_bug"] else "",
+                "shadow": (
+                    f"{r['shadow_pass']}/{r['shadow_fail']} "
+                    f"{_format_rate(r['shadow_rate'])}"
+                ),
+                "ded": (
+                    f"{r['dedicated_pass']}/{r['dedicated_fail']} "
+                    f"{_format_rate(r['dedicated_rate'])}"
+                ),
+                "sg": f"{r['suite'] or ''}/{r['group_name'] or ''}",
+            })
+        if not data:
+            print("no flaky rows matched")
+            return 0
+        widths = {
+            key: max(len(label), *(len(str(row[key])) for row in data))
+            for label, key in cols
+        }
+        print(" | ".join(label.ljust(widths[key]) for label, key in cols))
+        print("-+-".join("-" * widths[key] for _, key in cols))
+        for row in data:
+            print(" | ".join(str(row[key]).ljust(widths[key])
+                             for _, key in cols))
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_regressions(args: argparse.Namespace) -> int:
     """Standardized regression classification for a branch, read from
     the `regression_class` view. Buckets each (test, mode) as
@@ -2537,6 +2764,149 @@ def cmd_regressions(args: argparse.Namespace) -> int:
     return 0
 
 
+def _git_out(cwd: Path, *args: str) -> Optional[str]:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(cwd), *args],
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def cmd_stress(args: argparse.Namespace) -> int:
+    """Repeatedly run a *targeted* test (or family) at a worktree's HEAD
+    and publish every result to the store, so `dashboard.py validate`
+    has real samples to judge a flake fix against — instead of waiting
+    for the auto supervisor's broad round-robin, or reading a single
+    lucky pass as confirmation.
+
+    Runs in dedicated worktrees under `<state-dir>/stress/` (never the
+    supervisor's shadow — no `target/` race). `--parallel K` (or
+    `--under-load`) runs K copies concurrently, which reproduces the
+    parallel-build / broker-contention load that many litebox flakes
+    only fail under (they pass in isolation)."""
+    state_dir = resolve_state_dir(args.state_dir)
+    target = Path(args.worktree).resolve() if args.worktree else Path.cwd()
+    top = _git_out(target, "rev-parse", "--show-toplevel")
+    if top is None:
+        print(f"stress: {target} is not inside a git worktree", file=sys.stderr)
+        return 2
+    target = Path(top)
+    head = _git_out(target, "rev-parse", "HEAD")
+    branch = _git_out(target, "symbolic-ref", "--quiet", "--short", "HEAD") \
+        or f"detached-{(head or '')[:8]}"
+    if head is None:
+        print("stress: could not resolve HEAD", file=sys.stderr)
+        return 2
+
+    patterns = list(args.pattern)
+    parallel = args.parallel if args.parallel else (4 if args.under_load else 1)
+    parallel = max(1, parallel)
+    dist = _stress_distribute(args.iters, parallel)
+    dist = [n for n in dist if n > 0] or [1]
+    parallel = len(dist)
+    argv = _stress_cargo_argv(patterns)
+    root = _stress_worktrees_root(state_dir) / branch
+
+    print(f"# stress: {'/'.join(patterns)} @ {short_sha(head)} "
+          f"(branch {branch})")
+    print(f"#   {sum(dist)} run(s) across {parallel} worker(s) "
+          f"[{'+'.join(map(str, dist))}]"
+          f"{'  UNDER LOAD (concurrent)' if parallel > 1 else ''}")
+    print(f"#   cargo: {' '.join(argv)}")
+    if args.jobs:
+        print(f"#   LITEBOX_TEST_JOBS={args.jobs}")
+    if args.dry_run:
+        print("# (dry-run — not spawning cargo)")
+        for i, n in enumerate(dist):
+            print(f"#   worker {i}: {n} iters in {root / str(i)}")
+        return 0
+
+    env = os.environ.copy()
+    env["LITEBOX_DASHBOARD_DIR"] = str(state_dir)
+    env["LITEBOX_DASHBOARD_REF"] = branch
+    if args.jobs:
+        env["LITEBOX_TEST_JOBS"] = str(args.jobs)
+
+    start_ms = now_ms()
+    stop = threading.Event()
+    worktrees: list[Path] = []
+    counts = {"done": 0, "iters": sum(dist)}
+    counts_lock = threading.Lock()
+
+    def _worker(idx: int, n_iters: int) -> None:
+        wt = root / str(idx)
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        if wt.exists():
+            subprocess.run(["git", "-C", str(target), "worktree", "remove",
+                            "--force", str(wt)], check=False,
+                           capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["git", "-C", str(target), "worktree", "add",
+                            "--detach", str(wt), head], check=False,
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print(f"stress: worker {idx} worktree setup failed: "
+                  f"{r.stderr.strip()}", file=sys.stderr)
+            return
+        worktrees.append(wt)
+        for _ in range(n_iters):
+            if stop.is_set():
+                break
+            subprocess.run(argv, cwd=str(wt), env=env,
+                           start_new_session=True, check=False)
+            with counts_lock:
+                counts["done"] += 1
+                print(f"[stress] {counts['done']}/{counts['iters']} runs done",
+                      file=sys.stderr)
+
+    threads = [threading.Thread(target=_worker, args=(i, n), daemon=True)
+               for i, n in enumerate(dist)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            while t.is_alive():
+                t.join(timeout=1.0)
+    except KeyboardInterrupt:
+        print("\n[stress] interrupted — stopping after in-flight runs",
+              file=sys.stderr)
+        stop.set()
+        for t in threads:
+            t.join(timeout=30)
+    finally:
+        if not args.keep:
+            for wt in worktrees:
+                subprocess.run(["git", "-C", str(target), "worktree", "remove",
+                                "--force", str(wt)], check=False,
+                               capture_output=True, text=True, timeout=60)
+
+    conn = open_db(state_dir, with_state_views=False)
+    try:
+        rows = _stress_target_summary(conn, head, patterns,
+                                      args.mode, start_ms)
+    finally:
+        conn.close()
+    print(f"\n# results at {short_sha(head)} (this run):")
+    if not rows:
+        print("#   (no results recorded — did the filter match any test? "
+              "check the pattern / that the build succeeded)")
+    tot_f = 0
+    for r in rows:
+        tot = r["n_pass"] + r["n_fail"] + r["n_other"]
+        rate = r["n_fail"] / (r["n_pass"] + r["n_fail"]) if (
+            r["n_pass"] + r["n_fail"]) else 0.0
+        tot_f += r["n_fail"]
+        flag = "  <-- STILL FAILING" if r["n_fail"] else ""
+        print(f"  {r['test_id']:52s} {r['mode']:7s} "
+              f"pass={r['n_pass']} fail={r['n_fail']} "
+              f"no_result={r['n_other']}  rate={rate:.0%}{flag}")
+    print(f"\n# next: dashboard.py validate '{patterns[0]}' "
+          f"--sha {short_sha(head)}"
+          f"{'' if args.mode is None else ' --mode ' + args.mode}"
+          f"   (to judge with statistical confidence)")
+    return 1 if tot_f else 0
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     """Lossless in-place schema migration (v3 → v4). Opens the store
     raw (bypassing the strict version check, which would reject a v3
@@ -2606,6 +2976,278 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"{row['n_fail'] or 0:4d} fail  ({row['n_total'] or 0} total)"
         )
     return 0
+
+
+def _runs_needed(p: float, confidence: float) -> int:
+    """Clean consecutive passes needed to rule out flake rate ``p``."""
+    if not (0.0 < p < 1.0):
+        raise ValueError("flake rate must be between 0 and 1")
+    if not (0.0 < confidence < 1.0):
+        raise ValueError("confidence must be between 0 and 1")
+    return math.ceil(math.log(1.0 - confidence) / math.log(1.0 - p))
+
+
+def _resolve_validate_sha(args: argparse.Namespace, state_dir: Path) -> Optional[str]:
+    if args.sha:
+        return args.sha.strip()
+    if args.branch:
+        canonical = _canonical_worktree(args, state_dir)
+        for rev in (args.branch, f"refs/heads/{args.branch}",
+                    f"origin/{args.branch}"):
+            try:
+                out = subprocess.run(
+                    ["git", "-C", str(canonical), "rev-parse", "--verify",
+                     f"{rev}^{{commit}}"],
+                    check=True, capture_output=True, text=True, timeout=15,
+                )
+                return out.stdout.strip()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    FileNotFoundError):
+                pass
+        for wt in _list_worktrees(canonical):
+            if wt.get("branch") == args.branch and wt.get("head"):
+                return wt["head"]
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        return out.stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError):
+        return None
+
+
+def _validate_counts(conn: sqlite3.Connection, *, pattern: str, mode: str,
+                     sha: str, baseline_sha: Optional[str]) -> list[sqlite3.Row]:
+    like_pattern = f"%{pattern}%"
+    return conn.execute(
+        """
+        WITH universe AS (
+            SELECT DISTINCT rr.test_id
+              FROM run_results rr
+             WHERE rr.test_id LIKE ?
+        ),
+        target AS (
+            SELECT rr.test_id,
+                   SUM(CASE WHEN rr.verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
+                   SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END) AS n_fail,
+                   SUM(CASE WHEN rr.verdict = 'no_result' THEN 1 ELSE 0 END) AS n_no_result
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.dirty_hash IS NULL
+               AND r.commit_sha LIKE ?
+               AND rr.mode = ?
+               AND rr.test_id LIKE ?
+             GROUP BY rr.test_id
+        ),
+        baseline AS (
+            SELECT rr.test_id,
+                   SUM(CASE WHEN rr.verdict = 'pass' THEN 1 ELSE 0 END) AS baseline_pass,
+                   SUM(CASE WHEN rr.verdict = 'fail' THEN 1 ELSE 0 END) AS baseline_fail
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE ? IS NOT NULL
+               AND r.dirty_hash IS NULL
+               AND r.commit_sha LIKE ?
+               AND rr.mode = ?
+               AND rr.test_id LIKE ?
+             GROUP BY rr.test_id
+        ),
+        per_test AS (
+            SELECT 'test' AS row_kind,
+                   u.test_id,
+                   COALESCE(t.n_pass, 0) AS n_pass,
+                   COALESCE(t.n_fail, 0) AS n_fail,
+                   COALESCE(t.n_no_result, 0) AS n_no_result,
+                   COALESCE(b.baseline_pass, 0) AS baseline_pass,
+                   COALESCE(b.baseline_fail, 0) AS baseline_fail,
+                   COALESCE(f.n_pass, 0) AS hist_pass,
+                   COALESCE(f.n_fail, 0) AS hist_fail
+              FROM universe u
+              LEFT JOIN target t ON t.test_id = u.test_id
+              LEFT JOIN baseline b ON b.test_id = u.test_id
+              LEFT JOIN test_flake_stats f
+                     ON f.mode = ? AND f.test_id = u.test_id
+        )
+        SELECT * FROM per_test
+        UNION ALL
+        SELECT 'family' AS row_kind,
+               ? AS test_id,
+               COALESCE(SUM(n_pass), 0) AS n_pass,
+               COALESCE(SUM(n_fail), 0) AS n_fail,
+               COALESCE(SUM(n_no_result), 0) AS n_no_result,
+               COALESCE(SUM(baseline_pass), 0) AS baseline_pass,
+               COALESCE(SUM(baseline_fail), 0) AS baseline_fail,
+               COALESCE(SUM(hist_pass), 0) AS hist_pass,
+               COALESCE(SUM(hist_fail), 0) AS hist_fail
+          FROM per_test
+         ORDER BY row_kind DESC, test_id
+        """,
+        (like_pattern, f"{sha}%", mode, like_pattern,
+         baseline_sha, f"{baseline_sha or ''}%", mode, like_pattern,
+         mode, pattern),
+    ).fetchall()
+
+
+def _assumed_flake_rate(row: sqlite3.Row,
+                        explicit: Optional[float]) -> tuple[float, str]:
+    if explicit is not None:
+        return explicit, "assumed"
+    baseline_total = row["baseline_pass"] + row["baseline_fail"]
+    if baseline_total > 0 and row["baseline_fail"] > 0:
+        return row["baseline_fail"] / baseline_total, "baseline"
+    hist_total = row["hist_pass"] + row["hist_fail"]
+    if hist_total > 0 and row["hist_fail"] > 0:
+        return row["hist_fail"] / hist_total, "history"
+    return 0.05, "default"
+
+
+def _validate_verdict(row: sqlite3.Row, confidence: float,
+                      explicit_p: Optional[float]) -> dict:
+    definitive = row["n_pass"] + row["n_fail"]
+    clean = definitive + row["n_no_result"]
+    if clean == 0:
+        return {"verdict": "NOT_RUN", "p": None, "needed": None, "more": None}
+    if row["n_fail"] > 0:
+        return {"verdict": "STILL FAILING", "p": None,
+                "needed": None, "more": None}
+    p, source = _assumed_flake_rate(row, explicit_p)
+    needed = _runs_needed(p, confidence)
+    if row["n_pass"] >= needed:
+        verdict = "VALIDATED"
+        more = 0
+    else:
+        verdict = "INSUFFICIENT"
+        more = needed - row["n_pass"]
+    return {"verdict": verdict, "p": p, "p_source": source,
+            "needed": needed, "more": more}
+
+
+def _format_pct(p: float) -> str:
+    return f"{p * 100:.1f}%"
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    state_dir = resolve_state_dir(args.state_dir)
+    sha = _resolve_validate_sha(args, state_dir)
+    if sha is None:
+        print("validate: could not resolve target sha", file=sys.stderr)
+        return 2
+    explicit_p = args.assume_flake_rate
+    if explicit_p is not None and not (0.0 < explicit_p < 1.0):
+        print("validate: --assume-flake-rate must be between 0 and 1",
+              file=sys.stderr)
+        return 2
+    if not (0.0 < args.confidence < 1.0):
+        print("validate: --confidence must be between 0 and 1",
+              file=sys.stderr)
+        return 2
+    conn = open_db(state_dir, with_state_views=False)
+    try:
+        rows = _validate_counts(
+            conn, pattern=args.test_pattern, mode=args.mode, sha=sha,
+            baseline_sha=args.vs_baseline,
+        )
+    finally:
+        conn.close()
+
+    if args.format == "sql":
+        status = 0
+        for row in rows:
+            info = _validate_verdict(row, args.confidence, explicit_p)
+            if info["verdict"] in ("NOT_RUN", "STILL FAILING", "INSUFFICIENT"):
+                status = 1
+            print(
+                f"{row['row_kind']}\t{row['test_id']}\t{args.mode}\t{sha}\t"
+                f"{info['verdict']}\t{row['n_pass']}\t{row['n_fail']}\t"
+                f"{row['n_no_result']}\t{info.get('needed') or ''}\t"
+                f"{info.get('p') or ''}\t{args.confidence}\t"
+                f"{row['baseline_pass']}\t{row['baseline_fail']}\t"
+                f"{info.get('more') if info.get('more') is not None else ''}"
+            )
+        return status
+
+    print(f"# Validate — {args.test_pattern} @ {short_sha(sha)} ({args.mode})")
+    status = 0
+    test_rows = [r for r in rows if r["row_kind"] == "test"]
+    family_row = next((r for r in rows if r["row_kind"] == "family"), None)
+    verdict_counts: dict[str, int] = {}
+    for row in test_rows:
+        label = row["test_id"]
+        info = _validate_verdict(row, args.confidence, explicit_p)
+        verdict_counts[info["verdict"]] = verdict_counts.get(info["verdict"], 0) + 1
+        definitive = row["n_pass"] + row["n_fail"]
+        clean = definitive + row["n_no_result"]
+        if info["verdict"] == "NOT_RUN":
+            status = 1
+            print(
+                f"{label}: NOT VALIDATED — NOT_RUN: 0 runs at {short_sha(sha)} "
+                f"({args.mode}). The dashboard cannot confirm this fix; "
+                "you need to run it (`dashboard.py stress ...` or a targeted "
+                "cargo test)."
+            )
+            continue
+        if info["verdict"] == "STILL FAILING":
+            status = 1
+            extra = (f", {row['n_no_result']} no_result"
+                     if row["n_no_result"] else "")
+            print(f"{label}: STILL FAILING ({row['n_fail']} fails / "
+                  f"{clean} clean runs{extra})")
+            continue
+        p = info["p"]
+        needed = info["needed"]
+        baseline = ""
+        baseline_total = row["baseline_pass"] + row["baseline_fail"]
+        if args.vs_baseline and baseline_total > 0:
+            baseline_p = row["baseline_fail"] / baseline_total
+            baseline = (f"; baseline was {_format_pct(baseline_p)} "
+                        f"({row['baseline_fail']}/{baseline_total})")
+        if info["verdict"] == "VALIDATED":
+            print(
+                f"{label}: VALIDATED (rules out a >={_format_pct(p)} flake "
+                f"at {args.confidence:.2f} confidence: {row['n_pass']} clean, "
+                f"0 fail{baseline})"
+            )
+        else:
+            status = 1
+            print(
+                f"{label}: INSUFFICIENT: {row['n_pass']} clean of {needed} "
+                f"needed for {args.confidence:.2f} confidence at assumed "
+                f"rate {_format_pct(p)} → need {info['more']} more{baseline}."
+            )
+
+    if family_row is None or not test_rows:
+        status = 1
+        print(
+            f"family summary: NOT VALIDATED — NOT_RUN: 0 matching tests for "
+            f"{args.test_pattern!r} in the dashboard store."
+        )
+        return status
+
+    total_tests = len(test_rows)
+    agg = (f"aggregate {family_row['n_pass']} pass / "
+           f"{family_row['n_fail']} fail / "
+           f"{family_row['n_no_result']} no_result")
+    if verdict_counts.get("NOT_RUN", 0):
+        status = 1
+        print(f"family summary: NOT VALIDATED — "
+              f"{verdict_counts['NOT_RUN']}/{total_tests} tests NOT_RUN; {agg}.")
+    elif verdict_counts.get("STILL FAILING", 0):
+        status = 1
+        print(f"family summary: STILL FAILING — "
+              f"{verdict_counts['STILL FAILING']}/{total_tests} tests failing; "
+              f"{agg}.")
+    elif verdict_counts.get("INSUFFICIENT", 0):
+        status = 1
+        print(f"family summary: INSUFFICIENT — "
+              f"{verdict_counts['INSUFFICIENT']}/{total_tests} tests need more "
+              f"clean passes; {agg}.")
+    else:
+        print(f"family summary: VALIDATED — all {total_tests} tests validated; "
+              f"{agg}.")
+    return status
 
 
 def cmd_track(args: argparse.Namespace) -> int:
@@ -3125,6 +3767,63 @@ def _branch_from_shadow_path(state_dir: Path, shadow: Path) -> Optional[str]:
     if not parts:
         return None
     return "/".join(parts)
+
+
+def _stress_worktrees_root(state_dir: Path) -> Path:
+    """Root for `stress`'s dedicated worktrees. Deliberately separate
+    from `shadows/` so a `stress` run never races the auto supervisor's
+    per-branch shadow on `target/` / `docker build` for the same branch."""
+    return state_dir / "stress"
+
+
+def _stress_distribute(iters: int, workers: int) -> list[int]:
+    """Split `iters` runs across `workers` as evenly as possible.
+    `_stress_distribute(20, 3) == [7, 7, 6]`. Pure — unit-tested."""
+    workers = max(1, workers)
+    iters = max(0, iters)
+    base, extra = divmod(iters, workers)
+    return [base + (1 if i < extra else 0) for i in range(workers)]
+
+
+def _stress_cargo_argv(patterns: list[str]) -> list[str]:
+    """The cargo argv for one stress iteration: run the harness filtered
+    to `patterns` (OR-matched substrings, once each). A plain positional
+    filter — NOT `--fill` — so each invocation re-runs the matching
+    tests regardless of prior coverage at HEAD (that's what gives us
+    repeated samples). Pure — unit-tested."""
+    return ["cargo", "test", "-p", "litebox_test_harness",
+            "--test", "integration", "--", *patterns]
+
+
+def _stress_target_summary(conn: sqlite3.Connection, commit_sha: str,
+                           patterns: list[str], mode: Optional[str],
+                           since_ts_ms: int) -> list[sqlite3.Row]:
+    """SQL summary of the stressed tests at `commit_sha` since the run
+    started: per (test_id, mode) pass/fail/no_result counts over clean
+    rows. SQL-first — the aggregation is one grouped query."""
+    like = " OR ".join(["rr.test_id LIKE ?"] * len(patterns)) or "1=0"
+    params: list = [commit_sha, since_ts_ms]
+    params += [f"%{p}%" for p in patterns]
+    mode_clause = ""
+    if mode:
+        mode_clause = " AND rr.mode = ? "
+        params.append(mode)
+    return conn.execute(
+        f"""
+        SELECT rr.test_id, rr.mode,
+               SUM(CASE WHEN rr.verdict='pass' THEN 1 ELSE 0 END) AS n_pass,
+               SUM(CASE WHEN rr.verdict='fail' THEN 1 ELSE 0 END) AS n_fail,
+               SUM(CASE WHEN rr.verdict NOT IN ('pass','fail')
+                        THEN 1 ELSE 0 END)                        AS n_other
+          FROM run_results rr JOIN runs r ON r.run_id = rr.run_id
+         WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+           AND rr.finished_ts_ms >= ?
+           AND ({like}) {mode_clause}
+         GROUP BY rr.test_id, rr.mode
+         ORDER BY n_fail DESC, rr.test_id, rr.mode
+        """,
+        params,
+    ).fetchall()
 
 
 def _gc_shadow_worktrees(canonical: Path, state_dir: Path,
@@ -3971,6 +4670,85 @@ def build_parser() -> argparse.ArgumentParser:
                         help="canonical clone root for git queries "
                              "(default: state-dir's parent)")
     p_regr.set_defaults(func=cmd_regressions)
+
+    p_flaky = sub.add_parser(
+        "flaky",
+        help="rank recent flaky tests and flag load-sensitive/substrate flakes",
+    )
+    p_flaky.add_argument("--mode", choices=("litebox", "native", "both"),
+                         default="litebox")
+    p_flaky.add_argument("--pattern", help="SQL LIKE substring for test_id")
+    p_flaky.add_argument("--suite", help="filter by run_results.suite")
+    p_flaky.add_argument("--group", help="filter by run_results.group")
+    p_flaky.add_argument("--min-rate", type=float, default=0.0,
+                         help="minimum fail rate to show (default 0.0)")
+    p_flaky.add_argument("--limit", type=int, default=40,
+                         help="max rows to show (default 40)")
+    p_flaky.add_argument("--format", choices=("table", "sql"), default="table")
+    p_flaky.add_argument("--canonical-worktree", default=None,
+                         help=argparse.SUPPRESS)
+    p_flaky.set_defaults(func=cmd_flaky)
+
+    p_val = sub.add_parser(
+        "validate",
+        help="check whether clean dashboard runs validate a flaky/failing "
+             "test fix with statistical confidence",
+    )
+    p_val.add_argument("test_pattern",
+                       help="SQL LIKE substring matched against test_id")
+    p_val.add_argument("--sha", default=None,
+                       help="target commit sha or prefix (default: HEAD)")
+    p_val.add_argument("--branch", default=None,
+                       help="resolve this branch/worktree HEAD as target sha")
+    p_val.add_argument("--mode", choices=("native", "litebox"),
+                       default="litebox")
+    p_val.add_argument("--confidence", type=float, default=0.95)
+    p_val.add_argument("--assume-flake-rate", type=float, default=None,
+                       help="assumed true fail probability to rule out")
+    p_val.add_argument("--vs-baseline", default=None,
+                       help="baseline commit sha/prefix for contrast and "
+                            "flake-rate inference")
+    p_val.add_argument("--format", choices=("text", "sql"), default="text")
+    p_val.add_argument("--state-dir", default=argparse.SUPPRESS,
+                       help="override dashboard state directory")
+    p_val.add_argument("--canonical-worktree", default=None,
+                       help="canonical clone root for git queries "
+                            "(default: state-dir's parent)")
+    p_val.set_defaults(func=cmd_validate)
+
+    p_stress = sub.add_parser(
+        "stress",
+        help="repeatedly run a targeted test (family) at a worktree's "
+             "HEAD and publish every result — generates the samples "
+             "`validate` needs to judge a flake fix.",
+    )
+    p_stress.add_argument("pattern", nargs="+",
+                          help="test_id substring(s), OR-matched "
+                               "(e.g. RL.subscriber_exits_first)")
+    p_stress.add_argument("--iters", type=int, default=20,
+                          help="total runs to perform (default 20)")
+    p_stress.add_argument("--parallel", type=int, default=0,
+                          help="concurrent workers (default 1, or 4 with "
+                               "--under-load); >1 reproduces load-sensitive "
+                               "flakes via concurrent build/docker load")
+    p_stress.add_argument("--under-load", action="store_true",
+                          help="shorthand for --parallel 4: run concurrently "
+                               "so load-sensitive flakes (pass in isolation) "
+                               "reproduce")
+    p_stress.add_argument("--worktree", default=None,
+                          help="worktree whose HEAD to stress "
+                               "(default: current directory)")
+    p_stress.add_argument("--mode", choices=("native", "litebox"),
+                          default=None, help="restrict the summary to a mode")
+    p_stress.add_argument("--jobs", type=int, default=None,
+                          help="LITEBOX_TEST_JOBS for each worker")
+    p_stress.add_argument("--keep", action="store_true",
+                          help="keep the dedicated stress worktrees "
+                               "(default: remove them after)")
+    p_stress.add_argument("--dry-run", action="store_true",
+                          help="print the plan (worktrees, cargo argv) "
+                               "without spawning cargo")
+    p_stress.set_defaults(func=cmd_stress)
 
     p_track = sub.add_parser(
         "track",
