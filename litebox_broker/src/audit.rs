@@ -45,9 +45,21 @@ impl AuditLog {
     }
 
     /// Write a raw JSONL line.
+    ///
+    /// The line and its trailing newline are coalesced into a single
+    /// `write_all` so the whole record hits the file in one `write(2)`. The
+    /// audit file is opened `O_APPEND` and is shared with the runner's shim
+    /// audit (which likewise writes each line atomically), so a single
+    /// append-write per line is what keeps the two writers' JSONL from
+    /// interleaving mid-record. (`writeln!` emitted the body and the `\n` as
+    /// separate writes, leaving a window for a runner line to splice in and
+    /// corrupt both records.)
     fn write_line(&self, line: &str) {
         if let Ok(mut f) = self.inner.lock() {
-            let _ = writeln!(f, "{line}");
+            let mut buf = String::with_capacity(line.len() + 1);
+            buf.push_str(line);
+            buf.push('\n');
+            let _ = f.write_all(buf.as_bytes());
         }
     }
 
