@@ -1178,6 +1178,7 @@ impl LinuxShimBuilder {
             vfork_parking: Arc::new(VforkParking {
                 park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                 parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                fork_waiter_count: core::sync::atomic::AtomicU32::new(0),
                 deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
             }),
         });
@@ -1813,6 +1814,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             vfork_parking: Arc::new(VforkParking {
                 park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                 parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                fork_waiter_count: core::sync::atomic::AtomicU32::new(0),
                 deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
             }),
         });
@@ -5389,6 +5391,10 @@ pub(crate) struct VforkParking {
     /// until the count reaches `thread_count - 1`, confirming all other
     /// threads are safely stopped before modifying page permissions.
     pub parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    /// Threads that reached a fork/clone syscall while another thread already
+    /// owns the fork gate. They are executing shim-side gate code, not guest
+    /// code, so the active forker can exclude them from the parked checkpoint.
+    pub fork_waiter_count: core::sync::atomic::AtomicU32,
     /// Number of outstanding "deferred lies" — transport spin loops that have
     /// incremented `parked_count` without actually blocking. Each lie must be
     /// claimed by a task via `park_if_deferred()` before it writes to guest

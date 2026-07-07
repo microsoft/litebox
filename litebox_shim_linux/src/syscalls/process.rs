@@ -2166,12 +2166,12 @@ impl<FS: ShimFS> Task<FS> {
                     if self.is_exiting() {
                         return Err(Errno::EINTR);
                     }
-                    // Count ourselves as parked so the active forker
-                    // can satisfy its `parked_count == expected` wait
-                    // and proceed.
+                    // Count ourselves as a fork-gate waiter. We are stopped in
+                    // shim-side fork serialization code rather than running
+                    // guest code, so the active forker can exclude us from the
+                    // parked checkpoint without waiting for a normal park.
                     ps.vfork_parking
-                        .parked_count
-                        .underlying_atomic()
+                        .fork_waiter_count
                         .fetch_add(1, Ordering::Release);
                     ps.vfork_parking.parked_count.wake_all();
                     let v = parking_atomic.load(Ordering::Acquire);
@@ -2179,8 +2179,7 @@ impl<FS: ShimFS> Task<FS> {
                         let _ = ps.vfork_parking.park.block(v);
                     }
                     ps.vfork_parking
-                        .parked_count
-                        .underlying_atomic()
+                        .fork_waiter_count
                         .fetch_sub(1, Ordering::Release);
                     ps.vfork_parking.parked_count.wake_all();
                 }
@@ -2899,6 +2898,7 @@ impl<FS: ShimFS> Task<FS> {
                 vfork_parking: Arc::new(crate::VforkParking {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                    fork_waiter_count: core::sync::atomic::AtomicU32::new(0),
                     deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                 }),
             });
@@ -7185,8 +7185,7 @@ impl<FS: ShimFS> Task<FS> {
                 .load(Ordering::Acquire);
             if park_v != 0 {
                 ps.vfork_parking
-                    .parked_count
-                    .underlying_atomic()
+                    .fork_waiter_count
                     .fetch_add(1, Ordering::Release);
                 ps.vfork_parking.parked_count.wake_all();
                 loop {
@@ -7201,8 +7200,7 @@ impl<FS: ShimFS> Task<FS> {
                     let _ = ps.vfork_parking.park.block(v);
                 }
                 ps.vfork_parking
-                    .parked_count
-                    .underlying_atomic()
+                    .fork_waiter_count
                     .fetch_sub(1, Ordering::Release);
                 ps.vfork_parking.parked_count.wake_all();
             } else {
@@ -7226,7 +7224,7 @@ impl<FS: ShimFS> Task<FS> {
                 .load(Ordering::Acquire);
             let (expected_now, threads_to_interrupt) = {
                 let inner = self.thread.process.inner.lock();
-                let expected_now = u32::try_from(
+                let thread_peers = u32::try_from(
                     inner
                         .threads
                         .len()
@@ -7234,6 +7232,8 @@ impl<FS: ShimFS> Task<FS> {
                         .expect("calling thread must be in the map"),
                 )
                 .expect("thread count must fit in u32");
+                let fork_waiters = ps.vfork_parking.fork_waiter_count.load(Ordering::Acquire);
+                let expected_now = thread_peers.saturating_sub(fork_waiters);
                 let threads_to_interrupt = inner
                     .threads
                     .iter()
@@ -9382,6 +9382,7 @@ impl<FS: ShimFS> Task<FS> {
                         park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                         parked_count:
                             <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                        fork_waiter_count: core::sync::atomic::AtomicU32::new(0),
                         deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                     }),
                 });
@@ -9466,6 +9467,7 @@ impl<FS: ShimFS> Task<FS> {
                 vfork_parking: Arc::new(crate::VforkParking {
                     park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
                     parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                    fork_waiter_count: core::sync::atomic::AtomicU32::new(0),
                     deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                 }),
             });
