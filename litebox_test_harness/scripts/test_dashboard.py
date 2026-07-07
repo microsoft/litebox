@@ -17,6 +17,9 @@ import unittest
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+TEST_TMP_DIR = SCRIPTS_DIR.parents[1] / "target" / "dashboard-py-tests"
+TEST_TMP_DIR.mkdir(parents=True, exist_ok=True)
+tempfile.tempdir = str(TEST_TMP_DIR)
 sys.path.insert(0, str(SCRIPTS_DIR))
 import dashboard  # type: ignore
 
@@ -152,6 +155,86 @@ class CoverageFiltersDirtyTests(unittest.TestCase):
         self.assertEqual(covered, 1)
         self.assertEqual(n_pass, 1)
         self.assertEqual(n_fail, 0)
+
+
+class ValidateCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-val-")
+        self.state_dir = Path(self.tmp)
+        self.db = self.state_dir / "results.sqlite"
+        self.conn = _init_db(self.db)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_validate(self, *argv):
+        import contextlib
+        import io
+        args = dashboard.build_parser().parse_args(
+            ["validate", "RL.case", "--sha", "fixsha", "--mode", "litebox",
+             "--state-dir", str(self.state_dir), *argv]
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = dashboard.cmd_validate(args)
+        return status, out.getvalue()
+
+    def _add_trials(self, *, commit, n_pass=0, n_fail=0, n_no_result=0,
+                    test_id="RL.case"):
+        ts = 1000
+        for verdict, count in (("pass", n_pass), ("fail", n_fail),
+                               ("no_result", n_no_result)):
+            for _ in range(count):
+                run = _add_run(self.conn, commit=commit, started_ts_ms=ts)
+                _add_result(self.conn, run_id=run, test_id=test_id,
+                            pass_="litebox", verdict=verdict, ts_ms=ts + 1)
+                ts += 10
+
+    def test_runs_needed(self):
+        self.assertEqual(dashboard._runs_needed(0.05, 0.95), 59)
+        self.assertEqual(dashboard._runs_needed(0.01, 0.95), 299)
+        self.assertEqual(dashboard._runs_needed(0.5, 0.95), 5)
+
+    def test_not_run_is_loud_and_nonzero(self):
+        self._add_trials(commit="othersha", n_pass=1)
+        status, out = self._run_validate()
+        self.assertNotEqual(status, 0)
+        self.assertIn("NOT VALIDATED", out)
+        self.assertIn("NOT_RUN", out)
+        self.assertNotIn("VALIDATED (", out)
+        self.assertNotIn("passing", out.lower())
+
+    def test_still_failing_if_any_fail(self):
+        self._add_trials(commit="fixsha", n_pass=2, n_fail=1)
+        status, out = self._run_validate()
+        self.assertNotEqual(status, 0)
+        self.assertIn("STILL FAILING", out)
+        self.assertIn("1 fails / 3 clean runs", out)
+
+    def test_insufficient_clean_passes(self):
+        self._add_trials(commit="fixsha", n_pass=10)
+        status, out = self._run_validate("--assume-flake-rate", "0.05")
+        self.assertNotEqual(status, 0)
+        self.assertIn("INSUFFICIENT", out)
+        self.assertIn("10 clean of 59 needed", out)
+        self.assertIn("need 49 more", out)
+
+    def test_validated_with_enough_clean_passes(self):
+        self._add_trials(commit="fixsha", n_pass=60)
+        status, out = self._run_validate("--assume-flake-rate", "0.05")
+        self.assertEqual(status, 0)
+        self.assertIn("VALIDATED", out)
+        self.assertIn("60 clean, 0 fail", out)
+
+    def test_vs_baseline_prints_contrast(self):
+        self._add_trials(commit="basesha", n_pass=3, n_fail=1)
+        self._add_trials(commit="fixsha", n_pass=12)
+        status, out = self._run_validate("--vs-baseline", "basesha")
+        self.assertEqual(status, 0)
+        self.assertIn("baseline was 25.0% (1/4)", out)
+        self.assertIn("VALIDATED", out)
 
 
 class TrackedRefsTests(unittest.TestCase):
@@ -1089,6 +1172,151 @@ class RegressionClassTests(unittest.TestCase):
         self._upstream("BASE", "T", "pass")
         self._branch("BRANCH", "T", "fail")
         self.assertEqual(self._classify()["T"], ("hard_regression", "medium"))
+
+
+class FlakyLeaderboardTests(unittest.TestCase):
+    """The flaky leaderboard is SQL-first: the helper returns rows from
+    one aggregate query, and Python only formats them."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-flaky-")
+        self.db = Path(self.tmp) / "results.sqlite"
+        self.conn = _init_db(self.db)
+        self.now = dashboard.now_ms()
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _result(self, test_id, mode, verdict, *, worktree="/ci",
+                suite="vscode", group="pidfd", dt=0):
+        rid = _add_run(self.conn, worktree=worktree,
+                       started_ts_ms=self.now - dt)
+        _add_result(self.conn, run_id=rid, test_id=test_id, pass_=mode,
+                    verdict=verdict, ts_ms=self.now - dt,
+                    suite=suite, group=group)
+
+    def _rows(self, **kwargs):
+        defaults = {
+            "mode": "litebox",
+            "pattern": None,
+            "suite": None,
+            "group": None,
+            "min_rate": 0.0,
+            "limit": 40,
+        }
+        defaults.update(kwargs)
+        return dashboard._flaky_rows(self.conn, **defaults)
+
+    def test_genuinely_flaky_ranked_with_correct_rate(self):
+        self._result("T_flaky", "litebox", "pass", dt=3)
+        self._result("T_flaky", "litebox", "fail", dt=2)
+        self._result("T_solid", "litebox", "pass", dt=1)
+        rows = self._rows()
+        self.assertEqual(rows[0]["test_id"], "T_flaky")
+        self.assertEqual(rows[0]["n_pass"], 1)
+        self.assertEqual(rows[0]["n_fail"], 1)
+        self.assertAlmostEqual(rows[0]["fail_rate"], 0.5)
+
+    def test_load_sensitive_flag(self):
+        self._result("T_load", "litebox", "pass", worktree="/ci", dt=2)
+        self._result("T_load", "litebox", "fail",
+                     worktree="/repo/.dashboard/shadows/T_load", dt=1)
+        row = self._rows()[0]
+        self.assertEqual(row["test_id"], "T_load")
+        self.assertEqual(row["load_sensitive"], 1)
+        self.assertAlmostEqual(row["shadow_rate"], 1.0)
+        self.assertAlmostEqual(row["dedicated_rate"], 0.0)
+
+    def test_substrate_bug_flag(self):
+        self._result("T_substrate", "native", "pass", dt=4)
+        self._result("T_substrate", "native", "pass", dt=3)
+        self._result("T_substrate", "litebox", "pass", dt=2)
+        self._result("T_substrate", "litebox", "fail", dt=1)
+        row = self._rows()[0]
+        self.assertEqual(row["test_id"], "T_substrate")
+        self.assertEqual(row["substrate_bug"], 1)
+
+    def test_min_rate_filters(self):
+        self._result("T_low", "litebox", "pass", dt=4)
+        self._result("T_low", "litebox", "fail", dt=3)
+        self._result("T_low", "litebox", "pass", dt=2)
+        self._result("T_high", "litebox", "fail", dt=1)
+        rows = self._rows(min_rate=0.6)
+        self.assertEqual([r["test_id"] for r in rows], ["T_high"])
+
+    def test_pattern_filters(self):
+        self._result("alpha_match", "litebox", "fail", dt=2)
+        self._result("beta_other", "litebox", "fail", dt=1)
+        rows = self._rows(pattern="match")
+        self.assertEqual([r["test_id"] for r in rows], ["alpha_match"])
+
+    def test_no_result_rows_do_not_inflate_rate(self):
+        self._result("T_noresult", "litebox", "pass", dt=3)
+        self._result("T_noresult", "litebox", "fail", dt=2)
+        self._result("T_noresult", "litebox", "no_result", dt=1)
+        row = self._rows()[0]
+        self.assertEqual(row["n_pass"], 1)
+        self.assertEqual(row["n_fail"], 1)
+        self.assertAlmostEqual(row["fail_rate"], 0.5)
+
+
+class StressHelperTests(unittest.TestCase):
+    """Pure helpers behind `dashboard.py stress` + its SQL summary."""
+
+    def test_distribute_even_and_remainder(self):
+        self.assertEqual(dashboard._stress_distribute(20, 4), [5, 5, 5, 5])
+        self.assertEqual(dashboard._stress_distribute(20, 3), [7, 7, 6])
+        self.assertEqual(dashboard._stress_distribute(5, 1), [5])
+        self.assertEqual(dashboard._stress_distribute(0, 3), [0, 0, 0])
+        self.assertEqual(dashboard._stress_distribute(2, 5), [1, 1, 0, 0, 0])
+
+    def test_cargo_argv_is_positional_filter_not_fill(self):
+        argv = dashboard._stress_cargo_argv(["RL.subscriber", "F.fork"])
+        self.assertEqual(argv[:6], ["cargo", "test", "-p",
+                                    "litebox_test_harness", "--test",
+                                    "integration"])
+        self.assertEqual(argv[6], "--")
+        self.assertEqual(argv[7:], ["RL.subscriber", "F.fork"])
+        # Must NOT use --fill (that would skip already-covered tests
+        # instead of re-running them for fresh samples).
+        self.assertNotIn("--fill", " ".join(argv))
+
+    def test_target_summary_groups_and_windows(self):
+        tmp = tempfile.mkdtemp(prefix="dash-stress-")
+        try:
+            conn = _init_db(Path(tmp) / "results.sqlite")
+            # 2 pass + 1 fail + 1 no_result at sha S, plus a pre-window
+            # pass that must be excluded, plus a different sha / dirty row.
+            for v, dt in [("pass", 0), ("pass", 10), ("fail", 20),
+                          ("no_result", 30)]:
+                rid = _add_run(conn, worktree="/s", commit="S",
+                               dirty_hash=None, started_ts_ms=1000)
+                _add_result(conn, run_id=rid, test_id="RL.sub", pass_="litebox",
+                            verdict=v, ts_ms=1000 + dt)
+            pre = _add_run(conn, worktree="/s", commit="S", dirty_hash=None,
+                           started_ts_ms=1)
+            _add_result(conn, run_id=pre, test_id="RL.sub", pass_="litebox",
+                        verdict="pass", ts_ms=1)          # before window
+            oth = _add_run(conn, worktree="/s", commit="OTHER",
+                           dirty_hash=None, started_ts_ms=1000)
+            _add_result(conn, run_id=oth, test_id="RL.sub", pass_="litebox",
+                        verdict="fail", ts_ms=1005)       # different sha
+            rows = dashboard._stress_target_summary(
+                conn, "S", ["RL.sub"], "litebox", since_ts_ms=1000)
+            self.assertEqual(len(rows), 1)
+            r = rows[0]
+            self.assertEqual((r["n_pass"], r["n_fail"], r["n_other"]),
+                             (2, 1, 1))
+            # Pattern that matches nothing → no rows.
+            self.assertEqual(
+                dashboard._stress_target_summary(
+                    conn, "S", ["NOPE"], "litebox", 1000), [])
+            conn.close()
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

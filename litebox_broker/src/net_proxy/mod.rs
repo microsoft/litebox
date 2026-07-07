@@ -15,22 +15,22 @@ mod lbnp_handshake;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::audit::AuditLog;
 use crate::sandbox_policy::SandboxPolicy;
 use crate::sock_compat::{
-    self, AsRawSock, IpcListener, IpcStream, PollFd, RawSock, POLLERR, POLLHUP, POLLIN,
+    self, AsRawSock, IpcListener, IpcStream, POLLERR, POLLHUP, POLLIN, PollFd, RawSock,
 };
 use crate::state_registry::BrokerStateRegistry;
 
-use device::{IpcDrainResult, DEVICE_MTU};
+use device::{DEVICE_MTU, IpcDrainResult};
 use lb9p_handshake::{PendingLb9pResult, RingServiceSpawner};
 use lbnp_handshake::{
-    perform_handshake, send_handshake_response, validate_handshake_request, HANDSHAKE_MAGIC,
-    HANDSHAKE_VERSION,
+    HANDSHAKE_MAGIC, HANDSHAKE_VERSION, perform_handshake, send_handshake_response,
+    validate_handshake_request,
 };
 use tracing::{debug, info, warn};
 
@@ -750,8 +750,8 @@ mod tests {
     use std::io::{Read as _, Write as _};
     #[cfg(windows)]
     use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
 

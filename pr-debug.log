@@ -1,0 +1,307 @@
+[HypB-diag] ts=1781386299029901689 EDGE SEND OK sub_id=42949672961 mask=0x4 wpos=24
+[epoll-diag] ADD fd=5 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781386299031605618 EDGE SEND OK sub_id=42949672962 mask=0x4 wpos=48
+[epoll-diag] ADD fd=9 type=BrokerSocketPair mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-close-timing] host_pid=10 handle=5 dir=Write t_ns=22148003797139
+[HypB-close-timing] host_pid=10 handle=4 dir=Read t_ns=22148004067860
+[HypB-close-timing] host_pid=10 handle=7 dir=Write t_ns=22148004290076
+[HypB-close-timing] host_pid=10 handle=6 dir=Read t_ns=22148004512993
+[HypB-close-timing] host_pid=10 handle=4 dir=Read t_ns=22148145211193
+[HypB-close-timing] host_pid=10 handle=7 dir=Write t_ns=22148145661527
+[epoll-diag] ADD fd=10 type=BrokerPipe mask=Events(IN | OUT | RDHUP | 0x80000000) events=Events(OUT) host_poll=false ready=true
+[HypB-diag] ts=1781386299999513341 PIPE READ-END SUBSCRIBE handle=6 inner_addr=0x7bfcbc221880 sub_id=42949672963 mask=0x19 now=0x0
+[epoll-diag] ADD fd=13 type=BrokerPipe mask=Events(IN | OUT | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[epoll-diag] ADD fd=11 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781386300002175041 EDGE SEND OK sub_id=42949672961 mask=0x5 wpos=72
+[HypB-diag] ts=1781386300003114712 EDGE SEND OK sub_id=42949672965 mask=0x4 wpos=96
+[HypB-diag] ts=1781386300003453938 WRITE-PIPE-RPC handle=5 bytes=97
+[HypB-diag] ts=1781386300003530143 PIPE WRITE inner_addr=0x7bfcbc121570 n=97 has_data=true subs=0
+[HypB-diag] ts=1781386300004041682 EDGE SEND OK sub_id=42949672961 mask=0x5 wpos=120
+[HypB-diag] ts=1781386300079160041 PIPE READ-END SUBSCRIBE handle=4 inner_addr=0x7bfcbc121570 sub_id=42949672966 mask=0x19 now=0x1
+[HypB-diag] ts=1781386300079357456 EDGE SEND OK sub_id=42949672966 mask=0x1 wpos=144
+[HypB-diag] ts=1781386300105672939 EDGE SEND OK sub_id=42949672967 mask=0x4 wpos=168
+[epoll-diag] ADD fd=5 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781386300107419771 EDGE SEND OK sub_id=42949672968 mask=0x4 wpos=192
+[epoll-diag] ADD fd=9 type=BrokerSocketPair mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-read-entry] host_pid=10 handle=4 t_ns=22148257338141
+[HypB-diag] ts=1781386300110564708 EDGE SEND OK sub_id=42949672965 mask=0x4 wpos=216
+[HypB-diag] ts=1781386300111282962 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=240
+[HypB-close-timing] host_pid=10 handle=4 dir=Read t_ns=22148265226136
+[HypB-close-timing] host_pid=10 handle=7 dir=Write t_ns=22148266020995
+[HypB-close-timing] host_pid=10 handle=12 dir=Write t_ns=22148298818566
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=22148299310203
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=22148299704533
+[HypB-close-timing] host_pid=10 handle=13 dir=Read t_ns=22148300053459
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=22148463989911
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=22148464522451
+[epoll-diag] ADD fd=10 type=BrokerPipe mask=Events(IN | OUT | RDHUP | 0x80000000) events=Events(OUT) host_poll=false ready=true
+[HypB-diag] ts=1781386300318198551 PIPE READ-END SUBSCRIBE handle=13 inner_addr=0x7bfcbc442b60 sub_id=42949672969 mask=0x19 now=0x0
+[epoll-diag] ADD fd=13 type=BrokerPipe mask=Events(IN | OUT | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[epoll-diag] ADD fd=11 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781386300320289908 EDGE SEND OK sub_id=42949672971 mask=0x4 wpos=264
+[HypB-diag] ts=1781386300320549728 WRITE-PIPE-RPC handle=7 bytes=77
+[HypB-diag] ts=1781386300320590931 PIPE WRITE inner_addr=0x7bfcbc221880 n=77 has_data=true subs=1
+[HypB-diag] ts=1781386300320635535 EDGE SEND OK sub_id=42949672963 mask=0x1 wpos=288
+[HypB-diag] ts=1781386300321292684 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=312
+[HypB-read-entry] host_pid=10 handle=6 t_ns=22148468393042
+[HypB-diag] ts=1781386300321893629 EDGE SEND OK sub_id=42949672971 mask=0x4 wpos=336
+[HypB-diag] ts=1781386300322424469 WRITE-PIPE-RPC handle=5 bytes=195
+[HypB-diag] ts=1781386300322468973 PIPE WRITE inner_addr=0x7bfcbc121570 n=195 has_data=true subs=1
+[HypB-diag] ts=1781386300322513476 EDGE SEND OK sub_id=42949672966 mask=0x1 wpos=360
+[HypB-diag] ts=1781386300322885904 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=384
+[HypB-read-entry] host_pid=10 handle=4 t_ns=22148470898931
+[HypB-diag] ts=1781386300324349314 EDGE SEND OK sub_id=42949672965 mask=0x4 wpos=408
+[HypB-diag] ts=1781386300324711942 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=432
+[HypB-diag] ts=1781386300325743919 EDGE SEND OK sub_id=42949672972 mask=0x4 wpos=456
+[HypB-diag] ts=1781386300326056043 WRITE-PIPE-RPC handle=12 bytes=127
+[HypB-diag] ts=1781386300326099946 PIPE WRITE inner_addr=0x7bfcbc3429e0 n=127 has_data=true subs=0
+[HypB-diag] ts=1781386300326531079 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=480
+[HypB-diag] ts=1781386300381968455 PIPE READ-END SUBSCRIBE handle=11 inner_addr=0x7bfcbc3429e0 sub_id=42949672973 mask=0x19 now=0x1
+[HypB-diag] ts=1781386300382101665 EDGE SEND OK sub_id=42949672973 mask=0x1 wpos=504
+[HypB-diag] ts=1781386300400459649 EDGE SEND OK sub_id=42949672974 mask=0x4 wpos=528
+[epoll-diag] ADD fd=5 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-diag] ts=1781386300401929159 EDGE SEND OK sub_id=42949672975 mask=0x4 wpos=552
+[epoll-diag] ADD fd=9 type=BrokerSocketPair mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[HypB-read-entry] host_pid=10 handle=11 t_ns=22148551346092
+[HypB-diag] ts=1781386300404553457 EDGE SEND OK sub_id=42949672972 mask=0x4 wpos=576
+[HypB-diag] ts=1781386300404883882 EDGE SEND OK sub_id=42949672974 mask=0x5 wpos=600
+[PR-DEBUG] pid=4 tid=7 EAGAIN: park_other_threads (is_forking already)
+[PR-DEBUG] pid=4 tid=8 EAGAIN: park_other_threads (is_forking already)
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=22148561371147
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=22148561670870
+[HypB-diag] ts=1781386300418470806 EDGE SEND OK sub_id=42949672976 mask=0x4 wpos=624
+[HypB-diag] ts=1781386300418739126 WRITE-PIPE-RPC handle=14 bytes=82
+[HypB-diag] ts=1781386300418780729 PIPE WRITE inner_addr=0x7bfcbc442b60 n=82 has_data=true subs=1
+[HypB-diag] ts=1781386300418825632 EDGE SEND OK sub_id=42949672969 mask=0x1 wpos=648
+[HypB-diag] ts=1781386300419319770 EDGE SEND OK sub_id=42949672974 mask=0x5 wpos=672
+[HypB-read-entry] host_pid=10 handle=13 t_ns=22148566399426
+[HypB-diag] ts=1781386300419887412 EDGE SEND OK sub_id=42949672976 mask=0x4 wpos=696
+[HypB-diag] ts=1781386300420501559 EDGE SEND OK sub_id=42949672974 mask=0x5 wpos=720
+[HypB-diag] ts=1781386300420793781 WRITE-PIPE-RPC handle=7 bytes=82
+[HypB-diag] ts=1781386300420833884 PIPE WRITE inner_addr=0x7bfcbc221880 n=82 has_data=true subs=1
+[HypB-diag] ts=1781386300420877187 EDGE SEND OK sub_id=42949672963 mask=0x1 wpos=744
+[HypB-diag] ts=1781386300421772354 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=768
+[HypB-read-entry] host_pid=10 handle=6 t_ns=22148568858612
+[HypB-read-entry] host_pid=10 handle=11 t_ns=22148568942618
+[HypB-diag] ts=1781386300422305994 EDGE SEND OK sub_id=42949672971 mask=0x4 wpos=792
+[HypB-diag] ts=1781386300422770930 WRITE-PIPE-RPC handle=5 bytes=83
+[HypB-diag] ts=1781386300422812233 PIPE WRITE inner_addr=0x7bfcbc121570 n=83 has_data=true subs=1
+[HypB-diag] ts=1781386300422856336 EDGE SEND OK sub_id=42949672966 mask=0x1 wpos=816
+[HypB-read-entry] host_pid=10 handle=4 t_ns=22148570600043
+[HypB-diag] ts=1781386300423909815 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=840
+[HypB-diag] ts=1781386300424218039 EDGE SEND OK sub_id=42949672965 mask=0x4 wpos=864
+[HypB-diag] ts=1781386300424837785 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=888
+[HypB-diag] ts=1781386300425170810 WRITE-PIPE-RPC handle=12 bytes=15
+[HypB-diag] ts=1781386300425213714 PIPE WRITE inner_addr=0x7bfcbc3429e0 n=15 has_data=true subs=1
+[HypB-diag] ts=1781386300425266018 EDGE SEND OK sub_id=42949672973 mask=0x1 wpos=912
+[HypB-diag] ts=1781386300425568640 EDGE SEND OK sub_id=42949672972 mask=0x4 wpos=936
+[HypB-diag] ts=1781386300425864063 EDGE SEND OK sub_id=42949672967 mask=0x5 wpos=960
+[HypB-diag] ts=1781386300426154084 EDGE SEND OK sub_id=42949672974 mask=0x5 wpos=984
+[HypB-close-timing] host_pid=10 handle=11 dir=Read t_ns=22148576236067
+[HypB-close-timing] host_pid=10 handle=14 dir=Write t_ns=22148576503288
+[litebox-panic] ts=1781386300430519613 process=broker pid=8 thread=fd-token-conn at litebox_broker/src/cwfd/eventfd_state.rs:98:9: EventfdState dropped with 1 live subscription(s) — eager per-conn unsubscribe is not running, or a Release bypassed ConnRefTracker.drain_tracked_subscriptions
+backtrace:
+   0: litebox_panic_hook::install_with_path::{{closure}}
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_panic_hook/src/lib.rs:41:18
+   1: <alloc::boxed::Box<dyn for<'a, 'b> core::ops::function::Fn<(&'a std::panic::PanicHookInfo<'b>,), Output = ()> + core::marker::Sync + core::marker::Send> as core::ops::function::Fn<(&std::panic::PanicHookInfo,)>>::call
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/boxed.rs:2254:9
+   2: std::panicking::panic_with_hook
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:833:13
+   3: std::panicking::panic_handler::{closure#0}
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:698:13
+   4: std::sys::backtrace::__rust_end_short_backtrace::<std::panicking::panic_handler::{closure#0}, !>
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/backtrace.rs:182:18
+   5: __rustc::rust_begin_unwind
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:689:5
+   6: core::panicking::panic_fmt
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/panicking.rs:80:14
+   7: <litebox_broker::cwfd::eventfd_state::EventfdState as core::ops::drop::Drop>::drop
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/eventfd_state.rs:98:9
+   8: core::ptr::drop_in_place<litebox_broker::cwfd::eventfd_state::EventfdState>
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:805:1
+   9: alloc::sync::Arc<T,A>::drop_slow
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc/src/sync.rs:2120:18
+  10: <alloc::sync::Arc<T,A> as core::ops::drop::Drop>::drop
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc/src/sync.rs:2854:18
+  11: core::ptr::drop_in_place<alloc::sync::Arc<litebox_broker::cwfd::eventfd_state::EventfdState>>
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:805:1
+  12: core::ptr::drop_in_place<litebox_broker::cwfd::state_registry::StateObjectEnum>
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:805:1
+  13: alloc::sync::Arc<T,A>::drop_slow
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc/src/sync.rs:2120:18
+  14: <alloc::sync::Arc<T,A> as core::ops::drop::Drop>::drop
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc/src/sync.rs:2854:18
+  15: core::ptr::drop_in_place<alloc::sync::Arc<litebox_broker::cwfd::state_registry::StateObjectEnum>>
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:805:1
+  16: core::ptr::drop_in_place<litebox_broker::cwfd::state_registry::Entry>
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:805:1
+  17: core::ptr::drop_in_place<core::option::Option<litebox_broker::cwfd::state_registry::Entry>>
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:805:1
+  18: litebox_broker::cwfd::state_registry::BrokerStateRegistry::release
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/state_registry.rs:980:38
+  19: litebox_broker::cwfd::fd_token_socket::ConnRefTracker::release_all_for_pid
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:324:44
+  20: litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:1516:56
+  21: litebox_broker::cwfd::fd_token_socket::handle_control_connection::{{closure}}
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:868:9
+  22: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panic/unwind_safe.rs:274:9
+  23: std::panicking::catch_unwind::do_call
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:581:40
+  24: __rust_try
+  25: std::panicking::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:544:19
+  26: std::panic::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panic.rs:359:14
+  27: litebox_broker::cwfd::fd_token_socket::handle_control_connection
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:867:18
+  28: litebox_broker::cwfd::fd_token_socket::spawn_control_listener::{{closure}}::{{closure}}
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:1686:37
+  29: std::sys::backtrace::__rust_begin_short_backtrace
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/sys/backtrace.rs:166:18
+  30: std::thread::lifecycle::spawn_unchecked::{{closure}}::{{closure}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/lifecycle.rs:91:13
+  31: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panic/unwind_safe.rs:274:9
+  32: std::panicking::catch_unwind::do_call
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:581:40
+  33: __rust_try
+  34: std::panicking::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:544:19
+  35: std::panic::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panic.rs:359:14
+  36: std::thread::lifecycle::spawn_unchecked::{{closure}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/lifecycle.rs:89:26
+  37: core::ops::function::FnOnce::call_once{{vtable.shim}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  38: <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/boxed.rs:2240:9
+  39: <std::sys::thread::unix::Thread>::new::thread_start
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/thread/unix.rs:118:17
+  40: <unknown>
+  41: clone
+
+[PE.14-diag] ts=1781386300489457354 CONN HANDLER EXIT conn_id=1 fd=7 peer_pid=10 peer_uid=0 peer_gid=0 (UnixStream about to drop)
+backtrace:
+   0: <litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner::CloseGuard as core::ops::drop::Drop>::drop
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:978:22
+   1: core::ptr::drop_in_place<litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner::CloseGuard>
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:805:1
+   2: litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:1650:1
+   3: litebox_broker::cwfd::fd_token_socket::handle_control_connection::{{closure}}
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:868:9
+   4: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panic/unwind_safe.rs:274:9
+   5: std::panicking::catch_unwind::do_call
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:581:40
+   6: __rust_try
+   7: std::panicking::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:544:19
+   8: std::panic::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panic.rs:359:14
+   9: litebox_broker::cwfd::fd_token_socket::handle_control_connection
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:867:18
+  10: litebox_broker::cwfd::fd_token_socket::spawn_control_listener::{{closure}}::{{closure}}
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:1686:37
+  11: std::sys::backtrace::__rust_begin_short_backtrace
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/sys/backtrace.rs:166:18
+  12: std::thread::lifecycle::spawn_unchecked::{{closure}}::{{closure}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/lifecycle.rs:91:13
+  13: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panic/unwind_safe.rs:274:9
+  14: std::panicking::catch_unwind::do_call
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:581:40
+  15: __rust_try
+  16: std::panicking::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:544:19
+  17: std::panic::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panic.rs:359:14
+  18: std::thread::lifecycle::spawn_unchecked::{{closure}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/lifecycle.rs:89:26
+  19: core::ops::function::FnOnce::call_once{{vtable.shim}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  20: <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/boxed.rs:2240:9
+  21: <std::sys::thread::unix::Thread>::new::thread_start
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/thread/unix.rs:118:17
+  22: <unknown>
+  23: clone
+
+[PE.14-diag] ts=1781386300491172383 BROKER CONN HANDLER PANIC conn_id=1 peer_pid=10 peer_uid=0 peer_gid=0: EventfdState dropped with 1 live subscription(s) — eager per-conn unsubscribe is not running, or a Release bypassed ConnRefTracker.drain_tracked_subscriptions
+[litebox-panic] ts=1781386300491230587 process=broker pid=8 thread=fd-token-conn at litebox_broker/src/cwfd/state_registry.rs:1041:35: BrokerStateRegistry poisoned: PoisonError { .. }
+backtrace:
+[DBG-SUBSCRIBE] pid=4 RPC error mapped to Io: io error talking to broker control socket: unexpected end of file
+[DBG-SUBSCRIBE] pid=WARNING: unsupported: broker ReleaseAllForPid failed for pid 4: Io
+4 RPC error mapped to Io: io error talking to broker control socket: Broken pipe (os error 32)
+   0: litebox_panic_hook::install_with_path::{{closure}}
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_panic_hook/src/lib.rs:41:18
+   1: <alloc::boxed::Box<dyn for<'a, 'b> core::ops::function::Fn<(&'a std::panic::PanicHookInfo<'b>,), Output = ()> + core::marker::Sync + core::marker::Send> as core::ops::function::Fn<(&std::panic::PanicHookInfo,)>>::call
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/boxed.rs:2254:9
+   2: std::panicking::panic_with_hook
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:833:13
+   3: std::panicking::panic_handler::{closure#0}
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:698:13
+   4: std::sys::backtrace::__rust_end_short_backtrace::<std::panicking::panic_handler::{closure#0}, !>
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/backtrace.rs:182:18
+   5: __rustc::rust_begin_unwind
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:689:5
+   6: core::panicking::panic_fmt
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/panicking.rs:80:14
+   7: core::result::unwrap_failed
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/result.rs:1867:5
+   8: core::result::Result<T,E>::expect
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1185:23
+   9: litebox_broker::cwfd::state_registry::BrokerStateRegistry::resolve_untyped
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/state_registry.rs:1041:35
+  10: litebox_broker::cwfd::fd_token_socket::handle_control_connection
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:923:35
+  11: litebox_broker::cwfd::fd_token_socket::spawn_control_listener::{{closure}}::{{closure}}
+             at ./home/wportnoy/src/litebox-wave3-promotion-race/litebox_broker/src/cwfd/fd_token_socket.rs:1686:37
+  12: std::sys::backtrace::__rust_begin_short_backtrace
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/sys/backtrace.rs:166:18
+  13: std::thread::lifecycle::spawn_unchecked::{{closure}}::{{closure}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/lifecycle.rs:91:13
+  14: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panic/unwind_safe.rs:274:9
+  15: std::panicking::catch_unwind::do_call
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:581:40
+  16: __rust_try
+  17: std::panicking::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:544:19
+  18: std::panic::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panic.rs:359:14
+  19: std::thread::lifecycle::spawn_unchecked::{{closure}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/lifecycle.rs:89:26
+  20: core::ops::function::FnOnce::call_once{{vtable.shim}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  21: <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/boxed.rs:2240:9
+  22: <std::sys::thread::unix::Thread>::new::thread_start
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/thread/unix.rs:118:17
+  23: <unknown>
+  24: clone
+
+[HypB-close-timing] host_pid=10 handle=4 dir=Read t_ns=22163573416528
+[PE.13-diag] BrokerPipeProvider::release(handle=4) failed: io error talking to broker control socket: Broken pipe (os error 32)
+[HypB-close-timing] host_pid=10 handle=7 dir=Write t_ns=22163575376675
+[PE.13-diag] BrokerPipeProvider::release(handle=7) failed: io error talking to broker control socket: Broken pipe (os error 32)
+[HypB-close-timing] host_pid=10 handle=12 dir=Write t_ns=22163575944718
+[PE.13-diag] BrokerPipeProvider::release(handle=12) failed: io error talking to broker control socket: Broken pipe (os error 32)
+[HypB-close-timing] host_pid=10 handle=13 dir=Read t_ns=22163576158234
+[PE.13-diag] BrokerPipeProvider::release(handle=13) failed: io error talking to broker control socket: Broken pipe (os error 32)
+[DBG-SUBSCRIBE] pid=2 RPC error mapped to Io: io error talking to broker control socket: Broken pipe (os error 32)
+WARNING: unsupported: broker MarkProcessExited failed for pid 2 status 0: Io
+[DBG-SUBSCRIBE] pid=2 RPC error mapped to Io: io error talking to broker control socket: Broken pipe (os error 32)
+WARNING: unsupported: broker ReleaseAllForPid failed for pid 2: Io
+[HypB-close-timing] host_pid=10 handle=5 dir=Write t_ns=22163576741278
+[PE.13-diag] BrokerPipeProvider::release(handle=5) failed: io error talking to broker control socket: Broken pipe (os error 32)
+[HypB-close-timing] host_pid=10 handle=6 dir=Read t_ns=22163577029400
+[PE.13-diag] BrokerPipeProvider::release(handle=6) failed: io error talking to broker control socket: Broken pipe (os error 32)
+[DBG-SUBSCRIBE] pid=1 RPC error mapped to Io: io error talking to broker control socket: Broken pipe (os error 32)
+WARNING: unsupported: broker MarkProcessExited failed for pid 1 status 1: Io
+[DBG-SUBSCRIBE] pid=1 RPC error mapped to Io: io error talking to broker control socket: Broken pipe (os error 32)
+WARNING: unsupported: broker ReleaseAllForPid failed for pid 1: Io
+[DBG-SUBSCRIBE] pid=1 RPC error mapped to Io: io error talking to broker control socket: Broken pipe (os error 32)
+WARNING: unsupported: broker MarkProcessExited failed for pid 1 status 1: Io
