@@ -6,6 +6,7 @@ description = "CLI tool for importing and querying litebox audit logs via SQLite
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", default-features = false, features = ["events"] }
 rusqlite = { version = "0.35", features = ["bundled"] }
 serde_json = "1"
 

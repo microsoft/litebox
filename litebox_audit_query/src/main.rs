@@ -30,6 +30,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 mod tree;
+mod tui;
 mod watch;
 
 #[derive(Parser)]

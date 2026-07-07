@@ -40,27 +40,26 @@ pub fn run(
 ) -> Result<(), String> {
     let log_path = resolve_log_path(path)?;
     let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    let mut sink = if tree {
-        Sink::Tree(crate::tree::Frontier::new(color))
-    } else {
-        Sink::Plain(Renderer {
-            color,
-            policy_only,
-            filter: filter.map(str::to_string),
-            pending: HashMap::new(),
-        })
-    };
-
     let mut file =
         std::fs::File::open(&log_path).map_err(|e| format!("open {}: {e}", log_path.display()))?;
+
+    if tree {
+        return run_tree(file, follow, color);
+    }
+
+    // Plain streaming mode: tail the log, pretty-printing each event.
+    let mut renderer = Renderer {
+        color,
+        policy_only,
+        filter: filter.map(str::to_string),
+        pending: HashMap::new(),
+    };
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    if let Sink::Plain(_) = sink {
-        if color {
-            let _ = writeln!(out, "{DIM}watching {}{RESET}", log_path.display());
-        } else {
-            let _ = writeln!(out, "watching {}", log_path.display());
-        }
+    if color {
+        let _ = writeln!(out, "{DIM}watching {}{RESET}", log_path.display());
+    } else {
+        let _ = writeln!(out, "watching {}", log_path.display());
     }
 
     let mut carry: Vec<u8> = Vec::new();
@@ -74,9 +73,8 @@ pub fn run(
             while let Some(pos) = carry.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = carry.drain(..=pos).collect();
                 let text = String::from_utf8_lossy(&line);
-                sink.ingest_line(text.trim_end(), &mut out);
+                renderer.render_line(text.trim_end(), &mut out);
             }
-            sink.after_batch(color, &mut out);
             out.flush().map_err(|e| format!("flush: {e}"))?;
         } else if follow {
             thread::sleep(POLL_INTERVAL);
@@ -84,51 +82,31 @@ pub fn run(
             break;
         }
     }
-    // On a one-shot (`--no-follow`) tree run, emit a final frame so piped /
-    // non-tty output still shows the assembled tree.
-    if let Sink::Tree(f) = &sink
-        && !follow
-    {
-        if color {
-            let _ = write!(out, "\x1b[2J\x1b[H");
-        }
-        let _ = write!(out, "{}", f.render());
-        let _ = out.flush();
-    }
     Ok(())
 }
 
-/// Output target for the tail loop: either a streaming line renderer (plain
-/// mode) or the aggregating frontier tree (`--tree`).
-enum Sink {
-    Plain(Renderer),
-    Tree(crate::tree::Frontier),
-}
-
-impl Sink {
-    fn ingest_line(&mut self, line: &str, out: &mut impl Write) {
-        match self {
-            Sink::Plain(r) => r.render_line(line, out),
-            Sink::Tree(f) => {
-                let trimmed = line.trim();
-                if trimmed.starts_with('{')
-                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
-                {
-                    f.ingest(&v);
-                }
-            }
-        }
+/// Tree mode: an interactive TUI on a terminal (with `--follow`), or a one-shot
+/// static render for piped / `--no-follow` output.
+fn run_tree(mut file: std::fs::File, follow: bool, color: bool) -> Result<(), String> {
+    let mut frontier = crate::tree::Frontier::new(color);
+    if color && follow {
+        return crate::tui::run(frontier, file).map_err(|e| format!("tui: {e}"));
     }
-
-    /// Live-redraw the tree after each read batch (only on a terminal; piped
-    /// output gets a single final frame instead).
-    fn after_batch(&mut self, color: bool, out: &mut impl Write) {
-        if let Sink::Tree(f) = self
-            && color
+    // Non-interactive: fold the whole file and render the tree once.
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|e| format!("read: {e}"))?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{')
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
         {
-            let _ = write!(out, "\x1b[2J\x1b[H{}", f.render());
+            frontier.ingest(&v);
         }
     }
+    print!("{}", frontier.render());
+    let _ = io::stdout().flush();
+    Ok(())
 }
 
 /// Resolve `path` to a concrete JSONL file. If `path` is a directory, the

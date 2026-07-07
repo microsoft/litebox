@@ -84,10 +84,12 @@ guest's `connect()` returns `EPERM`) or read a denied path.
 Broker policy decisions are appended as JSONL to the bind-mounted
 `target/litebox-audit/` directory on the host. To watch them live:
 
-- **Terminal → Run Task → `LiteBox: Watch Sandbox Frontier`** — a
-  live-updating tree of allowed (green) vs denied (red) filesystem
-  paths and network endpoints. As the agent works the tree grows to
-  show the *frontier* of what it actually reached.
+- **Terminal → Run Task → `LiteBox: Watch Sandbox Frontier`** — an
+  interactive, collapsible tree of allowed (green) vs denied (red)
+  filesystem paths and network endpoints, collapsed by default with
+  per-node `(N✓ M✗)` counts. Navigate with **↑/↓**, **→/Enter** to
+  expand, **←** to collapse, **q** to quit; it keeps folding in new
+  events live as the agent works.
 - **`LiteBox: Watch Sandbox Trace`** — a scrolling live trace of the
   same events (broker policy decisions; plus per-syscall events if the
   runner was built with `--features audit_log`).

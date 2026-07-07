@@ -16,12 +16,12 @@
 
 use std::collections::BTreeMap;
 
-const RESET: &str = "\x1b[0m";
-const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const DIM: &str = "\x1b[90m";
-const BOLD: &str = "\x1b[1m";
+pub(crate) const RESET: &str = "\x1b[0m";
+pub(crate) const RED: &str = "\x1b[31m";
+pub(crate) const GREEN: &str = "\x1b[32m";
+pub(crate) const YELLOW: &str = "\x1b[33m";
+pub(crate) const DIM: &str = "\x1b[90m";
+pub(crate) const BOLD: &str = "\x1b[1m";
 
 /// One node of a frontier tree. `allowed`/`denied` are aggregated over the
 /// whole subtree rooted here (set on every node along an inserted path), so an
@@ -33,6 +33,8 @@ struct Node {
     allowed: bool,
     denied: bool,
     terminal: bool,
+    /// Interactive-TUI expand state (ignored by the static `render`).
+    expanded: bool,
 }
 
 impl Node {
@@ -51,6 +53,41 @@ impl Node {
                 .insert(rest, allowed),
         }
     }
+
+    /// Count of (allowed, denied) terminal leaves in this subtree.
+    fn leaf_counts(&self) -> (u32, u32) {
+        let mut a = u32::from(self.terminal && self.allowed);
+        let mut d = u32::from(self.terminal && self.denied);
+        for child in self.children.values() {
+            let (ca, cd) = child.leaf_counts();
+            a += ca;
+            d += cd;
+        }
+        (a, d)
+    }
+
+    fn child_mut(&mut self, labels: &[String]) -> Option<&mut Node> {
+        let mut cur = self;
+        for label in labels {
+            cur = cur.children.get_mut(label)?;
+        }
+        Some(cur)
+    }
+}
+
+/// One rendered line of the interactive tree, produced by
+/// [`Frontier::visible_rows`]. `path[0]` is the section (`"net"` / `"fs"`).
+pub struct Row {
+    pub depth: usize,
+    pub label: String,
+    pub allowed: bool,
+    pub denied: bool,
+    pub expandable: bool,
+    pub expanded: bool,
+    pub allow_count: u32,
+    pub deny_count: u32,
+    pub is_section: bool,
+    pub path: Vec<String>,
 }
 
 /// The two frontier trees plus running tallies.
@@ -62,6 +99,9 @@ pub struct Frontier {
     net_allowed: u64,
     net_denied: u64,
     color: bool,
+    /// Interactive-TUI section expand state (the two top-level headers).
+    net_expanded: bool,
+    fs_expanded: bool,
 }
 
 impl Frontier {
@@ -74,6 +114,63 @@ impl Frontier {
             net_allowed: 0,
             net_denied: 0,
             color,
+            net_expanded: true,
+            fs_expanded: true,
+        }
+    }
+
+    /// Flatten the tree into the currently-visible rows, honouring per-node
+    /// expand state. Used by the interactive TUI.
+    pub fn visible_rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for (key, root, expanded, title) in [
+            ("net", &self.net, self.net_expanded, "Network"),
+            ("fs", &self.fs, self.fs_expanded, "Filesystem"),
+        ] {
+            let (a, d) = root.leaf_counts();
+            rows.push(Row {
+                depth: 0,
+                label: title.to_string(),
+                allowed: a > 0,
+                denied: d > 0,
+                expandable: !root.children.is_empty(),
+                expanded,
+                allow_count: a,
+                deny_count: d,
+                is_section: true,
+                path: vec![key.to_string()],
+            });
+            if expanded {
+                collect_rows(root, &[key.to_string()], 1, &mut rows);
+            }
+        }
+        rows
+    }
+
+    /// Toggle the expand state of the node at `path` (`path[0]` selects the
+    /// section). No-op for an unknown path.
+    pub fn toggle(&mut self, path: &[String]) {
+        self.set_expanded_impl(path, None);
+    }
+
+    /// Force the expand state of the node at `path`.
+    pub fn set_expanded(&mut self, path: &[String], value: bool) {
+        self.set_expanded_impl(path, Some(value));
+    }
+
+    fn set_expanded_impl(&mut self, path: &[String], value: Option<bool>) {
+        let Some((section, rest)) = path.split_first() else {
+            return;
+        };
+        let (root, section_flag) = match section.as_str() {
+            "net" => (&mut self.net, &mut self.net_expanded),
+            "fs" => (&mut self.fs, &mut self.fs_expanded),
+            _ => return,
+        };
+        if rest.is_empty() {
+            *section_flag = value.unwrap_or(!*section_flag);
+        } else if let Some(node) = root.child_mut(rest) {
+            node.expanded = value.unwrap_or(!node.expanded);
         }
     }
 
@@ -184,12 +281,38 @@ impl Frontier {
     }
 }
 
-fn status_color(allowed: bool, denied: bool) -> &'static str {
+pub(crate) fn status_color(allowed: bool, denied: bool) -> &'static str {
     match (allowed, denied) {
         (true, true) => YELLOW,
         (false, true) => RED,
         (true, false) => GREEN,
         (false, false) => DIM,
+    }
+}
+
+/// Walk `node`'s children (descending only into expanded ones), appending a
+/// [`Row`] per visible node. `prefix` is the section-rooted path so far.
+fn collect_rows(node: &Node, prefix: &[String], depth: usize, rows: &mut Vec<Row>) {
+    for (label, child) in &node.children {
+        let mut path = prefix.to_vec();
+        path.push(label.clone());
+        let (a, d) = child.leaf_counts();
+        let expandable = !child.children.is_empty();
+        rows.push(Row {
+            depth,
+            label: label.clone(),
+            allowed: child.allowed,
+            denied: child.denied,
+            expandable,
+            expanded: child.expanded,
+            allow_count: a,
+            deny_count: d,
+            is_section: false,
+            path: path.clone(),
+        });
+        if expandable && child.expanded {
+            collect_rows(child, &path, depth + 1, rows);
+        }
     }
 }
 
