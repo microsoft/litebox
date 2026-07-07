@@ -42,6 +42,8 @@ enum SectionBacking {
     /// second-concurrent-view and the remap-after-unmap rejects exist. They are
     /// one missing feature, not two unrelated limitations.
     Pagefile,
+    /// CSR shared-section contents are synthesized on map and likewise limited
+    /// to one live view until `TODO(section-subsystem)` adds shared backing.
     CsrSharedSection,
     ImageFile,
 }
@@ -631,11 +633,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn named_section(&self, name: &str) -> Option<Arc<SectionObject<Platform>>> {
         let key = section_key(name);
         let mut namespace = self.process.section_namespace.write();
-        let section = namespace.get(&key).and_then(alloc::sync::Weak::upgrade);
-        if section.is_none() {
-            namespace.remove(&key);
+        if let Some(section) = namespace.get(&key).and_then(alloc::sync::Weak::upgrade) {
+            return Some(section);
         }
-        section.or_else(|| is_windows_shared_section(name).then(windows_shared_section))
+        namespace.remove(&key);
+        if !is_windows_shared_section(name) {
+            return None;
+        }
+        let section = windows_shared_section();
+        namespace.insert(key, Arc::downgrade(&section));
+        Some(section)
     }
 
     fn map_pagefile_section(
@@ -1455,6 +1462,40 @@ mod tests {
             task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
             NtStatus::SUCCESS
         );
+    }
+
+    #[test]
+    fn nt_open_section_caches_synthesized_windows_shared_section() {
+        let task = test_task();
+        let name = wide(r"\Sessions\0\Windows\SharedSection");
+        let unicode = unicode(&name);
+        let attrs = object_attributes(&unicode);
+        let mut opened = Handle::default();
+
+        assert_eq!(
+            task.sys_nt_open_section(
+                mut_ptr(&mut opened),
+                SectionAccess::QUERY.bits(),
+                Some(const_ptr(&attrs)),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let size = 0x1000_i64;
+        let mut created = Handle::from_raw(0xffff_ffff);
+        assert_eq!(
+            task.sys_nt_create_section(
+                mut_ptr(&mut created),
+                SectionAccess::ALL_ACCESS.bits(),
+                Some(const_ptr(&attrs)),
+                Some(const_ptr(&size)),
+                PageProtection::PAGE_READWRITE.bits(),
+                SectionAllocationAttributes::SEC_COMMIT.bits(),
+                Handle::default(),
+            ),
+            NtStatus::OBJECT_NAME_EXISTS
+        );
+        assert_eq!(created, Handle::from_raw(0xffff_ffff));
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
