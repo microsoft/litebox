@@ -2125,6 +2125,71 @@ mod tests {
         (dir, path, fd_registry, state_registry, process_registry)
     }
 
+    /// Like [`spawn_test_listener`] but the shared state registry enforces the
+    /// given JSON sandbox policy on inet connects.
+    fn spawn_test_listener_with_policy(
+        policy_json: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fd-token.sock");
+        let policy = crate::sandbox_policy::SandboxPolicy::from_json(policy_json).expect("policy");
+        let state_registry = Arc::new(BrokerStateRegistry::with_net_enforcement(
+            Some(Arc::new(policy)),
+            None,
+        ));
+        let _ = spawn_control_listener(
+            &path,
+            Arc::new(BrokerFdTokenRegistry::new()),
+            state_registry,
+            Arc::new(BrokerStateRegistry::new()),
+            Arc::new(InotifyDispatcher::new()),
+        )
+        .expect("spawn");
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (dir, path)
+    }
+
+    /// End-to-end over the real fd-token IPC socket: a real `FdTokenClient`
+    /// drives the real broker control listener, exercising the full connect
+    /// path (client → wire → handler → policy → response → client mapping).
+    #[test]
+    fn tcp_connect_enforced_by_policy_over_ipc() {
+        // deny-all except one IP-based allowlist entry (no DNS needed).
+        let (_dir, path) = spawn_test_listener_with_policy(
+            r#"{ "network": { "deny_all": true, "allow_connect": ["127.0.0.1:9"] } }"#,
+        );
+        let client = FdTokenClient::connect(&path).expect("connect");
+        let handle = client.tcp_conn_create(0).expect("tcp_conn_create");
+
+        // A non-allowlisted destination is refused end-to-end and the client
+        // surfaces PermissionDenied — this is what becomes EPERM on the guest.
+        let denied =
+            crate::cwfd::inet_listener_state::encode_sockaddr("93.184.216.34:443".parse().unwrap())
+                .expect("encode denied");
+        match client.tcp_conn_connect(handle, &denied, 1_000) {
+            Err(ClientError::PermissionDenied) => {}
+            other => panic!("expected PermissionDenied for a denied destination, got {other:?}"),
+        }
+
+        // The allowlisted destination passes enforcement: not PermissionDenied
+        // (the asynchronous host connect surfaces as WouldBlock).
+        let allowed =
+            crate::cwfd::inet_listener_state::encode_sockaddr("127.0.0.1:9".parse().unwrap())
+                .expect("encode allowed");
+        assert!(
+            !matches!(
+                client.tcp_conn_connect(handle, &allowed, 1_000),
+                Err(ClientError::PermissionDenied)
+            ),
+            "allowlisted destination must pass network enforcement",
+        );
+    }
+
     #[test]
     fn end_to_end_host_fd_lifecycle() {
         let (_dir, path, registry, _state, _proc) = spawn_test_listener();
