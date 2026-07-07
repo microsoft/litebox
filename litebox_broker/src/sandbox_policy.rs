@@ -33,7 +33,7 @@
 //! Hostname matching relies on the broker intercepting DNS queries from the
 //! guest and building an IP → hostname reverse map.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -139,7 +139,7 @@ impl SandboxPolicy {
     /// `hostname` is the DNS name that resolved to `ip`, if known. When the
     /// guest connects to an IP that was returned by a prior DNS query
     /// intercepted by the broker, the hostname is available for policy matching.
-    pub fn check_connect(&self, ip: Ipv4Addr, port: u16, hostname: Option<&str>) -> Decision {
+    pub fn check_connect(&self, ip: IpAddr, port: u16, hostname: Option<&str>) -> Decision {
         if !self.network.deny_all {
             return Decision::Allow;
         }
@@ -153,7 +153,7 @@ impl SandboxPolicy {
 }
 
 /// Check whether a `"host:port"` pattern matches a connection.
-fn connect_pattern_matches(pattern: &str, ip: Ipv4Addr, port: u16, hostname: Option<&str>) -> bool {
+fn connect_pattern_matches(pattern: &str, ip: IpAddr, port: u16, hostname: Option<&str>) -> bool {
     // Split pattern into host and port parts.
     let (host_pat, port_pat) = match pattern.rsplit_once(':') {
         Some((h, p)) => (h, p),
@@ -280,6 +280,12 @@ fn glob_match_inner(pat: &[char], txt: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    /// Test helper: build an `IpAddr` from V4 octets.
+    fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
 
     #[test]
     fn load_from_json() {
@@ -347,26 +353,22 @@ mod tests {
         .unwrap();
         // Allowed by exact hostname match.
         assert_eq!(
-            policy.check_connect(Ipv4Addr::new(140, 82, 121, 6), 443, Some("api.github.com"),),
+            policy.check_connect(ip(140, 82, 121, 6), 443, Some("api.github.com"),),
             Decision::Allow
         );
         // Allowed by wildcard hostname match.
         assert_eq!(
-            policy.check_connect(
-                Ipv4Addr::new(104, 16, 20, 35),
-                443,
-                Some("registry.npmjs.org"),
-            ),
+            policy.check_connect(ip(104, 16, 20, 35), 443, Some("registry.npmjs.org"),),
             Decision::Allow
         );
         // Denied — wrong hostname.
         assert_eq!(
-            policy.check_connect(Ipv4Addr::new(93, 184, 216, 34), 443, Some("evil.com"),),
+            policy.check_connect(ip(93, 184, 216, 34), 443, Some("evil.com"),),
             Decision::Deny
         );
         // Denied — no hostname, IP doesn't match pattern.
         assert_eq!(
-            policy.check_connect(Ipv4Addr::new(1, 2, 3, 4), 443, None),
+            policy.check_connect(ip(1, 2, 3, 4), 443, None),
             Decision::Deny
         );
     }
@@ -383,11 +385,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            policy.check_connect(Ipv4Addr::new(10, 0, 0, 1), 5640, None),
+            policy.check_connect(ip(10, 0, 0, 1), 5640, None),
             Decision::Allow
         );
         assert_eq!(
-            policy.check_connect(Ipv4Addr::new(10, 0, 1, 1), 80, None),
+            policy.check_connect(ip(10, 0, 1, 1), 80, None),
             Decision::Deny
         );
     }
@@ -404,11 +406,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            policy.check_connect(Ipv4Addr::new(93, 184, 216, 34), 80, Some("example.com"),),
+            policy.check_connect(ip(93, 184, 216, 34), 80, Some("example.com"),),
             Decision::Allow
         );
         assert_eq!(
-            policy.check_connect(Ipv4Addr::new(93, 184, 216, 34), 443, Some("example.com"),),
+            policy.check_connect(ip(93, 184, 216, 34), 443, Some("example.com"),),
             Decision::Allow
         );
     }
@@ -417,7 +419,7 @@ mod tests {
     fn network_not_deny_all_allows_everything() {
         let policy = SandboxPolicy::from_json(r#"{ "network": { "deny_all": false } }"#).unwrap();
         assert_eq!(
-            policy.check_connect(Ipv4Addr::new(1, 2, 3, 4), 80, Some("evil.com")),
+            policy.check_connect(ip(1, 2, 3, 4), 80, Some("evil.com")),
             Decision::Allow
         );
     }

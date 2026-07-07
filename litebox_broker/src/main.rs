@@ -271,6 +271,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sandbox_policy = load_sandbox_policy(&cli);
     litebox_timing::emit("broker_policy_loaded_ns");
 
+    // Open the audit log file for structured broker events. Opened before the
+    // state registry so the registry's network enforcer can emit its policy
+    // decisions (tcp_allowed / tcp_denied / dns_resolved) into the same file.
+    let audit_log =
+        cli.audit_log
+            .as_ref()
+            .and_then(|path| match litebox_broker::audit::AuditLog::open(path) {
+                Ok(al) => {
+                    info!(?path, "audit log opened");
+                    Some(al)
+                }
+                Err(e) => {
+                    tracing::error!("failed to open audit log {}: {e}", path.display());
+                    None
+                }
+            });
+    litebox_timing::emit("broker_audit_open_ns");
+
+    // Log policy summary to audit.
+    if let (Some(al), Some(sp)) = (&audit_log, &sandbox_policy) {
+        al.policy_loaded(
+            cli.policy
+                .as_ref()
+                .map(|p| p.to_str().unwrap_or("<non-utf8>"))
+                .unwrap_or("<default>"),
+            sp,
+        );
+    }
+
     // Phase B-Step8d: optionally host the fd-token / state-object
     // control listener. Runners connect via `--fd-token-broker <path>`
     // to register broker-backed eventfds (etc.) and to dup/materialise
@@ -305,10 +334,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     litebox_broker::nine_p_session_registry::set_global(std::sync::Arc::clone(
         &nine_p_session_registry,
     ));
-    let shared_state_registry = cli
-        .fd_token_broker_listen
-        .as_ref()
-        .map(|_| std::sync::Arc::new(litebox_broker::state_registry::BrokerStateRegistry::new()));
+    let shared_state_registry = cli.fd_token_broker_listen.as_ref().map(|_| {
+        std::sync::Arc::new(
+            litebox_broker::state_registry::BrokerStateRegistry::with_net_enforcement(
+                sandbox_policy.clone(),
+                audit_log.clone(),
+            ),
+        )
+    });
     let _fd_token_listener: Option<std::thread::JoinHandle<()>> =
         if let Some(path) = cli.fd_token_broker_listen.as_ref() {
             let fd_registry =
@@ -347,33 +380,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
-
-    // Open the audit log file for structured broker events.
-    let audit_log =
-        cli.audit_log
-            .as_ref()
-            .and_then(|path| match litebox_broker::audit::AuditLog::open(path) {
-                Ok(al) => {
-                    info!(?path, "audit log opened");
-                    Some(al)
-                }
-                Err(e) => {
-                    tracing::error!("failed to open audit log {}: {e}", path.display());
-                    None
-                }
-            });
-    litebox_timing::emit("broker_audit_open_ns");
-
-    // Log policy summary to audit.
-    if let (Some(al), Some(sp)) = (&audit_log, &sandbox_policy) {
-        al.policy_loaded(
-            cli.policy
-                .as_ref()
-                .map(|p| p.to_str().unwrap_or("<non-utf8>"))
-                .unwrap_or("<default>"),
-            sp,
-        );
-    }
 
     // Network proxy mode (fd passed from runner — Unix only).
     #[cfg(unix)]

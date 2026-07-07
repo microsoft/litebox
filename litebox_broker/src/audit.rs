@@ -8,7 +8,7 @@
 //! same file, providing a unified trace of sandbox activity.
 
 use std::io::Write;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -40,7 +40,7 @@ impl AuditLog {
     }
 
     /// Log that a DNS query was resolved.
-    pub fn dns_resolved(&self, hostname: &str, ips: &[Ipv4Addr]) {
+    pub fn dns_resolved(&self, hostname: &str, ips: &[IpAddr]) {
         let ips_json: Vec<String> = ips.iter().map(|ip| format!("\"{ip}\"")).collect();
         self.write_line(&format!(
             r#"{{"event":"dns_resolved","hostname":"{hostname}","ips":[{}]}}"#,
@@ -49,7 +49,7 @@ impl AuditLog {
     }
 
     /// Log that a TCP connection was allowed by policy.
-    pub fn tcp_allowed(&self, hostname: Option<&str>, ip: Ipv4Addr, port: u16) {
+    pub fn tcp_allowed(&self, hostname: Option<&str>, ip: IpAddr, port: u16) {
         let host = hostname
             .map(|h| format!(r#","hostname":"{h}""#))
             .unwrap_or_default();
@@ -59,7 +59,7 @@ impl AuditLog {
     }
 
     /// Log that a TCP connection was denied by policy.
-    pub fn tcp_denied(&self, hostname: Option<&str>, ip: Ipv4Addr, port: u16) {
+    pub fn tcp_denied(&self, hostname: Option<&str>, ip: IpAddr, port: u16) {
         let host = hostname
             .map(|h| format!(r#","hostname":"{h}""#))
             .unwrap_or_default();
@@ -69,7 +69,7 @@ impl AuditLog {
     }
 
     /// Log that a UDP datagram was denied by policy.
-    pub fn udp_denied(&self, hostname: Option<&str>, ip: Ipv4Addr, port: u16) {
+    pub fn udp_denied(&self, hostname: Option<&str>, ip: IpAddr, port: u16) {
         let host = hostname
             .map(|h| format!(r#","hostname":"{h}""#))
             .unwrap_or_default();
