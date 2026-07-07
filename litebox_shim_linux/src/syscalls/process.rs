@@ -7226,26 +7226,12 @@ impl<FS: ShimFS> Task<FS> {
                 .load(Ordering::Acquire);
             let (expected_now, threads_to_interrupt) = {
                 let inner = self.thread.process.inner.lock();
-                // Count only siblings that can still reach a park checkpoint.
-                // A thread that has begun exiting (`is_exiting`) will not park
-                // — the park checkpoint returns `EINTR` for it — yet it remains
-                // in `inner.threads` until its `Task` is dropped (which happens
-                // asynchronously, after fd cleanup). Counting such a thread in
-                // `expected_now` makes `parked_count` unreachable, so the
-                // forker spins until the exiting thread is finally removed.
-                // Under `PROMOTION_RACE.concurrent_fork` this is the previous
-                // forker: it finishes its fork, its thread closure returns and
-                // the pthread exits, and the next sibling forker would otherwise
-                // wait on that now-exiting thread — accumulating enough latency
-                // to trip the harness agent timeout.
                 let expected_now = u32::try_from(
                     inner
                         .threads
-                        .iter()
-                        .filter(|(tid, thread)| {
-                            **tid != self.tid && !thread.is_exiting.load(Ordering::Relaxed)
-                        })
-                        .count(),
+                        .len()
+                        .checked_sub(1)
+                        .expect("calling thread must be in the map"),
                 )
                 .expect("thread count must fit in u32");
                 let threads_to_interrupt = inner
