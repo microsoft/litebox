@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+mod tree;
 mod watch;
 
 #[derive(Parser)]
@@ -72,6 +73,10 @@ enum Commands {
         /// Path to a JSONL audit log file, or a directory (the most recent
         /// `*.jsonl` file within it is used).
         path: PathBuf,
+        /// Render a live-updating "frontier" tree (allowed vs denied
+        /// filesystem paths and network endpoints) instead of a line log.
+        #[arg(long)]
+        tree: bool,
         /// Print existing content and exit instead of following the file.
         #[arg(long)]
         no_follow: bool,
@@ -146,11 +151,12 @@ fn main() {
         Commands::Schema => print_schema(),
         Commands::Watch {
             path,
+            tree,
             no_follow,
             policy_only,
             filter,
         } => {
-            if let Err(e) = watch::run(&path, !no_follow, policy_only, filter.as_deref()) {
+            if let Err(e) = watch::run(&path, !no_follow, tree, policy_only, filter.as_deref()) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

@@ -1297,6 +1297,15 @@ impl Server {
             return error_response(libc::EPERM as u32);
         }
 
+        // Access authorized — record the first touch of this path for the
+        // "allowed" frontier (de-duplicated inside the audit log).
+        if let Some(ref al) = self.audit_log {
+            al.fs_allowed(
+                resolved.to_str().unwrap_or("?"),
+                if is_write { "write" } else { "read" },
+            );
+        }
+
         let mut opts = fs::OpenOptions::new();
         configure_open_options(&mut opts, flags);
 

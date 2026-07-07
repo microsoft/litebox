@@ -7,10 +7,17 @@
 //! events. These events interleave with the shim's syscall audit events in the
 //! same file, providing a unified trace of sandbox activity.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+/// Upper bound on the number of distinct `fs_allowed` `(action, path)` pairs
+/// remembered for de-duplication. Once reached, further first-touch allows are
+/// not emitted, bounding both memory and audit-log volume while still capturing
+/// the frontier of authorized paths.
+const FS_ALLOWED_DEDUP_CAP: usize = 65_536;
 
 /// Handle for writing structured audit events to a JSONL file.
 ///
@@ -18,6 +25,10 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct AuditLog {
     inner: Arc<Mutex<std::fs::File>>,
+    /// De-duplication set for `fs_allowed`: the shim opens the same paths
+    /// repeatedly, so only the first authorized access to each `(action, path)`
+    /// is emitted. Shared across clones so the whole broker de-dups together.
+    seen_allowed: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AuditLog {
@@ -29,6 +40,7 @@ impl AuditLog {
             .open(path)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(file)),
+            seen_allowed: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -96,6 +108,27 @@ impl AuditLog {
     pub fn fs_denied(&self, path: &str, action: &str) {
         self.write_line(&format!(
             r#"{{"event":"fs_denied","path":"{path}","action":"{action}"}}"#
+        ));
+    }
+
+    /// Log the first authorized access to a path, forming the "allowed"
+    /// frontier for the tree visualizer. De-duplicated per `(action, path)`
+    /// (bounded by [`FS_ALLOWED_DEDUP_CAP`]) since the shim re-opens paths
+    /// constantly.
+    pub fn fs_allowed(&self, path: &str, action: &str) {
+        let key = format!("{action}:{path}");
+        {
+            let mut seen = match self.seen_allowed.lock() {
+                Ok(seen) => seen,
+                Err(_) => return,
+            };
+            if seen.contains(&key) || seen.len() >= FS_ALLOWED_DEDUP_CAP {
+                return;
+            }
+            seen.insert(key);
+        }
+        self.write_line(&format!(
+            r#"{{"event":"fs_allowed","path":"{path}","action":"{action}"}}"#
         ));
     }
 }
