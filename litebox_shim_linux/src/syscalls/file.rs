@@ -2160,7 +2160,9 @@ impl<FS: ShimFS> Task<FS> {
                     self.broker_pty_background_read_sigttin(entry)?;
                     entry.read(&self.wait_cx(), buf)
                 }) {
-                    Err(Errno::EINTR) if self.pending_signals_all_ignored() => {
+                    Err(Errno::EINTR)
+                        if !self.is_suspended() && self.pending_signals_all_ignored() =>
+                    {
                         self.drain_ignored_pending();
                     }
                     result => return result,
@@ -2186,7 +2188,9 @@ impl<FS: ShimFS> Task<FS> {
                 .ok_or(Errno::EBADF)?;
             loop {
                 match handle.with_entry(|entry| entry.read(&self.wait_cx(), buf)) {
-                    Err(Errno::EINTR) if self.pending_signals_all_ignored() => {
+                    Err(Errno::EINTR)
+                        if !self.is_suspended() && self.pending_signals_all_ignored() =>
+                    {
                         self.drain_ignored_pending();
                     }
                     result => return result,
@@ -2404,7 +2408,9 @@ impl<FS: ShimFS> Task<FS> {
                         match handle
                             .with_entry(|entry| entry.read(&self.wait_cx(), &mut buf.borrow_mut()))
                         {
-                            Err(Errno::EINTR) if self.pending_signals_all_ignored() => {
+                            Err(Errno::EINTR)
+                                if !self.is_suspended() && self.pending_signals_all_ignored() =>
+                            {
                                 self.drain_ignored_pending();
                             }
                             result => return result,
@@ -8660,7 +8666,7 @@ impl<FS: ShimFS> Task<FS> {
                 ) {
                     Ok(()) => break,
                     Err(WaitError::Interrupted) => {
-                        if self.pending_signals_all_ignored() {
+                        if !self.is_suspended() && self.pending_signals_all_ignored() {
                             self.drain_ignored_pending();
                             continue;
                         }
