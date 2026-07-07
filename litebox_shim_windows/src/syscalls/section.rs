@@ -44,7 +44,9 @@ enum SectionBacking {
     Pagefile,
     /// The CSR client maps the session-global server data once; LiteBox pins the
     /// section object for the process and permanently rejects remaps instead of
-    /// reinitializing this persistent region.
+    /// reinitializing this persistent region. Unlike KUSER_SHARED_DATA, this is
+    /// synthesized by the shim on every host because CSRSS, not the kernel,
+    /// provides the real section.
     CsrSharedSection,
     ImageFile,
 }
@@ -643,6 +645,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !is_windows_shared_section(name) {
             return None;
         }
+        // TODO(section-subsystem): alias the base and session-qualified CSR names
+        // once a guest opens both; Windows resolves both to the same section.
         let section = {
             let mut persistent_sections = self.process.persistent_sections.write();
             persistent_sections
@@ -784,6 +788,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let csr_server_base = self.csr_server_read_only_shared_memory_base();
+        // TODO(section-subsystem): map a view of the load-time CSR region created
+        // in `build_process_environment` instead of allocating this second copy.
+        // The duplicate is safe only while the region remains read-only static
+        // data; its mapped base is not coherent with the PEB CSR base.
         let Ok(mapping) = create_pages(
             &self.global.page_manager,
             None,
