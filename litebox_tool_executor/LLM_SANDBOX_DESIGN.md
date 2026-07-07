@@ -430,9 +430,16 @@ The broker enforces two policy domains:
 - **Filesystem**: `allow_read`/`allow_write`/`deny` glob lists, enforced at the 9P protocol
   layer via `GlobPolicy`. All file operations pass through the broker's policy engine before
   touching the host filesystem.
-- **Network**: `deny_all` + `allow_connect` hostname:port patterns, enforced in the smoltcp
-  network proxy. The broker intercepts DNS queries (UDP port 53) to build an IP→hostname
-  reverse map, enabling hostname-based blocking (e.g., `allow_connect: ["api.github.com:443"]`).
+- **Network**: `deny_all` + `allow_connect` hostname:port patterns, enforced in the
+  broker-held inet connect path (`net_enforce::NetEnforcer`, consulted from
+  `cwfd::state_service::handle_inet_tcp_conn_connect` before the outbound
+  `start_connect`). The broker's virtual DNS resolver
+  (`cwfd::inet_dgram_state::forward_dns_query`) parses forwarded DNS answers to build an
+  IP→hostname reverse map, enabling hostname-based blocking (e.g.,
+  `allow_connect: ["api.github.com:443"]`). A denied connect surfaces to the guest as
+  `EPERM`. (Historically this lived in a smoltcp network proxy; that proxy was removed
+  when inet resources moved to the broker-held model, and enforcement was re-homed in
+  `net_enforce`.)
 
 Policies are loaded from a unified JSON file via the broker's `--policy` flag. The tool
 executor (`litebox_tool_executor`) spawns the broker with the policy file and connects
@@ -442,6 +449,13 @@ The previous shim-side policy (`litebox_shim_linux/src/policy.rs`) has been remo
 It ran inside the guest's trust domain, making it bypassable by malicious guest code.
 The `process` (exec) policy domain was dropped — filesystem policy provides indirect
 exec control by restricting which files can be accessed.
+
+Broker policy decisions and DNS resolutions are emitted as structured JSONL audit events
+(`policy_loaded`, `dns_resolved`, `tcp_allowed`, `tcp_denied`, `udp_denied`, `fs_allowed`,
+`fs_denied`). The cross-platform `litebox_audit_query watch` viewer tails this log, with a
+`--tree` mode that renders the live allow/deny "frontier" of filesystem paths and network
+endpoints. This supersedes the Windows-only PowerShell viewers
+(`scripts/audit/View-AuditLog.ps1`, `Tail-AuditLog.ps1`).
 
 ### Phase 4: VS Code Agent Integration
 

@@ -69,6 +69,46 @@ Then once VS Code is open:
 That second window's editor, terminal, and extensions all execute
 **inside** the sandbox.
 
+## Sandbox policy + frontier visualization
+
+The server task runs the sandbox with **policy enforcement on** —
+`--policy /opt/policies/demo-policy.json` (the repo's
+[`litebox_tool_executor/policies/demo-policy.json`](../policies/demo-policy.json)):
+a deny-by-default **network** policy with an allowlist for the hosts
+VS Code and Copilot need, plus **filesystem** rules that block secrets
+(`**/.ssh/**`, `**/id_rsa*`, `**/shadow`, …). This is what makes the
+sandbox *visible*: the coding agent inside cannot reach a
+non-allowlisted address (the broker refuses the outbound connect — the
+guest's `connect()` returns `EPERM`) or read a denied path.
+
+Broker policy decisions are appended as JSONL to the bind-mounted
+`target/litebox-audit/` directory on the host. To watch them live:
+
+- **Terminal → Run Task → `LiteBox: Watch Sandbox Frontier`** — a
+  live-updating tree of allowed (green) vs denied (red) filesystem
+  paths and network endpoints. As the agent works the tree grows to
+  show the *frontier* of what it actually reached.
+
+Or from any shell in the worktree:
+
+```sh
+# Frontier tree (a directory resolves to its newest *.jsonl):
+cargo run -p litebox_audit_query -- watch --tree target/litebox-audit
+
+# Scrolling policy-decision log (tcp/udp/fs/dns/policy, no syscall noise):
+cargo run -p litebox_audit_query -- watch --policy-only target/litebox-audit
+```
+
+`litebox_audit_query watch` is the cross-platform replacement for the
+old PowerShell `Tail-/View-AuditLog.ps1` viewers.
+
+**Demonstrating a block:** from the sandboxed VS Code terminal, try
+reaching a non-allowlisted host — e.g. `curl https://example.com` or a
+bash `exec 3<>/dev/tcp/1.1.1.1/80` — and it fails; a red node appears
+in the frontier tree. If VS Code itself misbehaves, a host it needs may
+be missing from the allowlist — add it to `demo-policy.json`'s
+`network.allow_connect` and restart the server task.
+
 ### Windows + WSL2 path note
 
 On Windows + WSL2, VS Code on Windows uses **Windows OpenSSH**,
