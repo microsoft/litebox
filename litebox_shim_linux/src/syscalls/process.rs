@@ -8532,13 +8532,29 @@ impl<FS: ShimFS> Task<FS> {
                 // without that infrastructure, plain EINTR is the safe
                 // choice (restarting would replay the original timeout,
                 // losing elapsed time).
-                self.global.futex_manager.wait(
+                match self.global.futex_manager.wait(
                     &self.wait_cx().with_timeout(timeout),
                     addr,
                     val,
                     None,
                     0,
-                )?;
+                ) {
+                    Ok(()) => {}
+                    Err(litebox::sync::futex::FutexError::WaitError(
+                        litebox::event::wait::WaitError::Interrupted,
+                    )) => {
+                        // Fork/vfork quiesce is an internal stop-the-world
+                        // interrupt, not a guest-visible signal. Restart the
+                        // futex wait after parking so glibc pthread locks
+                        // cannot observe a spurious EINTR while several
+                        // threads race fork().
+                        if self.is_suspended() {
+                            self.syscall_restartable.set(true);
+                        }
+                        return Err(Errno::EINTR);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
