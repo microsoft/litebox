@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32};
 use litebox::LiteBox;
 use litebox::fd::RawDescriptorStorage;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
+use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
 
@@ -97,6 +98,25 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
     let platform = test_platform();
     let litebox = LiteBox::new(platform);
     let page_manager = WindowsPageManager::<TestPlatform>::new(&litebox);
+    let windows_shared_section_base = {
+        let length =
+            NonZeroPageSize::new(crate::syscalls::section::WINDOWS_SHARED_SECTION_SIZE).unwrap();
+        // SAFETY: test setup requests a fresh anonymous mapping and does not replace pages.
+        unsafe {
+            page_manager.create_writable_pages(None, length, CreatePagesFlags::empty(), |_| Ok(0))
+        }
+        .expect("test CSR shared section allocation should succeed")
+        .as_usize()
+    };
+    crate::loader::initialize_windows_static_server_data_for_test::<TestPlatform>(
+        windows_shared_section_base,
+    )
+    .expect("test CSR shared section initialization should succeed");
+    let persistent_sections =
+        crate::WindowsPersistentSections::<TestPlatform>::new(BTreeMap::from([(
+            crate::syscalls::section::windows_shared_section_key(),
+            crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base),
+        )]));
     let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
     in_mem.with_root_privileges(|fs| {
         fs.mkdir(
@@ -156,9 +176,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             directory_namespace,
             event_namespace: crate::WindowsEventNamespace::<TestPlatform>::new(BTreeMap::new()),
             section_namespace: crate::WindowsSectionNamespace::<TestPlatform>::new(BTreeMap::new()),
-            persistent_sections: crate::WindowsPersistentSections::<TestPlatform>::new(
-                BTreeMap::new(),
-            ),
+            persistent_sections,
             section_views: crate::WindowsSectionViews::<TestPlatform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
             virtual_allocations: crate::WindowsVirtualAllocations::<TestPlatform>::new(

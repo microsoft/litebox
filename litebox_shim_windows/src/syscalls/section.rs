@@ -4,7 +4,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
-use core::mem::{offset_of, size_of};
+use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use int_enum::IntEnum;
@@ -16,7 +16,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, ProcessEnvironmentBlock};
+use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::mm::{MemoryType, PageProtection, create_pages, parse_page_protection};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsSectionView};
@@ -29,7 +29,7 @@ const MEM_DIFFERENT_IMAGE_BASE_OK: u32 = 0x0080_0000;
 const SUPPORTED_MAP_ALLOCATION_TYPES: u32 =
     MEM_TOP_DOWN | MEM_PHYSICAL | MEM_DIFFERENT_IMAGE_BASE_OK;
 const WINDOWS_SHARED_SECTION_OBJECT: &str = r"\Windows\SharedSection";
-const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
+pub(crate) const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
 
 enum SectionBacking {
     /// LiteBox lacks shared anonymous backing, so a pagefile section is
@@ -47,7 +47,9 @@ enum SectionBacking {
     /// reinitializing this persistent region. Unlike KUSER_SHARED_DATA, this is
     /// synthesized by the shim on every host because CSRSS, not the kernel,
     /// provides the real section.
-    CsrSharedSection,
+    CsrSharedSection {
+        base: usize,
+    },
     ImageFile,
 }
 
@@ -529,13 +531,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 page_protection,
                 permissions,
             ),
-            SectionBacking::CsrSharedSection => self.map_csr_shared_section(
+            SectionBacking::CsrSharedSection { .. } => self.map_csr_shared_section(
                 request,
                 &section,
                 requested_view_size,
                 section_offset,
                 page_protection,
-                permissions,
             ),
             SectionBacking::ImageFile => self.map_image_section(request, &section, page_protection),
         }
@@ -565,12 +566,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some((view_base, view)) = self.remove_section_view_for_address(base_address) else {
             return NtStatus::NOT_MAPPED_VIEW;
         };
-        let ptr = MutPtr::<Platform, u8>::from_usize(view_base);
-        // SAFETY: Section views are tracked only after this shim successfully creates the pages;
-        // unmapping consumes the tracked view and removes the exact owned range.
-        if unsafe { self.global.page_manager.remove_pages(ptr, view.size) }.is_err() {
-            self.process.section_views.write().insert(view_base, view);
-            return NtStatus::UNABLE_TO_FREE_VM;
+        let owns_pages = view.section.as_ref().is_none_or(|section| {
+            !matches!(section.backing, SectionBacking::CsrSharedSection { .. })
+        });
+        if owns_pages {
+            let ptr = MutPtr::<Platform, u8>::from_usize(view_base);
+            // SAFETY: Section views are tracked only after this shim successfully creates the pages;
+            // unmapping consumes the tracked view and removes the exact owned range.
+            if unsafe { self.global.page_manager.remove_pages(ptr, view.size) }.is_err() {
+                self.process.section_views.write().insert(view_base, view);
+                return NtStatus::UNABLE_TO_FREE_VM;
+            }
         }
         self.process.virtual_allocations.write().remove(&view_base);
         NtStatus::SUCCESS
@@ -645,13 +651,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !is_windows_shared_section(name) {
             return None;
         }
-        // TODO(section-subsystem): alias the base and session-qualified CSR names
-        // once a guest opens both; Windows resolves both to the same section.
         let section = {
             let mut persistent_sections = self.process.persistent_sections.write();
+            let section = persistent_sections
+                .get(&windows_shared_section_key())
+                .cloned()?;
             persistent_sections
                 .entry(key.clone())
-                .or_insert_with(windows_shared_section)
+                .or_insert(section)
                 .clone()
         };
         self.process
@@ -690,7 +697,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         match section.backing {
             SectionBacking::Pagefile => {}
-            SectionBacking::CsrSharedSection | SectionBacking::ImageFile => {
+            SectionBacking::CsrSharedSection { .. } | SectionBacking::ImageFile => {
                 return NtStatus::INVALID_FILE_FOR_SECTION;
             }
         }
@@ -761,7 +768,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         requested_view_size: usize,
         section_offset: usize,
         page_protection: PageProtection,
-        permissions: MemoryRegionPermissions,
     ) -> NtStatus {
         if section_offset != 0 {
             return NtStatus::INVALID_VIEW_SIZE;
@@ -777,9 +783,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(mapped_size) = view_size.checked_next_multiple_of(PAGE_SIZE) else {
             return NtStatus::INVALID_VIEW_SIZE;
         };
-        let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(mapped_size) else {
-            return NtStatus::INVALID_VIEW_SIZE;
-        };
         if !pagefile_view_protection_is_compatible(section.protection, page_protection) {
             return NtStatus::SECTION_PROTECTION;
         }
@@ -787,46 +790,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::NOT_SUPPORTED;
         }
 
-        let csr_server_base = self.csr_server_read_only_shared_memory_base();
-        // TODO(section-subsystem): make the load-time CSR region created in
-        // `build_process_environment` the backing for this SectionObject, then
-        // map views of that backing instead of allocating this second copy. The
-        // duplicate is safe only while the region remains read-only static data;
-        // its mapped base is not coherent with the PEB CSR base.
-        let Ok(mapping) = create_pages(
-            &self.global.page_manager,
-            None,
-            length,
-            CreatePagesFlags::empty(),
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-            |_| Ok(0),
-        ) else {
-            section.pagefile_view_active.store(false, Ordering::Release);
-            return NtStatus::NO_MEMORY;
+        let base = match section.backing {
+            SectionBacking::CsrSharedSection { base } => base,
+            SectionBacking::Pagefile | SectionBacking::ImageFile => unreachable!(),
         };
-
-        let base = mapping.as_usize();
-        if crate::loader::initialize_windows_static_server_data_for_server_base::<Platform>(
-            base,
-            csr_server_base.unwrap_or(base),
-        )
-        .is_err()
-        {
-            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
-            section.pagefile_view_active.store(false, Ordering::Release);
-            return NtStatus::NO_MEMORY;
-        }
-        if make_view_permissions(&self.global.page_manager, mapping, mapped_size, permissions)
-            .is_err()
-        {
-            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
-            section.pagefile_view_active.store(false, Ordering::Release);
-            return NtStatus::NO_MEMORY;
-        }
         if request.base_address.write_at_offset(0, base).is_none()
             || request.view_size.write_at_offset(0, view_size).is_none()
         {
-            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
             section.pagefile_view_active.store(false, Ordering::Release);
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -845,7 +815,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 size: mapped_size,
                 allocation_protect: section.protection,
                 type_: MemoryType::MEM_MAPPED,
-                pages: committed_pages(base, mapped_size, page_protection),
+                // TODO(section-subsystem): honor per-view CSR protections only after
+                // the backing is no longer aliased by PEB direct-deref pointers.
+                pages: committed_pages(base, mapped_size, section.protection),
             },
         );
         NtStatus::SUCCESS
@@ -933,20 +905,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    fn csr_server_read_only_shared_memory_base(&self) -> Option<usize> {
-        if self.process.peb_address == 0 {
-            return None;
-        }
-        let address = self.process.peb_address.checked_add(offset_of!(
-            ProcessEnvironmentBlock,
-            csr_server_read_only_shared_memory_base
-        ))?;
-        ConstPtr::<Platform, u64>::from_usize(address)
-            .read_at_offset(0)
-            .and_then(|base| usize::try_from(base).ok())
-            .filter(|base| *base != 0)
-    }
-
     fn read_section_name(
         &self,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
@@ -1010,7 +968,13 @@ fn is_windows_shared_section(object_path: &str) -> bool {
         }))
 }
 
-fn windows_shared_section<Platform: ShimPlatform>() -> Arc<SectionObject<Platform>> {
+pub(crate) fn windows_shared_section_key() -> String {
+    section_key(WINDOWS_SHARED_SECTION_OBJECT)
+}
+
+pub(crate) fn load_time_windows_shared_section<Platform: ShimPlatform>(
+    base: usize,
+) -> Arc<SectionObject<Platform>> {
     // CSRSS creates this named section for the CSR client/server contract. LiteBox
     // synthesizes it from the same static server data shape used for the PEB CSR
     // pointers instead of exposing a zeroed generic pagefile section.
@@ -1019,7 +983,7 @@ fn windows_shared_section<Platform: ShimPlatform>() -> Arc<SectionObject<Platfor
         size: WINDOWS_SHARED_SECTION_SIZE,
         attributes: SectionAllocationAttributes::SEC_COMMIT,
         protection: PageProtection::PAGE_READWRITE,
-        backing: SectionBacking::CsrSharedSection,
+        backing: SectionBacking::CsrSharedSection { base },
         pagefile_view_active: AtomicBool::new(false),
         _platform: PhantomData,
     })
@@ -1224,43 +1188,6 @@ fn remove_view_pages<Platform: ShimPlatform>(
     // SAFETY: The caller passes a section view range created by this module and not yet exposed,
     // or a tracked view being rolled back after output write failure.
     unsafe { page_manager.remove_pages(ptr, size) }.map_err(|_| ())
-}
-
-fn make_view_permissions<Platform: ShimPlatform>(
-    page_manager: &crate::WindowsPageManager<Platform>,
-    ptr: MutPtr<Platform, u8>,
-    len: usize,
-    permissions: MemoryRegionPermissions,
-) -> Result<(), ()> {
-    // SAFETY: The caller just created this exact mapping and has not exposed it
-    // to the guest yet; this only applies the final requested view protection.
-    unsafe {
-        match permissions {
-            permissions if permissions.is_empty() => page_manager.make_pages_inaccessible(ptr, len),
-            MemoryRegionPermissions::READ => page_manager.make_pages_readable(ptr, len),
-            permissions
-                if permissions
-                    == MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE =>
-            {
-                page_manager.make_pages_writable(ptr, len)
-            }
-            permissions
-                if permissions == MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC =>
-            {
-                page_manager.make_pages_executable(ptr, len)
-            }
-            permissions
-                if permissions
-                    == MemoryRegionPermissions::READ
-                        | MemoryRegionPermissions::WRITE
-                        | MemoryRegionPermissions::EXEC =>
-            {
-                page_manager.make_pages_rwx(ptr, len)
-            }
-            _ => unreachable!("Windows page protection parser produced unsupported permissions"),
-        }
-    }
-    .map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -1474,11 +1401,69 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(view_size, WINDOWS_SHARED_SECTION_SIZE);
+        let static_server_data_table = base + size_of::<usize>();
         let base_server_data =
-            ConstPtr::<TestPlatform, usize>::from_usize(base + size_of::<usize>())
-                .read_at_offset(0)
+            ConstPtr::<TestPlatform, usize>::from_usize(static_server_data_table)
+                .read_at_offset(1)
                 .expect("CSR static server data table is readable");
         assert!((base..base + view_size).contains(&base_server_data));
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
+            NtStatus::SUCCESS
+        );
+    }
+
+    #[test]
+    fn nt_map_view_of_windows_shared_section_keeps_direct_static_data_readable() {
+        let task = test_task();
+        let name = wide(r"\Windows\SharedSection");
+        let unicode = unicode(&name);
+        let attrs = object_attributes(&unicode);
+        let mut handle = Handle::default();
+
+        assert_eq!(
+            task.sys_nt_open_section(
+                mut_ptr(&mut handle),
+                SectionAccess::MAP_READ.bits(),
+                Some(const_ptr(&attrs)),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_NOACCESS.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+
+        let static_server_data_table = base + size_of::<usize>();
+        let base_server_data =
+            ConstPtr::<TestPlatform, usize>::from_usize(static_server_data_table)
+                .read_at_offset(1)
+                .expect("CSR static server data table remains readable");
+        let windows_directory =
+            ConstPtr::<TestPlatform, UnicodeString>::from_usize(base_server_data)
+                .read_at_offset(0)
+                .expect("BASESRV WindowsDirectory remains readable");
+        assert_eq!(
+            windows_directory
+                .read_string::<TestPlatform>()
+                .expect("WindowsDirectory string remains readable"),
+            r"C:\Windows"
+        );
+
         assert_eq!(
             task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
             NtStatus::SUCCESS

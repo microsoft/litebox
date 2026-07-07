@@ -40,6 +40,7 @@ use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
+    windows_shared_section_key,
 };
 use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
@@ -371,6 +372,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
         let directory_namespace = syscalls::directory::seed_directory_namespace();
+        let persistent_sections = WindowsPersistentSections::<Platform>::new(BTreeMap::from([(
+            windows_shared_section_key(),
+            load_info.windows_shared_section,
+        )]));
         let process = Arc::new(Process {
             ntdll_mapping: load_info.ntdll_mapping,
             peb_address: load_info.environment.peb,
@@ -378,7 +383,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             directory_namespace,
             event_namespace: WindowsEventNamespace::<Platform>::new(BTreeMap::new()),
             section_namespace: WindowsSectionNamespace::<Platform>::new(BTreeMap::new()),
-            persistent_sections: WindowsPersistentSections::<Platform>::new(BTreeMap::new()),
+            persistent_sections,
             section_views: WindowsSectionViews::<Platform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
             virtual_allocations: load_info.virtual_allocations,
