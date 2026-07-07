@@ -788,10 +788,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let csr_server_base = self.csr_server_read_only_shared_memory_base();
-        // TODO(section-subsystem): map a view of the load-time CSR region created
-        // in `build_process_environment` instead of allocating this second copy.
-        // The duplicate is safe only while the region remains read-only static
-        // data; its mapped base is not coherent with the PEB CSR base.
+        // TODO(section-subsystem): make the load-time CSR region created in
+        // `build_process_environment` the backing for this SectionObject, then
+        // map views of that backing instead of allocating this second copy. The
+        // duplicate is safe only while the region remains read-only static data;
+        // its mapped base is not coherent with the PEB CSR base.
         let Ok(mapping) = create_pages(
             &self.global.page_manager,
             None,
