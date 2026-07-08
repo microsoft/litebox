@@ -81,6 +81,7 @@ import datetime as _dt
 import json
 import math
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -2816,10 +2817,15 @@ def cmd_stress(args: argparse.Namespace) -> int:
     print(f"#   cargo: {' '.join(argv)}")
     if args.jobs:
         print(f"#   LITEBOX_TEST_JOBS={args.jobs}")
+    existing = sum(1 for i in range(parallel) if (root / str(i)).exists())
+    print(f"#   worktrees: {root}/  "
+          f"({existing}/{parallel} warm — reused; "
+          f"{'kept for reuse' if not args.cleanup else 'removed after (--cleanup)'})")
     if args.dry_run:
         print("# (dry-run — not spawning cargo)")
         for i, n in enumerate(dist):
-            print(f"#   worker {i}: {n} iters in {root / str(i)}")
+            warm = "warm-reuse" if (root / str(i)).exists() else "fresh (cold build)"
+            print(f"#   worker {i}: {n} iters in {root / str(i)}  [{warm}]")
         return 0
 
     env = os.environ.copy()
@@ -2837,17 +2843,39 @@ def cmd_stress(args: argparse.Namespace) -> int:
     def _worker(idx: int, n_iters: int) -> None:
         wt = root / str(idx)
         wt.parent.mkdir(parents=True, exist_ok=True)
+        # Reuse a *warm* worktree when one already exists: check out the
+        # target HEAD in place, keeping its `target/` so cargo builds
+        # incrementally (seconds) instead of cold (10+ min). Only create
+        # a fresh worktree when missing. Wiping + re-adding on every run
+        # forced a full rebuild of each worker before a single test ran —
+        # the dominant cost when iterating to catch a rare intermittent
+        # failure. A corrupt/locked reuse falls back to a clean re-add.
+        setup_ok = False
+        fresh = False
         if wt.exists():
-            subprocess.run(["git", "-C", str(target), "worktree", "remove",
-                            "--force", str(wt)], check=False,
-                           capture_output=True, text=True, timeout=60)
-        r = subprocess.run(["git", "-C", str(target), "worktree", "add",
-                            "--detach", str(wt), head], check=False,
-                           capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            print(f"stress: worker {idx} worktree setup failed: "
-                  f"{r.stderr.strip()}", file=sys.stderr)
-            return
+            r = subprocess.run(["git", "-C", str(wt), "checkout", "--detach",
+                                "-f", head], check=False,
+                               capture_output=True, text=True, timeout=120)
+            setup_ok = r.returncode == 0
+            if not setup_ok:
+                subprocess.run(["git", "-C", str(target), "worktree", "remove",
+                                "--force", str(wt)], check=False,
+                               capture_output=True, text=True, timeout=60)
+                shutil.rmtree(wt, ignore_errors=True)
+        if not setup_ok:
+            fresh = True
+            subprocess.run(["git", "-C", str(target), "worktree", "prune"],
+                           check=False, capture_output=True, timeout=30)
+            r = subprocess.run(["git", "-C", str(target), "worktree", "add",
+                                "--detach", str(wt), head], check=False,
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                print(f"stress: worker {idx} worktree setup failed: "
+                      f"{r.stderr.strip()}", file=sys.stderr)
+                return
+        print(f"[stress] worker {idx}: "
+              f"{'fresh worktree (cold build)' if fresh else 'reusing warm worktree'}"
+              f" {wt}", file=sys.stderr)
         worktrees.append(wt)
         for _ in range(n_iters):
             if stop.is_set():
@@ -2874,7 +2902,9 @@ def cmd_stress(args: argparse.Namespace) -> int:
         for t in threads:
             t.join(timeout=30)
     finally:
-        if not args.keep:
+        # Persist the worktrees by default so the NEXT run reuses their
+        # warm `target/`. Only remove on explicit --cleanup.
+        if args.cleanup:
             for wt in worktrees:
                 subprocess.run(["git", "-C", str(target), "worktree", "remove",
                                 "--force", str(wt)], check=False,
@@ -4742,9 +4772,12 @@ def build_parser() -> argparse.ArgumentParser:
                           default=None, help="restrict the summary to a mode")
     p_stress.add_argument("--jobs", type=int, default=None,
                           help="LITEBOX_TEST_JOBS for each worker")
+    p_stress.add_argument("--cleanup", action="store_true",
+                          help="remove the dedicated stress worktrees after "
+                               "the run (default: keep them so the next run "
+                               "reuses their warm target/ — no cold rebuild)")
     p_stress.add_argument("--keep", action="store_true",
-                          help="keep the dedicated stress worktrees "
-                               "(default: remove them after)")
+                          help=argparse.SUPPRESS)  # deprecated: now the default
     p_stress.add_argument("--dry-run", action="store_true",
                           help="print the plan (worktrees, cargo argv) "
                                "without spawning cargo")
