@@ -8582,6 +8582,29 @@ impl<FS: ShimFS> Task<FS> {
                         self.is_suspended(),
                         self.is_exiting(),
                     ));
+                    // Walk the guest stack to find the caller frames (return
+                    // addresses that land in guest .text) so the exact glibc
+                    // lock-acquire caller can be resolved.
+                    let rsp = self.last_syscall.get().map_or(0, |s| s.entry_rsp);
+                    if rsp != 0 {
+                        let mut frames = alloc::string::String::new();
+                        for i in 0..64usize {
+                            let w = crate::MutPtr::<usize>::from_usize(rsp + i * 8)
+                                .read_at_offset(0)
+                                .unwrap_or(0);
+                            // dng (non-PIE) harness .text ~0x4d4000..0x111c000;
+                            // glibc .text ~0xfffd3ab000..0xfffd533000.
+                            let is_harness = (0x40_0000..0x200_0000).contains(&w);
+                            let is_libc = (0xff_fd00_0000..0x100_0000_0000).contains(&w);
+                            if is_harness || is_libc {
+                                frames.push_str(&alloc::format!("{w:#x} "));
+                            }
+                        }
+                        self.global.platform.debug_log_print(&alloc::format!(
+                            "[FUTEX-STACK] tid={} rsp={:#x} frames=[ {}]\n",
+                            self.tid, rsp, frames,
+                        ));
+                    }
                 }
                 other => return other,
             }
