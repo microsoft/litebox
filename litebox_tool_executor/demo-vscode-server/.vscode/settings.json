@@ -16,20 +16,18 @@
     //
     //   Terminal → Run Task → "LiteBox: Setup and Start VS Code Server"
     //
-    // which runs three tasks in sequence:
+    // which runs setup tasks in sequence:
     //
     //   1. "LiteBox: Build"                — cargo build the litebox binaries.
     //   2. "LiteBox: Build VS Code Image"  — docker build litebox-vscode.
-    //   3. "LiteBox: Start VS Code Server" — docker run the image with --vscode-server.
+    //   3. "LiteBox: Setup SSH Key Auth"    — create a Windows-readable demo key.
+    //   4. "LiteBox: Start VS Code Server" — docker run the image with --vscode-server.
     //
-    // The three are also runnable individually if you only need to
+    // The component tasks are also runnable individually if you only need to
     // redo one step.
     //
     // Then in a separate VS Code window, Remote-SSH connect to
-    // `litebox` (configure `~/.ssh/config` Host litebox HostName
-    // 127.0.0.1 Port 2222 User root + empty password — dropbear
-    // is started with `-B` to allow blank-password root login for
-    // this demo).
+    // `litebox` (configure Windows %USERPROFILE%\.ssh\config as below).
     //
     // Recommended VS Code profile setup for Remote-SSH against
     // litebox (one-time, application-scoped settings — put them
@@ -52,9 +50,9 @@
     //     HostName 127.0.0.1
     //     Port 2222
     //     User root
-    //     PreferredAuthentications password
-    //     PubkeyAuthentication no
-    //     NumberOfPasswordPrompts 1
+    //     IdentityFile ~/.ssh/litebox_ed25519
+    //     IdentitiesOnly yes
+    //     PreferredAuthentications publickey
     //     StrictHostKeyChecking no
     //     UserKnownHostsFile /dev/null  ; on Windows: NUL
     //     ConnectionAttempts 1

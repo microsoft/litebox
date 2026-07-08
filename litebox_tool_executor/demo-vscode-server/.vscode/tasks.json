@@ -35,7 +35,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            // One-shot: run all three setup steps in sequence,
+            // One-shot: run all setup steps in sequence,
             // then start the server. Use this for first-time
             // setup or after switching worktrees. The
             // `dependsOrder: "sequence"` is required — without
@@ -46,6 +46,7 @@
             "dependsOn": [
                 "LiteBox: Build",
                 "LiteBox: Build VS Code Image",
+                "LiteBox: Setup SSH Key Auth",
                 "LiteBox: Start VS Code Server"
             ],
             "problemMatcher": [],
@@ -83,9 +84,21 @@
             }
         },
         {
+            "label": "LiteBox: Setup SSH Key Auth",
+            "type": "shell",
+            "command": "cd ${workspaceFolder}/../.. && bash litebox_tool_executor/demo-vscode-server/setup-ssh-key-auth.sh",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
             "label": "LiteBox: Start VS Code Server",
             "type": "shell",
-            "command": "mkdir -p ${workspaceFolder}/../../target/litebox-audit; docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro -v ${workspaceFolder}/../../litebox_tool_executor/policies:/opt/policies:ro -v ${workspaceFolder}/../../target/litebox-audit:/opt/audit litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --policy /opt/policies/demo-policy.json --audit-log /opt/audit",
+            "command": "cd ${workspaceFolder}/../.. && bash litebox_tool_executor/demo-vscode-server/setup-ssh-key-auth.sh && mkdir -p target/litebox-audit && (docker rm -f litebox-vscode 2>/dev/null || true) && docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro -v ${workspaceFolder}/../../litebox_tool_executor/policies:/opt/policies:ro -v ${workspaceFolder}/../../target/litebox-audit:/opt/audit -v ${workspaceFolder}/../../target/demo-vscode-server/ssh/server:/opt/litebox-demo-ssh:ro litebox-vscode /usr/bin/bash -lc 'mkdir -p /root/.ssh && cp /opt/litebox-demo-ssh/authorized_keys /root/.ssh/authorized_keys && chown root:root /root/.ssh /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --policy /opt/policies/demo-policy.json --audit-log /opt/audit'",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -98,7 +111,7 @@
         {
             "label": "LiteBox: Start VS Code Server (Debug)",
             "type": "shell",
-            "command": "mkdir -p ${workspaceFolder}/../../target/litebox-audit; docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro -v ${workspaceFolder}/../../litebox_tool_executor/policies:/opt/policies:ro -v ${workspaceFolder}/../../target/litebox-audit:/opt/audit litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --policy /opt/policies/demo-policy.json --audit-log /opt/audit --debug 9999",
+            "command": "cd ${workspaceFolder}/../.. && bash litebox_tool_executor/demo-vscode-server/setup-ssh-key-auth.sh && mkdir -p target/litebox-audit && (docker rm -f litebox-vscode 2>/dev/null || true) && docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro -v ${workspaceFolder}/../../litebox_tool_executor/policies:/opt/policies:ro -v ${workspaceFolder}/../../target/litebox-audit:/opt/audit -v ${workspaceFolder}/../../target/demo-vscode-server/ssh/server:/opt/litebox-demo-ssh:ro litebox-vscode /usr/bin/bash -lc 'mkdir -p /root/.ssh && cp /opt/litebox-demo-ssh/authorized_keys /root/.ssh/authorized_keys && chown root:root /root/.ssh /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --policy /opt/policies/demo-policy.json --audit-log /opt/audit --debug 9999'",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
