@@ -2248,11 +2248,17 @@ impl<FS: ShimFS> Task<FS> {
         writefds: Option<MutPtr<usize>>,
         exceptfds: Option<MutPtr<usize>>,
         timeout: TimeParam<Platform>,
-        sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack>>,
+        sigsetpack: Option<ConstPtr<litebox_common_linux::SigSetPack<Platform>>>,
     ) -> Result<usize, Errno> {
-        if sigsetpack.is_some() {
-            unimplemented!("no sigsetpack support yet");
-        }
+        let sigmask = if let Some(sigsetpack) = sigsetpack {
+            let sigsetpack = sigsetpack.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if sigsetpack.size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
+                return Err(Errno::EINVAL);
+            }
+            Some(sigsetpack.sigset.read_at_offset(0).ok_or(Errno::EFAULT)?)
+        } else {
+            None
+        };
         let timeout = timeout.read()?;
         if nfds >= i32::MAX as u32
             || nfds as usize
@@ -2277,13 +2283,20 @@ impl<FS: ShimFS> Task<FS> {
             .transpose()?
             .map(|fds| bitvec::vec::BitVec::from_vec(fds.into_vec()));
 
-        let count = self.do_pselect(
-            nfds,
-            kreadfds.as_mut(),
-            kwritefds.as_mut(),
-            kexceptfds.as_mut(),
-            timeout,
-        )?;
+        let mut do_pselect = || {
+            self.do_pselect(
+                nfds,
+                kreadfds.as_mut(),
+                kwritefds.as_mut(),
+                kexceptfds.as_mut(),
+                timeout,
+            )
+        };
+        let count = if let Some(sigmask) = sigmask {
+            self.with_temporary_signal_mask(sigmask, do_pselect)
+        } else {
+            do_pselect()
+        }?;
 
         if let Some(fds) = kreadfds {
             readfds

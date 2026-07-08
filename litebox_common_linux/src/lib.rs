@@ -1851,11 +1851,11 @@ bitflags::bitflags! {
     }
 }
 
-/// Packaged sigset with its size, used by `pselect` syscall
-#[derive(Clone, Copy, FromBytes, IntoBytes)]
+/// Packaged sigset pointer with its size, used by `pselect6` syscall.
+#[derive(Clone, Copy, FromBytes)]
 #[repr(C)]
-pub struct SigSetPack {
-    pub sigset: SigSet,
+pub struct SigSetPack<Platform: litebox::platform::RawPointerProvider> {
+    pub sigset: Platform::RawConstPointer<SigSet>,
     pub size: usize,
 }
 
@@ -2272,7 +2272,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         writefds: Option<Platform::RawMutPointer<usize>>,
         exceptfds: Option<Platform::RawMutPointer<usize>>,
         timeout: TimeParam<Platform>,
-        sigsetpack: Option<Platform::RawConstPointer<SigSetPack>>,
+        sigsetpack: Option<Platform::RawConstPointer<SigSetPack<Platform>>>,
     },
     ArchPrctl {
         arg: ArchPrctlArg<Platform>,

@@ -381,6 +381,14 @@ impl SignalState {
 struct DeliverFault;
 
 impl<FS: ShimFS> Task<FS> {
+    pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
+        let old = self.signals.blocked.get();
+        self.signals.set_signal_mask(mask);
+        let result = f();
+        self.signals.set_signal_mask(old);
+        result
+    }
+
     pub(crate) fn sys_rt_sigprocmask(
         &self,
         how: SigmaskHow,
