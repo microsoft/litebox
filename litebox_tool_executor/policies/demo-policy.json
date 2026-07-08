@@ -6,6 +6,8 @@
             "/shared/**",
             "/root/.cache",
             "/root/.cache/**",
+            "/root/.copilot",
+            "/root/.copilot/**",
             "/root/.vscode-server",
             "**/workspace/**",
             "**/workspaces/**",
@@ -13,7 +15,12 @@
             "/proc/self/fd/**"
         ],
         "deny": [
-            "**/.ssh/**",
+            "**/.ssh/id_*",
+            "**/.ssh/*_rsa*",
+            "**/.ssh/*_dsa*",
+            "**/.ssh/*_ecdsa*",
+            "**/.ssh/*_ed25519*",
+            "**/.ssh/config",
             "**/shadow",
             "**/id_rsa*",
             "**/id_ed25519*",
