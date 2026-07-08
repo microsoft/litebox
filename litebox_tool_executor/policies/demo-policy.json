@@ -26,6 +26,8 @@
             "update.code.visualstudio.com:443",
             "vscode.download.prss.microsoft.com:443",
             "*.prss.microsoft.com:443",
+            "main.vscode-cdn.net:443",
+            "*.vscode-cdn.net:443",
             "*.vo.msecnd.net:443",
             "*.visualstudio.com:443",
             "*.githubcopilot.com:443",
