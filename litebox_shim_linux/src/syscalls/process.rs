@@ -8571,9 +8571,11 @@ impl<FS: ShimFS> Task<FS> {
             match self.global.futex_manager.wait(&cx, addr, val, bitset, 0) {
                 Err(litebox::sync::futex::FutexError::WaitError(WaitError::TimedOut)) => {
                     let actual = crate::MutPtr::<u32>::from_usize(addr_usize).read_at_offset(0);
+                    let rip = self.last_syscall.get().map_or(0, |s| s.entry_rip);
                     self.global.platform.debug_log_print(&alloc::format!(
-                        "[FUTEX-STUCK] tid={} addr={:#x} expected={} actual={:?} suspended={} exiting={}\n",
+                        "[FUTEX-STUCK] tid={} rip={:#x} addr={:#x} expected={} actual={:?} suspended={} exiting={}\n",
                         self.tid,
+                        rip,
                         addr_usize,
                         val,
                         actual,
