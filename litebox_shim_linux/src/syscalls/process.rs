@@ -1085,10 +1085,18 @@ impl<FS: ShimFS> Task<FS> {
             // Some runtimes (e.g. BusyBox/musl) park clear_child_tid inside TLS
             // that they tear down before the final exit_group cleanup runs. Skip
             // the clear+wake once the guest mapping is already gone.
-            if self.guest_range_is_mapped(clear_child_tid_addr, core::mem::size_of::<i32>())
-                && self.prepare_guest_write(clear_child_tid, 1).is_ok()
-                && clear_child_tid.write_at_offset(0, 0).is_some()
+            let mapped =
+                self.guest_range_is_mapped(clear_child_tid_addr, core::mem::size_of::<i32>());
+            let prepped = mapped && self.prepare_guest_write(clear_child_tid, 1).is_ok();
+            let wrote = prepped && clear_child_tid.write_at_offset(0, 0).is_some();
             {
+                use litebox::platform::DebugLogProvider as _;
+                self.global.platform.debug_log_print(&alloc::format!(
+                    "[TID-EXIT] pid={} tid={} cct={:#x} mapped={} prepped={} wrote={}\n",
+                    self.process_id.0, self.tid, clear_child_tid_addr, mapped, prepped, wrote,
+                ));
+            }
+            if wrote {
                 let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid_addr);
                 let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
                     addr: clear_child_tid,
@@ -8573,7 +8581,8 @@ impl<FS: ShimFS> Task<FS> {
                     let actual = crate::MutPtr::<u32>::from_usize(addr_usize).read_at_offset(0);
                     let rip = self.last_syscall.get().map_or(0, |s| s.entry_rip);
                     self.global.platform.debug_log_print(&alloc::format!(
-                        "[FUTEX-STUCK] tid={} rip={:#x} addr={:#x} expected={} actual={:?} suspended={} exiting={}\n",
+                        "[FUTEX-STUCK] pid={} tid={} rip={:#x} addr={:#x} expected={} actual={:?} suspended={} exiting={}\n",
+                        self.process_id.0,
                         self.tid,
                         rip,
                         addr_usize,

@@ -214,7 +214,8 @@ impl<FS: ShimFS> Task<FS> {
             if park_iters.is_multiple_of(2) {
                 use litebox::platform::DebugLogProvider as _;
                 self.global.platform.debug_log_print(&alloc::format!(
-                    "[VFORK-PARK-STUCK] tid={} park_val={} iters={} suspended={} exiting={}\n",
+                    "[VFORK-PARK-STUCK] pid={} tid={} park_val={} iters={} suspended={} exiting={}\n",
+                    self.process_id.0,
                     self.tid,
                     v,
                     park_iters,
