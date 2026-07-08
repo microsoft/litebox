@@ -118,6 +118,20 @@ fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     }
 }
 
+/// DIAGNOSTIC (PROMOTION_RACE): set true (per fork-restore child process)
+/// by `run_fork_restore` so `handle_syscall_request` logs the child's first
+/// syscalls. A correct fork child resumes at fork()'s return and immediately
+/// `exit_group`s; a broken one replays program startup (mmap/clone/futex).
+pub static FORK_RESTORE_DIAG: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static FORK_RESTORE_DIAG_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Marks the current (fork-restore child) process for syscall-trace diagnostics.
+pub fn mark_fork_restore_child_for_diag() {
+    FORK_RESTORE_DIAG.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub struct LinuxShimEntrypoints<FS: ShimFS> {
     task: Task<FS>,
     // The task should not be moved once it's bound to a platform thread so that
@@ -3785,6 +3799,21 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let is_thread_exit = ctx.orig_rax == ::syscalls::Sysno::exit as usize;
+        if FORK_RESTORE_DIAG.load(core::sync::atomic::Ordering::Relaxed) {
+            let n = FORK_RESTORE_DIAG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 80 {
+                use litebox::platform::DebugLogProvider as _;
+                self.global.platform.debug_log_print(&alloc::format!(
+                    "[FORK-CHILD-SYS] #{} tid={} nr={} rip={:#x} arg0={:#x} arg1={:#x}\n",
+                    n,
+                    self.tid,
+                    ctx.orig_rax,
+                    ctx.rip,
+                    ctx.syscall_arg(0),
+                    ctx.syscall_arg(1),
+                ));
+            }
+        }
         // PE.1 Step C: stamp the broker control protocol caller_pid
         // header on every broker RPC issued by this syscall, so the
         // broker's per-(pid, id) tracker correctly attributes refs to
