@@ -1912,7 +1912,6 @@ fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
 /// the parent via the ack pipe before resuming.
 fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     // Audit log is now set up in run() before this is called.
-    litebox_shim_linux::mark_fork_restore_child_for_diag();
 
     let snapshot_fd = cli_args
         .fork_restore_fd

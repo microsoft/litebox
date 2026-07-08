@@ -1085,18 +1085,10 @@ impl<FS: ShimFS> Task<FS> {
             // Some runtimes (e.g. BusyBox/musl) park clear_child_tid inside TLS
             // that they tear down before the final exit_group cleanup runs. Skip
             // the clear+wake once the guest mapping is already gone.
-            let mapped =
-                self.guest_range_is_mapped(clear_child_tid_addr, core::mem::size_of::<i32>());
-            let prepped = mapped && self.prepare_guest_write(clear_child_tid, 1).is_ok();
-            let wrote = prepped && clear_child_tid.write_at_offset(0, 0).is_some();
+            if self.guest_range_is_mapped(clear_child_tid_addr, core::mem::size_of::<i32>())
+                && self.prepare_guest_write(clear_child_tid, 1).is_ok()
+                && clear_child_tid.write_at_offset(0, 0).is_some()
             {
-                use litebox::platform::DebugLogProvider as _;
-                self.global.platform.debug_log_print(&alloc::format!(
-                    "[TID-EXIT] pid={} tid={} cct={:#x} mapped={} prepped={} wrote={}\n",
-                    self.process_id.0, self.tid, clear_child_tid_addr, mapped, prepped, wrote,
-                ));
-            }
-            if wrote {
                 let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid_addr);
                 let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
                     addr: clear_child_tid,
@@ -7146,13 +7138,6 @@ impl<FS: ShimFS> Task<FS> {
                         .park
                         .underlying_atomic()
                         .store(1, Ordering::Release);
-                    {
-                        use litebox::platform::DebugLogProvider as _;
-                        self.global.platform.debug_log_print(&alloc::format!(
-                            "[PARK-SET] forker_tid={} expected={}\n",
-                            self.tid, expected,
-                        ));
-                    }
 
                     // Signal the transport to break out of spin loops.
                     self.global
@@ -7233,14 +7218,13 @@ impl<FS: ShimFS> Task<FS> {
         // Recompute the expected count each iteration. A sibling may exit
         // after the initial snapshot (without parking), which shrinks the
         // thread map and therefore the required parked count.
-        let mut confirm_iters = 0u32;
         loop {
             let n = ps
                 .vfork_parking
                 .parked_count
                 .underlying_atomic()
                 .load(Ordering::Acquire);
-            let (expected_now, threads_to_interrupt, diag) = {
+            let (expected_now, threads_to_interrupt) = {
                 let inner = self.thread.process.inner.lock();
                 let expected_now = u32::try_from(
                     inner
@@ -7261,33 +7245,8 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     })
                     .collect::<alloc::vec::Vec<_>>();
-                // DIAG (PROMOTION_RACE): once we have been unable to reach
-                // parking quorum for a while, snapshot each sibling's tid +
-                // is_suspended so we can see which thread never parked.
-                let diag = if confirm_iters >= 200 && confirm_iters.is_multiple_of(200) {
-                    let mut s = alloc::string::String::new();
-                    for (&tid, thread) in &inner.threads {
-                        if tid == self.tid {
-                            continue;
-                        }
-                        s.push_str(&alloc::format!(
-                            "{tid}:susp={},",
-                            thread.is_suspended.load(Ordering::Relaxed)
-                        ));
-                    }
-                    Some(s)
-                } else {
-                    None
-                };
-                (expected_now, threads_to_interrupt, diag)
+                (expected_now, threads_to_interrupt)
             };
-            if let Some(siblings) = diag {
-                use litebox::platform::DebugLogProvider as _;
-                self.global.platform.debug_log_print(&alloc::format!(
-                    "[VFORK-CONFIRM-STUCK] forker_tid={} iter={} parked={} expected={} siblings=[{}]\n",
-                    self.tid, confirm_iters, n, expected_now, siblings,
-                ));
-            }
             if n >= expected_now {
                 break;
             }
@@ -7306,7 +7265,6 @@ impl<FS: ShimFS> Task<FS> {
             for thread in threads_to_interrupt {
                 thread.interrupt();
             }
-            confirm_iters += 1;
             let _ = ps
                 .vfork_parking
                 .parked_count
@@ -7347,12 +7305,6 @@ impl<FS: ShimFS> Task<FS> {
             .underlying_atomic()
             .store(0, Ordering::Release);
         ps.vfork_parking.park.wake_all();
-        {
-            use litebox::platform::DebugLogProvider as _;
-            self.global
-                .platform
-                .debug_log_print(&alloc::format!("[PARK-CLEAR] forker_tid={}\n", self.tid));
-        }
 
         // Settle unclaimed deferred lies. Transport threads that lied
         // (incremented parked_count without blocking) may still be spinning
@@ -8552,74 +8504,6 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 impl<FS: ShimFS> Task<FS> {
-    /// DIAGNOSTIC (PROMOTION_RACE.concurrent_fork): wait on a *no-timeout*
-    /// futex with a periodic re-check so a stuck waiter (barrier / condvar)
-    /// is attributed. Every interval it logs the current guest futex word,
-    /// distinguishing:
-    ///   * `actual != expected` — the guest word changed (a wake IS due) but
-    ///     the waiter was still parked ⇒ litebox dropped the wake.
-    ///   * `actual == expected` — the word never changed ⇒ the waker never
-    ///     fired (upstream stall), not a lost wake.
-    /// The re-check also re-reads the word inside `FutexManager::wait`, so a
-    /// genuinely-changed word returns `ImmediatelyWokenBecauseValueMismatch`
-    /// on the next tick (self-heals within one interval — expected for the
-    /// diagnostic build).
-    fn futex_wait_stuck_diag(
-        &self,
-        addr_usize: usize,
-        val: u32,
-        bitset: Option<core::num::NonZeroU32>,
-    ) -> Result<(), litebox::sync::futex::FutexError> {
-        use litebox::platform::DebugLogProvider as _;
-        loop {
-            let cx = self
-                .wait_cx()
-                .with_timeout(Some(core::time::Duration::from_secs(3)));
-            let addr = crate::MutPtr::<u32>::from_usize(addr_usize);
-            match self.global.futex_manager.wait(&cx, addr, val, bitset, 0) {
-                Err(litebox::sync::futex::FutexError::WaitError(WaitError::TimedOut)) => {
-                    let actual = crate::MutPtr::<u32>::from_usize(addr_usize).read_at_offset(0);
-                    let rip = self.last_syscall.get().map_or(0, |s| s.entry_rip);
-                    self.global.platform.debug_log_print(&alloc::format!(
-                        "[FUTEX-STUCK] pid={} tid={} rip={:#x} addr={:#x} expected={} actual={:?} suspended={} exiting={}\n",
-                        self.process_id.0,
-                        self.tid,
-                        rip,
-                        addr_usize,
-                        val,
-                        actual,
-                        self.is_suspended(),
-                        self.is_exiting(),
-                    ));
-                    // Walk the guest stack to find the caller frames (return
-                    // addresses that land in guest .text) so the exact glibc
-                    // lock-acquire caller can be resolved.
-                    let rsp = self.last_syscall.get().map_or(0, |s| s.entry_rsp);
-                    if rsp != 0 {
-                        let mut frames = alloc::string::String::new();
-                        for i in 0..64usize {
-                            let w = crate::MutPtr::<usize>::from_usize(rsp + i * 8)
-                                .read_at_offset(0)
-                                .unwrap_or(0);
-                            // dng (non-PIE) harness .text ~0x4d4000..0x111c000;
-                            // glibc .text ~0xfffd3ab000..0xfffd533000.
-                            let is_harness = (0x40_0000..0x200_0000).contains(&w);
-                            let is_libc = (0xff_fd00_0000..0x100_0000_0000).contains(&w);
-                            if is_harness || is_libc {
-                                frames.push_str(&alloc::format!("{w:#x} "));
-                            }
-                        }
-                        self.global.platform.debug_log_print(&alloc::format!(
-                            "[FUTEX-STACK] tid={} rsp={:#x} frames=[ {}]\n",
-                            self.tid, rsp, frames,
-                        ));
-                    }
-                }
-                other => return other,
-            }
-        }
-    }
-
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(
         &self,
@@ -8648,17 +8532,13 @@ impl<FS: ShimFS> Task<FS> {
                 // without that infrastructure, plain EINTR is the safe
                 // choice (restarting would replay the original timeout,
                 // losing elapsed time).
-                if timeout.is_some() {
-                    self.global.futex_manager.wait(
-                        &self.wait_cx().with_timeout(timeout),
-                        addr,
-                        val,
-                        None,
-                        0,
-                    )?;
-                } else {
-                    self.futex_wait_stuck_diag(addr.as_usize(), val, None)?;
-                }
+                self.global.futex_manager.wait(
+                    &self.wait_cx().with_timeout(timeout),
+                    addr,
+                    val,
+                    None,
+                    0,
+                )?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
@@ -8711,19 +8591,13 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 // FUTEX_WAIT_BITSET uses an absolute deadline, so
                 // restart is safe — the same deadline is re-evaluated.
-                let bitset = core::num::NonZeroU32::new(bitmask);
-                let wait_result = if deadline.is_some() {
-                    self.global.futex_manager.wait(
-                        &self.wait_cx().with_deadline(deadline),
-                        addr,
-                        val,
-                        bitset,
-                        0,
-                    )
-                } else {
-                    self.futex_wait_stuck_diag(addr.as_usize(), val, bitset)
-                };
-                match wait_result {
+                match self.global.futex_manager.wait(
+                    &self.wait_cx().with_deadline(deadline),
+                    addr,
+                    val,
+                    core::num::NonZeroU32::new(bitmask),
+                    0,
+                ) {
                     Ok(()) => 0,
                     Err(litebox::sync::futex::FutexError::WaitError(
                         litebox::event::wait::WaitError::Interrupted,

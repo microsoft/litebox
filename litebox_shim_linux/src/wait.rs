@@ -193,7 +193,6 @@ impl<FS: ShimFS> Task<FS> {
 
         // Block until the forking thread clears the park flag or the
         // process begins exiting (exit_group wakes vfork_park).
-        let mut park_iters = 0u32;
         loop {
             let v = ps
                 .vfork_parking
@@ -203,26 +202,7 @@ impl<FS: ShimFS> Task<FS> {
             if v == 0 || self.is_exiting() {
                 break;
             }
-            let _ = ps
-                .vfork_parking
-                .park
-                .block_or_timeout(v, core::time::Duration::from_secs(2));
-            park_iters += 1;
-            // DIAG (PROMOTION_RACE): a thread parked-but-never-unparked would
-            // stall here forever. Log it so we can tell "stuck in fork park"
-            // apart from a guest-level wait.
-            if park_iters.is_multiple_of(2) {
-                use litebox::platform::DebugLogProvider as _;
-                self.global.platform.debug_log_print(&alloc::format!(
-                    "[VFORK-PARK-STUCK] pid={} tid={} park_val={} iters={} suspended={} exiting={}\n",
-                    self.process_id.0,
-                    self.tid,
-                    v,
-                    park_iters,
-                    self.is_suspended(),
-                    self.is_exiting(),
-                ));
-            }
+            let _ = ps.vfork_parking.park.block(v);
         }
 
         // Announce that we have unparked (whether we did a normal park or
