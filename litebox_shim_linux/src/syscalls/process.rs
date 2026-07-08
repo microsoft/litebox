@@ -7218,13 +7218,14 @@ impl<FS: ShimFS> Task<FS> {
         // Recompute the expected count each iteration. A sibling may exit
         // after the initial snapshot (without parking), which shrinks the
         // thread map and therefore the required parked count.
+        let mut confirm_iters = 0u32;
         loop {
             let n = ps
                 .vfork_parking
                 .parked_count
                 .underlying_atomic()
                 .load(Ordering::Acquire);
-            let (expected_now, threads_to_interrupt) = {
+            let (expected_now, threads_to_interrupt, diag) = {
                 let inner = self.thread.process.inner.lock();
                 let expected_now = u32::try_from(
                     inner
@@ -7245,8 +7246,33 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     })
                     .collect::<alloc::vec::Vec<_>>();
-                (expected_now, threads_to_interrupt)
+                // DIAG (PROMOTION_RACE): once we have been unable to reach
+                // parking quorum for a while, snapshot each sibling's tid +
+                // is_suspended so we can see which thread never parked.
+                let diag = if confirm_iters >= 200 && confirm_iters.is_multiple_of(200) {
+                    let mut s = alloc::string::String::new();
+                    for (&tid, thread) in &inner.threads {
+                        if tid == self.tid {
+                            continue;
+                        }
+                        s.push_str(&alloc::format!(
+                            "{tid}:susp={},",
+                            thread.is_suspended.load(Ordering::Relaxed)
+                        ));
+                    }
+                    Some(s)
+                } else {
+                    None
+                };
+                (expected_now, threads_to_interrupt, diag)
             };
+            if let Some(siblings) = diag {
+                use litebox::platform::DebugLogProvider as _;
+                self.global.platform.debug_log_print(&alloc::format!(
+                    "[VFORK-CONFIRM-STUCK] forker_tid={} iter={} parked={} expected={} siblings=[{}]\n",
+                    self.tid, confirm_iters, n, expected_now, siblings,
+                ));
+            }
             if n >= expected_now {
                 break;
             }
@@ -7265,6 +7291,7 @@ impl<FS: ShimFS> Task<FS> {
             for thread in threads_to_interrupt {
                 thread.interrupt();
             }
+            confirm_iters += 1;
             let _ = ps
                 .vfork_parking
                 .parked_count
