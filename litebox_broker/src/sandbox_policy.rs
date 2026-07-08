@@ -140,6 +140,16 @@ impl SandboxPolicy {
     /// guest connects to an IP that was returned by a prior DNS query
     /// intercepted by the broker, the hostname is available for policy matching.
     pub fn check_connect(&self, ip: IpAddr, port: u16, hostname: Option<&str>) -> Decision {
+        // Loopback is intra-sandbox, not egress: the network policy governs
+        // reachability of *external* hosts, so 127.0.0.0/8 and ::1 are always
+        // permitted. VS Code Remote-SSH depends on this — its SOCKS dynamic
+        // port-forward makes the in-sandbox sshd `connect()` to the server's
+        // `127.0.0.1:<ephemeral-port>`, which would otherwise be denied under
+        // `deny_all`. Loopback isolation, if ever needed, is the deployment's
+        // job (network namespace), not this egress policy's.
+        if ip.is_loopback() {
+            return Decision::Allow;
+        }
         if !self.network.deny_all {
             return Decision::Allow;
         }

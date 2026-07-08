@@ -341,6 +341,24 @@ mod tests {
     }
 
     #[test]
+    fn loopback_allowed_under_deny_all() {
+        // Loopback is intra-sandbox and exempt from the egress allowlist, even
+        // with an empty `allow_connect` under `deny_all`. VS Code Remote-SSH's
+        // SOCKS port-forward relies on the in-sandbox sshd reaching the
+        // server's `127.0.0.1:<ephemeral-port>`.
+        let policy =
+            SandboxPolicy::from_json(r#"{ "network": { "deny_all": true, "allow_connect": [] } }"#)
+                .unwrap();
+        let enforcer = NetEnforcer::new(Some(Arc::new(policy)), None);
+        // Any port on 127.0.0.0/8 and ::1 is allowed.
+        assert!(enforcer.allow_connect(IpAddr::V4(Ipv4Addr::LOCALHOST), 40539));
+        assert!(enforcer.allow_connect(IpAddr::V4(Ipv4Addr::new(127, 7, 7, 7)), 8080));
+        assert!(enforcer.allow_connect("::1".parse().unwrap(), 40539));
+        // A non-loopback address is still denied under deny_all.
+        assert!(!enforcer.allow_connect(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 40539));
+    }
+
+    #[test]
     fn disabled_enforcer_allows_everything() {
         let enforcer = NetEnforcer::disabled();
         assert!(enforcer.allow_connect(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443));
