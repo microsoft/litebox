@@ -14,7 +14,7 @@ use litebox::{
     fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path,
-    platform::{RawConstPointer, RawMutPointer},
+    platform::{RawConstPointer, RawMutPointer, StdioProvider, StdioStream},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -1949,7 +1949,17 @@ impl<FS: ShimFS> Task<FS> {
                 desc,
                 |fd| {
                     if self.is_stdio(&files.fs, fd)? {
-                        self.stdio_ioctl(&arg)
+                        let stream = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |stream: &StdioStream| *stream)
+                            .map_err(|_| Errno::ENOTTY)?;
+                        if self.global.platform.is_a_tty(stream) {
+                            self.stdio_ioctl(&arg)
+                        } else {
+                            Err(Errno::ENOTTY)
+                        }
                     } else {
                         Err(Errno::ENOTTY)
                     }

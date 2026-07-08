@@ -377,10 +377,16 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             .unwrap();
         let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
-        for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
+        for (raw_fd, fd, stream) in [
+            (0, stdin, litebox::platform::StdioStream::Stdin),
+            (1, stdout, litebox::platform::StdioStream::Stdout),
+            (2, stderr, litebox::platform::StdioStream::Stderr),
+        ] {
             let status_flags = OFlags::APPEND | OFlags::RDWR;
             debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
             let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
+            assert!(old.is_none());
+            let old = dt.set_entry_metadata(&fd, stream);
             assert!(old.is_none());
             let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
             assert!(success);
