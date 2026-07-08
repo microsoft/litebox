@@ -14,7 +14,7 @@
 //!   and `codeload.github.com` share a `com › github` subtree), with the port
 //!   as a `:PORT` leaf. Bare IPs are single-label nodes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const RESET: &str = "\x1b[0m";
 pub(crate) const RED: &str = "\x1b[31m";
@@ -33,37 +33,76 @@ struct Node {
     allowed: bool,
     denied: bool,
     terminal: bool,
+    /// Whether *this exact path* (not a descendant) was itself allowed/denied,
+    /// and with which action verbs. Distinct from `allowed`/`denied`, which
+    /// aggregate over the whole subtree for colouring. This is what lets the
+    /// tree surface a decision made *on an internal node's own path* (e.g. a
+    /// denied `mkdir /root` on a `root` node that also has allowed children) as
+    /// a `(self)` row, instead of an orphaned count that no child accounts for.
+    self_allowed: bool,
+    self_denied: bool,
+    allow_actions: BTreeSet<String>,
+    deny_actions: BTreeSet<String>,
     /// Interactive-TUI expand state (ignored by the static `render`).
     expanded: bool,
 }
 
 impl Node {
-    fn insert(&mut self, labels: &[String], allowed: bool) {
+    fn insert(&mut self, labels: &[String], allowed: bool, action: &str) {
         if allowed {
             self.allowed = true;
         } else {
             self.denied = true;
         }
         match labels.split_first() {
-            None => self.terminal = true,
+            None => {
+                self.terminal = true;
+                if allowed {
+                    self.self_allowed = true;
+                    if !action.is_empty() {
+                        self.allow_actions.insert(action.to_string());
+                    }
+                } else {
+                    self.self_denied = true;
+                    if !action.is_empty() {
+                        self.deny_actions.insert(action.to_string());
+                    }
+                }
+            }
             Some((head, rest)) => self
                 .children
                 .entry(head.clone())
                 .or_default()
-                .insert(rest, allowed),
+                .insert(rest, allowed, action),
         }
     }
 
-    /// Count of (allowed, denied) terminal leaves in this subtree.
+    /// Count of (allowed, denied) leaves in this subtree, counting a node's own
+    /// path decision — not the aggregate flags — so a node that was itself
+    /// denied but has allowed descendants contributes exactly one denial (its
+    /// own), never a phantom allow.
     fn leaf_counts(&self) -> (u32, u32) {
-        let mut a = u32::from(self.terminal && self.allowed);
-        let mut d = u32::from(self.terminal && self.denied);
+        let mut a = u32::from(self.self_allowed);
+        let mut d = u32::from(self.self_denied);
         for child in self.children.values() {
             let (ca, cd) = child.leaf_counts();
             a += ca;
             d += cd;
         }
         (a, d)
+    }
+
+    /// One-line summary of the verbs applied to *this exact path*, e.g.
+    /// `read ✓  mkdir ✗`. Empty when the path was only ever an interior node.
+    fn self_action_summary(&self) -> String {
+        let mut parts = Vec::new();
+        for a in &self.allow_actions {
+            parts.push(format!("{a} \u{2713}"));
+        }
+        for a in &self.deny_actions {
+            parts.push(format!("{a} \u{2717}"));
+        }
+        parts.join("  ")
     }
 
     fn child_mut(&mut self, labels: &[String]) -> Option<&mut Node> {
@@ -87,6 +126,10 @@ pub struct Row {
     pub allow_count: u32,
     pub deny_count: u32,
     pub is_section: bool,
+    /// A synthetic row for a node's *own* path decision (see `collect_rows`).
+    pub is_self: bool,
+    /// Verb summary for a terminal/self row, e.g. `read ✓  mkdir ✗`.
+    pub action: String,
     pub path: Vec<String>,
 }
 
@@ -138,6 +181,8 @@ impl Frontier {
                 allow_count: a,
                 deny_count: d,
                 is_section: true,
+                is_self: false,
+                action: String::new(),
                 path: vec![key.to_string()],
             });
             if expanded {
@@ -191,7 +236,8 @@ impl Frontier {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .collect();
-                self.fs.insert(&labels, allowed);
+                let action = v["action"].as_str().unwrap_or("");
+                self.fs.insert(&labels, allowed, action);
                 if allowed {
                     self.fs_allowed += 1;
                 } else {
@@ -208,7 +254,7 @@ impl Frontier {
                 let port = v["port"].as_i64().unwrap_or(0);
                 let mut labels: Vec<String> = host.split('.').rev().map(str::to_string).collect();
                 labels.push(format!(":{port}"));
-                self.net.insert(&labels, allowed);
+                self.net.insert(&labels, allowed, "connect");
                 if allowed {
                     self.net_allowed += 1;
                 } else {
@@ -308,9 +354,39 @@ fn collect_rows(node: &Node, prefix: &[String], depth: usize, rows: &mut Vec<Row
             allow_count: a,
             deny_count: d,
             is_section: false,
+            is_self: false,
+            // Leaves show their own verbs inline; interior nodes defer to a
+            // `(self)` row (below) so the header stays uncluttered.
+            action: if expandable {
+                String::new()
+            } else {
+                child.self_action_summary()
+            },
             path: path.clone(),
         });
         if expandable && child.expanded {
+            // If this interior node's *own* path was acted on (e.g. `mkdir
+            // /root` denied while its children were allowed), surface that
+            // decision as a `(self)` row so its aggregate count reconciles
+            // when you drill in — otherwise the ✗ looks orphaned.
+            if child.self_allowed || child.self_denied {
+                let mut self_path = path.clone();
+                self_path.push("\u{0}(self)".to_string());
+                rows.push(Row {
+                    depth: depth + 1,
+                    label: "(self)".to_string(),
+                    allowed: child.self_allowed,
+                    denied: child.self_denied,
+                    expandable: false,
+                    expanded: false,
+                    allow_count: u32::from(child.self_allowed),
+                    deny_count: u32::from(child.self_denied),
+                    is_section: false,
+                    is_self: true,
+                    action: child.self_action_summary(),
+                    path: self_path,
+                });
+            }
             collect_rows(child, &path, depth + 1, rows);
         }
     }
@@ -355,6 +431,47 @@ mod tests {
         assert!(f.fs.children["root"].allowed);
         assert!(f.fs.children["root"].denied);
         assert_eq!(status_color(true, true), YELLOW);
+    }
+
+    #[test]
+    fn self_decision_surfaces_as_row_with_actions() {
+        let mut f = Frontier::new(false);
+        // `/root` itself: read allowed + mkdir denied; plus an allowed child.
+        f.ingest(&ev(
+            r#"{"event":"fs_allowed","path":"/root","action":"read"}"#,
+        ));
+        f.ingest(&ev(
+            r#"{"event":"fs_denied","path":"/root","action":"mkdir"}"#,
+        ));
+        f.ingest(&ev(
+            r#"{"event":"fs_allowed","path":"/root/.bashrc","action":"read"}"#,
+        ));
+        f.set_expanded(&["fs".to_string(), "root".to_string()], true);
+        let rows = f.visible_rows();
+
+        // Count reconciles: own read + child .bashrc = 2 allowed; own mkdir = 1
+        // denied — no phantom allow from the terminal-with-allowed-descendants.
+        let root = rows.iter().find(|r| r.label == "root").expect("root row");
+        assert_eq!((root.allow_count, root.deny_count), (2, 1));
+
+        // The denial on `/root` itself surfaces as a `(self)` row carrying both
+        // verbs, so the ✗ is no longer orphaned when you drill in.
+        let self_row = rows.iter().find(|r| r.is_self).expect("(self) row");
+        assert!(self_row.allowed && self_row.denied);
+        assert!(self_row.action.contains("read") && self_row.action.contains("mkdir"));
+
+        // A pure denied leaf shows its verb inline.
+        f.ingest(&ev(
+            r#"{"event":"fs_denied","path":"/etc/shadow","action":"open"}"#,
+        ));
+        f.set_expanded(&["fs".to_string(), "etc".to_string()], true);
+        let rows = f.visible_rows();
+        let shadow = rows
+            .iter()
+            .find(|r| r.label == "shadow")
+            .expect("shadow row");
+        assert_eq!((shadow.allow_count, shadow.deny_count), (0, 1));
+        assert!(shadow.action.contains("open"));
     }
 
     #[test]

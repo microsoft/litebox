@@ -218,11 +218,16 @@ fn format_row(row: &Row, selected: bool, cols: usize) -> String {
     } else {
         String::new()
     };
+    let action = if row.action.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", row.action)
+    };
 
     if selected {
         // Reverse-video the whole row as plain text (inner colour resets would
         // otherwise cancel the highlight mid-line). Pad to full width.
-        let mut plain = format!("{indent}{glyph}{}{counts}", row.label);
+        let mut plain = format!("{indent}{glyph}{}{counts}{action}", row.label);
         let vis = plain.chars().count();
         if vis < cols {
             plain.push_str(&" ".repeat(cols - vis));
@@ -233,6 +238,10 @@ fn format_row(row: &Row, selected: bool, cols: usize) -> String {
     let color = status_color(row.allowed, row.denied);
     let label = if row.is_section {
         format!("{BOLD}{color}{}{RESET}", row.label)
+    } else if row.is_self {
+        // The `(self)` meta-row is a node's own-path decision, not a real
+        // child — render it dim so it's visually distinct from path children.
+        format!("{DIM}{}{RESET}", row.label)
     } else {
         format!("{color}{}{RESET}", row.label)
     };
@@ -241,5 +250,10 @@ fn format_row(row: &Row, selected: bool, cols: usize) -> String {
     } else {
         format!("{DIM}{counts}{RESET}")
     };
-    format!("{indent}{DIM}{glyph}{RESET}{label}{counts}")
+    let action = if action.is_empty() {
+        String::new()
+    } else {
+        format!("{DIM}{action}{RESET}")
+    };
+    format!("{indent}{DIM}{glyph}{RESET}{label}{counts}{action}")
 }
