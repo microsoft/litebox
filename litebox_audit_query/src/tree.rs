@@ -252,7 +252,16 @@ impl Frontier {
                     .or_else(|| v["ip"].as_str())
                     .unwrap_or("?");
                 let port = v["port"].as_i64().unwrap_or(0);
-                let mut labels: Vec<String> = host.split('.').rev().map(str::to_string).collect();
+                let mut labels: Vec<String> = if host.parse::<std::net::IpAddr>().is_ok() {
+                    // A bare IP is a single node: its octets/groups are not a
+                    // domain hierarchy, so reversing `169.254.169.254` into
+                    // `254 › 169 › 254 › 169` would be nonsense.
+                    vec![host.to_string()]
+                } else {
+                    // Reverse DNS labels so `api.github.com` and
+                    // `codeload.github.com` share a `com › github` subtree.
+                    host.split('.').rev().map(str::to_string).collect()
+                };
                 labels.push(format!(":{port}"));
                 self.net.insert(&labels, allowed, "connect");
                 if allowed {
@@ -472,6 +481,18 @@ mod tests {
             .expect("shadow row");
         assert_eq!((shadow.allow_count, shadow.deny_count), (0, 1));
         assert!(shadow.action.contains("open"));
+    }
+
+    #[test]
+    fn bare_ip_is_single_node_not_reversed() {
+        let mut f = Frontier::new(false);
+        f.ingest(&ev(
+            r#"{"event":"tcp_denied","ip":"169.254.169.254","port":80}"#,
+        ));
+        let rows = f.visible_rows();
+        // The IP is one node under Network, not four reversed octets.
+        assert!(rows.iter().any(|r| r.label == "169.254.169.254"));
+        assert!(!rows.iter().any(|r| r.label == "254"));
     }
 
     #[test]
