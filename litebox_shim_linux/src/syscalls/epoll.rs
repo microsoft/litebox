@@ -120,29 +120,6 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             }
         })?
     }
-
-    /// Human-readable descriptor kind, used only for diagnostics.
-    fn kind_str(&self) -> &'static str {
-        match self {
-            EpollDescriptor::Eventfd(_) => "eventfd",
-            EpollDescriptor::Signalfd(_) => "signalfd",
-            EpollDescriptor::Inotify(_) => "inotify",
-            EpollDescriptor::BrokerInetListener(_) => "broker_inet_listener",
-            EpollDescriptor::BrokerInetDgram(_) => "broker_inet_dgram",
-            EpollDescriptor::BrokerInetRaw(_) => "broker_inet_raw",
-            EpollDescriptor::Epoll(_) => "epoll",
-            EpollDescriptor::File(_) => "file",
-            #[cfg(feature = "worker_local_inet")]
-            EpollDescriptor::Socket(_) => "socket",
-            EpollDescriptor::Unix(_) => "unix",
-            EpollDescriptor::HostPassthroughFd(_) => "host_passthrough",
-            EpollDescriptor::BrokerPipe(_) => "broker_pipe",
-            EpollDescriptor::BrokerPty(_) => "broker_pty",
-            EpollDescriptor::BrokerSocketPair(_) => "broker_socketpair",
-            EpollDescriptor::BrokerTcpConn(_) => "broker_tcp_conn",
-            EpollDescriptor::BrokerUnixStream(_) => "broker_unix_stream",
-        }
-    }
 }
 
 enum DescriptorRef<FS: ShimFS> {
@@ -627,20 +604,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                     }
                 }
             } else {
-                // Even when no descriptor needs host polling, do not trust
-                // in-process readiness notifications *indefinitely*. A
-                // broker-backed fd whose readiness notification is dropped
-                // during a concurrent fork / eventfd-signalfd promotion race
-                // (see PROMOTION_RACE.concurrent_fork.*) would otherwise wedge
-                // this wait forever, since nothing re-polls the interest set.
-                // Bound the wait with a safety re-poll interval and rescan on
-                // expiry so any lost notification self-heals. `with_timeout`
-                // clamps to the caller's real deadline, so this never delays a
-                // genuine epoll_wait timeout.
-                const SAFETY_POLL_INTERVAL: core::time::Duration =
-                    core::time::Duration::from_millis(50);
-                let poll_cx = cx.with_timeout(Some(SAFETY_POLL_INTERVAL));
-                match self.ready.pollee.wait(&poll_cx, false, Events::IN, || {
+                match self.ready.pollee.wait(cx, false, Events::IN, || {
                     self.drive_network_for_socket_interests(global);
                     self.ready.pop_multiple(global, fs, maxevents, &mut events);
                     if !events.is_empty() {
@@ -655,23 +619,6 @@ impl<FS: ShimFS> EpollFile<FS> {
                     Ok(WaitOutcome::Ready) => return Ok(events),
                     Ok(WaitOutcome::RecheckMode) => {}
                     Err(TryOpError::TryAgain) => unreachable!(),
-                    Err(TryOpError::WaitError(WaitError::TimedOut)) => {
-                        // Distinguish the caller's real deadline from our
-                        // internal safety interval. If the caller set a
-                        // deadline and it has elapsed, propagate the timeout.
-                        if cx
-                            .deadline()
-                            .is_some_and(|_| cx.remaining_timeout().is_none())
-                        {
-                            return Err(WaitError::TimedOut);
-                        }
-                        // Only our safety interval elapsed: a lost notification
-                        // would leave a genuinely-ready interest unqueued.
-                        // Attribute it (diagnostic) and recover it; the outer
-                        // loop then re-pops.
-                        self.log_lost_ready_interests(global, fs);
-                        self.refresh_ready_interests(global, fs);
-                    }
                     Err(TryOpError::WaitError(WaitError::Interrupted)) => {
                         // PE.14: before honoring EINTR, do one more pass
                         // to collect events that may have become ready
@@ -806,30 +753,6 @@ impl<FS: ShimFS> EpollFile<FS> {
             }
             if let Some((Some(_event), _)) = entry.poll(global, fs, false, false) {
                 self.ready.push(&entry);
-            }
-        }
-    }
-
-    /// Diagnostic: log any interest that polls ready but was never queued
-    /// into the ready set (i.e. whose readiness notification was lost). Used
-    /// only from the Branch-B safety re-poll to attribute lost wakeups to a
-    /// descriptor kind.
-    fn log_lost_ready_interests(&self, global: &GlobalState<FS>, fs: &FS) {
-        use litebox::platform::DebugLogProvider as _;
-        let entries = {
-            let interests = self.interests.lock();
-            interests.values().cloned().collect::<Vec<_>>()
-        };
-        for entry in entries {
-            if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
-                continue;
-            }
-            if let Some((Some(_event), _)) = entry.poll(global, fs, false, false) {
-                let kind = entry.desc.upgrade().map_or("<dropped>", |d| d.kind_str());
-                let msg = alloc::format!(
-                    "[EPOLL-LOST-WAKE] Branch-B safety re-poll found ready-but-unqueued interest kind={kind}\n"
-                );
-                litebox_platform_multiplex::platform().debug_log_print(&msg);
             }
         }
     }
