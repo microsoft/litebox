@@ -1085,28 +1085,32 @@ impl<FS: ShimFS> Task<FS> {
             // Some runtimes (e.g. BusyBox/musl) park clear_child_tid inside TLS
             // that they tear down before the final exit_group cleanup runs. Skip
             // the clear+wake once the guest mapping is already gone.
-            if self.guest_range_is_mapped(clear_child_tid_addr, core::mem::size_of::<i32>())
-                && self.prepare_guest_write(clear_child_tid, 1).is_ok()
-                && clear_child_tid.write_at_offset(0, 0).is_some()
-            {
-                let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid_addr);
-                let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
-                    addr: clear_child_tid,
-                    flags: litebox_common_linux::FutexFlags::PRIVATE,
-                    count: 1,
-                });
-                // If this clear landed inside an active vfork/delayed-fork
-                // window, the forking thread's `restore_cow_layer` will roll
-                // the descriptor page back to its snapshot (the pre-clear TID
-                // value), resurrecting the join futex and wedging any joiner
-                // in `pthread_join` forever. An exiting thread is deliberately
-                // allowed to bypass the fork quiesce (see the `is_suspended`
-                // wake above) so the forker isn't stuck waiting for it to park
-                // — but that means its clear_child_tid write is exposed to the
-                // rollback. Record the address on the covering CoW layer so the
-                // restore re-applies the clear+wake after rolling the page back.
+            if self.guest_range_is_mapped(clear_child_tid_addr, core::mem::size_of::<i32>()) {
+                // If this clear lands inside an active vfork/delayed-fork window,
+                // the forking thread's `restore_cow_layer` will roll the
+                // descriptor page back to its snapshot (the pre-clear TID value),
+                // resurrecting the join futex and wedging any joiner in
+                // `pthread_join` forever. An exiting thread is deliberately
+                // allowed to bypass the fork quiesce (see the `is_suspended` wake
+                // above) so the forker isn't stuck waiting for it to park — but
+                // that leaves its clear_child_tid write exposed to the rollback.
+                // Record the address on the covering CoW layer *before* the write
+                // so a restore that races between our snapshot-fault and here
+                // still re-applies the clear+wake (a register-after-write could be
+                // drained-then-missed). The re-applying layer always restores
+                // after the layer the snapshot landed in, so word ends at 0.
                 if let Some((cow, _)) = self.top_cow_layer_for_page(clear_child_tid_addr) {
                     cow.pending_join_wakes.lock().push(clear_child_tid_addr);
+                }
+                if self.prepare_guest_write(clear_child_tid, 1).is_ok()
+                    && clear_child_tid.write_at_offset(0, 0).is_some()
+                {
+                    let clear_child_tid = crate::MutPtr::from_usize(clear_child_tid_addr);
+                    let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
+                        addr: clear_child_tid,
+                        flags: litebox_common_linux::FutexFlags::PRIVATE,
+                        count: 1,
+                    });
                 }
             }
         }
