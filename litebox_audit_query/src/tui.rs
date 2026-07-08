@@ -51,9 +51,17 @@ fn event_loop(
     let mut dirty = true;
 
     loop {
-        // Fold any newly-appended log lines into the model.
-        let n = file.read(&mut buf).unwrap_or(0);
-        if n > 0 {
+        // Drain newly-appended log lines into the model each tick. Cap the work
+        // per tick (~4 MiB) so a huge backlog — e.g. a runaway extension host
+        // flooding the log — is caught up over several ticks while the UI stays
+        // responsive, instead of the old one-64-KiB-chunk-per-tick pace that
+        // fell behind unboundedly whenever the log outgrew ~530 KiB/s.
+        let mut drained = 0usize;
+        loop {
+            let n = file.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
             carry.extend_from_slice(&buf[..n]);
             while let Some(pos) = carry.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = carry.drain(..=pos).collect();
@@ -64,6 +72,10 @@ fn event_loop(
                 {
                     dirty |= frontier.ingest(&v);
                 }
+            }
+            drained += n;
+            if drained >= 4 * 1024 * 1024 {
+                break;
             }
         }
 
