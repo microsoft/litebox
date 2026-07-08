@@ -8,6 +8,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::cell::Cell;
+use std::io::IsTerminal as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -103,6 +104,7 @@ pub struct LinuxUserland {
     /// is persistent across multiple process executions, however, it is ephemeral across true
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
+    stdio_is_tty: [bool; 3],
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -232,6 +234,11 @@ impl LinuxUserland {
             reserved_pages,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
+            stdio_is_tty: [
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+                std::io::stderr().is_terminal(),
+            ],
         };
         Box::leak(Box::new(platform))
     }
@@ -1669,13 +1676,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
-        use litebox::platform::StdioStream;
-        use std::io::IsTerminal as _;
-        match stream {
-            StdioStream::Stdin => std::io::stdin().is_terminal(),
-            StdioStream::Stdout => std::io::stdout().is_terminal(),
-            StdioStream::Stderr => std::io::stderr().is_terminal(),
-        }
+        self.stdio_is_tty[stream as usize]
     }
 }
 
