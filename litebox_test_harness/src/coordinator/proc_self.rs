@@ -20,6 +20,7 @@ const PROC_SELF_CASES: &[&str] = &[
     "exe_points_to_guest_program",
     "fd_lists_guest_table",
     "fd_N_symlink_target_correct",
+    "fd_N_chmod_reaches_real_file",
     "cmdline_is_guest_argv",
     "cwd_matches_guest_chdir",
     "status_pid_is_guest_pid",
@@ -79,6 +80,7 @@ fn proc_self_leaf(args: &[String]) -> i32 {
         "exe_points_to_guest_program" => check_exe_points_to_guest_program(args),
         "fd_lists_guest_table" => check_fd_lists_guest_table(),
         "fd_N_symlink_target_correct" => check_fd_n_symlink_target_correct(),
+        "fd_N_chmod_reaches_real_file" => check_fd_n_chmod_reaches_real_file(),
         "cmdline_is_guest_argv" => check_cmdline_is_guest_argv(args),
         "cwd_matches_guest_chdir" => check_cwd_matches_guest_chdir(),
         "status_pid_is_guest_pid" => check_status_pid_is_guest_pid(),
@@ -154,6 +156,43 @@ fn check_fd_n_symlink_target_correct() -> Result<String, String> {
             "fd={fd} target={} expected={}",
             target.display(),
             expected.display()
+        ))
+    }
+}
+
+/// A chmod through `/proc/self/fd/N` must land on the file behind fd N.
+///
+/// This is exactly how musl's `fchmod(fd, mode)` is implemented and how GNU
+/// `tar` sets permissions while extracting — so it is the minimal repro for the
+/// VS Code Remote-SSH server tar-extraction failure under Litebox, where every
+/// `fchmodat(AT_FDCWD, "/proc/self/fd/N", …)` mis-resolves broker-side (the
+/// broker canonicalizes `/proc/self/fd/N` against *its own* fd table). Under an
+/// allow-all policy it silently chmods the wrong file (the guest's file keeps
+/// its old mode); under an enforcing policy it surfaces as `EPERM`.
+///
+/// Native: `chmod("/proc/self/fd/N", 0o755)` follows the magic symlink and the
+/// real file becomes `0o755`.
+fn check_fd_n_chmod_reaches_real_file() -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = unique_shared_path("proc-self-fd-chmod");
+    fs::write(&path, b"chmod-target").map_err(|e| format!("write {}: {e}", path.display()))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("set initial mode {}: {e}", path.display()))?;
+    let file = File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let fd = file.as_raw_fd();
+    let proc_path = format!("/proc/self/fd/{fd}");
+    fs::set_permissions(&proc_path, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod via {proc_path}: {e}"))?;
+    let mode = fs::metadata(&path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode == 0o755 {
+        Ok(format!("fd={fd} mode={mode:o}"))
+    } else {
+        Err(format!(
+            "chmod via {proc_path} did not reach the file behind fd {fd}: mode={mode:o} expected=755"
         ))
     }
 }

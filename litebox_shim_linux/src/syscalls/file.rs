@@ -6191,6 +6191,24 @@ impl<FS: ShimFS> Task<FS> {
         let mode = litebox::fs::Mode::from_bits_truncate(mode);
         match fs_path {
             FsPath::Absolute { path } => {
+                // `/proc/self/fd/N` and `/dev/fd/N` are guest-relative fd
+                // references: `N` names a *guest* fd, meaningful only in the
+                // guest fd namespace. Resolve to the fd's real path here (as
+                // `openat`/`stat` already do) so the broker chmods the file
+                // behind fd `N` — not whatever its own host fd `N` happens to
+                // point at. glibc `tar` depends on this: it sets extracted-file
+                // modes via `fchmodat(AT_FDCWD, "/proc/self/fd/N", mode)`, and
+                // without the translation every such call mis-resolves
+                // broker-side (the broker canonicalizes the literal path
+                // against its own `/proc/self/fd`).
+                let procfd = path.to_str().ok().and_then(|s| {
+                    (s.starts_with("/proc/self/fd/") || s.starts_with("/dev/fd/"))
+                        .then(|| s.to_string())
+                });
+                let path = match procfd {
+                    Some(s) => CString::new(self.do_readlink(&s)?).map_err(|_| Errno::EINVAL)?,
+                    None => path,
+                };
                 let mut descriptors = self.global.litebox.descriptor_table_mut();
                 self.files
                     .borrow()
