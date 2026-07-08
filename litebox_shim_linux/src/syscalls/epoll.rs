@@ -129,9 +129,21 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 Some(handle.with_entry(|entry| poll(entry)))
             }
             EpollDescriptor::Epoll(_file) => unimplemented!(),
-            EpollDescriptor::File(_file) => {
-                // TODO: probably polling on stdio files, return dummy events for now
-                Some(Events::OUT & mask)
+            EpollDescriptor::File(file) => {
+                // TODO: File polling returns dummy events for now, but distinguish stdio enough for REPLs.
+                let events = match global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(file, |stream: &litebox::platform::StdioStream| *stream)
+                {
+                    Ok(litebox::platform::StdioStream::Stdin) => Events::IN,
+                    Ok(
+                        litebox::platform::StdioStream::Stdout
+                        | litebox::platform::StdioStream::Stderr,
+                    )
+                    | Err(_) => Events::OUT,
+                };
+                Some(events & mask)
             }
             EpollDescriptor::Socket(fd) => {
                 let proxy = match global.get_proxy(fd) {
