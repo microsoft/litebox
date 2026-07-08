@@ -571,14 +571,21 @@ dashboard.py validate RL.subscriber_exits_first --sha <HEAD>
 
 - Runs in **dedicated** worktrees under `<state-dir>/stress/` — never the
   supervisor's per-branch shadow, so it can't race `target/` / `docker
-  build`.
+  build`. These worktrees **persist and are reused warm** across runs:
+  only the *first* run for a branch pays a cold `cargo build`; restarts
+  check out HEAD in place and build incrementally (seconds, not minutes).
+  This matters when iterating to catch a rare intermittent failure —
+  otherwise every restart recompiles instead of testing. Pass `--cleanup`
+  to remove the worktrees after a run (frees the ~10–15 GB `target/` per
+  worker, at the cost of a cold build next time).
 - `--parallel K` (or `--under-load` = `--parallel 4`) runs K copies
   concurrently; the concurrency *is* the load that surfaces the flake
   class litebox keeps hitting (broker/coordination timeouts under load).
 - Uses a plain positional filter, not `--fill`, so each iteration re-runs
   the test for a fresh sample (rather than skipping already-covered ones).
-- `--dry-run` prints the plan (worktrees + cargo argv) without spawning
-  cargo. Exits non-zero if any stressed run failed.
+- `--dry-run` prints the plan (worktrees + cargo argv, marking each worker
+  warm-reuse vs fresh) without spawning cargo. Exits non-zero if any
+  stressed run failed.
 
 ### Standardized regression classification (`regression_class` view)
 
