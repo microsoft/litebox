@@ -457,6 +457,43 @@ Broker policy decisions and DNS resolutions are emitted as structured JSONL audi
 endpoints. This supersedes the Windows-only PowerShell viewers
 (`scripts/audit/View-AuditLog.ps1`, `Tail-AuditLog.ps1`).
 
+#### Enforcement seams, `/proc`, and what the frontier shows
+
+Policy is enforced **per broker-held resource class, at that class's own seam** — there
+is no single choke point:
+
+- **Files** — gated in the 9P request handlers (`nine_p::server`): every path-based
+  operation calls `policy.check(action, path)` before touching the host FS, emitting
+  `fs_allowed` / `fs_denied`. The `action` is a verb (`read`, `write`, `chmod`, `mkdir`,
+  `rename`, `symlink`, `truncate`, …) — policy is over **paths**, not over any single
+  syscall.
+- **Network** — gated in the broker-held inet connect/DNS path (`net_enforce`), emitting
+  `tcp_allowed` / `tcp_denied` / `udp_denied` / `dns_resolved`.
+- **Anonymous descriptors** (sockets, pipes, eventfds, ptys) — gated at *creation* time in
+  the broker as capabilities. They have no path and are outside the glob FS policy.
+
+`/proc` is **not** a policy surface. In litebox, `/proc/self/*` — `maps`, `status`,
+`cmdline`, `fd`, `exe`, `cwd`, and `/proc/<pid>/stat` — is *synthesized by the guest-side
+shim* (`litebox_shim_linux`) from the guest's own state; it never reaches the broker, the
+policy engine, or the audit stream. That is deliberate: reading one's own `/proc/self` is
+self-introspection, not access to a guarded resource, and there is no host `/proc` behind
+it to leak.
+
+The single bridge from `/proc` to a real resource is **`/proc/self/fd/N`** (and
+`/dev/fd/N`): a handle to whatever guest fd `N` refers to. For a *file* fd the shim
+resolves it to the fd's real guest path **before** the operation reaches the broker, so
+the policy decision — and the frontier node — is made against the **real file**, never the
+literal `/proc/self/fd/N` string (`openat`→`dup`, `stat`→`fstat`,
+`fchmodat`→resolve-then-chmod all implement this translation). Non-file fds
+(`socket:[…]`, `pipe:[…]`, `anon_inode:[…]`) have no path and are not policed through
+`/proc`.
+
+The frontier tree **unifies the *visualization*** — it renders the file and network event
+streams side by side — but it is a view of *policy decisions*, not raw syscalls. A syscall
+that fails upstream of a policy decision (e.g. a path that never resolves to a real file)
+produces no `fs_*` / `tcp_*` event and therefore no node; such failures appear only in the
+raw per-syscall trace (`litebox_audit_query watch`, without `--tree`).
+
 ### Phase 4: VS Code Agent Integration
 
 The sandbox is exposed as a VS Code terminal profile. A demo workspace (`litebox_tool_executor/demo/`) provides:
@@ -475,6 +512,7 @@ Several LiteBox bugs were discovered and fixed during integration:
 | **Double-echo in Windows terminal** | ConPTY and busybox both echoed keystrokes; fixed by disabling `ENABLE_ECHO_INPUT` |
 | **Line wrapping at 20 columns** | TIOCGWINSZ ioctl hardcoded to 20×20 instead of 80×24 |
 | **Debug banner on stdout** | `Platform::new()` printed "System information" to stdout, polluting guest output |
+| **`fchmodat` via `/proc/self/fd/N` mis-resolved** | glibc `tar` sets extracted-file modes with `fchmodat(AT_FDCWD, "/proc/self/fd/N")`; the broker canonicalized the procfd against its *own* fd table, so the chmod hit the wrong file — silent under allow-all, `EPERM` under an enforcing policy, which broke the VS Code server's tar extraction. Fixed by resolving `/proc/self/fd/N` to the fd's real guest path in the shim before the op reaches the broker (mirrors the existing `openat`/`stat` procfd handling). |
 
 ### Phase 5: WSL2 Investigation
 
