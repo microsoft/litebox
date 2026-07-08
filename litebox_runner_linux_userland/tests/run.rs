@@ -131,7 +131,7 @@ impl Runner {
         self.run_inner(true)
     }
 
-    fn run_inner(&mut self, capture_stdout: bool) -> Vec<u8> {
+    fn prepare_command(&mut self) {
         assert!(!self.has_run);
         self.has_run = true;
         // create tar file using `tar` command with caching
@@ -147,8 +147,12 @@ impl Runner {
             .arg("--initial-files")
             .arg(tar_file)
             .arg(&self.cmd_path)
-            .args(&self.cmd_args)
-            .stderr(std::process::Stdio::inherit());
+            .args(&self.cmd_args);
+    }
+
+    fn run_inner(&mut self, capture_stdout: bool) -> Vec<u8> {
+        self.prepare_command();
+        self.command.stderr(std::process::Stdio::inherit());
         if !capture_stdout {
             self.command.stdout(std::process::Stdio::inherit());
         }
@@ -163,6 +167,21 @@ impl Runner {
             output.status
         );
         output.stdout
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn spawn_with_stdio(
+        &mut self,
+        stdin: std::process::Stdio,
+        stdout: std::process::Stdio,
+        stderr: std::process::Stdio,
+    ) -> std::process::Child {
+        self.prepare_command();
+        self.command.stdin(stdin).stdout(stdout).stderr(stderr);
+        println!("Running `{:?}`", self.command);
+        self.command
+            .spawn()
+            .expect("Failed to spawn litebox_runner_linux_userland")
     }
 }
 
@@ -306,11 +325,8 @@ fn run_python(args: &[&str]) -> String {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-#[test]
-fn test_runner_with_python() {
-    const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
+fn python_runner(unique_name: &str) -> Runner {
     let python_path = run_which("python3");
-
     let python_guest_dir = python_path.parent().unwrap().to_str().unwrap().to_string();
 
     let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
@@ -337,8 +353,8 @@ fn test_runner_with_python() {
     let mut paths_to_stage = std::collections::BTreeSet::new();
     paths_to_stage.extend(python_lib_paths.iter().cloned());
 
-    Runner::new(&python_path, "python_rewriter")
-        .args(["-c", HELLO_WORLD_PY])
+    let mut runner = Runner::new(&python_path, unique_name);
+    runner
         .envs([
             &format!("PYTHONHOME={python_home}"),
             &format!("PYTHONPATH={python_lib_paths_str}"),
@@ -429,8 +445,43 @@ fn test_runner_with_python() {
                     }
                 }
             }
-        })
+        });
+    runner
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_with_python() {
+    const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
+    python_runner("python_rewriter")
+        .args(["-c", HELLO_WORLD_PY])
         .run();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_with_python_repl_pty() {
+    let mut runner = python_runner("python_repl_pty_rewriter");
+    let mut pty = common::pty::Pty::open();
+    let (stdin, stdout, stderr) = pty.slave_stdio();
+    let mut child = runner.spawn_with_stdio(stdin, stdout, stderr);
+    pty.close_slave();
+
+    let mut output = Vec::new();
+    pty.wait_for_output(&mut output, b">>> ");
+    pty.write_all(b"print(\"hi\")\nexit()\n");
+    let status = pty.wait_for_child_exit(&mut child, &mut output);
+    assert!(
+        status.success(),
+        "Python exited with {status}; output:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = String::from_utf8_lossy(&output).replace("\r\n", "\n");
+    assert!(
+        output.lines().any(|line| line.trim() == "hi"),
+        "Python REPL did not print a standalone hi line; output:\n{output}"
+    );
 }
 
 #[test]

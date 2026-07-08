@@ -4,6 +4,9 @@
 use glob::glob;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+pub mod pty;
+
 /// Find all dependencies of a given binary via `ldd`
 #[allow(dead_code, reason = "not used by loader.rs for x86")]
 pub fn find_dependencies(prog: &str) -> Vec<String> {
