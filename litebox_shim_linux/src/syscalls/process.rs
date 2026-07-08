@@ -3561,13 +3561,14 @@ impl<FS: ShimFS> Task<FS> {
         // This is still the pre-exec fork child. Preserve FD_CLOEXEC fds in
         // the restored worker so they remain usable until a later exec closes
         // them.
+        let preserve_cloexec_fd = Self::delayed_fork_trigger_fd(ctx);
         let fd_table = self.snapshot_fd_table(
             &mut reject,
             &mut fc.fork_snapshot_broker_transit,
             &mut fc.fork_snapshot_pidfd_process_transit,
             &mut fc.fork_snapshot_fd_token_transit,
             false,
-            Self::delayed_fork_trigger_fd(ctx),
+            preserve_cloexec_fd,
         );
         let memory = self.snapshot_memory(&mut reject);
 
@@ -3810,6 +3811,14 @@ impl<FS: ShimFS> Task<FS> {
                 {
                     let dt = self.global.litebox.descriptor_table();
                     for (raw_fd, typed) in &typed_stdio_sockets {
+                        let fd_flags = dt
+                            .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
+                            .unwrap_or_else(|_| FileDescriptorFlags::empty());
+                        if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC)
+                            && Some(*raw_fd) != preserve_cloexec_fd
+                        {
+                            continue;
+                        }
                         let pair_id = dt
                             .with_entry(typed, |sock: &super::unix::UnixSocket<FS>| {
                                 sock.socket_pair_id()
