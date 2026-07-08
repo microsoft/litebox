@@ -1095,6 +1095,19 @@ impl<FS: ShimFS> Task<FS> {
                     flags: litebox_common_linux::FutexFlags::PRIVATE,
                     count: 1,
                 });
+                // If this clear landed inside an active vfork/delayed-fork
+                // window, the forking thread's `restore_cow_layer` will roll
+                // the descriptor page back to its snapshot (the pre-clear TID
+                // value), resurrecting the join futex and wedging any joiner
+                // in `pthread_join` forever. An exiting thread is deliberately
+                // allowed to bypass the fork quiesce (see the `is_suspended`
+                // wake above) so the forker isn't stuck waiting for it to park
+                // — but that means its clear_child_tid write is exposed to the
+                // rollback. Record the address on the covering CoW layer so the
+                // restore re-applies the clear+wake after rolling the page back.
+                if let Some((cow, _)) = self.top_cow_layer_for_page(clear_child_tid_addr) {
+                    cow.pending_join_wakes.lock().push(clear_child_tid_addr);
+                }
             }
         }
         if let Some(robust_list) = self.thread.robust_list.take() {
@@ -2799,6 +2812,7 @@ impl<FS: ShimFS> Task<FS> {
                 let cow = Arc::new(crate::CowState {
                     protected_ranges: protected,
                     dirty_pages: litebox::sync::Mutex::new(eager_dirty),
+                    pending_join_wakes: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 });
                 // Store CoW state in ProcessState so all threads (and the
                 // fault handler) can access it.
