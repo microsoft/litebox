@@ -1471,6 +1471,9 @@ impl Server {
         }
 
         if self.policy.check(Action::Write, Some(&target)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(target.to_str().unwrap_or("?"), "symlink");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -1680,6 +1683,9 @@ impl Server {
                 Err(errno) => return error_response(errno),
             };
             if self.policy.check(Action::Chmod, Some(&resolved)) == Decision::Deny {
+                if let Some(ref al) = self.audit_log {
+                    al.fs_denied(resolved.to_str().unwrap_or("?"), "chmod");
+                }
                 return error_response(libc::EPERM as u32);
             }
             let perms = fs_compat::permissions_from_mode(req.stat.mode);
@@ -1698,6 +1704,9 @@ impl Server {
                 Err(errno) => return error_response(errno),
             };
             if self.policy.check(Action::Truncate, Some(&resolved)) == Decision::Deny {
+                if let Some(ref al) = self.audit_log {
+                    al.fs_denied(resolved.to_str().unwrap_or("?"), "truncate");
+                }
                 return error_response(libc::EPERM as u32);
             }
             let open_file = {
@@ -1833,6 +1842,9 @@ impl Server {
         }
 
         if self.policy.check(Action::Mkdir, Some(&target)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(target.to_str().unwrap_or("?"), "mkdir");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -1960,9 +1972,15 @@ impl Server {
 
         // Policy checks on both source and destination
         if self.policy.check(Action::Write, Some(&resolved_src)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(resolved_src.to_str().unwrap_or("?"), "rename");
+            }
             return error_response(libc::EPERM as u32);
         }
         if self.policy.check(Action::Write, Some(&dst)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(dst.to_str().unwrap_or("?"), "rename");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -2038,9 +2056,15 @@ impl Server {
 
         // Policy checks on both source and destination
         if self.policy.check(Action::Write, Some(&src)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(src.to_str().unwrap_or("?"), "rename");
+            }
             return error_response(libc::EPERM as u32);
         }
         if self.policy.check(Action::Write, Some(&dst)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(dst.to_str().unwrap_or("?"), "rename");
+            }
             return error_response(libc::EPERM as u32);
         }
 
