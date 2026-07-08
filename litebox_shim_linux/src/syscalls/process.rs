@@ -7138,6 +7138,13 @@ impl<FS: ShimFS> Task<FS> {
                         .park
                         .underlying_atomic()
                         .store(1, Ordering::Release);
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        self.global.platform.debug_log_print(&alloc::format!(
+                            "[PARK-SET] forker_tid={} expected={}\n",
+                            self.tid, expected,
+                        ));
+                    }
 
                     // Signal the transport to break out of spin loops.
                     self.global
@@ -7332,6 +7339,12 @@ impl<FS: ShimFS> Task<FS> {
             .underlying_atomic()
             .store(0, Ordering::Release);
         ps.vfork_parking.park.wake_all();
+        {
+            use litebox::platform::DebugLogProvider as _;
+            self.global
+                .platform
+                .debug_log_print(&alloc::format!("[PARK-CLEAR] forker_tid={}\n", self.tid));
+        }
 
         // Settle unclaimed deferred lies. Transport threads that lied
         // (incremented parked_count without blocking) may still be spinning
