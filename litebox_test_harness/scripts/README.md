@@ -51,6 +51,7 @@ dashboard.py untrack <ref>                   # remove a tracked ref
 dashboard.py refs                            # list tracked refs
 dashboard.py auto [--interval SECS]          # autonomous fill driver
 dashboard.py stop                            # stop auto + reap descendants
+dashboard.py watchdog                        # relaunch auto if it died (cron/timer)
 ```
 
 ### `dashboard.py validate`
@@ -94,9 +95,69 @@ concurrent dispatches within the same wall-second (the old
 `subsec_nanos()` suffix could collide at high jobs).
 
 **Pidfile.** `<state_dir>/auto.pidfile` is JSON: `{supervisor_pid,
-cargo_pid, cargo_pgid, harness_pid}`. Written when the supervisor
-starts, updated when each cycle's harness pid is discovered, removed
-on exit. `dashboard.py stop` reads it.
+heartbeat_ms, children: [{cargo_pgid, harness_pid, worktree_path,
+kind}, ...], started_ms, argv, cwd}`. Written when the supervisor
+starts, updated whenever the children registry changes **and** on
+every freshness tick (so `heartbeat_ms` advances even during a long
+cold cargo build), removed on exit. `dashboard.py stop` and
+`dashboard.py watchdog` both read it.
+
+### Watchdog & liveness (self-healing)
+
+The supervisor is a detached `setsid nohup python3 dashboard.py auto`
+process with no init-system supervision. It has been silently killed
+before (a stray SIGTERM) and stayed dead for two days because nothing
+noticed. The watchdog closes that gap without adding a daemon:
+
+- **Heartbeat.** Each freshness tick (every `FRESHNESS_INTERVAL_SECS`,
+  default 300s) the supervisor stamps `heartbeat_ms` into the pidfile.
+  A supervisor is considered *hung* if its heartbeat is older than 20
+  min (`_HEARTBEAT_STALE_MS`) — 4× the tick interval, so a couple of
+  slow renders never trip it.
+- **Enabled sentinel.** `auto` writes `<state_dir>/auto.enabled`
+  (recording its `argv`/`cwd`); `stop` removes it. This is the
+  "supposed to be running" flag. `watchdog` only ever restarts a
+  supervisor when this file is present — so an intentional `stop`
+  stays stopped, while a crash / external kill self-heals.
+- **`dashboard.py watchdog`** is a one-shot, idempotent liveness
+  check: if `auto.enabled` is present but the supervisor is down
+  (no pidfile / dead pid / not a `dashboard.py auto` process) or hung
+  (stale heartbeat), it relaunches `auto` detached using the recorded
+  `argv`/`cwd`. Otherwise it is a no-op. Safe to run as often as you
+  like.
+- **Double-start guard.** `auto` refuses to start if a healthy
+  supervisor is already running (fresh heartbeat + live supervisor
+  pid); pass `--force` to override. This makes the watchdog and a
+  manual restart safe to race.
+- **Rendered status.** `summary.md`'s header shows a `_Supervisor_:`
+  line (✅ up / ⚠️ hung / ⚠️ DOWN / ⏹ stopped) so a dead supervisor
+  is obvious at a glance instead of silently stale numbers.
+
+Install it via cron or a systemd-user timer so a crash can't leave
+the dashboard dark:
+
+```cron
+# every 3 minutes; no-op unless the supervisor is enabled-but-down
+*/3 * * * * cd /home/you/src/litebox && python3 litebox_test_harness/scripts/dashboard.py watchdog --quiet >> .dashboard/watchdog.log 2>&1
+```
+
+```ini
+# ~/.config/systemd/user/dashboard-watchdog.service
+[Service]
+Type=oneshot
+WorkingDirectory=%h/src/litebox
+ExecStart=/usr/bin/python3 litebox_test_harness/scripts/dashboard.py watchdog --quiet
+
+# ~/.config/systemd/user/dashboard-watchdog.timer
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+[Install]
+WantedBy=timers.target
+```
+
+Enable the timer with
+`systemctl --user enable --now dashboard-watchdog.timer`.
 
 **Why not just `setsid` everywhere.** Process groups don't compose
 hierarchically — they're a flat label. If both the supervisor and
