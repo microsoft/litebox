@@ -36,6 +36,17 @@ const SYSTEM_VERIFIER_INFORMATION_LENGTH: u32 = 0x90;
 const SYSTEM_VERIFIER_INFORMATION_LENGTH_USIZE: usize = 0x90;
 const X64_SYSTEM_RANGE_START: usize = 0xffff_8000_0000_0000;
 
+pub(crate) const WINDOWS_TIME_ZONE_ID_INVALID: u32 = u32::MAX;
+pub(crate) const WINDOWS_OS_MAJOR_VERSION: u16 = 10;
+pub(crate) const WINDOWS_OS_MINOR_VERSION: u16 = 0;
+pub(crate) const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
+pub(crate) const WINDOWS_OS_PLATFORM_WIN32_NT: u32 = 2;
+#[cfg(not(target_os = "windows"))]
+pub(crate) const WINDOWS_NT_PRODUCT_WORKSTATION: u32 = 1;
+pub(crate) const WINDOWS_DIRECTORY: &str = r"C:\Windows";
+pub(crate) const WINDOWS_SYSTEM_DIRECTORY: &str = r"C:\Windows\System32";
+pub(crate) const WINDOWS_NAMED_OBJECT_DIRECTORY: &str = r"\BaseNamedObjects";
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum SystemInformationClass {

@@ -354,13 +354,17 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
 /// 0x7FFE0000. Native Windows hosts already provide that page; Non-Windows hosts
 /// need LiteBox to create it before guest ntdll reads it during startup.
 #[cfg(not(target_os = "windows"))]
+const WINDOWS_USER_SHARED_DATA_BASE: usize = 0x7FFE_0000;
+
+#[cfg(not(target_os = "windows"))]
 fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
     page_manager: &crate::WindowsPageManager<Platform>,
-) -> Result<(), PeImageAccessError> {
-    let address = NonZeroAddress::new(WINDOWS_USER_SHARED_DATA_BASE)
-        .ok_or(PeImageAccessError::AddressOverflow)?;
-    let length = NonZeroPageSize::new(size_of::<KUserSharedData>().next_multiple_of(PAGE_SIZE))
-        .ok_or(PeImageAccessError::AddressOverflow)?;
+) -> Option<usize> {
+    use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize};
+    use zerocopy::IntoBytes as _;
+    let address = NonZeroAddress::new(WINDOWS_USER_SHARED_DATA_BASE)?;
+    let length =
+        NonZeroPageSize::new(size_of::<nt_types::KUserSharedData>().next_multiple_of(PAGE_SIZE))?;
     let shared_data = windows_user_shared_data();
     let shared_data_bytes = shared_data.as_bytes();
     // SAFETY: `NOREPLACE` makes the fixed mapping fail instead of replacing any
@@ -377,22 +381,23 @@ fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
             },
         )
     }
-    .map_err(PeImageAccessError::from)
-    .map(|_| ())
+    .map(|ptr| ptr.as_usize())
+    .ok()
 }
 
 // TODO: This is a temporary placeholder for the Windows shared data page.
 // Once we have a proper shared mapping implementation, we can remove this
 // and instead map the shared data page from the host into the guest.
 #[cfg(not(target_os = "windows"))]
-fn windows_user_shared_data() -> KUserSharedData {
-    let mut shared_data = KUserSharedData::new_zeroed();
-    shared_data.nt_build_number = u32::from(WINDOWS_OS_BUILD_NUMBER);
-    shared_data.nt_product_type = WINDOWS_NT_PRODUCT_WORKSTATION;
+fn windows_user_shared_data() -> nt_types::KUserSharedData {
+    use zerocopy::FromZeros as _;
+    let mut shared_data = nt_types::KUserSharedData::new_zeroed();
+    shared_data.nt_build_number = u32::from(syscalls::sysinfo::WINDOWS_OS_BUILD_NUMBER);
+    shared_data.nt_product_type = syscalls::sysinfo::WINDOWS_NT_PRODUCT_WORKSTATION;
     shared_data.product_type_is_valid = 1;
-    shared_data.nt_major_version = u32::from(WINDOWS_OS_MAJOR_VERSION);
-    shared_data.nt_minor_version = u32::from(WINDOWS_OS_MINOR_VERSION);
-    for (index, code_unit) in WINDOWS_DIRECTORY.encode_utf16().enumerate() {
+    shared_data.nt_major_version = u32::from(syscalls::sysinfo::WINDOWS_OS_MAJOR_VERSION);
+    shared_data.nt_minor_version = u32::from(syscalls::sysinfo::WINDOWS_OS_MINOR_VERSION);
+    for (index, code_unit) in r"C:\Windows".encode_utf16().enumerate() {
         shared_data.nt_system_root[index] = code_unit;
     }
 
@@ -432,7 +437,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
     ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
         // TODO: refactor the shared mapping
         #[cfg(not(target_os = "windows"))]
-        map_windows_user_shared_data::<Platform>(self.0.page_manager)?;
+        let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
+            .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
         let windows_shared_section_addr = map_csr_server_shared_memory(&self.0.page_manager)
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
         let windows_shared_section =

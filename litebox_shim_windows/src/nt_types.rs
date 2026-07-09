@@ -5,7 +5,7 @@ use alloc::string::String;
 use core::mem::offset_of;
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
-use zerocopy::{FromBytes, Immutable, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{ConstPtr, syscalls::Handle};
 
@@ -781,3 +781,102 @@ const _: [(); 0x1878] = [(); core::mem::size_of::<ThreadEnvironmentBlock>()];
 const _: [(); 0x7d0] = [(); core::mem::size_of::<ProcessEnvironmentBlock>()];
 const _: [(); 0x4d0] = [(); core::mem::size_of::<X64Context>()];
 const _: [(); 0x448] = [(); core::mem::size_of::<RtlUserProcessParameters>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
+pub struct KSystemTime {
+    pub low_part: u32,
+    pub high_1_time: i32,
+    pub high_2_time: i32,
+}
+
+#[cfg(not(target_os = "windows"))]
+const WINDOWS_KUSER_SHARED_DATA_XSTATE_CONFIGURATION_SIZE: usize = 0x348;
+
+/// Layout from Wine `include/ddk/wdm.h` and ReactOS `sdk/include/wine/ddk/wdm.h`.
+#[cfg(not(target_os = "windows"))]
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
+pub struct KUserSharedData {
+    tick_count_low_deprecated: u32,
+    tick_count_multiplier: u32,
+    interrupt_time: KSystemTime,
+    system_time: KSystemTime,
+    time_zone_bias: KSystemTime,
+    image_number_low: u16,
+    image_number_high: u16,
+    pub nt_system_root: [u16; 260],
+    max_stack_trace_depth: u32,
+    crypto_exponent: u32,
+    time_zone_id: u32,
+    large_page_minimum: u32,
+    ait_sampling_value: u32,
+    app_compat_flag: u32,
+    rng_seed_version: u64,
+    global_validation_run_level: u32,
+    time_zone_bias_stamp: u32,
+    pub nt_build_number: u32,
+    pub nt_product_type: u32,
+    pub product_type_is_valid: u8,
+    reserved_0: u8,
+    native_processor_architecture: u16,
+    pub nt_major_version: u32,
+    pub nt_minor_version: u32,
+    processor_features: [u8; 64],
+    reserved_1: u32,
+    reserved_3: u32,
+    time_slip: u32,
+    alternative_architecture: u32,
+    boot_id: u32,
+    system_expiration_date: i64,
+    suite_mask: u32,
+    kd_debugger_enabled: u8,
+    nx_support_policy: u8,
+    cycles_per_yield: u16,
+    active_console_id: u32,
+    dismount_count: u32,
+    com_plus_package: u32,
+    last_system_rit_event_tick_count: u32,
+    number_of_physical_pages: u32,
+    safe_boot_mode: u8,
+    virtualization_flags: u8,
+    padding_2ee: [u8; 2],
+    shared_data_flags: u32,
+    data_flags_pad: [u32; 1],
+    test_ret_instruction: u64,
+    qpc_frequency: i64,
+    system_call: u32,
+    user_cet_available_environments: u32,
+    system_call_pad: [u64; 2],
+    tick_count: [u8; 0x10],
+    cookie: u32,
+    cookie_pad: [u32; 1],
+    console_session_foreground_process_id: i64,
+    time_update_lock: u64,
+    baseline_system_time_qpc: u64,
+    baseline_interrupt_time_qpc: u64,
+    qpc_system_time_increment: u64,
+    qpc_interrupt_time_increment: u64,
+    qpc_system_time_increment_shift: u8,
+    qpc_interrupt_time_increment_shift: u8,
+    unparked_processor_count: u16,
+    enclave_feature_mask: [u32; 4],
+    telemetry_coverage_round: u32,
+    user_mode_global_logger: [u16; 16],
+    image_file_execution_options: u32,
+    lang_generation_count: u32,
+    active_processor_affinity: u32,
+    padding_3ac: u32,
+    interrupt_time_bias: u64,
+    qpc_bias: u64,
+    active_processor_count: u32,
+    active_group_count: u8,
+    padding_3c5: u8,
+    qpc_data: u16,
+    time_zone_bias_effective_start: i64,
+    time_zone_bias_effective_end: i64,
+    x_state: [u8; WINDOWS_KUSER_SHARED_DATA_XSTATE_CONFIGURATION_SIZE],
+    feature_configuration_change_stamp: KSystemTime,
+    spare: u32,
+    user_pointer_auth_mask: u64,
+}
