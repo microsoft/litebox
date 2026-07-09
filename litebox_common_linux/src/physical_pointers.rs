@@ -25,6 +25,14 @@
 //! physical memory range assigned to VTL1/LiteBox. Thus, this module can
 //! confirm a given physical address does not belong to VTL1's physical
 //! memory.
+//!
+//! Beyond that validation, the platform enforces strict virtual address
+//! spatial separation. On LVBS (see the address-space layout in
+//! `litebox_platform_lvbs/src/lib.rs`), foreign physical memory is visible
+//! only through the direct-map or on-demand vmap regions, both of which
+//! are fully disjoint from the VTL1 kernel region where all LiteBox/Rust
+//! code and data live. Thus, a raw pointer into a physical mapping can
+//! never alias any Rust reference.
 
 use crate::vmap::{
     GlobalVmapManager, PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
@@ -92,16 +100,29 @@ impl<T: Clone, const ALIGN: usize, V> PhysMutPtr<T, ALIGN, V>
 where
     V: GlobalVmapManager<ALIGN>,
 {
+    /// Compile-time guard rejecting zero-sized types.
+    ///
+    /// A physical pointer names a region of foreign memory to copy bytes to or from.
+    /// ZST has no byte representation and thus has no referent in foreign memory.
+    const ASSERT_NON_ZST: () = assert!(
+        core::mem::size_of::<T>() != 0,
+        "PhysMutPtr does not support zero-sized types"
+    );
+
     /// Create a new `PhysMutPtr` from the given physical page array and offset.
     ///
     /// All addresses in `pages` should be valid and aligned to `ALIGN`, and `offset` should be
     /// smaller than `ALIGN`. Also, `pages` should contain enough pages to cover at least one
     /// object of type `T` starting from `offset`. If these conditions are not met, this function
     /// returns `Err(PhysPointerError)`.
+    ///
+    /// Note: `T` does not need to satisfy `align_of::<T>()` at its location in (foreign) physical
+    /// memory. This is sound because the foreign `T` is never dereferenced as a Rust reference or
+    /// via a typed load/store: all access goes through `copy_in`/`copy_out`, which cast the
+    /// mapped pointer to `*mut u8` and perform a byte-granular, unaligned-safe `memcpy_fallible`.
     pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
-        if core::mem::size_of::<T>() == 0 {
-            return Err(PhysPointerError::UnsupportedZeroSizedType);
-        }
+        // Force evaluation of the compile-time ZST guard.
+        let () = Self::ASSERT_NON_ZST;
         if offset >= ALIGN {
             return Err(PhysPointerError::InvalidBaseOffset(offset, ALIGN));
         }
@@ -134,8 +155,6 @@ where
     ///
     /// This is a shortcut for
     /// `PhysMutPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
-    /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
-    /// later accesses through `PhysMutPtr` may read/write data in a wrong order.
     pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         if bytes < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
@@ -223,6 +242,10 @@ where
         )?;
         // SAFETY: `values` is valid for writes of `size_of_val(values)` bytes, which is
         // the guard's mapped size.
+        //
+        // If `copy_out` fails (e.g., concurrent unmap), `values` can be partially
+        // overwritten. This is sound because `T: FromBytes` ensures every byte pattern
+        // is a valid, initialized `T` - there is no element in an undefined state.
         unsafe { guard.copy_out(values.as_mut_ptr().cast::<u8>())? };
         Ok(())
     }
@@ -441,8 +464,6 @@ where
     ///
     /// This is a shortcut for
     /// `PhysConstPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
-    /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
-    /// later accesses through `PhysConstPtr` may read data in a wrong order.
     pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         Ok(Self {
             inner: PhysMutPtr::with_contiguous_pages(pa, bytes)?,

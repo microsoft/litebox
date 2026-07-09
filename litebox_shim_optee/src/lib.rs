@@ -1497,8 +1497,8 @@ impl SessionIdPool {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Vmap;
+/// Type-level marker for the normal-world physical-pointer provider.
+pub enum Vmap {}
 
 impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
     type Manager = litebox_platform_multiplex::Platform;

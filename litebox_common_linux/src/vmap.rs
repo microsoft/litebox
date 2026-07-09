@@ -68,9 +68,14 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     /// Platform is expected to track which physical memory addresses are owned by LiteBox (e.g., VTL1 memory addresses).
     ///
     /// Returns `Ok(())` if the physical pages are not owned by LiteBox. Otherwise, returns `Err(PhysPointerError)`.
-    fn validate_unowned(&self, _pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
-        Ok(())
-    }
+    ///
+    /// # Invariant
+    ///
+    /// The implementor must ensure that, whenever this function returns `Ok(())`, none of the
+    /// given physical pages may name memory owned by LiteBox/Rust (heap, stack, ...). Callers rely
+    /// on a successful return to treat the pages as foreign memory (mapping them and accessing
+    /// them through raw pointers).
+    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError>;
 
     /// Protect the given physical pages to ensure concurrent read or exclusive write access:
     /// - Read protection: prevent others from writing to the pages.
@@ -78,7 +83,6 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     /// - No protection: allow others to read and write the pages.
     ///
     /// This function can be implemented using EPT/NPT, TZASC, PMP, or some other hardware mechanisms.
-    /// If the platform does not support such protection, this function returns `Ok(())` without any action.
     ///
     /// Returns `Ok(())` if it successfully protects the pages. If it fails, returns
     /// `Err(PhysPointerError)`.
@@ -90,11 +94,9 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     /// The caller should unprotect the pages when they are no longer needed to access them.
     unsafe fn protect(
         &self,
-        _pages: &PhysPageAddrArray<ALIGN>,
-        _perms: PhysPageMapPermissions,
-    ) -> Result<(), PhysPointerError> {
-        Ok(())
-    }
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<(), PhysPointerError>;
 }
 
 /// A type-level handle to a platform-global [`VmapManager`].
@@ -216,8 +218,6 @@ pub enum PhysPointerError {
         "The total size of the given pages ({0} bytes) is insufficient for the requested type ({1} bytes)"
     )]
     InsufficientPhysicalPages(usize, usize),
-    #[error("Zero-sized types are unsupported for physical pointers")]
-    UnsupportedZeroSizedType,
     #[error("Index {0} is out of bounds (count: {1})")]
     IndexOutOfBounds(usize, usize),
     #[error("Physical address {0:#x} is already mapped")]

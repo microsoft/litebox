@@ -444,8 +444,8 @@ type UserConstPtr<T> =
 type UserMutPtr<T> =
     litebox::platform::common_providers::userspace_pointers::UserMutPtr<LvbsValidateAccess, T>;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Vmap;
+/// Type-level marker for the VTL0 physical-pointer provider.
+pub enum Vmap {}
 
 impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
     type Manager = crate::host::LvbsLinuxKernel;
@@ -1282,7 +1282,6 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         Ok(())
     }
 
-    #[allow(dead_code, reason = "will be used soon")]
     unsafe fn protect(
         &self,
         pages: &PhysPageAddrArray<ALIGN>,
