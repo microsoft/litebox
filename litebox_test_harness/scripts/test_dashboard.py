@@ -561,6 +561,142 @@ class PidfileConcurrentWriteTests(unittest.TestCase):
                              f"leftover tmp files: {leftovers}")
 
 
+class WatchdogTests(unittest.TestCase):
+    """Supervisor liveness classification + watchdog relaunch gating.
+
+    The pure helpers (`_cmdline_is_supervisor`, `_supervisor_health`)
+    are tested with an injected process predicate / synthetic cmdlines
+    so they're hermetic. The `cmd_watchdog` gating + relaunch wiring
+    use a temp state dir with `subprocess.Popen` stubbed — no real
+    process is ever spawned."""
+
+    # ---- _cmdline_is_supervisor (NUL-separated /proc/<pid>/cmdline) ----
+    def test_cmdline_auto_supervisor_is_recognised(self):
+        cl = "python3\x00/x/dashboard.py\x00auto\x00--interval\x0060\x00"
+        self.assertTrue(dashboard._cmdline_is_supervisor(cl))
+
+    def test_cmdline_stop_is_not_supervisor(self):
+        cl = "python3\x00/x/dashboard.py\x00stop\x00"
+        self.assertFalse(dashboard._cmdline_is_supervisor(cl))
+
+    def test_cmdline_unrelated_process_is_not_supervisor(self):
+        cl = "python3\x00-m\x00unittest\x00"
+        self.assertFalse(dashboard._cmdline_is_supervisor(cl))
+
+    def test_cmdline_dashboard_without_auto_token_is_not_supervisor(self):
+        # dashboard.py present but the subcommand is 'status', not 'auto'
+        # — must not be mistaken for the supervisor after PID reuse.
+        cl = "python3\x00/x/dashboard.py\x00status\x00"
+        self.assertFalse(dashboard._cmdline_is_supervisor(cl))
+
+    # ---- _supervisor_health (pure; injected pid→process predicate) ----
+    @staticmethod
+    def _pf(pid, heartbeat_ms):
+        return {"supervisor_pid": pid, "heartbeat_ms": heartbeat_ms}
+
+    def test_health_no_pidfile_is_down(self):
+        status, age = dashboard._supervisor_health(None, 1_000_000)
+        self.assertEqual(status, "down")
+        self.assertEqual(age, -1)
+
+    def test_health_live_fresh_is_up(self):
+        now = 10_000_000
+        status, age = dashboard._supervisor_health(
+            self._pf(123, now - 5_000), now, is_supervisor=lambda p: True)
+        self.assertEqual(status, "up")
+        self.assertEqual(age, 5_000)
+
+    def test_health_live_stale_is_hung(self):
+        now = 10_000_000
+        pf = self._pf(123, now - (dashboard._HEARTBEAT_STALE_MS + 1))
+        status, _ = dashboard._supervisor_health(
+            pf, now, is_supervisor=lambda p: True)
+        self.assertEqual(status, "hung")
+
+    def test_health_dead_pid_is_down_even_with_fresh_heartbeat(self):
+        # Fresh heartbeat but the pid is gone / reused → down (guards
+        # against reading a stale pidfile of a since-dead supervisor).
+        now = 10_000_000
+        status, _ = dashboard._supervisor_health(
+            self._pf(123, now - 5_000), now, is_supervisor=lambda p: False)
+        self.assertEqual(status, "down")
+
+    def test_health_live_without_heartbeat_field_is_up(self):
+        # Pre-watchdog pidfile (no heartbeat_ms) but a live supervisor
+        # pid → 'up', not 'hung'. Must not cry wolf during a version
+        # transition; age is -1 (unknown).
+        now = 10_000_000
+        status, age = dashboard._supervisor_health(
+            {"supervisor_pid": 123}, now, is_supervisor=lambda p: True)
+        self.assertEqual(status, "up")
+        self.assertEqual(age, -1)
+
+    def test_fmt_hb_age(self):
+        self.assertEqual(dashboard._fmt_hb_age(5_000), "heartbeat 5s ago")
+        self.assertEqual(dashboard._fmt_hb_age(0), "heartbeat 0s ago")
+        self.assertEqual(dashboard._fmt_hb_age(-1),
+                         "no heartbeat (pre-watchdog supervisor)")
+
+    def test_health_stale_boundary(self):
+        now = 10_000_000
+        thr = dashboard._HEARTBEAT_STALE_MS
+        alive = lambda p: True  # noqa: E731
+        self.assertEqual(dashboard._supervisor_health(
+            self._pf(1, now - (thr - 1)), now, is_supervisor=alive)[0], "up")
+        self.assertEqual(dashboard._supervisor_health(
+            self._pf(1, now - thr), now, is_supervisor=alive)[0], "hung")
+
+    # ---- cmd_watchdog gating + relaunch (Popen stubbed) ----
+    def test_watchdog_noop_when_not_enabled(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as td:
+            # No auto.enabled sentinel → supervisor was intentionally
+            # `stop`ped → watchdog must NOT relaunch it.
+            args = argparse.Namespace(state_dir=td, quiet=True)
+            calls: list = []
+            orig = dashboard.subprocess.Popen
+            dashboard.subprocess.Popen = lambda *a, **k: calls.append((a, k))
+            try:
+                rc = dashboard.cmd_watchdog(args)
+            finally:
+                dashboard.subprocess.Popen = orig
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls, [], "must not relaunch when stopped")
+
+    def test_watchdog_relaunches_when_enabled_and_down(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            # Enabled (supposed to be running) + no pidfile → 'down' →
+            # relaunch using the recorded argv/cwd.
+            (state / "auto.enabled").write_text(json.dumps({
+                "argv": ["/x/dashboard.py", "auto", "--interval", "60"],
+                "cwd": "/some/cwd",
+            }))
+            args = argparse.Namespace(state_dir=str(state), quiet=True)
+            calls: list = []
+
+            class FakePopen:
+                def __init__(self, cmd, **kw):
+                    calls.append((cmd, kw))
+
+            orig = dashboard.subprocess.Popen
+            dashboard.subprocess.Popen = FakePopen
+            try:
+                rc = dashboard.cmd_watchdog(args)
+            finally:
+                dashboard.subprocess.Popen = orig
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(calls), 1)
+            cmd, kw = calls[0]
+            # [python, <this dashboard.py>, "auto", "--interval", "60"]
+            self.assertEqual(cmd[0], sys.executable)
+            self.assertTrue(cmd[1].endswith("dashboard.py"))
+            self.assertEqual(cmd[2:], ["auto", "--interval", "60"])
+            self.assertEqual(kw.get("cwd"), "/some/cwd")
+            self.assertTrue(kw.get("start_new_session"))
+
+
 class PickTopNTests(unittest.TestCase):
     """The parallel orchestrator picks the top-N worktrees by the
     same scoring tuple the single-pick selector uses. These tests

@@ -1003,7 +1003,25 @@ def _render_meta(conn: sqlite3.Connection, state_dir: Path) -> str:
     return (
         f"_State dir_: `{state_dir}` · "
         f"_{n_runs} runs_ · _{n_results} result rows_ · _{universe_str}_\n"
+        f"{_render_supervisor_liveness(state_dir)}"
     )
+
+
+def _render_supervisor_liveness(state_dir: Path) -> str:
+    """One-line supervisor health, read from the pidfile heartbeat +
+    the `auto.enabled` sentinel. Makes a dead/hung supervisor obvious
+    at the top of the report instead of silently stale numbers."""
+    enabled = _enabled_path(state_dir).exists()
+    pf = _read_pidfile(state_dir / "auto.pidfile")
+    status, age = _supervisor_health(pf, now_ms())
+    if status == "up":
+        return (f"_Supervisor_: ✅ up · pid {pf.get('supervisor_pid')} · "
+                f"{_fmt_hb_age(age)}\n")
+    if status == "hung":
+        return (f"_Supervisor_: ⚠️ hung? · pid {pf.get('supervisor_pid')} · "
+                f"{_fmt_hb_age(age)} (stale)\n")
+    state = "⚠️ DOWN (watchdog will restart)" if enabled else "⏹ stopped"
+    return f"_Supervisor_: {state}\n"
 
 
 def _render_tracked_refs(conn: sqlite3.Connection) -> str:
@@ -3395,6 +3413,33 @@ def cmd_auto(args: argparse.Namespace) -> int:
     pidfile = state_dir / "auto.pidfile"
     _supervisor_state = _new_supervisor_state()
 
+    # Double-start guard: refuse if a healthy supervisor is already up
+    # (keeps the watchdog + a manual start from racing into duplicates).
+    existing = _read_pidfile(pidfile)
+    if existing and not getattr(args, "force", False):
+        status, age = _supervisor_health(existing, now_ms())
+        if status == "up":
+            print(f"[auto] a supervisor is already running "
+                  f"(pid {existing.get('supervisor_pid')}, "
+                  f"{_fmt_hb_age(age)}); use --force to start anyway",
+                  file=sys.stderr)
+            return 1
+    _supervisor_state["meta"] = {
+        "started_ms": now_ms(),
+        "argv": list(sys.argv),
+        "cwd": os.getcwd(),
+    }
+    # Mark 'supposed to be running' so `dashboard.py watchdog` restarts
+    # it if it dies. `stop` removes this; a crash/kill leaves it, so the
+    # watchdog self-heals only what wasn't stopped on purpose.
+    try:
+        _enabled_path(state_dir).write_text(json.dumps(
+            {"argv": list(sys.argv), "cwd": os.getcwd(),
+             "enabled_at_ms": now_ms()}))
+    except OSError as e:
+        print(f"[auto] warning: could not write auto.enabled: {e}",
+              file=sys.stderr)
+
     def _signal_handler(signum, _frame):
         sig_name = signal.Signals(signum).name
         if not args.quiet:
@@ -3468,6 +3513,12 @@ def cmd_auto(args: argparse.Namespace) -> int:
                 conn = open_db(state_dir)
                 write_summary(conn, state_dir)
                 conn.close()
+                # Bump the heartbeat here (every FRESHNESS_INTERVAL_SECS)
+                # so the watchdog sees liveness independent of long cargo
+                # cycles — a cold build can keep the main loop busy for
+                # 10+ min without touching the pidfile otherwise.
+                _write_pidfile_from_state(pidfile, os.getpid(),
+                                          _supervisor_state)
             except Exception as e:
                 # Non-fatal — the next tick will retry. Keep the
                 # supervisor alive even if the renderer transiently
@@ -4370,16 +4421,100 @@ def _snapshot_children(state: dict) -> list[dict]:
         return [dict(slot) for slot in state["children"].values()]
 
 
+_HEARTBEAT_STALE_MS = 20 * 60 * 1000
+
+
+def _enabled_path(state_dir: Path) -> Path:
+    """Sentinel marking the supervisor is *supposed* to be running.
+    `auto` writes it (with argv/cwd to relaunch); `stop` removes it. The
+    `watchdog` only restarts a down supervisor when this exists — so an
+    intentional `stop` stays stopped, while a crash / external kill (the
+    2-day-outage class) self-heals."""
+    return state_dir / "auto.enabled"
+
+
+def _cmdline_is_supervisor(cmdline: str) -> bool:
+    """Pure predicate: does this `/proc/<pid>/cmdline` (NUL-separated)
+    belong to a `dashboard.py auto` supervisor? Split out from
+    `_pid_is_supervisor` so the parsing is unit-testable without a
+    live process."""
+    return "dashboard.py" in cmdline and "auto" in cmdline.split("\x00")
+
+
+def _pid_is_supervisor(pid: Optional[int]) -> bool:
+    """True iff `pid` is alive AND is a `dashboard.py auto` process —
+    guards against PID reuse after the real supervisor died."""
+    if not pid:
+        return False
+    try:
+        cmdline = Path(f"/proc/{int(pid)}/cmdline").read_text()
+    except (FileNotFoundError, ProcessLookupError, PermissionError,
+            ValueError):
+        return False
+    return _cmdline_is_supervisor(cmdline)
+
+
+def _supervisor_health(
+    pf: Optional[dict],
+    now: int,
+    is_supervisor: Callable[[Optional[int]], bool] = _pid_is_supervisor,
+) -> tuple[str, int]:
+    """Classify supervisor liveness from a pidfile dict. Pure (the only
+    impurity, the pid→process check, is injected so tests can fake it).
+
+    Returns `(status, heartbeat_age_ms)` where status is:
+      * 'up'   — pid is a live supervisor AND heartbeat is fresh (or the
+                 pidfile predates heartbeats — see below).
+      * 'hung' — pid is a live supervisor BUT a *present* heartbeat is
+                 stale (main loop wedged / freshness thread dead).
+      * 'down' — no pidfile, or the pid is gone / not a supervisor.
+
+    `heartbeat_age_ms` is `-1` when there is no heartbeat to age (no
+    pidfile, or a pre-watchdog pidfile without a `heartbeat_ms` field).
+    A live supervisor whose pidfile lacks `heartbeat_ms` entirely is
+    reported 'up', not 'hung': it was written by an older supervisor
+    that never emitted heartbeats, so pid-liveness is the only signal
+    and we must not cry wolf during a version transition. New
+    supervisors always stamp `heartbeat_ms` on their first write, so a
+    genuinely wedged new supervisor still surfaces as 'hung'.
+
+    Shared by the `auto` double-start guard, the `watchdog` relaunch
+    decision, and the rendered liveness line so all three agree."""
+    if not pf:
+        return ("down", -1)
+    if not is_supervisor(pf.get("supervisor_pid")):
+        return ("down", -1)
+    hb = pf.get("heartbeat_ms")
+    if hb is None:
+        return ("up", -1)
+    age = now - hb
+    return ("up" if age < _HEARTBEAT_STALE_MS else "hung", age)
+
+
+def _fmt_hb_age(age_ms: int) -> str:
+    """Human phrase for a heartbeat age from `_supervisor_health`.
+    `-1` (no heartbeat available) → a pre-watchdog note."""
+    if age_ms < 0:
+        return "no heartbeat (pre-watchdog supervisor)"
+    return f"heartbeat {age_ms // 1000}s ago"
+
+
 def _write_pidfile_from_state(pidfile: Path, supervisor_pid: int,
                               state: dict) -> None:
     """Mirror the current children registry to disk. Replaces the
     pidfile atomically. Called whenever the registry changes so
-    `dashboard.py stop` always sees the latest in-flight PGIDs."""
+    `dashboard.py stop` always sees the latest in-flight PGIDs. Also
+    stamps a `heartbeat_ms` (bumped each cycle *and* each freshness
+    tick) + the supervisor's `started_ms`/`argv`/`cwd`, which the
+    `watchdog` uses to detect a dead/hung supervisor and relaunch it."""
     children = _snapshot_children(state)
+    meta = state.get("meta") or {}
     _write_pidfile(
         pidfile,
         supervisor_pid=supervisor_pid,
+        heartbeat_ms=now_ms(),
         children=children,
+        **meta,
     )
 
 
@@ -4649,8 +4784,68 @@ def cmd_stop(args: argparse.Namespace) -> int:
         pidfile.unlink()
     except FileNotFoundError:
         pass
+    # Clear the 'supposed to be running' sentinel so the watchdog does
+    # NOT restart it — a `stop` is an explicit "keep it down".
+    try:
+        _enabled_path(state_dir).unlink()
+    except FileNotFoundError:
+        pass
     if not args.quiet:
         print("[stop] done", file=sys.stderr)
+    return 0
+
+
+def cmd_watchdog(args: argparse.Namespace) -> int:
+    """One-shot liveness check: if the supervisor is *supposed* to be
+    running (`auto.enabled` present) but is down or hung (dead pid / not
+    a supervisor / stale heartbeat), relaunch it detached. Idempotent
+    and cheap — run it from cron or a systemd-user timer every few
+    minutes so an accidental kill or crash can't leave the dashboard
+    dark for days (as happened once — a stray SIGTERM with no restart).
+
+    Does nothing when the supervisor was intentionally stopped (`stop`
+    removed `auto.enabled`) or is healthy."""
+    state_dir = resolve_state_dir(args.state_dir)
+    enabled = _enabled_path(state_dir)
+    if not enabled.exists():
+        if not args.quiet:
+            print("[watchdog] auto.enabled absent — supervisor "
+                  "intentionally stopped; nothing to do")
+        return 0
+    pf = _read_pidfile(state_dir / "auto.pidfile")
+    status, age = _supervisor_health(pf, now_ms())
+    if status == "up":
+        if not args.quiet:
+            print(f"[watchdog] supervisor healthy "
+                  f"(pid {pf.get('supervisor_pid')}, {_fmt_hb_age(age)})")
+        return 0
+    reason = "no pidfile" if pf is None else (
+        f"heartbeat stale ({age // 1000}s)" if status == "hung"
+        else "pid dead / not a supervisor")
+    try:
+        spec = json.loads(enabled.read_text())
+    except (json.JSONDecodeError, OSError):
+        spec = {}
+    argv = spec.get("argv") or []
+    cwd = spec.get("cwd") or os.getcwd()
+    script = str(Path(__file__).resolve())
+    rest = argv[1:] if argv else ["auto"]
+    print(f"[watchdog] supervisor DOWN ({reason}) — relaunching "
+          f"`{' '.join(rest)}` in {cwd}", file=sys.stderr)
+    logf = None
+    try:
+        logf = open(state_dir / "auto.log", "a")
+        out = logf
+    except OSError:
+        out = subprocess.DEVNULL
+    subprocess.Popen(
+        [sys.executable, script, *rest], cwd=cwd,
+        stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if logf is not None:
+        logf.close()
+    print("[watchdog] relaunched (detached).", file=sys.stderr)
     return 0
 
 
@@ -4887,6 +5082,11 @@ def build_parser() -> argparse.ArgumentParser:
              "entirely; supervisor only drives tracked refs.",
     )
     p_auto.add_argument("--quiet", "-q", action="store_true")
+    p_auto.add_argument(
+        "--force", action="store_true",
+        help="start even if a supervisor already appears to be running "
+             "(bypasses the healthy-supervisor double-start guard).",
+    )
     p_auto.set_defaults(func=cmd_auto)
 
     p_stop = sub.add_parser(
@@ -4897,6 +5097,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stop.add_argument("--quiet", "-q", action="store_true")
     p_stop.set_defaults(func=cmd_stop)
+
+    p_watchdog = sub.add_parser(
+        "watchdog",
+        help="one-shot liveness check: relaunch the `auto` supervisor "
+             "if it is supposed to be running (was started, not "
+             "`stop`ped) but is down or hung. Idempotent — run it from "
+             "cron / a systemd-user timer every few minutes so a crash "
+             "or stray kill can't leave the dashboard dark.",
+    )
+    p_watchdog.add_argument("--quiet", "-q", action="store_true")
+    p_watchdog.set_defaults(func=cmd_watchdog)
 
     p_drain = sub.add_parser(
         "drain",

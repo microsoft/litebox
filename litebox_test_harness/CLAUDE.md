@@ -1086,6 +1086,20 @@ Used by `dashboard.py auto` to autonomously fill coverage of tracked
 refs. See [`scripts/README.md`](scripts/README.md) for the full driver
 contract and tuning knobs.
 
+**Keeping the supervisor alive.** `dashboard.py auto` is a detached
+process with no init supervision, so a crash or stray kill can leave
+the dashboard dark (this happened once for two days). Guard against it
+with `dashboard.py watchdog` — a one-shot, idempotent liveness check
+that relaunches `auto` iff it is *supposed* to be running (an
+`auto.enabled` sentinel is present, written by `auto` and removed by
+`stop`) but is down or hung (stale pidfile heartbeat). Install it on a
+cron / systemd-user timer (every few minutes); an intentional `stop`
+stays stopped. `summary.md`'s header renders a `_Supervisor_:` up /
+hung / DOWN / stopped line so liveness is visible at a glance. Full
+details (heartbeat thresholds, sentinel, double-start guard, timer
+snippets) are in [`scripts/README.md`](scripts/README.md) under
+"Watchdog & liveness".
+
 ```sh
 # run only the missing-at-HEAD trials, default batch size 300
 cargo test -p litebox_test_harness --test integration -- --fill
