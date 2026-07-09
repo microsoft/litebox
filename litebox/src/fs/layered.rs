@@ -834,6 +834,29 @@ impl<
         }))
     }
 
+    fn create_anonymous_file_from_bytes(
+        &self,
+        name: &str,
+        mode: super::Mode,
+        contents: &[u8],
+        flags: OFlags,
+        descriptors: &mut Descriptors<Platform>,
+    ) -> Result<FileFd<Platform, Upper, Lower>, super::errors::CreateAnonymousFileError> {
+        let upper_fd = self.upper.create_anonymous_file_from_bytes(
+            name,
+            mode,
+            contents,
+            flags,
+            descriptors,
+        )?;
+        Ok(descriptors.insert(Descriptor {
+            path: super::memfd_display_path(name),
+            flags,
+            entry: Arc::new(EntryX::Upper { fd: upper_fd }),
+            position: 0.into(),
+        }))
+    }
+
     fn allocate_fid_number(&self) -> Result<u32, OpenError> {
         self.lower.allocate_fid_number()
     }

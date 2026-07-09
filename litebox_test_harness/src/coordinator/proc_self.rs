@@ -12,7 +12,7 @@ use crate::protocol::Response;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +26,7 @@ const PROC_SELF_CASES: &[&str] = &[
     "maps_contains_guest_program",
     "auxv_is_guest_values",
     "comm_is_guest_progname",
+    "synthetic_proc_no_tmp_dependency",
 ];
 
 pub(crate) fn register_proc_self_tests(reg: &mut Registry<'_>) {
@@ -85,6 +86,7 @@ fn proc_self_leaf(args: &[String]) -> i32 {
         "maps_contains_guest_program" => check_maps_contains_guest_program(args),
         "auxv_is_guest_values" => check_auxv_is_guest_values(),
         "comm_is_guest_progname" => check_comm_is_guest_progname(),
+        "synthetic_proc_no_tmp_dependency" => check_synthetic_proc_no_tmp_dependency(),
         other => Err(format!("unknown case {other}")),
     };
 
@@ -280,6 +282,75 @@ fn check_comm_is_guest_progname() -> Result<String, String> {
         Ok(format!("comm={comm}"))
     } else {
         Err(format!("comm={comm:?} expected={expected:?}"))
+    }
+}
+
+fn check_synthetic_proc_no_tmp_dependency() -> Result<String, String> {
+    let mut file = File::open("/proc/self/stat").map_err(|e| format!("open stat: {e}"))?;
+    let fd_target = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|e| format!("readlink stat fd: {e}"))?;
+    if fd_target.to_string_lossy().contains(".proc_synthetic_") {
+        return Err(format!(
+            "synthetic proc fd is backed by /tmp temp file: {}",
+            fd_target.display()
+        ));
+    }
+
+    let size = file
+        .metadata()
+        .map_err(|e| format!("fstat stat: {e}"))?
+        .len();
+
+    let mut first = String::new();
+    file.read_to_string(&mut first)
+        .map_err(|e| format!("first read stat: {e}"))?;
+    let pos = file
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek stat: {e}"))?;
+    let mut second = String::new();
+    file.read_to_string(&mut second)
+        .map_err(|e| format!("second read stat: {e}"))?;
+
+    let first_identity = proc_stat_identity(&first)?;
+    let second_identity = proc_stat_identity(&second)?;
+    if first.is_empty() || second.is_empty() || first_identity != second_identity || pos != 0 {
+        return Err(format!(
+            "bad stat read: first_len={} second_len={} first_id={first_identity:?} second_id={second_identity:?} pos={pos} size={size}",
+            first.len(),
+            second.len(),
+        ));
+    }
+
+    drop(file);
+    assert_no_proc_synthetic_tmp_files()?;
+    Ok(format!(
+        "len={} size={size} fd_target={}",
+        first.len(),
+        fd_target.display()
+    ))
+}
+
+fn proc_stat_identity(stat: &str) -> Result<&str, String> {
+    stat.find(") ")
+        .map(|end| &stat[..=end])
+        .ok_or_else(|| format!("malformed proc stat: {stat:?}"))
+}
+
+fn assert_no_proc_synthetic_tmp_files() -> Result<(), String> {
+    let entries = fs::read_dir("/tmp")
+        .map_err(|e| format!("read_dir /tmp after restore: {e}"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read_dir /tmp entry after restore: {e}"))?;
+    let leaked: Vec<_> = entries
+        .iter()
+        .filter_map(|name| name.to_str())
+        .filter(|name| name.starts_with(".proc_synthetic_"))
+        .collect();
+    if leaked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("leaked synthetic proc temp files: {leaked:?}"))
     }
 }
 

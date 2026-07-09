@@ -19,7 +19,7 @@ use super::errors::{
     ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError,
     WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'IMem'.hex()`.
@@ -382,6 +382,36 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             write_allowed: true,
             position: 0,
             append_mode: false,
+            path,
+        }))
+    }
+
+    fn create_anonymous_file_from_bytes(
+        &self,
+        name: &str,
+        mode: super::Mode,
+        contents: &[u8],
+        flags: OFlags,
+        descriptors: &mut Descriptors<Platform>,
+    ) -> Result<FileFd<Platform>, super::errors::CreateAnonymousFileError> {
+        let path = super::memfd_display_path(name);
+        let file = Arc::new(sync::RwLock::new(FileX {
+            perms: Permissions {
+                mode,
+                userinfo: self.current_user,
+            },
+            data: contents.to_vec().into(),
+            unique_id: self.fresh_id(),
+        }));
+        let read_allowed =
+            !flags.intersects(OFlags::WRONLY | OFlags::RDWR) || flags.contains(OFlags::RDWR);
+        let write_allowed = flags.intersects(OFlags::WRONLY | OFlags::RDWR);
+        Ok(descriptors.insert(Descriptor::File {
+            file,
+            read_allowed,
+            write_allowed,
+            position: 0,
+            append_mode: flags.contains(OFlags::APPEND),
             path,
         }))
     }

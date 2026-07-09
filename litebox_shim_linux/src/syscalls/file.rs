@@ -1243,6 +1243,8 @@ impl<FS: ShimFS> Task<FS> {
         flags: OFlags,
         contents: alloc::string::String,
     ) -> Result<u32, Errno> {
+        use litebox::fs::errors::CreateAnonymousFileError;
+
         if flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
             return Err(Errno::EACCES);
         }
@@ -1255,44 +1257,21 @@ impl<FS: ShimFS> Task<FS> {
         // Using a pipe breaks programs (like the VS Code Server) that
         // call lseek() on /proc/PID/stat to check seekability.
         let files = self.files.borrow();
-
-        // Create a temporary file path that won't collide.
-        static PROC_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        let n = PROC_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let tmp_path = alloc::format!("/tmp/.proc_synthetic_{n}");
-
-        // Create, write, close, then reopen read-only.
         let mut descriptors = self.global.litebox.descriptor_table_mut();
-        let write_fd = files
-            .fs
-            .open(
-                &tmp_path,
-                OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC,
-                litebox::fs::Mode::RWXU,
-                &mut *descriptors,
-            )
-            .map_err(Errno::from)?;
-        files
-            .fs
-            .write(&write_fd, contents.as_bytes(), None, &mut *descriptors)
-            .map_err(Errno::from)?;
-        files
-            .fs
-            .close(&write_fd, &mut *descriptors)
-            .map_err(Errno::from)?;
 
         let read_fd = files
             .fs
-            .open(
-                &tmp_path,
-                OFlags::RDONLY,
-                litebox::fs::Mode::empty(),
+            .create_anonymous_file_from_bytes(
+                "proc_synthetic",
+                litebox::fs::Mode::from_bits_truncate(0o444),
+                contents.as_bytes(),
+                flags & OFlags::STATUS_FLAGS_MASK,
                 &mut *descriptors,
             )
-            .map_err(Errno::from)?;
-
-        // Delete the file so it's cleaned up when the fd is closed.
-        let _ = files.fs.unlink(&tmp_path, &mut *descriptors);
+            .map_err(|e| match e {
+                CreateAnonymousFileError::NotSupported => Errno::ENOSYS,
+                CreateAnonymousFileError::Io | _ => Errno::EIO,
+            })?;
 
         // Apply CLOEXEC if requested.
         if flags.contains(OFlags::CLOEXEC) {
@@ -1301,6 +1280,10 @@ impl<FS: ShimFS> Task<FS> {
                 unreachable!()
             };
         }
+        let status = flags & OFlags::STATUS_FLAGS_MASK;
+        let None = descriptors.set_entry_metadata(&read_fd, crate::StdioStatusFlags(status)) else {
+            unreachable!()
+        };
         drop(descriptors);
 
         let raw_fd = files.insert_raw_fd(read_fd).map_err(|read_fd| {
