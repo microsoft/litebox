@@ -1133,6 +1133,15 @@ impl<FS: ShimFS> Task<FS> {
                         flags: litebox_common_linux::FutexFlags::PRIVATE,
                         count: 1,
                     });
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        let post = crate::MutPtr::<u32>::from_usize(clear_child_tid_addr)
+                            .read_at_offset(0);
+                        self.global.platform.debug_log_print(&alloc::format!(
+                            "[TID-EXIT-POST] pid={} tid={} cct={:#x} post_word={:?}\n",
+                            self.process_id.0, self.tid, clear_child_tid_addr, post,
+                        ));
+                    }
                 }
             }
         }

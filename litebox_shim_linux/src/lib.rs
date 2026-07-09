@@ -2927,6 +2927,15 @@ impl<FS: ShimFS> Task<FS> {
 
     fn restore_cow_layer(&self, cow: &Arc<CowState>, restore_bytes: bool) {
         if restore_bytes {
+            {
+                use litebox::platform::DebugLogProvider as _;
+                self.global.platform.debug_log_print(&alloc::format!(
+                    "[RESTORE] pid={} dirty_pages={} pending={}\n",
+                    self.process_id.0,
+                    cow.dirty_pages.lock().len(),
+                    cow.pending_join_wakes.lock().len(),
+                ));
+            }
             let dirty_pages = {
                 let mut dirty = cow.dirty_pages.lock();
                 let dirty_pages = core::mem::take(&mut *dirty);
