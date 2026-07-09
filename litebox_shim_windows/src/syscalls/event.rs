@@ -3,7 +3,6 @@
 
 //! Windows NT event object syscalls.
 
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -183,7 +182,7 @@ impl<Platform: crate::ShimPlatform> IOPollable for EventObject<Platform> {
 }
 
 struct EventName {
-    key: String,
+    original_path: alloc::string::String,
 }
 
 const EVENT_BASIC_INFORMATION_SIZE_U32: u32 = 8;
@@ -213,16 +212,11 @@ fn read_event_name<Platform: RawPointerProvider>(
     if unicode_string.buffer == 0 {
         return Err(NtStatus::ACCESS_VIOLATION);
     }
-    let mut key = unicode_string.read_string::<Platform>()?;
-    if key.is_empty() {
+    let original_path = unicode_string.read_string::<Platform>()?;
+    if original_path.is_empty() {
         return Err(NtStatus::OBJECT_NAME_INVALID);
     }
-    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-        .contains(ObjectAttributesFlags::CASE_INSENSITIVE)
-    {
-        key = key.to_ascii_lowercase();
-    }
-    Ok(Some(EventName { key }))
+    Ok(Some(EventName { original_path }))
 }
 
 fn read_event_object_attributes<Platform: RawPointerProvider>(
@@ -307,43 +301,39 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let granted_access = EventAccess::from_desired_access(desired_access);
 
         if let Some(event_name) = event_name {
-            let mut namespace = self.process.event_namespace.write();
-            let existing =
-                if let Some(event) = namespace.get(&event_name.key).and_then(Weak::upgrade) {
-                    Some(event)
-                } else {
-                    namespace.remove(&event_name.key);
-                    None
-                };
-            if let Some(event) = existing {
-                let Some(object_attributes) = object_attributes else {
-                    return NtStatus::INVALID_PARAMETER;
-                };
-                if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-                    .contains(ObjectAttributesFlags::OPENIF)
-                {
-                    return NtStatus::OBJECT_NAME_COLLISION;
-                }
-                let Ok(handle) = self.insert_event_handle(event, granted_access) else {
-                    return NtStatus::QUOTA_EXCEEDED;
-                };
-                if event_handle.write_at_offset(0, handle).is_none() {
-                    self.close_event_handle(handle);
-                    return NtStatus::ACCESS_VIOLATION;
-                }
-                return NtStatus::OBJECT_NAME_EXISTS;
-            }
-
             let event = Arc::new(EventObject::new(event_type, initial_state != 0));
-            let Ok(handle) = self.insert_event_handle(event.clone(), granted_access) else {
-                return NtStatus::QUOTA_EXCEEDED;
-            };
-            if event_handle.write_at_offset(0, handle).is_none() {
-                self.close_event_handle(handle);
-                return NtStatus::ACCESS_VIOLATION;
-            }
-            namespace.insert(event_name.key, Arc::downgrade(&event));
-            return NtStatus::SUCCESS;
+            return self.process.object_manager.create_event(
+                &event_name.original_path,
+                &event,
+                |event| {
+                    let Some(object_attributes) = object_attributes else {
+                        return NtStatus::INVALID_PARAMETER;
+                    };
+                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+                        .contains(ObjectAttributesFlags::OPENIF)
+                    {
+                        return NtStatus::OBJECT_NAME_COLLISION;
+                    }
+                    let Ok(handle) = self.insert_event_handle(event, granted_access) else {
+                        return NtStatus::QUOTA_EXCEEDED;
+                    };
+                    if event_handle.write_at_offset(0, handle).is_none() {
+                        self.close_event_handle(handle);
+                        return NtStatus::ACCESS_VIOLATION;
+                    }
+                    NtStatus::OBJECT_NAME_EXISTS
+                },
+                || {
+                    let Ok(handle) = self.insert_event_handle(event.clone(), granted_access) else {
+                        return NtStatus::QUOTA_EXCEEDED;
+                    };
+                    if event_handle.write_at_offset(0, handle).is_none() {
+                        self.close_event_handle(handle);
+                        return NtStatus::ACCESS_VIOLATION;
+                    }
+                    NtStatus::SUCCESS
+                },
+            );
         }
 
         let event = Arc::new(EventObject::new(event_type, initial_state != 0));
@@ -371,14 +361,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
             Err(status) => return status,
         };
-        let event = {
-            let mut namespace = self.process.event_namespace.write();
-            if let Some(event) = namespace.get(&event_name.key).and_then(Weak::upgrade) {
-                event
-            } else {
-                namespace.remove(&event_name.key);
-                return NtStatus::OBJECT_NAME_NOT_FOUND;
-            }
+        let event = match self
+            .process
+            .object_manager
+            .resolve_event(&event_name.original_path)
+        {
+            Ok(event) => event,
+            Err(status) => return status,
         };
 
         let Ok(handle) =

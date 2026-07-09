@@ -3,25 +3,17 @@
 
 extern crate std;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicI32, AtomicU32};
 use litebox::LiteBox;
-use litebox::fd::RawDescriptorStorage;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
-use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
-use crate::{
-    ConstPtr, DefaultFS, GlobalState, MutPtr, Process, Task, WindowsHandleStore,
-    WindowsNlsSectionMappings, WindowsPageManager,
-};
+use crate::{ConstPtr, DefaultFS, MutPtr, Process, Task, WindowsShim};
 
 #[cfg(target_os = "linux")]
 pub(crate) type TestPlatform = litebox_platform_linux_userland::LinuxUserland;
@@ -97,26 +89,6 @@ pub(crate) fn test_task() -> Task<TestPlatform, TestFS> {
 pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform, TestFS> {
     let platform = test_platform();
     let litebox = LiteBox::new(platform);
-    let page_manager = WindowsPageManager::<TestPlatform>::new(&litebox);
-    let windows_shared_section_base = {
-        let length =
-            NonZeroPageSize::new(crate::syscalls::section::WINDOWS_SHARED_SECTION_SIZE).unwrap();
-        // SAFETY: test setup requests a fresh anonymous mapping and does not replace pages.
-        unsafe {
-            page_manager.create_writable_pages(None, length, CreatePagesFlags::empty(), |_| Ok(0))
-        }
-        .expect("test CSR shared section allocation should succeed")
-        .as_usize()
-    };
-    crate::loader::initialize_windows_static_server_data_for_test::<TestPlatform>(
-        windows_shared_section_base,
-    )
-    .expect("test CSR shared section initialization should succeed");
-    let persistent_sections =
-        crate::WindowsPersistentSections::<TestPlatform>::new(BTreeMap::from([(
-            crate::syscalls::section::windows_shared_section_key(),
-            crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base),
-        )]));
     let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
     in_mem.with_root_privileges(|fs| {
         fs.mkdir(
@@ -158,37 +130,19 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
     });
     let tar_ro =
         litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
-    let fs = Arc::new(crate::default_fs(&litebox, in_mem, tar_ro));
-    let directory_namespace = crate::syscalls::directory::seed_directory_namespace();
+    let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new(platform);
+    let fs = Arc::new(shim_builder.default_fs(in_mem, tar_ro));
+    let shim = shim_builder.build();
+    let WindowsShim(global) = shim;
+
+    let windows_shared_section_base = crate::map_csr_server_shared_memory(&global.page_manager)
+        .expect("mapping shared memory should succeed");
+    let windows_shared_section =
+        crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base);
+
     Task {
-        global: Arc::new(GlobalState {
-            platform,
-            registry: crate::syscalls::registry::RegistryStore::new(&litebox),
-            qpc_boot_instant: litebox::platform::TimeProvider::now(platform),
-            litebox,
-            page_manager,
-            _fs: PhantomData,
-        }),
-        process: Arc::new(Process {
-            ntdll_mapping: None,
-            peb_address: 0,
-            handles: WindowsHandleStore::<TestPlatform>::new(RawDescriptorStorage::new()),
-            directory_namespace,
-            event_namespace: crate::WindowsEventNamespace::<TestPlatform>::new(BTreeMap::new()),
-            section_namespace: crate::WindowsSectionNamespace::<TestPlatform>::new(BTreeMap::new()),
-            persistent_sections,
-            section_views: crate::WindowsSectionViews::<TestPlatform>::new(BTreeMap::new()),
-            nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
-            virtual_allocations: crate::WindowsVirtualAllocations::<TestPlatform>::new(
-                BTreeMap::new(),
-            ),
-            system_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
-            user_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
-            user_ui_language: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
-            default_hard_error_mode: AtomicU32::new(0),
-            cookie: crate::syscalls::process::default_process_cookie(),
-            exit_code: AtomicI32::new(0),
-        }),
+        global,
+        process: Arc::new(Process::default(None, windows_shared_section)),
         fs,
         entry_point: 0,
         stack_top: 0,

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Windows NT object-manager directory syscalls.
+//! Windows NT object-manager namespace and directory syscalls.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString as _};
@@ -21,6 +21,10 @@ use crate::nt_types::{
     AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString, read_object_attributes,
 };
 use crate::syscalls::Handle;
+use crate::syscalls::event::EventObject;
+use crate::syscalls::section::{
+    SectionObject, WINDOWS_SESSION_SHARED_SECTION_OBJECT, WINDOWS_SHARED_SECTION_OBJECT,
+};
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 const MAX_SYMLINK_REPARSE_DEPTH: usize = 64;
@@ -48,12 +52,20 @@ const SEEDED_DIRECTORY_PATHS: &[&str] = &[
     r"\Sessions\0\Windows",
     r"\Sessions\0\Windows\WindowStations",
     r"\Sessions\BNOLINKS",
+    r"\Windows",
 ];
 
 // Wine's wineboot and ReactOS SMSS create KnownDllPath so ntdll can open/query
 // the DOS path prefix for known DLL lookups during loader initialization.
-const SEEDED_SYMLINK_PATHS: &[(&str, &str)] =
-    &[(r"\KnownDlls\KnownDllPath", r"C:\Windows\System32")];
+const SEEDED_SYMLINK_PATHS: &[(&str, &str)] = &[
+    (r"\KnownDlls\KnownDllPath", r"C:\Windows\System32"),
+    // TODO(windows-sessions): resolve this through the current session id once
+    // the shim supports multiple Windows sessions.
+    (
+        WINDOWS_SHARED_SECTION_OBJECT,
+        WINDOWS_SESSION_SHARED_SECTION_OBJECT,
+    ),
+];
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,10 +132,9 @@ pub(super) struct ObjectNode<Platform: crate::ShimPlatform> {
     name: String,
     parent: Option<Weak<ObjectNode<Platform>>>,
     body: litebox::sync::RwLock<Platform, NamedObject<Platform>>,
-    _not_send_without_platform: PhantomData<fn(Platform)>,
 }
 
-pub(crate) struct DirectoryNamespace<Platform: crate::ShimPlatform> {
+pub(crate) struct ObjectManager<Platform: crate::ShimPlatform> {
     root: Arc<ObjectNode<Platform>>,
 }
 
@@ -134,6 +145,55 @@ enum NamedObject<Platform: crate::ShimPlatform> {
     Symlink {
         target: String,
     },
+    Event {
+        event: Weak<EventObject<Platform>>,
+    },
+    Section {
+        section: Weak<SectionObject<Platform>>,
+    },
+}
+
+pub(super) enum ObjectLeafLookup<T> {
+    Live(T),
+    Stale,
+    TypeMismatch,
+}
+
+impl<T> ObjectLeafLookup<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> ObjectLeafLookup<U> {
+        match self {
+            Self::Live(object) => ObjectLeafLookup::Live(f(object)),
+            Self::Stale => ObjectLeafLookup::Stale,
+            Self::TypeMismatch => ObjectLeafLookup::TypeMismatch,
+        }
+    }
+
+    pub(super) fn into_result(self) -> Result<T, NtStatus> {
+        match self {
+            Self::Live(object) => Ok(object),
+            Self::Stale => Err(NtStatus::OBJECT_NAME_NOT_FOUND),
+            Self::TypeMismatch => Err(NtStatus::OBJECT_TYPE_MISMATCH),
+        }
+    }
+}
+
+impl<T> ObjectLeafLookup<Arc<T>> {
+    fn from_weak(object: &Weak<T>) -> Self {
+        object.upgrade().map_or(Self::Stale, Self::Live)
+    }
+}
+
+macro_rules! object_leaf_accessors {
+    ($($vis:vis $method:ident, $lookup:ty, $pattern:pat => $value:expr;)+) => {
+        $(
+            $vis fn $method(&self) -> $lookup {
+                match &*self.body.read() {
+                    $pattern => $value,
+                    _ => ObjectLeafLookup::TypeMismatch,
+                }
+            }
+        )+
+    };
 }
 
 #[derive(Clone, Debug)]
@@ -237,7 +297,6 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
             body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Directory {
                 children: BTreeMap::new(),
             }),
-            _not_send_without_platform: PhantomData,
         }
     }
 
@@ -252,28 +311,59 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
             name,
             parent,
             body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Symlink { target }),
-            _not_send_without_platform: PhantomData,
+        }
+    }
+
+    fn new_event(
+        path: String,
+        parent: Option<Weak<ObjectNode<Platform>>>,
+        name: String,
+        event: Weak<EventObject<Platform>>,
+    ) -> Self {
+        Self {
+            path,
+            name,
+            parent,
+            body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Event { event }),
+        }
+    }
+
+    fn new_section(
+        path: String,
+        parent: Option<Weak<ObjectNode<Platform>>>,
+        name: String,
+        section: Weak<SectionObject<Platform>>,
+    ) -> Self {
+        Self {
+            path,
+            name,
+            parent,
+            body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Section { section }),
         }
     }
 
     fn child(&self, name: &str) -> Option<Arc<Self>> {
-        match &*self.body.read() {
-            NamedObject::Directory { children } => children.get(&ObjectName::new(name)).cloned(),
-            NamedObject::Symlink { .. } => None,
-        }
+        let body = self.body.read();
+        let NamedObject::Directory { children } = &*body else {
+            return None;
+        };
+        children.get(&ObjectName::new(name)).cloned()
     }
 
     fn children_snapshot(&self) -> Result<Vec<DirectoryEntrySnapshot>, NtStatus> {
-        match &*self.body.read() {
-            NamedObject::Directory { children } => Ok(children
-                .values()
-                .map(|child| DirectoryEntrySnapshot {
+        let body = self.body.read();
+        let NamedObject::Directory { children } = &*body else {
+            return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+        };
+        Ok(children
+            .values()
+            .filter_map(|child| {
+                child.type_name().map(|type_name| DirectoryEntrySnapshot {
                     name: child.name.clone(),
-                    type_name: child.type_name(),
+                    type_name,
                 })
-                .collect()),
-            NamedObject::Symlink { .. } => Err(NtStatus::OBJECT_TYPE_MISMATCH),
-        }
+            })
+            .collect())
     }
 
     pub(super) fn is_directory(&self) -> bool {
@@ -284,17 +374,19 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         matches!(&*self.body.read(), NamedObject::Symlink { .. })
     }
 
-    pub(super) fn symlink_target(&self) -> Result<String, NtStatus> {
-        match &*self.body.read() {
-            NamedObject::Symlink { target } => Ok(target.clone()),
-            NamedObject::Directory { .. } => Err(NtStatus::OBJECT_TYPE_MISMATCH),
-        }
+    object_leaf_accessors! {
+        directory_object, ObjectLeafLookup<()>, NamedObject::Directory { .. } => ObjectLeafLookup::Live(());
+        pub(super) symlink_target, ObjectLeafLookup<String>, NamedObject::Symlink { target } => ObjectLeafLookup::Live(target.clone());
+        event_object, ObjectLeafLookup<Arc<EventObject<Platform>>>, NamedObject::Event { event } => ObjectLeafLookup::from_weak(event);
+        section_object, ObjectLeafLookup<Arc<SectionObject<Platform>>>, NamedObject::Section { section } => ObjectLeafLookup::from_weak(section);
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name(&self) -> Option<&'static str> {
         match &*self.body.read() {
-            NamedObject::Directory { .. } => "Directory",
-            NamedObject::Symlink { .. } => "SymbolicLink",
+            NamedObject::Directory { .. } => Some("Directory"),
+            NamedObject::Symlink { .. } => Some("SymbolicLink"),
+            NamedObject::Event { event } => event.upgrade().map(|_| "Event"),
+            NamedObject::Section { section } => section.upgrade().map(|_| "Section"),
         }
     }
 
@@ -303,7 +395,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
     }
 }
 
-impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
+impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
     fn new() -> Self {
         Self {
             root: Arc::new(ObjectNode::new_directory(
@@ -312,24 +404,6 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
                 String::new(),
             )),
         }
-    }
-
-    pub(super) fn resolve_directory(
-        &self,
-        path: &str,
-    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        let tail = absolute_path_tail(path)?;
-        let node = self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, false)?;
-        if node.is_directory() {
-            Ok(node)
-        } else {
-            Err(NtStatus::OBJECT_TYPE_MISMATCH)
-        }
-    }
-
-    pub(super) fn resolve_object(&self, path: &str) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        let tail = absolute_path_tail(path)?;
-        self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, true)
     }
 
     pub(super) fn parent_directory_exists(&self, path: &str) -> bool {
@@ -352,8 +426,15 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     ) -> NtStatus {
         self.create_child(
             path,
-            ObjectNode::is_directory,
+            |node| {
+                if node.is_directory() {
+                    ObjectLeafLookup::Live(Arc::clone(node))
+                } else {
+                    ObjectLeafLookup::TypeMismatch
+                }
+            },
             ObjectNode::new_directory,
+            NtStatus::OBJECT_TYPE_MISMATCH,
             on_exists,
             on_created,
         )
@@ -368,23 +449,65 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
     ) -> NtStatus {
         self.create_child(
             path,
-            ObjectNode::is_symlink,
+            |node| {
+                if node.is_symlink() {
+                    ObjectLeafLookup::Live(Arc::clone(node))
+                } else {
+                    ObjectLeafLookup::TypeMismatch
+                }
+            },
             |path, parent, name| ObjectNode::new_symlink(path, parent, name, target),
+            NtStatus::OBJECT_TYPE_MISMATCH,
             on_exists,
             on_created,
         )
     }
 
-    fn create_child(
+    pub(super) fn create_event(
         &self,
         path: &str,
-        existing_matches: impl Fn(&ObjectNode<Platform>) -> bool,
+        event: &Arc<EventObject<Platform>>,
+        on_exists: impl FnOnce(Arc<EventObject<Platform>>) -> NtStatus,
+        on_created: impl FnOnce() -> NtStatus,
+    ) -> NtStatus {
+        let event = Arc::downgrade(event);
+        self.create_child(
+            path,
+            |node| node.event_object(),
+            |path, parent, name| ObjectNode::new_event(path, parent, name, event),
+            NtStatus::OBJECT_TYPE_MISMATCH,
+            on_exists,
+            |_| on_created(),
+        )
+    }
+
+    pub(crate) fn create_section(
+        &self,
+        path: &str,
+        section: &Arc<SectionObject<Platform>>,
+    ) -> NtStatus {
+        let section = Arc::downgrade(section);
+        self.create_child(
+            path,
+            |node| node.section_object(),
+            |path, parent, name| ObjectNode::new_section(path, parent, name, section),
+            NtStatus::OBJECT_NAME_EXISTS,
+            |_| NtStatus::OBJECT_NAME_EXISTS,
+            |_| NtStatus::SUCCESS,
+        )
+    }
+
+    fn create_child<T>(
+        &self,
+        path: &str,
+        existing_object: impl Fn(&Arc<ObjectNode<Platform>>) -> ObjectLeafLookup<T>,
         construct: impl FnOnce(
             String,
             Option<Weak<ObjectNode<Platform>>>,
             String,
         ) -> ObjectNode<Platform>,
-        on_exists: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
+        mismatch_status: NtStatus,
+        on_exists: impl FnOnce(T) -> NtStatus,
         on_created: impl FnOnce(Arc<ObjectNode<Platform>>) -> NtStatus,
     ) -> NtStatus {
         let tail = match absolute_path_tail(path) {
@@ -392,7 +515,11 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
             Err(status) => return status,
         };
         if tail.is_empty() {
-            return on_exists(Arc::clone(&self.root));
+            return match existing_object(&self.root) {
+                ObjectLeafLookup::Live(object) => on_exists(object),
+                ObjectLeafLookup::Stale => NtStatus::OBJECT_NAME_NOT_FOUND,
+                ObjectLeafLookup::TypeMismatch => mismatch_status,
+            };
         }
 
         let (parent_tail, leaf_name) = match tail.rsplit_once('\\') {
@@ -412,11 +539,14 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
             return NtStatus::OBJECT_TYPE_MISMATCH;
         };
         let leaf_key = ObjectName::new(leaf_name);
-        if let Some(existing) = children.get(&leaf_key) {
-            if !existing_matches(existing) {
-                return NtStatus::OBJECT_TYPE_MISMATCH;
+        if let Some(existing) = children.get(&leaf_key).cloned() {
+            match existing_object(&existing) {
+                ObjectLeafLookup::Live(object) => return on_exists(object),
+                ObjectLeafLookup::Stale => {
+                    children.remove(&leaf_key);
+                }
+                ObjectLeafLookup::TypeMismatch => return mismatch_status,
             }
-            return on_exists(Arc::clone(existing));
         }
 
         let node = Arc::new(construct(
@@ -432,18 +562,45 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         status
     }
 
+    pub(super) fn resolve_directory(
+        &self,
+        path: &str,
+    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+        self.resolve_object_leaf(path, false, |node| {
+            node.directory_object().map(|()| Arc::clone(node))
+        })
+    }
+
     pub(super) fn resolve_symlink(
         &self,
         path: &str,
         open_final_symlink: bool,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+        self.resolve_object_leaf(path, open_final_symlink, |node| {
+            node.symlink_target().map(|_| Arc::clone(node))
+        })
+    }
+
+    pub(super) fn resolve_event(&self, path: &str) -> Result<Arc<EventObject<Platform>>, NtStatus> {
+        self.resolve_object_leaf(path, true, |node| node.event_object())
+    }
+
+    pub(super) fn resolve_section(
+        &self,
+        path: &str,
+    ) -> Result<Arc<SectionObject<Platform>>, NtStatus> {
+        self.resolve_object_leaf(path, false, |node| node.section_object())
+    }
+
+    fn resolve_object_leaf<T>(
+        &self,
+        path: &str,
+        open_final_symlink: bool,
+        lookup: impl FnOnce(&Arc<ObjectNode<Platform>>) -> ObjectLeafLookup<T>,
+    ) -> Result<T, NtStatus> {
         let tail = absolute_path_tail(path)?;
         let node = self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, open_final_symlink)?;
-        if node.is_symlink() {
-            Ok(node)
-        } else {
-            Err(NtStatus::OBJECT_TYPE_MISMATCH)
-        }
+        lookup(&node).into_result()
     }
 
     fn seed_directory(&self, path: &str) {
@@ -509,7 +666,7 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
             if child.is_symlink() && (!final_component || !open_final_symlink) {
                 // This is the lazy-resolution point paired with
                 // NtCreateSymbolicLinkObject storing the target without lookup.
-                let target = normalize_reparse_target(&child.symlink_target()?)?;
+                let target = normalize_reparse_target(&child.symlink_target().into_result()?)?;
                 let target_tail = absolute_path_tail(&target)?;
                 let remaining = components.collect::<Vec<_>>().join("\\");
                 let next_tail = if target_tail.is_empty() {
@@ -870,7 +1027,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let granted_access = DirectoryAccess::from_desired_access(desired_access);
 
         if let Some(directory_name) = directory_name {
-            return self.process.directory_namespace.create_directory(
+            return self.process.object_manager.create_directory(
                 &directory_name.original_path,
                 |directory| {
                     let Some(object_attributes) = object_attributes else {
@@ -943,7 +1100,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let directory = {
             match self
                 .process
-                .directory_namespace
+                .object_manager
                 .resolve_directory(&directory_name.original_path)
             {
                 Ok(directory) => directory,
@@ -1097,20 +1254,21 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-pub(crate) fn seed_directory_namespace<Platform: crate::ShimPlatform>()
--> crate::WindowsDirectoryNamespace<Platform> {
-    let namespace = DirectoryNamespace::new();
+pub(crate) fn seed_object_manager<Platform: crate::ShimPlatform>()
+-> crate::WindowsObjectManager<Platform> {
+    let object_manager = ObjectManager::new();
     for path in SEEDED_DIRECTORY_PATHS {
-        namespace.seed_directory(path);
+        object_manager.seed_directory(path);
     }
     for (path, target) in SEEDED_SYMLINK_PATHS {
-        namespace.seed_symlink(path, target);
+        object_manager.seed_symlink(path, target);
     }
-    namespace
+    object_manager
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
     use core::mem::size_of;
 
     use litebox::platform::ThreadProvider;
@@ -1119,6 +1277,10 @@ mod tests {
 
     use super::*;
     use crate::nt_types::{ObjectAttributes, ObjectAttributesFlags};
+    use crate::syscalls::section::{
+        WINDOWS_SESSION_SHARED_SECTION_OBJECT, WINDOWS_SHARED_SECTION_OBJECT,
+        load_time_windows_shared_section,
+    };
     use crate::tests::{
         TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes, test_task,
         unicode_string, utf16_units,
@@ -1288,6 +1450,31 @@ mod tests {
                 NtStatus::SUCCESS
             );
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn windows_shared_section_resolves_to_session_shared_section() {
+        run_with_test_platform_pointers(|| {
+            let object_manager = seed_object_manager::<TestPlatform>();
+            let shared_section = load_time_windows_shared_section::<TestPlatform>(0x10000);
+            assert_eq!(
+                object_manager
+                    .create_section(WINDOWS_SESSION_SHARED_SECTION_OBJECT, &shared_section,),
+                NtStatus::SUCCESS
+            );
+
+            let shortcut = object_manager
+                .resolve_symlink(WINDOWS_SHARED_SECTION_OBJECT, true)
+                .expect("Windows shared section shortcut is a symbolic link");
+            assert_eq!(
+                shortcut.symlink_target().into_result(),
+                Ok(WINDOWS_SESSION_SHARED_SECTION_OBJECT.to_string())
+            );
+            let resolved = object_manager
+                .resolve_section(WINDOWS_SHARED_SECTION_OBJECT)
+                .expect("Windows shared section shortcut resolves to session section");
+            assert!(Arc::ptr_eq(&resolved, &shared_section));
         });
     }
 

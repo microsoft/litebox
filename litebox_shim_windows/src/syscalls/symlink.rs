@@ -15,8 +15,8 @@ use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString};
-use crate::syscalls::directory::ObjectNode;
-use crate::syscalls::{Handle, directory::DirectoryName};
+use crate::syscalls::Handle;
+use crate::syscalls::object_manager::{DirectoryName, ObjectNode};
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
@@ -163,7 +163,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         target: String,
         open_if: bool,
     ) -> NtStatus {
-        self.process.directory_namespace.create_symlink(
+        self.process.object_manager.create_symlink(
             &link_name.original_path,
             target,
             |link| {
@@ -209,7 +209,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let link = match self
             .process
-            .directory_namespace
+            .object_manager
             .resolve_symlink(&link_name.original_path, true)
         {
             Ok(link) => link,
@@ -252,8 +252,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
-        let target = entry.with_entry(|entry| entry.link.symlink_target());
-        let target = match target {
+        let target = match entry.with_entry(|entry| entry.link.symlink_target().into_result()) {
             Ok(target) => target,
             Err(status) => return status,
         };

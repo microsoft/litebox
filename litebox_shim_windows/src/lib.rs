@@ -12,8 +12,7 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -31,16 +30,15 @@ use litebox::sync::RawSyncPrimitivesProvider;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
-use crate::syscalls::directory::{
-    DirectoryHandleObject, DirectoryNamespace, DirectoryObjectSubsystem,
-};
-use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
+use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
+use crate::syscalls::object_manager::{
+    DirectoryHandleObject, DirectoryObjectSubsystem, ObjectManager,
+};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
-    windows_shared_section_key,
 };
 use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
@@ -94,15 +92,9 @@ pub(crate) type WindowsNlsSectionMappings<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
 pub(crate) type WindowsVirtualAllocations<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
-pub(crate) type WindowsSectionNamespace<Platform> =
-    litebox::sync::RwLock<Platform, BTreeMap<String, Weak<SectionObject<Platform>>>>;
-pub(crate) type WindowsPersistentSections<Platform> =
-    litebox::sync::RwLock<Platform, BTreeMap<String, Arc<SectionObject<Platform>>>>;
 pub(crate) type WindowsSectionViews<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsSectionView<Platform>>>;
-pub(crate) type WindowsEventNamespace<Platform> =
-    litebox::sync::RwLock<Platform, BTreeMap<String, Weak<EventObject<Platform>>>>;
-pub(crate) type WindowsDirectoryNamespace<Platform> = DirectoryNamespace<Platform>;
+pub(crate) type WindowsObjectManager<Platform> = ObjectManager<Platform>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {
@@ -358,6 +350,75 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     }
 }
 
+/// Wine and ReactOS model KUSER_SHARED_DATA as a fixed user page at
+/// 0x7FFE0000. Native Windows hosts already provide that page; Non-Windows hosts
+/// need LiteBox to create it before guest ntdll reads it during startup.
+#[cfg(not(target_os = "windows"))]
+fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
+    page_manager: &crate::WindowsPageManager<Platform>,
+) -> Result<(), PeImageAccessError> {
+    let address = NonZeroAddress::new(WINDOWS_USER_SHARED_DATA_BASE)
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let length = NonZeroPageSize::new(size_of::<KUserSharedData>().next_multiple_of(PAGE_SIZE))
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let shared_data = windows_user_shared_data();
+    let shared_data_bytes = shared_data.as_bytes();
+    // SAFETY: `NOREPLACE` makes the fixed mapping fail instead of replacing any
+    // existing host or guest mapping at the shared-data address.
+    unsafe {
+        page_manager.create_readable_pages(
+            Some(address),
+            length,
+            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+            |ptr| {
+                ptr.copy_from_slice(0, shared_data_bytes)
+                    .ok_or(MappingError::OutOfMemory)?;
+                Ok(0)
+            },
+        )
+    }
+    .map_err(PeImageAccessError::from)
+    .map(|_| ())
+}
+
+// TODO: This is a temporary placeholder for the Windows shared data page.
+// Once we have a proper shared mapping implementation, we can remove this
+// and instead map the shared data page from the host into the guest.
+#[cfg(not(target_os = "windows"))]
+fn windows_user_shared_data() -> KUserSharedData {
+    let mut shared_data = KUserSharedData::new_zeroed();
+    shared_data.nt_build_number = u32::from(WINDOWS_OS_BUILD_NUMBER);
+    shared_data.nt_product_type = WINDOWS_NT_PRODUCT_WORKSTATION;
+    shared_data.product_type_is_valid = 1;
+    shared_data.nt_major_version = u32::from(WINDOWS_OS_MAJOR_VERSION);
+    shared_data.nt_minor_version = u32::from(WINDOWS_OS_MINOR_VERSION);
+    for (index, code_unit) in WINDOWS_DIRECTORY.encode_utf16().enumerate() {
+        shared_data.nt_system_root[index] = code_unit;
+    }
+
+    shared_data
+}
+
+fn map_csr_server_shared_memory<Platform: crate::ShimPlatform>(
+    page_manager: &crate::WindowsPageManager<Platform>,
+) -> Option<usize> {
+    let length = litebox::mm::linux::NonZeroPageSize::new(
+        crate::syscalls::section::WINDOWS_SHARED_SECTION_SIZE,
+    )?;
+    // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` leaves address
+    // selection to the page manager, so this cannot replace an existing mapping.
+    unsafe {
+        page_manager.create_writable_pages(
+            None,
+            length,
+            litebox::mm::linux::CreatePagesFlags::empty(),
+            |_| Ok(0),
+        )
+    }
+    .map(|mapping| mapping.as_usize())
+    .ok()
+}
+
 pub struct WindowsShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platform, FS>>);
 
 impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
@@ -369,31 +430,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
+        // TODO: refactor the shared mapping
+        #[cfg(not(target_os = "windows"))]
+        map_windows_user_shared_data::<Platform>(self.0.page_manager)?;
+        let windows_shared_section_addr = map_csr_server_shared_memory(&self.0.page_manager)
+            .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
+        let windows_shared_section =
+            crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_addr);
+
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
-        let directory_namespace = syscalls::directory::seed_directory_namespace();
-        let persistent_sections = WindowsPersistentSections::<Platform>::new(BTreeMap::from([(
-            windows_shared_section_key(),
-            load_info.windows_shared_section,
-        )]));
-        let process = Arc::new(Process {
-            ntdll_mapping: load_info.ntdll_mapping,
-            peb_address: load_info.environment.peb,
-            handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
-            directory_namespace,
-            event_namespace: WindowsEventNamespace::<Platform>::new(BTreeMap::new()),
-            section_namespace: WindowsSectionNamespace::<Platform>::new(BTreeMap::new()),
-            persistent_sections,
-            section_views: WindowsSectionViews::<Platform>::new(BTreeMap::new()),
-            nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
-            virtual_allocations: load_info.virtual_allocations,
-            system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
-            user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
-            user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
-            default_hard_error_mode: AtomicU32::new(0),
-            cookie: syscalls::process::default_process_cookie(),
-            exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
-        });
+        let mut process =
+            Process::default(Some(load_info.virtual_allocations), windows_shared_section);
+        process.ntdll_mapping = load_info.ntdll_mapping;
+        process.peb_address = load_info.environment.peb;
+        write_field_at_offset::<Platform, _>(
+            process.peb_address,
+            core::mem::offset_of!(
+                crate::nt_types::ProcessEnvironmentBlock,
+                csr_server_read_only_shared_memory_base
+            ),
+            windows_shared_section_addr,
+        )
+        .ok_or(loader::WindowsLoadError::MemoryAccess)?;
+        let process = Arc::new(process);
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
                 task: Task {
@@ -427,11 +487,11 @@ pub struct Process<Platform: ShimPlatform> {
     ntdll_mapping: Option<MappingInfo>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
-    directory_namespace: WindowsDirectoryNamespace<Platform>,
-    event_namespace: WindowsEventNamespace<Platform>,
-    section_namespace: WindowsSectionNamespace<Platform>,
-    persistent_sections: WindowsPersistentSections<Platform>,
+    object_manager: WindowsObjectManager<Platform>,
     section_views: WindowsSectionViews<Platform>,
+    // TODO: move this into `GlobalState` once we have a proper shared mapping implementation.
+    #[expect(dead_code)]
+    windows_shared_section: Arc<SectionObject<Platform>>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,
     system_lcid: AtomicU32,
@@ -451,6 +511,38 @@ impl<Platform: ShimPlatform> Process<Platform> {
     pub fn wait(&self) -> i32 {
         // TODO: Wait for the NT process object once process lifecycle exists.
         self.exit_code.load(Ordering::Relaxed)
+    }
+
+    fn default(
+        virtual_allocations: Option<WindowsVirtualAllocations<Platform>>,
+        windows_shared_section: Arc<SectionObject<Platform>>,
+    ) -> Self {
+        let object_manager = syscalls::object_manager::seed_object_manager();
+        let status = object_manager.create_section(
+            syscalls::section::WINDOWS_SESSION_SHARED_SECTION_OBJECT,
+            &windows_shared_section,
+        );
+        assert!(
+            status == NtStatus::SUCCESS,
+            "seeded Windows shared section must have seeded ancestors: {status:?}"
+        );
+        Process {
+            ntdll_mapping: None,
+            peb_address: 0,
+            handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
+            object_manager,
+            windows_shared_section,
+            section_views: WindowsSectionViews::<Platform>::new(BTreeMap::new()),
+            nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
+            virtual_allocations: virtual_allocations
+                .unwrap_or_else(|| WindowsVirtualAllocations::<Platform>::new(BTreeMap::new())),
+            system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
+            user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
+            user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
+            default_hard_error_mode: AtomicU32::new(0),
+            cookie: syscalls::process::default_process_cookie(),
+            exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
+        }
     }
 }
 
@@ -652,7 +744,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return_length,
             } => {
                 let status = self.sys_nt_query_directory_object(
-                    syscalls::directory::DirectoryQueryParameters {
+                    syscalls::object_manager::DirectoryQueryParameters {
                         directory_handle,
                         buffer,
                         buffer_length,

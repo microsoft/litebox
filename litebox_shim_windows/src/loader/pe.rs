@@ -32,7 +32,6 @@ use crate::nt_types::{
 };
 use crate::syscalls::mm::{MemoryType, PageProtection};
 use crate::syscalls::process::{INITIAL_PROCESS_ID, INITIAL_THREAD_ID};
-use crate::syscalls::section::{SectionObject, load_time_windows_shared_section};
 use crate::{MutPtr, ShimFS};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
@@ -167,7 +166,7 @@ pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
     pub(crate) teb: usize,
     pub(crate) context: usize,
-    pub(crate) read_only_shared_memory_base: usize,
+    // pub(crate) csr_server_read_only_shared_memory_base: usize,
 }
 
 pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
@@ -176,7 +175,7 @@ pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
     pub(crate) ntdll_mapping: Option<MappingInfo>,
     pub(crate) virtual_allocations: crate::WindowsVirtualAllocations<Platform>,
     pub(crate) environment: WindowsProcessEnvironment,
-    pub(crate) windows_shared_section: Arc<SectionObject<Platform>>,
+    // pub(crate) windows_shared_section: Arc<SectionObject<Platform>>,
 }
 
 struct ProcessEnvironmentInput<'a> {
@@ -214,9 +213,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         argv: &[CString],
         envp: &[CString],
     ) -> Result<PeLoadInfo<Platform>, WindowsLoadError> {
-        #[cfg(not(target_os = "windows"))]
-        map_windows_user_shared_data::<Platform>(self.page_manager)?;
-
         let image = load_image(self.platform, self.fs.clone(), path, self.page_manager)?;
         let application_entry_point = image.mapping.entry_point;
         let ntdll = load_ntdll(self.platform, self.fs.clone(), self.page_manager)?;
@@ -280,8 +276,8 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             None
         };
 
-        let windows_shared_section =
-            load_time_windows_shared_section(environment.read_only_shared_memory_base);
+        // let windows_shared_section =
+        //     load_time_windows_shared_section(environment.csr_server_read_only_shared_memory_base);
 
         Ok(PeLoadInfo {
             entry_point,
@@ -289,7 +285,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             ntdll_mapping,
             virtual_allocations,
             environment,
-            windows_shared_section,
+            // windows_shared_section,
         })
     }
 
@@ -486,12 +482,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         peb.image_subsystem_minor_version = u32::from(input.image.minor_subsystem_version());
         peb.read_only_shared_memory_base = read_only_shared_memory_base;
         peb.read_only_static_server_data = read_only_static_server_data;
-        // Inert host-shape scalar: the CSR client never dereferences this base;
-        // static-server-data pointers are client-view.
-        peb.csr_server_read_only_shared_memory_base = read_only_shared_memory_base
-            .checked_add(WINDOWS_SHARED_SECTION_SIZE)
-            .ok_or(PeImageAccessError::AddressOverflow)?
-            as u64;
+
         write_guest_value::<Platform, _>(peb_ptr, peb)?;
 
         let mut teb = ThreadEnvironmentBlock::new_zeroed();
@@ -519,7 +510,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             peb: peb_ptr,
             teb: teb_ptr,
             context: ctx_ptr,
-            read_only_shared_memory_base,
+            // csr_server_read_only_shared_memory_base,
         })
     }
 }
@@ -539,20 +530,10 @@ fn initialize_windows_static_server_data<Platform: RawPointerProvider>(
     read_only_static_server_data
         .write_at_offset(
             BASESRV_SERVERDLL_INDEX.cast_signed(),
-            shared_heap.pointer_address(client_base_static_server_data.as_usize())?,
+            client_base_static_server_data.as_usize(),
         )
         .ok_or(PeImageAccessError::MemoryAccess)?;
     Ok(read_only_static_server_data.as_usize())
-}
-
-#[cfg(test)]
-pub(crate) fn initialize_windows_static_server_data_for_test<Platform: RawPointerProvider>(
-    read_only_shared_memory_base: usize,
-) -> Result<(), PeImageAccessError> {
-    let mut shared_heap =
-        GuestMemoryAllocator::new(read_only_shared_memory_base, WINDOWS_SHARED_SECTION_SIZE)?;
-    initialize_windows_static_server_data::<Platform>(&mut shared_heap)?;
-    Ok(())
 }
 
 fn initialize_static_server_data<Platform: RawPointerProvider>(
@@ -611,7 +592,7 @@ fn initialize_static_server_data<Platform: RawPointerProvider>(
         Platform,
         base_static_server_data,
         ini_file_mapping,
-        shared_heap.pointer_address(ini_file_mapping)?,
+        ini_file_mapping,
     )?;
     write_static_server_data_field!(
         Platform,
@@ -704,38 +685,16 @@ impl RtlCriticalSection {
 struct GuestMemoryAllocator {
     cursor: usize,
     end: usize,
-    pointer_base_delta: isize,
 }
 
 impl GuestMemoryAllocator {
     fn new(base: usize, size: usize) -> Result<Self, PeImageAccessError> {
-        Self::new_with_pointer_base(base, size, base)
-    }
-
-    fn new_with_pointer_base(
-        base: usize,
-        size: usize,
-        pointer_base: usize,
-    ) -> Result<Self, PeImageAccessError> {
         let cursor = base;
         let end = checked_add(base, size)?;
         if cursor > end {
             return Err(PeImageAccessError::AddressOverflow);
         }
-        let pointer_base_delta = pointer_base
-            .checked_sub(base)
-            .and_then(|delta| isize::try_from(delta).ok())
-            .or_else(|| {
-                base.checked_sub(pointer_base)
-                    .and_then(|delta| isize::try_from(delta).ok())
-                    .map(isize::wrapping_neg)
-            })
-            .ok_or(PeImageAccessError::AddressOverflow)?;
-        Ok(Self {
-            cursor,
-            end,
-            pointer_base_delta,
-        })
+        Ok(Self { cursor, end })
     }
 
     fn allocate<Platform, T>(&mut self) -> Result<MutPtr<Platform, T>, PeImageAccessError>
@@ -774,12 +733,6 @@ impl GuestMemoryAllocator {
         }
         self.cursor = cursor;
         Ok(address)
-    }
-
-    fn pointer_address(&self, address: usize) -> Result<usize, PeImageAccessError> {
-        address
-            .checked_add_signed(self.pointer_base_delta)
-            .ok_or(PeImageAccessError::AddressOverflow)
     }
 }
 
@@ -1181,52 +1134,6 @@ where
     crate::write_slice::<Platform, T>(address, values).ok_or(PeImageAccessError::MemoryAccess)
 }
 
-/// Wine and ReactOS model KUSER_SHARED_DATA as a fixed user page at
-/// 0x7FFE0000. Native Windows hosts already provide that page; Non-Windows hosts
-/// need LiteBox to create it before guest ntdll reads it during startup.
-#[cfg(not(target_os = "windows"))]
-fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
-    page_manager: &crate::WindowsPageManager<Platform>,
-) -> Result<(), PeImageAccessError> {
-    let address = NonZeroAddress::new(WINDOWS_USER_SHARED_DATA_BASE)
-        .ok_or(PeImageAccessError::AddressOverflow)?;
-    let length = NonZeroPageSize::new(size_of::<KUserSharedData>().next_multiple_of(PAGE_SIZE))
-        .ok_or(PeImageAccessError::AddressOverflow)?;
-    let shared_data = windows_user_shared_data();
-    let shared_data_bytes = shared_data.as_bytes();
-    // SAFETY: `NOREPLACE` makes the fixed mapping fail instead of replacing any
-    // existing host or guest mapping at the shared-data address.
-    unsafe {
-        page_manager.create_readable_pages(
-            Some(address),
-            length,
-            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-            |ptr| {
-                ptr.copy_from_slice(0, shared_data_bytes)
-                    .ok_or(MappingError::OutOfMemory)?;
-                Ok(0)
-            },
-        )
-    }
-    .map_err(PeImageAccessError::from)
-    .map(|_| ())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn windows_user_shared_data() -> KUserSharedData {
-    let mut shared_data = KUserSharedData::new_zeroed();
-    shared_data.nt_build_number = u32::from(WINDOWS_OS_BUILD_NUMBER);
-    shared_data.nt_product_type = WINDOWS_NT_PRODUCT_WORKSTATION;
-    shared_data.product_type_is_valid = 1;
-    shared_data.nt_major_version = u32::from(WINDOWS_OS_MAJOR_VERSION);
-    shared_data.nt_minor_version = u32::from(WINDOWS_OS_MINOR_VERSION);
-    for (index, code_unit) in WINDOWS_DIRECTORY.encode_utf16().enumerate() {
-        shared_data.nt_system_root[index] = code_unit;
-    }
-
-    shared_data
-}
-
 struct LoadedNtDll {
     image: LoadedImage,
     exports: NtDllExports,
@@ -1421,6 +1328,10 @@ pub enum WindowsLoadError {
     /// Guest ntdll.dll has not been rewritten for LiteBox syscall/GS handling.
     #[error("guest ntdll.dll must be rewritten for LiteBox before entering its loader")]
     UnrewrittenNtDll,
+    #[error("failed to map shared memory")]
+    MapSharedMemory,
+    #[error("memory access failed")]
+    MemoryAccess,
 }
 
 fn is_missing_file_error(error: &WindowsLoadError) -> bool {
@@ -1852,7 +1763,7 @@ fn allocate_guest_unicode_string<Platform: RawPointerProvider>(
         length: string.length,
         maximum_length: string.maximum_length,
         padding_0: [0; 4],
-        buffer: allocation.pointer_address(buffer.as_usize())?,
+        buffer: buffer.as_usize(),
     })
 }
 
