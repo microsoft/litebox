@@ -1094,13 +1094,20 @@ impl<FS: ShimFS> Task<FS> {
                 // allowed to bypass the fork quiesce (see the `is_suspended` wake
                 // above) so the forker isn't stuck waiting for it to park — but
                 // that leaves its clear_child_tid write exposed to the rollback.
-                // Record the address on the covering CoW layer *before* the write
-                // so a restore that races between our snapshot-fault and here
-                // still re-applies the clear+wake (a register-after-write could be
-                // drained-then-missed). The re-applying layer always restores
-                // after the layer the snapshot landed in, so word ends at 0.
-                if let Some((cow, _)) = self.top_cow_layer_for_page(clear_child_tid_addr) {
-                    cow.pending_join_wakes.lock().push(clear_child_tid_addr);
+                // Record `(addr, stale_tid)` on the covering CoW layer *before*
+                // the write so a restore that races between our snapshot-fault
+                // and here still re-applies the clear+wake (a register-after
+                // could be drained-then-missed). The re-apply only fires if the
+                // slot still holds `stale_tid`, so a slot glibc has reused for a
+                // new thread is never clobbered.
+                if let Some(stale) =
+                    crate::MutPtr::<u32>::from_usize(clear_child_tid_addr).read_at_offset(0)
+                    && stale != 0
+                    && let Some((cow, _)) = self.top_cow_layer_for_page(clear_child_tid_addr)
+                {
+                    cow.pending_join_wakes
+                        .lock()
+                        .push((clear_child_tid_addr, stale));
                 }
                 if self.prepare_guest_write(clear_child_tid, 1).is_ok()
                     && clear_child_tid.write_at_offset(0, 0).is_some()
