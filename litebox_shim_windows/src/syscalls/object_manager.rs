@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Windows NT object-manager namespace and directory syscalls.
+//! Windows NT object manager.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString as _};
@@ -196,6 +196,21 @@ macro_rules! object_leaf_accessors {
     };
 }
 
+macro_rules! object_node_constructors {
+    ($($method:ident($($arg:ident: $arg_ty:ty),*) => $body:expr;)+) => {
+        $(
+            fn $method(
+                path: String,
+                parent: Option<Weak<ObjectNode<Platform>>>,
+                name: String,
+                $($arg: $arg_ty),*
+            ) -> Self {
+                Self::new(path, parent, name, $body)
+            }
+        )+
+    };
+}
+
 #[derive(Clone, Debug)]
 struct ObjectName(String);
 
@@ -285,61 +300,25 @@ pub(crate) struct DirectoryQueryParameters<Platform: RawPointerProvider> {
 }
 
 impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
-    fn new_directory(
+    fn new(
         path: String,
         parent: Option<Weak<ObjectNode<Platform>>>,
         name: String,
+        body: NamedObject<Platform>,
     ) -> Self {
         Self {
             path,
             name,
             parent,
-            body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Directory {
-                children: BTreeMap::new(),
-            }),
+            body: litebox::sync::RwLock::<Platform, _>::new(body),
         }
     }
 
-    fn new_symlink(
-        path: String,
-        parent: Option<Weak<ObjectNode<Platform>>>,
-        name: String,
-        target: String,
-    ) -> Self {
-        Self {
-            path,
-            name,
-            parent,
-            body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Symlink { target }),
-        }
-    }
-
-    fn new_event(
-        path: String,
-        parent: Option<Weak<ObjectNode<Platform>>>,
-        name: String,
-        event: Weak<EventObject<Platform>>,
-    ) -> Self {
-        Self {
-            path,
-            name,
-            parent,
-            body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Event { event }),
-        }
-    }
-
-    fn new_section(
-        path: String,
-        parent: Option<Weak<ObjectNode<Platform>>>,
-        name: String,
-        section: Weak<SectionObject<Platform>>,
-    ) -> Self {
-        Self {
-            path,
-            name,
-            parent,
-            body: litebox::sync::RwLock::<Platform, _>::new(NamedObject::Section { section }),
-        }
+    object_node_constructors! {
+        new_directory() => NamedObject::Directory { children: BTreeMap::new() };
+        new_symlink(target: String) => NamedObject::Symlink { target };
+        new_event(event: Weak<EventObject<Platform>>) => NamedObject::Event { event };
+        new_section(section: Weak<SectionObject<Platform>>) => NamedObject::Section { section };
     }
 
     fn child(&self, name: &str) -> Option<Arc<Self>> {

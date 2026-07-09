@@ -166,7 +166,6 @@ pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
     pub(crate) teb: usize,
     pub(crate) context: usize,
-    // pub(crate) csr_server_read_only_shared_memory_base: usize,
 }
 
 pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
@@ -175,7 +174,6 @@ pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
     pub(crate) ntdll_mapping: Option<MappingInfo>,
     pub(crate) virtual_allocations: crate::WindowsVirtualAllocations<Platform>,
     pub(crate) environment: WindowsProcessEnvironment,
-    // pub(crate) windows_shared_section: Arc<SectionObject<Platform>>,
 }
 
 struct ProcessEnvironmentInput<'a> {
@@ -276,16 +274,12 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             None
         };
 
-        // let windows_shared_section =
-        //     load_time_windows_shared_section(environment.csr_server_read_only_shared_memory_base);
-
         Ok(PeLoadInfo {
             entry_point,
             stack_top,
             ntdll_mapping,
             virtual_allocations,
             environment,
-            // windows_shared_section,
         })
     }
 
@@ -510,7 +504,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             peb: peb_ptr,
             teb: teb_ptr,
             context: ctx_ptr,
-            // csr_server_read_only_shared_memory_base,
         })
     }
 }
@@ -518,9 +511,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
 fn initialize_windows_static_server_data<Platform: RawPointerProvider>(
     shared_heap: &mut GuestMemoryAllocator,
 ) -> Result<usize, PeImageAccessError> {
-    // Real CSRSS allocates this out of a shared heap; keep the table away from
-    // the region base without modeling the heap header itself.
-    let _ = shared_heap.allocate_array::<Platform, usize>(1)?;
     let read_only_static_server_data =
         shared_heap.allocate_array::<Platform, usize>(CSR_SERVER_DLL_MAX)?;
     let client_base_static_server_data =
@@ -2504,44 +2494,6 @@ mod tests {
                     / size_of::<u16>(),
             ),
             utf16_environment_units(&["a=one", "B=two", "c=three"])
-        );
-    }
-
-    #[test]
-    fn csr_static_server_data_uses_client_view_pointers() {
-        let created = created_process_environment_snapshot();
-        let base = created.peb.read_only_shared_memory_base;
-        let end = base + WINDOWS_SHARED_SECTION_SIZE;
-        let table = created.peb.read_only_static_server_data;
-
-        assert!((base..end).contains(&table));
-        assert_ne!(table, base);
-        assert_ne!(
-            usize::try_from(created.peb.csr_server_read_only_shared_memory_base).unwrap(),
-            base
-        );
-
-        let base_static_server_data =
-            <crate::tests::TestPlatform as RawPointerProvider>::RawConstPointer::<usize>::from_usize(
-                table,
-            )
-            .read_at_offset(BASESRV_SERVERDLL_INDEX.cast_signed())
-            .expect("BASESRV static server data pointer is readable");
-        assert!((base..end).contains(&base_static_server_data));
-
-        let windows_directory =
-            <crate::tests::TestPlatform as RawPointerProvider>::RawConstPointer::<
-                UnicodeString,
-            >::from_usize(
-                base_static_server_data
-                    + core::mem::offset_of!(BaseStaticServerData, windows_directory),
-            )
-            .read_at_offset(0)
-            .expect("BASESRV WindowsDirectory is readable");
-        assert!((base..end).contains(&windows_directory.buffer));
-        assert_eq!(
-            decode_guest_unicode_string(windows_directory),
-            WINDOWS_DIRECTORY
         );
     }
 
