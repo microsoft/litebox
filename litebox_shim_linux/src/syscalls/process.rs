@@ -1100,29 +1100,14 @@ impl<FS: ShimFS> Task<FS> {
                 // could be drained-then-missed). The re-apply only fires if the
                 // slot still holds `stale_tid`, so a slot glibc has reused for a
                 // new thread is never clobbered.
-                let stale = crate::MutPtr::<u32>::from_usize(clear_child_tid_addr).read_at_offset(0);
-                let registered = if let Some(stale) = stale
+                if let Some(stale) =
+                    crate::MutPtr::<u32>::from_usize(clear_child_tid_addr).read_at_offset(0)
                     && stale != 0
                     && let Some((cow, _)) = self.top_cow_layer_for_page(clear_child_tid_addr)
                 {
                     cow.pending_join_wakes
                         .lock()
                         .push((clear_child_tid_addr, stale));
-                    true
-                } else {
-                    false
-                };
-                {
-                    use litebox::platform::DebugLogProvider as _;
-                    self.global.platform.debug_log_print(&alloc::format!(
-                        "[TID-EXIT] pid={} tid={} cct={:#x} stale={:?} layers={} registered={}\n",
-                        self.process_id.0,
-                        self.tid,
-                        clear_child_tid_addr,
-                        stale,
-                        self.active_vfork_layer_count(),
-                        registered,
-                    ));
                 }
                 if self.prepare_guest_write(clear_child_tid, 1).is_ok()
                     && clear_child_tid.write_at_offset(0, 0).is_some()
@@ -1133,15 +1118,6 @@ impl<FS: ShimFS> Task<FS> {
                         flags: litebox_common_linux::FutexFlags::PRIVATE,
                         count: 1,
                     });
-                    {
-                        use litebox::platform::DebugLogProvider as _;
-                        let post = crate::MutPtr::<u32>::from_usize(clear_child_tid_addr)
-                            .read_at_offset(0);
-                        self.global.platform.debug_log_print(&alloc::format!(
-                            "[TID-EXIT-POST] pid={} tid={} cct={:#x} post_word={:?}\n",
-                            self.process_id.0, self.tid, clear_child_tid_addr, post,
-                        ));
-                    }
                 }
             }
         }
@@ -8553,49 +8529,6 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 impl<FS: ShimFS> Task<FS> {
-    /// DIAGNOSTIC (PROMOTION_RACE.concurrent_fork): wait on a *no-timeout*
-    /// futex with a periodic re-check so a stuck waiter (barrier / condvar)
-    /// is attributed. Every interval it logs the current guest futex word,
-    /// distinguishing:
-    ///   * `actual != expected` — the guest word changed (a wake IS due) but
-    ///     the waiter was still parked ⇒ litebox dropped the wake.
-    ///   * `actual == expected` — the word never changed ⇒ the waker never
-    ///     fired (upstream stall), not a lost wake.
-    /// The re-check also re-reads the word inside `FutexManager::wait`, so a
-    /// genuinely-changed word returns `ImmediatelyWokenBecauseValueMismatch`
-    /// on the next tick (self-heals within one interval — expected for the
-    /// diagnostic build).
-    fn futex_wait_stuck_diag(
-        &self,
-        addr_usize: usize,
-        val: u32,
-        bitset: Option<core::num::NonZeroU32>,
-    ) -> Result<(), litebox::sync::futex::FutexError> {
-        use litebox::platform::DebugLogProvider as _;
-        loop {
-            let cx = self
-                .wait_cx()
-                .with_timeout(Some(core::time::Duration::from_secs(3)));
-            let addr = crate::MutPtr::<u32>::from_usize(addr_usize);
-            match self.global.futex_manager.wait(&cx, addr, val, bitset, 0) {
-                Err(litebox::sync::futex::FutexError::WaitError(WaitError::TimedOut)) => {
-                    let actual = crate::MutPtr::<u32>::from_usize(addr_usize).read_at_offset(0);
-                    self.global.platform.debug_log_print(&alloc::format!(
-                        "[FUTEX-STUCK] pid={} tid={} addr={:#x} expected={} actual={:?} suspended={} exiting={}\n",
-                        self.process_id.0,
-                        self.tid,
-                        addr_usize,
-                        val,
-                        actual,
-                        self.is_suspended(),
-                        self.is_exiting(),
-                    ));
-                }
-                other => return other,
-            }
-        }
-    }
-
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(
         &self,
@@ -8624,17 +8557,13 @@ impl<FS: ShimFS> Task<FS> {
                 // without that infrastructure, plain EINTR is the safe
                 // choice (restarting would replay the original timeout,
                 // losing elapsed time).
-                if timeout.is_some() {
-                    self.global.futex_manager.wait(
-                        &self.wait_cx().with_timeout(timeout),
-                        addr,
-                        val,
-                        None,
-                        0,
-                    )?;
-                } else {
-                    self.futex_wait_stuck_diag(addr.as_usize(), val, None)?;
-                }
+                self.global.futex_manager.wait(
+                    &self.wait_cx().with_timeout(timeout),
+                    addr,
+                    val,
+                    None,
+                    0,
+                )?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
@@ -8687,19 +8616,13 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 // FUTEX_WAIT_BITSET uses an absolute deadline, so
                 // restart is safe — the same deadline is re-evaluated.
-                let bitset = core::num::NonZeroU32::new(bitmask);
-                let wait_result = if deadline.is_some() {
-                    self.global.futex_manager.wait(
-                        &self.wait_cx().with_deadline(deadline),
-                        addr,
-                        val,
-                        bitset,
-                        0,
-                    )
-                } else {
-                    self.futex_wait_stuck_diag(addr.as_usize(), val, bitset)
-                };
-                match wait_result {
+                match self.global.futex_manager.wait(
+                    &self.wait_cx().with_deadline(deadline),
+                    addr,
+                    val,
+                    core::num::NonZeroU32::new(bitmask),
+                    0,
+                ) {
                     Ok(()) => 0,
                     Err(litebox::sync::futex::FutexError::WaitError(
                         litebox::event::wait::WaitError::Interrupted,
