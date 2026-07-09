@@ -1455,5 +1455,72 @@ class StressHelperTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class ThroughputRenderTests(unittest.TestCase):
+    """`_render_throughput` computes cycle-completion, per-trial overhead,
+    and per-tip velocity entirely in SQL. Hermetic temp DB with rows
+    positioned relative to `now_ms()` so the relative windows apply."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = _init_db(Path(self.tmp.name) / "results.sqlite")
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _run(self, *, finished_ts_ms, started_ts_ms, branch="b"):
+        self.conn.execute(
+            "INSERT INTO runs(started_ts_ms, finished_ts_ms, hostname,"
+            " worktree_path, commit_sha, branch) VALUES (?,?,?,?,?,?)",
+            (started_ts_ms, finished_ts_ms, "h", "/wt", "sha", branch))
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def _res(self, rid, tid, mode, ts, *, spawn=1, init=1, useful=1):
+        self.conn.execute(
+            'INSERT INTO run_results(run_id,test_id,mode,verdict,'
+            'finished_ts_ms,suite,"group",t_acquire_ms,t_docker_start_ms,'
+            't_docker_spawn_ms,t_litebox_init_ms,t_useful_ms)'
+            ' VALUES (?,?,?,?,?,?,?,0,0,?,?,?)',
+            (rid, tid, mode, "pass", ts, "s", "g", spawn, init, useful))
+
+    def test_empty_store_returns_blank(self):
+        self.assertEqual(dashboard._render_throughput(self.conn), "")
+
+    def test_cycle_completion_counts(self):
+        now = dashboard.now_ms()
+        # completed: finalized run
+        a = self._run(finished_ts_ms=now, started_ts_ms=now - 60_000)
+        self._res(a, "t1", "litebox", now - 60_000)
+        # reaped: not finalized, last result older than the 5-min settle
+        b = self._run(finished_ts_ms=None, started_ts_ms=now - 600_000)
+        self._res(b, "t2", "litebox", now - 600_000)
+        # in-flight: not finalized, recent result
+        c = self._run(finished_ts_ms=None, started_ts_ms=now - 60_000)
+        self._res(c, "t3", "litebox", now - 60_000)
+        out = dashboard._render_throughput(self.conn)
+        self.assertIn("1 completed · 1 reaped", out)
+        self.assertIn("1 in-flight", out)
+        self.assertIn("(50% reaped)", out)  # 1 reaped of (1+1)
+
+    def test_overhead_percent(self):
+        now = dashboard.now_ms()
+        a = self._run(finished_ts_ms=now, started_ts_ms=now - 60_000)
+        # spawn 20s + init 1s vs useful 2s ⇒ overhead 21/23 = 91%
+        self._res(a, "t1", "litebox", now - 60_000,
+                  spawn=20_000, init=1_000, useful=2_000)
+        out = dashboard._render_throughput(self.conn)
+        self.assertIn("| litebox |", out)
+        self.assertIn("**91%**", out)
+
+    def test_velocity_per_tip(self):
+        now = dashboard.now_ms()
+        a = self._run(finished_ts_ms=now, started_ts_ms=now - 60_000,
+                      branch="mybranch")
+        for i in range(6):  # 6 litebox results in 6h ⇒ 1.0/hr, 0 native
+            self._res(a, f"t{i}", "litebox", now - 60_000)
+        out = dashboard._render_throughput(self.conn)
+        self.assertIn("`mybranch` | 0.0 | 1.0 |", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -900,6 +900,7 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     parts.append(_render_meta(conn, state_dir))
     parts.append(_render_leases(conn))
     parts.append(_render_velocity(conn))
+    parts.append(_render_throughput(conn))
     parts.append(_render_tracked_refs(conn))
     parts.append(_render_agent_worktrees(conn, state_dir))
     parts.append(_render_current_fails(conn))
@@ -986,6 +987,127 @@ def _render_velocity(conn: sqlite3.Connection) -> str:
         f"_{n_runs} runs · +{newly_covered} newly covered "
         f"(test_id, pass) pairs · {flips} verdict flips_\n"
     )
+
+
+def _render_throughput(conn: sqlite3.Connection) -> str:
+    """Throughput health, all computed in SQL (Python only formats):
+
+      * **Cycle completion** — reaped vs finalized cargo cycles. A
+        reaped cycle keeps every result it already committed (WAL
+        autocommit per trial); it loses only the one in-flight trial +
+        that cycle's setup. A rising reaped fraction is the contention
+        signal; lowering it is the goal of parallelism tuning.
+      * **Per-trial wall time** — where each trial's time goes. On this
+        box container spawn dominates (~20-40x the useful test), so
+        this makes the Docker overhead visible and lets a runtime
+        change (native docker, warm pool) be judged.
+      * **Coverage velocity** — results/hr per tip, so a starved
+        branch (few results/hr) is obvious.
+
+    Empty (returns "") on a store with no timing rows yet."""
+    now = now_ms()
+    settled = now - 5 * 60 * 1000  # last result older than this ⇒ done
+
+    def _cycles(window_ms: int) -> tuple[int, int, int]:
+        row = conn.execute(
+            """
+            WITH w AS (
+                SELECT r.finished_ts_ms, r.started_ts_ms,
+                       (SELECT MAX(rr.finished_ts_ms) FROM run_results rr
+                         WHERE rr.run_id = r.run_id) AS last_ms
+                  FROM runs r
+                 WHERE r.started_ts_ms > :cutoff
+            )
+            SELECT
+              SUM(finished_ts_ms IS NOT NULL),
+              SUM(finished_ts_ms IS NULL
+                  AND COALESCE(last_ms, started_ts_ms) <  :settled),
+              SUM(finished_ts_ms IS NULL
+                  AND COALESCE(last_ms, started_ts_ms) >= :settled)
+              FROM w
+            """,
+            {"cutoff": now - window_ms, "settled": settled},
+        ).fetchone()
+        return (row[0] or 0, row[1] or 0, row[2] or 0)
+
+    def _pct(reaped: int, completed: int) -> str:
+        tot = reaped + completed
+        return f"{round(100 * reaped / tot)}%" if tot else "—"
+
+    c3, r3, i3 = _cycles(3 * 3600 * 1000)
+    c24, r24, _ = _cycles(24 * 3600 * 1000)
+    if (c3 + r3 + i3 + c24 + r24) == 0:
+        return ""
+
+    out = [
+        "## Throughput\n\n",
+        "_Cycle completion_ — a reaped cycle keeps every result it "
+        "already committed (per-trial WAL autocommit); it loses only the "
+        "one in-flight trial + that cycle's setup:\n",
+        f"- last 3h: **{c3} completed · {r3} reaped** "
+        f"({_pct(r3, c3)} reaped) · {i3} in-flight\n",
+        f"- last 24h: {c24} completed · {r24} reaped "
+        f"({_pct(r24, c24)} reaped)\n",
+    ]
+
+    over = conn.execute(
+        """
+        SELECT mode, COUNT(*) AS n,
+               AVG(t_acquire_ms)      AS acquire,
+               AVG(t_docker_spawn_ms) AS spawn,
+               AVG(t_litebox_init_ms) AS init,
+               AVG(t_useful_ms)       AS useful
+          FROM run_results
+         WHERE finished_ts_ms > :cutoff AND t_useful_ms IS NOT NULL
+         GROUP BY mode ORDER BY mode
+        """,
+        {"cutoff": now - 6 * 3600 * 1000},
+    ).fetchall()
+    if over:
+        out.append(
+            "\n_Per-trial wall time_ (last 6h) — container spawn "
+            "dominates; `useful` is the actual test:\n\n"
+            "| mode | n | acquire | docker_spawn | init | useful | overhead |\n"
+            "|---|--:|--:|--:|--:|--:|--:|\n"
+        )
+        for m in over:
+            spawn = m["spawn"] or 0
+            init = m["init"] or 0
+            useful = m["useful"] or 0
+            ovh = spawn + init
+            pct = round(100 * ovh / (ovh + useful)) if (ovh + useful) else 0
+            out.append(
+                f"| {m['mode']} | {m['n']} "
+                f"| {(m['acquire'] or 0) / 1000:.1f}s | {spawn / 1000:.1f}s "
+                f"| {init / 1000:.1f}s | {useful / 1000:.1f}s "
+                f"| **{pct}%** |\n"
+            )
+
+    vel = conn.execute(
+        """
+        SELECT COALESCE(r.branch, r.worktree_path) AS tip,
+               SUM(rr.mode = 'native')  AS native,
+               SUM(rr.mode = 'litebox') AS litebox
+          FROM run_results rr JOIN runs r ON r.run_id = rr.run_id
+         WHERE rr.finished_ts_ms > :cutoff
+         GROUP BY tip ORDER BY (native + litebox) DESC LIMIT 8
+        """,
+        {"cutoff": now - 6 * 3600 * 1000},
+    ).fetchall()
+    if vel:
+        out.append(
+            "\n_Coverage velocity_ (results/hr, last 6h, top tips):\n\n"
+            "| tip | native/hr | litebox/hr |\n|---|--:|--:|\n"
+        )
+        for v in vel:
+            tip = v["tip"] or "?"
+            short = tip.rsplit("/", 1)[-1]
+            out.append(
+                f"| `{short}` | {round((v['native'] or 0) / 6.0, 1)} "
+                f"| {round((v['litebox'] or 0) / 6.0, 1)} |\n"
+            )
+
+    return "".join(out)
 
 
 def _render_meta(conn: sqlite3.Connection, state_dir: Path) -> str:
