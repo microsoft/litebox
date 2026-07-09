@@ -54,11 +54,6 @@ impl RingBuffer {
 /// Returns the new write offset (unchanged on failure).
 fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> usize {
     const MAX_SPAN_PAGES: usize = 16;
-    // If `buf` would force the start page into the span twice, vmap rejects the
-    // duplicate. Hand off to the two-write slow path before truncating `buf`.
-    if buf.len() < size && write_offset % PAGE_SIZE + buf.len() > size {
-        return write_slow(rb_pa, size, write_offset, buf);
-    }
 
     // Inputs longer than the buffer overwrite the whole ring with the trailing bytes.
     let (buf, start) = if buf.len() >= size {
@@ -71,7 +66,10 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
     let start_page = start / PAGE_SIZE;
     let in_page_offset = start % PAGE_SIZE;
     let span_pages = (in_page_offset + buf.len()).div_ceil(PAGE_SIZE);
-    if span_pages > MAX_SPAN_PAGES {
+    // `span_pages > page_count`: the wrap *revisits* the start page, so the span
+    //   would map the same physical page twice and vmap rejects the duplicate.
+    // `span_pages > MAX_SPAN_PAGES`: the span is too long for `span` below.
+    if span_pages > page_count || span_pages > MAX_SPAN_PAGES {
         return write_slow(rb_pa, size, write_offset, buf);
     }
     let rb_pa: usize = rb_pa.as_u64().trunc();
