@@ -4,7 +4,7 @@
 mod in_mem {
     use crate::LiteBox;
     use crate::fs::in_mem;
-    use crate::fs::{Mode, OFlags};
+    use crate::fs::{Mode, OFlags, SeekWhence};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -57,6 +57,42 @@ mod in_mem {
             assert_eq!(bytes_read, data.len());
             assert_eq!(&buffer, data);
             fs.close(&fd).expect("Failed to close file");
+        });
+    }
+
+    #[test]
+    fn anonymous_file_from_bytes_is_seekable_and_read_only() {
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
+
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
+            let fd = {
+                let mut descriptors = litebox.descriptor_table_mut();
+                <in_mem::FileSystem<MockPlatform> as crate::fs::FileSystem>::create_anonymous_file_from_bytes(
+                    fs,
+                    "proc_synthetic_test",
+                    Mode::from_bits_truncate(0o444),
+                    b"synthetic proc\n",
+                    OFlags::RDONLY,
+                    &mut *descriptors,
+                )
+                .expect("create anonymous file from bytes")
+            };
+
+            let status = fs.fd_file_status(&fd).expect("fstat anonymous file");
+            assert_eq!(status.size, "synthetic proc\n".len());
+
+            let mut buffer = vec![0; "synthetic proc\n".len()];
+            let bytes_read = fs.read(&fd, &mut buffer, None).expect("read anonymous file");
+            assert_eq!(bytes_read, buffer.len());
+            assert_eq!(&buffer, b"synthetic proc\n");
+
+            assert_eq!(
+                fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
+                    .expect("seek anonymous file"),
+                0
+            );
+            assert!(fs.write(&fd, b"x", None).is_err(), "read-only anonymous file must reject writes");
+            fs.close(&fd).expect("close anonymous file");
         });
     }
 
