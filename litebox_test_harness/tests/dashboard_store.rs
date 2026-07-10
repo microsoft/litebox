@@ -111,7 +111,7 @@ fn dashboard_schema_initializes_and_view_returns_latest() {
 
     let insert_result = |run_id: i64, verdict: &str, ts: i64| {
         conn.execute(
-            "INSERT INTO run_results(run_id, test_id, pass, verdict, finished_ts_ms,
+            "INSERT INTO run_results(run_id, test_id, mode, verdict, finished_ts_ms,
                                      suite, \"group\",
                                      t_acquire_ms, t_docker_start_ms, t_useful_ms)
              VALUES (?1, 'X.id', 'native', ?2, ?3, 'fork', 'fork_matrix', 0, 0, 100)",
@@ -126,7 +126,7 @@ fn dashboard_schema_initializes_and_view_returns_latest() {
     let (verdict, ts): (String, i64) = conn
         .query_row(
             "SELECT verdict, finished_ts_ms FROM latest_results
-              WHERE test_id='X.id' AND pass='native'",
+              WHERE test_id='X.id' AND mode='native'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -468,7 +468,7 @@ fn insert_result(
     finished_ts_ms: i64,
 ) {
     conn.execute(
-        "INSERT INTO run_results(run_id, test_id, pass, verdict, finished_ts_ms,
+        "INSERT INTO run_results(run_id, test_id, mode, verdict, finished_ts_ms,
                                  suite, \"group\",
                                  t_acquire_ms, t_docker_start_ms, t_useful_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, 'fork', 'fork_matrix', 0, 0, 100)",
@@ -498,6 +498,52 @@ fn select_fill_batch_class1_picks_uncovered() {
         picked.len(),
         3,
         "all uncovered trials should be picked: {picked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn select_fill_batch_excludes_sub_namespaced_suites() {
+    // native::vscode::… / litebox::copilot::… share the native/litebox
+    // prefix but are NOT canonical <pass>::<id> matrix trials (they carry
+    // a second "::"). They must be excluded from the fill batch — else the
+    // --fill-drain name→run_pass_group router panics on an id the metadata
+    // registry doesn't know (regression guard for the fill-drain rc=101).
+    let tmp = tempdir_marker("fillsubns");
+    let (db, run_id) = setup_fill_db(&tmp, "abc1234");
+    let conn = Connection::open(&db).unwrap();
+
+    let trials = vec![
+        mk_trial("native::FOO.bar"),
+        mk_trial("litebox::FOO.bar"),
+        mk_trial("native::vscode::extension_host_spawn"),
+        mk_trial("litebox::vscode::bootstrap"),
+        mk_trial("native::copilot::tui.simple_math"),
+        mk_trial("host::fwd"),
+        mk_trial("dropbear_bash::red_gate"),
+    ];
+    let picked = dashboard_store::select_fill_batch_inner(
+        &conn,
+        run_id,
+        &trials,
+        dashboard_store::FillCap::Count(100),
+    );
+    assert_eq!(
+        picked
+            .iter()
+            .filter(|n| n.contains("vscode")
+                || n.contains("copilot")
+                || n.starts_with("host::")
+                || n.starts_with("dropbear_bash::"))
+            .count(),
+        0,
+        "sub-namespaced / non-matrix suites must be excluded: {picked:?}"
+    );
+    assert!(
+        picked.contains(&"native::FOO.bar".to_string())
+            && picked.contains(&"litebox::FOO.bar".to_string()),
+        "canonical matrix trials must still be picked: {picked:?}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
