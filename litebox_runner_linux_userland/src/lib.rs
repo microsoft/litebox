@@ -368,13 +368,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let envp = if cli_args.forward_environment_variables {
         envp.into_iter()
             .chain(std::env::vars().map(|(k, v)| {
-                std::ffi::CString::new(
-                    k.bytes()
-                        .chain([b'='])
-                        .chain(v.bytes())
-                        .collect::<Vec<u8>>(),
-                )
-                .unwrap()
+                std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
+                    .unwrap()
             }))
             .collect()
     } else {

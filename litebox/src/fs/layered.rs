@@ -157,11 +157,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     unreachable!("we just confirmed valid path")
                 }
                 Err(FileStatusError::PathError(e @ PathError::NoSearchPerms { .. })) => {
-                    return Err(e)?;
+                    Err(e)?;
                 }
                 Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
                     assert_ne!(dir, path);
-                    return Err(PathError::MissingComponent)?;
+                    Err(PathError::MissingComponent)?;
                 }
                 Err(FileStatusError::Io) => return Err(MkdirError::Io),
             }
@@ -493,7 +493,7 @@ impl<
                         // remove the tombstone though.
                         tombstone_removal = true;
                     } else {
-                        return Err(PathError::NoSuchFileOrDirectory)?;
+                        Err(PathError::NoSuchFileOrDirectory)?;
                     }
                 }
                 EntryX::Upper { .. } => unreachable!(),

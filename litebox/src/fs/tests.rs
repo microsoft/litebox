@@ -1482,7 +1482,7 @@ mod layered {
         fs.close(&fd).expect("Failed to close upperdir");
 
         // only . and ..
-        assert!(entries.len() == 2);
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]
