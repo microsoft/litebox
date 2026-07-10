@@ -13,6 +13,7 @@
 //! through the creator rather than transferring a kernel fd to the reader.
 
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::os::epoll::{Epoll, EpollTarget};
 use crate::os::eventfd::EventFd;
 use crate::register_handler;
 
@@ -48,6 +49,11 @@ struct EpolletOut {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct EpollLevelOut {
+    detail: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct CrossAgentArgs {
     reader_name: String,
 }
@@ -62,6 +68,16 @@ struct CrossAgentOut {
 const COUNTER: HandlerToken<(), CounterOut> = HandlerToken::new("eventfd.counter");
 const SEMAPHORE: HandlerToken<(), SemaphoreOut> = HandlerToken::new("eventfd.semaphore");
 const EPOLLET: HandlerToken<(), EpolletOut> = HandlerToken::new("eventfd.epollet");
+const EPOLL_ZERO_COUNTER: HandlerToken<(), EpollLevelOut> =
+    HandlerToken::new("eventfd.epoll_zero_counter");
+const EPOLL_DRAIN_CLEARS: HandlerToken<(), EpollLevelOut> =
+    HandlerToken::new("eventfd.epoll_drain_clears");
+const EPOLL_MASKS_EVENTS: HandlerToken<(), EpollLevelOut> =
+    HandlerToken::new("eventfd.epoll_masks_events");
+const EPOLL_NESTED_ZERO_COUNTER: HandlerToken<(), EpollLevelOut> =
+    HandlerToken::new("eventfd.epoll_nested_zero_counter");
+const EPOLL_NESTED_DRAIN_CLEARS: HandlerToken<(), EpollLevelOut> =
+    HandlerToken::new("eventfd.epoll_nested_drain_clears");
 const CROSS_AGENT: HandlerToken<CrossAgentArgs, CrossAgentOut> =
     HandlerToken::new("eventfd.cross_agent");
 
@@ -117,6 +133,229 @@ async fn handle_epollet(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<EpolletO
     Ok(EpolletOut { detail })
 }
 
+async fn handle_epoll_zero_counter(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollLevelOut, HandlerError> {
+    let ev = EventFd::open(0, "nonblock|cloexec")
+        .map_err(|e| HandlerError(format!("eventfd open: {e}")))?;
+    let mut ep = Epoll::new().map_err(|e| HandlerError(format!("epoll create: {e}")))?;
+    ep.add_fd(
+        ev.as_raw_fd(),
+        "in",
+        EpollTarget {
+            kind: "eventfd",
+            id: 1,
+        },
+    )
+    .map_err(|e| HandlerError(format!("epoll add eventfd: {e}")))?;
+    let events = ep
+        .wait(100, 1)
+        .map_err(|e| HandlerError(format!("epoll wait: {e}")))?;
+    if !events.is_empty() {
+        return Err(HandlerError(format!(
+            "counter=0 eventfd reported ready: events={events:?}"
+        )));
+    }
+    Ok(EpollLevelOut {
+        detail: "counter=0 EPOLLIN wait timed out".to_string(),
+    })
+}
+
+async fn handle_epoll_drain_clears(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollLevelOut, HandlerError> {
+    let ev = EventFd::open(0, "nonblock|cloexec")
+        .map_err(|e| HandlerError(format!("eventfd open: {e}")))?;
+    let mut ep = Epoll::new().map_err(|e| HandlerError(format!("epoll create: {e}")))?;
+    ep.add_fd(
+        ev.as_raw_fd(),
+        "in",
+        EpollTarget {
+            kind: "eventfd",
+            id: 1,
+        },
+    )
+    .map_err(|e| HandlerError(format!("epoll add eventfd: {e}")))?;
+
+    ev.write(1)
+        .map_err(|e| HandlerError(format!("eventfd write: {e}")))?;
+    let first = ep
+        .wait(1000, 1)
+        .map_err(|e| HandlerError(format!("first epoll wait: {e}")))?;
+    if first.len() != 1 || !first[0].observed_events.split('|').any(|name| name == "in") {
+        return Err(HandlerError(format!(
+            "written eventfd did not report EPOLLIN: events={first:?}"
+        )));
+    }
+    let value = ev
+        .read()
+        .map_err(|e| HandlerError(format!("eventfd read: {e}")))?;
+    if value != 1 {
+        return Err(HandlerError(format!("eventfd read got {value}, want 1")));
+    }
+    let second = ep
+        .wait(100, 1)
+        .map_err(|e| HandlerError(format!("second epoll wait: {e}")))?;
+    if !second.is_empty() {
+        return Err(HandlerError(format!(
+            "drained eventfd still reported ready: events={second:?}"
+        )));
+    }
+    Ok(EpollLevelOut {
+        detail: "write produced EPOLLIN and drain cleared readiness".to_string(),
+    })
+}
+
+async fn handle_epoll_masks_events(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollLevelOut, HandlerError> {
+    let ev = EventFd::open(0, "nonblock|cloexec")
+        .map_err(|e| HandlerError(format!("eventfd open: {e}")))?;
+    let mut ep = Epoll::new().map_err(|e| HandlerError(format!("epoll create: {e}")))?;
+    ep.add_fd(
+        ev.as_raw_fd(),
+        "in",
+        EpollTarget {
+            kind: "eventfd",
+            id: 1,
+        },
+    )
+    .map_err(|e| HandlerError(format!("epoll add eventfd: {e}")))?;
+
+    ev.write(1)
+        .map_err(|e| HandlerError(format!("eventfd write: {e}")))?;
+    let events = ep
+        .wait(1000, 1)
+        .map_err(|e| HandlerError(format!("epoll wait: {e}")))?;
+    if events.len() != 1 {
+        return Err(HandlerError(format!(
+            "written eventfd wait returned {} events: {events:?}",
+            events.len()
+        )));
+    }
+    let observed = &events[0].observed_events;
+    let has_in = observed.split('|').any(|name| name == "in");
+    let has_out = observed.split('|').any(|name| name == "out");
+    if !has_in || has_out {
+        return Err(HandlerError(format!(
+            "EPOLLIN-only registration returned mask {observed:?}; has_in={has_in} has_out={has_out}"
+        )));
+    }
+    Ok(EpollLevelOut {
+        detail: format!("EPOLLIN-only registration returned {observed}"),
+    })
+}
+
+async fn handle_epoll_nested_zero_counter(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollLevelOut, HandlerError> {
+    let ev = EventFd::open(0, "nonblock|cloexec")
+        .map_err(|e| HandlerError(format!("eventfd open: {e}")))?;
+    let mut inner = Epoll::new().map_err(|e| HandlerError(format!("inner epoll create: {e}")))?;
+    inner
+        .add_fd(
+            ev.as_raw_fd(),
+            "in",
+            EpollTarget {
+                kind: "eventfd",
+                id: 1,
+            },
+        )
+        .map_err(|e| HandlerError(format!("inner epoll add eventfd: {e}")))?;
+    let mut outer = Epoll::new().map_err(|e| HandlerError(format!("outer epoll create: {e}")))?;
+    outer
+        .add_fd(
+            inner.as_raw_fd(),
+            "in",
+            EpollTarget {
+                kind: "epoll",
+                id: 2,
+            },
+        )
+        .map_err(|e| HandlerError(format!("outer epoll add inner epoll: {e}")))?;
+    let events = outer
+        .wait(100, 1)
+        .map_err(|e| HandlerError(format!("outer epoll wait: {e}")))?;
+    if !events.is_empty() {
+        return Err(HandlerError(format!(
+            "outer epoll reported inner epoll ready while eventfd counter=0: events={events:?}"
+        )));
+    }
+    Ok(EpollLevelOut {
+        detail: "nested epoll blocked with counter=0 eventfd".to_string(),
+    })
+}
+
+async fn handle_epoll_nested_drain_clears(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollLevelOut, HandlerError> {
+    let ev = EventFd::open(0, "nonblock|cloexec")
+        .map_err(|e| HandlerError(format!("eventfd open: {e}")))?;
+    let mut inner = Epoll::new().map_err(|e| HandlerError(format!("inner epoll create: {e}")))?;
+    inner
+        .add_fd(
+            ev.as_raw_fd(),
+            "in",
+            EpollTarget {
+                kind: "eventfd",
+                id: 1,
+            },
+        )
+        .map_err(|e| HandlerError(format!("inner epoll add eventfd: {e}")))?;
+    let mut outer = Epoll::new().map_err(|e| HandlerError(format!("outer epoll create: {e}")))?;
+    outer
+        .add_fd(
+            inner.as_raw_fd(),
+            "in",
+            EpollTarget {
+                kind: "epoll",
+                id: 2,
+            },
+        )
+        .map_err(|e| HandlerError(format!("outer epoll add inner epoll: {e}")))?;
+
+    ev.write(1)
+        .map_err(|e| HandlerError(format!("eventfd write: {e}")))?;
+    let first_outer = outer
+        .wait(1000, 1)
+        .map_err(|e| HandlerError(format!("first outer epoll wait: {e}")))?;
+    if first_outer.len() != 1
+        || !first_outer[0]
+            .observed_events
+            .split('|')
+            .any(|name| name == "in")
+    {
+        return Err(HandlerError(format!(
+            "outer epoll did not report inner readiness after write: events={first_outer:?}"
+        )));
+    }
+
+    let value = ev
+        .read()
+        .map_err(|e| HandlerError(format!("eventfd read: {e}")))?;
+    if value != 1 {
+        return Err(HandlerError(format!("eventfd read got {value}, want 1")));
+    }
+
+    let second_outer = outer
+        .wait(100, 1)
+        .map_err(|e| HandlerError(format!("second outer epoll wait: {e}")))?;
+    if !second_outer.is_empty() {
+        return Err(HandlerError(format!(
+            "outer epoll reported stale inner readiness after direct eventfd drain: events={second_outer:?}"
+        )));
+    }
+
+    Ok(EpollLevelOut {
+        detail: "nested epoll readiness cleared after direct eventfd drain".to_string(),
+    })
+}
+
 async fn handle_cross_agent(
     args: CrossAgentArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -143,6 +382,11 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
     register_handler!(COUNTER, handle_counter);
     register_handler!(SEMAPHORE, handle_semaphore);
     register_handler!(EPOLLET, handle_epollet);
+    register_handler!(EPOLL_ZERO_COUNTER, handle_epoll_zero_counter);
+    register_handler!(EPOLL_DRAIN_CLEARS, handle_epoll_drain_clears);
+    register_handler!(EPOLL_MASKS_EVENTS, handle_epoll_masks_events);
+    register_handler!(EPOLL_NESTED_ZERO_COUNTER, handle_epoll_nested_zero_counter);
+    register_handler!(EPOLL_NESTED_DRAIN_CLEARS, handle_epoll_nested_drain_clears);
     register_handler!(CROSS_AGENT, handle_cross_agent);
     register_handler!(FORK_INHERIT, handle_fork_inherit);
     register_handler!(FORK_INHERIT_POLL, handle_fork_inherit_poll);
@@ -181,6 +425,18 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
             &EPOLLET,
             |out| Ok(format!("epollet {}", out.detail)),
         );
+    }
+
+    for &(id, token) in &[
+        ("EV.epoll_zero_counter", &EPOLL_ZERO_COUNTER),
+        ("EV.epoll_drain_clears", &EPOLL_DRAIN_CLEARS),
+        ("EV.epoll_masks_events", &EPOLL_MASKS_EVENTS),
+        ("EV.epoll_nested_zero_counter", &EPOLL_NESTED_ZERO_COUNTER),
+        ("EV.epoll_nested_drain_clears", &EPOLL_NESTED_DRAIN_CLEARS),
+    ] {
+        reg.single_agent_handler_test("vscode", "eventfd", id, AgentName::Dpg1, token, |out| {
+            Ok(out.detail.clone())
+        });
     }
 
     // Legacy share-registry semantics forwarded the read through the creator.
