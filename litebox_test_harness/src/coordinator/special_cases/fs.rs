@@ -27,6 +27,97 @@ pub(super) struct LeafOut {
 }
 
 use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+#[derive(Serialize, Deserialize, Debug)]
+struct UtimensatOut {
+    nonexistent_errno: i32,
+    readonly_errno: i32,
+    writable_errno: i32,
+    omit_nonexistent_errno: i32,
+    directory_errno: i32,
+    dirfd_relative_errno: i32,
+    empty_path_errno: i32,
+    touch_tmp_exit: i32,
+    touch_etc_exit: i32,
+    touch_etc_stderr: String,
+}
+
+const UTIMENSAT: HandlerToken<(), UtimensatOut> = HandlerToken::new("special_cases.fs.utimensat");
+
+fn utimensat_errno(dirfd: i32, path: &str, flags: i32) -> i32 {
+    let path = std::ffi::CString::new(path).expect("test path has no NUL");
+    let rc = unsafe { libc::utimensat(dirfd, path.as_ptr(), std::ptr::null(), flags) };
+    if rc == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+    }
+}
+
+fn utimensat_omit_errno(dirfd: i32, path: &str, flags: i32) -> i32 {
+    let path = std::ffi::CString::new(path).expect("test path has no NUL");
+    let omit = (1 << 30) - 2;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: omit,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: omit,
+        },
+    ];
+    let rc = unsafe { libc::utimensat(dirfd, path.as_ptr(), times.as_ptr(), flags) };
+    if rc == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+    }
+}
+
+async fn handle_utimensat((): (), _ctx: &mut HandlerCtx<'_>) -> Result<UtimensatOut, HandlerError> {
+    let unique = format!("/tmp/litebox-utimensat-{}", std::process::id());
+    let writable = format!("{unique}-writable");
+    let missing = format!("{unique}-missing");
+    let _ = std::fs::remove_file(&writable);
+    let _ = std::fs::remove_file(&missing);
+    std::fs::write(&writable, b"ok")?;
+
+    let nonexistent_errno = utimensat_errno(libc::AT_FDCWD, &missing, 0);
+    let readonly_errno = utimensat_errno(libc::AT_FDCWD, "/proc/sys/kernel/hostname", 0);
+    let writable_errno = utimensat_errno(libc::AT_FDCWD, &writable, 0);
+    let omit_nonexistent_errno = utimensat_omit_errno(libc::AT_FDCWD, &missing, 0);
+    let directory_errno = utimensat_errno(libc::AT_FDCWD, "/tmp", 0);
+
+    let tmp = std::ffi::CString::new("/tmp").expect("literal has no NUL");
+    let dir_raw = unsafe { libc::open(tmp.as_ptr(), libc::O_RDONLY) };
+    if dir_raw < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let dir = unsafe { OwnedFd::from_raw_fd(dir_raw) };
+    let name = format!("litebox-utimensat-{}-writable", std::process::id());
+    let dirfd_relative_errno = utimensat_errno(dir.as_raw_fd(), &name, 0);
+    let empty_path_errno = utimensat_errno(dir.as_raw_fd(), "", libc::AT_EMPTY_PATH);
+
+    let touch_tmp = StdCommand::new("/usr/bin/touch").arg(&writable).output()?;
+    let touch_etc = StdCommand::new("/usr/bin/touch")
+        .arg(format!("/etc/litebox-utimensat-{}", std::process::id()))
+        .output()?;
+
+    Ok(UtimensatOut {
+        nonexistent_errno,
+        readonly_errno,
+        writable_errno,
+        omit_nonexistent_errno,
+        directory_errno,
+        dirfd_relative_errno,
+        empty_path_errno,
+        touch_tmp_exit: touch_tmp.status.code().unwrap_or(-1),
+        touch_etc_exit: touch_etc.status.code().unwrap_or(-1),
+        touch_etc_stderr: String::from_utf8_lossy(&touch_etc.stderr).to_string(),
+    })
+}
 
 pub fn run(sub: &str, args: &[String]) -> i32 {
     match sub {
@@ -499,6 +590,7 @@ pub(super) async fn handle_run(
 /// Register argv leaves used by exec-driven filesystem/pipe-lifecycle tests.
 pub(super) fn register() {
     crate::register_handler!(RUN, handle_run);
+    crate::register_handler!(UTIMENSAT, handle_utimensat);
     crate::register_leaf_subcommand!("fs-test", subcmd_fs_test);
 }
 
@@ -509,6 +601,31 @@ fn subcmd_fs_test(args: &[String]) -> i32 {
 /// Register FS I/O matrix tests.
 pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
     register();
+    typed_test!(
+        reg,
+        "matrix",
+        "fs_io",
+        "UTIME.utimensat.validation",
+        timeout = 60,
+        agents[a = AgentName::Dpg1],
+        |run| {
+            let resp = run.send_named_typed(&a, &UTIMENSAT, ()).await;
+            let pass = matches!(
+                &resp,
+                Ok(out)
+                    if out.nonexistent_errno == libc::ENOENT
+                        && matches!(out.readonly_errno, libc::EACCES | libc::EPERM | libc::EROFS)
+                        && out.writable_errno == 0
+                        && out.omit_nonexistent_errno == 0
+                        && out.directory_errno == 0
+                        && out.dirfd_relative_errno == 0
+                        && out.empty_path_errno == 0
+                        && out.touch_tmp_exit == 0
+            );
+            crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
     let ops: &[&str] = &[
         "write-read",
         "append-read",

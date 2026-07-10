@@ -1362,7 +1362,7 @@ pub fn syscall_canonical_name(
         S::Fchownat => "fchownat",
         S::Fsync { .. } => "fsync",
         S::Fdatasync { .. } => "fdatasync",
-        S::Utimensat => "utimensat",
+        S::Utimensat { .. } => "utimensat",
         S::Seccomp => "seccomp",
         S::Fchmodat { .. } => "fchmodat",
         #[cfg(target_arch = "x86_64")]

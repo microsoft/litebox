@@ -2617,8 +2617,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Fdatasync {
         fd: i32,
     },
-    /// No-op: set file timestamps (in-memory FS ignores timestamps).
-    Utimensat,
+    /// Validate and no-op file timestamp updates.
+    Utimensat {
+        dirfd: i32,
+        pathname: Option<Platform::RawConstPointer<i8>>,
+        times: Option<Platform::RawMutPointer<Timespec>>,
+        flags: AtFlags,
+    },
     /// No-op: seccomp filter installation (sandbox handles this externally).
     Seccomp,
     Fchmodat {
@@ -3845,10 +3850,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::timer_gettime => sys_req!(TimerGettime { timerid, curr_value:* }),
             Sysno::timer_delete => sys_req!(TimerDelete { timerid }),
             Sysno::timer_getoverrun => sys_req!(TimerGetoverrun { timerid }),
-            // utimensat: set file timestamps — no-op for in-memory FS.
-            Sysno::utimensat => {
-                return Ok(SyscallRequest::Utimensat);
-            }
+            Sysno::utimensat => sys_req!(Utimensat { dirfd, pathname:*, times:*, flags }),
             // Noisy unsupported syscalls.
             Sysno::statx => sys_req!(Statx { dirfd, pathname:*, flags, mask, buf:* }),
             Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),

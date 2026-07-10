@@ -22,10 +22,10 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, STATX_BASIC_STATS, StatfsBuf, StatxBuf,
-    StatxTimestamp, TMPFS_MAGIC, TimeParam, TimerfdFlags, TimerfdTimerFlags, errno::Errno,
-    fd_token_protocol::PtyIoctlOp,
+    AccessFlags, AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags,
+    FileStat, IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, STATX_BASIC_STATS, StatfsBuf, StatxBuf,
+    StatxTimestamp, TMPFS_MAGIC, TimeParam, TimerfdFlags, TimerfdTimerFlags, Timespec,
+    errno::Errno, fd_token_protocol::PtyIoctlOp,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -4791,6 +4791,113 @@ impl<FS: ShimFS> Task<FS> {
             .fs
             .file_status(&*pathname, &*descriptors)?;
         Self::check_access_mode(&status, mode)
+    }
+
+    /// Handle syscall `utimensat`.
+    ///
+    /// Litebox does not persist atime/mtime updates, but the syscall must still
+    /// validate its target and permissions so callers like `touch` see the same
+    /// failure they would get from a real timestamp update.
+    pub fn sys_utimensat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        times: Option<MutPtr<Timespec>>,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        const UTIME_NOW: u64 = (1 << 30) - 1;
+        const UTIME_OMIT: u64 = (1 << 30) - 2;
+
+        let supported = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        if flags.intersects(!supported) {
+            return Err(Errno::EINVAL);
+        }
+
+        let all_omit = if let Some(times) = times {
+            let atime = times.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let mtime = times.read_at_offset(1).ok_or(Errno::EFAULT)?;
+            for ts in [atime, mtime] {
+                if !(0..1_000_000_000).contains(&ts.tv_nsec)
+                    && ts.tv_nsec != UTIME_NOW
+                    && ts.tv_nsec != UTIME_OMIT
+                {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            atime.tv_nsec == UTIME_OMIT && mtime.tv_nsec == UTIME_OMIT
+        } else {
+            false
+        };
+        if all_omit {
+            return Ok(());
+        }
+
+        self.validate_utimensat_target(dirfd, pathname, flags)
+    }
+
+    fn validate_utimensat_target(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let allow_empty = flags.contains(AtFlags::AT_EMPTY_PATH);
+        let fs_path = FsPath::new_inner(dirfd, pathname, get_cwd, allow_empty)?;
+
+        match fs_path {
+            FsPath::Absolute { path } => {
+                self.validate_utimensat_path(litebox_common_linux::AT_FDCWD, path, flags)
+            }
+            FsPath::Cwd => {
+                let cwd = self.fs.borrow().cwd.read().clone();
+                self.validate_utimensat_path(
+                    litebox_common_linux::AT_FDCWD,
+                    CString::new(cwd).map_err(|_| Errno::EINVAL)?,
+                    flags,
+                )
+            }
+            FsPath::Fd(fd) => {
+                let fd = i32::try_from(fd).map_err(|_| Errno::EBADF)?;
+                self.validate_fd(fd)
+            }
+            FsPath::FdRelative { fd, path } => {
+                let fd = i32::try_from(fd).map_err(|_| Errno::EBADF)?;
+                self.validate_utimensat_path(fd, path, flags)
+            }
+        }
+    }
+
+    fn validate_utimensat_path(
+        &self,
+        dirfd: i32,
+        path: CString,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let empty_path = flags.contains(AtFlags::AT_EMPTY_PATH);
+        let nofollow = flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
+        let mut stat_flags = AtFlags::empty();
+        if empty_path {
+            stat_flags.insert(AtFlags::AT_EMPTY_PATH);
+        }
+        if nofollow {
+            stat_flags.insert(AtFlags::AT_SYMLINK_NOFOLLOW);
+        }
+        let stat = self.sys_newfstatat(dirfd, path.clone(), stat_flags)?;
+        let inode_type = stat.st_mode & 0o170000;
+        if inode_type == 0o040000 {
+            return self.sys_faccessat(dirfd, path, AccessFlags::W_OK, flags);
+        }
+        if nofollow && inode_type == 0o120000 {
+            return Ok(());
+        }
+
+        let mut open_flags = OFlags::WRONLY;
+        if nofollow {
+            open_flags.insert(OFlags::NOFOLLOW);
+        }
+        let fd = self.sys_openat(dirfd, path, open_flags, Mode::empty())?;
+        self.sys_close(i32::try_from(fd).map_err(|_| Errno::EBADF)?)
     }
 
     /// Handle `faccessat` and `faccessat2` syscalls.
