@@ -900,10 +900,9 @@ fn known_dll_section_fs_path(object_path: &str) -> Option<String> {
     let (dll_name, fs_directory) =
         if let Some(rest) = strip_case_insensitive_prefix(object_path, r"\KnownDlls\") {
             (rest, "/Windows/System32/")
-        } else if let Some(rest) = strip_case_insensitive_prefix(object_path, r"\KnownDlls32\") {
-            (rest, "/Windows/SysWOW64/")
         } else {
-            return None;
+            let rest = strip_case_insensitive_prefix(object_path, r"\KnownDlls32\")?;
+            (rest, "/Windows/SysWOW64/")
         };
     if dll_name.contains(['\\', '/']) || !ends_with_ignore_ascii_case(dll_name, ".dll") {
         return None;

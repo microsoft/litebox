@@ -575,7 +575,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         ctx.rip = self.entry_point;
-        debug_assert!(self.stack_top % 16 == core::mem::size_of::<usize>());
+        debug_assert_eq!(self.stack_top % 16, core::mem::size_of::<usize>());
         ctx.rsp = self.stack_top;
         ctx.eflags = 0x202;
         ctx.rcx = self.context;
