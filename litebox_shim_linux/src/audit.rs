@@ -308,6 +308,44 @@ pub fn emit_exit_event(
     }
 }
 
+/// Emit diagnostic `epoll_ready` events: one line per fd reported ready by an
+/// `epoll_pwait`/`epoll_wait`, recording the epoll fd, the ready fd (the
+/// `EpollEvent.data` the guest registered at `epoll_ctl` time — libuv stores
+/// the watched fd there), and the raw returned event mask (`EpollEvent.events`,
+/// e.g. `EPOLLIN=0x1`, `EPOLLOUT=0x4`, `EPOLLERR=0x8`, `EPOLLHUP=0x10`).
+///
+/// This makes the *reason* an event loop wakes visible in the audit log: a
+/// perpetually-`EPOLLOUT` fd that the guest never services is the signature of
+/// a libuv livelock. Formatted so `litebox_audit_query import` stores each line
+/// in the `syscalls` table with `syscall = "epoll_ready"` and queryable `args`
+/// `[{"fd":<epfd>},{"int":<ready_fd>},{"int":<mask>}]`. Capped per call to bound
+/// volume during high-frequency polling.
+pub fn emit_epoll_ready_events(
+    pid: i32,
+    tid: i32,
+    epfd: u32,
+    events: &[litebox_common_linux::EpollEvent],
+) {
+    let fd = AUDIT_LOG_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let worker = WORKER_ID.load(Ordering::Relaxed);
+    let host_tid = host_tid();
+    let ts = monotonic_nanos();
+    for ev in events.iter().take(8) {
+        // Copy out of the `#[repr(C, packed)]` struct (both fields are `Copy`)
+        // to avoid taking unaligned references.
+        let ready_fd = ev.data;
+        let mask = ev.events;
+        let seq = AUDIT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let msg = alloc::format!(
+            "{{\"phase\":\"enter\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"host_tid\":{host_tid},\"syscall\":\"epoll_ready\",\"args\":[{{\"fd\":{epfd}}},{{\"int\":{ready_fd}}},{{\"int\":{mask}}}]}}\n",
+        );
+        write_audit_line_to_fd(fd, &msg);
+    }
+}
+
 /// Write a line directly to the given audit log fd.
 fn write_audit_line_to_fd(fd: i32, msg: &str) {
     use litebox::platform::DebugLogProvider as _;

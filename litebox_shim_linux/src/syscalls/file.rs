@@ -8525,6 +8525,15 @@ impl<FS: ShimFS> Task<FS> {
             });
             match inner_result {
                 Ok(epoll_events) => {
+                    #[cfg(feature = "audit_log")]
+                    if !epoll_events.is_empty() && crate::audit::is_enabled() {
+                        crate::audit::emit_epoll_ready_events(
+                            self.pid,
+                            self.tid,
+                            epfd,
+                            &epoll_events,
+                        );
+                    }
                     if !epoll_events.is_empty() {
                         if let Err(e) = events
                             .copy_from_slice(0, &epoll_events)
