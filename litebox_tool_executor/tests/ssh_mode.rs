@@ -26,6 +26,16 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
+const NATIVE_DOCKER_HOST: &str = "unix:///run/litebox-docker.sock";
+
+fn docker_command() -> Command {
+    let mut cmd = Command::new("docker");
+    if std::env::var_os("DOCKER_HOST").is_none() {
+        cmd.env("DOCKER_HOST", NATIVE_DOCKER_HOST);
+    }
+    cmd
+}
+
 // Allocate a port in the range 22300..22399 for each test invocation.
 // Using static atomic + PID-shift keeps tests in this binary independent
 // of each other and unlikely to collide with anything else on the host.
@@ -63,19 +73,19 @@ fn require_prereqs() -> Result<(), String> {
             ));
         }
     }
-    if Command::new("docker").arg("--version").output().is_err() {
+    if docker_command().arg("--version").output().is_err() {
         return Err("docker not on PATH".into());
     }
     if Command::new("ssh").arg("-V").output().is_err() {
         return Err("ssh not on PATH".into());
     }
-    let out = Command::new("docker")
+    let out = docker_command()
         .args(["image", "inspect", "litebox-vscode"])
         .output()
         .map_err(|e| format!("docker inspect failed: {e}"))?;
     if !out.status.success() {
         return Err("litebox-vscode image not present. Build with: \
-             docker build --target litebox-vscode -t litebox-vscode \
+             DOCKER_HOST=unix:///run/litebox-docker.sock docker build --target litebox-vscode -t litebox-vscode \
              -f litebox_tool_executor/rootfs/Dockerfile ."
             .into());
     }
@@ -88,9 +98,7 @@ struct SandboxContainer {
 
 impl Drop for SandboxContainer {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.name])
-            .output();
+        let _ = docker_command().args(["rm", "-f", &self.name]).output();
     }
 }
 
@@ -126,9 +134,9 @@ fn start_sandbox(name: &str, host_port: u16, tool_executor_args: &[&str]) -> San
     let wrapped = format!("passwd -d root >/dev/null 2>&1; exec {exec_cmd}");
 
     // Always remove any old container with this name first.
-    let _ = Command::new("docker").args(["rm", "-f", name]).output();
+    let _ = docker_command().args(["rm", "-f", name]).output();
 
-    let out = Command::new("docker")
+    let out = docker_command()
         .args([
             "run",
             "-d",
@@ -170,7 +178,7 @@ fn start_sandbox(name: &str, host_port: u16, tool_executor_args: &[&str]) -> San
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    let logs = Command::new("docker").args(["logs", name]).output();
+    let logs = docker_command().args(["logs", name]).output();
     let logs_str = logs
         .as_ref()
         .map(|o| {
@@ -181,7 +189,7 @@ fn start_sandbox(name: &str, host_port: u16, tool_executor_args: &[&str]) -> San
             )
         })
         .unwrap_or_else(|e| format!("(docker logs failed: {e})"));
-    let _ = Command::new("docker").args(["rm", "-f", name]).output();
+    let _ = docker_command().args(["rm", "-f", name]).output();
     panic!("timed out waiting for sshd on host port {host_port}; container logs:\n{logs_str}");
 }
 

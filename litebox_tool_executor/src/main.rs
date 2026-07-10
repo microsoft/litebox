@@ -784,7 +784,8 @@ fn run_sandbox(
 /// Server — all sharing one filesystem inside the sandbox.
 ///
 /// Usage:
-///   docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode \
+///   DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+///     docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode \
 ///     /`opt/litebox/litebox_tool_executor` --rootfs / --vscode-server
 ///   # then in VS Code: Remote-SSH → litebox (port 2222)
 /// Which preset variant of SSH mode we're in. Affects only banner text,
@@ -822,8 +823,8 @@ fn ssh_mode(
     if !cli.rootfs.is_dir() {
         anyhow::bail!(
             "--ssh / --vscode-server / --interactive require a directory rootfs (not a tar).\n\
-             Use Docker: docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .\n\
-             Then: docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --ssh"
+             Use Docker: DOCKER_HOST=unix:///run/litebox-docker.sock docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .\n\
+             Then: DOCKER_HOST=unix:///run/litebox-docker.sock docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --ssh"
         );
     }
 
