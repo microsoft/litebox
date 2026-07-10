@@ -499,13 +499,6 @@ fn get_test_metadata() -> &'static Vec<TestMeta> {
     })
 }
 
-fn get_test_ids() -> Vec<String> {
-    get_test_metadata().iter().map(|m| m.id.clone()).collect()
-}
-
-/// Lookup the harness-declared per-test timeout (the `.timeout(N)` value
-/// the coordinator enforces). Returns 60s as a defensive fallback if
-/// the test ID isn't in the registry (shouldn't happen).
 fn test_timeout_secs(test_id: &str) -> u64 {
     get_test_metadata()
         .iter()
@@ -1539,24 +1532,40 @@ fn main() {
     // rows, but queued trials are left for the next runner/commit.
     if fill_drain_mode && positionals.is_empty() && !args.list {
         let drain_requested = graceful_drain::install_sigusr1_handler();
-        let total = trials.len();
         let mut iteration = 0u64;
         let mut selected_total = 0usize;
         let mut failed_total = 0u64;
         let outcome = fill_drain::run_until_done_or_drained(
             || {
-                dashboard_store::select_fill_batch(
-                    &build_trials(),
-                    dashboard_store::FillCap::Count(DEFAULT_FILL),
-                )
+                // Rebuild the fillable set each iteration (coverage shifts
+                // as WAL rows land), pick the missing chunk by name, and
+                // hand back the real HarnessTrials so the pool runs their
+                // actual bodies — every suite, no name→runner re-derivation.
+                let all = build_harness_trials();
+                let candidates: Vec<dashboard_store::FillCandidate> = all
+                    .iter()
+                    .map(|t| dashboard_store::FillCandidate {
+                        name: t.name.clone(),
+                        suite: t.suite,
+                    })
+                    .collect();
+                let selected: std::collections::HashSet<String> =
+                    dashboard_store::select_fill_batch(
+                        &candidates,
+                        dashboard_store::FillCap::Count(DEFAULT_FILL),
+                    )
+                    .into_iter()
+                    .collect();
+                all.into_iter()
+                    .filter(|t| selected.contains(&t.name))
+                    .collect::<Vec<HarnessTrial>>()
             },
             |batch| {
                 iteration += 1;
                 eprintln!(
-                    "[fill-drain] iteration {iteration}: selected {}/{} trials missing for \
-                     current HEAD (chunk={DEFAULT_FILL})",
+                    "[fill-drain] iteration {iteration}: {} trials selected \
+                     (chunk={DEFAULT_FILL})",
                     batch.len(),
-                    total,
                 );
                 let (started, failed) = run_fill_drain_batch(batch, &drain_requested);
                 selected_total += started;
@@ -1596,8 +1605,15 @@ fn main() {
                 jobs: current_jobs_cap() as u64,
             },
         };
+        let candidates: Vec<dashboard_store::FillCandidate> = build_harness_trials()
+            .iter()
+            .map(|t| dashboard_store::FillCandidate {
+                name: t.name.clone(),
+                suite: t.suite,
+            })
+            .collect();
         let kept: std::collections::HashSet<String> =
-            dashboard_store::select_fill_batch(&trials, cap_for_selector)
+            dashboard_store::select_fill_batch(&candidates, cap_for_selector)
                 .into_iter()
                 .collect();
         let total = trials.len();
@@ -1639,64 +1655,90 @@ fn main() {
     conclusion.exit();
 }
 
-fn build_trials() -> Vec<Trial> {
-    let mut trials: Vec<Trial> = Vec::new();
+/// A harness trial as structured data: the pass axis, the full dashboard
+/// name, and the closure that runs it. Both the normal libtest path and
+/// the autonomous `--fill-drain` pool consume these, so a trial's body is
+/// defined exactly once — no `name → executor` re-derivation. (That
+/// re-derivation is what made `--fill-drain` panic on the vscode/copilot/
+/// dropbear suites: their names share the `native::`/`litebox::` prefix
+/// but aren't in the `run_pass_group` matrix registry, so routing them by
+/// name blew up. Running the real closure sidesteps the whole problem.)
+struct HarnessTrial {
+    /// "native" or "litebox" — the pass axis. The value is also carried
+    /// *into* each trial's closure (which hands it to
+    /// `framework::run_trial` as the recorded `mode`), so it isn't read
+    /// off the record externally; kept here for a complete, self-describing
+    /// trial (and a future pass-aware consumer).
+    #[allow(dead_code)]
+    pass: &'static str,
+    /// The dashboard `suite` — carried explicitly so the fill selector's
+    /// round-robin fairness ordering never has to *guess* it from the
+    /// name (the old `infer_suite_from_name` prefix table), and so a
+    /// never-run trial buckets by its true suite.
+    suite: &'static str,
+    /// Full dashboard name, e.g. `native::RL.foo` / `native::vscode::bootstrap`.
+    name: String,
+    run: Box<dyn FnOnce() -> Result<(), Failed> + Send>,
+}
 
-    // Generate one Trial per test ID. Each Trial spawns its own
-    // docker run with `--filter=<test_id>`; results are recorded as
-    // soon as the JSON line for that test ID is observed on stdout,
-    // and the container is allowed to drain in a background thread
-    // (see `spawn_drain`). Concurrent docker runs are bounded by the
-    // dynamic lease-aware dispatch gate.
-    let test_ids = get_test_ids();
-    for tid in test_ids {
-        let tid2 = tid.clone();
-        trials.push(Trial::test(format!("native::{tid}"), move || {
-            run_pass_group("native", &tid2)
-        }));
+/// The single source of truth for the autonomously-fillable trial set:
+/// the canonical `<pass>::<id>` matrix PLUS the dropbear/copilot/vscode
+/// suites. Every closure is constructed exactly once here, so the normal
+/// libtest run and `--fill-drain` execute identical bodies. `host::fwd`
+/// is intentionally excluded — it's the one non-pass trial and is not
+/// part of autonomous fill (it's added only to the normal libtest set by
+/// `build_trials`).
+fn build_harness_trials() -> Vec<HarnessTrial> {
+    let mut trials: Vec<HarnessTrial> = Vec::new();
 
-        let tid2 = tid.clone();
-        trials.push(Trial::test(format!("litebox::{tid}"), move || {
-            run_pass_group("litebox", &tid2)
-        }));
+    // Canonical <pass>::<id> matrix: one docker run per trial via
+    // run_pass_group → framework::run_trial. Concurrent docker runs are
+    // bounded by the dynamic lease-aware dispatch gate. Iterating the
+    // metadata (not just ids) carries the real suite onto each trial.
+    for meta in get_test_metadata() {
+        for pass in ["native", "litebox"] {
+            let id = meta.id.clone();
+            trials.push(HarnessTrial {
+                pass,
+                suite: meta.suite,
+                name: format!("{pass}::{}", meta.id),
+                run: Box::new(move || run_pass_group(pass, &id)),
+            });
+        }
     }
 
-    // Host forwarding trial (not a coordinator suite — uses its own docker run).
+    // Special suites — token-free (dropbear, vscode) or token-gated but
+    // fail-cheap (copilot). setup() is called so litebox-pass copilot/
+    // vscode trials have the bind-mountable binaries; idempotent + cheap
+    // when warm. A missing GitHub token fails each copilot trial cheaply
+    // inside its body (no docker spawn), never panicking the process.
+    let _ = setup();
+    dropbear_bash::register_trials(&mut trials);
+    copilot::register_trials(&mut trials);
+    vscode::register_trials(&mut trials);
+
+    trials
+}
+
+fn build_trials() -> Vec<Trial> {
+    // The normal libtest set = every fillable trial (as a libtest Trial),
+    // plus host::fwd — the lone non-pass trial, which uses its own docker
+    // run and is not part of autonomous fill.
+    let mut trials: Vec<Trial> = build_harness_trials()
+        .into_iter()
+        .map(|t| Trial::test(t.name, t.run))
+        .collect();
+
     trials.push(Trial::test("host::fwd".to_string(), move || {
         let (_, bins) = setup();
         run_host_fwd(&bins.pie_glibc, &bins.nonpie_glibc);
         Ok(())
     }));
 
-    // Phase H dropbear + bash red-gate scenarios. These are token-free
-    // and always registered so regular filters can select them.
-    dropbear_bash::register_trials(&mut trials);
-
-    // Copilot CLI integration scenarios — always registered so the
-    // dashboard universe stays consistent and the autonomous fill
-    // selector can pick them up. Missing GitHub token (a normal
-    // dev-environment state for sessions without `gh auth login`)
-    // fails each trial cheaply inside its body rather than panicking
-    // the whole process; see `mod copilot::run_scenario`.
-    //
-    // setup() is still called here so litebox-pass copilot trials
-    // have the bind-mountable binaries available. The docker image
-    // build is deferred to `ensure_copilot_image` inside each trial
-    // (idempotent inspect-then-build), so a token-less run incurs
-    // zero docker-build cost.
-    let _ = setup();
-    copilot::register_trials(&mut trials);
-
-    // VS Code Remote Server integration scenarios — always registered
-    // (no token required). See `mod vscode` for the scenario set and
-    // `litebox_test_harness/CLAUDE.md` "VS Code Server integration
-    // scenarios" for invocation knobs.
-    vscode::register_trials(&mut trials);
-
     trials
 }
 
-fn run_fill_drain_batch(batch: Vec<String>, drain_requested: &AtomicBool) -> (usize, u64) {
+fn run_fill_drain_batch(batch: Vec<HarnessTrial>, drain_requested: &AtomicBool) -> (usize, u64) {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::AtomicUsize;
@@ -1718,18 +1760,23 @@ fn run_fill_drain_batch(batch: Vec<String>, drain_requested: &AtomicBool) -> (us
                         break;
                     }
 
-                    let Some(name) = queue.lock().expect("fill-drain queue lock").pop_front()
+                    let Some(trial) = queue.lock().expect("fill-drain queue lock").pop_front()
                     else {
                         break;
                     };
                     started.fetch_add(1, Ordering::SeqCst);
+                    let name = trial.name.clone();
                     eprintln!("[fill-drain] running {name}");
-                    let result = run_fill_drain_trial(&name);
-                    if let Err(e) = result {
-                        failed.fetch_add(1, Ordering::SeqCst);
-                        eprintln!("[fill-drain] {name} ... FAILED: {e:?}");
-                    } else {
-                        eprintln!("[fill-drain] {name} ... ok");
+                    // Run the trial's OWN closure — the exact body a normal
+                    // libtest run executes — so every suite (matrix, vscode,
+                    // copilot, dropbear) fills correctly. No name→runner
+                    // re-derivation, so no more sub-namespaced-suite panic.
+                    match (trial.run)() {
+                        Ok(()) => eprintln!("[fill-drain] {name} ... ok"),
+                        Err(e) => {
+                            failed.fetch_add(1, Ordering::SeqCst);
+                            eprintln!("[fill-drain] {name} ... FAILED: {e:?}");
+                        }
                     }
                 }
             });
@@ -1740,28 +1787,6 @@ fn run_fill_drain_batch(batch: Vec<String>, drain_requested: &AtomicBool) -> (us
         started.load(Ordering::SeqCst),
         failed.load(Ordering::SeqCst),
     )
-}
-
-fn run_fill_drain_trial(name: &str) -> Result<(), Failed> {
-    let Some((pass, test_id)) = name.split_once("::") else {
-        panic!("fill selector returned non pass-qualified trial name: {name}");
-    };
-
-    match pass {
-        "native" => run_pass_group("native", test_id),
-        "litebox" => run_pass_group("litebox", test_id),
-        "host" => panic!("fill selector returned host trial, which is out of fill scope: {name}"),
-        "dropbear_bash" => {
-            panic!("fill selector returned dropbear_bash trial, which is out of fill scope: {name}")
-        }
-        "copilot" => {
-            panic!("fill selector returned copilot trial, which is out of fill scope: {name}")
-        }
-        "vscode" => {
-            panic!("fill selector returned vscode trial, which is out of fill scope: {name}")
-        }
-        other => panic!("fill selector returned trial with unknown pass {other:?}: {name}"),
-    }
 }
 
 /// Parsed `--fill` argument: a hard count cap or a wall-time
@@ -2506,7 +2531,7 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
 // ════════════════════════════════════════════════════════════════════
 
 mod copilot {
-    use super::{Failed, Trial};
+    use super::Failed;
     use litebox_test_harness::os::pty::Pty;
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -3258,7 +3283,7 @@ mod copilot {
 
     /// Register all Copilot Trials (24 = 6 scenarios × 2 modes × 2 passes).
     /// Called from `main()` only when `requested()` returned true.
-    pub(super) fn register_trials(trials: &mut Vec<Trial>) {
+    pub(super) fn register_trials(trials: &mut Vec<super::HarnessTrial>) {
         // Registration is unconditional and side-effect free: the
         // copilot trial set should always be visible to the dashboard
         // (and to the autonomous `--fill` selector) so coverage gaps
@@ -3286,10 +3311,12 @@ mod copilot {
                     let scn_id = scn.id;
                     let mode = *mode;
                     let driver = *driver;
-                    let pass_owned = pass.to_string();
-                    trials.push(Trial::test(name, move || {
-                        run_matrix_scenario(&pass_owned, mode, driver, scn_id)
-                    }));
+                    trials.push(super::HarnessTrial {
+                        pass,
+                        suite: "copilot_cli",
+                        name,
+                        run: Box::new(move || run_matrix_scenario(pass, mode, driver, scn_id)),
+                    });
                 }
             }
         }
@@ -3304,10 +3331,12 @@ mod copilot {
                     let id = format!("copilot::{}.llm.{}", mode.label(), scn.id);
                     let name = format!("{pass}::{id}");
                     let scn_id = scn.id;
-                    let pass_owned = pass.to_string();
-                    trials.push(Trial::test(name, move || {
-                        run_llm_only_scenario(&pass_owned, mode, scn_id)
-                    }));
+                    trials.push(super::HarnessTrial {
+                        pass,
+                        suite: "copilot_cli",
+                        name,
+                        run: Box::new(move || run_llm_only_scenario(pass, mode, scn_id)),
+                    });
                 }
             }
         }
@@ -3318,10 +3347,12 @@ mod copilot {
         // this probe has no prompt at all and doesn't fit the matrix.
         for pass in ["native", "litebox"] {
             let name = format!("{pass}::copilot::tui.startup_then_exit");
-            let pass_owned = pass.to_string();
-            trials.push(Trial::test(name, move || {
-                run_startup_then_exit(&pass_owned, "startup_then_exit")
-            }));
+            trials.push(super::HarnessTrial {
+                pass,
+                suite: "copilot_cli",
+                name,
+                run: Box::new(move || run_startup_then_exit(pass, "startup_then_exit")),
+            });
         }
     }
 
@@ -4384,7 +4415,7 @@ mod copilot {
 // for the workflow.
 
 mod vscode {
-    use super::{Failed, Trial, copilot, docker_command};
+    use super::{Failed, copilot, docker_command};
     use litebox_test_harness::os::pty::Pty;
     use std::path::Path;
     use std::sync::OnceLock;
@@ -4600,15 +4631,17 @@ mod vscode {
     /// unconditionally from `main()` so the dashboard universe
     /// stays consistent and the autonomous `--fill` selector can
     /// pick them up.
-    pub(super) fn register_trials(trials: &mut Vec<Trial>) {
+    pub(super) fn register_trials(trials: &mut Vec<super::HarnessTrial>) {
         for scn in SCENARIOS {
             for pass in ["native", "litebox"] {
                 let name = format!("{pass}::vscode::{scn}");
-                let pass_owned = pass.to_string();
                 let scn_owned = (*scn).to_string();
-                trials.push(Trial::test(name, move || {
-                    run_scenario(&pass_owned, &scn_owned)
-                }));
+                trials.push(super::HarnessTrial {
+                    pass,
+                    suite: "vscode",
+                    name,
+                    run: Box::new(move || run_scenario(pass, &scn_owned)),
+                });
             }
         }
     }
@@ -6299,7 +6332,7 @@ setTimeout(() => {
 }
 
 mod dropbear_bash {
-    use super::{Failed, Trial, copilot};
+    use super::{Failed, copilot};
     use litebox_test_harness::os::pty::Pty;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -6672,15 +6705,17 @@ process.exit(0);\n",
         ]
     }
 
-    pub(super) fn register_trials(trials: &mut Vec<Trial>) {
+    pub(super) fn register_trials(trials: &mut Vec<super::HarnessTrial>) {
         for scn in scenarios() {
             for pass in ["native", "litebox"] {
                 let name = format!("{pass}::dropbear_bash.{}", scn.id);
-                let pass_owned = pass.to_string();
                 let scenario_id = scn.id;
-                trials.push(Trial::test(name, move || {
-                    run_scenario(&pass_owned, scenario_id)
-                }));
+                trials.push(super::HarnessTrial {
+                    pass,
+                    suite: "dropbear_bash",
+                    name,
+                    run: Box::new(move || run_scenario(pass, scenario_id)),
+                });
             }
         }
     }
