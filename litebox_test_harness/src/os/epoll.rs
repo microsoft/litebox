@@ -43,6 +43,11 @@ impl Epoll {
         })
     }
 
+    #[must_use]
+    pub fn as_raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
     /// Open `pidfd_open(pid)` and add it to this epoll set.
     ///
     /// # Errors

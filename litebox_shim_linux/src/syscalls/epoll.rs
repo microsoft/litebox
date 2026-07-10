@@ -748,11 +748,13 @@ impl<FS: ShimFS> EpollFile<FS> {
             interests.values().cloned().collect::<Vec<_>>()
         };
         for entry in entries {
-            if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
-                continue; // already in the ready set
-            }
-            if let Some((Some(_event), _)) = entry.poll(global, fs, false, false) {
-                self.ready.push(&entry);
+            match entry.poll(global, fs, false, false) {
+                Some((Some(_event), _)) => self.ready.push(&entry),
+                Some((None, _)) | None => {
+                    entry
+                        .is_ready
+                        .store(false, core::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
