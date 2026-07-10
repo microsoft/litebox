@@ -18,8 +18,8 @@
 #     docker build --target litebox-vscode-prewrite -t litebox-vscode-prewrite -f litebox_tool_executor/rootfs/Dockerfile .
 #
 # The explicit DOCKER_HOST default selects the native in-distro dockerd
-# (Docker Desktop is retired for this workflow). If DOCKER_HOST is already
-# set, keep the caller's daemon.
+# (Docker Desktop stays installed but is unused for litebox). If DOCKER_HOST
+# is already set, keep the caller's daemon.
 #
 # IMPORTANT: Binaries must be bind-mounted from a Linux-native filesystem
 # (WSL2 ext4), NOT from NTFS (/mnt/c/...).  Docker Desktop on Windows

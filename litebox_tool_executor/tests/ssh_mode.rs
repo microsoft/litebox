@@ -27,10 +27,16 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 const NATIVE_DOCKER_HOST: &str = "unix:///run/litebox-docker.sock";
+const NATIVE_DOCKER_SOCK: &str = "/run/litebox-docker.sock";
 
 fn docker_command() -> Command {
     let mut cmd = Command::new("docker");
-    if std::env::var_os("DOCKER_HOST").is_none() {
+    // Default to the native in-distro dockerd only when no daemon was
+    // chosen AND its socket exists — a portable fallback to the default
+    // docker daemon on CI / other machines.
+    if std::env::var_os("DOCKER_HOST").is_none()
+        && std::path::Path::new(NATIVE_DOCKER_SOCK).exists()
+    {
         cmd.env("DOCKER_HOST", NATIVE_DOCKER_HOST);
     }
     cmd

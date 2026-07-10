@@ -35,9 +35,17 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const NATIVE_DOCKER_HOST: &str = "unix:///run/litebox-docker.sock";
+const NATIVE_DOCKER_SOCK: &str = "/run/litebox-docker.sock";
 
 fn set_native_docker_host_if_unset(cmd: &mut Command) {
-    if std::env::var_os("DOCKER_HOST").is_none() {
+    // Prefer the native in-distro dockerd, but only when the caller hasn't
+    // already chosen a daemon AND that socket actually exists. Keeps manual
+    // runs on the native-docker host convenient while staying portable: CI
+    // / machines without the socket fall back to the default docker daemon
+    // instead of hard-failing on a missing socket.
+    if std::env::var_os("DOCKER_HOST").is_none()
+        && std::path::Path::new(NATIVE_DOCKER_SOCK).exists()
+    {
         cmd.env("DOCKER_HOST", NATIVE_DOCKER_HOST);
     }
 }
