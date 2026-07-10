@@ -174,9 +174,19 @@ alongside the harness source.
 
 ### Docker images
 
+For local harness runs, prefer the native in-distro dockerd documented in
+[`litebox_test_harness/native-docker/`](litebox_test_harness/native-docker/).
+It listens on `/run/litebox-docker.sock`; set
+`DOCKER_HOST=unix:///run/litebox-docker.sock` before `cargo test`,
+manual `docker build`, or dashboard/supervisor runs to avoid Docker
+Desktop VM spawn overhead. The harness still spawns one fresh container
+per trial.
+
 ```bash
-docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
-docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .
 ```
 
 ### Logging

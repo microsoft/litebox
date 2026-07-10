@@ -14,6 +14,10 @@
     // (main worktree) and from any sibling worktree like
     // `~/src/litebox-<work-stream>/litebox_tool_executor/demo-vscode-server`.
     //
+    // Docker commands respect an inherited DOCKER_HOST. If it is
+    // unset, tasks default to the native in-distro daemon at
+    // unix:///run/litebox-docker.sock instead of Docker Desktop.
+    //
     // Cargo's default `target/` directory is used — no
     // `--target-dir` overrides. Docker can `-v` bind-mount
     // `<worktree>/target/debug` directly (WSL ext4 is fine for
@@ -72,7 +76,7 @@
         {
             "label": "LiteBox: Build VS Code Image",
             "type": "shell",
-            "command": "cd ${workspaceFolder}/../.. && docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .",
+            "command": "if [ -z \"$DOCKER_HOST\" ]; then export DOCKER_HOST=unix:///run/litebox-docker.sock; fi; cd ${workspaceFolder}/../.. && docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .",
             "group": "build",
             "problemMatcher": [],
             "presentation": {
@@ -85,7 +89,7 @@
         {
             "label": "LiteBox: Start VS Code Server",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
+            "command": "if [ -z \"$DOCKER_HOST\" ]; then export DOCKER_HOST=unix:///run/litebox-docker.sock; fi; docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -98,7 +102,7 @@
         {
             "label": "LiteBox: Start VS Code Server (Debug)",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug 9999",
+            "command": "if [ -z \"$DOCKER_HOST\" ]; then export DOCKER_HOST=unix:///run/litebox-docker.sock; fi; docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug 9999",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -111,7 +115,7 @@
         {
             "label": "LiteBox: Stop VS Code Server",
             "type": "shell",
-            "command": "docker stop litebox-vscode || true",
+            "command": "if [ -z \"$DOCKER_HOST\" ]; then export DOCKER_HOST=unix:///run/litebox-docker.sock; fi; docker stop litebox-vscode || true",
             "problemMatcher": [],
             "presentation": {
                 "reveal": "silent",
@@ -121,7 +125,7 @@
         {
             "label": "LiteBox: Run Integration Tests (vscode::*)",
             "type": "shell",
-            "command": "cd ${workspaceFolder}/../.. && cargo test -p litebox_test_harness --test integration -- 'vscode::'",
+            "command": "if [ -z \"$DOCKER_HOST\" ]; then export DOCKER_HOST=unix:///run/litebox-docker.sock; fi; cd ${workspaceFolder}/../.. && cargo test -p litebox_test_harness --test integration -- 'vscode::'",
             "group": "test",
             "problemMatcher": [],
             "presentation": {

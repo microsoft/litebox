@@ -84,6 +84,18 @@ Docker daemon. The `--target` argument to `docker build` always
 uses the bare stage name (`litebox-test`, `litebox-agent-cli`) —
 that's a Dockerfile-internal handle, not a tag.
 
+For local runs, use the native in-distro Docker daemon installed by
+[`native-docker/install-native-dockerd.sh`](native-docker/install-native-dockerd.sh):
+
+```sh
+export DOCKER_HOST=unix:///run/litebox-docker.sock
+```
+
+The harness and supervisor invoke `Command::new("docker")`, so the
+Docker CLI honors `DOCKER_HOST` for image builds, cleanup, and every
+per-trial `docker run`. This selects the faster native daemon without
+changing the harness's required fresh-container-per-trial isolation.
+
 **Opportunistic dashboard coverage for agent worktrees.** When the
 `dashboard.py auto` supervisor is running, it scans `git worktree
 list` each cycle and identifies any worktree that is NOT a
@@ -742,6 +754,9 @@ The native baseline is the gold standard. Every test must pass there —
 - Any native failure is a **test bug**, not a litebox bug.
 - The Docker image is built on demand by `ensure_docker_image()` from
   `litebox_tool_executor/rootfs/Dockerfile` — no manual setup.
+- To avoid Docker Desktop's VM spawn overhead, install the native daemon
+  in [`native-docker/`](native-docker/) and run with
+  `DOCKER_HOST=unix:///run/litebox-docker.sock`.
 
 There is no expected-failure mechanism in this harness. Outcomes are
 strictly `pass` or `FAIL`. A litebox test that does not work fails for
@@ -983,6 +998,9 @@ Pattern:
 Always run with **`cargo test`**, not `cargo nextest`:
 
 ```sh
+# Recommended local backend:
+export DOCKER_HOST=unix:///run/litebox-docker.sock
+
 cargo test -p litebox_test_harness --test integration
 # Subset (one Trial per pass per test ID):
 cargo test -p litebox_test_harness --test integration -- native::NL1
@@ -1006,6 +1024,10 @@ two trials per test ID: `native::<id>` and `litebox::<id>`. Each trial
 spawns its own `docker run` with `--filter=<test_id>` so every test
 gets a fresh `litebox_tool_executor` + broker + runner + agent
 matrix. Tests cannot contaminate each other.
+
+`DOCKER_HOST=unix:///run/litebox-docker.sock` selects the native
+Litebox dockerd backend. It is a daemon selection only, not container
+reuse.
 
 #### Why not `cargo nextest`
 
@@ -1086,6 +1108,20 @@ Used by `dashboard.py auto` to autonomously fill coverage of tracked
 refs. See [`scripts/README.md`](scripts/README.md) for the full driver
 contract and tuning knobs.
 
+**Keeping the supervisor alive.** `dashboard.py auto` is a detached
+process with no init supervision, so a crash or stray kill can leave
+the dashboard dark (this happened once for two days). Guard against it
+with `dashboard.py watchdog` — a one-shot, idempotent liveness check
+that relaunches `auto` iff it is *supposed* to be running (an
+`auto.enabled` sentinel is present, written by `auto` and removed by
+`stop`) but is down or hung (stale pidfile heartbeat). Install it on a
+cron / systemd-user timer (every few minutes); an intentional `stop`
+stays stopped. `summary.md`'s header renders a `_Supervisor_:` up /
+hung / DOWN / stopped line so liveness is visible at a glance. Full
+details (heartbeat thresholds, sentinel, double-start guard, timer
+snippets) are in [`scripts/README.md`](scripts/README.md) under
+"Watchdog & liveness".
+
 ```sh
 # run only the missing-at-HEAD trials, default batch size 300
 cargo test -p litebox_test_harness --test integration -- --fill
@@ -1135,6 +1171,8 @@ LITEBOX_HARNESS_PAUSE='harness:test-start=PB.c2p.nonpie-glibc.dpg2' \
 To run a docker invocation by hand for debugging:
 
 ```bash
+export DOCKER_HOST=unix:///run/litebox-docker.sock
+
 # Native (gold standard — real kernel):
 docker run --rm --cap-add SYS_PTRACE \
   -v $(pwd)/target/debug:/opt/litebox:ro \
@@ -1404,20 +1442,28 @@ each trial on `gh auth token` / `COPILOT_GITHUB_TOKEN`.)
 
 ```bash
 # Single scenario:
-cargo test -p litebox_test_harness --test integration -- \
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  cargo test -p litebox_test_harness --test integration -- \
   'native::vscode::bootstrap' --exact
 
 # All native vscode scenarios:
-cargo test -p litebox_test_harness --test integration -- 'native::vscode::'
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  cargo test -p litebox_test_harness --test integration -- 'native::vscode::'
 
 # Full VS Code suite (defaults to LITEBOX_VSCODE_JOBS=1 — serial,
 # safest for shared / autonomous-driver runs):
-cargo test -p litebox_test_harness --test integration -- 'vscode::'
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  cargo test -p litebox_test_harness --test integration -- 'vscode::'
 
 # Same suite, parallelized:
-LITEBOX_VSCODE_JOBS=4 \
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  LITEBOX_VSCODE_JOBS=4 \
   cargo test -p litebox_test_harness --test integration -- 'vscode::'
 ```
+
+The VS Code image inspect/build and per-trial `docker run` paths also
+default to `unix:///run/litebox-docker.sock` internally when
+`DOCKER_HOST` is unset, while preserving any inherited `DOCKER_HOST`.
 
 **Image-stage selection (`LITEBOX_VSCODE_IMAGE_STAGE`):**
 
@@ -1495,4 +1541,3 @@ contracted by their respective native trials).
   which is sufficient to validate the listener + broker TCP
   loopback; speaking the protocol would couple to a moving
   upstream binary format.
-

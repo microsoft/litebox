@@ -289,12 +289,16 @@ under `gdbserver` inside the Docker container.
 VS Code Server (Debug)" or manually):
 
 ```bash
-docker run --rm --name litebox-vscode \
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  docker run --rm --name litebox-vscode \
   -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE \
   -v $PWD/target/debug:/opt/litebox:ro \
   litebox-vscode /opt/litebox/litebox_tool_executor \
     --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug
 ```
+
+The default `DOCKER_HOST` value targets the native in-distro Docker
+daemon; override it only when deliberately testing another daemon.
 
 **Connect GDB from the host:**
 

@@ -10,9 +10,16 @@
 #   litebox-agent-cli        — Copilot CLI rootfs (dropbear + Node + @github/copilot)
 #
 # Usage:
-#   docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
-#   docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .
-#   docker build --target litebox-vscode-prewrite -t litebox-vscode-prewrite -f litebox_tool_executor/rootfs/Dockerfile .
+#   DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+#     docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
+#   DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+#     docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .
+#   DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+#     docker build --target litebox-vscode-prewrite -t litebox-vscode-prewrite -f litebox_tool_executor/rootfs/Dockerfile .
+#
+# The explicit DOCKER_HOST default selects the native in-distro dockerd
+# (Docker Desktop stays installed but is unused for litebox). If DOCKER_HOST
+# is already set, keep the caller's daemon.
 #
 # IMPORTANT: Binaries must be bind-mounted from a Linux-native filesystem
 # (WSL2 ext4), NOT from NTFS (/mnt/c/...).  Docker Desktop on Windows
@@ -20,13 +27,15 @@
 #   cargo build --target-dir ~/litebox-out -p litebox_tool_executor ...
 #
 # Runtime (tests):
-#   docker run --rm --cap-add SYS_PTRACE \
+#   DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+#     docker run --rm --cap-add SYS_PTRACE \
 #     -v \\wsl$\Ubuntu\home\USER\litebox-out\debug:/opt/litebox:ro \
 #     -v \\wsl$\Ubuntu\home\USER\litebox-out\nonpie\debug:/opt/nonpie:ro \
 #     litebox-test /opt/litebox/litebox_test_harness spawn-tree
 #
 # Runtime (VS Code Server):
-#   docker run --rm -p 2222:22 --cap-add SYS_PTRACE \
+#   DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+#     docker run --rm -p 2222:22 --cap-add SYS_PTRACE \
 #     -v \\wsl$\Ubuntu\home\USER\litebox-out\debug:/opt/litebox:ro \
 #     litebox-vscode /opt/litebox/litebox_tool_executor \
 #       --rootfs / --vscode-server --ssh-port 22 --record-baseline
@@ -184,8 +193,9 @@ EXPOSE 9999
 #   cargo build --release -p litebox_syscall_rewriter
 #
 # Usage:
-#   docker build --target litebox-vscode-prewrite -t litebox-vscode-prewrite \
-#     -f litebox_tool_executor/rootfs/Dockerfile .
+#   DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+#     docker build --target litebox-vscode-prewrite -t litebox-vscode-prewrite \
+#       -f litebox_tool_executor/rootfs/Dockerfile .
 FROM litebox-vscode AS litebox-vscode-prewrite
 
 COPY litebox_tool_executor/rootfs/litebox_syscall_rewriter /tmp/rewriter
@@ -206,9 +216,11 @@ RUN chmod +x /tmp/rewriter \
 # issues can be attributed to litebox vs. environment problems.
 #
 # Usage:
-#   docker build --target litebox-vscode-native -t litebox-vscode-native \
-#     -f litebox_tool_executor/rootfs/Dockerfile .
-#   docker run --rm -p 2223:22 litebox-vscode-native
+#   DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+#     docker build --target litebox-vscode-native -t litebox-vscode-native \
+#       -f litebox_tool_executor/rootfs/Dockerfile .
+#   DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+#     docker run --rm -p 2223:22 litebox-vscode-native
 #   # then in VS Code: Remote-SSH → localhost:2223 (user: root, empty password)
 FROM litebox-vscode AS litebox-vscode-native
 
