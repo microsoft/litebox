@@ -605,10 +605,11 @@ fn fail_retries_cap() -> i64 {
 /// unless a new sha arrives." Drift detection (re-running passing
 /// tests to catch silent rot) is a future class-3 expansion.
 ///
-/// Trial names that don't follow `<pass>::<id>` are ignored
-/// (host::fwd, dropbear_bash, copilot::* — those are out of scope
-/// for the autonomous fill).
-pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<String> {
+/// Every provided candidate is in scope — the caller
+/// (`build_harness_trials`) already decides the fillable set (the whole
+/// matrix + the vscode/copilot/dropbear suites). The selector only picks
+/// *which* names to run next; it never inspects the name shape.
+pub fn select_fill_batch(candidates: &[FillCandidate], cap: FillCap) -> Vec<String> {
     let count_cap = match cap {
         FillCap::Count(n) => n,
         FillCap::BudgetSecs { .. } => usize::MAX, // budget-bound below
@@ -617,15 +618,24 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<S
         return Vec::new();
     }
     let Some(ctx) = ctx() else {
-        // Dashboard disabled — return alphabetically, capped by count.
-        return trials
+        // Dashboard disabled — return in-order, capped by count.
+        return candidates
             .iter()
             .take(count_cap)
-            .map(|t| t.name().to_string())
+            .map(|c| c.name.clone())
             .collect();
     };
     let conn = ctx.conn.lock().expect("dashboard: conn lock");
-    select_fill_batch_inner(&conn, ctx.run_id, trials, cap)
+    select_fill_batch_inner(&conn, ctx.run_id, candidates, cap)
+}
+
+/// A fill-selection candidate: the identity a selector needs — the full
+/// trial name and its suite (for round-robin fairness). Carrying the
+/// suite explicitly is what lets the selector avoid ever guessing it from
+/// the name. The runnable closure lives on the caller's `HarnessTrial`.
+pub struct FillCandidate {
+    pub name: String,
+    pub suite: &'static str,
 }
 
 /// Test-friendly variant: takes the connection + run_id explicitly
@@ -635,7 +645,7 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<S
 pub fn select_fill_batch_inner(
     conn: &Connection,
     run_id: i64,
-    trials: &[libtest_mimic::Trial],
+    candidates: &[FillCandidate],
     cap: FillCap,
 ) -> Vec<String> {
     let count_cap = match cap {
@@ -698,12 +708,17 @@ pub fn select_fill_batch_inner(
     // we can prioritize within the candidate set and (for the
     // BudgetSecs cap) estimate accumulated cost.
     let mut stalest: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    let mut suites: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Suite comes straight off the candidates — no DB round-trip and no
+    // name-prefix guessing (the retired `infer_suite_from_name` table).
+    let suites: std::collections::HashMap<String, String> = candidates
+        .iter()
+        .map(|c| (c.name.clone(), c.suite.to_string()))
+        .collect();
     let mut costs: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     {
         let mut stmt = conn
             .prepare(
-                "SELECT lr.mode, lr.test_id, lr.finished_ts_ms, lr.suite,
+                "SELECT lr.mode, lr.test_id, lr.finished_ts_ms,
                         rr.t_useful_ms
                    FROM latest_results lr
                    JOIN run_results rr ON rr.run_id = lr.run_id
@@ -716,17 +731,13 @@ pub fn select_fill_batch_inner(
                 let pass: String = r.get(0)?;
                 let id: String = r.get(1)?;
                 let ts: i64 = r.get(2)?;
-                let suite: Option<String> = r.get(3)?;
-                let cost: i64 = r.get(4)?;
-                Ok((format!("{pass}::{id}"), ts, suite, cost))
+                let cost: i64 = r.get(3)?;
+                Ok((format!("{pass}::{id}"), ts, cost))
             })
             .expect("dashboard: latest query");
         for row in rows.flatten() {
             stalest.insert(row.0.clone(), row.1);
-            if let Some(s) = row.2 {
-                suites.insert(row.0.clone(), s);
-            }
-            costs.insert(row.0, row.3);
+            costs.insert(row.0, row.2);
         }
     }
 
@@ -738,25 +749,8 @@ pub fn select_fill_batch_inner(
     let mut class1_never_run: Vec<String> = Vec::new();
     let mut class1_seen_before: Vec<(String, i64)> = Vec::new();
     let mut class2: Vec<(String, i64)> = Vec::new();
-    for t in trials {
-        let name = t.name().to_string();
-        // Autonomous fill only drives the canonical <pass>::<id> matrix
-        // that `run_pass_group` (the --fill-drain name→runner router) can
-        // resolve. Beyond the non-native/litebox passes (host::,
-        // dropbear_bash::), the VS Code and Copilot suites register as
-        // `native::vscode::…` / `litebox::copilot::…`: they share the
-        // native/litebox prefix but carry a SECOND "::" segment and are NOT
-        // in the metadata registry. A canonical matrix name has exactly one
-        // "::" (the pass prefix), so requiring that excludes the
-        // sub-namespaced special suites — otherwise --fill-drain selects a
-        // name whose test_id `test_suite_group` can't resolve and panics
-        // the whole batch (rc=101). `--fill` tolerated the loose check only
-        // because it re-runs the real Trial objects, not this router.
-        let is_canonical_matrix = (name.starts_with("native::") || name.starts_with("litebox::"))
-            && name.matches("::").count() == 1;
-        if !is_canonical_matrix {
-            continue;
-        }
+    for c in candidates {
+        let name = c.name.clone();
         match at_sha.get(&name) {
             None => match stalest.get(&name) {
                 None => class1_never_run.push(name),
@@ -823,10 +817,12 @@ fn round_robin_by_suite(
     let mut buckets: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for n in names {
+        // Every candidate carries its suite, so the map is complete;
+        // "other" is only a defensive default.
         let suite = suites
             .get(n)
             .cloned()
-            .unwrap_or_else(|| infer_suite_from_name(n));
+            .unwrap_or_else(|| "other".to_string());
         buckets.entry(suite).or_default().push(n.clone());
     }
     let mut out: Vec<String> = Vec::with_capacity(names.len());
@@ -846,32 +842,4 @@ fn round_robin_by_suite(
     // reverse-alphabetic order; reverse to get stable forward.
     out.reverse();
     out
-}
-
-fn infer_suite_from_name(name: &str) -> String {
-    // For never-run trials, latest_results has no row, so we
-    // don't know the suite. Fall back to a coarse bucket based on
-    // the test_id prefix (matches the `reg.test(suite, ...)` calls
-    // in coordinator/*).
-    let id = name
-        .splitn(2, "::")
-        .nth(1)
-        .unwrap_or(name)
-        .split('.')
-        .next()
-        .unwrap_or("");
-    match id {
-        "PIDF" | "PIDFI" | "PIFH" | "EV" | "PTY" | "SFD" => "vscode",
-        "X" | "BSF" | "PIF" | "SXF" | "BASH" | "FWE" | "SK" => "fork",
-        "PB" | "PN" | "PID" | "NPIPE" | "BPIPE" | "EPIPE" | "PXEOF" | "CWF" | "US6" | "P1" => {
-            "xworker"
-        }
-        "EP" | "POLL" | "EPI" | "PROC" | "KP" | "KPX" => "matrix",
-        "TCS" | "THC" | "TLB" | "XCONN" | "FKLC" | "PR" | "FT" => "stress",
-        "SP" | "SC" | "TR" | "FR" | "BR" | "BRS" => "shell",
-        "VS" | "CSM" => "vscode",
-        "SOCKOPT" | "GSN" => "sockopt",
-        _ => "other",
-    }
-    .to_string()
 }
