@@ -28,7 +28,7 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -43,6 +43,15 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const STALE_THRESHOLD_MS: i64 = 30_000;
 
 static LIVE_LEASES: AtomicUsize = AtomicUsize::new(1);
+// On-demand refresh TTL for the live-lease count. Native docker
+// dispatches a whole batch of containers well inside the 10s heartbeat
+// window; without a fresher count each runner reads a stale, too-low
+// peer count and grabs the full `GLOBAL_CAP` (`global/1`), so N runners
+// oversubscribe to N*GLOBAL_CAP. Refreshing on `acquire` (read-only,
+// gated to ~1 query/TTL per process via `LAST_REFRESH_MS`) keeps the
+// count current within ~1s while staying off the hot path.
+const LIVE_COUNT_TTL_MS: i64 = 1000;
+static LAST_REFRESH_MS: AtomicI64 = AtomicI64::new(0);
 static REGISTERED: OnceLock<Registered> = OnceLock::new();
 
 struct Registered {
@@ -59,11 +68,22 @@ fn open_conn(db_path: &PathBuf) -> Option<Connection> {
 
 fn refresh_live_count(conn: &Connection) -> usize {
     let cutoff = dashboard_store::now_ms() - STALE_THRESHOLD_MS;
-    // Prune stale rows opportunistically. Best-effort.
+    // Prune stale rows opportunistically. Best-effort. This is a WRITE,
+    // so it stays on the heartbeat cadence (every HEARTBEAT_INTERVAL_SECS)
+    // rather than the hot `acquire` path — see `count_live`.
     let _ = conn.execute(
         "DELETE FROM harness_leases WHERE heartbeat_at_ms < ?1",
         params![cutoff],
     );
+    count_live(conn)
+}
+
+/// Count live peers (read-only) and publish to the atomics. Split from
+/// `refresh_live_count` so `live_lease_count()` can refresh on-demand
+/// WITHOUT the prune `DELETE`, which would otherwise add write
+/// contention with the result producer on every dispatch acquire.
+fn count_live(conn: &Connection) -> usize {
+    let cutoff = dashboard_store::now_ms() - STALE_THRESHOLD_MS;
     let n: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM harness_leases WHERE heartbeat_at_ms >= ?1",
@@ -72,19 +92,38 @@ fn refresh_live_count(conn: &Connection) -> usize {
         )
         .unwrap_or(0);
     // Floor at 1 — we're always at least counting ourselves once
-    // registered. Treats the startup race (other harnesses have
-    // registered but we haven't yet) as "I'm the only one" which is
-    // safe-on-the-optimistic-side; new peers will be picked up at
-    // the next refresh.
+    // registered. Treats the startup race (a peer has registered but its
+    // row isn't visible to us yet) as "I'm the only one" which is
+    // safe-on-the-optimistic-side; the next refresh (~TTL) picks it up.
     let n = usize::try_from(n.max(1)).unwrap_or(1);
     LIVE_LEASES.store(n, Ordering::Relaxed);
+    LAST_REFRESH_MS.store(dashboard_store::now_ms(), Ordering::Relaxed);
     n
 }
 
-/// Number of live peer harnesses, as last refreshed by the
-/// heartbeat thread (every `HEARTBEAT_INTERVAL_SECS`). Defaults to
-/// 1 before any refresh has happened.
+/// Number of live peer harnesses. Returns the cached count, but
+/// refreshes it on-demand (read-only) when it's older than
+/// `LIVE_COUNT_TTL_MS`, so a fast native-docker dispatch burst sees the
+/// current peer count instead of one up to a heartbeat (10s) stale.
+/// The `LAST_REFRESH_MS` CAS ensures at most one thread per process
+/// refreshes per TTL window. Defaults to 1 before any refresh.
 pub fn live_lease_count() -> usize {
+    let now = dashboard_store::now_ms();
+    let last = LAST_REFRESH_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= LIVE_COUNT_TTL_MS
+        && LAST_REFRESH_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        // We won the refresh slot for this TTL window. Best-effort: on
+        // any failure we fall back to the cached value — the lease layer
+        // must never block the run.
+        if let Some(reg) = REGISTERED.get() {
+            if let Some(conn) = open_conn(&reg.db_path) {
+                count_live(&conn);
+            }
+        }
+    }
     LIVE_LEASES.load(Ordering::Relaxed).max(1)
 }
 
