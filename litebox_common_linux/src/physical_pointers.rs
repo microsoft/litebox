@@ -87,7 +87,7 @@ fn align_down(address: usize, align: usize) -> usize {
 /// - `T`: The type of the object being pointed to. `pages` with respect to `offset` should cover enough
 ///   memory for an object of type `T`.
 #[repr(C)]
-pub struct PhysMutPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
+pub struct PhysMutPtr<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
     offset: usize,
     count: usize,
@@ -95,7 +95,7 @@ pub struct PhysMutPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>>
     _vmap: PhantomData<V>,
 }
 
-impl<T: Clone, const ALIGN: usize, V> PhysMutPtr<T, ALIGN, V>
+impl<T, const ALIGN: usize, V> PhysMutPtr<T, ALIGN, V>
 where
     V: GlobalVmapManager<ALIGN>,
 {
@@ -234,14 +234,17 @@ where
     where
         T: FromBytes,
     {
-        if values.is_empty() {
-            return Ok(());
-        }
         if count
             .checked_add(values.len())
             .is_none_or(|end| end > self.count)
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
+        }
+        if values.is_empty() {
+            if count >= self.count {
+                return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
+            }
+            return Ok(());
         }
         let guard = self.map_and_get_ptr_guard(
             count,
@@ -282,14 +285,17 @@ where
     where
         T: IntoBytes,
     {
-        if values.is_empty() {
-            return Ok(());
-        }
         if count
             .checked_add(values.len())
             .is_none_or(|end| end > self.count)
         {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
+        }
+        if values.is_empty() {
+            if count >= self.count {
+                return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
+            }
+            return Ok(());
         }
         let guard = self.map_and_get_ptr_guard(
             count,
@@ -379,14 +385,14 @@ where
 /// at `ptr` lie within that mapping. The mapping refers to foreign (non-Rust) physical
 /// memory that another core may unmap concurrently, so `ptr` must only ever be accessed
 /// through [`Self::copy_in`]/[`Self::copy_out`], which perform fault-tolerant copies.
-struct MappedGuard<'a, T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
+struct MappedGuard<'a, T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     map_info: Option<MapInfoOf<V, ALIGN>>,
     ptr: *mut T,
     size: usize,
     _owner: PhantomData<&'a PhysMutPtr<T, ALIGN, V>>,
 }
 
-impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, T, ALIGN, V> {
+impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, T, ALIGN, V> {
     /// Copy the `self.size` mapped bytes out into `dst`.
     ///
     /// This is the only path through which the raw mapped pointer is dereferenced.
@@ -420,9 +426,7 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, 
     }
 }
 
-impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
-    for MappedGuard<'_, T, ALIGN, V>
-{
+impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop for MappedGuard<'_, T, ALIGN, V> {
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely. Drop cannot
         // report errors. If unmapping fails, drop the returned private map_info;
@@ -434,7 +438,7 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
     }
 }
 
-impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
+impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
     for PhysMutPtr<T, ALIGN, V>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -448,11 +452,11 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
 /// Represent a physical pointer to a read-only object. This wraps around [`PhysMutPtr`] and
 /// exposes only copy-out access.
 #[repr(C)]
-pub struct PhysConstPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
+pub struct PhysConstPtr<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     inner: PhysMutPtr<T, ALIGN, V>,
 }
 
-impl<T: Clone + FromBytes, const ALIGN: usize, V> PhysConstPtr<T, ALIGN, V>
+impl<T: FromBytes, const ALIGN: usize, V> PhysConstPtr<T, ALIGN, V>
 where
     V: GlobalVmapManager<ALIGN>,
 {
@@ -514,7 +518,7 @@ where
     }
 }
 
-impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
+impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
     for PhysConstPtr<T, ALIGN, V>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

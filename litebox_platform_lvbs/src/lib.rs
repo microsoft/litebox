@@ -1137,6 +1137,8 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
+        self.validate_unowned(pages)?;
+
         // Reject duplicates early as an API-level validation. The page-table implementation also
         // rejects duplicate/shared mappings, but this keeps the error local to the input array.
         if !is_contiguous(pages) {

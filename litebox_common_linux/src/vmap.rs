@@ -209,10 +209,6 @@ impl From<PhysPageMapPermissions> for MemoryRegionPermissions {
 pub enum PhysPointerError {
     #[error("Physical address {0:#x} is invalid to access")]
     InvalidPhysicalAddress(usize),
-    #[error("Physical address {0:#x} is not aligned to {1} bytes")]
-    UnalignedPhysicalAddress(usize, usize),
-    #[error("Offset {0:#x} is not aligned to {1} bytes")]
-    UnalignedOffset(usize, usize),
     #[error("Base offset {0:#x} is greater than or equal to alignment ({1} bytes)")]
     InvalidBaseOffset(usize, usize),
     #[error(
@@ -225,8 +221,6 @@ pub enum PhysPointerError {
     AlreadyMapped(usize),
     #[error("Physical address {0:#x} is unmapped")]
     Unmapped(usize),
-    #[error("No mapping information available")]
-    NoMappingInfo,
     #[error("Overflow occurred during calculation")]
     Overflow,
     #[error("The operation is unsupported on this platform")]

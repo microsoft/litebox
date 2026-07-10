@@ -91,7 +91,7 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
             .and_then(|off| rb_pa.checked_add(off))
             .and_then(PhysPageAddr::<PAGE_SIZE>::new)
         else {
-            return advance_offset(size, write_offset, buf.len());
+            return write_offset;
         };
         span.push(addr);
     }
