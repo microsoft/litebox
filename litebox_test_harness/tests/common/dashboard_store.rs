@@ -740,10 +740,21 @@ pub fn select_fill_batch_inner(
     let mut class2: Vec<(String, i64)> = Vec::new();
     for t in trials {
         let name = t.name().to_string();
-        // Out-of-scope trial shapes (host::, dropbear_bash, copilot::)
-        // are excluded — autonomous fill only drives the canonical
-        // <pass>::<id> matrix.
-        if !(name.starts_with("native::") || name.starts_with("litebox::")) {
+        // Autonomous fill only drives the canonical <pass>::<id> matrix
+        // that `run_pass_group` (the --fill-drain name→runner router) can
+        // resolve. Beyond the non-native/litebox passes (host::,
+        // dropbear_bash::), the VS Code and Copilot suites register as
+        // `native::vscode::…` / `litebox::copilot::…`: they share the
+        // native/litebox prefix but carry a SECOND "::" segment and are NOT
+        // in the metadata registry. A canonical matrix name has exactly one
+        // "::" (the pass prefix), so requiring that excludes the
+        // sub-namespaced special suites — otherwise --fill-drain selects a
+        // name whose test_id `test_suite_group` can't resolve and panics
+        // the whole batch (rc=101). `--fill` tolerated the loose check only
+        // because it re-runs the real Trial objects, not this router.
+        let is_canonical_matrix = (name.starts_with("native::") || name.starts_with("litebox::"))
+            && name.matches("::").count() == 1;
+        if !is_canonical_matrix {
             continue;
         }
         match at_sha.get(&name) {
