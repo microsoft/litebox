@@ -48,10 +48,19 @@ impl RingBuffer {
     }
 }
 
+#[inline]
+fn advance_offset(size: usize, write_offset: usize, len: usize) -> usize {
+    if len >= size {
+        0
+    } else {
+        (write_offset + len) % size
+    }
+}
+
 /// Fast path for a page-aligned, page-sized ring buffer. Wraparound becomes a
 /// single virtually-contiguous, physically non-contiguous mapping by emitting
 /// the wrap span as `[rb_pa + (start_page + i) % page_count * PAGE_SIZE]`.
-/// Returns the new write offset (unchanged on failure).
+/// Returns the new write offset after attempting the write.
 fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> usize {
     const MAX_SPAN_PAGES: usize = 16;
 
@@ -82,28 +91,21 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
             .and_then(|off| rb_pa.checked_add(off))
             .and_then(PhysPageAddr::<PAGE_SIZE>::new)
         else {
-            return write_offset;
+            return advance_offset(size, write_offset, buf.len());
         };
         span.push(addr);
     }
 
     let Ok(ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::new(&span, in_page_offset) else {
-        return write_offset;
+        return advance_offset(size, write_offset, buf.len());
     };
-    if ptr.write_slice_at_offset(0, buf).is_ok() {
-        (start + buf.len()) % size
-    } else {
-        write_offset
-    }
+    let _ = ptr.write_slice_at_offset(0, buf);
+    advance_offset(size, write_offset, buf.len())
 }
 
 /// Slow path used when `rb_pa` or `size` is not page-aligned/page-multiple.
-/// Wraparound issues two map/unmap cycles; the returned offset advances by
-/// bytes actually written so a mid-sequence failure does not strand stale data.
-/// Failure return values:
-/// - First slice fails: nothing written, cursor unchanged (`write_offset`).
-/// - Second slice fails after first succeeded: `space_remaining` bytes were
-///   written, so the cursor advances to `(write_offset + space_remaining) % size = 0`.
+/// Wraparound issues two map/unmap cycles. Returns the new write offset
+/// after attempting the write.
 fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> usize {
     let write_slice = |pa: PhysAddr, slice: &[u8]| -> bool {
         Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(pa.as_u64().trunc(), slice.len())
@@ -113,30 +115,20 @@ fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
 
     if buf.len() >= size {
         let single_slice = &buf[(buf.len() - size)..];
-        return if write_slice(rb_pa, single_slice) {
-            0
-        } else {
-            write_offset
-        };
+        let _ = write_slice(rb_pa, single_slice);
+        return advance_offset(size, write_offset, buf.len());
     }
 
     let space_remaining = size - write_offset;
     if buf.len() > space_remaining {
         let first_slice = &buf[..space_remaining];
         let wraparound_slice = &buf[space_remaining..];
-        if !write_slice(rb_pa + write_offset as u64, first_slice) {
-            return write_offset;
-        }
-        if !write_slice(rb_pa, wraparound_slice) {
-            // `space_remaining` bytes written; cursor wraps to 0.
-            return 0;
-        }
-        (write_offset + buf.len()) % size
-    } else if write_slice(rb_pa + write_offset as u64, buf) {
-        (write_offset + buf.len()) % size
+        let _ = write_slice(rb_pa + write_offset as u64, first_slice);
+        let _ = write_slice(rb_pa, wraparound_slice);
     } else {
-        write_offset
+        let _ = write_slice(rb_pa + write_offset as u64, buf);
     }
+    advance_offset(size, write_offset, buf.len())
 }
 
 static RINGBUFFER_ONCE: Once<Mutex<RingBuffer>> = Once::new();
