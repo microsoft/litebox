@@ -120,6 +120,14 @@ where
     /// via a typed load/store: all access goes through `copy_in`/`copy_out`, which cast the
     /// mapped pointer to `*mut u8` and perform a byte-granular, unaligned-safe `memcpy_fallible`.
     pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
+        Self::from_boxed(pages.into(), offset)
+    }
+
+    /// Create a new `PhysMutPtr` from an owned page list, consuming it without copying.
+    fn from_boxed(
+        pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
+        offset: usize,
+    ) -> Result<Self, PhysPointerError> {
         // Force evaluation of the compile-time ZST guard.
         let () = Self::ASSERT_NON_ZST;
         if offset >= ALIGN {
@@ -140,11 +148,11 @@ where
                 core::mem::size_of::<T>(),
             ));
         }
-        V::manager().validate_unowned(pages)?;
+        V::manager().validate_unowned(&pages)?;
         Ok(Self {
-            pages: pages.into(),
             offset,
             count: size / core::mem::size_of::<T>(),
+            pages,
             _type: PhantomData,
             _vmap: PhantomData,
         })
@@ -180,7 +188,8 @@ where
                 .checked_add(ALIGN)
                 .ok_or(PhysPointerError::Overflow)?;
         }
-        Self::new(&pages, pa - start_page)
+        // reuse the allocation
+        Self::from_boxed(pages.into_boxed_slice(), pa - start_page)
     }
 
     /// Create a new `PhysMutPtr` from the given physical address for a single object.
