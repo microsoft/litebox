@@ -32,7 +32,8 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     /// create a Rust reference. Any later use of that pointer must satisfy the platform's access
     /// requirements for the mapped physical pages. Even when access is logically exclusive, callers
     /// must treat the mapped memory like DMA/shared physical memory rather than ordinary Rust-owned
-    /// RAM.
+    /// RAM. Implementors must not return a VA that aliases LiteBox-owned memory; the returned
+    /// mapping must live in a platform-defined foreign-memory VA range.
     unsafe fn vmap(
         &self,
         _pages: &PhysPageAddrArray<ALIGN>,
@@ -73,8 +74,8 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     ///
     /// The implementor must ensure that, whenever this function returns `Ok(())`, none of the
     /// given physical pages may name memory owned by LiteBox/Rust (heap, stack, ...). Callers rely
-    /// on a successful return to treat the pages as foreign memory (mapping them and accessing
-    /// them through raw pointers).
+    /// on a successful return to treat the pages as foreign memory and to map them only through
+    /// platform-defined foreign-memory VA ranges, never through LiteBox-owned VA ranges.
     fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError>;
 
     /// Protect the given physical pages to ensure concurrent read or exclusive write access:

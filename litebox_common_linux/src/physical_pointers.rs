@@ -3,7 +3,7 @@
 
 //! Physical Pointer Abstraction with On-demand Mapping
 //!
-//! This module adds supports for accessing physical addresses (e.g., VTL0
+//! This module supports accessing foreign physical addresses (e.g., VTL0
 //! or normal-world physical memory) from LiteBox with on-demand mapping.
 //! In the context of LVBS and OP-TEE, accessing physical memory is
 //! necessary because VTL0 and VTL1 as well as normal world and secure
@@ -17,22 +17,21 @@
 //! memory; they only perform bounded copies between a temporary mapping
 //! and memory owned by LiteBox.
 //!
-//! The safe APIs should validate whether a given physical address is okay
-//! to access. For example, accessing LiteBox's own memory through this
-//! physical pointer abstraction is prohibited to avoid confused-deputy
-//! attacks and to ensure Rust memory safety. In the case of LVBS, LiteBox
-//! obtains the physical memory information from VTL0 like the total
-//! physical memory range assigned to VTL1/LiteBox. Thus, this module can
-//! confirm a given physical address does not belong to VTL1's physical
-//! memory.
+//! The safe APIs validate that a physical address is foreign before it is
+//! mapped. Accessing LiteBox's own memory through this physical pointer
+//! abstraction is prohibited to avoid confused-deputy attacks and to ensure
+//! Rust memory safety. In the case of LVBS, LiteBox obtains the physical memory
+//! information from VTL0, including the physical memory range assigned to
+//! VTL1/LiteBox. Thus, the platform can reject any address that belongs to
+//! VTL1's physical memory.
 //!
-//! Beyond that validation, the platform enforces strict virtual address
-//! spatial separation. On LVBS (see the address-space layout in
-//! `litebox_platform_lvbs/src/lib.rs`), foreign physical memory is visible
-//! only through the direct-map or on-demand vmap regions, both of which
-//! are fully disjoint from the VTL1 kernel region where all LiteBox/Rust
-//! code and data live. Thus, a raw pointer into a physical mapping can
-//! never alias any Rust reference.
+//! Beyond that validation, the platform enforces strict PA/VA separation. On
+//! LVBS (see the address-space layout in `litebox_platform_lvbs/src/lib.rs`),
+//! VTL1-owned PA is mapped only in the VTL1 kernel VA region, while foreign PA
+//! is mapped only in the dedicated direct-map or on-demand vmap VA regions.
+//! Those foreign VA ranges are fully disjoint from the VTL1 kernel region where
+//! all LiteBox/Rust code and data live, so a raw pointer into a foreign physical
+//! mapping cannot alias any Rust reference.
 
 use crate::vmap::{
     GlobalVmapManager, PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
@@ -352,10 +351,10 @@ where
             return Err(PhysPointerError::UnsupportedPermissions(perms.bits()));
         }
         let sub_pages = &self.pages[start..end];
-        // SAFETY: This caller never creates Rust references from the returned mapped pointer.
-        // The mapping is wrapped in `MapInfo`, then consumed by `MappedGuard`, which accesses it
-        // only through fault-tolerant raw copies. That avoids relying on Rust aliasing or validity
-        // guarantees for the external physical memory.
+        // SAFETY: `PhysMutPtr::new` validated these pages as foreign via `validate_unowned`.
+        // The platform `VmapManager` must map them only in a foreign-memory VA range, disjoint
+        // from LiteBox-owned Rust objects. This caller never creates Rust references from the
+        // returned pointer; `MappedGuard` uses it only for fault-tolerant raw byte copies.
         unsafe { V::manager().vmap(sub_pages, perms) }
     }
 }

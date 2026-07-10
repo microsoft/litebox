@@ -1154,8 +1154,9 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             flags |= PageTableFlags::WRITABLE;
         }
 
-        // If pages are contiguous, use `map_phys_frame_range_direct` which is efficient and
-        // doesn't require vmap VA space.
+        // `validate_unowned` rejects VTL1-owned PA before callers reach `vmap`, so these pages
+        // are foreign. Contiguous foreign PA uses the foreign direct-map VA range; non-contiguous
+        // foreign PA uses the vmap VA range. Neither range aliases VTL1-owned Rust memory.
         if is_contiguous(pages) {
             let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
             let phys_end = x86_64::PhysAddr::new(
