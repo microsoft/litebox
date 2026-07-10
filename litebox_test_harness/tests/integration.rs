@@ -17,6 +17,7 @@
 //!   cargo test -p `litebox_test_harness` --test integration -- fork                  # fork in both passes
 //!   cargo test -p `litebox_test_harness` --test integration -- `litebox::PB` `litebox::EPIPE`  # OR of multiple filters (one process, one setup, shared LITEBOX_TEST_JOBS pool)
 //!   cargo test -p `litebox_test_harness` --test integration -- --list                # list all trials
+//!   cargo test -p `litebox_test_harness` --test integration -- --fill-drain          # fill uncovered/stale trials until selector-empty or SIGUSR1 drain
 //!
 //! Multi-filter note: stock libtest treats multiple positional args as
 //! OR'd filters (see <https://doc.rust-lang.org/rustc/tests/index.html#filters>).
@@ -31,6 +32,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -156,6 +158,9 @@ fn broker_elf_cache_dir() -> &'static PathBuf {
 // for the schema, init, record, finalize, and selection logic.
 #[path = "common/dashboard_store.rs"]
 mod dashboard_store;
+
+#[path = "common/fill_drain.rs"]
+mod fill_drain;
 
 // ── Cross-session concurrency lease ──────────────────────────────────
 // Registers this harness invocation in the shared dashboard sqlite so
@@ -956,6 +961,36 @@ mod cleanup {
     }
 }
 
+mod graceful_drain {
+    use super::AtomicBool;
+    use std::sync::Arc;
+
+    /// Install the SIGUSR1 graceful-drain handler. Unlike SIGTERM/SIGINT,
+    /// SIGUSR1 only flips a flag; the fill-drain loop observes it between
+    /// batches, stops selecting new trials, and lets in-flight trials finish.
+    pub(crate) fn install_sigusr1_handler() -> Arc<AtomicBool> {
+        use signal_hook::consts::SIGUSR1;
+        use signal_hook::iterator::Signals;
+
+        let drain_requested = Arc::new(AtomicBool::new(false));
+        let handler_flag = Arc::clone(&drain_requested);
+        let mut signals = match Signals::new([SIGUSR1]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[fill-drain] failed to install SIGUSR1 handler: {e}");
+                return drain_requested;
+            }
+        };
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                eprintln!("[fill-drain] received signal {sig}; draining after in-flight trials");
+                handler_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        drain_requested
+    }
+}
+
 /// Best-effort sanitize a test id into a docker container name suffix.
 fn sanitize_id(id: &str) -> String {
     id.chars()
@@ -1418,9 +1453,16 @@ fn main() {
     let positionals: Vec<String> = pos_idx.iter().map(|&i| argv[i].clone()).collect();
     // `--fill[=N]` extension: select up to N trials that have no
     // run_results row at the current clean HEAD (dirty_hash IS NULL).
+    // `--fill-drain` re-selects DEFAULT_FILL-sized chunks until no
+    // work remains, or SIGUSR1 asks it to drain gracefully.
     // Parsed and stripped before handing to libtest-mimic.
     let fill_cap: Option<FillCap> = parse_fill_flag(&argv);
-    let mut args = if positionals.len() >= 2 || fill_cap.is_some() {
+    let fill_drain_mode = parse_fill_drain_flag(&argv);
+    if fill_cap.is_some() && fill_drain_mode {
+        eprintln!("[fill] --fill and --fill-drain are mutually exclusive");
+        std::process::exit(2);
+    }
+    let mut args = if positionals.len() >= 2 || fill_cap.is_some() || fill_drain_mode {
         let drop: std::collections::HashSet<usize> = pos_idx.iter().skip(1).copied().collect();
         let trimmed: Vec<String> = argv
             .iter()
@@ -1482,63 +1524,63 @@ fn main() {
         }
     }
 
-    let mut trials: Vec<Trial> = Vec::new();
-
-    // Generate one Trial per test ID. Each Trial spawns its own
-    // docker run with `--filter=<test_id>`; results are recorded as
-    // soon as the JSON line for that test ID is observed on stdout,
-    // and the container is allowed to drain in a background thread
-    // (see `spawn_drain`). Concurrent docker runs are bounded by
-    // LITEBOX_TEST_JOBS (default 5).
-    let test_ids = get_test_ids();
-    for tid in test_ids {
-        let tid2 = tid.clone();
-        trials.push(Trial::test(format!("native::{tid}"), move || {
-            run_pass_group("native", &tid2)
-        }));
-
-        let tid2 = tid.clone();
-        trials.push(Trial::test(format!("litebox::{tid}"), move || {
-            run_pass_group("litebox", &tid2)
-        }));
-    }
-
-    // Host forwarding trial (not a coordinator suite — uses its own docker run).
-    trials.push(Trial::test("host::fwd".to_string(), move || {
-        let (_, bins) = setup();
-        run_host_fwd(&bins.pie_glibc, &bins.nonpie_glibc);
-        Ok(())
-    }));
-
-    // Phase H dropbear + bash red-gate scenarios. These are token-free
-    // and always registered so regular filters can select them.
-    dropbear_bash::register_trials(&mut trials);
-
-    // Copilot CLI integration scenarios — always registered so the
-    // dashboard universe stays consistent and the autonomous `--fill`
-    // selector can pick them up. Missing GitHub token (a normal
-    // dev-environment state for sessions without `gh auth login`)
-    // fails each trial cheaply inside its body rather than panicking
-    // the whole process; see `mod copilot::run_scenario`.
-    //
-    // setup() is still called here so litebox-pass copilot trials
-    // have the bind-mountable binaries available. The docker image
-    // build is deferred to `ensure_copilot_image` inside each trial
-    // (idempotent inspect-then-build), so a token-less run incurs
-    // zero docker-build cost.
-    let _ = setup();
-    copilot::register_trials(&mut trials);
-
-    // VS Code Remote Server integration scenarios — always registered
-    // (no token required). See `mod vscode` for the scenario set and
-    // `litebox_test_harness/CLAUDE.md` "VS Code Server integration
-    // scenarios" for invocation knobs.
-    vscode::register_trials(&mut trials);
+    let mut trials = build_trials();
 
     // Record the universe size on the runs row so the renderer can
     // show "N covered of M known".
     if !args.list {
         dashboard_store::record_universe_size(i64::try_from(trials.len()).unwrap_or(0));
+    }
+
+    // `--fill-drain`: repeatedly select fresh DEFAULT_FILL-sized
+    // chunks until the selector is empty, or SIGUSR1 requests a
+    // graceful drain. Workers observe SIGUSR1 between trial dispatches:
+    // containers already started finish and record their per-trial WAL
+    // rows, but queued trials are left for the next runner/commit.
+    if fill_drain_mode && positionals.is_empty() && !args.list {
+        let drain_requested = graceful_drain::install_sigusr1_handler();
+        let total = trials.len();
+        let mut iteration = 0u64;
+        let mut selected_total = 0usize;
+        let mut failed_total = 0u64;
+        let outcome = fill_drain::run_until_done_or_drained(
+            || {
+                dashboard_store::select_fill_batch(
+                    &build_trials(),
+                    dashboard_store::FillCap::Count(DEFAULT_FILL),
+                )
+            },
+            |batch| {
+                iteration += 1;
+                eprintln!(
+                    "[fill-drain] iteration {iteration}: selected {}/{} trials missing for \
+                     current HEAD (chunk={DEFAULT_FILL})",
+                    batch.len(),
+                    total,
+                );
+                let (started, failed) = run_fill_drain_batch(batch, &drain_requested);
+                selected_total += started;
+                failed_total += failed;
+            },
+            || drain_requested.load(Ordering::SeqCst),
+        );
+        match outcome {
+            fill_drain::FillDrainOutcome::Done => {
+                eprintln!(
+                    "[fill-drain] selector empty after {iteration} iteration(s), \
+                     {selected_total} dispatched, {failed_total} failed attempt(s) recorded",
+                );
+            }
+            fill_drain::FillDrainOutcome::Drained => {
+                eprintln!(
+                    "[fill-drain] drained after {iteration} iteration(s), \
+                     {selected_total} dispatched, {failed_total} failed attempt(s) recorded",
+                );
+            }
+        }
+        dashboard_store::finalize();
+        lease::deregister();
+        std::process::exit(0);
     }
 
     // `--fill[=N|=Ns]`: pick a batch of trials that have no run_results
@@ -1597,9 +1639,136 @@ fn main() {
     conclusion.exit();
 }
 
+fn build_trials() -> Vec<Trial> {
+    let mut trials: Vec<Trial> = Vec::new();
+
+    // Generate one Trial per test ID. Each Trial spawns its own
+    // docker run with `--filter=<test_id>`; results are recorded as
+    // soon as the JSON line for that test ID is observed on stdout,
+    // and the container is allowed to drain in a background thread
+    // (see `spawn_drain`). Concurrent docker runs are bounded by the
+    // dynamic lease-aware dispatch gate.
+    let test_ids = get_test_ids();
+    for tid in test_ids {
+        let tid2 = tid.clone();
+        trials.push(Trial::test(format!("native::{tid}"), move || {
+            run_pass_group("native", &tid2)
+        }));
+
+        let tid2 = tid.clone();
+        trials.push(Trial::test(format!("litebox::{tid}"), move || {
+            run_pass_group("litebox", &tid2)
+        }));
+    }
+
+    // Host forwarding trial (not a coordinator suite — uses its own docker run).
+    trials.push(Trial::test("host::fwd".to_string(), move || {
+        let (_, bins) = setup();
+        run_host_fwd(&bins.pie_glibc, &bins.nonpie_glibc);
+        Ok(())
+    }));
+
+    // Phase H dropbear + bash red-gate scenarios. These are token-free
+    // and always registered so regular filters can select them.
+    dropbear_bash::register_trials(&mut trials);
+
+    // Copilot CLI integration scenarios — always registered so the
+    // dashboard universe stays consistent and the autonomous fill
+    // selector can pick them up. Missing GitHub token (a normal
+    // dev-environment state for sessions without `gh auth login`)
+    // fails each trial cheaply inside its body rather than panicking
+    // the whole process; see `mod copilot::run_scenario`.
+    //
+    // setup() is still called here so litebox-pass copilot trials
+    // have the bind-mountable binaries available. The docker image
+    // build is deferred to `ensure_copilot_image` inside each trial
+    // (idempotent inspect-then-build), so a token-less run incurs
+    // zero docker-build cost.
+    let _ = setup();
+    copilot::register_trials(&mut trials);
+
+    // VS Code Remote Server integration scenarios — always registered
+    // (no token required). See `mod vscode` for the scenario set and
+    // `litebox_test_harness/CLAUDE.md` "VS Code Server integration
+    // scenarios" for invocation knobs.
+    vscode::register_trials(&mut trials);
+
+    trials
+}
+
+fn run_fill_drain_batch(batch: Vec<String>, drain_requested: &AtomicBool) -> (usize, u64) {
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::AtomicUsize;
+
+    if batch.is_empty() {
+        return (0, 0);
+    }
+
+    let worker_count = dynamic_dispatch_cap().min(batch.len()).max(1);
+    let queue = Mutex::new(VecDeque::from(batch));
+    let started = AtomicUsize::new(0);
+    let failed = AtomicU64::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| {
+                loop {
+                    if drain_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let Some(name) = queue.lock().expect("fill-drain queue lock").pop_front()
+                    else {
+                        break;
+                    };
+                    started.fetch_add(1, Ordering::SeqCst);
+                    eprintln!("[fill-drain] running {name}");
+                    let result = run_fill_drain_trial(&name);
+                    if let Err(e) = result {
+                        failed.fetch_add(1, Ordering::SeqCst);
+                        eprintln!("[fill-drain] {name} ... FAILED: {e:?}");
+                    } else {
+                        eprintln!("[fill-drain] {name} ... ok");
+                    }
+                }
+            });
+        }
+    });
+
+    (
+        started.load(Ordering::SeqCst),
+        failed.load(Ordering::SeqCst),
+    )
+}
+
+fn run_fill_drain_trial(name: &str) -> Result<(), Failed> {
+    let Some((pass, test_id)) = name.split_once("::") else {
+        panic!("fill selector returned non pass-qualified trial name: {name}");
+    };
+
+    match pass {
+        "native" => run_pass_group("native", test_id),
+        "litebox" => run_pass_group("litebox", test_id),
+        "host" => panic!("fill selector returned host trial, which is out of fill scope: {name}"),
+        "dropbear_bash" => {
+            panic!("fill selector returned dropbear_bash trial, which is out of fill scope: {name}")
+        }
+        "copilot" => {
+            panic!("fill selector returned copilot trial, which is out of fill scope: {name}")
+        }
+        "vscode" => {
+            panic!("fill selector returned vscode trial, which is out of fill scope: {name}")
+        }
+        other => panic!("fill selector returned trial with unknown pass {other:?}: {name}"),
+    }
+}
+
 /// Parsed `--fill` argument: a hard count cap or a wall-time
 /// budget that the selector translates into "as many tests as
 /// fit." `--fill` with no value defaults to 300 count.
+const DEFAULT_FILL: usize = 300;
+
 #[derive(Clone, Copy, Debug)]
 enum FillCap {
     Count(usize),
@@ -1607,11 +1776,10 @@ enum FillCap {
 }
 
 /// Parse `--fill` / `--fill=N` / `--fill=Ns` from argv.
-///   `--fill`     → Count(300)
+///   `--fill`     → Count(DEFAULT_FILL)
 ///   `--fill=200` → Count(200)
 ///   `--fill=600s` → BudgetSecs(600)
 fn parse_fill_flag(argv: &[String]) -> Option<FillCap> {
-    const DEFAULT_FILL: usize = 300;
     for a in argv {
         if a == "--fill" {
             return Some(FillCap::Count(DEFAULT_FILL));
@@ -1626,8 +1794,12 @@ fn parse_fill_flag(argv: &[String]) -> Option<FillCap> {
     None
 }
 
+fn parse_fill_drain_flag(argv: &[String]) -> bool {
+    argv.iter().any(|a| a == "--fill-drain")
+}
+
 fn is_fill_arg(a: &str) -> bool {
-    a == "--fill" || a.starts_with("--fill=")
+    a == "--fill" || a.starts_with("--fill=") || a == "--fill-drain"
 }
 
 // ── Per-Trial runner ─────────────────────────────────────────────────

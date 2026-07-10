@@ -3658,6 +3658,31 @@ def cmd_auto(args: argparse.Namespace) -> int:
     )
     freshness_thread.start()
 
+    # Persistent per-tip agent-coverage reconciler (opt-in via
+    # --reconcile-agents). Runs on a short cadence in its own thread,
+    # independent of the long tracked-ref cargo cycles, keeping one
+    # `--fill-drain` runner alive per live agent tip. Replaces the
+    # per-cycle top-N `_maybe_drive_agent_worktree` pick (the source of
+    # agent-tip starvation), so no tip is skipped and each fills to
+    # completion. Lease layer bounds total containers across all runners.
+    RECONCILE_INTERVAL_SECS = 45
+    reconcile_stop = threading.Event()
+
+    def _reconcile_loop() -> None:
+        while not reconcile_stop.wait(RECONCILE_INTERVAL_SECS):
+            try:
+                _reconcile_agent_runners(
+                    args, supervisor_state=_supervisor_state, pidfile=pidfile,
+                )
+            except Exception as e:
+                print(f"[auto] agent-reconcile failed: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+
+    if getattr(args, "reconcile_agents", False):
+        threading.Thread(
+            target=_reconcile_loop, name="dashboard-reconcile", daemon=True,
+        ).start()
+
     try:
         while True:
             conn = open_db(state_dir, with_state_views=False)
@@ -3759,7 +3784,8 @@ def cmd_auto(args: argparse.Namespace) -> int:
             # agent worktree per cycle (if any) and run a short fill.
             # Lease coordinator already shares concurrency fairly with
             # any in-flight tracked-ref cycle.
-            if not getattr(args, "agent_coverage_disable", False):
+            if not getattr(args, "agent_coverage_disable", False) \
+                    and not getattr(args, "reconcile_agents", False):
                 try:
                     _maybe_drive_agent_worktree(
                         args, pidfile=pidfile,
@@ -3785,6 +3811,17 @@ def cmd_auto(args: argparse.Namespace) -> int:
             time.sleep(args.interval)
     finally:
         freshness_stop.set()
+        reconcile_stop.set()
+        # Drain all persistent per-tip runners cleanly on supervisor exit
+        # (SIGUSR1 → grace → reap). Best-effort; WAL keeps their results.
+        runners = _supervisor_state.get("runners", {})
+        for key in list(runners.keys()):
+            r = runners.pop(key, None)
+            if r is not None:
+                try:
+                    _drain_runner(r, _supervisor_state, quiet=args.quiet)
+                except Exception:
+                    pass
         try:
             pidfile.unlink()
         except FileNotFoundError:
@@ -4210,6 +4247,50 @@ def _ensure_shadow_worktree(canonical: Path, state_dir: Path,
     return shadow
 
 
+def _reconcile_runners(
+    desired: dict[str, str],
+    running: dict[str, dict],
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Pure reconciliation for persistent per-tip fill-drain runners.
+
+    Inputs:
+      * ``desired`` — ``{tip_key: sha}`` for every tip that should have a
+        runner right now (live agent tip-set + tracked refs), each at its
+        current HEAD sha.
+      * ``running`` — ``{tip_key: {"sha", "alive", "done"}}`` for every
+        runner we currently track. ``alive`` = process still running;
+        ``done`` = it exited cleanly (fill completed → the tip is fully
+        covered at ``sha``, or it was drained).
+
+    Returns ``(to_start, to_drain)``:
+      * ``to_start`` — ``[(tip_key, sha)]`` tips needing a new runner:
+        none yet, or the sha moved. (A runner that has EXITED — cleanly
+        or crashed — is treated as terminal for its sha and left alone;
+        it re-runs only when its sha moves. This avoids respawn/compile
+        loops on tips whose branch can't run the flag yet.)
+      * ``to_drain`` — ``[tip_key]`` runners to stop gracefully: their
+        tip's sha moved (drain the stale one before starting the new
+        one) or the tip is no longer desired.
+
+    A runner alive at the desired sha is left filling; an exited one at
+    the desired sha is left as-is. This is the whole scheduling policy —
+    everything else is spawn/drain plumbing — so it's kept pure and
+    unit-tested."""
+    to_start: list[tuple[str, str]] = []
+    to_drain: list[str] = []
+    for key, sha in desired.items():
+        r = running.get(key)
+        if r is None:
+            to_start.append((key, sha))
+        elif r["sha"] != sha:
+            to_drain.append(key)
+            to_start.append((key, sha))
+    for key in running:
+        if key not in desired:
+            to_drain.append(key)
+    return to_start, to_drain
+
+
 def _maybe_drive_agent_worktree(
     args: argparse.Namespace,
     *,
@@ -4404,6 +4485,177 @@ def _drive_agent_worktree(
             print(f"[auto] agent-coverage sidecar failed: "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
     return rc == 0
+
+
+def _spawn_agent_fill_runner(
+    wt: dict,
+    args: argparse.Namespace,
+    *,
+    supervisor_state: Optional[dict],
+    pidfile: Optional[Path],
+) -> Optional[dict]:
+    """Spawn a PERSISTENT `--fill-drain` runner for one agent tip and
+    return its handle WITHOUT waiting. The runner fills the tip's whole
+    matrix to completion (or exits early when SIGUSR1-drained because its
+    sha moved). Container concurrency across all live runners is bounded
+    by the harness lease layer, so we can run one per tip. Returns None
+    if the shadow worktree can't be set up."""
+    state_dir = resolve_state_dir(args.state_dir)
+    canonical = _canonical_worktree(args, state_dir)
+    shadow = _ensure_shadow_worktree(
+        canonical, state_dir, wt.get("branch") or "", wt["head"],
+    )
+    if shadow is None:
+        return None
+    env = os.environ.copy()
+    env["LITEBOX_DASHBOARD_DIR"] = str(state_dir)
+    env["LITEBOX_DASHBOARD_REF"] = wt.get("branch") or "<detached>"
+    cargo_args = [
+        "cargo", "test", "-p", "litebox_test_harness",
+        "--test", "integration", "--", "--fill-drain",
+    ]
+    proc = subprocess.Popen(
+        cargo_args, cwd=str(shadow), env=env, start_new_session=True,
+    )
+    child_id: Optional[int] = None
+    if supervisor_state is not None:
+        child_id = _register_child(
+            supervisor_state, kind="agent-coverage",
+            worktree_path=str(shadow),
+        )
+        _update_child(supervisor_state, child_id, cargo_pgid=proc.pid)
+        if pidfile is not None:
+            _write_pidfile_from_state(pidfile, os.getpid(), supervisor_state)
+    return {
+        "sha": wt["head"], "proc": proc, "pgid": proc.pid,
+        "shadow": str(shadow), "child_id": child_id,
+        "harness_pid": None, "reaped": False, "branch": wt.get("branch"),
+    }
+
+
+def _drain_runner(r: dict, supervisor_state: Optional[dict], *,
+                  quiet: bool) -> None:
+    """Stop a persistent runner: SIGUSR1 the harness for a GRACEFUL
+    drain (finish in-flight trials + finalize), give it a short grace
+    window, then reap anything still alive + its containers. Best-effort;
+    reaping is nearly free because per-trial results are already
+    WAL-committed."""
+    if r.get("reaped"):
+        _unregister_runner_child(r, supervisor_state)
+        return
+    hp = r.get("harness_pid")
+    pgid = r.get("pgid")
+    proc = r.get("proc")
+    if hp is not None:
+        try:
+            os.kill(hp, signal.SIGUSR1)  # Phase-A graceful-drain handler
+        except (ProcessLookupError, PermissionError):
+            pass
+        for _ in range(25):  # ~5s grace to finalize + exit
+            if proc is None or proc.poll() is not None:
+                break
+            time.sleep(0.2)
+    if pgid is not None and _pids_in_pgid(pgid):
+        _reap_pgid_and_containers(pgid, hp, quiet=quiet)
+    if proc is not None:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    r["reaped"] = True
+    _unregister_runner_child(r, supervisor_state)
+
+
+def _unregister_runner_child(r: dict, supervisor_state: Optional[dict]) -> None:
+    cid = r.get("child_id")
+    if cid is not None and supervisor_state is not None:
+        _unregister_child(supervisor_state, cid)
+        r["child_id"] = None
+
+
+def _reconcile_agent_runners(
+    args: argparse.Namespace,
+    *,
+    supervisor_state: dict,
+    pidfile: Optional[Path] = None,
+) -> None:
+    """Persistent per-tip agent coverage: keep exactly one live
+    `--fill-drain` runner per live agent tip, at its current HEAD.
+
+    This REPLACES the per-cycle top-N pick — no tip is ever skipped, so
+    none is starved; each fills to completion instead of a biased
+    time-slice. Non-blocking: runners persist across calls, and the
+    lease layer bounds total containers across all of them. Reconcile
+    (start new tips, drain moved/gone ones, restart crashed ones, leave
+    covered ones) is the pure `_reconcile_runners`."""
+    state_dir = resolve_state_dir(args.state_dir)
+    canonical = _canonical_worktree(args, state_dir)
+    runners: dict = supervisor_state.setdefault("runners", {})
+    conn = open_db(state_dir)
+    try:
+        live_branches = _live_branches(conn, canonical)
+        if live_branches:
+            _gc_shadow_worktrees(canonical, state_dir, live_branches)
+        tips, _ = _agent_tip_worktrees(conn, canonical)
+    finally:
+        conn.close()
+    tip_by_key = {(w.get("branch") or w["path"]): w for w in tips}
+    desired = {k: w["head"] for k, w in tip_by_key.items()}
+
+    # Poll: reap just-exited runners once (zombie + child slot +
+    # container stragglers), then snapshot alive/done for reconcile.
+    running_view: dict[str, dict] = {}
+    for key, r in runners.items():
+        rc = r["proc"].poll()
+        if rc is not None and not r.get("reaped"):
+            if not args.quiet:
+                outcome = ("covered (fill complete)" if rc == 0
+                           else f"CRASHED rc={rc} (branch may lack "
+                                f"--fill-drain; re-runs on next commit)")
+                print(f"[auto] agent-reconcile: {key} runner exited — "
+                      f"{outcome}", file=sys.stderr)
+            try:
+                r["proc"].wait(timeout=1)
+            except Exception:
+                pass
+            pgid = r.get("pgid")
+            if pgid is not None and _pids_in_pgid(pgid):
+                _reap_pgid_and_containers(pgid, r.get("harness_pid"),
+                                          quiet=args.quiet)
+            _unregister_runner_child(r, supervisor_state)
+            r["reaped"] = True
+        elif rc is None and r.get("harness_pid") is None:
+            hp = _find_harness_pid(r["proc"].pid)
+            if hp is not None:
+                r["harness_pid"] = hp
+                if r.get("child_id") is not None:
+                    _update_child(supervisor_state, r["child_id"],
+                                  harness_pid=hp)
+        running_view[key] = {
+            "sha": r["sha"], "alive": rc is None, "done": rc is not None,
+        }
+
+    to_start, to_drain = _reconcile_runners(desired, running_view)
+
+    for key in to_drain:
+        r = runners.pop(key, None)
+        if r is not None:
+            _drain_runner(r, supervisor_state, quiet=args.quiet)
+    for key, _sha in to_start:
+        wt = tip_by_key.get(key)
+        if wt is None:
+            continue
+        handle = _spawn_agent_fill_runner(
+            wt, args, supervisor_state=supervisor_state, pidfile=pidfile,
+        )
+        if handle is not None:
+            runners[key] = handle
+    if not args.quiet and (to_start or to_drain):
+        print(f"[auto] agent-reconcile: +{len(to_start)} started, "
+              f"-{len(to_drain)} drained, {len(runners)} live tip-runners",
+              file=sys.stderr)
+    if pidfile is not None:
+        _write_pidfile_from_state(pidfile, os.getpid(), supervisor_state)
 
 
 def _write_agent_sidecar(wt: dict, args: argparse.Namespace) -> None:
@@ -5202,6 +5454,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent-coverage-disable", action="store_true",
         help="disable opportunistic agent-worktree coverage "
              "entirely; supervisor only drives tracked refs.",
+    )
+    p_auto.add_argument(
+        "--reconcile-agents", action="store_true",
+        help="EXPERIMENTAL: replace the per-cycle top-N agent-coverage "
+             "pick with a persistent per-tip reconciler — keep one live "
+             "`--fill-drain` runner per agent tip (at its HEAD), filling "
+             "each to completion instead of a starved time-slice. Drains "
+             "(SIGUSR1) a runner when its sha moves. Total containers are "
+             "bounded by the harness lease layer. Fixes agent-tip "
+             "starvation; the number of runners is the live tip count, "
+             "not --max-parallel-agent-cargos.",
     )
     p_auto.add_argument("--quiet", "-q", action="store_true")
     p_auto.add_argument(

@@ -1522,5 +1522,52 @@ class ThroughputRenderTests(unittest.TestCase):
         self.assertIn("`mybranch` | 0.0 | 1.0 |", out)
 
 
+class ReconcileRunnersTests(unittest.TestCase):
+    """Pure per-tip runner reconciliation: (desired, running) ->
+    (to_start, to_drain). This is the whole scheduling policy."""
+
+    def test_new_tip_starts(self):
+        s, d = dashboard._reconcile_runners({"a": "sha1"}, {})
+        self.assertEqual((s, d), ([("a", "sha1")], []))
+
+    def test_alive_at_right_sha_left_alone(self):
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha1"}, {"a": {"sha": "sha1", "alive": True, "done": False}})
+        self.assertEqual((s, d), ([], []))
+
+    def test_done_at_right_sha_left_alone(self):
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha1"}, {"a": {"sha": "sha1", "alive": False, "done": True}})
+        self.assertEqual((s, d), ([], []))
+
+    def test_sha_moved_drains_and_restarts(self):
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha2"}, {"a": {"sha": "sha1", "alive": True, "done": False}})
+        self.assertEqual((s, d), ([("a", "sha2")], ["a"]))
+
+    def test_exited_at_right_sha_left_alone(self):
+        # Any exit (clean or crash) at the desired sha is terminal — the
+        # tip re-runs only when its sha moves, never a respawn loop.
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha1"}, {"a": {"sha": "sha1", "alive": False, "done": False}})
+        self.assertEqual((s, d), ([], []))
+
+    def test_tip_gone_drains(self):
+        s, d = dashboard._reconcile_runners(
+            {}, {"a": {"sha": "sha1", "alive": True, "done": False}})
+        self.assertEqual((s, d), ([], ["a"]))
+
+    def test_mixed(self):
+        desired = {"keep": "s1", "moved": "s2new", "new": "s3"}
+        running = {
+            "keep": {"sha": "s1", "alive": True, "done": False},
+            "moved": {"sha": "s2old", "alive": True, "done": False},
+            "gone": {"sha": "s9", "alive": False, "done": True},
+        }
+        s, d = dashboard._reconcile_runners(desired, running)
+        self.assertEqual(sorted(s), [("moved", "s2new"), ("new", "s3")])
+        self.assertEqual(sorted(d), ["gone", "moved"])
+
+
 if __name__ == "__main__":
     unittest.main()
