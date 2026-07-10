@@ -197,6 +197,7 @@ connect+workspace+terminal+edit+chat path doesn't need them.
 ## Methodology block (for re-running on a later trace)
 
 ```sh
+export DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}"
 docker rm -f litebox-vscode-trace2
 docker run -d --name litebox-vscode-trace2 \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \

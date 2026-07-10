@@ -1442,20 +1442,28 @@ each trial on `gh auth token` / `COPILOT_GITHUB_TOKEN`.)
 
 ```bash
 # Single scenario:
-cargo test -p litebox_test_harness --test integration -- \
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  cargo test -p litebox_test_harness --test integration -- \
   'native::vscode::bootstrap' --exact
 
 # All native vscode scenarios:
-cargo test -p litebox_test_harness --test integration -- 'native::vscode::'
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  cargo test -p litebox_test_harness --test integration -- 'native::vscode::'
 
 # Full VS Code suite (defaults to LITEBOX_VSCODE_JOBS=1 — serial,
 # safest for shared / autonomous-driver runs):
-cargo test -p litebox_test_harness --test integration -- 'vscode::'
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  cargo test -p litebox_test_harness --test integration -- 'vscode::'
 
 # Same suite, parallelized:
-LITEBOX_VSCODE_JOBS=4 \
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  LITEBOX_VSCODE_JOBS=4 \
   cargo test -p litebox_test_harness --test integration -- 'vscode::'
 ```
+
+The VS Code image inspect/build and per-trial `docker run` paths also
+default to `unix:///run/litebox-docker.sock` internally when
+`DOCKER_HOST` is unset, while preserving any inherited `DOCKER_HOST`.
 
 **Image-stage selection (`LITEBOX_VSCODE_IMAGE_STAGE`):**
 
@@ -1533,4 +1541,3 @@ contracted by their respective native trials).
   which is sufficient to validate the listener + broker TCP
   loopback; speaking the protocol would couple to a moving
   upstream binary format.
-

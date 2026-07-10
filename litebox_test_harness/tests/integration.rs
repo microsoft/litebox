@@ -34,6 +34,28 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+const NATIVE_DOCKER_HOST: &str = "unix:///run/litebox-docker.sock";
+const NATIVE_DOCKER_SOCK: &str = "/run/litebox-docker.sock";
+
+fn set_native_docker_host_if_unset(cmd: &mut Command) {
+    // Prefer the native in-distro dockerd, but only when the caller hasn't
+    // already chosen a daemon AND that socket actually exists. Keeps manual
+    // runs on the native-docker host convenient while staying portable: CI
+    // / machines without the socket fall back to the default docker daemon
+    // instead of hard-failing on a missing socket.
+    if std::env::var_os("DOCKER_HOST").is_none()
+        && std::path::Path::new(NATIVE_DOCKER_SOCK).exists()
+    {
+        cmd.env("DOCKER_HOST", NATIVE_DOCKER_HOST);
+    }
+}
+
+fn docker_command() -> Command {
+    let mut cmd = Command::new("docker");
+    set_native_docker_host_if_unset(&mut cmd);
+    cmd
+}
+
 fn monotonic_nanos() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -1278,7 +1300,7 @@ fn spawn_drain(
                 timeout.as_secs()
             );
             if !keep_containers() {
-                let _ = Command::new("docker")
+                let _ = docker_command()
                     .args(["rm", "-f", &cname_for_watchdog])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -1785,7 +1807,7 @@ fn ensure_docker_image(ws_root: &Path) {
         "Dockerfile not found at {}",
         dockerfile.display()
     );
-    let status = Command::new("docker")
+    let status = docker_command()
         .args(["build", "--target", "litebox-test", "-t", &tag, "-f"])
         .arg(&dockerfile)
         .arg(ws_root)
@@ -2070,7 +2092,7 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
     let data_port = ctrl_port + 1;
     let ctrl_map = format!("{ctrl_port}:19090");
     let data_map = format!("{data_port}:19091");
-    let mut docker = Command::new("docker");
+    let mut docker = docker_command();
     docker
         .args(if keep_containers() {
             vec!["run", "--name", &container_name]
@@ -2149,9 +2171,7 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
 
             attempts += 1;
             if attempts > 30 {
-                let _ = Command::new("docker")
-                    .args(["kill", &container_name])
-                    .status();
+                let _ = docker_command().args(["kill", &container_name]).status();
                 let _ = child.wait();
                 let detail = last_error.unwrap_or_else(|| "no readiness attempts made".to_string());
                 panic!("[host-test] TCP agent not ready after 15s: {detail}");
@@ -4192,10 +4212,9 @@ mod copilot {
 // for the workflow.
 
 mod vscode {
-    use super::{Failed, Trial, copilot};
+    use super::{Failed, Trial, copilot, docker_command};
     use litebox_test_harness::os::pty::Pty;
     use std::path::Path;
-    use std::process::Command;
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
@@ -4234,7 +4253,7 @@ mod vscode {
     fn ensure_vscode_image(ws_root: &Path) {
         let stage = vscode_image_base();
         let tag = vscode_image_tag();
-        let check = Command::new("docker")
+        let check = docker_command()
             .args(["image", "inspect", &tag])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -4263,7 +4282,7 @@ mod vscode {
         }
 
         let dockerfile = ws_root.join("litebox_tool_executor/rootfs/Dockerfile");
-        let status = Command::new("docker")
+        let status = docker_command()
             .args(["build", "--target", stage, "-t", &tag, "-f"])
             .arg(&dockerfile)
             .arg(ws_root)
@@ -6778,7 +6797,7 @@ fn write_token_env(path: &Path, tok: &str) -> Result<(), String> {
 /// only when Copilot trials are being registered.
 fn ensure_copilot_image(ws_root: &Path) {
     let tag = copilot_image_tag();
-    let check = Command::new("docker")
+    let check = docker_command()
         .args(["image", "inspect", &tag])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -6788,7 +6807,7 @@ fn ensure_copilot_image(ws_root: &Path) {
     }
     eprintln!("Building {tag} Docker image...");
     let dockerfile = ws_root.join("litebox_tool_executor/rootfs/Dockerfile");
-    let status = Command::new("docker")
+    let status = docker_command()
         .args(["build", "--target", copilot_image_base(), "-t", &tag, "-f"])
         .arg(&dockerfile)
         .arg(ws_root)

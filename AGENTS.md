@@ -183,8 +183,10 @@ Desktop VM spawn overhead. The harness still spawns one fresh container
 per trial.
 
 ```bash
-docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
-docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .
 ```
 
 ### Logging

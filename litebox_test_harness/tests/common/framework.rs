@@ -117,7 +117,7 @@ fn apply_pdeathsig(cmd: &mut Command) {
 fn build_command(spec: &ContainerSpec, name: &str) -> Command {
     let keep_containers = std::env::var("LITEBOX_KEEP_CONTAINER").is_ok();
     let args = build_docker_run_args(spec, name, keep_containers);
-    let mut cmd = Command::new("docker");
+    let mut cmd = crate::docker_command();
     cmd.args(&args);
     apply_pdeathsig(&mut cmd);
     cmd
@@ -126,7 +126,7 @@ fn build_command(spec: &ContainerSpec, name: &str) -> Command {
 /// Query `docker port <name>` and parse out published host ports.
 /// Returns an empty map if the container publishes no ports.
 fn query_published_ports(name: &str) -> HashMap<u16, u16> {
-    let out = Command::new("docker").args(["port", name]).output().ok();
+    let out = crate::docker_command().args(["port", name]).output().ok();
     let mut ports = HashMap::new();
     let Some(out) = out else { return ports };
     if !out.status.success() {
@@ -176,7 +176,9 @@ fn query_published_ports(name: &str) -> HashMap<u16, u16> {
 /// container remains in `docker ps -a` for post-mortem inspection.
 fn tear_down_detached(name: &str) {
     if std::env::var("LITEBOX_KEEP_CONTAINER").is_err() {
-        let _ = Command::new("timeout")
+        let mut cmd = Command::new("timeout");
+        crate::set_native_docker_host_if_unset(&mut cmd);
+        let _ = cmd
             .args(["10", "docker", "rm", "-f", name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -279,7 +281,7 @@ where
             // Respect LITEBOX_KEEP_CONTAINER even on the bail path:
             // a partially-failed spawn might leave debug breadcrumbs.
             if std::env::var("LITEBOX_KEEP_CONTAINER").is_err() {
-                let _ = Command::new("docker")
+                let _ = crate::docker_command()
                     .args(["rm", "-f", &name])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
