@@ -1204,7 +1204,7 @@ fn set_context_to_interrupt_callback(
 ) {
     let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
         | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
-    assert!(context.ContextFlags & required_flags == required_flags);
+    assert_eq!(context.ContextFlags & required_flags, required_flags);
     context.Rip = interrupt_callback as *const () as usize as u64;
     context.Rsp = tls.host_sp.get().addr() as u64;
     context.Rbp = tls.host_bp.get().addr() as u64;
