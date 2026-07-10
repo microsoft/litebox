@@ -561,6 +561,142 @@ class PidfileConcurrentWriteTests(unittest.TestCase):
                              f"leftover tmp files: {leftovers}")
 
 
+class WatchdogTests(unittest.TestCase):
+    """Supervisor liveness classification + watchdog relaunch gating.
+
+    The pure helpers (`_cmdline_is_supervisor`, `_supervisor_health`)
+    are tested with an injected process predicate / synthetic cmdlines
+    so they're hermetic. The `cmd_watchdog` gating + relaunch wiring
+    use a temp state dir with `subprocess.Popen` stubbed — no real
+    process is ever spawned."""
+
+    # ---- _cmdline_is_supervisor (NUL-separated /proc/<pid>/cmdline) ----
+    def test_cmdline_auto_supervisor_is_recognised(self):
+        cl = "python3\x00/x/dashboard.py\x00auto\x00--interval\x0060\x00"
+        self.assertTrue(dashboard._cmdline_is_supervisor(cl))
+
+    def test_cmdline_stop_is_not_supervisor(self):
+        cl = "python3\x00/x/dashboard.py\x00stop\x00"
+        self.assertFalse(dashboard._cmdline_is_supervisor(cl))
+
+    def test_cmdline_unrelated_process_is_not_supervisor(self):
+        cl = "python3\x00-m\x00unittest\x00"
+        self.assertFalse(dashboard._cmdline_is_supervisor(cl))
+
+    def test_cmdline_dashboard_without_auto_token_is_not_supervisor(self):
+        # dashboard.py present but the subcommand is 'status', not 'auto'
+        # — must not be mistaken for the supervisor after PID reuse.
+        cl = "python3\x00/x/dashboard.py\x00status\x00"
+        self.assertFalse(dashboard._cmdline_is_supervisor(cl))
+
+    # ---- _supervisor_health (pure; injected pid→process predicate) ----
+    @staticmethod
+    def _pf(pid, heartbeat_ms):
+        return {"supervisor_pid": pid, "heartbeat_ms": heartbeat_ms}
+
+    def test_health_no_pidfile_is_down(self):
+        status, age = dashboard._supervisor_health(None, 1_000_000)
+        self.assertEqual(status, "down")
+        self.assertEqual(age, -1)
+
+    def test_health_live_fresh_is_up(self):
+        now = 10_000_000
+        status, age = dashboard._supervisor_health(
+            self._pf(123, now - 5_000), now, is_supervisor=lambda p: True)
+        self.assertEqual(status, "up")
+        self.assertEqual(age, 5_000)
+
+    def test_health_live_stale_is_hung(self):
+        now = 10_000_000
+        pf = self._pf(123, now - (dashboard._HEARTBEAT_STALE_MS + 1))
+        status, _ = dashboard._supervisor_health(
+            pf, now, is_supervisor=lambda p: True)
+        self.assertEqual(status, "hung")
+
+    def test_health_dead_pid_is_down_even_with_fresh_heartbeat(self):
+        # Fresh heartbeat but the pid is gone / reused → down (guards
+        # against reading a stale pidfile of a since-dead supervisor).
+        now = 10_000_000
+        status, _ = dashboard._supervisor_health(
+            self._pf(123, now - 5_000), now, is_supervisor=lambda p: False)
+        self.assertEqual(status, "down")
+
+    def test_health_live_without_heartbeat_field_is_up(self):
+        # Pre-watchdog pidfile (no heartbeat_ms) but a live supervisor
+        # pid → 'up', not 'hung'. Must not cry wolf during a version
+        # transition; age is -1 (unknown).
+        now = 10_000_000
+        status, age = dashboard._supervisor_health(
+            {"supervisor_pid": 123}, now, is_supervisor=lambda p: True)
+        self.assertEqual(status, "up")
+        self.assertEqual(age, -1)
+
+    def test_fmt_hb_age(self):
+        self.assertEqual(dashboard._fmt_hb_age(5_000), "heartbeat 5s ago")
+        self.assertEqual(dashboard._fmt_hb_age(0), "heartbeat 0s ago")
+        self.assertEqual(dashboard._fmt_hb_age(-1),
+                         "no heartbeat (pre-watchdog supervisor)")
+
+    def test_health_stale_boundary(self):
+        now = 10_000_000
+        thr = dashboard._HEARTBEAT_STALE_MS
+        alive = lambda p: True  # noqa: E731
+        self.assertEqual(dashboard._supervisor_health(
+            self._pf(1, now - (thr - 1)), now, is_supervisor=alive)[0], "up")
+        self.assertEqual(dashboard._supervisor_health(
+            self._pf(1, now - thr), now, is_supervisor=alive)[0], "hung")
+
+    # ---- cmd_watchdog gating + relaunch (Popen stubbed) ----
+    def test_watchdog_noop_when_not_enabled(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as td:
+            # No auto.enabled sentinel → supervisor was intentionally
+            # `stop`ped → watchdog must NOT relaunch it.
+            args = argparse.Namespace(state_dir=td, quiet=True)
+            calls: list = []
+            orig = dashboard.subprocess.Popen
+            dashboard.subprocess.Popen = lambda *a, **k: calls.append((a, k))
+            try:
+                rc = dashboard.cmd_watchdog(args)
+            finally:
+                dashboard.subprocess.Popen = orig
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls, [], "must not relaunch when stopped")
+
+    def test_watchdog_relaunches_when_enabled_and_down(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            # Enabled (supposed to be running) + no pidfile → 'down' →
+            # relaunch using the recorded argv/cwd.
+            (state / "auto.enabled").write_text(json.dumps({
+                "argv": ["/x/dashboard.py", "auto", "--interval", "60"],
+                "cwd": "/some/cwd",
+            }))
+            args = argparse.Namespace(state_dir=str(state), quiet=True)
+            calls: list = []
+
+            class FakePopen:
+                def __init__(self, cmd, **kw):
+                    calls.append((cmd, kw))
+
+            orig = dashboard.subprocess.Popen
+            dashboard.subprocess.Popen = FakePopen
+            try:
+                rc = dashboard.cmd_watchdog(args)
+            finally:
+                dashboard.subprocess.Popen = orig
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(calls), 1)
+            cmd, kw = calls[0]
+            # [python, <this dashboard.py>, "auto", "--interval", "60"]
+            self.assertEqual(cmd[0], sys.executable)
+            self.assertTrue(cmd[1].endswith("dashboard.py"))
+            self.assertEqual(cmd[2:], ["auto", "--interval", "60"])
+            self.assertEqual(kw.get("cwd"), "/some/cwd")
+            self.assertTrue(kw.get("start_new_session"))
+
+
 class PickTopNTests(unittest.TestCase):
     """The parallel orchestrator picks the top-N worktrees by the
     same scoring tuple the single-pick selector uses. These tests
@@ -1317,6 +1453,120 @@ class StressHelperTests(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ThroughputRenderTests(unittest.TestCase):
+    """`_render_throughput` computes cycle-completion, per-trial overhead,
+    and per-tip velocity entirely in SQL. Hermetic temp DB with rows
+    positioned relative to `now_ms()` so the relative windows apply."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = _init_db(Path(self.tmp.name) / "results.sqlite")
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _run(self, *, finished_ts_ms, started_ts_ms, branch="b"):
+        self.conn.execute(
+            "INSERT INTO runs(started_ts_ms, finished_ts_ms, hostname,"
+            " worktree_path, commit_sha, branch) VALUES (?,?,?,?,?,?)",
+            (started_ts_ms, finished_ts_ms, "h", "/wt", "sha", branch))
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def _res(self, rid, tid, mode, ts, *, spawn=1, init=1, useful=1):
+        self.conn.execute(
+            'INSERT INTO run_results(run_id,test_id,mode,verdict,'
+            'finished_ts_ms,suite,"group",t_acquire_ms,t_docker_start_ms,'
+            't_docker_spawn_ms,t_litebox_init_ms,t_useful_ms)'
+            ' VALUES (?,?,?,?,?,?,?,0,0,?,?,?)',
+            (rid, tid, mode, "pass", ts, "s", "g", spawn, init, useful))
+
+    def test_empty_store_returns_blank(self):
+        self.assertEqual(dashboard._render_throughput(self.conn), "")
+
+    def test_cycle_completion_counts(self):
+        now = dashboard.now_ms()
+        # completed: finalized run
+        a = self._run(finished_ts_ms=now, started_ts_ms=now - 60_000)
+        self._res(a, "t1", "litebox", now - 60_000)
+        # reaped: not finalized, last result older than the 5-min settle
+        b = self._run(finished_ts_ms=None, started_ts_ms=now - 600_000)
+        self._res(b, "t2", "litebox", now - 600_000)
+        # in-flight: not finalized, recent result
+        c = self._run(finished_ts_ms=None, started_ts_ms=now - 60_000)
+        self._res(c, "t3", "litebox", now - 60_000)
+        out = dashboard._render_throughput(self.conn)
+        self.assertIn("1 completed · 1 reaped", out)
+        self.assertIn("1 in-flight", out)
+        self.assertIn("(50% reaped)", out)  # 1 reaped of (1+1)
+
+    def test_overhead_percent(self):
+        now = dashboard.now_ms()
+        a = self._run(finished_ts_ms=now, started_ts_ms=now - 60_000)
+        # spawn 20s + init 1s vs useful 2s ⇒ overhead 21/23 = 91%
+        self._res(a, "t1", "litebox", now - 60_000,
+                  spawn=20_000, init=1_000, useful=2_000)
+        out = dashboard._render_throughput(self.conn)
+        self.assertIn("| litebox |", out)
+        self.assertIn("**91%**", out)
+
+    def test_velocity_per_tip(self):
+        now = dashboard.now_ms()
+        a = self._run(finished_ts_ms=now, started_ts_ms=now - 60_000,
+                      branch="mybranch")
+        for i in range(6):  # 6 litebox results in 6h ⇒ 1.0/hr, 0 native
+            self._res(a, f"t{i}", "litebox", now - 60_000)
+        out = dashboard._render_throughput(self.conn)
+        self.assertIn("`mybranch` | 0.0 | 1.0 |", out)
+
+
+class ReconcileRunnersTests(unittest.TestCase):
+    """Pure per-tip runner reconciliation: (desired, running) ->
+    (to_start, to_drain). This is the whole scheduling policy."""
+
+    def test_new_tip_starts(self):
+        s, d = dashboard._reconcile_runners({"a": "sha1"}, {})
+        self.assertEqual((s, d), ([("a", "sha1")], []))
+
+    def test_alive_at_right_sha_left_alone(self):
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha1"}, {"a": {"sha": "sha1", "alive": True, "done": False}})
+        self.assertEqual((s, d), ([], []))
+
+    def test_done_at_right_sha_left_alone(self):
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha1"}, {"a": {"sha": "sha1", "alive": False, "done": True}})
+        self.assertEqual((s, d), ([], []))
+
+    def test_sha_moved_drains_and_restarts(self):
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha2"}, {"a": {"sha": "sha1", "alive": True, "done": False}})
+        self.assertEqual((s, d), ([("a", "sha2")], ["a"]))
+
+    def test_exited_at_right_sha_left_alone(self):
+        # Any exit (clean or crash) at the desired sha is terminal — the
+        # tip re-runs only when its sha moves, never a respawn loop.
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha1"}, {"a": {"sha": "sha1", "alive": False, "done": False}})
+        self.assertEqual((s, d), ([], []))
+
+    def test_tip_gone_drains(self):
+        s, d = dashboard._reconcile_runners(
+            {}, {"a": {"sha": "sha1", "alive": True, "done": False}})
+        self.assertEqual((s, d), ([], ["a"]))
+
+    def test_mixed(self):
+        desired = {"keep": "s1", "moved": "s2new", "new": "s3"}
+        running = {
+            "keep": {"sha": "s1", "alive": True, "done": False},
+            "moved": {"sha": "s2old", "alive": True, "done": False},
+            "gone": {"sha": "s9", "alive": False, "done": True},
+        }
+        s, d = dashboard._reconcile_runners(desired, running)
+        self.assertEqual(sorted(s), [("moved", "s2new"), ("new", "s3")])
+        self.assertEqual(sorted(d), ["gone", "moved"])
 
 
 if __name__ == "__main__":

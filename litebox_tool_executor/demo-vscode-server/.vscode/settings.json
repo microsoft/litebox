@@ -19,7 +19,9 @@
     // which runs setup tasks in sequence:
     //
     //   1. "LiteBox: Build"                — cargo build the litebox binaries.
-    //   2. "LiteBox: Build VS Code Image"  — docker build litebox-vscode.
+    //   2. "LiteBox: Build VS Code Image"  — docker build litebox-vscode
+    //      via DOCKER_HOST=unix:///run/litebox-docker.sock unless
+    //      DOCKER_HOST is already set.
     //   3. "LiteBox: Setup SSH Key Auth"    — create a Windows-readable demo key.
     //   4. "LiteBox: Start VS Code Server" — docker run the image with --vscode-server.
     //

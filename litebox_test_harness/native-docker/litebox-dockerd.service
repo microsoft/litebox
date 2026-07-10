@@ -1,0 +1,26 @@
+[Unit]
+Description=Native dockerd for Litebox integration tests
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/lib/litebox-docker:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/lib/litebox-docker/dockerd \
+  --host unix:///run/litebox-docker.sock \
+  --data-root /var/lib/litebox-docker \
+  --exec-root /run/litebox-docker-exec \
+  --group docker \
+  --pidfile /run/litebox-dockerd.pid \
+  --exec-opt native.cgroupdriver=cgroupfs
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=2
+Delegate=yes
+TimeoutStartSec=120
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+
+[Install]
+WantedBy=multi-user.target

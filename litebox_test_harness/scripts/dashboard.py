@@ -900,6 +900,7 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     parts.append(_render_meta(conn, state_dir))
     parts.append(_render_leases(conn))
     parts.append(_render_velocity(conn))
+    parts.append(_render_throughput(conn))
     parts.append(_render_tracked_refs(conn))
     parts.append(_render_agent_worktrees(conn, state_dir))
     parts.append(_render_current_fails(conn))
@@ -988,6 +989,127 @@ def _render_velocity(conn: sqlite3.Connection) -> str:
     )
 
 
+def _render_throughput(conn: sqlite3.Connection) -> str:
+    """Throughput health, all computed in SQL (Python only formats):
+
+      * **Cycle completion** — reaped vs finalized cargo cycles. A
+        reaped cycle keeps every result it already committed (WAL
+        autocommit per trial); it loses only the one in-flight trial +
+        that cycle's setup. A rising reaped fraction is the contention
+        signal; lowering it is the goal of parallelism tuning.
+      * **Per-trial wall time** — where each trial's time goes. On this
+        box container spawn dominates (~20-40x the useful test), so
+        this makes the Docker overhead visible and lets a runtime
+        change (native docker, warm pool) be judged.
+      * **Coverage velocity** — results/hr per tip, so a starved
+        branch (few results/hr) is obvious.
+
+    Empty (returns "") on a store with no timing rows yet."""
+    now = now_ms()
+    settled = now - 5 * 60 * 1000  # last result older than this ⇒ done
+
+    def _cycles(window_ms: int) -> tuple[int, int, int]:
+        row = conn.execute(
+            """
+            WITH w AS (
+                SELECT r.finished_ts_ms, r.started_ts_ms,
+                       (SELECT MAX(rr.finished_ts_ms) FROM run_results rr
+                         WHERE rr.run_id = r.run_id) AS last_ms
+                  FROM runs r
+                 WHERE r.started_ts_ms > :cutoff
+            )
+            SELECT
+              SUM(finished_ts_ms IS NOT NULL),
+              SUM(finished_ts_ms IS NULL
+                  AND COALESCE(last_ms, started_ts_ms) <  :settled),
+              SUM(finished_ts_ms IS NULL
+                  AND COALESCE(last_ms, started_ts_ms) >= :settled)
+              FROM w
+            """,
+            {"cutoff": now - window_ms, "settled": settled},
+        ).fetchone()
+        return (row[0] or 0, row[1] or 0, row[2] or 0)
+
+    def _pct(reaped: int, completed: int) -> str:
+        tot = reaped + completed
+        return f"{round(100 * reaped / tot)}%" if tot else "—"
+
+    c3, r3, i3 = _cycles(3 * 3600 * 1000)
+    c24, r24, _ = _cycles(24 * 3600 * 1000)
+    if (c3 + r3 + i3 + c24 + r24) == 0:
+        return ""
+
+    out = [
+        "## Throughput\n\n",
+        "_Cycle completion_ — a reaped cycle keeps every result it "
+        "already committed (per-trial WAL autocommit); it loses only the "
+        "one in-flight trial + that cycle's setup:\n",
+        f"- last 3h: **{c3} completed · {r3} reaped** "
+        f"({_pct(r3, c3)} reaped) · {i3} in-flight\n",
+        f"- last 24h: {c24} completed · {r24} reaped "
+        f"({_pct(r24, c24)} reaped)\n",
+    ]
+
+    over = conn.execute(
+        """
+        SELECT mode, COUNT(*) AS n,
+               AVG(t_acquire_ms)      AS acquire,
+               AVG(t_docker_spawn_ms) AS spawn,
+               AVG(t_litebox_init_ms) AS init,
+               AVG(t_useful_ms)       AS useful
+          FROM run_results
+         WHERE finished_ts_ms > :cutoff AND t_useful_ms IS NOT NULL
+         GROUP BY mode ORDER BY mode
+        """,
+        {"cutoff": now - 6 * 3600 * 1000},
+    ).fetchall()
+    if over:
+        out.append(
+            "\n_Per-trial wall time_ (last 6h) — container spawn "
+            "dominates; `useful` is the actual test:\n\n"
+            "| mode | n | acquire | docker_spawn | init | useful | overhead |\n"
+            "|---|--:|--:|--:|--:|--:|--:|\n"
+        )
+        for m in over:
+            spawn = m["spawn"] or 0
+            init = m["init"] or 0
+            useful = m["useful"] or 0
+            ovh = spawn + init
+            pct = round(100 * ovh / (ovh + useful)) if (ovh + useful) else 0
+            out.append(
+                f"| {m['mode']} | {m['n']} "
+                f"| {(m['acquire'] or 0) / 1000:.1f}s | {spawn / 1000:.1f}s "
+                f"| {init / 1000:.1f}s | {useful / 1000:.1f}s "
+                f"| **{pct}%** |\n"
+            )
+
+    vel = conn.execute(
+        """
+        SELECT COALESCE(r.branch, r.worktree_path) AS tip,
+               SUM(rr.mode = 'native')  AS native,
+               SUM(rr.mode = 'litebox') AS litebox
+          FROM run_results rr JOIN runs r ON r.run_id = rr.run_id
+         WHERE rr.finished_ts_ms > :cutoff
+         GROUP BY tip ORDER BY (native + litebox) DESC LIMIT 8
+        """,
+        {"cutoff": now - 6 * 3600 * 1000},
+    ).fetchall()
+    if vel:
+        out.append(
+            "\n_Coverage velocity_ (results/hr, last 6h, top tips):\n\n"
+            "| tip | native/hr | litebox/hr |\n|---|--:|--:|\n"
+        )
+        for v in vel:
+            tip = v["tip"] or "?"
+            short = tip.rsplit("/", 1)[-1]
+            out.append(
+                f"| `{short}` | {round((v['native'] or 0) / 6.0, 1)} "
+                f"| {round((v['litebox'] or 0) / 6.0, 1)} |\n"
+            )
+
+    return "".join(out)
+
+
 def _render_meta(conn: sqlite3.Connection, state_dir: Path) -> str:
     n_runs = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] or 0
     n_results = conn.execute("SELECT COUNT(*) FROM run_results").fetchone()[0] or 0
@@ -1003,7 +1125,25 @@ def _render_meta(conn: sqlite3.Connection, state_dir: Path) -> str:
     return (
         f"_State dir_: `{state_dir}` · "
         f"_{n_runs} runs_ · _{n_results} result rows_ · _{universe_str}_\n"
+        f"{_render_supervisor_liveness(state_dir)}"
     )
+
+
+def _render_supervisor_liveness(state_dir: Path) -> str:
+    """One-line supervisor health, read from the pidfile heartbeat +
+    the `auto.enabled` sentinel. Makes a dead/hung supervisor obvious
+    at the top of the report instead of silently stale numbers."""
+    enabled = _enabled_path(state_dir).exists()
+    pf = _read_pidfile(state_dir / "auto.pidfile")
+    status, age = _supervisor_health(pf, now_ms())
+    if status == "up":
+        return (f"_Supervisor_: ✅ up · pid {pf.get('supervisor_pid')} · "
+                f"{_fmt_hb_age(age)}\n")
+    if status == "hung":
+        return (f"_Supervisor_: ⚠️ hung? · pid {pf.get('supervisor_pid')} · "
+                f"{_fmt_hb_age(age)} (stale)\n")
+    state = "⚠️ DOWN (watchdog will restart)" if enabled else "⏹ stopped"
+    return f"_Supervisor_: {state}\n"
 
 
 def _render_tracked_refs(conn: sqlite3.Connection) -> str:
@@ -3395,6 +3535,33 @@ def cmd_auto(args: argparse.Namespace) -> int:
     pidfile = state_dir / "auto.pidfile"
     _supervisor_state = _new_supervisor_state()
 
+    # Double-start guard: refuse if a healthy supervisor is already up
+    # (keeps the watchdog + a manual start from racing into duplicates).
+    existing = _read_pidfile(pidfile)
+    if existing and not getattr(args, "force", False):
+        status, age = _supervisor_health(existing, now_ms())
+        if status == "up":
+            print(f"[auto] a supervisor is already running "
+                  f"(pid {existing.get('supervisor_pid')}, "
+                  f"{_fmt_hb_age(age)}); use --force to start anyway",
+                  file=sys.stderr)
+            return 1
+    _supervisor_state["meta"] = {
+        "started_ms": now_ms(),
+        "argv": list(sys.argv),
+        "cwd": os.getcwd(),
+    }
+    # Mark 'supposed to be running' so `dashboard.py watchdog` restarts
+    # it if it dies. `stop` removes this; a crash/kill leaves it, so the
+    # watchdog self-heals only what wasn't stopped on purpose.
+    try:
+        _enabled_path(state_dir).write_text(json.dumps(
+            {"argv": list(sys.argv), "cwd": os.getcwd(),
+             "enabled_at_ms": now_ms()}))
+    except OSError as e:
+        print(f"[auto] warning: could not write auto.enabled: {e}",
+              file=sys.stderr)
+
     def _signal_handler(signum, _frame):
         sig_name = signal.Signals(signum).name
         if not args.quiet:
@@ -3468,6 +3635,12 @@ def cmd_auto(args: argparse.Namespace) -> int:
                 conn = open_db(state_dir)
                 write_summary(conn, state_dir)
                 conn.close()
+                # Bump the heartbeat here (every FRESHNESS_INTERVAL_SECS)
+                # so the watchdog sees liveness independent of long cargo
+                # cycles — a cold build can keep the main loop busy for
+                # 10+ min without touching the pidfile otherwise.
+                _write_pidfile_from_state(pidfile, os.getpid(),
+                                          _supervisor_state)
             except Exception as e:
                 # Non-fatal — the next tick will retry. Keep the
                 # supervisor alive even if the renderer transiently
@@ -3484,6 +3657,31 @@ def cmd_auto(args: argparse.Namespace) -> int:
         daemon=True,
     )
     freshness_thread.start()
+
+    # Persistent per-tip agent-coverage reconciler (opt-in via
+    # --reconcile-agents). Runs on a short cadence in its own thread,
+    # independent of the long tracked-ref cargo cycles, keeping one
+    # `--fill-drain` runner alive per live agent tip. Replaces the
+    # per-cycle top-N `_maybe_drive_agent_worktree` pick (the source of
+    # agent-tip starvation), so no tip is skipped and each fills to
+    # completion. Lease layer bounds total containers across all runners.
+    RECONCILE_INTERVAL_SECS = 45
+    reconcile_stop = threading.Event()
+
+    def _reconcile_loop() -> None:
+        while not reconcile_stop.wait(RECONCILE_INTERVAL_SECS):
+            try:
+                _reconcile_agent_runners(
+                    args, supervisor_state=_supervisor_state, pidfile=pidfile,
+                )
+            except Exception as e:
+                print(f"[auto] agent-reconcile failed: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+
+    if getattr(args, "reconcile_agents", False):
+        threading.Thread(
+            target=_reconcile_loop, name="dashboard-reconcile", daemon=True,
+        ).start()
 
     try:
         while True:
@@ -3586,7 +3784,8 @@ def cmd_auto(args: argparse.Namespace) -> int:
             # agent worktree per cycle (if any) and run a short fill.
             # Lease coordinator already shares concurrency fairly with
             # any in-flight tracked-ref cycle.
-            if not getattr(args, "agent_coverage_disable", False):
+            if not getattr(args, "agent_coverage_disable", False) \
+                    and not getattr(args, "reconcile_agents", False):
                 try:
                     _maybe_drive_agent_worktree(
                         args, pidfile=pidfile,
@@ -3612,6 +3811,17 @@ def cmd_auto(args: argparse.Namespace) -> int:
             time.sleep(args.interval)
     finally:
         freshness_stop.set()
+        reconcile_stop.set()
+        # Drain all persistent per-tip runners cleanly on supervisor exit
+        # (SIGUSR1 → grace → reap). Best-effort; WAL keeps their results.
+        runners = _supervisor_state.get("runners", {})
+        for key in list(runners.keys()):
+            r = runners.pop(key, None)
+            if r is not None:
+                try:
+                    _drain_runner(r, _supervisor_state, quiet=args.quiet)
+                except Exception:
+                    pass
         try:
             pidfile.unlink()
         except FileNotFoundError:
@@ -4037,6 +4247,50 @@ def _ensure_shadow_worktree(canonical: Path, state_dir: Path,
     return shadow
 
 
+def _reconcile_runners(
+    desired: dict[str, str],
+    running: dict[str, dict],
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Pure reconciliation for persistent per-tip fill-drain runners.
+
+    Inputs:
+      * ``desired`` — ``{tip_key: sha}`` for every tip that should have a
+        runner right now (live agent tip-set + tracked refs), each at its
+        current HEAD sha.
+      * ``running`` — ``{tip_key: {"sha", "alive", "done"}}`` for every
+        runner we currently track. ``alive`` = process still running;
+        ``done`` = it exited cleanly (fill completed → the tip is fully
+        covered at ``sha``, or it was drained).
+
+    Returns ``(to_start, to_drain)``:
+      * ``to_start`` — ``[(tip_key, sha)]`` tips needing a new runner:
+        none yet, or the sha moved. (A runner that has EXITED — cleanly
+        or crashed — is treated as terminal for its sha and left alone;
+        it re-runs only when its sha moves. This avoids respawn/compile
+        loops on tips whose branch can't run the flag yet.)
+      * ``to_drain`` — ``[tip_key]`` runners to stop gracefully: their
+        tip's sha moved (drain the stale one before starting the new
+        one) or the tip is no longer desired.
+
+    A runner alive at the desired sha is left filling; an exited one at
+    the desired sha is left as-is. This is the whole scheduling policy —
+    everything else is spawn/drain plumbing — so it's kept pure and
+    unit-tested."""
+    to_start: list[tuple[str, str]] = []
+    to_drain: list[str] = []
+    for key, sha in desired.items():
+        r = running.get(key)
+        if r is None:
+            to_start.append((key, sha))
+        elif r["sha"] != sha:
+            to_drain.append(key)
+            to_start.append((key, sha))
+    for key in running:
+        if key not in desired:
+            to_drain.append(key)
+    return to_start, to_drain
+
+
 def _maybe_drive_agent_worktree(
     args: argparse.Namespace,
     *,
@@ -4233,6 +4487,177 @@ def _drive_agent_worktree(
     return rc == 0
 
 
+def _spawn_agent_fill_runner(
+    wt: dict,
+    args: argparse.Namespace,
+    *,
+    supervisor_state: Optional[dict],
+    pidfile: Optional[Path],
+) -> Optional[dict]:
+    """Spawn a PERSISTENT `--fill-drain` runner for one agent tip and
+    return its handle WITHOUT waiting. The runner fills the tip's whole
+    matrix to completion (or exits early when SIGUSR1-drained because its
+    sha moved). Container concurrency across all live runners is bounded
+    by the harness lease layer, so we can run one per tip. Returns None
+    if the shadow worktree can't be set up."""
+    state_dir = resolve_state_dir(args.state_dir)
+    canonical = _canonical_worktree(args, state_dir)
+    shadow = _ensure_shadow_worktree(
+        canonical, state_dir, wt.get("branch") or "", wt["head"],
+    )
+    if shadow is None:
+        return None
+    env = os.environ.copy()
+    env["LITEBOX_DASHBOARD_DIR"] = str(state_dir)
+    env["LITEBOX_DASHBOARD_REF"] = wt.get("branch") or "<detached>"
+    cargo_args = [
+        "cargo", "test", "-p", "litebox_test_harness",
+        "--test", "integration", "--", "--fill-drain",
+    ]
+    proc = subprocess.Popen(
+        cargo_args, cwd=str(shadow), env=env, start_new_session=True,
+    )
+    child_id: Optional[int] = None
+    if supervisor_state is not None:
+        child_id = _register_child(
+            supervisor_state, kind="agent-coverage",
+            worktree_path=str(shadow),
+        )
+        _update_child(supervisor_state, child_id, cargo_pgid=proc.pid)
+        if pidfile is not None:
+            _write_pidfile_from_state(pidfile, os.getpid(), supervisor_state)
+    return {
+        "sha": wt["head"], "proc": proc, "pgid": proc.pid,
+        "shadow": str(shadow), "child_id": child_id,
+        "harness_pid": None, "reaped": False, "branch": wt.get("branch"),
+    }
+
+
+def _drain_runner(r: dict, supervisor_state: Optional[dict], *,
+                  quiet: bool) -> None:
+    """Stop a persistent runner: SIGUSR1 the harness for a GRACEFUL
+    drain (finish in-flight trials + finalize), give it a short grace
+    window, then reap anything still alive + its containers. Best-effort;
+    reaping is nearly free because per-trial results are already
+    WAL-committed."""
+    if r.get("reaped"):
+        _unregister_runner_child(r, supervisor_state)
+        return
+    hp = r.get("harness_pid")
+    pgid = r.get("pgid")
+    proc = r.get("proc")
+    if hp is not None:
+        try:
+            os.kill(hp, signal.SIGUSR1)  # Phase-A graceful-drain handler
+        except (ProcessLookupError, PermissionError):
+            pass
+        for _ in range(25):  # ~5s grace to finalize + exit
+            if proc is None or proc.poll() is not None:
+                break
+            time.sleep(0.2)
+    if pgid is not None and _pids_in_pgid(pgid):
+        _reap_pgid_and_containers(pgid, hp, quiet=quiet)
+    if proc is not None:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    r["reaped"] = True
+    _unregister_runner_child(r, supervisor_state)
+
+
+def _unregister_runner_child(r: dict, supervisor_state: Optional[dict]) -> None:
+    cid = r.get("child_id")
+    if cid is not None and supervisor_state is not None:
+        _unregister_child(supervisor_state, cid)
+        r["child_id"] = None
+
+
+def _reconcile_agent_runners(
+    args: argparse.Namespace,
+    *,
+    supervisor_state: dict,
+    pidfile: Optional[Path] = None,
+) -> None:
+    """Persistent per-tip agent coverage: keep exactly one live
+    `--fill-drain` runner per live agent tip, at its current HEAD.
+
+    This REPLACES the per-cycle top-N pick — no tip is ever skipped, so
+    none is starved; each fills to completion instead of a biased
+    time-slice. Non-blocking: runners persist across calls, and the
+    lease layer bounds total containers across all of them. Reconcile
+    (start new tips, drain moved/gone ones, restart crashed ones, leave
+    covered ones) is the pure `_reconcile_runners`."""
+    state_dir = resolve_state_dir(args.state_dir)
+    canonical = _canonical_worktree(args, state_dir)
+    runners: dict = supervisor_state.setdefault("runners", {})
+    conn = open_db(state_dir)
+    try:
+        live_branches = _live_branches(conn, canonical)
+        if live_branches:
+            _gc_shadow_worktrees(canonical, state_dir, live_branches)
+        tips, _ = _agent_tip_worktrees(conn, canonical)
+    finally:
+        conn.close()
+    tip_by_key = {(w.get("branch") or w["path"]): w for w in tips}
+    desired = {k: w["head"] for k, w in tip_by_key.items()}
+
+    # Poll: reap just-exited runners once (zombie + child slot +
+    # container stragglers), then snapshot alive/done for reconcile.
+    running_view: dict[str, dict] = {}
+    for key, r in runners.items():
+        rc = r["proc"].poll()
+        if rc is not None and not r.get("reaped"):
+            if not args.quiet:
+                outcome = ("covered (fill complete)" if rc == 0
+                           else f"CRASHED rc={rc} (branch may lack "
+                                f"--fill-drain; re-runs on next commit)")
+                print(f"[auto] agent-reconcile: {key} runner exited — "
+                      f"{outcome}", file=sys.stderr)
+            try:
+                r["proc"].wait(timeout=1)
+            except Exception:
+                pass
+            pgid = r.get("pgid")
+            if pgid is not None and _pids_in_pgid(pgid):
+                _reap_pgid_and_containers(pgid, r.get("harness_pid"),
+                                          quiet=args.quiet)
+            _unregister_runner_child(r, supervisor_state)
+            r["reaped"] = True
+        elif rc is None and r.get("harness_pid") is None:
+            hp = _find_harness_pid(r["proc"].pid)
+            if hp is not None:
+                r["harness_pid"] = hp
+                if r.get("child_id") is not None:
+                    _update_child(supervisor_state, r["child_id"],
+                                  harness_pid=hp)
+        running_view[key] = {
+            "sha": r["sha"], "alive": rc is None, "done": rc is not None,
+        }
+
+    to_start, to_drain = _reconcile_runners(desired, running_view)
+
+    for key in to_drain:
+        r = runners.pop(key, None)
+        if r is not None:
+            _drain_runner(r, supervisor_state, quiet=args.quiet)
+    for key, _sha in to_start:
+        wt = tip_by_key.get(key)
+        if wt is None:
+            continue
+        handle = _spawn_agent_fill_runner(
+            wt, args, supervisor_state=supervisor_state, pidfile=pidfile,
+        )
+        if handle is not None:
+            runners[key] = handle
+    if not args.quiet and (to_start or to_drain):
+        print(f"[auto] agent-reconcile: +{len(to_start)} started, "
+              f"-{len(to_drain)} drained, {len(runners)} live tip-runners",
+              file=sys.stderr)
+    if pidfile is not None:
+        _write_pidfile_from_state(pidfile, os.getpid(), supervisor_state)
+
+
 def _write_agent_sidecar(wt: dict, args: argparse.Namespace) -> None:
     """Write a focused `regressions.md` into the agent worktree so
     they can `cat` it without scrolling the full summary.md."""
@@ -4370,16 +4795,100 @@ def _snapshot_children(state: dict) -> list[dict]:
         return [dict(slot) for slot in state["children"].values()]
 
 
+_HEARTBEAT_STALE_MS = 20 * 60 * 1000
+
+
+def _enabled_path(state_dir: Path) -> Path:
+    """Sentinel marking the supervisor is *supposed* to be running.
+    `auto` writes it (with argv/cwd to relaunch); `stop` removes it. The
+    `watchdog` only restarts a down supervisor when this exists — so an
+    intentional `stop` stays stopped, while a crash / external kill (the
+    2-day-outage class) self-heals."""
+    return state_dir / "auto.enabled"
+
+
+def _cmdline_is_supervisor(cmdline: str) -> bool:
+    """Pure predicate: does this `/proc/<pid>/cmdline` (NUL-separated)
+    belong to a `dashboard.py auto` supervisor? Split out from
+    `_pid_is_supervisor` so the parsing is unit-testable without a
+    live process."""
+    return "dashboard.py" in cmdline and "auto" in cmdline.split("\x00")
+
+
+def _pid_is_supervisor(pid: Optional[int]) -> bool:
+    """True iff `pid` is alive AND is a `dashboard.py auto` process —
+    guards against PID reuse after the real supervisor died."""
+    if not pid:
+        return False
+    try:
+        cmdline = Path(f"/proc/{int(pid)}/cmdline").read_text()
+    except (FileNotFoundError, ProcessLookupError, PermissionError,
+            ValueError):
+        return False
+    return _cmdline_is_supervisor(cmdline)
+
+
+def _supervisor_health(
+    pf: Optional[dict],
+    now: int,
+    is_supervisor: Callable[[Optional[int]], bool] = _pid_is_supervisor,
+) -> tuple[str, int]:
+    """Classify supervisor liveness from a pidfile dict. Pure (the only
+    impurity, the pid→process check, is injected so tests can fake it).
+
+    Returns `(status, heartbeat_age_ms)` where status is:
+      * 'up'   — pid is a live supervisor AND heartbeat is fresh (or the
+                 pidfile predates heartbeats — see below).
+      * 'hung' — pid is a live supervisor BUT a *present* heartbeat is
+                 stale (main loop wedged / freshness thread dead).
+      * 'down' — no pidfile, or the pid is gone / not a supervisor.
+
+    `heartbeat_age_ms` is `-1` when there is no heartbeat to age (no
+    pidfile, or a pre-watchdog pidfile without a `heartbeat_ms` field).
+    A live supervisor whose pidfile lacks `heartbeat_ms` entirely is
+    reported 'up', not 'hung': it was written by an older supervisor
+    that never emitted heartbeats, so pid-liveness is the only signal
+    and we must not cry wolf during a version transition. New
+    supervisors always stamp `heartbeat_ms` on their first write, so a
+    genuinely wedged new supervisor still surfaces as 'hung'.
+
+    Shared by the `auto` double-start guard, the `watchdog` relaunch
+    decision, and the rendered liveness line so all three agree."""
+    if not pf:
+        return ("down", -1)
+    if not is_supervisor(pf.get("supervisor_pid")):
+        return ("down", -1)
+    hb = pf.get("heartbeat_ms")
+    if hb is None:
+        return ("up", -1)
+    age = now - hb
+    return ("up" if age < _HEARTBEAT_STALE_MS else "hung", age)
+
+
+def _fmt_hb_age(age_ms: int) -> str:
+    """Human phrase for a heartbeat age from `_supervisor_health`.
+    `-1` (no heartbeat available) → a pre-watchdog note."""
+    if age_ms < 0:
+        return "no heartbeat (pre-watchdog supervisor)"
+    return f"heartbeat {age_ms // 1000}s ago"
+
+
 def _write_pidfile_from_state(pidfile: Path, supervisor_pid: int,
                               state: dict) -> None:
     """Mirror the current children registry to disk. Replaces the
     pidfile atomically. Called whenever the registry changes so
-    `dashboard.py stop` always sees the latest in-flight PGIDs."""
+    `dashboard.py stop` always sees the latest in-flight PGIDs. Also
+    stamps a `heartbeat_ms` (bumped each cycle *and* each freshness
+    tick) + the supervisor's `started_ms`/`argv`/`cwd`, which the
+    `watchdog` uses to detect a dead/hung supervisor and relaunch it."""
     children = _snapshot_children(state)
+    meta = state.get("meta") or {}
     _write_pidfile(
         pidfile,
         supervisor_pid=supervisor_pid,
+        heartbeat_ms=now_ms(),
         children=children,
+        **meta,
     )
 
 
@@ -4649,8 +5158,68 @@ def cmd_stop(args: argparse.Namespace) -> int:
         pidfile.unlink()
     except FileNotFoundError:
         pass
+    # Clear the 'supposed to be running' sentinel so the watchdog does
+    # NOT restart it — a `stop` is an explicit "keep it down".
+    try:
+        _enabled_path(state_dir).unlink()
+    except FileNotFoundError:
+        pass
     if not args.quiet:
         print("[stop] done", file=sys.stderr)
+    return 0
+
+
+def cmd_watchdog(args: argparse.Namespace) -> int:
+    """One-shot liveness check: if the supervisor is *supposed* to be
+    running (`auto.enabled` present) but is down or hung (dead pid / not
+    a supervisor / stale heartbeat), relaunch it detached. Idempotent
+    and cheap — run it from cron or a systemd-user timer every few
+    minutes so an accidental kill or crash can't leave the dashboard
+    dark for days (as happened once — a stray SIGTERM with no restart).
+
+    Does nothing when the supervisor was intentionally stopped (`stop`
+    removed `auto.enabled`) or is healthy."""
+    state_dir = resolve_state_dir(args.state_dir)
+    enabled = _enabled_path(state_dir)
+    if not enabled.exists():
+        if not args.quiet:
+            print("[watchdog] auto.enabled absent — supervisor "
+                  "intentionally stopped; nothing to do")
+        return 0
+    pf = _read_pidfile(state_dir / "auto.pidfile")
+    status, age = _supervisor_health(pf, now_ms())
+    if status == "up":
+        if not args.quiet:
+            print(f"[watchdog] supervisor healthy "
+                  f"(pid {pf.get('supervisor_pid')}, {_fmt_hb_age(age)})")
+        return 0
+    reason = "no pidfile" if pf is None else (
+        f"heartbeat stale ({age // 1000}s)" if status == "hung"
+        else "pid dead / not a supervisor")
+    try:
+        spec = json.loads(enabled.read_text())
+    except (json.JSONDecodeError, OSError):
+        spec = {}
+    argv = spec.get("argv") or []
+    cwd = spec.get("cwd") or os.getcwd()
+    script = str(Path(__file__).resolve())
+    rest = argv[1:] if argv else ["auto"]
+    print(f"[watchdog] supervisor DOWN ({reason}) — relaunching "
+          f"`{' '.join(rest)}` in {cwd}", file=sys.stderr)
+    logf = None
+    try:
+        logf = open(state_dir / "auto.log", "a")
+        out = logf
+    except OSError:
+        out = subprocess.DEVNULL
+    subprocess.Popen(
+        [sys.executable, script, *rest], cwd=cwd,
+        stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if logf is not None:
+        logf.close()
+    print("[watchdog] relaunched (detached).", file=sys.stderr)
     return 0
 
 
@@ -4886,7 +5455,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable opportunistic agent-worktree coverage "
              "entirely; supervisor only drives tracked refs.",
     )
+    p_auto.add_argument(
+        "--reconcile-agents", action="store_true",
+        help="EXPERIMENTAL: replace the per-cycle top-N agent-coverage "
+             "pick with a persistent per-tip reconciler — keep one live "
+             "`--fill-drain` runner per agent tip (at its HEAD), filling "
+             "each to completion instead of a starved time-slice. Drains "
+             "(SIGUSR1) a runner when its sha moves. Total containers are "
+             "bounded by the harness lease layer. Fixes agent-tip "
+             "starvation; the number of runners is the live tip count, "
+             "not --max-parallel-agent-cargos.",
+    )
     p_auto.add_argument("--quiet", "-q", action="store_true")
+    p_auto.add_argument(
+        "--force", action="store_true",
+        help="start even if a supervisor already appears to be running "
+             "(bypasses the healthy-supervisor double-start guard).",
+    )
     p_auto.set_defaults(func=cmd_auto)
 
     p_stop = sub.add_parser(
@@ -4897,6 +5482,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stop.add_argument("--quiet", "-q", action="store_true")
     p_stop.set_defaults(func=cmd_stop)
+
+    p_watchdog = sub.add_parser(
+        "watchdog",
+        help="one-shot liveness check: relaunch the `auto` supervisor "
+             "if it is supposed to be running (was started, not "
+             "`stop`ped) but is down or hung. Idempotent — run it from "
+             "cron / a systemd-user timer every few minutes so a crash "
+             "or stray kill can't leave the dashboard dark.",
+    )
+    p_watchdog.add_argument("--quiet", "-q", action="store_true")
+    p_watchdog.set_defaults(func=cmd_watchdog)
 
     p_drain = sub.add_parser(
         "drain",

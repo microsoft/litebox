@@ -44,6 +44,12 @@ The tasks resolve all paths via `${workspaceFolder}/../..`, so each
 demo workspace builds and bind-mounts from **its own worktree's**
 `target/debug/` — no hardcoded `~/src/litebox`.
 
+The demo uses the native in-distro Docker daemon by default. Each
+Docker task respects an inherited `DOCKER_HOST`; if it is unset, the
+task exports `DOCKER_HOST=unix:///run/litebox-docker.sock` before
+running `docker`, bypassing the active Docker context and the retired
+Docker Desktop backend.
+
 Then once VS Code is open:
 
 1. **Terminal → Run Task → `LiteBox: Setup and Start VS Code Server`** —
@@ -190,7 +196,8 @@ The hand-driven workflow above is for demos and exploratory
 debugging. For repeatable regression coverage, run:
 
 ```sh
-cargo test -p litebox_test_harness --test integration -- 'vscode::'
+DOCKER_HOST="${DOCKER_HOST:-unix:///run/litebox-docker.sock}" \
+  cargo test -p litebox_test_harness --test integration -- 'vscode::'
 ```
 
 (or run the `LiteBox: Run Integration Tests (vscode::*)` task
