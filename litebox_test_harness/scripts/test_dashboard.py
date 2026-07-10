@@ -1569,5 +1569,46 @@ class ReconcileRunnersTests(unittest.TestCase):
         self.assertEqual(sorted(d), ["gone", "moved"])
 
 
+class FmtRcRegressionsTests(unittest.TestCase):
+    """The Agent-worktrees regression cell must be coverage-aware: a run
+    with zero regressions only reads as `clean` when the WHOLE universe
+    ran; a thin run reads as `partial` so a passing subset can't be
+    mistaken for a validated branch."""
+
+    def _s(self, **kw):
+        s = dict(dashboard._RC_EMPTY)
+        s.update(kw)
+        return s
+
+    def test_clean_only_at_full_coverage(self):
+        self.assertEqual(
+            dashboard._fmt_rc_regressions(self._s(covered=10, not_run=0)),
+            "clean",
+        )
+
+    def test_partial_when_coverage_incomplete(self):
+        # Zero regressions but 5 tests never ran → NOT clean.
+        self.assertEqual(
+            dashboard._fmt_rc_regressions(self._s(covered=10, not_run=5)),
+            "partial",
+        )
+
+    def test_dash_when_nothing_covered(self):
+        self.assertEqual(
+            dashboard._fmt_rc_regressions(self._s(covered=0, not_run=100)),
+            "—",
+        )
+
+    def test_regressions_take_precedence_over_partial(self):
+        # A real break is reported regardless of coverage — never masked
+        # as `partial`/`clean`.
+        out = dashboard._fmt_rc_regressions(
+            self._s(covered=10, not_run=5, hard=2, hard_high=1)
+        )
+        self.assertIn("hard", out)
+        self.assertNotIn("partial", out)
+        self.assertNotIn("clean", out)
+
+
 if __name__ == "__main__":
     unittest.main()
