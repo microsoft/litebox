@@ -2961,6 +2961,41 @@ impl<FS: ShimFS> Task<FS> {
 
         self.restore_cow_layer_permissions(cow);
         self.pop_cow_layer(cow);
+
+        if restore_bytes {
+            // Re-apply any `clear_child_tid` clears that exiting sibling
+            // threads performed during this vfork window. The byte restore
+            // above rolled the descriptor pages back to their snapshots — the
+            // pre-clear TID value — which would leave the corresponding
+            // `pthread_join` waiting on the resurrected futex forever. Only
+            // re-clear a slot that still holds exactly the stale tid we
+            // recorded: if it now holds anything else (already 0, or a tid
+            // glibc's thread cache reassigned to a *new* thread reusing the
+            // slot) writing 0 would corrupt a live descriptor. If a lower
+            // layer still covers the address it will roll it back again on its
+            // own restore, so hand the pending wake down to that layer.
+            let pending = core::mem::take(&mut *cow.pending_join_wakes.lock());
+            for (addr, stale) in pending {
+                if let Some((lower, _)) = self.top_cow_layer_for_page(addr) {
+                    lower.pending_join_wakes.lock().push((addr, stale));
+                    continue;
+                }
+                let ptr = MutPtr::<u32>::from_usize(addr);
+                if ptr.read_at_offset(0) != Some(stale) {
+                    continue;
+                }
+                if self.guest_range_is_mapped(addr, core::mem::size_of::<u32>())
+                    && self.prepare_guest_write(ptr, 1).is_ok()
+                    && ptr.write_at_offset(0, 0).is_some()
+                {
+                    let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
+                        addr: ptr,
+                        flags: litebox_common_linux::FutexFlags::PRIVATE,
+                        count: 1,
+                    });
+                }
+            }
+        }
     }
 
     /// If the current task's transport told a "deferred park lie" during a 9P
@@ -5492,6 +5527,18 @@ struct CowState {
     /// Per-page snapshots taken on first write for this layer, keyed by
     /// page-aligned address.
     dirty_pages: litebox::sync::Mutex<Platform, BTreeMap<usize, Vec<u8>>>,
+    /// `clear_child_tid` addresses (and the stale tid each held) of sibling
+    /// threads that *exited during this vfork window*. Such a thread is allowed
+    /// to bypass the fork quiesce (an exiting thread must make progress so the
+    /// forker isn't wedged waiting for it to park), so it writes `0` to its
+    /// `clear_child_tid` — the futex a `pthread_join` waits on — inside the
+    /// window. `restore_cow_layer` then rolls that page back to the pre-clear
+    /// (stale TID) value, resurrecting the join futex and wedging the joiner
+    /// forever. We record `(addr, stale_tid)` here and, after the byte restore,
+    /// re-apply the clear+wake — but only if the slot still holds exactly
+    /// `stale_tid`, so we never clobber a slot glibc's thread cache has already
+    /// reused for a new thread (a different tid).
+    pending_join_wakes: litebox::sync::Mutex<Platform, Vec<(usize, u32)>>,
 }
 
 /// Call `update_permissions` with the correct `PAGE_SIZE` const generic.
@@ -5954,10 +6001,12 @@ mod tests {
         let lower = Arc::new(CowState {
             protected_ranges: vec![(0x4000, PAGE_SIZE, perms)],
             dirty_pages: litebox::sync::Mutex::new(BTreeMap::new()),
+            pending_join_wakes: litebox::sync::Mutex::new(Vec::new()),
         });
         let upper = Arc::new(CowState {
             protected_ranges: vec![(0x8000, PAGE_SIZE, perms)],
             dirty_pages: litebox::sync::Mutex::new(BTreeMap::new()),
+            pending_join_wakes: litebox::sync::Mutex::new(Vec::new()),
         });
 
         task.process_state
