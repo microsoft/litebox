@@ -2403,7 +2403,24 @@ impl litebox::platform::DerivedKeyProvider for LinuxUserland {
 /// In general, userland platforms do not support `vmap` and `vunmap` (which are kernel functions).
 /// We might need to emulate these functions' behaviors using virtual addresses for development or
 /// testing, or use a kernel module to provide this functionality (if needed).
-impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {}
+unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {
+    type MapInfo = litebox_common_linux::vmap::NoopPhysPageMapInfo;
+
+    fn validate_unowned(
+        &self,
+        _pages: &litebox_common_linux::vmap::PhysPageAddrArray<ALIGN>,
+    ) -> Result<(), litebox_common_linux::vmap::PhysPointerError> {
+        Err(litebox_common_linux::vmap::PhysPointerError::UnsupportedOperation)
+    }
+
+    unsafe fn protect(
+        &self,
+        _pages: &litebox_common_linux::vmap::PhysPageAddrArray<ALIGN>,
+        _perms: litebox_common_linux::vmap::PhysPageMapPermissions,
+    ) -> Result<(), litebox_common_linux::vmap::PhysPointerError> {
+        Err(litebox_common_linux::vmap::PhysPointerError::UnsupportedOperation)
+    }
+}
 
 /// Dummy `VmemPageFaultHandler`.
 ///

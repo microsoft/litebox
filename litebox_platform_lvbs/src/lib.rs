@@ -23,10 +23,9 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-#[cfg(feature = "optee_syscall")]
 use litebox_common_linux::vmap::{
-    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
-    VmapManager,
+    GlobalVmapManager, PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions,
+    PhysPointerError, VmapManager,
 };
 use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use x86_64::{
@@ -38,7 +37,6 @@ use x86_64::{
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-#[cfg(feature = "optee_syscall")]
 use crate::mm::vmap::vmap_allocator;
 
 extern crate alloc;
@@ -50,29 +48,26 @@ pub mod mshv;
 
 pub mod syscall_entry;
 
-/// Allocate a zeroed `Box<T>` directly on the heap, avoiding stack intermediaries
-/// for large types (e.g., 4096-byte `HekiPage`).
-///
-/// This is safe because `T: FromBytes` guarantees that all-zero bytes are a valid `T`.
-///
-/// # Panics
-///
-/// Panics if `T` is a zero-sized type, since `alloc_zeroed` with a zero-sized
-/// layout is undefined behavior.
-fn box_new_zeroed<T: FromBytes>() -> alloc::boxed::Box<T> {
-    assert!(
-        core::mem::size_of::<T>() > 0,
-        "box_new_zeroed does not support zero-sized types"
-    );
-    let layout = core::alloc::Layout::new::<T>();
-    // Safety: layout has a non-zero size and correct alignment for T.
-    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<T>();
-    if ptr.is_null() {
-        alloc::alloc::handle_alloc_error(layout);
+/// Mapping info returned by [`LinuxKernel`]'s [`VmapManager::vmap`].
+pub struct LvbsPhysPageMapInfo {
+    base: *mut u8,
+    size: usize,
+}
+
+impl LvbsPhysPageMapInfo {
+    fn new(base: *mut u8, size: usize) -> Self {
+        Self { base, size }
     }
-    // Safety: ptr is a valid, zeroed, properly aligned heap allocation for T.
-    // T: FromBytes guarantees all-zero is a valid bit pattern.
-    unsafe { alloc::boxed::Box::from_raw(ptr) }
+}
+
+impl PhysPageMapInfo for LvbsPhysPageMapInfo {
+    fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
 }
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
@@ -470,6 +465,21 @@ type UserConstPtr<T> =
 type UserMutPtr<T> =
     litebox::platform::common_providers::userspace_pointers::UserMutPtr<LvbsValidateAccess, T>;
 
+/// Type-level marker for the VTL0 physical-pointer provider.
+pub enum Vmap {}
+
+impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
+    type Manager = crate::host::LvbsLinuxKernel;
+    fn manager() -> &'static Self::Manager {
+        crate::platform_low()
+    }
+}
+
+pub type Vtl0PhysConstPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, Vmap>;
+pub type Vtl0PhysMutPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, Vmap>;
+
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
@@ -643,50 +653,14 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         self.vtl1_phys_frame_range
     }
 
-    /// This function maps VTL0 physical page frames containing the physical addresses
-    /// from `phys_start` to `phys_end` to the VTL1 kernel page table. It internally page aligns
-    /// the input addresses to ensure the mapped memory area covers the entire input addresses
-    /// at the page level. It returns a page-aligned address (as `mmap` does) and the length of the mapped memory.
-    ///
-    /// Note: VTL0 physical memory is external/remote memory that this Rust binary doesn't own,
-    /// so mapping it doesn't create aliasing issues within the Rust memory model.
-    fn map_vtl0_phys_range(
-        &self,
-        phys_start: x86_64::PhysAddr,
-        phys_end: x86_64::PhysAddr,
-        flags: PageTableFlags,
-    ) -> Result<(*mut u8, usize), MapToError<Size4KiB>> {
-        let frame_range = PhysFrame::range(
-            PhysFrame::containing_address(phys_start),
-            PhysFrame::containing_address(phys_end.align_up(Size4KiB::SIZE)),
-        );
-
-        // ensure the input address range does not overlap with VTL1 memory
-        if frame_range.start < self.vtl1_phys_frame_range.end
-            && self.vtl1_phys_frame_range.start < frame_range.end
-        {
-            return Err(MapToError::FrameAllocationFailed);
-        }
-
-        let flags = flags | PageTableFlags::NO_EXECUTE;
-
-        Ok((
-            self.page_table_manager
-                .current_page_table()
-                .map_phys_frame_range_direct(frame_range, flags, None)?,
-            usize::try_from(frame_range.len()).unwrap() * PAGE_SIZE,
-        ))
-    }
-
     /// This function unmaps VTL0 pages from the page table.
     ///
     /// Allocator does not allocate memory frames for VTL0 pages, so frame deallocation is not needed.
     ///
-    /// Note: VTL0 physical memory is external memory not owned by LiteBox (similar to MMIO).
-    /// LiteBox accesses it by creating a temporary non-shared mapping, copying data to/from a
-    /// LiteBox-owned buffer, and unmapping immediately. No Rust references are created to the
-    /// mapped VTL0 memory; all accesses use raw pointer operations (read_volatile /
-    /// copy_nonoverlapping) to avoid violating Rust's aliasing model.
+    /// Note: VTL0 physical memory is external memory not owned by LiteBox, similar to DMA/shared
+    /// physical memory. Physical pointer APIs access it by creating a temporary mapping, copying
+    /// data to/from a LiteBox-owned buffer with fallible raw-pointer copies, and unmapping
+    /// immediately. These APIs do not create Rust references to the mapped VTL0 memory.
     fn unmap_vtl0_pages(
         &self,
         page_addr: *const u8,
@@ -715,174 +689,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 false,
             )
         }
-    }
-
-    /// Map a VTL0 physical range and return a guard that unmaps on drop.
-    fn map_vtl0_guard(
-        &self,
-        phys_addr: x86_64::PhysAddr,
-        size: u64,
-        flags: PageTableFlags,
-    ) -> Option<Vtl0MappedGuard<'_, Host>> {
-        let phys_end = phys_addr
-            .as_u64()
-            .checked_add(size)
-            .and_then(|end| x86_64::PhysAddr::try_new(end).ok())?;
-        let (page_addr, page_aligned_length) =
-            self.map_vtl0_phys_range(phys_addr, phys_end, flags).ok()?;
-        let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).trunc();
-        Some(Vtl0MappedGuard {
-            owner: self,
-            page_addr,
-            page_aligned_length,
-            ptr: page_addr.wrapping_add(page_offset),
-            size: size.trunc(),
-        })
-    }
-
-    /// This function copies data from VTL0 physical memory to the VTL1 kernel through `Box`.
-    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
-    pub unsafe fn copy_from_vtl0_phys<T: FromBytes + Copy>(
-        &self,
-        phys_addr: x86_64::PhysAddr,
-    ) -> Option<alloc::boxed::Box<T>> {
-        if core::mem::size_of::<T>() == 0 {
-            return Some(alloc::boxed::Box::new(T::new_zeroed()));
-        }
-
-        let src_guard = self.map_vtl0_guard(
-            phys_addr,
-            core::mem::size_of::<T>() as u64,
-            PageTableFlags::PRESENT,
-        )?;
-
-        let mut boxed = box_new_zeroed::<T>();
-        // Use memcpy_fallible instead of ptr::copy_nonoverlapping to handle
-        // the race where another core running on the same page table unmaps
-        // this page between map_vtl0_guard and the copy. The mapping is valid
-        // at this point, so a fault is not expected in the common case.
-        // TODO: Once VTL0 page-range locking is in place, this fallible copy
-        // may become unnecessary since the lock would prevent concurrent
-        // unmapping.  It could still serve as a safety net against callers
-        // that forget to acquire the lock.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                core::ptr::from_mut::<T>(boxed.as_mut()).cast(),
-                src_guard.ptr,
-                src_guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault copying from VTL0 mapped page");
-
-        result.ok().map(|()| boxed)
-    }
-
-    /// This function copies data from the VTL1 kernel to VTL0 physical memory.
-    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
-    /// # Safety
-    ///
-    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address
-    pub unsafe fn copy_to_vtl0_phys<T: Copy>(
-        &self,
-        phys_addr: x86_64::PhysAddr,
-        value: &T,
-    ) -> bool {
-        if core::mem::size_of::<T>() == 0 {
-            return true;
-        }
-
-        let Some(dst_guard) = self.map_vtl0_guard(
-            phys_addr,
-            core::mem::size_of::<T>() as u64,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        ) else {
-            return false;
-        };
-
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                dst_guard.ptr,
-                core::ptr::from_ref::<T>(value).cast::<u8>(),
-                dst_guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault copying to VTL0 mapped page");
-        result.is_ok()
-    }
-
-    /// This function copies a slice from the VTL1 kernel to VTL0 physical memory.
-    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address.
-    pub unsafe fn copy_slice_to_vtl0_phys<T: Copy>(
-        &self,
-        phys_addr: x86_64::PhysAddr,
-        value: &[T],
-    ) -> bool {
-        if core::mem::size_of_val(value) == 0 {
-            return true;
-        }
-
-        let Some(dst_guard) = self.map_vtl0_guard(
-            phys_addr,
-            core::mem::size_of_val(value) as u64,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        ) else {
-            return false;
-        };
-
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                dst_guard.ptr,
-                value.as_ptr().cast::<u8>(),
-                dst_guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault copying to VTL0 mapped page");
-        result.is_ok()
-    }
-
-    /// This function copies a slice from VTL0 physical memory to the VTL1 kernel.
-    /// Use this function instead of map/unmap functions to avoid potential TOCTTOU.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the `phys_addr` is a valid VTL0 physical address.
-    pub unsafe fn copy_slice_from_vtl0_phys<T: Copy>(
-        &self,
-        phys_addr: x86_64::PhysAddr,
-        buf: &mut [T],
-    ) -> bool {
-        if core::mem::size_of_val(buf) == 0 {
-            return true;
-        }
-
-        let Some(src_guard) = self.map_vtl0_guard(
-            phys_addr,
-            core::mem::size_of_val(buf) as u64,
-            PageTableFlags::PRESENT,
-        ) else {
-            return false;
-        };
-
-        // Fallible: another core may unmap this page concurrently.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                buf.as_mut_ptr().cast::<u8>(),
-                src_guard.ptr,
-                src_guard.size,
-            )
-        };
-        debug_assert!(result.is_ok(), "fault copying from VTL0 mapped page");
-        result.is_ok()
     }
 
     /// Create a new task page table for VTL1 user space and returns its ID.
@@ -962,26 +768,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// Enable syscall support in the platform.
     pub fn enable_syscall_support() {
         syscall_entry::init();
-    }
-}
-
-/// RAII guard that unmaps VTL0 physical pages when dropped.
-struct Vtl0MappedGuard<'a, Host: HostInterface> {
-    owner: &'a LinuxKernel<Host>,
-    page_addr: *mut u8,
-    page_aligned_length: usize,
-    ptr: *mut u8,
-    size: usize,
-}
-
-impl<Host: HostInterface> Drop for Vtl0MappedGuard<'_, Host> {
-    fn drop(&mut self) {
-        assert!(
-            self.owner
-                .unmap_vtl0_pages(self.page_addr, self.page_aligned_length)
-                .is_ok(),
-            "Failed to unmap VTL0 pages"
-        );
     }
 }
 
@@ -1355,7 +1141,6 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 }
 
-#[cfg(feature = "optee_syscall")]
 /// Checks whether the given physical addresses are contiguous with respect to ALIGN.
 fn is_contiguous<const ALIGN: usize>(addrs: &[PhysPageAddr<ALIGN>]) -> bool {
     for window in addrs.windows(2) {
@@ -1372,13 +1157,14 @@ fn is_contiguous<const ALIGN: usize>(addrs: &[PhysPageAddr<ALIGN>]) -> bool {
     true
 }
 
-#[cfg(feature = "optee_syscall")]
-impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
+unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
+    type MapInfo = LvbsPhysPageMapInfo;
+
     unsafe fn vmap(
         &self,
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
-    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
+    ) -> Result<Self::MapInfo, PhysPointerError> {
         if pages.is_empty() {
             return Err(PhysPointerError::InvalidPhysicalAddress(0));
         }
@@ -1387,14 +1173,28 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
+        self.validate_unowned(pages)?;
+
+        // Reject duplicates early as an API-level validation. The page-table implementation also
+        // rejects duplicate/shared mappings, but this keeps the error local to the input array.
+        if !is_contiguous(pages) {
+            let mut seen = hashbrown::HashSet::with_capacity(pages.len());
+            for page in pages {
+                if !seen.insert(page.as_usize()) {
+                    return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
+                }
+            }
+        }
+
         // VTL0 memory must never be executable from VTL1 (DEP).
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
         if perms.contains(PhysPageMapPermissions::WRITE) {
             flags |= PageTableFlags::WRITABLE;
         }
 
-        // If pages are contiguous, use `map_phys_frame_range_direct` which is efficient and
-        // doesn't require vmap VA space.
+        // `validate_unowned` rejects VTL1-owned PA before callers reach `vmap`, so these pages
+        // are foreign. Contiguous foreign PA uses the foreign direct-map VA range; non-contiguous
+        // foreign PA uses the vmap VA range. Neither range aliases VTL1-owned Rust memory.
         if is_contiguous(pages) {
             let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
             let phys_end = x86_64::PhysAddr::new(
@@ -1415,10 +1215,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                 .current_page_table()
                 .map_phys_frame_range_direct(frame_range, flags, None)
             {
-                Ok(page_addr) => Ok(PhysPageMapInfo {
-                    base: page_addr,
-                    size: pages.len() * ALIGN,
-                }),
+                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(page_addr, pages.len() * ALIGN)),
                 Err(MapToError::PageAlreadyMapped(_)) => {
                     Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
                 }
@@ -1430,16 +1227,6 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                 ),
             }
         } else {
-            // Reject duplicate page addresses
-            {
-                let mut seen = hashbrown::HashSet::with_capacity(pages.len());
-                for page in pages {
-                    if !seen.insert(page.as_usize()) {
-                        return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
-                    }
-                }
-            }
-
             let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
                 .iter()
                 .map(|p| PhysFrame::containing_address(x86_64::PhysAddr::new(p.as_usize() as u64)))
@@ -1464,10 +1251,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                 .current_page_table()
                 .map_non_contiguous_phys_frames(&frames, base_va, flags)
             {
-                Ok(page_addr) => Ok(PhysPageMapInfo {
-                    base: page_addr,
-                    size: pages.len() * ALIGN,
-                }),
+                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(page_addr, pages.len() * ALIGN)),
                 Err(e) => {
                     let _ = vmap_allocator().unregister_allocation(base_va);
                     match e {
@@ -1486,24 +1270,37 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         }
     }
 
-    unsafe fn vunmap(&self, vmap_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
+    unsafe fn vunmap(
+        &self,
+        vmap_info: Self::MapInfo,
+    ) -> Result<(), (PhysPointerError, Self::MapInfo)> {
         if ALIGN != PAGE_SIZE {
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        let base_va = x86_64::VirtAddr::new(vmap_info.base as u64);
+        let base = vmap_info.base();
+        let size = vmap_info.size();
+        let base_va = x86_64::VirtAddr::new(base as u64);
 
         // Unmap the page table entries first. Only release the VA range back
         // to the allocator when unmapping succeeds; if it fails, stale PTE
         // entries remain and recycling the VA would cause collisions.
-        self.unmap_vtl0_pages(vmap_info.base, vmap_info.size)
-            .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))?;
-
-        if crate::mm::vmap::is_vmap_address(base_va) {
-            crate::mm::vmap::vmap_allocator()
-                .unregister_allocation(base_va)
-                .ok_or(PhysPointerError::Unmapped(vmap_info.base as usize))?;
+        if self.unmap_vtl0_pages(base, size).is_err() {
+            return Err((PhysPointerError::Unmapped(base as usize), vmap_info));
         }
+
+        // PTEs are already cleared at this point, so the mapping is functionally gone
+        // and a retry would only re-fail against empty page-table entries. If the VA
+        // allocator's bookkeeping is inconsistent, surface it via `debug_assert!`. The
+        // VA region is leaked but cannot be safely recycled.
+        let unregister_ok = !crate::mm::vmap::is_vmap_address(base_va)
+            || crate::mm::vmap::vmap_allocator()
+                .unregister_allocation(base_va)
+                .is_some();
+        debug_assert!(
+            unregister_ok,
+            "vmap allocator unregister failed at {base_va:?}",
+        );
 
         Ok(())
     }

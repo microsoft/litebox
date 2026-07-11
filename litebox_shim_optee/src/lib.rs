@@ -22,7 +22,7 @@ use litebox::{
     shim::ContinueOperation,
     utils::{ReinterpretUnsignedExt, TruncateExt},
 };
-use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, vmap::GlobalVmapManager};
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SyscallRequest, TaFlags, TeeAlgorithm, TeeAlgorithmClass,
     TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
@@ -35,7 +35,6 @@ pub mod session;
 pub(crate) mod syscalls;
 
 pub mod msg_handler;
-pub mod ptr;
 
 // Re-export session management types for convenience
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
@@ -1489,8 +1488,20 @@ impl SessionIdPool {
     }
 }
 
-pub type NormalWorldConstPtr<T, const ALIGN: usize> = crate::ptr::PhysConstPtr<T, ALIGN>;
-pub type NormalWorldMutPtr<T, const ALIGN: usize> = crate::ptr::PhysMutPtr<T, ALIGN>;
+/// Type-level marker for the normal-world physical-pointer provider.
+pub enum Vmap {}
+
+impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
+    type Manager = litebox_platform_multiplex::Platform;
+    fn manager() -> &'static Self::Manager {
+        litebox_platform_multiplex::platform()
+    }
+}
+
+pub type NormalWorldConstPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, Vmap>;
+pub type NormalWorldMutPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, Vmap>;
 
 #[cfg(test)]
 mod test_utils {

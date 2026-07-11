@@ -2119,7 +2119,7 @@ impl From<&OpteeSmcArgsPage> for OpteeSmcArgs {
 }
 
 /// OP-TEE SMC call arguments.
-#[derive(Clone, Copy, Default, FromBytes)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
 pub struct OpteeSmcArgs {
     args: [usize; Self::NUM_OPTEE_SMC_ARGS],
 }
@@ -2352,7 +2352,6 @@ impl From<litebox_common_linux::vmap::PhysPointerError> for OpteeSmcReturnCode {
         use litebox_common_linux::vmap::PhysPointerError;
         match err {
             PhysPointerError::AlreadyMapped(_) => OpteeSmcReturnCode::EBusy,
-            PhysPointerError::NoMappingInfo => OpteeSmcReturnCode::ENomem,
             _ => OpteeSmcReturnCode::EBadAddr,
         }
     }
