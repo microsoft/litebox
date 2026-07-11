@@ -111,7 +111,7 @@ fn dashboard_schema_initializes_and_view_returns_latest() {
 
     let insert_result = |run_id: i64, verdict: &str, ts: i64| {
         conn.execute(
-            "INSERT INTO run_results(run_id, test_id, pass, verdict, finished_ts_ms,
+            "INSERT INTO run_results(run_id, test_id, mode, verdict, finished_ts_ms,
                                      suite, \"group\",
                                      t_acquire_ms, t_docker_start_ms, t_useful_ms)
              VALUES (?1, 'X.id', 'native', ?2, ?3, 'fork', 'fork_matrix', 0, 0, 100)",
@@ -126,7 +126,7 @@ fn dashboard_schema_initializes_and_view_returns_latest() {
     let (verdict, ts): (String, i64) = conn
         .query_row(
             "SELECT verdict, finished_ts_ms FROM latest_results
-              WHERE test_id='X.id' AND pass='native'",
+              WHERE test_id='X.id' AND mode='native'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -420,10 +420,13 @@ fn build_docker_run_args_no_timeout_no_wrap() {
 // (e.g. retries cap removed, class 2 always re-runs, passing-at-
 // sha incorrectly re-selected).
 
-use libtest_mimic::Trial;
-
-fn mk_trial(name: &str) -> Trial {
-    Trial::test(name.to_string(), || Ok(()))
+fn mk_trial(name: &str) -> dashboard_store::FillCandidate {
+    // Fill candidates carry a suite; tests that don't exercise suite
+    // bucketing just use "fork".
+    dashboard_store::FillCandidate {
+        name: name.to_string(),
+        suite: "fork",
+    }
 }
 
 /// Set up a fresh dashboard sqlite at `tmp` with the canonical
@@ -468,7 +471,7 @@ fn insert_result(
     finished_ts_ms: i64,
 ) {
     conn.execute(
-        "INSERT INTO run_results(run_id, test_id, pass, verdict, finished_ts_ms,
+        "INSERT INTO run_results(run_id, test_id, mode, verdict, finished_ts_ms,
                                  suite, \"group\",
                                  t_acquire_ms, t_docker_start_ms, t_useful_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, 'fork', 'fork_matrix', 0, 0, 100)",
@@ -499,6 +502,43 @@ fn select_fill_batch_class1_picks_uncovered() {
         3,
         "all uncovered trials should be picked: {picked:?}"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn select_fill_batch_is_suite_agnostic() {
+    // The selector no longer inspects the name shape — every provided
+    // candidate is fillable (the vscode/copilot/dropbear suites run their
+    // own closures now, not run_pass_group). Guards against a regression
+    // where a name-prefix filter silently drops whole suites (which is
+    // what made --fill-drain's old router panic / plateau).
+    let tmp = tempdir_marker("fillsubns");
+    let (db, run_id) = setup_fill_db(&tmp, "abc1234");
+    let conn = Connection::open(&db).unwrap();
+
+    let names = [
+        "native::FOO.bar",
+        "litebox::FOO.bar",
+        "native::vscode::extension_host_spawn",
+        "litebox::vscode::bootstrap",
+        "native::copilot::tui.simple_math",
+        "native::dropbear_bash.red_gate",
+    ];
+    let trials: Vec<_> = names.iter().map(|n| mk_trial(n)).collect();
+    let picked = dashboard_store::select_fill_batch_inner(
+        &conn,
+        run_id,
+        &trials,
+        dashboard_store::FillCap::Count(100),
+    );
+    for n in names {
+        assert!(
+            picked.contains(&n.to_string()),
+            "every never-run candidate should be picked (suite-agnostic): \
+             {n} missing from {picked:?}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

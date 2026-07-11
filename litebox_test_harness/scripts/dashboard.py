@@ -2337,7 +2337,13 @@ def _fmt_rc_regressions(s: dict[str, int]) -> str:
     if s["covered"] == 0:
         return "—"
     if s["hard"] == 0 and s["soft"] == 0:
-        return "clean"
+        # No regressions among the tests that RAN — but "no regressions"
+        # is only a *validation* verdict if the whole universe ran. A thin
+        # run (`not_run > 0`) reads as `partial`, never `clean`, so a
+        # passing subset can't be mistaken for a validated branch: the
+        # regressions that matter most hide in the tests the author never
+        # thought to run.
+        return "clean" if s["not_run"] == 0 else "partial"
     parts: list[str] = []
     if s["hard"]:
         conf = []
@@ -2504,9 +2510,13 @@ def _render_agent_worktrees(conn: sqlite3.Connection,
         "full retry budget with a rock-solid upstream history; `lo` = "
         "insufficient evidence. `inh` (inherited) = the baseline ref's "
         "current tip fails the same test, so the branch isn't the "
-        "cause. Fixed = baseline fail → branch pass. Coverage `c/u` is "
-        "litebox tests run / comparable universe; `not run` is the gap "
-        "(a partial run can't read as clean). Worktrees are "
+        "cause. Fixed = baseline fail → branch pass. The verdict is "
+        "coverage-aware: `clean` = no regressions **and** the whole "
+        "universe ran; `partial` = no regressions **yet** but `not run` "
+        "> 0, so a passing subset is **not** validated (the regressions "
+        "that matter most hide in the tests the author didn't predict). "
+        "Coverage `c/u` is litebox tests run / comparable universe; "
+        "`not run` is the gap. Worktrees are "
         "auto-discovered from `git worktree list`; the supervisor "
         "opportunistically tests only the tip-set (marker `→`). Full "
         "per-test detail: `dashboard.py regressions <branch>`._"
