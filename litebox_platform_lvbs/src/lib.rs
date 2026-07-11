@@ -23,7 +23,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_linux::vmap::{
-    GlobalVmapManager, PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions,
+    GlobalVmapManager, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions,
     PhysPointerError, VmapManager,
 };
 use x86_64::{
@@ -94,7 +94,7 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 //  0xFFFF_C000_0000_0000  ├─────────────────────────────────┤
 //                         │ Direct map region (64 TiB)      │
 //                         │ VA = PA + GVA_OFFSET            │
-//                         │ VTL0 memory mapped on demand    │
+//                         │ Currently unused                │
 //                         │                                 │
 //                         │  ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄ ┄    │
 //                         │  VTL1 PA range = unmapped gap   │
@@ -108,12 +108,13 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 //                         │ mmap / TA memory                │
 //  0x0000_0000_0001_0000  └─────────────────────────────────┘ ← USER_ADDR_MIN
 //
-// The 64 TiB direct map reservation ensures that any physical address
-// up to 64 TiB can be mapped via the simple PA + GVA_OFFSET formula
-// without colliding with the vmap region. A 1 TiB guard gap between
-// the direct map and the vmap region catches stray accesses.
-// VTL1 memory is never mapped in the direct map; it lives exclusively
-// in the VTL1 kernel region at KERNEL_OFFSET.
+// The 64 TiB direct map region is reserved for possible future use (e.g., device
+// drivers, persistent mapping). Foreign physical memory currently uses private
+// mappings in the vmap region instead. If direct mapping is restored, physical
+// addresses up to 64 TiB can use the PA + GVA_OFFSET formula without colliding
+// with vmap. A 1 TiB guard gap catches stray accesses. VTL1 memory must never
+// be mapped in the direct map; it lives exclusively in the VTL1 kernel region
+// at KERNEL_OFFSET.
 //
 // The VTL1 kernel region at the top of the address space maps the
 // entire VTL1 kernel via PA + KERNEL_OFFSET. A 1 TiB guard gap
@@ -1106,22 +1107,6 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 }
 
-/// Checks whether the given physical addresses are contiguous with respect to ALIGN.
-fn is_contiguous<const ALIGN: usize>(addrs: &[PhysPageAddr<ALIGN>]) -> bool {
-    for window in addrs.windows(2) {
-        let first = window[0].as_usize();
-        let second = window[1].as_usize();
-        if let Some(expected) = first.checked_add(ALIGN) {
-            if second != expected {
-                return false;
-            }
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
 unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
     type MapInfo = LvbsPhysPageMapInfo;
 
@@ -1162,7 +1147,8 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
 
         // Reject duplicates early as an API-level validation. The page-table implementation also
         // rejects duplicate/shared mappings, but this keeps the error local to the input array.
-        if !is_contiguous(pages) {
+        // A single page can never collide with itself, so skip the set allocation.
+        if pages.len() > 1 {
             let mut seen = hashbrown::HashSet::with_capacity(pages.len());
             for page in pages {
                 if !seen.insert(page.as_usize()) {
@@ -1177,79 +1163,54 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             flags |= PageTableFlags::WRITABLE;
         }
 
-        // `validate_unowned` rejects VTL1-owned PA before callers reach `vmap`, so these pages
-        // are foreign. Contiguous foreign PA uses the foreign direct-map VA range; non-contiguous
-        // foreign PA uses the vmap VA range. Neither range aliases VTL1-owned Rust memory.
-        if is_contiguous(pages) {
-            let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
-            let phys_end = x86_64::PhysAddr::new(
-                pages
-                    .last()
-                    .unwrap()
-                    .as_usize()
-                    .checked_add(ALIGN)
-                    .ok_or(PhysPointerError::Overflow)? as u64,
-            );
-            let frame_range = PhysFrame::range(
-                PhysFrame::<Size4KiB>::containing_address(phys_start),
-                PhysFrame::<Size4KiB>::containing_address(phys_end),
-            );
+        // Always allocate a fresh, private virtual address window for the mapping. This lets
+        // multiple cores map the same physical frame(s) concurrently at distinct VAs (used only for
+        // transient data copy in/out via raw pointers), so a core unmapping its window never
+        // disturbs another core's access to the same frame.
+        //
+        // `validate_unowned` rejects VTL1-owned PA before callers reach `vmap`, so these pages are
+        // foreign and the vmap VA range never aliases VTL1-owned Rust memory.
+        let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
+            .iter()
+            .map(|p| {
+                let address = p.as_usize();
+                x86_64::PhysAddr::try_new(address as u64)
+                    .map(PhysFrame::containing_address)
+                    .map_err(|_| PhysPointerError::InvalidPhysicalAddress(address))
+            })
+            .collect::<Result<_, _>>()?;
 
-            match self
-                .page_table_manager
-                .current_page_table()
-                .map_phys_frame_range_direct(frame_range, flags, None)
-            {
-                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(page_addr, pages.len() * ALIGN)),
-                Err(MapToError::PageAlreadyMapped(_)) => {
-                    Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
+        let base_va = vmap_allocator()
+            .allocate_va(frames.len())
+            .map_err(|e| match e {
+                crate::mm::vmap::VmapAllocError::VaSpaceExhausted => {
+                    PhysPointerError::VaSpaceExhausted
                 }
-                Err(MapToError::FrameAllocationFailed) => {
-                    Err(PhysPointerError::FrameAllocationFailed)
+                // `pages` was checked non-empty above and `frames` is built 1:1 from it, so the
+                // allocator cannot report an empty input here.
+                crate::mm::vmap::VmapAllocError::EmptyInput => {
+                    unreachable!("frames is derived 1:1 from a non-empty pages slice")
                 }
-                Err(MapToError::ParentEntryHugePage) => Err(
-                    PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
-                ),
-            }
-        } else {
-            let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
-                .iter()
-                .map(|p| PhysFrame::containing_address(x86_64::PhysAddr::new(p.as_usize() as u64)))
-                .collect();
+            })?;
 
-            let base_va = vmap_allocator()
-                .allocate_va_and_register_map(&frames)
-                .map_err(|e| match e {
-                    crate::mm::vmap::VmapAllocError::EmptyInput => {
-                        PhysPointerError::InvalidPhysicalAddress(0)
+        match self
+            .page_table_manager
+            .current_page_table()
+            .map_non_contiguous_phys_frames(&frames, base_va, flags)
+        {
+            Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(page_addr, pages.len() * ALIGN)),
+            Err(e) => {
+                vmap_allocator().free_va(base_va, frames.len());
+                match e {
+                    MapToError::PageAlreadyMapped(_) => {
+                        Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
                     }
-                    crate::mm::vmap::VmapAllocError::DuplicateMapping => {
-                        PhysPointerError::AlreadyMapped(pages[0].as_usize())
+                    MapToError::FrameAllocationFailed => {
+                        Err(PhysPointerError::FrameAllocationFailed)
                     }
-                    crate::mm::vmap::VmapAllocError::VaSpaceExhausted => {
-                        PhysPointerError::VaSpaceExhausted
-                    }
-                })?;
-
-            match self
-                .page_table_manager
-                .current_page_table()
-                .map_non_contiguous_phys_frames(&frames, base_va, flags)
-            {
-                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(page_addr, pages.len() * ALIGN)),
-                Err(e) => {
-                    let _ = vmap_allocator().unregister_allocation(base_va);
-                    match e {
-                        MapToError::PageAlreadyMapped(_) => {
-                            Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
-                        }
-                        MapToError::FrameAllocationFailed => {
-                            Err(PhysPointerError::FrameAllocationFailed)
-                        }
-                        MapToError::ParentEntryHugePage => Err(
-                            PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
-                        ),
-                    }
+                    MapToError::ParentEntryHugePage => Err(
+                        PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
+                    ),
                 }
             }
         }
@@ -1275,17 +1236,12 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         }
 
         // PTEs are already cleared at this point, so the mapping is functionally gone
-        // and a retry would only re-fail against empty page-table entries. If the VA
-        // allocator's bookkeeping is inconsistent, surface it via `debug_assert!`. The
-        // VA region is leaked but cannot be safely recycled.
-        let unregister_ok = !crate::mm::vmap::is_vmap_address(base_va)
-            || crate::mm::vmap::vmap_allocator()
-                .unregister_allocation(base_va)
-                .is_some();
-        debug_assert!(
-            unregister_ok,
-            "vmap allocator unregister failed at {base_va:?}",
-        );
+        // and a retry would only re-fail against empty page-table entries. Return the VA
+        // range to the allocator. `vmap_info` is consumed by value and never cloned, so this
+        // range is freed exactly once.
+        if crate::mm::vmap::is_vmap_address(base_va) {
+            crate::mm::vmap::vmap_allocator().free_va(base_va, size / ALIGN);
+        }
 
         Ok(())
     }
