@@ -172,12 +172,14 @@
         },
         {
             // Open both visualizers side by side (parallel dependsOn opens two
-            // dedicated terminal panels): the frontier tree + the scrolling
-            // trace. Run this after the server task is up.
+            // dedicated terminal panels): the scrolling trace + the frontier
+            // tree. The frontier is listed LAST so its panel is the one focused
+            // when the compound task finishes starting — no manual switch from
+            // the trace needed. Run this after the server task is up.
             "label": "LiteBox: Watch Sandbox (Tree + Trace)",
             "dependsOn": [
-                "LiteBox: Watch Sandbox Frontier",
-                "LiteBox: Watch Sandbox Trace"
+                "LiteBox: Watch Sandbox Trace",
+                "LiteBox: Watch Sandbox Frontier"
             ],
             "problemMatcher": []
         },
