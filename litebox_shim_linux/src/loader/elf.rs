@@ -25,6 +25,7 @@ use crate::{ShimFS, Task};
 struct ElfFile<'a, FS: ShimFS> {
     task: &'a Task<FS>,
     fd: i32,
+    load_high: bool,
 }
 
 impl<'a, FS: ShimFS> ElfFile<'a, FS> {
@@ -32,7 +33,11 @@ impl<'a, FS: ShimFS> ElfFile<'a, FS> {
         let fd = task
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
-        Ok(ElfFile { task, fd })
+        Ok(ElfFile {
+            task,
+            fd,
+            load_high: false,
+        })
     }
 }
 
@@ -75,10 +80,22 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        let hint = if self.load_high {
+            // Reserve the interpreter top-down by passing no hint: LiteBox's
+            // `get_unmmaped_area` then runs its top-down search and returns
+            // the highest free slot (see `litebox/src/mm/linux.rs`), which is
+            // where we want `ld.so` so the low ET_EXEC brk heap below stays
+            // uncapped. This needs no explicit `TASK_ADDR_MAX` arithmetic and
+            // no reserve-once bookkeeping, and it does not rely on any
+            // platform honoring an out-of-range hint.
+            0
+        } else {
+            super::DEFAULT_LOW_ADDR
+        };
         let mapping_ptr = self
             .task
             .sys_mmap(
-                super::DEFAULT_LOW_ADDR,
+                hint,
                 mapping_len,
                 litebox_common_linux::ProtFlags::PROT_NONE,
                 litebox_common_linux::MapFlags::MAP_ANONYMOUS
@@ -225,7 +242,11 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         // Parse the interpreter ELF file, if any.
         let interp = if let Some(interp_name) = main.parsed.interp(&mut &main.file)? {
             // e.g., /lib64/ld-linux-x86-64.so.2
-            Some(FileAndParsed::new(task, interp_name)?)
+            let mut interp = FileAndParsed::new(task, interp_name)?;
+            // Linux places the ET_EXEC interpreter high so brk can grow above
+            // the fixed-address main image without hitting ld.so.
+            interp.file.load_high = true;
+            Some(interp)
         } else {
             None
         };
@@ -315,5 +336,182 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
             }
             ElfLoaderError::LoadError(e) => e.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::vec::Vec;
+
+    use litebox::{
+        fs::{Mode, OFlags},
+        platform::PageManagementProvider,
+    };
+    use litebox_platform_multiplex::Platform;
+
+    use super::*;
+
+    const ELF_HEADER_SIZE: usize = 64;
+    const ELF_HEADER_SIZE_U16: u16 = 64;
+    const PROGRAM_HEADER_SIZE_U16: u16 = 56;
+    const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
+    const EM_X86_64: u16 = 62;
+    const PT_LOAD: u32 = 1;
+    const PT_INTERP: u32 = 3;
+    const PF_X: u32 = 1;
+    const PF_R: u32 = 4;
+    const EXEC_LOAD_ADDR: u64 = 0x400000;
+    const INTERP_PATH_OFFSET: usize = 0x200;
+    const INTERP_PATH: &[u8] = b"/ld.so\0";
+
+    #[derive(Clone, Copy)]
+    struct ProgramHeader {
+        typ: u32,
+        flags: u32,
+        offset: u64,
+        vaddr: u64,
+        filesz: u64,
+        memsz: u64,
+        align: u64,
+    }
+
+    fn push_u16(buf: &mut Vec<u8>, value: u16) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u64(buf: &mut Vec<u8>, value: u64) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn append_elf_header(buf: &mut Vec<u8>, elf_type: u16, entry: u64, phnum: u16) {
+        buf.extend_from_slice(b"\x7fELF");
+        buf.extend_from_slice(&[2, 1, 1, 0]);
+        buf.extend_from_slice(&[0; 8]);
+        push_u16(buf, elf_type);
+        push_u16(buf, EM_X86_64);
+        push_u32(buf, 1);
+        push_u64(buf, entry);
+        push_u64(buf, u64::from(ELF_HEADER_SIZE_U16));
+        push_u64(buf, 0);
+        push_u32(buf, 0);
+        push_u16(buf, ELF_HEADER_SIZE_U16);
+        push_u16(buf, PROGRAM_HEADER_SIZE_U16);
+        push_u16(buf, phnum);
+        push_u16(buf, 0);
+        push_u16(buf, 0);
+        push_u16(buf, 0);
+        assert_eq!(buf.len(), ELF_HEADER_SIZE);
+    }
+
+    fn append_program_header(buf: &mut Vec<u8>, ph: ProgramHeader) {
+        push_u32(buf, ph.typ);
+        push_u32(buf, ph.flags);
+        push_u64(buf, ph.offset);
+        push_u64(buf, ph.vaddr);
+        push_u64(buf, ph.vaddr);
+        push_u64(buf, ph.filesz);
+        push_u64(buf, ph.memsz);
+        push_u64(buf, ph.align);
+    }
+
+    fn minimal_elf(elf_type: u16, interp: Option<&[u8]>) -> Vec<u8> {
+        let phnum = if interp.is_some() { 2 } else { 1 };
+        let page_size = u64::try_from(PAGE_SIZE).expect("PAGE_SIZE fits u64");
+        let entry = if elf_type == ET_EXEC {
+            EXEC_LOAD_ADDR
+        } else {
+            0
+        };
+        let mut buf = Vec::new();
+        append_elf_header(&mut buf, elf_type, entry, phnum);
+        append_program_header(
+            &mut buf,
+            ProgramHeader {
+                typ: PT_LOAD,
+                flags: PF_R | PF_X,
+                offset: 0,
+                vaddr: if elf_type == ET_EXEC {
+                    EXEC_LOAD_ADDR
+                } else {
+                    0
+                },
+                filesz: page_size,
+                memsz: page_size,
+                align: page_size,
+            },
+        );
+        if let Some(interp) = interp {
+            append_program_header(
+                &mut buf,
+                ProgramHeader {
+                    typ: PT_INTERP,
+                    flags: PF_R,
+                    offset: u64::try_from(INTERP_PATH_OFFSET).expect("offset fits u64"),
+                    vaddr: 0,
+                    filesz: u64::try_from(interp.len()).expect("interpreter path length fits u64"),
+                    memsz: u64::try_from(interp.len()).expect("interpreter path length fits u64"),
+                    align: 1,
+                },
+            );
+        }
+        buf.resize(PAGE_SIZE, 0);
+        if let Some(interp) = interp {
+            buf[INTERP_PATH_OFFSET..INTERP_PATH_OFFSET + interp.len()].copy_from_slice(interp);
+        }
+        buf
+    }
+
+    fn write_file(task: &Task<crate::DefaultFS>, path: &str, data: &[u8]) {
+        let fd = task
+            .sys_open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("failed to create test ELF");
+        let fd = i32::try_from(fd).expect("fd fits i32");
+        task.sys_write(fd, data, None)
+            .expect("failed to write test ELF");
+        task.sys_close(fd).expect("failed to close test ELF");
+    }
+
+    #[test]
+    fn et_exec_interpreter_loads_top_down_above_low_heap() {
+        let task = crate::syscalls::tests::init_platform(None);
+        write_file(&task, "/main", &minimal_elf(ET_EXEC, Some(INTERP_PATH)));
+        write_file(&task, "/ld.so", &minimal_elf(ET_DYN, None));
+
+        let mut loader = ElfLoader::new(&task, "/main").expect("loader should parse test ELFs");
+        let main = loader
+            .main
+            .load_mapped(task.global.platform)
+            .expect("main should load");
+        assert_eq!(main.base_addr, 0);
+
+        let interp = loader
+            .interp
+            .as_mut()
+            .expect("test main should have PT_INTERP")
+            .load_mapped(task.global.platform)
+            .expect("interpreter should load");
+
+        // The interpreter must land high — via the top-down search — so the
+        // low ET_EXEC brk heap below it is not capped. The exact address is
+        // not asserted: `get_unmmaped_area` returns the highest free gap, and
+        // host mappings seeded into the userland VMA tree can sit near the top
+        // and push that gap below the very top slot (see `mm/linux.rs`). Assert
+        // the invariant that matters — placement in the high half of the
+        // address space, far above the low-heap region — not one exact slot.
+        let addr_max = <Platform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
+        assert!(
+            interp.base_addr >= addr_max / 2,
+            "ET_EXEC interpreter loaded at {:#x}, near the low-heap region {:#x} rather than top-down high (>= {:#x})",
+            interp.base_addr,
+            crate::loader::DEFAULT_LOW_ADDR,
+            addr_max / 2,
+        );
     }
 }
