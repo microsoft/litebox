@@ -420,10 +420,13 @@ fn build_docker_run_args_no_timeout_no_wrap() {
 // (e.g. retries cap removed, class 2 always re-runs, passing-at-
 // sha incorrectly re-selected).
 
-use libtest_mimic::Trial;
-
-fn mk_trial(name: &str) -> Trial {
-    Trial::test(name.to_string(), || Ok(()))
+fn mk_trial(name: &str) -> dashboard_store::FillCandidate {
+    // Fill candidates carry a suite; tests that don't exercise suite
+    // bucketing just use "fork".
+    dashboard_store::FillCandidate {
+        name: name.to_string(),
+        suite: "fork",
+    }
 }
 
 /// Set up a fresh dashboard sqlite at `tmp` with the canonical
@@ -504,47 +507,38 @@ fn select_fill_batch_class1_picks_uncovered() {
 }
 
 #[test]
-fn select_fill_batch_excludes_sub_namespaced_suites() {
-    // native::vscode::… / litebox::copilot::… share the native/litebox
-    // prefix but are NOT canonical <pass>::<id> matrix trials (they carry
-    // a second "::"). They must be excluded from the fill batch — else the
-    // --fill-drain name→run_pass_group router panics on an id the metadata
-    // registry doesn't know (regression guard for the fill-drain rc=101).
+fn select_fill_batch_is_suite_agnostic() {
+    // The selector no longer inspects the name shape — every provided
+    // candidate is fillable (the vscode/copilot/dropbear suites run their
+    // own closures now, not run_pass_group). Guards against a regression
+    // where a name-prefix filter silently drops whole suites (which is
+    // what made --fill-drain's old router panic / plateau).
     let tmp = tempdir_marker("fillsubns");
     let (db, run_id) = setup_fill_db(&tmp, "abc1234");
     let conn = Connection::open(&db).unwrap();
 
-    let trials = vec![
-        mk_trial("native::FOO.bar"),
-        mk_trial("litebox::FOO.bar"),
-        mk_trial("native::vscode::extension_host_spawn"),
-        mk_trial("litebox::vscode::bootstrap"),
-        mk_trial("native::copilot::tui.simple_math"),
-        mk_trial("host::fwd"),
-        mk_trial("dropbear_bash::red_gate"),
+    let names = [
+        "native::FOO.bar",
+        "litebox::FOO.bar",
+        "native::vscode::extension_host_spawn",
+        "litebox::vscode::bootstrap",
+        "native::copilot::tui.simple_math",
+        "native::dropbear_bash.red_gate",
     ];
+    let trials: Vec<_> = names.iter().map(|n| mk_trial(n)).collect();
     let picked = dashboard_store::select_fill_batch_inner(
         &conn,
         run_id,
         &trials,
         dashboard_store::FillCap::Count(100),
     );
-    assert_eq!(
-        picked
-            .iter()
-            .filter(|n| n.contains("vscode")
-                || n.contains("copilot")
-                || n.starts_with("host::")
-                || n.starts_with("dropbear_bash::"))
-            .count(),
-        0,
-        "sub-namespaced / non-matrix suites must be excluded: {picked:?}"
-    );
-    assert!(
-        picked.contains(&"native::FOO.bar".to_string())
-            && picked.contains(&"litebox::FOO.bar".to_string()),
-        "canonical matrix trials must still be picked: {picked:?}"
-    );
+    for n in names {
+        assert!(
+            picked.contains(&n.to_string()),
+            "every never-run candidate should be picked (suite-agnostic): \
+             {n} missing from {picked:?}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
