@@ -5674,25 +5674,29 @@ mod vscode {
         spec
     }
 
-    /// In-container probe: attempt a loopback TCP connect to a denied port
-    /// (`:19`, not in the allowlist) and an allowed port (`:9`, allowlisted).
-    /// Both ports are closed, so a *permitted* connect merely fails to
-    /// establish (refused / invalid); only a *policy-blocked* connect yields
-    /// `EPERM` ("Operation not permitted"). We classify purely on that, which
-    /// is robust to the exact errno a permitted-but-failed connect returns.
+    /// In-container probe: attempt a TCP connect to a denied non-loopback
+    /// address (`192.0.2.19:19`, not in the allowlist) and an allowed one
+    /// (`192.0.2.9:9`, allowlisted). Non-loopback is deliberate — `check_connect`
+    /// exempts loopback (`127.0.0.0/8`/`::1` is intra-sandbox, not egress, and
+    /// VS Code Remote-SSH depends on it), so a loopback probe can never be
+    /// policy-blocked. The addresses are RFC 5737 TEST-NET-1 (guaranteed
+    /// unrouted), so a *permitted* connect merely fails to establish
+    /// (unreachable / timeout); only a *policy-blocked* connect yields `EPERM`
+    /// ("Operation not permitted"). We classify purely on that, which is robust
+    /// to the exact errno a permitted-but-failed connect returns.
     fn build_network_policy_probe_cmd() -> String {
         "set +e; \
          classify() { \
-            msg=$(timeout 5 bash -c \"exec 3<>/dev/tcp/127.0.0.1/$1\" 2>&1); \
-            echo \"PROBE port=$1 msg=[$msg]\" >&2; \
+            msg=$(timeout 5 bash -c \"exec 3<>/dev/tcp/$1/$2\" 2>&1); \
+            echo \"PROBE addr=$1:$2 msg=[$msg]\" >&2; \
             if printf '%s' \"$msg\" | grep -qi 'not permitted'; then \
                 echo BLOCKED; \
             else \
                 echo PERMITTED; \
             fi; \
          }; \
-         echo \"DENY_VERDICT=$(classify 19)\"; \
-         echo \"ALLOW_VERDICT=$(classify 9)\""
+         echo \"DENY_VERDICT=$(classify 192.0.2.19 19)\"; \
+         echo \"ALLOW_VERDICT=$(classify 192.0.2.9 9)\""
             .to_string()
     }
 
@@ -5704,11 +5708,11 @@ mod vscode {
     }
 
     /// `sandbox`/policy enforcement end-to-end. Runs the sandboxed SSH server
-    /// under a deny-all-except-`127.0.0.1:9` policy, then from inside the
-    /// sandbox (over SSH) probes a denied and an allowed loopback port:
+    /// under a deny-all-except-`192.0.2.9:9` policy, then from inside the
+    /// sandbox (over SSH) probes a denied and an allowed non-loopback address:
     ///
-    /// - **litebox**: the denied port is blocked (`EPERM`) and the allowed
-    ///   port is permitted — the sandbox is enforcing.
+    /// - **litebox**: the denied address is blocked (`EPERM`) and the allowed
+    ///   address is permitted — the sandbox is enforcing egress policy.
     /// - **native**: no sandbox, so both connects are simply permitted. This
     ///   is the control that proves the litebox `EPERM` is policy, not the
     ///   environment.
@@ -5717,7 +5721,7 @@ mod vscode {
         let fixture_dir = prep_fixture_dir(pass, "network_policy").map_err(Failed::from)?;
         std::fs::write(
             fixture_dir.join("policy.json"),
-            r#"{"network":{"deny_all":true,"allow_connect":["127.0.0.1:9"]}}"#,
+            r#"{"network":{"deny_all":true,"allow_connect":["192.0.2.9:9"]}}"#,
         )
         .map_err(|e| Failed::from(format!("write policy.json: {e}")))?;
         ensure_vscode_image(&super::workspace_root());
