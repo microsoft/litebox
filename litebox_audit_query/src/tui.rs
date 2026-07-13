@@ -5,8 +5,9 @@
 //!
 //! Renders the [`Frontier`] as a collapsible tree the user navigates with the
 //! arrow keys, while continuing to fold new audit events in live. Collapsed by
-//! default: each node shows a `(N✓ M✗)` allow/deny leaf count so the shape is
-//! visible without expanding.
+//! default: each node shows a `(N✓ M✗)` allow/deny path count — with a `×N`
+//! attempt tally when a resource was hit more than once — so the shape and the
+//! hot spots are visible without expanding.
 //!
 //! Keys: `↑`/`↓` (or `k`/`j`) move · `→`/`Enter`/`Space` expand · `←` collapse ·
 //! `PgUp`/`PgDn` page · `Home`/`End` jump · `q`/`Esc`/`Ctrl-C` quit.
@@ -22,7 +23,7 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 
-use crate::tree::{BOLD, DIM, Frontier, RESET, Row, status_color};
+use crate::tree::{BOLD, DIM, Frontier, RESET, Row, format_counts, status_color};
 
 /// How long to block waiting for a keypress before folding in new log data.
 const POLL: Duration = Duration::from_millis(120);
@@ -225,10 +226,18 @@ fn format_row(row: &Row, selected: bool, cols: usize) -> String {
     } else {
         "  "
     };
-    let counts = if row.allow_count + row.deny_count > 0 {
-        format!("  ({}\u{2713} {}\u{2717})", row.allow_count, row.deny_count)
-    } else {
-        String::new()
+    let counts = {
+        let c = format_counts(
+            row.allow_count,
+            row.deny_count,
+            row.allow_hits,
+            row.deny_hits,
+        );
+        if c.is_empty() {
+            String::new()
+        } else {
+            format!("  {c}")
+        }
     };
     let action = if row.action.is_empty() {
         String::new()
