@@ -168,6 +168,7 @@ impl Task {
     ) -> Result<(), TeeResult> {
         let tee_cryp_state_map = &self.tee_cryp_state_map;
         if dst_slice.len() < src_slice.len() {
+            *dst_len = src_slice.len();
             return Err(TeeResult::ShortBuffer);
         }
         if let Some(mut map) = tee_cryp_state_map.get_mut(state) {
