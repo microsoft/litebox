@@ -33,14 +33,16 @@ struct Node {
     allowed: bool,
     denied: bool,
     terminal: bool,
-    /// Whether *this exact path* (not a descendant) was itself allowed/denied,
-    /// and with which action verbs. Distinct from `allowed`/`denied`, which
-    /// aggregate over the whole subtree for colouring. This is what lets the
-    /// tree surface a decision made *on an internal node's own path* (e.g. a
-    /// denied `mkdir /root` on a `root` node that also has allowed children) as
-    /// a `(self)` row, instead of an orphaned count that no child accounts for.
-    self_allowed: bool,
-    self_denied: bool,
+    /// How many times *this exact path* (not a descendant) was itself
+    /// allowed/denied — an attempt tally, not a boolean — and with which action
+    /// verbs. Distinct from `allowed`/`denied`, which aggregate over the whole
+    /// subtree for colouring. The tally lets the tree surface both a decision
+    /// made *on an internal node's own path* (e.g. a denied `mkdir /root` on a
+    /// `root` node that also has allowed children) as a `(self)` row, and *how
+    /// often* a resource was hit, so a repeatedly blocked endpoint shows its
+    /// true volume rather than a flat 1.
+    self_allow_hits: u64,
+    self_deny_hits: u64,
     allow_actions: BTreeSet<String>,
     deny_actions: BTreeSet<String>,
     /// Interactive-TUI expand state (ignored by the static `render`).
@@ -58,12 +60,12 @@ impl Node {
             None => {
                 self.terminal = true;
                 if allowed {
-                    self.self_allowed = true;
+                    self.self_allow_hits += 1;
                     if !action.is_empty() {
                         self.allow_actions.insert(action.to_string());
                     }
                 } else {
-                    self.self_denied = true;
+                    self.self_deny_hits += 1;
                     if !action.is_empty() {
                         self.deny_actions.insert(action.to_string());
                     }
@@ -82,10 +84,25 @@ impl Node {
     /// denied but has allowed descendants contributes exactly one denial (its
     /// own), never a phantom allow.
     fn leaf_counts(&self) -> (u32, u32) {
-        let mut a = u32::from(self.self_allowed);
-        let mut d = u32::from(self.self_denied);
+        let mut a = u32::from(self.self_allow_hits > 0);
+        let mut d = u32::from(self.self_deny_hits > 0);
         for child in self.children.values() {
             let (ca, cd) = child.leaf_counts();
+            a += ca;
+            d += cd;
+        }
+        (a, d)
+    }
+
+    /// Count of (allowed, denied) *attempts* — audit events — in this subtree,
+    /// summing each node's own tally. Where [`Node::leaf_counts`] answers "how
+    /// many distinct paths", this answers "how many times", so a resource the
+    /// agent bounced off repeatedly surfaces its true attempt volume.
+    fn hit_counts(&self) -> (u64, u64) {
+        let mut a = self.self_allow_hits;
+        let mut d = self.self_deny_hits;
+        for child in self.children.values() {
+            let (ca, cd) = child.hit_counts();
             a += ca;
             d += cd;
         }
@@ -125,6 +142,11 @@ pub struct Row {
     pub expanded: bool,
     pub allow_count: u32,
     pub deny_count: u32,
+    /// Total allow/deny *attempts* (audit events) aggregated over this
+    /// subtree — the sister of `allow_count`/`deny_count`, which count distinct
+    /// paths. Lets the view show `×N` when a resource was hit more than once.
+    pub allow_hits: u64,
+    pub deny_hits: u64,
     pub is_section: bool,
     /// A synthetic row for a node's *own* path decision (see `collect_rows`).
     pub is_self: bool,
@@ -171,6 +193,7 @@ impl Frontier {
             ("fs", &self.fs, self.fs_expanded, "Filesystem"),
         ] {
             let (a, d) = root.leaf_counts();
+            let (ah, dh) = root.hit_counts();
             rows.push(Row {
                 depth: 0,
                 label: title.to_string(),
@@ -180,6 +203,8 @@ impl Frontier {
                 expanded,
                 allow_count: a,
                 deny_count: d,
+                allow_hits: ah,
+                deny_hits: dh,
                 is_section: true,
                 is_self: false,
                 action: String::new(),
@@ -295,7 +320,10 @@ impl Frontier {
         out.push_str(&self.color(RED, "denied"));
         out.push_str("  ");
         out.push_str(&self.color(YELLOW, "mixed"));
-        out.push_str(&self.color(DIM, "   (denied = agent was blocked)"));
+        out.push_str(&self.color(
+            DIM,
+            "   (denied = agent was blocked; N\u{2713}/N\u{2717} = paths, \u{00d7}N = attempts)",
+        ));
         out.push('\n');
         out.push('\n');
 
@@ -329,6 +357,13 @@ impl Frontier {
             out.push_str(prefix);
             out.push_str(&self.color(DIM, branch));
             out.push_str(&self.color(code, label));
+            let (ap, dp) = child.leaf_counts();
+            let (ah, dh) = child.hit_counts();
+            let counts = format_counts(ap, dp, ah, dh);
+            if !counts.is_empty() {
+                out.push(' ');
+                out.push_str(&self.color(DIM, &counts));
+            }
             out.push('\n');
             let child_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
             self.render_children(child, &child_prefix, out);
@@ -345,6 +380,35 @@ pub(crate) fn status_color(allowed: bool, denied: bool) -> &'static str {
     }
 }
 
+/// Format the `(paths … attempts)` count shown next to a tree node:
+/// `(<ap>✓ <dp>✗)`, with a `×<hits>` suffix on either side only when that side
+/// was hit more often than it has distinct paths — so a resource the agent
+/// retried (a repeatedly blocked address, a hot allowed file) surfaces its
+/// attempt volume while single-hit leaves stay uncluttered. Empty when nothing
+/// was recorded at or under the node. Shared by the interactive TUI and the
+/// static tree so both read identically.
+pub(crate) fn format_counts(
+    allow_paths: u32,
+    deny_paths: u32,
+    allow_hits: u64,
+    deny_hits: u64,
+) -> String {
+    if allow_paths == 0 && deny_paths == 0 {
+        return String::new();
+    }
+    let allow = if allow_hits > u64::from(allow_paths) {
+        format!("{allow_paths}\u{2713}\u{00d7}{allow_hits}")
+    } else {
+        format!("{allow_paths}\u{2713}")
+    };
+    let deny = if deny_hits > u64::from(deny_paths) {
+        format!("{deny_paths}\u{2717}\u{00d7}{deny_hits}")
+    } else {
+        format!("{deny_paths}\u{2717}")
+    };
+    format!("({allow} {deny})")
+}
+
 /// Walk `node`'s children (descending only into expanded ones), appending a
 /// [`Row`] per visible node. `prefix` is the section-rooted path so far.
 fn collect_rows(node: &Node, prefix: &[String], depth: usize, rows: &mut Vec<Row>) {
@@ -352,6 +416,7 @@ fn collect_rows(node: &Node, prefix: &[String], depth: usize, rows: &mut Vec<Row
         let mut path = prefix.to_vec();
         path.push(label.clone());
         let (a, d) = child.leaf_counts();
+        let (ah, dh) = child.hit_counts();
         let expandable = !child.children.is_empty();
         rows.push(Row {
             depth,
@@ -362,6 +427,8 @@ fn collect_rows(node: &Node, prefix: &[String], depth: usize, rows: &mut Vec<Row
             expanded: child.expanded,
             allow_count: a,
             deny_count: d,
+            allow_hits: ah,
+            deny_hits: dh,
             is_section: false,
             is_self: false,
             // Leaves show their own verbs inline; interior nodes defer to a
@@ -378,18 +445,20 @@ fn collect_rows(node: &Node, prefix: &[String], depth: usize, rows: &mut Vec<Row
             // /root` denied while its children were allowed), surface that
             // decision as a `(self)` row so its aggregate count reconciles
             // when you drill in — otherwise the ✗ looks orphaned.
-            if child.self_allowed || child.self_denied {
+            if child.self_allow_hits > 0 || child.self_deny_hits > 0 {
                 let mut self_path = path.clone();
                 self_path.push("\u{0}(self)".to_string());
                 rows.push(Row {
                     depth: depth + 1,
                     label: "(self)".to_string(),
-                    allowed: child.self_allowed,
-                    denied: child.self_denied,
+                    allowed: child.self_allow_hits > 0,
+                    denied: child.self_deny_hits > 0,
                     expandable: false,
                     expanded: false,
-                    allow_count: u32::from(child.self_allowed),
-                    deny_count: u32::from(child.self_denied),
+                    allow_count: u32::from(child.self_allow_hits > 0),
+                    deny_count: u32::from(child.self_deny_hits > 0),
+                    allow_hits: child.self_allow_hits,
+                    deny_hits: child.self_deny_hits,
                     is_section: false,
                     is_self: true,
                     action: child.self_action_summary(),
@@ -502,5 +571,69 @@ mod tests {
         assert!(!f.ingest(&ev(
             r#"{"event":"dns_resolved","hostname":"x.com","ips":[]}"#
         )));
+    }
+
+    #[test]
+    fn repeat_attempts_counted_and_aggregated() {
+        let mut f = Frontier::new(false);
+        // Same blocked endpoint hit three times, plus a different blocked host.
+        for _ in 0..3 {
+            f.ingest(&ev(
+                r#"{"event":"tcp_denied","ip":"169.254.169.254","port":80}"#,
+            ));
+        }
+        f.ingest(&ev(
+            r#"{"event":"tcp_denied","hostname":"evil.example.com","ip":"9.9.9.9","port":443}"#,
+        ));
+        // Distinct denied paths under Network = 2 (the IP leaf + evil.…:443),
+        // but the *attempt* total is 4 (3 on the IP, 1 on the host).
+        assert_eq!(f.net.leaf_counts(), (0, 2));
+        assert_eq!(f.net.hit_counts(), (0, 4));
+        // The IP's own leaf carries all three of its attempts, not a flat 1.
+        let ip = &f.net.children["169.254.169.254"].children[":80"];
+        assert_eq!(ip.self_deny_hits, 3);
+    }
+
+    #[test]
+    fn format_counts_shows_attempts_only_when_repeated() {
+        // Single hit: attempts == paths, so no ×N suffix.
+        assert_eq!(format_counts(0, 1, 0, 1), "(0\u{2713} 1\u{2717})");
+        // Repeated denial: ×N appears on the deny side, making it pop.
+        assert_eq!(
+            format_counts(0, 1, 0, 47),
+            "(0\u{2713} 1\u{2717}\u{00d7}47)"
+        );
+        // Repeated allow: ×N on the allow side.
+        assert_eq!(
+            format_counts(2, 0, 12, 0),
+            "(2\u{2713}\u{00d7}12 0\u{2717})"
+        );
+        // Nothing recorded here: empty string.
+        assert_eq!(format_counts(0, 0, 0, 0), "");
+    }
+
+    #[test]
+    fn rows_carry_attempt_counts() {
+        let mut f = Frontier::new(false);
+        for _ in 0..5 {
+            f.ingest(&ev(
+                r#"{"event":"fs_denied","path":"/etc/shadow","action":"open"}"#,
+            ));
+        }
+        f.set_expanded(&["fs".to_string(), "etc".to_string()], true);
+        let rows = f.visible_rows();
+        // The leaf shows one distinct denied path but five attempts.
+        let shadow = rows
+            .iter()
+            .find(|r| r.label == "shadow")
+            .expect("shadow row");
+        assert_eq!((shadow.allow_count, shadow.deny_count), (0, 1));
+        assert_eq!((shadow.allow_hits, shadow.deny_hits), (0, 5));
+        // The Filesystem section aggregates the same five attempts.
+        let section = rows
+            .iter()
+            .find(|r| r.label == "Filesystem")
+            .expect("fs section");
+        assert_eq!(section.deny_hits, 5);
     }
 }
