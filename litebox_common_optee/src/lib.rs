@@ -726,6 +726,11 @@ bitflags::bitflags! {
     }
 }
 
+/// Default flags for a single-instance, multi-session, keep-alive pseudo-TA.
+pub const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
+    .union(TaFlags::MULTI_SESSION)
+    .union(TaFlags::INSTANCE_KEEP_ALIVE);
+
 impl TaFlags {
     /// Returns true if this TA should only have one instance.
     pub fn is_single_instance(&self) -> bool {

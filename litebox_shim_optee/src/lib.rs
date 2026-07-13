@@ -36,7 +36,6 @@ pub(crate) mod syscalls;
 
 pub mod msg_handler;
 
-#[cfg(feature = "platform_lvbs")]
 pub mod idk;
 
 // Re-export session management types for convenience
@@ -262,6 +261,8 @@ impl OpteeShim {
                 global: self.0.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: ta_uuid,
+                // TODO: Populate this from trusted TA version metadata when available.
+                ta_svn: 0,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
@@ -1387,6 +1388,8 @@ struct Task {
     thread: ThreadState,
     /// TA UUID
     ta_app_id: TeeUuid,
+    /// TA security version number
+    ta_svn: u32,
     /// TEE cryptography state map
     tee_cryp_state_map: TeeCrypStateMap,
     /// TEE object map
@@ -1563,6 +1566,7 @@ mod test_utils {
                 global: self.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: TeeUuid::default(),
+                ta_svn: 0,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),

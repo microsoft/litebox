@@ -27,6 +27,7 @@ p384 = { version = "0.13.1", default-features = false, features = ["arithmetic",
 
 [features]
 default = ["platform_lvbs"]
+idks-production = []
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland_with_optee_syscall"]
 platform_lvbs = ["litebox_platform_multiplex/platform_lvbs_with_optee_syscall"]
 

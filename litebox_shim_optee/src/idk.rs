@@ -1,11 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::NormalWorldMutPtr;
-use litebox::{mm::linux::PAGE_SIZE, platform::CrngProvider, utils::TruncateExt};
+use crate::{NormalWorldMutPtr, Task, UserConstPtr, UserMutPtr, syscalls::Cleanup};
+use alloc::vec::Vec;
+use litebox::{
+    mm::linux::PAGE_SIZE,
+    platform::{CrngProvider, RawConstPointer as _, RawMutPointer as _},
+    utils::TruncateExt,
+};
 use litebox_common_linux::errno::Errno;
+use litebox_common_optee::{
+    PTA_DEFAULT_FLAGS, TaFlags, TeeParamType, TeeResult, TeeUuid, UteeParams,
+};
 use num_enum::TryFromPrimitive;
-use p384::{NonZeroScalar, elliptic_curve::sec1::ToEncodedPoint};
+use p384::{
+    NonZeroScalar,
+    ecdsa::{Signature, SigningKey, signature::Signer},
+    elliptic_curve::sec1::ToEncodedPoint,
+};
 use spin::Once;
 use zeroize::Zeroizing;
 
@@ -15,11 +27,148 @@ const KEY_ALGORITHM_MASK: u64 = 0xff00;
 const KEY_VARIANT_MASK: u64 = 0xff;
 const KEY_ALGORITHM_VALUE_MASK: u64 = KEY_ALGORITHM_MASK | KEY_VARIANT_MASK;
 const MAX_KEYGEN_ATTEMPT: usize = 256;
+const IDKS_ENDORSEMENT_DATA_MAX_SIZE: usize = 8 * 1024 * 1024;
+const IDKS_ENDORSEMENT_MAGIC: &[u8; 4] = b"IDKS";
+const IDKS_ENDORSEMENT_VERSION: u32 = 1;
+#[cfg(not(feature = "idks-production"))]
+const IDKS_DEBUG_FLAG: u8 = 1;
+#[cfg(feature = "idks-production")]
+const IDKS_DEBUG_FLAG: u8 = 0;
+const ISOLATION_SOLUTION: &[u8] = b"LVBS";
+pub(crate) const IDKS_ENDORSEMENT_SIGNATURE_LEN: usize = 96;
+const IDKS_ENDORSEMENT_METADATA_LEN: usize = IDKS_ENDORSEMENT_MAGIC.len()
+    + size_of::<u32>()
+    + size_of::<TeeUuid>()
+    + size_of::<u32>()
+    + size_of::<u8>()
+    + ISOLATION_SOLUTION.len();
+pub(crate) struct IdksPta;
+
+#[derive(Clone, Copy, TryFromPrimitive)]
+#[repr(u32)]
+pub(crate) enum IdksCommandId {
+    EndorseData = 0,
+}
+
+impl IdksPta {
+    pub(crate) const FLAGS: TaFlags = PTA_DEFAULT_FLAGS.union(TaFlags::CONCURRENT);
+    pub(crate) const UUID: TeeUuid = TeeUuid {
+        time_low: 0xfd79_8211,
+        time_mid: 0x38a3,
+        time_hi_and_version: 0x474a,
+        clock_seq_and_node: [0xab, 0x6c, 0x75, 0x61, 0x0d, 0x45, 0x35, 0x93],
+    };
+
+    pub(crate) fn open_session(params: &UteeParams) -> Result<u32, TeeResult> {
+        crate::syscalls::pta::open_default_pta_session(params)
+    }
+
+    pub(crate) fn close_session(_task: &Task, _session_id: u32) {}
+
+    pub(crate) fn invoke_command(
+        task: &Task,
+        cmd_id: u32,
+        params: &mut UteeParams,
+    ) -> Result<Cleanup, TeeResult> {
+        match IdksCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
+            IdksCommandId::EndorseData => Self::endorse_data(task, params).map(|()| Cleanup::None),
+        }
+    }
+
+    fn endorse_data(task: &Task, params: &mut UteeParams) -> Result<(), TeeResult> {
+        use TeeParamType::{MemrefInput, MemrefOutput, None};
+
+        if !params.has_types([MemrefInput, MemrefOutput, None, None]) {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let (ta_data_addr, ta_data_size) = params
+            .get_values(0)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let ta_data_size = usize::try_from(ta_data_size).map_err(|_| TeeResult::BadParameters)?;
+        if ta_data_size > IDKS_ENDORSEMENT_DATA_MAX_SIZE {
+            return Err(TeeResult::BadParameters);
+        }
+        if ta_data_size > 0 && ta_data_addr == 0 {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let (endorsement_addr, endorsement_size) = params
+            .get_values(1)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let required_endorsement_size = ta_data_size
+            .checked_add(IDKS_ENDORSEMENT_METADATA_LEN)
+            .and_then(|size| size.checked_add(IDKS_ENDORSEMENT_SIGNATURE_LEN))
+            .ok_or(TeeResult::BadParameters)?;
+        let required_endorsement_size_u64 =
+            u64::try_from(required_endorsement_size).map_err(|_| TeeResult::BadParameters)?;
+        if endorsement_size < required_endorsement_size_u64 {
+            params
+                .set_values(1, endorsement_addr, required_endorsement_size_u64)
+                .map_err(|_| TeeResult::BadParameters)?;
+            return Err(TeeResult::ShortBuffer);
+        }
+        if endorsement_addr == 0 {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let ta_data = if ta_data_size == 0 {
+            Vec::new().into_boxed_slice()
+        } else {
+            UserConstPtr::<u8>::from_usize(
+                usize::try_from(ta_data_addr).map_err(|_| TeeResult::BadParameters)?,
+            )
+            .to_owned_slice(ta_data_size)
+            .ok_or(TeeResult::BadParameters)?
+        };
+        let mut endorsement = build_endorsement_data(&ta_data, &task.ta_app_id, task.ta_svn)
+            .ok_or(TeeResult::BadParameters)?;
+        let key_pair = get_identity_signing_key_pair().map_err(|_| TeeResult::GenericError)?;
+        let signature =
+            endorse_data_with(&endorsement, &key_pair.private_key)
+                .map_err(|_| TeeResult::GenericError)?;
+        endorsement.extend_from_slice(&signature);
+        UserMutPtr::<u8>::from_usize(
+            usize::try_from(endorsement_addr).map_err(|_| TeeResult::BadParameters)?,
+        )
+        .copy_from_slice(0, &endorsement)
+        .ok_or(TeeResult::AccessDenied)?;
+        params
+            .set_values(1, endorsement_addr, required_endorsement_size_u64)
+            .map_err(|_| TeeResult::BadParameters)
+    }
+}
+
+fn build_endorsement_data(ta_data: &[u8], ta_uuid: &TeeUuid, ta_svn: u32) -> Option<Vec<u8>> {
+    // MAGIC || VERSION || TA_DATA || TA_UUID || TA_SVN || DEBUG || ISOLATION_SOLUTION
+    let capacity = ta_data.len().checked_add(IDKS_ENDORSEMENT_METADATA_LEN)?;
+    let mut endorsement = Vec::with_capacity(capacity);
+    endorsement.extend_from_slice(IDKS_ENDORSEMENT_MAGIC);
+    endorsement.extend_from_slice(&IDKS_ENDORSEMENT_VERSION.to_le_bytes());
+    endorsement.extend_from_slice(ta_data);
+    endorsement.extend_from_slice(&ta_uuid.to_le_bytes());
+    endorsement.extend_from_slice(&ta_svn.to_le_bytes());
+    endorsement.push(IDKS_DEBUG_FLAG);
+    endorsement.extend_from_slice(ISOLATION_SOLUTION);
+    Some(endorsement)
+}
+
+fn endorse_data_with(
+    endorsement_data: &[u8],
+    private_key: &[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN],
+) -> Result<[u8; IDKS_ENDORSEMENT_SIGNATURE_LEN], Errno> {
+    let signing_key = SigningKey::from_slice(private_key).map_err(|_| Errno::EINVAL)?;
+    let signature: Signature = signing_key.sign(endorsement_data);
+    let mut signature_bytes = [0u8; IDKS_ENDORSEMENT_SIGNATURE_LEN];
+    signature_bytes.copy_from_slice(&signature.to_bytes());
+    Ok(signature_bytes)
+}
 
 static IDENTITY_SIGNING_KEY_PAIR: Once<IdentitySigningKeyPair> = Once::new();
 
 struct IdentitySigningKeyPair {
-    #[allow(dead_code, reason = "retained for future IDK_S signing operations")]
     private_key: Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]>,
     public_key: [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN],
 }
@@ -150,24 +299,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_signing_private_key_signs_and_verifies_message() {
-        use crate::syscalls::tests::init_platform;
-        use p384::ecdsa::{
-            Signature, SigningKey, VerifyingKey,
-            signature::{Signer, Verifier},
+    fn endorsement_signature_covers_plaintext_layout() {
+        use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+
+        let mut private_key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
+        private_key[IDENTITY_SIGNING_PRIVATE_KEY_LEN - 1] = 1;
+        let ta_data = b"TA public key";
+        let ta_uuid = TeeUuid {
+            time_low: 0x1122_3344,
+            time_mid: 0x5566,
+            time_hi_and_version: 0x7788,
+            clock_seq_and_node: [0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00],
         };
 
-        let message = b"IDK_S signing test message";
+        let ta_svn = 7u32;
+        let expected_plaintext = build_endorsement_data(ta_data, &ta_uuid, ta_svn).unwrap();
 
-        let _task = init_platform();
-        let private_key = generate_identity_signing_private_key().unwrap();
-        assert!(is_valid_identity_signing_private_key(&private_key));
-        let signing_key = SigningKey::from_slice(&private_key[..]).unwrap();
+        let signature = endorse_data_with(&expected_plaintext, &private_key).unwrap();
         let public_key = identity_signing_public_key_from_private_key(&private_key).unwrap();
         let verifying_key = VerifyingKey::from_sec1_bytes(&public_key).unwrap();
+        let signature = Signature::from_slice(&signature).unwrap();
 
-        let signature: Signature = signing_key.sign(message);
+        verifying_key
+            .verify(&expected_plaintext, &signature)
+            .unwrap();
+        let other_uuid = TeeUuid {
+            time_low: ta_uuid.time_low.wrapping_add(1),
+            ..ta_uuid
+        };
+        let mut other_plaintext = Vec::from(ta_data.as_slice());
+        other_plaintext.extend_from_slice(&other_uuid.to_le_bytes());
+        other_plaintext.extend_from_slice(&ta_svn.to_le_bytes());
+        other_plaintext.extend_from_slice(ISOLATION_SOLUTION);
 
-        verifying_key.verify(message, &signature).unwrap();
+        assert!(verifying_key.verify(&other_plaintext, &signature).is_err());
     }
 }
