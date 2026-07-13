@@ -1588,6 +1588,62 @@ class ReconcileRunnersTests(unittest.TestCase):
         self.assertEqual(sorted(d), ["gone", "moved"])
 
 
+class WatchdogStuckPlanTests(unittest.TestCase):
+    """Pure remediation decision for an UP-but-stuck supervisor. Cooldown-
+    and dedup-guarded so the durable 3-min systemd timer can never turn a
+    persistent failure into a restart storm."""
+
+    NOW = 1_000_000_000_000
+
+    def test_healthy_no_restart(self):
+        p = dashboard._wd_stuck_plan(0, [], {}, self.NOW)
+        self.assertFalse(p["restart"])
+        self.assertEqual(p["stale"], [])
+
+    def test_build_failing_restarts_and_fixes_docker(self):
+        p = dashboard._wd_stuck_plan(
+            dashboard._WD_INFRA_FAIL_ALARM + 1, [], {}, self.NOW)
+        self.assertTrue(p["restart"])
+        self.assertTrue(p["fix_docker"])
+        self.assertIn("BUILD_FAILING", p["reason"])
+
+    def test_build_failing_respects_cooldown(self):
+        st = {"last_remediation_ms": self.NOW - 1}  # remediated a moment ago
+        p = dashboard._wd_stuck_plan(
+            dashboard._WD_INFRA_FAIL_ALARM + 5, [], st, self.NOW)
+        self.assertFalse(p["restart"])
+        self.assertIn("cooldown", p["reason"])
+
+    def test_new_park_restarts_and_marks(self):
+        p = dashboard._wd_stuck_plan(
+            0, [("wportnoy/x", "sha1")], {}, self.NOW)
+        self.assertTrue(p["restart"])
+        self.assertFalse(p["fix_docker"])   # a park is not a docker issue
+        self.assertIn("COVERAGE_GAP", p["reason"])
+        self.assertEqual(p["mark"], [("wportnoy/x", "sha1")])
+
+    def test_already_remediated_park_is_stale_no_restart(self):
+        st = {"remediated_parks": {"wportnoy/x": "sha1"}}
+        p = dashboard._wd_stuck_plan(0, [("wportnoy/x", "sha1")], st, self.NOW)
+        self.assertFalse(p["restart"])   # genuine build failure — don't loop
+        self.assertEqual(p["stale"], [("wportnoy/x", "sha1")])
+        self.assertEqual(p["mark"], [])
+
+    def test_park_at_new_sha_is_fresh(self):
+        # A new commit (sha move) earns a fresh remediation attempt.
+        st = {"remediated_parks": {"wportnoy/x": "OLDsha"}}
+        p = dashboard._wd_stuck_plan(0, [("wportnoy/x", "sha2")], st, self.NOW)
+        self.assertTrue(p["restart"])
+        self.assertEqual(p["mark"], [("wportnoy/x", "sha2")])
+
+    def test_build_failing_precedes_coverage_gap(self):
+        p = dashboard._wd_stuck_plan(
+            dashboard._WD_INFRA_FAIL_ALARM + 1,
+            [("wportnoy/x", "sha1")], {}, self.NOW)
+        self.assertTrue(p["fix_docker"])   # took the BUILD_FAILING branch
+        self.assertIn("BUILD_FAILING", p["reason"])
+
+
 class FmtRcRegressionsTests(unittest.TestCase):
     """The Agent-worktrees regression cell must be coverage-aware: a run
     with zero regressions only reads as `clean` when the WHOLE universe
