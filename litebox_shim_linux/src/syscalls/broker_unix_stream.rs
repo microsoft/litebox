@@ -39,6 +39,7 @@ use litebox_common_linux::{
 use litebox_platform_multiplex::Platform;
 
 use super::{
+    broker_backed::BrokerEdgeResetState,
     broker_backed::{BrokerBackedCommon, broker_err_to_errno},
     fork_snapshot::FdKind,
     unix::UnixSocketAddr,
@@ -75,6 +76,7 @@ pub(crate) struct BrokerUnixStreamFd<P: RawSyncPrimitivesProvider + litebox::pla
     /// (see [`StreamScmDeframer`]); the named unix-stream is a byte stream
     /// with the same coalescing hazard as the broker socketpair.
     deframer: litebox::sync::Mutex<P, StreamScmDeframer>,
+    edge_reset: Arc<BrokerEdgeResetState>,
 }
 
 impl<P> BrokerUnixStreamFd<P>
@@ -88,7 +90,13 @@ where
     ) -> Self {
         let subscribable: Arc<dyn BrokerSubscribable> = Arc::clone(&provider) as _;
         let events_mask = NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR;
-        let common = BrokerBackedCommon::new(subscribable, handle, events_mask);
+        let edge_reset = Arc::new(BrokerEdgeResetState::new());
+        let common = BrokerBackedCommon::new_edge_tracked(
+            subscribable,
+            handle,
+            events_mask,
+            Arc::clone(&edge_reset),
+        );
         common.disable_release_on_drop();
         Self {
             provider,
@@ -98,6 +106,7 @@ where
             write_shutdown: AtomicBool::new(false),
             pollee: Arc::new(Pollee::new()),
             deframer: litebox::sync::Mutex::new(StreamScmDeframer::new()),
+            edge_reset,
         }
     }
 
@@ -121,6 +130,14 @@ where
         FdKind::BrokerUnixStream {
             handle_id: self.handle(),
         }
+    }
+
+    pub(crate) fn read_edge_reset_generation(&self) -> u64 {
+        self.edge_reset.read_generation()
+    }
+
+    pub(crate) fn write_edge_reset_generation(&self) -> u64 {
+        self.edge_reset.write_generation()
     }
 }
 
@@ -174,7 +191,10 @@ impl BrokerUnixStreamFd<Platform> {
             .wait(cx, nonblock, Events::OUT, || {
                 match self.provider.send(self.handle(), payload) {
                     Ok(n) => Ok(n),
-                    Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Err(BrokerOpError::WouldBlock) => {
+                        self.edge_reset.note_write_would_block();
+                        Err(TryOpError::TryAgain)
+                    }
                     Err(e) => Err(TryOpError::Other(broker_err_to_errno(e))),
                 }
             })

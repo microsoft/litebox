@@ -32,6 +32,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
+use super::broker_backed::BrokerEdgeResetState;
 use super::guest_pid::BrokerProcessExitWake;
 
 pub(crate) struct EventfdSubsystem;
@@ -165,6 +166,7 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     /// passes it to `BrokerBackedCommon::ensure_subscribed` so the
     /// broker subscription's callback wakes the same pollee.
     pollee: Arc<Pollee<Platform>>,
+    edge_reset: Arc<BrokerEdgeResetState>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
@@ -192,10 +194,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         let subscribable: Arc<
             dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
         > = Arc::clone(&provider) as _;
-        let common = super::broker_backed::BrokerBackedCommon::new(
+        let edge_reset = Arc::new(BrokerEdgeResetState::new());
+        let common = super::broker_backed::BrokerBackedCommon::new_edge_tracked(
             subscribable,
             handle,
             NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT,
+            Arc::clone(&edge_reset),
         );
         Self {
             inner: litebox::sync::Mutex::new(EventFileInner::BrokerBacked {
@@ -205,6 +209,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             }),
             status: AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
+            edge_reset,
         }
     }
 
@@ -228,6 +233,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             }),
             status: AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
+            edge_reset: Arc::new(BrokerEdgeResetState::new()),
         }
     }
 
@@ -251,7 +257,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             }),
             status: AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
+            edge_reset: Arc::new(BrokerEdgeResetState::new()),
         }
+    }
+
+    pub(crate) fn read_edge_reset_generation(&self) -> u64 {
+        self.edge_reset.read_generation()
+    }
+
+    pub(crate) fn write_edge_reset_generation(&self) -> u64 {
+        self.edge_reset.write_generation()
     }
 
     pub(crate) fn is_timerfd(&self) -> bool {
@@ -375,6 +390,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 #[allow(clippy::wildcard_enum_match_arm)]
                 match provider.read_eventfd(handle) {
                     Ok(v) => {
+                        self.edge_reset.note_write_edge_if_armed();
                         // Wake in-process pollee observers; readiness
                         // is then re-derived synchronously via
                         // `check_io_events` -> broker. No local cache.
@@ -459,6 +475,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 #[allow(clippy::wildcard_enum_match_arm)]
                 match provider.write_eventfd(handle, value) {
                     Ok(()) => {
+                        self.edge_reset.note_read_edge();
                         // In-process observers still need a wake-up
                         // for this same-process write (the broker
                         // notification path covers cross-process
@@ -467,7 +484,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                         self.pollee.notify_observers(Events::IN);
                         Ok(8)
                     }
-                    Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Err(BrokerOpError::WouldBlock) => {
+                        self.edge_reset.note_write_would_block();
+                        Err(TryOpError::TryAgain)
+                    }
                     Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
                     Err(BrokerOpError::InvalidValue) => Err(TryOpError::Other(Errno::EINVAL)),
                     Err(BrokerOpError::PermissionDenied) => Err(TryOpError::Other(Errno::EPERM)),
