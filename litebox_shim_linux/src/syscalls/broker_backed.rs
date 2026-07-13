@@ -27,7 +27,7 @@
 //! the dispatcher thread processing the corresponding frame.
 
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use litebox::event::{Events, polling::Pollee};
 use litebox::platform::TimeProvider;
@@ -63,6 +63,7 @@ struct BrokerSubscription {
 /// dangling reference.
 struct BrokerSubscriptionWaker<P: RawSyncPrimitivesProvider + TimeProvider> {
     pollee: Weak<Pollee<P>>,
+    edge_reset: Option<Weak<BrokerEdgeResetState>>,
 }
 
 impl<P> BrokerEventCallback for BrokerSubscriptionWaker<P>
@@ -74,8 +75,58 @@ where
             return;
         };
         let shim_events = broker_events_to_shim_events(events);
+        if let Some(edge_reset) = self.edge_reset.as_ref().and_then(Weak::upgrade) {
+            edge_reset.note_broker_events(events);
+        }
         if !shim_events.is_empty() {
             pollee.notify_observers(shim_events);
+        }
+    }
+}
+
+pub(crate) struct BrokerEdgeResetState {
+    read_generation: AtomicU64,
+    write_generation: AtomicU64,
+    write_blocked: AtomicBool,
+}
+
+impl BrokerEdgeResetState {
+    pub(crate) fn new() -> Self {
+        Self {
+            read_generation: AtomicU64::new(0),
+            write_generation: AtomicU64::new(0),
+            write_blocked: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn read_generation(&self) -> u64 {
+        self.read_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn write_generation(&self) -> u64 {
+        self.write_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn note_write_would_block(&self) {
+        self.write_blocked.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn note_read_edge(&self) {
+        self.read_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn note_write_edge_if_armed(&self) {
+        if self.write_blocked.swap(false, Ordering::AcqRel) {
+            self.write_generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn note_broker_events(&self, events: u32) {
+        if events & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP) != 0 {
+            self.note_read_edge();
+        }
+        if events & NOTIFY_EVENT_OUT != 0 {
+            self.note_write_edge_if_armed();
         }
     }
 }
@@ -117,6 +168,7 @@ pub(crate) struct BrokerBackedCommon<P: RawSyncPrimitivesProvider + TimeProvider
     handle: u64,
     sub: litebox::sync::Mutex<P, Option<BrokerSubscription>>,
     events_mask: u32,
+    edge_reset: Option<Arc<BrokerEdgeResetState>>,
     /// If `false`, `Drop` skips calling `provider.release(handle)`.
     /// Used by subsystems that manage the registry refcount per
     /// fd-table-slot (via `on_dup`/`on_close`), where Drop would
@@ -152,6 +204,24 @@ where
             handle,
             sub: litebox::sync::Mutex::new(None),
             events_mask,
+            edge_reset: None,
+            release_on_drop: AtomicBool::new(true),
+            slot_refs: AtomicUsize::new(1),
+        }
+    }
+
+    pub(crate) fn new_edge_tracked(
+        provider: Arc<dyn BrokerSubscribable>,
+        handle: u64,
+        events_mask: u32,
+        edge_reset: Arc<BrokerEdgeResetState>,
+    ) -> Self {
+        Self {
+            provider,
+            handle,
+            sub: litebox::sync::Mutex::new(None),
+            events_mask,
+            edge_reset: Some(edge_reset),
             release_on_drop: AtomicBool::new(true),
             slot_refs: AtomicUsize::new(1),
         }
@@ -251,6 +321,7 @@ where
         }
         let waker: Arc<BrokerSubscriptionWaker<P>> = Arc::new(BrokerSubscriptionWaker {
             pollee: Arc::downgrade(pollee),
+            edge_reset: self.edge_reset.as_ref().map(Arc::downgrade),
         });
         let callback: Arc<dyn BrokerEventCallback> = waker;
         match self

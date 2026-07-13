@@ -21,7 +21,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use super::broker_backed::{BrokerBackedCommon, broker_err_to_errno};
+use super::broker_backed::{BrokerBackedCommon, BrokerEdgeResetState, broker_err_to_errno};
 use super::fork_snapshot::FdKind;
 
 static BROKER_PIPE_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPipeProvider>> =
@@ -74,6 +74,7 @@ pub(crate) struct BrokerPipeFd<P: RawSyncPrimitivesProvider + litebox::platform:
     // 0=sys_pipe2, 1=install_broker_bridge_fd,
     // 2=fork_snapshot_restore, 3=SCM_RIGHTS.
     creation_site: u8,
+    edge_reset: Arc<BrokerEdgeResetState>,
 }
 
 impl<P> BrokerPipeFd<P>
@@ -148,7 +149,13 @@ where
             BrokerPipeEnd::Read => NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR,
             BrokerPipeEnd::Write => NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR,
         };
-        let common = BrokerBackedCommon::new(subscribable, handle, events_mask);
+        let edge_reset = Arc::new(BrokerEdgeResetState::new());
+        let common = BrokerBackedCommon::new_edge_tracked(
+            subscribable,
+            handle,
+            events_mask,
+            Arc::clone(&edge_reset),
+        );
         // Per-slot refcount model: each fd-table slot that references
         // this BrokerPipeFd contributes one registry refcount on the
         // broker. `on_dup` bumps via `dup_handle`; `on_close` (called
@@ -165,6 +172,7 @@ where
             pollee: Arc::new(Pollee::new()),
             read_count: AtomicU32::new(0),
             creation_site,
+            edge_reset,
         }
     }
 
@@ -193,6 +201,14 @@ where
             handle_id: self.handle(),
             direction: self.direction,
         }
+    }
+
+    pub(crate) fn read_edge_reset_generation(&self) -> u64 {
+        self.edge_reset.read_generation()
+    }
+
+    pub(crate) fn write_edge_reset_generation(&self) -> u64 {
+        self.edge_reset.write_generation()
     }
 }
 
@@ -299,6 +315,7 @@ impl BrokerPipeFd<Platform> {
                 match self.provider.write_pipe(self.handle(), chunk) {
                     Ok(n) => Ok(n),
                     Err(BrokerOpError::WouldBlock) => {
+                        self.edge_reset.note_write_would_block();
                         Err(litebox::event::polling::TryOpError::TryAgain)
                     }
                     Err(BrokerOpError::InvalidValue) => {

@@ -260,27 +260,24 @@ impl<FS: ShimFS> DescriptorRef<FS> {
                 | Events::HUP.bits()
                 | Events::RDHUP.bits(),
         );
+        const BROKER_LOCAL_EDGE_TRACKED: Events =
+            Events::from_bits_truncate(Events::IN.bits() | Events::OUT.bits());
         match self {
             DescriptorRef::BrokerInetDgram(_)
             | DescriptorRef::BrokerTcpConn(_)
             | DescriptorRef::BrokerInetListener(_)
             | DescriptorRef::BrokerInetRaw(_) => BROKER_INET_STICKY,
-            DescriptorRef::Eventfd(_)
-            | DescriptorRef::Signalfd(_)
+            DescriptorRef::Eventfd(_) => BROKER_LOCAL_EDGE_TRACKED,
+            DescriptorRef::Signalfd(_)
             | DescriptorRef::Inotify(_)
             | DescriptorRef::Epoll(_)
             | DescriptorRef::File(_)
-            | DescriptorRef::Unix(_)
             | DescriptorRef::HostPassthroughFd(_)
-            | DescriptorRef::BrokerPipe(_)
             | DescriptorRef::BrokerPty(_)
-            // BrokerUnixStream reports constant OUT while connected (its
-            // readiness does not track send-buffer fullness), so OUT carries no
-            // real edge to dedup; grouping it with its AF_UNIX-stream sibling
-            // BrokerSocketPair (no dedup) keeps a blocked writer's retry wakeups
-            // and matches the branch's tested behavior.
+            | DescriptorRef::Unix(_) => Events::empty(),
+            DescriptorRef::BrokerPipe(_)
             | DescriptorRef::BrokerSocketPair(_)
-            | DescriptorRef::BrokerUnixStream(_) => Events::empty(),
+            | DescriptorRef::BrokerUnixStream(_) => BROKER_LOCAL_EDGE_TRACKED,
             #[cfg(feature = "worker_local_inet")]
             DescriptorRef::Socket(_) => Events::empty(),
         }
@@ -290,6 +287,16 @@ impl<FS: ShimFS> DescriptorRef<FS> {
 impl<FS: ShimFS> EpollDescriptor<FS> {
     fn edge_reset_generations(&self, global: &GlobalState<FS>) -> EdgeResetGenerations {
         match self {
+            EpollDescriptor::Eventfd(fd) => global
+                .litebox
+                .descriptor_table()
+                .entry_handle(fd)
+                .map_or_else(EdgeResetGenerations::default, |handle| {
+                    handle.with_entry(|entry| EdgeResetGenerations {
+                        read: entry.read_edge_reset_generation(),
+                        write: entry.write_edge_reset_generation(),
+                    })
+                }),
             EpollDescriptor::BrokerTcpConn(fd) => global
                 .litebox
                 .descriptor_table()
@@ -300,8 +307,37 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                         write: entry.write_edge_reset_generation(),
                     })
                 }),
-            EpollDescriptor::Eventfd(_)
-            | EpollDescriptor::Signalfd(_)
+            EpollDescriptor::BrokerPipe(fd) => global
+                .litebox
+                .descriptor_table()
+                .entry_handle(fd)
+                .map_or_else(EdgeResetGenerations::default, |handle| {
+                    handle.with_entry(|entry| EdgeResetGenerations {
+                        read: entry.read_edge_reset_generation(),
+                        write: entry.write_edge_reset_generation(),
+                    })
+                }),
+            EpollDescriptor::BrokerSocketPair(fd) => global
+                .litebox
+                .descriptor_table()
+                .entry_handle(fd)
+                .map_or_else(EdgeResetGenerations::default, |handle| {
+                    handle.with_entry(|entry| EdgeResetGenerations {
+                        read: entry.read_edge_reset_generation(),
+                        write: entry.write_edge_reset_generation(),
+                    })
+                }),
+            EpollDescriptor::BrokerUnixStream(fd) => global
+                .litebox
+                .descriptor_table()
+                .entry_handle(fd)
+                .map_or_else(EdgeResetGenerations::default, |handle| {
+                    handle.with_entry(|entry| EdgeResetGenerations {
+                        read: entry.read_edge_reset_generation(),
+                        write: entry.write_edge_reset_generation(),
+                    })
+                }),
+            EpollDescriptor::Signalfd(_)
             | EpollDescriptor::Inotify(_)
             | EpollDescriptor::BrokerInetListener(_)
             | EpollDescriptor::BrokerInetDgram(_)
@@ -310,10 +346,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             | EpollDescriptor::File(_)
             | EpollDescriptor::Unix(_)
             | EpollDescriptor::HostPassthroughFd(_)
-            | EpollDescriptor::BrokerPipe(_)
-            | EpollDescriptor::BrokerPty(_)
-            | EpollDescriptor::BrokerSocketPair(_)
-            | EpollDescriptor::BrokerUnixStream(_) => EdgeResetGenerations::default(),
+            | EpollDescriptor::BrokerPty(_) => EdgeResetGenerations::default(),
             #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(_) => EdgeResetGenerations::default(),
         }

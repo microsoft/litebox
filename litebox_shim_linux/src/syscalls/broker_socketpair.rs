@@ -33,7 +33,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use super::broker_backed::{BrokerBackedCommon, broker_err_to_errno};
+use super::broker_backed::{BrokerBackedCommon, BrokerEdgeResetState, broker_err_to_errno};
 use super::fork_snapshot::FdKind;
 use litebox_common_linux::cwfd::fd_transfer_frame::{PassedToken, StreamScmDeframer};
 
@@ -88,6 +88,7 @@ pub(crate) struct BrokerSocketPairFd<P: RawSyncPrimitivesProvider + litebox::pla
     /// which matches the cross-process handoff usage (the child is the
     /// sole reader and starts clean).
     deframer: litebox::sync::Mutex<P, StreamScmDeframer>,
+    edge_reset: Arc<BrokerEdgeResetState>,
 }
 
 impl<P> BrokerSocketPairFd<P>
@@ -120,7 +121,13 @@ where
         // Both endpoints care about IN (peer wrote), OUT (peer drained,
         // we have room), HUP (peer closed), ERR (write would EPIPE).
         let events_mask = NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR;
-        let common = BrokerBackedCommon::new(subscribable, handle, events_mask);
+        let edge_reset = Arc::new(BrokerEdgeResetState::new());
+        let common = BrokerBackedCommon::new_edge_tracked(
+            subscribable,
+            handle,
+            events_mask,
+            Arc::clone(&edge_reset),
+        );
         // Per-slot refcount model (same as broker pipe): on_dup bumps
         // via dup_handle, on_close balances via release. Suppress
         // BrokerBackedCommon::Drop's own release.
@@ -134,6 +141,7 @@ where
             write_shutdown: AtomicBool::new(false),
             pollee: Arc::new(Pollee::new()),
             deframer: litebox::sync::Mutex::new(StreamScmDeframer::new()),
+            edge_reset,
         }
     }
 
@@ -162,6 +170,14 @@ where
             handle_id: self.handle(),
             endpoint: self.endpoint,
         }
+    }
+
+    pub(crate) fn read_edge_reset_generation(&self) -> u64 {
+        self.edge_reset.read_generation()
+    }
+
+    pub(crate) fn write_edge_reset_generation(&self) -> u64 {
+        self.edge_reset.write_generation()
     }
 }
 
@@ -266,6 +282,7 @@ impl BrokerSocketPairFd<Platform> {
                 match self.provider.write_socketpair(self.handle(), chunk) {
                     Ok(n) => Ok(n),
                     Err(BrokerOpError::WouldBlock) => {
+                        self.edge_reset.note_write_would_block();
                         Err(litebox::event::polling::TryOpError::TryAgain)
                     }
                     Err(BrokerOpError::InvalidValue) => {

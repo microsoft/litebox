@@ -25,7 +25,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::TestOutcome;
@@ -58,6 +60,8 @@ const PIDFD_MATRIX: HandlerToken<PidfdTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.pidfd");
 const EPOLL_MATRIX: HandlerToken<EpollTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.epoll");
+const EPOLL_READINESS_MATRIX: HandlerToken<EpollReadinessTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.epoll_readiness");
 const INOTIFY_MATRIX: HandlerToken<InotifyTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.inotify");
 
@@ -224,6 +228,91 @@ enum InheritOp {
     PollReadableAfterExpire,
     EpollCtlAdd,
     InotifyReadEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EpollReadyFdType {
+    Pipe,
+    UnixStream,
+    Eventfd,
+    TcpLoopback,
+}
+
+impl EpollReadyFdType {
+    const ALL: &'static [Self] = &[
+        Self::Pipe,
+        Self::UnixStream,
+        Self::Eventfd,
+        Self::TcpLoopback,
+    ];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Pipe => "pipe",
+            Self::UnixStream => "unix_stream",
+            Self::Eventfd => "eventfd",
+            Self::TcpLoopback => "tcp_loopback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EpollReadyInterest {
+    In,
+    Out,
+    InOut,
+}
+
+impl EpollReadyInterest {
+    const ALL: &'static [Self] = &[Self::In, Self::Out, Self::InOut];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+            Self::InOut => "inout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EpollReadyTrigger {
+    Level,
+    Edge,
+}
+
+impl EpollReadyTrigger {
+    const ALL: &'static [Self] = &[Self::Level, Self::Edge];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Level => "level",
+            Self::Edge => "edge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EpollReadyConcurrency {
+    SingleThread,
+    MultiThread,
+    CrossWorker,
+}
+
+impl EpollReadyConcurrency {
+    const ALL: &'static [Self] = &[Self::SingleThread, Self::MultiThread, Self::CrossWorker];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::SingleThread => "single_thread",
+            Self::MultiThread => "multi_thread",
+            Self::CrossWorker => "cross_worker",
+        }
+    }
 }
 
 impl InheritOp {
@@ -409,6 +498,16 @@ struct FsFidTrialArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct EpollReadinessTrialArgs {
+    child_binary: String,
+    fd_type: EpollReadyFdType,
+    interest: EpollReadyInterest,
+    trigger: EpollReadyTrigger,
+    concurrency: EpollReadyConcurrency,
+    timeout_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct ChildOutput {
     exit_code: i32,
     stdout: String,
@@ -429,8 +528,66 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(FS_FID, handle_fs_fid_trial);
     register_handler!(PIDFD_MATRIX, handle_pidfd_trial);
     register_handler!(EPOLL_MATRIX, handle_epoll_trial);
+    register_handler!(EPOLL_READINESS_MATRIX, handle_epoll_readiness_trial);
     register_handler!(INOTIFY_MATRIX, handle_inotify_trial);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
+
+    for &fd_type in EpollReadyFdType::ALL {
+        for &interest in EpollReadyInterest::ALL {
+            for &trigger in EpollReadyTrigger::ALL {
+                for &concurrency in EpollReadyConcurrency::ALL {
+                    let id = format!(
+                        "inherit_matrix.epoll_readiness.{}.{}.{}.{}",
+                        fd_type.id(),
+                        interest.id(),
+                        trigger.id(),
+                        concurrency.id()
+                    );
+                    reg.test("vscode", "inherit_matrix", id.clone())
+                        .timeout(30)
+                        .build(move |cx| {
+                            let parent = cx.require(AgentName::Dpg1);
+                            let id = id.clone();
+                            Box::new(move |run| {
+                                Box::pin(async move {
+                                    let self_exe = run.self_exe().to_string();
+                                    let child_binary =
+                                        crate::binary_path(BinaryType::NonPieGlibc, &self_exe);
+                                    let result = run
+                                        .send_named_typed(
+                                            &parent,
+                                            &EPOLL_READINESS_MATRIX,
+                                            EpollReadinessTrialArgs {
+                                                child_binary,
+                                                fd_type,
+                                                interest,
+                                                trigger,
+                                                concurrency,
+                                                timeout_ms: 500,
+                                            },
+                                        )
+                                        .await;
+                                    match result {
+                                        Ok(out) if out.exit_code == 0 => {
+                                            TestOutcome::new("Dpg1", true, out.stdout)
+                                        }
+                                        Ok(out) => TestOutcome::new(
+                                            "Dpg1",
+                                            false,
+                                            format!(
+                                                "{id}: exit_code={} stdout={:?} stderr={:?}",
+                                                out.exit_code, out.stdout, out.stderr
+                                            ),
+                                        ),
+                                        Err(error) => TestOutcome::new("Dpg1", false, error),
+                                    }
+                                })
+                            })
+                        });
+                }
+            }
+        }
+    }
 
     for scenario in [
         FsFidScenario::SharedPosition,
@@ -2322,6 +2479,533 @@ async fn handle_epoll_trial(
     })
 }
 
+async fn handle_epoll_readiness_trial(
+    args: EpollReadinessTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    match run_epoll_readiness_trial(&args) {
+        Ok(detail) => Ok(ChildOutput {
+            exit_code: 0,
+            stdout: detail,
+            stderr: String::new(),
+        }),
+        Err(error) => Ok(ChildOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: error,
+        }),
+    }
+}
+
+struct EpollReadyTarget {
+    poll_fd: RawFd,
+    driver_fd: RawFd,
+    _read_fd: Option<OwnedFd>,
+    _write_fd: Option<OwnedFd>,
+    _unix_poll: Option<UnixStream>,
+    _unix_peer: Option<UnixStream>,
+    _eventfd: Option<EventFd>,
+    _tcp_poll: Option<TcpStream>,
+    _tcp_peer: Option<TcpStream>,
+}
+
+fn run_epoll_readiness_trial(args: &EpollReadinessTrialArgs) -> Result<String, String> {
+    let target = epoll_ready_target(args.fd_type, args.interest)?;
+    let epoll = create_epoll_fd()?;
+    let epoll_fd = epoll.as_raw_fd();
+    let mut detail = Vec::new();
+
+    drive_readable(args, &target)?;
+    let interest_mask = epoll_ready_interest_mask(args.interest, args.trigger);
+    epoll_ctl(
+        epoll_fd,
+        libc::EPOLL_CTL_ADD,
+        target.poll_fd,
+        interest_mask,
+        0,
+    )?;
+    let expected = epoll_ready_expected_mask(args.fd_type, args.interest);
+    let timeout_ms = i32::try_from(args.timeout_ms)
+        .map_err(|_| format!("timeout too large: {}", args.timeout_ms))?;
+    let first = epoll_wait_mask(epoll_fd, timeout_ms)?;
+    if first != expected {
+        return Err(format!(
+            "first readiness fd_type={} interest={} trigger={} concurrency={} got {first:#x}, expected {expected:#x}",
+            args.fd_type.id(),
+            args.interest.id(),
+            args.trigger.id(),
+            args.concurrency.id()
+        ));
+    }
+    detail.push(format!("first={first:#x}"));
+
+    if args.trigger == EpollReadyTrigger::Edge && expected != 0 {
+        let second = epoll_wait_mask(epoll_fd, 0)?;
+        if second != 0 {
+            return Err(format!(
+                "EPOLLET redelivered sticky readiness: got {second:#x} after first {first:#x}"
+            ));
+        }
+        detail.push("edge_second=0".to_string());
+
+        if args.interest == EpollReadyInterest::Out && args.fd_type != EpollReadyFdType::Eventfd {
+            epoll_ready_fd_action(target.poll_fd, "write", args.fd_type)?;
+            let after_write = epoll_wait_mask(epoll_fd, 0)?;
+            if after_write != 0 {
+                return Err(format!(
+                    "EPOLLET redelivered writable fd after unrelated write: got {after_write:#x}"
+                ));
+            }
+            detail.push("edge_after_write=0".to_string());
+        }
+    }
+
+    if args.interest != EpollReadyInterest::In {
+        drain_readable(args, &target)?;
+        epoll_ctl(
+            epoll_fd,
+            libc::EPOLL_CTL_MOD,
+            target.poll_fd,
+            epoll_ready_interest_mask(EpollReadyInterest::In, args.trigger),
+            0,
+        )?;
+        let after_mod = epoll_wait_mask(epoll_fd, 0)?;
+        if after_mod != 0 {
+            return Err(format!(
+                "EPOLLOUT remained ready after MOD removed OUT: got {after_mod:#x}"
+            ));
+        }
+        detail.push("after_mod=0".to_string());
+    }
+
+    if epoll_ready_fd_supports_out(args.fd_type, args.interest) {
+        let del_epoll = create_epoll_fd()?;
+        let del_epoll_fd = del_epoll.as_raw_fd();
+        epoll_ctl(
+            del_epoll_fd,
+            libc::EPOLL_CTL_ADD,
+            target.poll_fd,
+            epoll_ready_interest_mask(EpollReadyInterest::Out, args.trigger),
+            0,
+        )?;
+        epoll_ctl(
+            del_epoll_fd,
+            libc::EPOLL_CTL_DEL,
+            target.poll_fd,
+            epoll_ready_interest_mask(EpollReadyInterest::Out, args.trigger),
+            0,
+        )?;
+        let after_del = epoll_wait_mask(del_epoll_fd, 0)?;
+        if after_del != 0 {
+            return Err(format!(
+                "EPOLLOUT remained ready after DEL removed fd: got {after_del:#x}"
+            ));
+        }
+        detail.push("after_del=0".to_string());
+
+        let mod_epoll = create_epoll_fd()?;
+        let mod_epoll_fd = mod_epoll.as_raw_fd();
+        epoll_ctl(
+            mod_epoll_fd,
+            libc::EPOLL_CTL_ADD,
+            target.poll_fd,
+            epoll_ready_interest_mask(EpollReadyInterest::Out, args.trigger),
+            0,
+        )?;
+        epoll_ctl(
+            mod_epoll_fd,
+            libc::EPOLL_CTL_MOD,
+            target.poll_fd,
+            epoll_ready_interest_mask(EpollReadyInterest::In, args.trigger),
+            0,
+        )?;
+        let after_pre_wait_mod = epoll_wait_mask(mod_epoll_fd, 0)?;
+        if after_pre_wait_mod != 0 {
+            return Err(format!(
+                "EPOLLOUT remained ready after pre-wait MOD removed OUT: got {after_pre_wait_mod:#x}"
+            ));
+        }
+        detail.push("after_pre_wait_mod=0".to_string());
+    }
+
+    if args.fd_type == EpollReadyFdType::Eventfd && args.interest != EpollReadyInterest::Out {
+        epoll_ctl(
+            epoll_fd,
+            libc::EPOLL_CTL_MOD,
+            target.poll_fd,
+            epoll_ready_interest_mask(EpollReadyInterest::In, EpollReadyTrigger::Level),
+            0,
+        )?;
+        write_eventfd_raw(target.poll_fd, 1)?;
+        drain_readable(args, &target)?;
+        let stale = epoll_wait_mask(epoll_fd, 0)?;
+        if stale != 0 {
+            return Err(format!(
+                "eventfd reported stale EPOLLIN after concurrent drain: got {stale:#x}"
+            ));
+        }
+        detail.push("eventfd_stale=0".to_string());
+    }
+
+    Ok(detail.join(","))
+}
+
+fn epoll_ready_target(
+    fd_type: EpollReadyFdType,
+    interest: EpollReadyInterest,
+) -> Result<EpollReadyTarget, String> {
+    match fd_type {
+        EpollReadyFdType::Pipe => {
+            let mut fds = [0; 2];
+            // SAFETY: `fds` points to two writable integers for pipe2.
+            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+            if rc != 0 {
+                return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
+            }
+            // SAFETY: pipe2 returned two fresh fds.
+            let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+            // SAFETY: pipe2 returned two fresh fds.
+            let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+            let poll_fd = if interest == EpollReadyInterest::Out {
+                write_fd.as_raw_fd()
+            } else {
+                read_fd.as_raw_fd()
+            };
+            Ok(EpollReadyTarget {
+                poll_fd,
+                driver_fd: write_fd.as_raw_fd(),
+                _read_fd: Some(read_fd),
+                _write_fd: Some(write_fd),
+                _unix_poll: None,
+                _unix_peer: None,
+                _eventfd: None,
+                _tcp_poll: None,
+                _tcp_peer: None,
+            })
+        }
+        EpollReadyFdType::UnixStream => {
+            let (poll, peer) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
+            poll.set_nonblocking(true)
+                .map_err(|e| format!("socketpair poll nonblock: {e}"))?;
+            peer.set_nonblocking(true)
+                .map_err(|e| format!("socketpair peer nonblock: {e}"))?;
+            Ok(EpollReadyTarget {
+                poll_fd: poll.as_raw_fd(),
+                driver_fd: peer.as_raw_fd(),
+                _read_fd: None,
+                _write_fd: None,
+                _unix_poll: Some(poll),
+                _unix_peer: Some(peer),
+                _eventfd: None,
+                _tcp_poll: None,
+                _tcp_peer: None,
+            })
+        }
+        EpollReadyFdType::Eventfd => {
+            let eventfd =
+                EventFd::open(0, "nonblock|cloexec").map_err(|e| format!("eventfd: {e}"))?;
+            Ok(EpollReadyTarget {
+                poll_fd: eventfd.as_raw_fd(),
+                driver_fd: eventfd.as_raw_fd(),
+                _read_fd: None,
+                _write_fd: None,
+                _unix_poll: None,
+                _unix_peer: None,
+                _eventfd: Some(eventfd),
+                _tcp_poll: None,
+                _tcp_peer: None,
+            })
+        }
+        EpollReadyFdType::TcpLoopback => {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .map_err(|e| format!("tcp bind: {e}"))?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| format!("tcp local_addr: {e}"))?;
+            let poll = TcpStream::connect(addr).map_err(|e| format!("tcp connect: {e}"))?;
+            let (peer, _) = listener.accept().map_err(|e| format!("tcp accept: {e}"))?;
+            poll.set_nonblocking(true)
+                .map_err(|e| format!("tcp poll nonblock: {e}"))?;
+            peer.set_nonblocking(true)
+                .map_err(|e| format!("tcp peer nonblock: {e}"))?;
+            Ok(EpollReadyTarget {
+                poll_fd: poll.as_raw_fd(),
+                driver_fd: peer.as_raw_fd(),
+                _read_fd: None,
+                _write_fd: None,
+                _unix_poll: None,
+                _unix_peer: None,
+                _eventfd: None,
+                _tcp_poll: Some(poll),
+                _tcp_peer: Some(peer),
+            })
+        }
+    }
+}
+
+fn create_epoll_fd() -> Result<OwnedFd, String> {
+    // SAFETY: epoll_create1 has no pointer arguments and returns a fresh fd.
+    let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if fd < 0 {
+        return Err(format!(
+            "epoll_create1: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fd was just returned by epoll_create1 and is owned here.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn epoll_ready_interest_mask(interest: EpollReadyInterest, trigger: EpollReadyTrigger) -> u32 {
+    let mut mask = match interest {
+        EpollReadyInterest::In => libc::EPOLLIN as u32,
+        EpollReadyInterest::Out => libc::EPOLLOUT as u32,
+        EpollReadyInterest::InOut => (libc::EPOLLIN | libc::EPOLLOUT) as u32,
+    };
+    if trigger == EpollReadyTrigger::Edge {
+        mask |= libc::EPOLLET.cast_unsigned();
+    }
+    mask
+}
+
+fn epoll_ready_expected_mask(fd_type: EpollReadyFdType, interest: EpollReadyInterest) -> u32 {
+    let actual = match fd_type {
+        EpollReadyFdType::Pipe if interest == EpollReadyInterest::Out => libc::EPOLLOUT as u32,
+        EpollReadyFdType::Pipe => libc::EPOLLIN as u32,
+        EpollReadyFdType::UnixStream | EpollReadyFdType::TcpLoopback => {
+            (libc::EPOLLIN | libc::EPOLLOUT) as u32
+        }
+        EpollReadyFdType::Eventfd => (libc::EPOLLIN | libc::EPOLLOUT) as u32,
+    };
+    actual
+        & match interest {
+            EpollReadyInterest::In => libc::EPOLLIN as u32,
+            EpollReadyInterest::Out => libc::EPOLLOUT as u32,
+            EpollReadyInterest::InOut => (libc::EPOLLIN | libc::EPOLLOUT) as u32,
+        }
+}
+
+fn epoll_ready_fd_supports_out(fd_type: EpollReadyFdType, interest: EpollReadyInterest) -> bool {
+    match (fd_type, interest) {
+        (EpollReadyFdType::Pipe, EpollReadyInterest::In | EpollReadyInterest::InOut) => false,
+        (
+            EpollReadyFdType::Pipe
+            | EpollReadyFdType::UnixStream
+            | EpollReadyFdType::Eventfd
+            | EpollReadyFdType::TcpLoopback,
+            EpollReadyInterest::Out,
+        )
+        | (
+            EpollReadyFdType::UnixStream
+            | EpollReadyFdType::Eventfd
+            | EpollReadyFdType::TcpLoopback,
+            EpollReadyInterest::InOut,
+        ) => true,
+        (
+            EpollReadyFdType::UnixStream
+            | EpollReadyFdType::Eventfd
+            | EpollReadyFdType::TcpLoopback,
+            EpollReadyInterest::In,
+        ) => false,
+    }
+}
+
+fn epoll_ctl(epoll_fd: RawFd, op: i32, fd: RawFd, events: u32, data: u64) -> Result<(), String> {
+    let mut event = libc::epoll_event { events, u64: data };
+    // SAFETY: epoll_fd and fd are live descriptors; event is initialized.
+    let rc = unsafe { libc::epoll_ctl(epoll_fd, op, fd, &raw mut event) };
+    if rc != 0 {
+        return Err(format!(
+            "epoll_ctl op={op} fd={fd} events={events:#x}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn epoll_wait_mask(epoll_fd: RawFd, timeout_ms: i32) -> Result<u32, String> {
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
+    // SAFETY: events is valid writable storage and epoll_fd is live.
+    let n = unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 8, timeout_ms) };
+    if n < 0 {
+        return Err(format!("epoll_wait: {}", std::io::Error::last_os_error()));
+    }
+    let mut mask = 0;
+    let n = usize::try_from(n).map_err(|_| format!("epoll_wait returned negative count {n}"))?;
+    for event in events.iter().take(n) {
+        let data = event.u64;
+        if data != 0 {
+            return Err(format!("epoll returned unexpected data={data}"));
+        }
+        let event_mask = event.events;
+        mask |= event_mask
+            & (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP)
+                as u32;
+    }
+    Ok(mask)
+}
+
+fn drive_readable(args: &EpollReadinessTrialArgs, target: &EpollReadyTarget) -> Result<(), String> {
+    if args.interest == EpollReadyInterest::Out {
+        return Ok(());
+    }
+    run_fd_action(args, target.driver_fd, "write", args.fd_type)
+}
+
+fn drain_readable(args: &EpollReadinessTrialArgs, target: &EpollReadyTarget) -> Result<(), String> {
+    if args.interest == EpollReadyInterest::Out {
+        return Ok(());
+    }
+    run_fd_action(args, target.poll_fd, "drain", args.fd_type)
+}
+
+fn run_fd_action(
+    args: &EpollReadinessTrialArgs,
+    fd: RawFd,
+    action: &str,
+    fd_type: EpollReadyFdType,
+) -> Result<(), String> {
+    match args.concurrency {
+        EpollReadyConcurrency::SingleThread => epoll_ready_fd_action(fd, action, fd_type),
+        EpollReadyConcurrency::MultiThread => {
+            let action = action.to_string();
+            thread::spawn(move || epoll_ready_fd_action(fd, &action, fd_type))
+                .join()
+                .map_err(|_| "epoll readiness driver thread panicked".to_string())?
+        }
+        EpollReadyConcurrency::CrossWorker => {
+            clear_cloexec(fd).map_err(|e| e.0)?;
+            let child = Command::new(&args.child_binary)
+                .args([
+                    "inherit-matrix",
+                    "epoll-readiness-fd-action",
+                    action,
+                    fd_type.id(),
+                ])
+                .env("LITEBOX_INHERIT_FD", fd.to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("spawn {}: {e}", args.child_binary))?;
+            let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))
+                .map_err(|e| e.0)?;
+            if !output.status.success() {
+                return Err(format!(
+                    "cross-worker fd action {action} failed: stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn set_fd_nonblocking(fd: RawFd) -> Result<(), String> {
+    // SAFETY: fcntl F_GETFL only reads file status flags for a live fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(format!(
+            "fcntl F_GETFL fd={fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fcntl F_SETFL updates file status flags for a live fd.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc != 0 {
+        return Err(format!(
+            "fcntl F_SETFL O_NONBLOCK fd={fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn epoll_ready_fd_action(fd: RawFd, action: &str, fd_type: EpollReadyFdType) -> Result<(), String> {
+    if action == "drain" {
+        set_fd_nonblocking(fd)?;
+    }
+    match action {
+        "write" => match fd_type {
+            EpollReadyFdType::Eventfd => write_eventfd_raw(fd, 1),
+            EpollReadyFdType::Pipe
+            | EpollReadyFdType::UnixStream
+            | EpollReadyFdType::TcpLoopback => write_byte_raw(fd),
+        },
+        "drain" => match fd_type {
+            EpollReadyFdType::Eventfd => drain_eventfd_raw(fd),
+            EpollReadyFdType::Pipe
+            | EpollReadyFdType::UnixStream
+            | EpollReadyFdType::TcpLoopback => drain_bytes_raw(fd),
+        },
+        other => Err(format!("unknown epoll readiness fd action {other}")),
+    }
+}
+
+fn write_byte_raw(fd: RawFd) -> Result<(), String> {
+    let byte = [0x5a_u8];
+    // SAFETY: byte is valid readable storage for one byte.
+    let n = unsafe { libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1) };
+    if n == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "write byte fd={fd} n={n}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+fn write_eventfd_raw(fd: RawFd, value: u64) -> Result<(), String> {
+    // SAFETY: value is valid readable storage for an eventfd word.
+    let n = unsafe { libc::write(fd, std::ptr::from_ref(&value).cast::<libc::c_void>(), 8) };
+    if n == 8 {
+        Ok(())
+    } else {
+        Err(format!(
+            "write eventfd fd={fd} n={n}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+fn drain_bytes_raw(fd: RawFd) -> Result<(), String> {
+    let mut buf = [0_u8; 64];
+    loop {
+        // SAFETY: buf is valid writable storage.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n > 0 {
+            continue;
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK => return Ok(()),
+            Some(libc::EINTR) => {}
+            _ => return Err(format!("drain fd={fd}: {err}")),
+        }
+    }
+}
+
+fn drain_eventfd_raw(fd: RawFd) -> Result<(), String> {
+    let mut value = 0_u64;
+    loop {
+        // SAFETY: value is valid writable storage for an eventfd word.
+        let n = unsafe { libc::read(fd, std::ptr::from_mut(&mut value).cast::<libc::c_void>(), 8) };
+        if n == 8 {
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(errno) if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK => return Ok(()),
+            Some(libc::EINTR) => {}
+            _ => return Err(format!("drain eventfd fd={fd} n={n}: {err}")),
+        }
+    }
+}
+
 async fn handle_inotify_trial(
     args: InotifyTrialArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -3038,6 +3722,7 @@ mod leaf_subcmd {
             Some("timerfd-child") => timerfd_child(args),
             Some("pidfd-child") => pidfd_child(args),
             Some("epoll-child") => epoll_child(args),
+            Some("epoll-readiness-fd-action") => epoll_readiness_fd_action_child(args),
             Some("inotify-child") => inotify_child(args),
             Some(other) => {
                 eprintln!("inherit-matrix: unknown subcommand: {other}");
@@ -3046,6 +3731,44 @@ mod leaf_subcmd {
             None => {
                 eprintln!("inherit-matrix: missing subcommand");
                 2
+            }
+        }
+    }
+
+    fn epoll_readiness_fd_action_child(args: &[String]) -> i32 {
+        let Some(action) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix epoll-readiness action: missing action");
+            return 2;
+        };
+        let Some(fd_type) = args.get(4).map(String::as_str) else {
+            eprintln!("inherit-matrix epoll-readiness action: missing fd type");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix epoll-readiness action: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+        let fd_type = match fd_type {
+            "pipe" => super::EpollReadyFdType::Pipe,
+            "unix_stream" => super::EpollReadyFdType::UnixStream,
+            "eventfd" => super::EpollReadyFdType::Eventfd,
+            "tcp_loopback" => super::EpollReadyFdType::TcpLoopback,
+            other => {
+                eprintln!("inherit-matrix epoll-readiness action: bad fd type {other}");
+                return 2;
+            }
+        };
+        match super::epoll_ready_fd_action(fd, action, fd_type) {
+            Ok(()) => {
+                println!("ok");
+                0
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                1
             }
         }
     }
