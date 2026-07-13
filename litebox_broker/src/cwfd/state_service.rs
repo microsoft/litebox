@@ -2099,7 +2099,8 @@ fn handle_inet_tcp_conn_connect(
         Ok(target) => target,
         Err(_) => return status_err(response_opcode, StatusCode::InvalidValue),
     };
-    if is_broker_dns_service(target) {
+    let is_dns = is_broker_dns_service(target);
+    if is_dns {
         target = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
             crate::net_proxy::host_dns::discover_host_dns(),
             target.port(),
@@ -2131,6 +2132,14 @@ fn handle_inet_tcp_conn_connect(
             }
             Err(TcpConnError::Io) => return status_err(response_opcode, StatusCode::Internal),
         }
+    }
+
+    // Enforce network policy on real outbound connects. Broker-held listener
+    // (loopback / same-sandbox) connects already returned above, and the
+    // virtual DNS resolver is exempt (it was rewritten to the host resolver).
+    // A policy denial surfaces to the guest's connect() as EPERM.
+    if !is_dns && !registry.net().allow_connect(target.ip(), target.port()) {
+        return status_err(response_opcode, StatusCode::PermissionDenied);
     }
 
     match state.start_connect(target, Duration::from_millis(u64::from(timeout_ms))) {
@@ -2627,7 +2636,7 @@ fn handle_inet_dgram_create(
         Some(family) => family,
         None => return status_err(Opcode::InetDgramCreateResponse, StatusCode::InvalidValue),
     };
-    let handle = registry.register(InetDgramState::new(family));
+    let handle = registry.register(InetDgramState::new(family, Arc::clone(registry.net())));
     HandlerResult {
         frame: proto::build_inet_dgram_create_response_ok(handle.id()),
         out_fd: None,
@@ -4088,7 +4097,8 @@ fn handle_debug_query_state_object(
 mod tests {
     use super::*;
     use litebox_common_linux::fd_token_protocol::{
-        build_create_eventfd_request, build_mark_process_exited_request,
+        build_create_eventfd_request, build_inet_tcp_conn_connect_request,
+        build_inet_tcp_conn_create_request, build_mark_process_exited_request,
         build_read_eventfd_request, build_register_process_request,
         build_subscribe_eventfd_request, build_subscribe_process_exit_request,
         build_unsubscribe_request, build_write_eventfd_request, decode,
@@ -4198,6 +4208,45 @@ mod tests {
         let mut conn = ConnState::new();
         let read = run(&registry, &mut conn, &build_read_eventfd_request(9999));
         assert_eq!(read.frame.status, StatusCode::UnknownHandle);
+    }
+
+    #[test]
+    fn inet_tcp_connect_enforces_network_policy() {
+        use crate::sandbox_policy::SandboxPolicy;
+
+        // deny-all except one IP-based allowlist entry (so no DNS is needed).
+        let policy = SandboxPolicy::from_json(
+            r#"{ "network": { "deny_all": true, "allow_connect": ["127.0.0.1:9"] } }"#,
+        )
+        .unwrap();
+        let registry = BrokerStateRegistry::with_net_enforcement(Some(Arc::new(policy)), None);
+        let mut conn = ConnState::new();
+
+        // Create an AF_INET (family byte 0) TCP connection handle.
+        let create = run(&registry, &mut conn, &build_inet_tcp_conn_create_request(0));
+        let handle_id = u64::from_le_bytes(create.frame.body[..8].try_into().unwrap());
+
+        // A non-allowlisted destination is refused before any host connect,
+        // surfacing to the guest as EPERM (StatusCode::PermissionDenied).
+        let denied =
+            encode_sockaddr("93.184.216.34:443".parse().unwrap()).expect("encode denied sockaddr");
+        let res = run(
+            &registry,
+            &mut conn,
+            &build_inet_tcp_conn_connect_request(handle_id, &denied, 1_000),
+        );
+        assert_eq!(res.frame.status, StatusCode::PermissionDenied);
+
+        // The allowlisted destination passes enforcement: it is not denied
+        // (the real connect is asynchronous, so the status is WouldBlock).
+        let allowed =
+            encode_sockaddr("127.0.0.1:9".parse().unwrap()).expect("encode allowed sockaddr");
+        let res = run(
+            &registry,
+            &mut conn,
+            &build_inet_tcp_conn_connect_request(handle_id, &allowed, 1_000),
+        );
+        assert_ne!(res.frame.status, StatusCode::PermissionDenied);
     }
 
     #[test]

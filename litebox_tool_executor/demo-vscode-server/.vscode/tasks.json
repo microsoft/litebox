@@ -39,7 +39,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            // One-shot: run all three setup steps in sequence,
+            // One-shot: run all setup steps in sequence,
             // then start the server. Use this for first-time
             // setup or after switching worktrees. The
             // `dependsOrder: "sequence"` is required — without
@@ -50,6 +50,7 @@
             "dependsOn": [
                 "LiteBox: Build",
                 "LiteBox: Build VS Code Image",
+                "LiteBox: Setup SSH Key Auth",
                 "LiteBox: Start VS Code Server"
             ],
             "problemMatcher": [],
@@ -63,7 +64,7 @@
         {
             "label": "LiteBox: Build",
             "type": "shell",
-            "command": "cd ${workspaceFolder}/../.. && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland",
+            "command": "cd ${workspaceFolder}/../.. && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland -p litebox_audit_query",
             "group": "build",
             "problemMatcher": [],
             "presentation": {
@@ -87,9 +88,21 @@
             }
         },
         {
+            "label": "LiteBox: Setup SSH Key Auth",
+            "type": "shell",
+            "command": "cd ${workspaceFolder}/../.. && bash litebox_tool_executor/demo-vscode-server/setup-ssh-key-auth.sh",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
             "label": "LiteBox: Start VS Code Server",
             "type": "shell",
-            "command": "if [ -z \"$DOCKER_HOST\" ]; then export DOCKER_HOST=unix:///run/litebox-docker.sock; fi; docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
+            "command": "if [ -z \"$DOCKER_HOST\" ]; then export DOCKER_HOST=unix:///run/litebox-docker.sock; fi; cd ${workspaceFolder}/../.. && bash litebox_tool_executor/demo-vscode-server/setup-ssh-key-auth.sh && mkdir -p target/litebox-audit && (docker rm -f litebox-vscode 2>/dev/null || true) && docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro -v ${workspaceFolder}/../../litebox_tool_executor/policies:/opt/policies:ro -v ${workspaceFolder}/../../target/litebox-audit:/opt/audit -v ${workspaceFolder}/../../target/demo-vscode-server/ssh/server:/opt/litebox-demo-ssh:ro litebox-vscode /usr/bin/bash -lc 'mkdir -p /root/.ssh && cp /opt/litebox-demo-ssh/authorized_keys /root/.ssh/authorized_keys && chown root:root /root/.ssh /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --policy /opt/policies/demo-policy.json --audit-log /opt/audit'",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -102,7 +115,7 @@
         {
             "label": "LiteBox: Start VS Code Server (Debug)",
             "type": "shell",
-            "command": "if [ -z \"$DOCKER_HOST\" ]; then export DOCKER_HOST=unix:///run/litebox-docker.sock; fi; docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug 9999",
+            "command": "if [ -z \"$DOCKER_HOST\" ]; then export DOCKER_HOST=unix:///run/litebox-docker.sock; fi; cd ${workspaceFolder}/../.. && bash litebox_tool_executor/demo-vscode-server/setup-ssh-key-auth.sh && mkdir -p target/litebox-audit && (docker rm -f litebox-vscode 2>/dev/null || true) && docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro -v ${workspaceFolder}/../../litebox_tool_executor/policies:/opt/policies:ro -v ${workspaceFolder}/../../target/litebox-audit:/opt/audit -v ${workspaceFolder}/../../target/demo-vscode-server/ssh/server:/opt/litebox-demo-ssh:ro litebox-vscode /usr/bin/bash -lc 'mkdir -p /root/.ssh && cp /opt/litebox-demo-ssh/authorized_keys /root/.ssh/authorized_keys && chown root:root /root/.ssh /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --policy /opt/policies/demo-policy.json --audit-log /opt/audit --debug 9999'",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -121,6 +134,54 @@
                 "reveal": "silent",
                 "panel": "shared"
             }
+        },
+        {
+            // Live "frontier" tree of the sandbox: allowed (green) vs denied
+            // (red) filesystem paths and network endpoints, updating as the
+            // agent runs. Reads the bind-mounted audit dir the server task
+            // writes to. Use `watch --policy-only <dir>` for a scrolling log
+            // instead of the tree.
+            "label": "LiteBox: Watch Sandbox Frontier",
+            "type": "shell",
+            "command": "cd ${workspaceFolder}/../.. && cargo build -q -p litebox_audit_query && ./target/debug/litebox_audit_query watch --tree target/litebox-audit",
+            "problemMatcher": [],
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "echo": true
+            }
+        },
+        {
+            // Scrolling live trace of sandbox activity: broker policy
+            // decisions (tcp/udp/fs/dns) and, if the runner was built with
+            // `--features audit_log`, per-syscall events too. This is the
+            // cross-platform successor to the old View-AuditLog.ps1 viewer.
+            "label": "LiteBox: Watch Sandbox Trace",
+            "type": "shell",
+            "command": "cd ${workspaceFolder}/../.. && cargo build -q -p litebox_audit_query && ./target/debug/litebox_audit_query watch target/litebox-audit",
+            "problemMatcher": [],
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
+            // Open both visualizers side by side (parallel dependsOn opens two
+            // dedicated terminal panels): the scrolling trace + the frontier
+            // tree. The frontier is listed LAST so its panel is the one focused
+            // when the compound task finishes starting — no manual switch from
+            // the trace needed. Run this after the server task is up.
+            "label": "LiteBox: Watch Sandbox (Tree + Trace)",
+            "dependsOn": [
+                "LiteBox: Watch Sandbox Trace",
+                "LiteBox: Watch Sandbox Frontier"
+            ],
+            "problemMatcher": []
         },
         {
             "label": "LiteBox: Run Integration Tests (vscode::*)",

@@ -17,6 +17,7 @@ use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT
 use litebox_common_linux::notification_ring::NotificationSender;
 
 use crate::cwfd::inet_listener_state::{AddressFamily, decode_sockaddr, encode_sockaddr};
+use crate::net_enforce::NetEnforcer;
 use crate::state_registry::StateObject;
 use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeError};
 
@@ -57,10 +58,13 @@ pub struct InetDgramState {
     recv_thread: Mutex<Option<thread::JoinHandle<()>>>,
     queued_recvs: AtomicUsize,
     stop_recv: Arc<AtomicBool>,
+    /// Broker-global network enforcement context. Used here to record the
+    /// IP→hostname mappings learned from forwarded DNS responses.
+    net: Arc<NetEnforcer>,
 }
 
 impl InetDgramState {
-    pub fn new(family: AddressFamily) -> Arc<Self> {
+    pub fn new(family: AddressFamily, net: Arc<NetEnforcer>) -> Arc<Self> {
         Arc::new(Self {
             family,
             socket: Mutex::new(None),
@@ -71,6 +75,7 @@ impl InetDgramState {
             recv_thread: Mutex::new(None),
             queued_recvs: AtomicUsize::new(0),
             stop_recv: Arc::new(AtomicBool::new(false)),
+            net,
         })
     }
 
@@ -361,6 +366,7 @@ impl InetDgramState {
         ));
         let query = payload.to_vec();
         let state = Arc::downgrade(self);
+        let net = Arc::clone(&self.net);
         thread::Builder::new()
             .name("litebox-dns-forward".into())
             .spawn(move || {
@@ -390,6 +396,9 @@ impl InetDgramState {
                     }
                 };
                 response.truncate(len);
+                // Learn IP→hostname mappings from the answer so later TCP
+                // connects can be matched against hostname policy rules.
+                net.record_dns_response(&response);
                 if let Some(state) = state.upgrade() {
                     if let Err(err) = state.enqueue_datagram(response, virtual_peer) {
                         tracing::warn!(error = %err, %virtual_peer, "DNS forwarder enqueue failed");
@@ -559,7 +568,7 @@ mod tests {
     }
 
     fn bound_state() -> (Arc<InetDgramState>, SocketAddr) {
-        let state = InetDgramState::new(AddressFamily::V4);
+        let state = InetDgramState::new(AddressFamily::V4, NetEnforcer::disabled());
         state.bind(&loopback_zero()).unwrap();
         let local = decode_sockaddr(&state.getsockname().unwrap()).unwrap();
         (state, local)

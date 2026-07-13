@@ -933,6 +933,9 @@ fn print_ssh_banner(
             eprintln!("        HostName {host_ip}");
             eprintln!("        Port {ssh_port}");
             eprintln!("        User root");
+            eprintln!("        IdentityFile ~/.ssh/litebox_ed25519");
+            eprintln!("        IdentitiesOnly yes");
+            eprintln!("        PreferredAuthentications publickey");
             eprintln!("        StrictHostKeyChecking no");
             eprintln!("        UserKnownHostsFile /dev/null");
             eprintln!();

@@ -22,10 +22,10 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, STATX_BASIC_STATS, StatfsBuf, StatxBuf,
-    StatxTimestamp, TMPFS_MAGIC, TimeParam, TimerfdFlags, TimerfdTimerFlags, errno::Errno,
-    fd_token_protocol::PtyIoctlOp,
+    AccessFlags, AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags,
+    FileStat, IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, STATX_BASIC_STATS, StatfsBuf, StatxBuf,
+    StatxTimestamp, TMPFS_MAGIC, TimeParam, TimerfdFlags, TimerfdTimerFlags, Timespec,
+    errno::Errno, fd_token_protocol::PtyIoctlOp,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -1243,6 +1243,8 @@ impl<FS: ShimFS> Task<FS> {
         flags: OFlags,
         contents: alloc::string::String,
     ) -> Result<u32, Errno> {
+        use litebox::fs::errors::CreateAnonymousFileError;
+
         if flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
             return Err(Errno::EACCES);
         }
@@ -1255,44 +1257,21 @@ impl<FS: ShimFS> Task<FS> {
         // Using a pipe breaks programs (like the VS Code Server) that
         // call lseek() on /proc/PID/stat to check seekability.
         let files = self.files.borrow();
-
-        // Create a temporary file path that won't collide.
-        static PROC_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        let n = PROC_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let tmp_path = alloc::format!("/tmp/.proc_synthetic_{n}");
-
-        // Create, write, close, then reopen read-only.
         let mut descriptors = self.global.litebox.descriptor_table_mut();
-        let write_fd = files
-            .fs
-            .open(
-                &tmp_path,
-                OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC,
-                litebox::fs::Mode::RWXU,
-                &mut *descriptors,
-            )
-            .map_err(Errno::from)?;
-        files
-            .fs
-            .write(&write_fd, contents.as_bytes(), None, &mut *descriptors)
-            .map_err(Errno::from)?;
-        files
-            .fs
-            .close(&write_fd, &mut *descriptors)
-            .map_err(Errno::from)?;
 
         let read_fd = files
             .fs
-            .open(
-                &tmp_path,
-                OFlags::RDONLY,
-                litebox::fs::Mode::empty(),
+            .create_anonymous_file_from_bytes(
+                "proc_synthetic",
+                litebox::fs::Mode::from_bits_truncate(0o444),
+                contents.as_bytes(),
+                flags & OFlags::STATUS_FLAGS_MASK,
                 &mut *descriptors,
             )
-            .map_err(Errno::from)?;
-
-        // Delete the file so it's cleaned up when the fd is closed.
-        let _ = files.fs.unlink(&tmp_path, &mut *descriptors);
+            .map_err(|e| match e {
+                CreateAnonymousFileError::NotSupported => Errno::ENOSYS,
+                CreateAnonymousFileError::Io | _ => Errno::EIO,
+            })?;
 
         // Apply CLOEXEC if requested.
         if flags.contains(OFlags::CLOEXEC) {
@@ -1301,6 +1280,10 @@ impl<FS: ShimFS> Task<FS> {
                 unreachable!()
             };
         }
+        let status = flags & OFlags::STATUS_FLAGS_MASK;
+        let None = descriptors.set_entry_metadata(&read_fd, crate::StdioStatusFlags(status)) else {
+            unreachable!()
+        };
         drop(descriptors);
 
         let raw_fd = files.insert_raw_fd(read_fd).map_err(|read_fd| {
@@ -4793,6 +4776,113 @@ impl<FS: ShimFS> Task<FS> {
         Self::check_access_mode(&status, mode)
     }
 
+    /// Handle syscall `utimensat`.
+    ///
+    /// Litebox does not persist atime/mtime updates, but the syscall must still
+    /// validate its target and permissions so callers like `touch` see the same
+    /// failure they would get from a real timestamp update.
+    pub fn sys_utimensat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        times: Option<MutPtr<Timespec>>,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        const UTIME_NOW: u64 = (1 << 30) - 1;
+        const UTIME_OMIT: u64 = (1 << 30) - 2;
+
+        let supported = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        if flags.intersects(!supported) {
+            return Err(Errno::EINVAL);
+        }
+
+        let all_omit = if let Some(times) = times {
+            let atime = times.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let mtime = times.read_at_offset(1).ok_or(Errno::EFAULT)?;
+            for ts in [atime, mtime] {
+                if !(0..1_000_000_000).contains(&ts.tv_nsec)
+                    && ts.tv_nsec != UTIME_NOW
+                    && ts.tv_nsec != UTIME_OMIT
+                {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            atime.tv_nsec == UTIME_OMIT && mtime.tv_nsec == UTIME_OMIT
+        } else {
+            false
+        };
+        if all_omit {
+            return Ok(());
+        }
+
+        self.validate_utimensat_target(dirfd, pathname, flags)
+    }
+
+    fn validate_utimensat_target(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let allow_empty = flags.contains(AtFlags::AT_EMPTY_PATH);
+        let fs_path = FsPath::new_inner(dirfd, pathname, get_cwd, allow_empty)?;
+
+        match fs_path {
+            FsPath::Absolute { path } => {
+                self.validate_utimensat_path(litebox_common_linux::AT_FDCWD, path, flags)
+            }
+            FsPath::Cwd => {
+                let cwd = self.fs.borrow().cwd.read().clone();
+                self.validate_utimensat_path(
+                    litebox_common_linux::AT_FDCWD,
+                    CString::new(cwd).map_err(|_| Errno::EINVAL)?,
+                    flags,
+                )
+            }
+            FsPath::Fd(fd) => {
+                let fd = i32::try_from(fd).map_err(|_| Errno::EBADF)?;
+                self.validate_fd(fd)
+            }
+            FsPath::FdRelative { fd, path } => {
+                let fd = i32::try_from(fd).map_err(|_| Errno::EBADF)?;
+                self.validate_utimensat_path(fd, path, flags)
+            }
+        }
+    }
+
+    fn validate_utimensat_path(
+        &self,
+        dirfd: i32,
+        path: CString,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let empty_path = flags.contains(AtFlags::AT_EMPTY_PATH);
+        let nofollow = flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
+        let mut stat_flags = AtFlags::empty();
+        if empty_path {
+            stat_flags.insert(AtFlags::AT_EMPTY_PATH);
+        }
+        if nofollow {
+            stat_flags.insert(AtFlags::AT_SYMLINK_NOFOLLOW);
+        }
+        let stat = self.sys_newfstatat(dirfd, path.clone(), stat_flags)?;
+        let inode_type = stat.st_mode & 0o170000;
+        if inode_type == 0o040000 {
+            return self.sys_faccessat(dirfd, path, AccessFlags::W_OK, flags);
+        }
+        if nofollow && inode_type == 0o120000 {
+            return Ok(());
+        }
+
+        let mut open_flags = OFlags::WRONLY;
+        if nofollow {
+            open_flags.insert(OFlags::NOFOLLOW);
+        }
+        let fd = self.sys_openat(dirfd, path, open_flags, Mode::empty())?;
+        self.sys_close(i32::try_from(fd).map_err(|_| Errno::EBADF)?)
+    }
+
     /// Handle `faccessat` and `faccessat2` syscalls.
     pub fn sys_faccessat(
         &self,
@@ -6191,6 +6281,24 @@ impl<FS: ShimFS> Task<FS> {
         let mode = litebox::fs::Mode::from_bits_truncate(mode);
         match fs_path {
             FsPath::Absolute { path } => {
+                // `/proc/self/fd/N` and `/dev/fd/N` are guest-relative fd
+                // references: `N` names a *guest* fd, meaningful only in the
+                // guest fd namespace. Resolve to the fd's real path here (as
+                // `openat`/`stat` already do) so the broker chmods the file
+                // behind fd `N` — not whatever its own host fd `N` happens to
+                // point at. glibc `tar` depends on this: it sets extracted-file
+                // modes via `fchmodat(AT_FDCWD, "/proc/self/fd/N", mode)`, and
+                // without the translation every such call mis-resolves
+                // broker-side (the broker canonicalizes the literal path
+                // against its own `/proc/self/fd`).
+                let procfd = path.to_str().ok().and_then(|s| {
+                    (s.starts_with("/proc/self/fd/") || s.starts_with("/dev/fd/"))
+                        .then(|| s.to_string())
+                });
+                let path = match procfd {
+                    Some(s) => CString::new(self.do_readlink(&s)?).map_err(|_| Errno::EINVAL)?,
+                    None => path,
+                };
                 let mut descriptors = self.global.litebox.descriptor_table_mut();
                 self.files
                     .borrow()
@@ -8524,6 +8632,15 @@ impl<FS: ShimFS> Task<FS> {
             });
             match inner_result {
                 Ok(epoll_events) => {
+                    #[cfg(feature = "audit_log")]
+                    if !epoll_events.is_empty() && crate::audit::is_enabled() {
+                        crate::audit::emit_epoll_ready_events(
+                            self.pid,
+                            self.tid,
+                            epfd,
+                            &epoll_events,
+                        );
+                    }
                     if !epoll_events.is_empty() {
                         if let Err(e) = events
                             .copy_from_slice(0, &epoll_events)

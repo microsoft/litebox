@@ -1297,6 +1297,15 @@ impl Server {
             return error_response(libc::EPERM as u32);
         }
 
+        // Access authorized — record the first touch of this path for the
+        // "allowed" frontier (de-duplicated inside the audit log).
+        if let Some(ref al) = self.audit_log {
+            al.fs_allowed(
+                resolved.to_str().unwrap_or("?"),
+                if is_write { "write" } else { "read" },
+            );
+        }
+
         let mut opts = fs::OpenOptions::new();
         configure_open_options(&mut opts, flags);
 
@@ -1379,6 +1388,9 @@ impl Server {
             .check(Action::Open, Some(resolved_target.as_path()))
             == Decision::Deny
         {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(resolved_target.to_str().unwrap_or("?"), "create");
+            }
             return error_response(libc::EPERM as u32);
         }
         if self
@@ -1386,6 +1398,9 @@ impl Server {
             .check(Action::Write, Some(resolved_target.as_path()))
             == Decision::Deny
         {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(resolved_target.to_str().unwrap_or("?"), "write");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -1430,7 +1445,16 @@ impl Server {
                     iounit: msize - fcall::IOHDRSZ,
                 })
             }
-            Err(e) => io_error_response(e),
+            Err(e) => {
+                let denied = e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error().is_some_and(|errno| {
+                        errno == libc::EACCES || errno == libc::EPERM || errno == libc::EROFS
+                    });
+                if denied && let Some(ref al) = self.audit_log {
+                    al.fs_denied(resolved_target.to_str().unwrap_or("?"), "write");
+                }
+                io_error_response(e)
+            }
         }
     }
 
@@ -1462,6 +1486,9 @@ impl Server {
         }
 
         if self.policy.check(Action::Write, Some(&target)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(target.to_str().unwrap_or("?"), "symlink");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -1671,6 +1698,9 @@ impl Server {
                 Err(errno) => return error_response(errno),
             };
             if self.policy.check(Action::Chmod, Some(&resolved)) == Decision::Deny {
+                if let Some(ref al) = self.audit_log {
+                    al.fs_denied(resolved.to_str().unwrap_or("?"), "chmod");
+                }
                 return error_response(libc::EPERM as u32);
             }
             let perms = fs_compat::permissions_from_mode(req.stat.mode);
@@ -1689,6 +1719,9 @@ impl Server {
                 Err(errno) => return error_response(errno),
             };
             if self.policy.check(Action::Truncate, Some(&resolved)) == Decision::Deny {
+                if let Some(ref al) = self.audit_log {
+                    al.fs_denied(resolved.to_str().unwrap_or("?"), "truncate");
+                }
                 return error_response(libc::EPERM as u32);
             }
             let open_file = {
@@ -1824,6 +1857,9 @@ impl Server {
         }
 
         if self.policy.check(Action::Mkdir, Some(&target)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(target.to_str().unwrap_or("?"), "mkdir");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -1951,9 +1987,15 @@ impl Server {
 
         // Policy checks on both source and destination
         if self.policy.check(Action::Write, Some(&resolved_src)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(resolved_src.to_str().unwrap_or("?"), "rename");
+            }
             return error_response(libc::EPERM as u32);
         }
         if self.policy.check(Action::Write, Some(&dst)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(dst.to_str().unwrap_or("?"), "rename");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -2029,9 +2071,15 @@ impl Server {
 
         // Policy checks on both source and destination
         if self.policy.check(Action::Write, Some(&src)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(src.to_str().unwrap_or("?"), "rename");
+            }
             return error_response(libc::EPERM as u32);
         }
         if self.policy.check(Action::Write, Some(&dst)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(dst.to_str().unwrap_or("?"), "rename");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -2795,6 +2843,55 @@ mod tests {
             open_file_id: None,
         };
         write_lock(&server.fids, "fids").insert(fid, Arc::new(RwLock::new(state)));
+    }
+
+    fn insert_closed_fid(server: &Server, fid: u32, path: &Path) {
+        let qid = metadata_to_qid(&fs::metadata(path).expect("fid metadata"));
+        let state = FidState {
+            path: path.to_path_buf(),
+            readlink_path: None,
+            file: None,
+            patched_data: None,
+            patched_offset: 0,
+            qid,
+            is_open: false,
+            is_canonical: true,
+            open_file_id: None,
+        };
+        write_lock(&server.fids, "fids").insert(fid, Arc::new(RwLock::new(state)));
+    }
+
+    #[test]
+    fn lcreate_policy_denial_emits_fs_denied_audit_event() {
+        let root = temp_root();
+        let audit_path = root.path().join("audit.jsonl");
+        let mut server = Server::new(
+            root.path().to_path_buf(),
+            Arc::new(crate::policy::ReadOnlyPolicy),
+            false,
+            Arc::new(InotifyDispatcher::new()),
+        );
+        server.set_audit_log(crate::audit::AuditLog::open(&audit_path).expect("open audit log"));
+        insert_closed_fid(&server, 1, root.path());
+
+        assert!(matches!(
+            server.handle_lcreate(
+                1,
+                "denied".to_string(),
+                fcall::LOpenFlags::O_WRONLY,
+                0o644,
+                0
+            ),
+            Fcall::Rlerror(fcall::Rlerror { ecode }) if ecode == libc::EPERM as u32
+        ));
+
+        let audit = fs::read_to_string(&audit_path).expect("read audit log");
+        assert!(
+            audit.contains(r#""event":"fs_denied""#)
+                && audit.contains(r#""action":"write""#)
+                && audit.contains("denied"),
+            "missing create/write denial audit event: {audit}"
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::protocol::Response;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -20,12 +20,14 @@ const PROC_SELF_CASES: &[&str] = &[
     "exe_points_to_guest_program",
     "fd_lists_guest_table",
     "fd_N_symlink_target_correct",
+    "fd_N_chmod_reaches_real_file",
     "cmdline_is_guest_argv",
     "cwd_matches_guest_chdir",
     "status_pid_is_guest_pid",
     "maps_contains_guest_program",
     "auxv_is_guest_values",
     "comm_is_guest_progname",
+    "synthetic_proc_no_tmp_dependency",
 ];
 
 pub(crate) fn register_proc_self_tests(reg: &mut Registry<'_>) {
@@ -79,12 +81,14 @@ fn proc_self_leaf(args: &[String]) -> i32 {
         "exe_points_to_guest_program" => check_exe_points_to_guest_program(args),
         "fd_lists_guest_table" => check_fd_lists_guest_table(),
         "fd_N_symlink_target_correct" => check_fd_n_symlink_target_correct(),
+        "fd_N_chmod_reaches_real_file" => check_fd_n_chmod_reaches_real_file(),
         "cmdline_is_guest_argv" => check_cmdline_is_guest_argv(args),
         "cwd_matches_guest_chdir" => check_cwd_matches_guest_chdir(),
         "status_pid_is_guest_pid" => check_status_pid_is_guest_pid(),
         "maps_contains_guest_program" => check_maps_contains_guest_program(args),
         "auxv_is_guest_values" => check_auxv_is_guest_values(),
         "comm_is_guest_progname" => check_comm_is_guest_progname(),
+        "synthetic_proc_no_tmp_dependency" => check_synthetic_proc_no_tmp_dependency(),
         other => Err(format!("unknown case {other}")),
     };
 
@@ -154,6 +158,43 @@ fn check_fd_n_symlink_target_correct() -> Result<String, String> {
             "fd={fd} target={} expected={}",
             target.display(),
             expected.display()
+        ))
+    }
+}
+
+/// A chmod through `/proc/self/fd/N` must land on the file behind fd N.
+///
+/// This is exactly how musl's `fchmod(fd, mode)` is implemented and how GNU
+/// `tar` sets permissions while extracting — so it is the minimal repro for the
+/// VS Code Remote-SSH server tar-extraction failure under Litebox, where every
+/// `fchmodat(AT_FDCWD, "/proc/self/fd/N", …)` mis-resolves broker-side (the
+/// broker canonicalizes `/proc/self/fd/N` against *its own* fd table). Under an
+/// allow-all policy it silently chmods the wrong file (the guest's file keeps
+/// its old mode); under an enforcing policy it surfaces as `EPERM`.
+///
+/// Native: `chmod("/proc/self/fd/N", 0o755)` follows the magic symlink and the
+/// real file becomes `0o755`.
+fn check_fd_n_chmod_reaches_real_file() -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = unique_shared_path("proc-self-fd-chmod");
+    fs::write(&path, b"chmod-target").map_err(|e| format!("write {}: {e}", path.display()))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("set initial mode {}: {e}", path.display()))?;
+    let file = File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let fd = file.as_raw_fd();
+    let proc_path = format!("/proc/self/fd/{fd}");
+    fs::set_permissions(&proc_path, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod via {proc_path}: {e}"))?;
+    let mode = fs::metadata(&path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode == 0o755 {
+        Ok(format!("fd={fd} mode={mode:o}"))
+    } else {
+        Err(format!(
+            "chmod via {proc_path} did not reach the file behind fd {fd}: mode={mode:o} expected=755"
         ))
     }
 }
@@ -280,6 +321,75 @@ fn check_comm_is_guest_progname() -> Result<String, String> {
         Ok(format!("comm={comm}"))
     } else {
         Err(format!("comm={comm:?} expected={expected:?}"))
+    }
+}
+
+fn check_synthetic_proc_no_tmp_dependency() -> Result<String, String> {
+    let mut file = File::open("/proc/self/stat").map_err(|e| format!("open stat: {e}"))?;
+    let fd_target = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|e| format!("readlink stat fd: {e}"))?;
+    if fd_target.to_string_lossy().contains(".proc_synthetic_") {
+        return Err(format!(
+            "synthetic proc fd is backed by /tmp temp file: {}",
+            fd_target.display()
+        ));
+    }
+
+    let size = file
+        .metadata()
+        .map_err(|e| format!("fstat stat: {e}"))?
+        .len();
+
+    let mut first = String::new();
+    file.read_to_string(&mut first)
+        .map_err(|e| format!("first read stat: {e}"))?;
+    let pos = file
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek stat: {e}"))?;
+    let mut second = String::new();
+    file.read_to_string(&mut second)
+        .map_err(|e| format!("second read stat: {e}"))?;
+
+    let first_identity = proc_stat_identity(&first)?;
+    let second_identity = proc_stat_identity(&second)?;
+    if first.is_empty() || second.is_empty() || first_identity != second_identity || pos != 0 {
+        return Err(format!(
+            "bad stat read: first_len={} second_len={} first_id={first_identity:?} second_id={second_identity:?} pos={pos} size={size}",
+            first.len(),
+            second.len(),
+        ));
+    }
+
+    drop(file);
+    assert_no_proc_synthetic_tmp_files()?;
+    Ok(format!(
+        "len={} size={size} fd_target={}",
+        first.len(),
+        fd_target.display()
+    ))
+}
+
+fn proc_stat_identity(stat: &str) -> Result<&str, String> {
+    stat.find(") ")
+        .map(|end| &stat[..=end])
+        .ok_or_else(|| format!("malformed proc stat: {stat:?}"))
+}
+
+fn assert_no_proc_synthetic_tmp_files() -> Result<(), String> {
+    let entries = fs::read_dir("/tmp")
+        .map_err(|e| format!("read_dir /tmp after restore: {e}"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read_dir /tmp entry after restore: {e}"))?;
+    let leaked: Vec<_> = entries
+        .iter()
+        .filter_map(|name| name.to_str())
+        .filter(|name| name.starts_with(".proc_synthetic_"))
+        .collect();
+    if leaked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("leaked synthetic proc temp files: {leaked:?}"))
     }
 }
 

@@ -22,8 +22,12 @@ all encoded the manual full-stack workflow we are trying to eliminate.
 
 Audit-log viewers.
 
-- `View-AuditLog.ps1`, `Tail-AuditLog.ps1` — audit log viewers.
-  Referenced from `litebox_tool_executor/demo/.vscode/tasks.json`.
+- `View-AuditLog.ps1`, `Tail-AuditLog.ps1` — **legacy** Windows-only
+  PowerShell audit-log viewers, referenced from the old
+  `litebox_tool_executor/demo/.vscode/tasks.json`. Superseded by the
+  cross-platform `litebox_audit_query watch` (and `watch --tree`, the
+  live allow/deny frontier), which the WSL2-native
+  `demo-vscode-server` workflow uses.
 
 ### `vscode/`
 

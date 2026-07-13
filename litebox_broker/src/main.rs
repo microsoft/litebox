@@ -149,6 +149,7 @@ fn build_local_services(
     cli: &Cli,
     elf_cache: Arc<Mutex<litebox_broker::nine_p::server::ElfCache>>,
     sandbox_policy: &Option<Arc<litebox_broker::sandbox_policy::SandboxPolicy>>,
+    audit_log: Option<litebox_broker::audit::AuditLog>,
     inotify_dispatcher: Arc<litebox_broker::inotify_dispatcher::InotifyDispatcher>,
     ofd_registry: Arc<litebox_broker::ofd_registry::OfdRegistry>,
     nine_p_session_registry: Arc<litebox_broker::nine_p_session_registry::NinePSessionRegistry>,
@@ -168,6 +169,7 @@ fn build_local_services(
         let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
         let ofd_registry = Arc::clone(&ofd_registry);
         let nine_p_session_registry = Arc::clone(&nine_p_session_registry);
+        let audit_log = audit_log.clone();
         registry.register(
             5640,
             Box::new(move |stream| {
@@ -177,6 +179,7 @@ fn build_local_services(
                 let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
                 let ofd_registry = Arc::clone(&ofd_registry);
                 let nine_p_session_registry = Arc::clone(&nine_p_session_registry);
+                let audit_log = audit_log.clone();
                 std::thread::spawn(move || {
                     let mut stream = stream;
                     let mut server = litebox_broker::nine_p::server::Server::with_elf_cache(
@@ -186,6 +189,9 @@ fn build_local_services(
                         elf_cache,
                         inotify_dispatcher,
                     );
+                    if let Some(al) = audit_log {
+                        server.set_audit_log(al);
+                    }
                     // Legacy-pipes Phase 3 (D3): every 9P Server
                     // shares the broker-global OFD registry so
                     // RegisterOfd/CloneOfd can plumb host OFDs
@@ -220,6 +226,7 @@ fn build_local_services(
         let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
         let ofd_registry = Arc::clone(&ofd_registry);
         let nine_p_session_registry = Arc::clone(&nine_p_session_registry);
+        let audit_log = audit_log.clone();
         registry.register_ring(
             5640,
             Arc::new(move |writer, reader, conn_id| {
@@ -229,6 +236,7 @@ fn build_local_services(
                 let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
                 let ofd_registry = Arc::clone(&ofd_registry);
                 let nine_p_session_registry = Arc::clone(&nine_p_session_registry);
+                let audit_log = audit_log.clone();
                 std::thread::spawn(move || {
                     let mut server_inner = litebox_broker::nine_p::server::Server::with_elf_cache(
                         root,
@@ -237,6 +245,9 @@ fn build_local_services(
                         elf_cache,
                         inotify_dispatcher,
                     );
+                    if let Some(al) = audit_log {
+                        server_inner.set_audit_log(al);
+                    }
                     server_inner.set_ofd_registry(ofd_registry);
                     server_inner.set_conn_id(conn_id);
                     let server = Arc::new(server_inner);
@@ -270,6 +281,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     litebox_timing::emit("broker_args_parsed_ns");
     let sandbox_policy = load_sandbox_policy(&cli);
     litebox_timing::emit("broker_policy_loaded_ns");
+
+    // Open the audit log file for structured broker events. Opened before the
+    // state registry so the registry's network enforcer can emit its policy
+    // decisions (tcp_allowed / tcp_denied / dns_resolved) into the same file.
+    let audit_log =
+        cli.audit_log
+            .as_ref()
+            .and_then(|path| match litebox_broker::audit::AuditLog::open(path) {
+                Ok(al) => {
+                    info!(?path, "audit log opened");
+                    Some(al)
+                }
+                Err(e) => {
+                    tracing::error!("failed to open audit log {}: {e}", path.display());
+                    None
+                }
+            });
+    litebox_timing::emit("broker_audit_open_ns");
+
+    // Log policy summary to audit.
+    if let (Some(al), Some(sp)) = (&audit_log, &sandbox_policy) {
+        al.policy_loaded(
+            cli.policy
+                .as_ref()
+                .map(|p| p.to_str().unwrap_or("<non-utf8>"))
+                .unwrap_or("<default>"),
+            sp,
+        );
+    }
 
     // Phase B-Step8d: optionally host the fd-token / state-object
     // control listener. Runners connect via `--fd-token-broker <path>`
@@ -305,10 +345,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     litebox_broker::nine_p_session_registry::set_global(std::sync::Arc::clone(
         &nine_p_session_registry,
     ));
-    let shared_state_registry = cli
-        .fd_token_broker_listen
-        .as_ref()
-        .map(|_| std::sync::Arc::new(litebox_broker::state_registry::BrokerStateRegistry::new()));
+    let shared_state_registry = cli.fd_token_broker_listen.as_ref().map(|_| {
+        std::sync::Arc::new(
+            litebox_broker::state_registry::BrokerStateRegistry::with_net_enforcement(
+                sandbox_policy.clone(),
+                audit_log.clone(),
+            ),
+        )
+    });
     let _fd_token_listener: Option<std::thread::JoinHandle<()>> =
         if let Some(path) = cli.fd_token_broker_listen.as_ref() {
             let fd_registry =
@@ -348,33 +392,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
 
-    // Open the audit log file for structured broker events.
-    let audit_log =
-        cli.audit_log
-            .as_ref()
-            .and_then(|path| match litebox_broker::audit::AuditLog::open(path) {
-                Ok(al) => {
-                    info!(?path, "audit log opened");
-                    Some(al)
-                }
-                Err(e) => {
-                    tracing::error!("failed to open audit log {}: {e}", path.display());
-                    None
-                }
-            });
-    litebox_timing::emit("broker_audit_open_ns");
-
-    // Log policy summary to audit.
-    if let (Some(al), Some(sp)) = (&audit_log, &sandbox_policy) {
-        al.policy_loaded(
-            cli.policy
-                .as_ref()
-                .map(|p| p.to_str().unwrap_or("<non-utf8>"))
-                .unwrap_or("<default>"),
-            sp,
-        );
-    }
-
     // Network proxy mode (fd passed from runner — Unix only).
     #[cfg(unix)]
     if let Some(fd_num) = cli.network_proxy_fd {
@@ -388,6 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &cli,
             elf_cache,
             &sandbox_policy,
+            audit_log.clone(),
             Arc::clone(&inotify_dispatcher),
             Arc::clone(&ofd_registry),
             Arc::clone(&nine_p_session_registry),
@@ -529,6 +547,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &cli,
                 Arc::clone(&elf_cache),
                 &sandbox_policy,
+                audit_log.clone(),
                 Arc::clone(&inotify_dispatcher),
                 Arc::clone(&ofd_registry),
                 Arc::clone(&nine_p_session_registry),

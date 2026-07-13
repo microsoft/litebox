@@ -68,6 +68,7 @@ use std::sync::{Arc, Mutex};
 use litebox_common_linux::cwfd::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::cwfd::notification_ring::NotificationSender;
 
+use crate::audit::AuditLog;
 use crate::cwfd::eventfd_state::EventfdState;
 use crate::cwfd::host_fd_state::HostFdState;
 use crate::cwfd::inet_dgram_state::InetDgramState;
@@ -86,6 +87,8 @@ use crate::cwfd::subscription_list::{SubscribeError, UnsubscribeError};
 use crate::cwfd::tcp_conn_state::TcpConnState;
 use crate::cwfd::timerfd_state::TimerfdState;
 use crate::cwfd::unix_stream_state::UnixStreamState;
+use crate::net_enforce::NetEnforcer;
+use crate::sandbox_policy::SandboxPolicy;
 
 /// An opaque, broker-global handle to a [`StateObject`] held by the
 /// broker on behalf of one or more workers.
@@ -642,6 +645,11 @@ pub struct DiagnosticEntry {
 /// [`StateHandle`]s.
 pub struct BrokerStateRegistry {
     state: Mutex<State>,
+    /// Broker-global network enforcement context (policy + audit + DNS
+    /// reverse map), shared with every broker-held UDP socket and consulted
+    /// by the inet TCP connect handler. Disabled (no-op) unless the broker
+    /// was started with a policy.
+    net: Arc<NetEnforcer>,
 }
 
 impl Default for BrokerStateRegistry {
@@ -655,6 +663,20 @@ impl BrokerStateRegistry {
     /// reserved as a sentinel "no handle" for any wire encoding that
     /// wants an absent value.
     pub fn new() -> Self {
+        Self::with_net(NetEnforcer::disabled())
+    }
+
+    /// Creates a registry whose inet connect handler enforces `policy` and
+    /// records decisions to `audit`. A `None` policy disables network
+    /// enforcement (every connect is allowed and none are audited).
+    pub fn with_net_enforcement(
+        policy: Option<Arc<SandboxPolicy>>,
+        audit: Option<AuditLog>,
+    ) -> Self {
+        Self::with_net(NetEnforcer::new(policy, audit))
+    }
+
+    fn with_net(net: Arc<NetEnforcer>) -> Self {
         Self {
             state: Mutex::new(State {
                 next_id: 1,
@@ -663,7 +685,15 @@ impl BrokerStateRegistry {
                 broker_held_inet_listener_cursor: HashMap::new(),
                 inbound_forwarded_ports: HashSet::new(),
             }),
+            net,
         }
+    }
+
+    /// The broker-global network enforcement context. Fed by the UDP DNS
+    /// forwarder ([`NetEnforcer::record_dns_response`]) and consulted by the
+    /// inet TCP connect handler ([`NetEnforcer::allow_connect`]).
+    pub fn net(&self) -> &Arc<NetEnforcer> {
+        &self.net
     }
 
     /// Records the set of guest ports that the broker's `net_proxy`

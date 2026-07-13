@@ -54,10 +54,11 @@ Then once VS Code is open:
 
 1. **Terminal → Run Task → `LiteBox: Setup and Start VS Code Server`** —
    one-shot: builds the litebox binaries, builds the
-   `litebox-vscode` Docker image, then `docker run`s it.
-   The three component tasks (`Build`, `Build VS Code Image`,
-   `Start VS Code Server`) are also runnable individually if
-   you only need to redo one step.
+   `litebox-vscode` Docker image, creates the demo SSH key if
+   needed, then `docker run`s it. The component tasks (`Build`,
+   `Build VS Code Image`, `Setup SSH Key Auth`, `Start VS Code
+   Server`) are also runnable individually if you only need to
+   redo one step.
 
 2. **In a separate desktop VS Code window** — `Ctrl+Shift+P → Remote-SSH: Connect to Host… → litebox`.
    (See `.vscode/settings.json` in this folder for the
@@ -65,15 +66,62 @@ Then once VS Code is open:
    `127.0.0.1:2222`, and for the recommended VS Code profile
    settings.)
 
-   On the **first** connect VS Code will prompt for a password —
-   just press **Enter** (the demo's dropbear runs with `-B` for
-   blank-password root). With `remote.SSH.showLoginTerminal: true`
-   in your user settings, the prompt surfaces in a terminal you
-   can interact with; otherwise the prompt appears in the
-   notification area at the top of the window.
+   The setup task writes a public key into the container's
+   `/root/.ssh/authorized_keys`, so VS Code should authenticate
+   with the matching private key and never show a password prompt.
+   The demo's dropbear still runs with `-B` as a fallback, but
+   modern VS Code opens multiple SSH connections and password
+   prompts are not reliable for this workflow.
 
 That second window's editor, terminal, and extensions all execute
 **inside** the sandbox.
+
+## Sandbox policy + frontier visualization
+
+The server task runs the sandbox with **policy enforcement on** —
+`--policy /opt/policies/demo-policy.json` (the repo's
+[`litebox_tool_executor/policies/demo-policy.json`](../policies/demo-policy.json)):
+a deny-by-default **network** policy with an allowlist for the hosts
+VS Code and Copilot need, plus **filesystem** rules that block secrets
+(`**/.ssh/**`, `**/id_rsa*`, `**/shadow`, …). This is what makes the
+sandbox *visible*: the coding agent inside cannot reach a
+non-allowlisted address (the broker refuses the outbound connect — the
+guest's `connect()` returns `EPERM`) or read a denied path.
+
+Broker policy decisions are appended as JSONL to the bind-mounted
+`target/litebox-audit/` directory on the host. To watch them live:
+
+- **Terminal → Run Task → `LiteBox: Watch Sandbox Frontier`** — an
+  interactive, collapsible tree of allowed (green) vs denied (red)
+  filesystem paths and network endpoints, collapsed by default with
+  per-node `(N✓ M✗)` counts. Navigate with **↑/↓**, **→/Enter** to
+  expand, **←** to collapse, **q** to quit; it keeps folding in new
+  events live as the agent works.
+- **`LiteBox: Watch Sandbox Trace`** — a scrolling live trace of the
+  same events (broker policy decisions; plus per-syscall events if the
+  runner was built with `--features audit_log`).
+- **`LiteBox: Watch Sandbox (Tree + Trace)`** — opens both of the above
+  side by side in dedicated terminal panels.
+
+Or from any shell in the worktree:
+
+```sh
+# Frontier tree (a directory resolves to its newest *.jsonl):
+cargo run -p litebox_audit_query -- watch --tree target/litebox-audit
+
+# Scrolling policy-decision log (tcp/udp/fs/dns/policy, no syscall noise):
+cargo run -p litebox_audit_query -- watch --policy-only target/litebox-audit
+```
+
+`litebox_audit_query watch` is the cross-platform replacement for the
+old PowerShell `Tail-/View-AuditLog.ps1` viewers.
+
+**Demonstrating a block:** from the sandboxed VS Code terminal, try
+reaching a non-allowlisted host — e.g. `curl https://example.com` or a
+bash `exec 3<>/dev/tcp/1.1.1.1/80` — and it fails; a red node appears
+in the frontier tree. If VS Code itself misbehaves, a host it needs may
+be missing from the allowlist — add it to `demo-policy.json`'s
+`network.allow_connect` and restart the server task.
 
 ### Windows + WSL2 path note
 
@@ -84,6 +132,30 @@ from WSL), and `UserKnownHostsFile` in that file must be `NUL`
 (not `/dev/null`). The demo workspace is opened from WSL via
 `code .`, but the SSH config it uses to connect lives on the
 Windows side.
+
+The `LiteBox: Setup SSH Key Auth` task generates an Ed25519 key
+at `%USERPROFILE%\.ssh\litebox_ed25519` when the Windows profile
+is visible from WSL (`/mnt/c/Users/<USER>/.ssh/litebox_ed25519`).
+If that path is not available, it falls back to WSL's
+`~/.ssh/litebox_ed25519`; copy that private key to the Windows
+`%USERPROFILE%\.ssh\` directory before connecting from desktop
+VS Code.
+
+Add this entry to the Windows `%USERPROFILE%\.ssh\config` file:
+
+```sshconfig
+Host litebox
+  HostName 127.0.0.1
+  Port 2222
+  User root
+  IdentityFile ~/.ssh/litebox_ed25519
+  IdentitiesOnly yes
+  PreferredAuthentications publickey
+  StrictHostKeyChecking no
+  UserKnownHostsFile NUL
+  ConnectionAttempts 1
+  ServerAliveCountMax 1
+```
 
 ## Single demo at a time
 

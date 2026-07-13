@@ -4731,11 +4731,25 @@ impl<FS: ShimFS> Task<FS> {
             }
             SyscallRequest::Fsync { fd: _ }
             | SyscallRequest::Fdatasync { fd: _ }
-            | SyscallRequest::Utimensat
             | SyscallRequest::Seccomp => {
-                // No-op: in-memory FS doesn't need fsync/timestamps, and
-                // seccomp filter installation is handled by the sandbox.
+                // No-op: in-memory FS doesn't need fsync, and seccomp filter
+                // installation is handled by the sandbox.
                 Ok(0)
+            }
+            SyscallRequest::Utimensat {
+                dirfd,
+                pathname,
+                times,
+                mut flags,
+            } => {
+                let pathname = match pathname {
+                    Some(pathname) => pathname.to_cstring().ok_or(Errno::EFAULT)?,
+                    None => {
+                        flags.insert(litebox_common_linux::AtFlags::AT_EMPTY_PATH);
+                        alloc::ffi::CString::new("").expect("empty CString")
+                    }
+                };
+                syscall!(sys_utimensat(dirfd, pathname, times, flags))
             }
             SyscallRequest::Fadvise64 { fd, .. } => {
                 // No-op: file access advice is optional and safe to ignore.

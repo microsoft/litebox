@@ -358,6 +358,23 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         Err(errors::CreateAnonymousFileError::NotSupported)
     }
 
+    /// Create an anonymous regular file pre-populated with `contents`.
+    ///
+    /// `flags` controls the returned descriptor's access mode. This lets
+    /// callers publish immutable synthetic regular files without first
+    /// creating a writable guest-visible fd.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn create_anonymous_file_from_bytes(
+        &self,
+        name: &str,
+        mode: Mode,
+        contents: &[u8],
+        flags: OFlags,
+        descriptors: &mut Descriptors<Self::DescriptorPlatform>,
+    ) -> Result<TypedFd<Self>, errors::CreateAnonymousFileError> {
+        Err(errors::CreateAnonymousFileError::NotSupported)
+    }
+
     /// Allocate a fresh client-side fid number without issuing any
     /// 9P (or backend-equivalent) request.
     ///

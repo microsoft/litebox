@@ -29,6 +29,10 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+mod tree;
+mod tui;
+mod watch;
+
 #[derive(Parser)]
 #[command(name = "litebox_audit_query")]
 #[command(about = "Import and query litebox audit logs via SQLite")]
@@ -63,6 +67,28 @@ enum Commands {
     },
     /// Print the database schema and example queries.
     Schema,
+    /// Live-tail an audit log (JSONL), pretty-printing events with color.
+    ///
+    /// The cross-platform replacement for the legacy PowerShell audit viewers.
+    Watch {
+        /// Path to a JSONL audit log file, or a directory (the most recent
+        /// `*.jsonl` file within it is used).
+        path: PathBuf,
+        /// Render a live-updating "frontier" tree (allowed vs denied
+        /// filesystem paths and network endpoints) instead of a line log.
+        #[arg(long)]
+        tree: bool,
+        /// Print existing content and exit instead of following the file.
+        #[arg(long)]
+        no_follow: bool,
+        /// Show only broker policy events (tcp/udp/fs/dns/policy), hiding the
+        /// per-syscall stream.
+        #[arg(long)]
+        policy_only: bool,
+        /// Only show syscall events whose name contains this substring.
+        #[arg(long)]
+        filter: Option<String>,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -124,6 +150,18 @@ fn main() {
             }
         }
         Commands::Schema => print_schema(),
+        Commands::Watch {
+            path,
+            tree,
+            no_follow,
+            policy_only,
+            filter,
+        } => {
+            if let Err(e) = watch::run(&path, !no_follow, tree, policy_only, filter.as_deref()) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
