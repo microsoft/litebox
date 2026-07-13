@@ -81,6 +81,7 @@ import datetime as _dt
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -5244,43 +5245,201 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_watchdog(args: argparse.Namespace) -> int:
-    """One-shot liveness check: if the supervisor is *supposed* to be
-    running (`auto.enabled` present) but is down or hung (dead pid / not
-    a supervisor / stale heartbeat), relaunch it detached. Idempotent
-    and cheap — run it from cron or a systemd-user timer every few
-    minutes so an accidental kill or crash can't leave the dashboard
-    dark for days (as happened once — a stray SIGTERM with no restart).
+# ─── watchdog: durable up-but-stuck detection + remediation ──────────
+#
+# The systemd `dashboard-watchdog.timer` runs `watchdog` every ~3 min,
+# independent of any interactive session. Besides relaunching a DOWN/HUNG
+# supervisor, it detects the two "UP but not doing its job" modes a
+# liveness check misses (both have run undetected before):
+#   * BUILD_FAILING — looping on docker/infra build failures with a fresh
+#     heartbeat (e.g. a stale Docker-Desktop credential helper failing
+#     every image build). Remediate: fix the docker config if that's the
+#     cause, then restart.
+#   * COVERAGE_GAP — a live agent tip parked/uncovered (the reconciler
+#     spent its retry budget on a transient build race). Remediate: restart
+#     once per (tip, sha) to reset the budget; a re-park at the same sha is
+#     a genuine build failure — logged once, never restart-looped.
+_WATCHDOG_STATE = "watchdog.json"
+_WD_INFRA_FAIL_RE = re.compile(
+    r"Docker build failed|error getting credentials|docker-credential|"
+    r"failed to solve|ERROR: failed to build",
+    re.I,
+)
+_WD_INFRA_FAIL_ALARM = 20
+_WD_LOG_READ_CAP = 64 * 1024 * 1024
+_WD_PARKED_STALL_MS = 30 * 60 * 1000
+_WD_PARKED_GRACE_MS = 45 * 60 * 1000
+_WD_REMEDIATION_COOLDOWN_MS = 20 * 60 * 1000
 
-    Does nothing when the supervisor was intentionally stopped (`stop`
-    removed `auto.enabled`) or is healthy."""
-    state_dir = resolve_state_dir(args.state_dir)
-    enabled = _enabled_path(state_dir)
-    if not enabled.exists():
-        if not args.quiet:
-            print("[watchdog] auto.enabled absent — supervisor "
-                  "intentionally stopped; nothing to do")
-        return 0
-    pf = _read_pidfile(state_dir / "auto.pidfile")
-    status, age = _supervisor_health(pf, now_ms())
-    if status == "up":
-        if not args.quiet:
-            print(f"[watchdog] supervisor healthy "
-                  f"(pid {pf.get('supervisor_pid')}, {_fmt_hb_age(age)})")
-        return 0
-    reason = "no pidfile" if pf is None else (
-        f"heartbeat stale ({age // 1000}s)" if status == "hung"
-        else "pid dead / not a supervisor")
+
+def _wd_load_state(state_dir: Path) -> dict:
     try:
-        spec = json.loads(enabled.read_text())
-    except (json.JSONDecodeError, OSError):
-        spec = {}
+        return json.loads((state_dir / _WATCHDOG_STATE).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _wd_save_state(state_dir: Path, st: dict) -> None:
+    st["ts"] = now_ms()
+    try:
+        (state_dir / _WATCHDOG_STATE).write_text(json.dumps(st))
+    except OSError:
+        pass
+
+
+def _wd_scan_infra_failures(state_dir: Path, st: dict) -> int:
+    """New infra/build-failure markers appended to auto.log since the last
+    scan (byte-offset high-water mark in ``st``). First run / rotation
+    baselines silently to EOF (returns 0), so a historical backlog never
+    triggers a remediation."""
+    log = state_dir / "auto.log"
+    try:
+        size = log.stat().st_size
+    except OSError:
+        return 0
+    off = st.get("auto_log_off")
+    if off is None or off > size:  # first run / rotation
+        st["auto_log_off"] = size
+        return 0
+    start = max(off, size - _WD_LOG_READ_CAP)
+    n = 0
+    try:
+        with open(log, "rb") as f:
+            f.seek(start)
+            data = f.read(size - start)
+        n = len(_WD_INFRA_FAIL_RE.findall(data.decode("utf-8", "replace")))
+    except OSError:
+        pass
+    st["auto_log_off"] = size
+    return n
+
+
+def _wd_parked_tips(
+    args: argparse.Namespace, state_dir: Path, st: dict, now: int,
+) -> list[tuple[str, str]]:
+    """Live agent tips PARKED — uncovered/stalled past the grace window
+    (the reconciler can't cover them). Tracks first-seen/last-progress per
+    (branch, sha) in ``st['tips']`` and returns ``[(branch, sha)]``. Uses a
+    read-only connection so it never perturbs the store."""
+    try:
+        canonical = _canonical_worktree(args, state_dir)
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        conn = sqlite3.connect(
+            f"file:{state_dir}/results.sqlite?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            tips, _ = _agent_tip_worktrees(conn, canonical)
+        except Exception:  # noqa: BLE001
+            return []
+        tip_state = st.setdefault("tips", {})
+        parked: list[tuple[str, str]] = []
+        live: set[str] = set()
+        for w in tips:
+            ref = w.get("branch") or w.get("path")
+            sha = w.get("head")
+            if not ref or not sha:
+                continue
+            live.add(ref)
+            agg = conn.execute(
+                "SELECT COUNT(*) univ, "
+                "COALESCE(SUM(classification!='not_run'),0) cov "
+                "FROM regression_class WHERE branch_sha=?", (sha,)
+            ).fetchone()
+            univ, cov = (agg["univ"], agg["cov"]) if agg else (0, 0)
+            rate = conn.execute(
+                "SELECT COUNT(*) FROM run_results rr JOIN runs run ON "
+                "run.run_id=rr.run_id WHERE run.commit_sha=? AND "
+                "rr.finished_ts_ms>?-300000", (sha, now)
+            ).fetchone()[0]
+            ts = tip_state.get(ref)
+            if ts is None or ts.get("sha") != sha:
+                ts = {"sha": sha, "first_seen_ms": now,
+                      "last_progress_ms": now}
+            covered = univ > 0 and cov >= univ
+            if covered or rate > 0:
+                ts["last_progress_ms"] = now
+            tip_state[ref] = ts
+            stalled = now - ts["last_progress_ms"]
+            age = now - ts["first_seen_ms"]
+            if (not covered and stalled >= _WD_PARKED_STALL_MS
+                    and age >= _WD_PARKED_GRACE_MS):
+                parked.append((ref, sha))
+        for k in list(tip_state):
+            if k not in live:
+                tip_state.pop(k, None)
+        return parked
+    finally:
+        conn.close()
+
+
+def _wd_stuck_plan(
+    infra_fails: int, parked: list[tuple[str, str]], st: dict, now: int,
+) -> dict:
+    """Pure remediation decision for an UP-but-stuck supervisor. Returns
+    ``{restart, fix_docker, reason, mark, stale}``. At most one restart per
+    ``_WD_REMEDIATION_COOLDOWN_MS``; a tip already remediated at its current
+    sha is ``stale`` (a genuine build failure → log, never restart again).
+    Kept pure so the risky decision is unit-tested in isolation."""
+    remediated = st.get("remediated_parks", {})
+    new_parks = [(b, s) for (b, s) in parked if remediated.get(b) != s]
+    stale = [(b, s) for (b, s) in parked if remediated.get(b) == s]
+    on_cooldown = (now - st.get("last_remediation_ms", 0)) \
+        < _WD_REMEDIATION_COOLDOWN_MS
+    build_failing = infra_fails > _WD_INFRA_FAIL_ALARM
+    if build_failing and not on_cooldown:
+        return {"restart": True, "fix_docker": True,
+                "reason": f"BUILD_FAILING ({infra_fails} new build-fails)",
+                "mark": [], "stale": stale}
+    if new_parks and not on_cooldown:
+        names = ",".join(b for b, _ in new_parks)
+        return {"restart": True, "fix_docker": False,
+                "reason": f"COVERAGE_GAP (parked: {names})",
+                "mark": new_parks, "stale": stale}
+    reason = "stuck but on remediation cooldown" \
+        if (build_failing or new_parks) and on_cooldown else ""
+    return {"restart": False, "fix_docker": False, "reason": reason,
+            "mark": [], "stale": stale}
+
+
+def _wd_fix_docker_config(quiet: bool) -> bool:
+    """If ``~/.docker/config.json`` carries a credential helper that can't
+    run under native docker (the Docker-Desktop leftover that once broke
+    every image build), back it up and replace it with an anonymous-pull
+    config. Idempotent — returns True only if it changed something."""
+    cfg = Path.home() / ".docker" / "config.json"
+    try:
+        data = json.loads(cfg.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not data.get("credsStore") and not data.get("credHelpers"):
+        return False
+    try:
+        cfg.replace(cfg.parent / f"config.json.bak-{int(time.time())}")
+    except OSError:
+        pass
+    try:
+        cfg.write_text('{\n\t"auths": {}\n}\n')
+    except OSError:
+        return False
+    if not quiet:
+        print("[watchdog] removed stale docker credsStore/credHelpers "
+              "(native-docker anonymous pull)", file=sys.stderr)
+    return True
+
+
+def _wd_relaunch(state_dir: Path, spec: dict) -> None:
+    """Relaunch the supervisor detached, appending to auto.log. Env (incl.
+    DOCKER_HOST + LITEBOX_*_JOBS) is inherited from this process — the
+    systemd unit sets it, so a watchdog relaunch stays on native docker."""
     argv = spec.get("argv") or []
     cwd = spec.get("cwd") or os.getcwd()
     script = str(Path(__file__).resolve())
     rest = argv[1:] if argv else ["auto"]
-    print(f"[watchdog] supervisor DOWN ({reason}) — relaunching "
-          f"`{' '.join(rest)}` in {cwd}", file=sys.stderr)
     logf = None
     try:
         logf = open(state_dir / "auto.log", "a")
@@ -5294,6 +5453,122 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
     )
     if logf is not None:
         logf.close()
+
+
+def _wd_restart_supervisor(state_dir: Path, pf: Optional[dict],
+                           spec: dict, quiet: bool) -> None:
+    """Stop the current (up-but-stuck) supervisor and relaunch it, KEEPING
+    auto.enabled so it stays 'supposed to be running' (unlike `stop`)."""
+    sup = pf.get("supervisor_pid") if pf else None
+    if sup:
+        try:
+            os.kill(sup, signal.SIGTERM)
+        except ProcessLookupError:
+            sup = None
+    if sup:
+        deadline = time.monotonic() + _SUPERVISOR_SIGTERM_GRACE_SECS
+        while time.monotonic() < deadline:
+            try:
+                os.kill(sup, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.5)
+        else:
+            try:
+                os.kill(sup, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    for slot in (pf.get("children") or []) if pf else []:
+        _reap_pgid_and_containers(
+            slot.get("cargo_pgid"), slot.get("harness_pid"), quiet=quiet)
+    _wd_relaunch(state_dir, spec)
+
+
+def cmd_watchdog(args: argparse.Namespace) -> int:
+    """One-shot liveness check: if the supervisor is *supposed* to be
+    running (`auto.enabled` present) but is down or hung (dead pid / not
+    a supervisor / stale heartbeat), relaunch it detached. Idempotent
+    and cheap — run it from cron or a systemd-user timer every few
+    minutes so an accidental kill or crash can't leave the dashboard
+    dark for days (as happened once — a stray SIGTERM with no restart).
+
+    Beyond liveness it also detects the two "supervisor UP but not doing
+    its job" modes a heartbeat check misses — BUILD_FAILING (looping on
+    docker/infra build failures, fresh heartbeat) and COVERAGE_GAP (a live
+    tip parked/uncovered because the reconciler spent its retry budget) —
+    and remediates (docker-config fix + restart), cooldown- and
+    dedup-guarded so a persistent failure can't turn the 3-min timer into a
+    restart storm. Because it runs from the systemd timer, this protection
+    is durable and session-independent.
+
+    Does nothing when the supervisor was intentionally stopped (`stop`
+    removed `auto.enabled`) or is healthy."""
+    state_dir = resolve_state_dir(args.state_dir)
+    enabled = _enabled_path(state_dir)
+    if not enabled.exists():
+        if not args.quiet:
+            print("[watchdog] auto.enabled absent — supervisor "
+                  "intentionally stopped; nothing to do")
+        return 0
+    pf = _read_pidfile(state_dir / "auto.pidfile")
+    status, age = _supervisor_health(pf, now_ms())
+    try:
+        spec = json.loads(enabled.read_text())
+    except (json.JSONDecodeError, OSError):
+        spec = {}
+    if status == "up":
+        # Beyond liveness: catch the two "UP but not doing its job" modes a
+        # heartbeat check misses, and remediate (cooldown/dedup-guarded).
+        wst = _wd_load_state(state_dir)
+        infra_fails = _wd_scan_infra_failures(state_dir, wst)
+        parked = _wd_parked_tips(args, state_dir, wst, now_ms())
+        plan = _wd_stuck_plan(infra_fails, parked, wst, now_ms())
+        logged = wst.setdefault("logged_stale", {})
+        for b, s in plan["stale"]:
+            if logged.get(b) != s:
+                print(f"[watchdog] {b} @ {s[:8]} STILL parked after prior "
+                      f"remediation — genuine build failure? needs attention",
+                      file=sys.stderr)
+                logged[b] = s
+        if plan["restart"]:
+            if plan["fix_docker"]:
+                _wd_fix_docker_config(quiet=args.quiet)
+            print(f"[watchdog] supervisor UP but stuck: {plan['reason']} — "
+                  f"restarting to remediate", file=sys.stderr)
+            try:
+                with open(state_dir / "auto.log", "a") as lf:
+                    lf.write(f"\n=== watchdog remediation "
+                             f"{_dt.datetime.now():%H:%M:%S}: "
+                             f"{plan['reason']} ===\n")
+            except OSError:
+                pass
+            _wd_restart_supervisor(state_dir, pf, spec, quiet=args.quiet)
+            wst["last_remediation_ms"] = now_ms()
+            for b, s in plan["mark"]:
+                wst.setdefault("remediated_parks", {})[b] = s
+        elif not args.quiet:
+            extra = f"; {plan['reason']}" if plan["reason"] else ""
+            print(f"[watchdog] supervisor healthy "
+                  f"(pid {pf.get('supervisor_pid')}, {_fmt_hb_age(age)})"
+                  f"{extra}")
+        # Forget remediation/stale bookkeeping for tips no longer parked so
+        # a recovered tip that later re-parks is treated as new.
+        parked_refs = {b for b, _ in parked}
+        for tbl in ("remediated_parks", "logged_stale"):
+            d = wst.get(tbl, {})
+            for b in list(d):
+                if b not in parked_refs:
+                    d.pop(b, None)
+        _wd_save_state(state_dir, wst)
+        return 0
+    reason = "no pidfile" if pf is None else (
+        f"heartbeat stale ({age // 1000}s)" if status == "hung"
+        else "pid dead / not a supervisor")
+    rest = (spec.get("argv") or ["", "auto"])[1:] or ["auto"]
+    cwd = spec.get("cwd") or os.getcwd()
+    print(f"[watchdog] supervisor DOWN ({reason}) — relaunching "
+          f"`{' '.join(rest)}` in {cwd}", file=sys.stderr)
+    _wd_relaunch(state_dir, spec)
     print("[watchdog] relaunched (detached).", file=sys.stderr)
     return 0
 
