@@ -1546,10 +1546,29 @@ class ReconcileRunnersTests(unittest.TestCase):
         self.assertEqual((s, d), ([("a", "sha2")], ["a"]))
 
     def test_exited_at_right_sha_left_alone(self):
-        # Any exit (clean or crash) at the desired sha is terminal — the
-        # tip re-runs only when its sha moves, never a respawn loop.
+        # A clean/parked exit at the desired sha with no retry budget is
+        # terminal — the tip re-runs only when its sha moves.
         s, d = dashboard._reconcile_runners(
             {"a": "sha1"}, {"a": {"sha": "sha1", "alive": False, "done": False}})
+        self.assertEqual((s, d), ([], []))
+
+    def test_crashed_with_retry_budget_restarts(self):
+        # A crashed runner still within its retry budget is drained and
+        # respawned at the SAME sha (transient build race self-heals on a
+        # clean retry) — no sha move required.
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha1"},
+            {"a": {"sha": "sha1", "alive": False, "done": True,
+                   "retry": True}})
+        self.assertEqual((s, d), ([("a", "sha1")], ["a"]))
+
+    def test_crashed_budget_spent_parked(self):
+        # Once the retry budget is spent (retry=False), a crashed runner is
+        # parked terminal — no respawn loop on a genuinely un-buildable tip.
+        s, d = dashboard._reconcile_runners(
+            {"a": "sha1"},
+            {"a": {"sha": "sha1", "alive": False, "done": True,
+                   "retry": False}})
         self.assertEqual((s, d), ([], []))
 
     def test_tip_gone_drains(self):

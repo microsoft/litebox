@@ -4257,6 +4257,22 @@ def _ensure_shadow_worktree(canonical: Path, state_dir: Path,
     return shadow
 
 
+# A per-tip runner that CRASHES (rc>0, excluding the arg-parse rc==2
+# "branch lacks --fill-drain" case) is retried at the same sha up to this
+# many times before being parked terminal. A transient shadow build race —
+# concurrent cargo touching the same ``target/`` during a rapid drain→
+# restart, surfacing as ``failed to write .../.fingerprint/.../
+# invoked.timestamp: No such file or directory`` — self-heals on a clean
+# retry (cargo recreates the fingerprint dir); only a genuinely un-buildable
+# tip exhausts the budget. Without this, a single transient hiccup parked a
+# tip until its sha moved, which blocked real sessions (they resorted to
+# empty "retrigger" commits that just raced again). See
+# ``reconciler-retry-before-park``.
+AGENT_RETRY_BEFORE_PARK = int(
+    os.environ.get("LITEBOX_AGENT_RETRY_BEFORE_PARK", "4")
+)
+
+
 def _reconcile_runners(
     desired: dict[str, str],
     running: dict[str, dict],
@@ -4267,25 +4283,28 @@ def _reconcile_runners(
       * ``desired`` — ``{tip_key: sha}`` for every tip that should have a
         runner right now (live agent tip-set + tracked refs), each at its
         current HEAD sha.
-      * ``running`` — ``{tip_key: {"sha", "alive", "done"}}`` for every
-        runner we currently track. ``alive`` = process still running;
-        ``done`` = it exited cleanly (fill completed → the tip is fully
-        covered at ``sha``, or it was drained).
+      * ``running`` — ``{tip_key: {"sha", "alive", "done", "retry"}}`` for
+        every runner we currently track. ``alive`` = process still running;
+        ``done`` = it exited (cleanly → the tip is fully covered at ``sha``,
+        or crashed); ``retry`` = it crashed with a retryable rc and its
+        bounded retry budget isn't yet spent (see ``AGENT_RETRY_BEFORE_PARK``).
 
     Returns ``(to_start, to_drain)``:
       * ``to_start`` — ``[(tip_key, sha)]`` tips needing a new runner:
-        none yet, or the sha moved. (A runner that has EXITED — cleanly
-        or crashed — is treated as terminal for its sha and left alone;
-        it re-runs only when its sha moves. This avoids respawn/compile
-        loops on tips whose branch can't run the flag yet.)
-      * ``to_drain`` — ``[tip_key]`` runners to stop gracefully: their
-        tip's sha moved (drain the stale one before starting the new
-        one) or the tip is no longer desired.
+        none yet, the sha moved, or a crashed runner still has retry budget
+        (transient build race → a clean retry, run alone, self-heals). A
+        runner that exited CLEANLY, or crashed with its budget spent, is
+        terminal for its sha and left alone — it re-runs only when its sha
+        moves. This bounds respawn/compile loops on tips whose branch
+        genuinely can't build or run the flag.
+      * ``to_drain`` — ``[tip_key]`` runners to stop / clean up: their
+        tip's sha moved (drain the stale one before starting the new one),
+        the tip is no longer desired, or a crashed handle is being reaped
+        before a retry respawn.
 
-    A runner alive at the desired sha is left filling; an exited one at
-    the desired sha is left as-is. This is the whole scheduling policy —
-    everything else is spawn/drain plumbing — so it's kept pure and
-    unit-tested."""
+    A runner alive at the desired sha is left filling. This is the whole
+    scheduling policy — everything else is spawn/drain plumbing — so it's
+    kept pure and unit-tested."""
     to_start: list[tuple[str, str]] = []
     to_drain: list[str] = []
     for key, sha in desired.items():
@@ -4293,6 +4312,13 @@ def _reconcile_runners(
         if r is None:
             to_start.append((key, sha))
         elif r["sha"] != sha:
+            to_drain.append(key)
+            to_start.append((key, sha))
+        elif r.get("retry"):
+            # Crashed at the desired sha with retry budget left: reap the
+            # dead handle and respawn. The retry builds alone (the crashed
+            # process is fully reaped), so the drain-overlap / target-dir
+            # race that felled it can't recur within the retry.
             to_drain.append(key)
             to_start.append((key, sha))
     for key in running:
@@ -4601,6 +4627,9 @@ def _reconcile_agent_runners(
     state_dir = resolve_state_dir(args.state_dir)
     canonical = _canonical_worktree(args, state_dir)
     runners: dict = supervisor_state.setdefault("runners", {})
+    # Per-key crash bookkeeping for the bounded retry-before-park policy:
+    # ``{key: {"sha": sha, "n": consecutive_retryable_crashes}}``.
+    crash_counts: dict = supervisor_state.setdefault("agent_crash_counts", {})
     conn = open_db(state_dir)
     try:
         live_branches = _live_branches(conn, canonical)
@@ -4618,10 +4647,35 @@ def _reconcile_agent_runners(
     for key, r in runners.items():
         rc = r["proc"].poll()
         if rc is not None and not r.get("reaped"):
+            # Classify the exit and update the retry budget. rc==0 is a
+            # clean fill (reset); rc==2 is the arg-parse "branch lacks
+            # --fill-drain" case (park, never retry); any other rc>0 is a
+            # build/run failure eligible for a bounded retry.
+            r["rc"] = rc
+            retryable = rc > 0 and rc != 2
+            cc = crash_counts.get(key)
+            if cc is None or cc.get("sha") != r["sha"]:
+                cc = {"sha": r["sha"], "n": 0}
+            if rc == 0:
+                crash_counts.pop(key, None)
+            else:
+                if retryable:
+                    cc["n"] += 1
+                crash_counts[key] = cc
             if not args.quiet:
-                outcome = ("covered (fill complete)" if rc == 0
-                           else f"CRASHED rc={rc} (branch may lack "
-                                f"--fill-drain; re-runs on next commit)")
+                if rc == 0:
+                    outcome = "covered (fill complete)"
+                elif rc == 2:
+                    outcome = (f"exited rc={rc} (branch lacks --fill-drain; "
+                               f"re-runs on next commit)")
+                elif retryable and cc["n"] <= AGENT_RETRY_BEFORE_PARK:
+                    outcome = (f"CRASHED rc={rc} — retrying "
+                               f"{cc['n']}/{AGENT_RETRY_BEFORE_PARK} "
+                               f"(transient build race?)")
+                else:
+                    outcome = (f"CRASHED rc={rc} — parked after "
+                               f"{AGENT_RETRY_BEFORE_PARK} retries; "
+                               f"re-runs on next commit")
                 print(f"[auto] agent-reconcile: {key} runner exited — "
                       f"{outcome}", file=sys.stderr)
             try:
@@ -4641,8 +4695,14 @@ def _reconcile_agent_runners(
                 if r.get("child_id") is not None:
                     _update_child(supervisor_state, r["child_id"],
                                   harness_pid=hp)
+        cc = crash_counts.get(key)
+        crashes = cc["n"] if (cc and cc.get("sha") == r["sha"]) else 0
+        rc_val = r.get("rc")
+        retry = (rc is not None and rc_val is not None and rc_val > 0
+                 and rc_val != 2 and crashes <= AGENT_RETRY_BEFORE_PARK)
         running_view[key] = {
             "sha": r["sha"], "alive": rc is None, "done": rc is not None,
+            "retry": retry,
         }
 
     to_start, to_drain = _reconcile_runners(desired, running_view)
@@ -4660,6 +4720,11 @@ def _reconcile_agent_runners(
         )
         if handle is not None:
             runners[key] = handle
+    # Forget crash bookkeeping for tips no longer desired so it can't leak
+    # or mis-apply to a future tip that reuses the key.
+    for key in list(crash_counts):
+        if key not in desired:
+            crash_counts.pop(key, None)
     if not args.quiet and (to_start or to_drain):
         print(f"[auto] agent-reconcile: +{len(to_start)} started, "
               f"-{len(to_drain)} drained, {len(runners)} live tip-runners",
