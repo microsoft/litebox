@@ -399,6 +399,22 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    pub(crate) fn set_event(&self, event_handle: Handle) -> NtStatus {
+        match self.modify_event(event_handle, None, |event| Ok(event.set())) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
+    }
+
+    pub(crate) fn clear_event(&self, event_handle: Handle) -> Result<(), NtStatus> {
+        self.modify_event(event_handle, None, |event| Ok(event.clear()))
+    }
+
+    pub(crate) fn check_event_modify_access(&self, event_handle: Handle) -> Result<(), NtStatus> {
+        let entry = self.event_entry(event_handle)?;
+        entry.with_entry(|entry| entry.granted_access.require(EventAccess::MODIFY_STATE))
+    }
+
     pub(crate) fn sys_nt_reset_event(
         &self,
         event_handle: Handle,

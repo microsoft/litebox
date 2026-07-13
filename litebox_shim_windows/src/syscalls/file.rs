@@ -17,6 +17,8 @@ use crate::nt_types::{
     AccessMask, IoStatusBlock, ObjectAttributes, UnicodeString, read_object_attributes,
 };
 use crate::syscalls::Handle;
+use crate::syscalls::condrv::{self, CondrvObject};
+use crate::syscalls::file_path::{FilePathResolver, FilePathRoot, FileTarget};
 use crate::{
     ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
 };
@@ -26,12 +28,6 @@ const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-
-const CONDRV_INPUT_OBJECT: &str = "Input";
-const CONDRV_OUTPUT_OBJECT: &str = "Output";
-const CONDRV_SERVER_DEVICE: &str = "Server";
-const CONDRV_REFERENCE_OBJECT: &str = "Reference";
-const CONDRV_CONNECT_OBJECT: &str = "Connect";
 
 // These names and values are Windows ABI constants from WDK headers; Wine's
 // regular file/directory branch and ReactOS' filesystem device query path use
@@ -93,11 +89,42 @@ impl<FS: ShimFS> FdEnabledSubsystemEntry for FileObject<FS> {}
 
 pub(crate) struct FileObject<FS: ShimFS> {
     path: String,
-    fd: TypedFd<FS>,
+    backing: FileObjectBacking<FS>,
     granted_access: FileAccess,
     share_access: FileShareAccess,
-    is_directory: bool,
     create_options: FileCreateOptions,
+}
+
+enum FileObjectBacking<FS: ShimFS> {
+    Filesystem {
+        fd: TypedFd<FS>,
+        is_directory: bool,
+    },
+    CondrvStream {
+        object: CondrvObject,
+        fd: TypedFd<FS>,
+    },
+    CondrvControl(CondrvObject),
+}
+
+impl<FS: ShimFS> FileObject<FS> {
+    fn condrv_object(&self) -> Option<CondrvObject> {
+        match self.backing {
+            FileObjectBacking::CondrvStream { object, .. }
+            | FileObjectBacking::CondrvControl(object) => Some(object),
+            FileObjectBacking::Filesystem { .. } => None,
+        }
+    }
+
+    fn is_directory(&self) -> bool {
+        matches!(
+            self.backing,
+            FileObjectBacking::Filesystem {
+                is_directory: true,
+                ..
+            }
+        )
+    }
 }
 
 bitflags::bitflags! {
@@ -353,16 +380,24 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn close_file(&self, file: FileObject<FS>) {
-        let _ = self.fs.close(&file.fd);
-        if file
-            .create_options
-            .contains(FileCreateOptions::DELETE_ON_CLOSE)
-        {
-            if file.is_directory {
-                let _ = self.fs.rmdir(&file.path);
-            } else {
-                let _ = self.fs.unlink(&file.path);
+        match file.backing {
+            FileObjectBacking::Filesystem { fd, is_directory } => {
+                let _ = self.fs.close(&fd);
+                if file
+                    .create_options
+                    .contains(FileCreateOptions::DELETE_ON_CLOSE)
+                {
+                    if is_directory {
+                        let _ = self.fs.rmdir(&file.path);
+                    } else {
+                        let _ = self.fs.unlink(&file.path);
+                    }
+                }
             }
+            FileObjectBacking::CondrvStream { fd, .. } => {
+                let _ = self.fs.close(&fd);
+            }
+            FileObjectBacking::CondrvControl(_) => {}
         }
     }
 
@@ -485,6 +520,76 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         status
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "NtDeviceIoControlFile has ten ABI parameters; keeping them explicit preserves syscall ordering"
+    )]
+    pub(crate) fn sys_nt_device_io_control_file(
+        &self,
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<ConstPtr<Platform, u8>>,
+        apc_context: Option<ConstPtr<Platform, u8>>,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        io_control_code: u32,
+        input_buffer: Option<ConstPtr<Platform, u8>>,
+        input_buffer_length: u32,
+        output_buffer: Option<MutPtr<Platform, u8>>,
+        output_buffer_length: u32,
+    ) -> NtStatus {
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block)
+        {
+            return status;
+        }
+        if !event.is_null()
+            && let Err(status) = self.check_event_modify_access(event)
+        {
+            return status;
+        }
+
+        let condrv_object = match self.file_entry(file_handle) {
+            Ok(entry) => entry.with_entry(FileObject::condrv_object),
+            Err(status) => return status,
+        };
+        if !event.is_null()
+            && let Err(status) = self.clear_event(event)
+        {
+            return status;
+        }
+        let Some(condrv_object) = condrv_object else {
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw(),
+                io_control_code:% = format_args!("{io_control_code:#x}");
+                "Unsupported NtDeviceIoControlFile for non-ConDrv file handle"
+            );
+            return NtStatus::INVALID_DEVICE_REQUEST;
+        };
+        if apc_routine.is_some() || apc_context.is_some() {
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw(),
+                apc_context = apc_context.map_or(0, |context| context.as_usize());
+                "Ignoring NtDeviceIoControlFile APC completion arguments for synchronous completion"
+            );
+        }
+        let status = condrv::handle_ioctl::<Platform>(
+            condrv_object,
+            io_status_block,
+            io_control_code,
+            input_buffer,
+            input_buffer_length,
+            output_buffer,
+            output_buffer_length,
+        );
+        if !event.is_null() {
+            let event_status = self.set_event(event);
+            if event_status != NtStatus::SUCCESS {
+                return event_status;
+            }
+        }
+        status
+    }
+
     fn write_file_fs_device_information(
         &self,
         file_handle: Handle,
@@ -553,17 +658,50 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if object_attributes.object_name == 0 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        if ea_buffer.is_some() || ea_length != 0 {
-            return Err(NtStatus::EAS_NOT_SUPPORTED);
-        }
         let desired_access = FileAccess::from_desired_access(desired_access);
         let create_options = FileCreateOptions::from_bits_retain(create_options);
         validate_create_options(desired_access, create_disposition, create_options)?;
 
         let share_access = FileShareAccess::from_share_access(share_access)?;
-        let path = self.object_attributes_to_fs_path(object_attributes)?;
-        self.check_file_sharing(&path, desired_access, share_access)?;
+        let (file, information) = match self.object_attributes_to_file_target(object_attributes)? {
+            FileTarget::Filesystem(path) => {
+                if ea_buffer.is_some() || ea_length != 0 {
+                    return Err(NtStatus::EAS_NOT_SUPPORTED);
+                }
+                self.open_filesystem_target(
+                    path,
+                    desired_access,
+                    share_access,
+                    create_disposition,
+                    create_options,
+                    file_attributes,
+                )
+            }
+            FileTarget::Condrv(object) => self.open_condrv_target(
+                object,
+                desired_access,
+                share_access,
+                create_disposition,
+                create_options,
+                file_attributes,
+                ea_buffer,
+                ea_length,
+            ),
+        }?;
+        let handle = self.insert_file_handle(file)?;
+        Ok((handle, information))
+    }
 
+    fn open_filesystem_target(
+        &self,
+        path: String,
+        desired_access: FileAccess,
+        share_access: FileShareAccess,
+        create_disposition: CreateDisposition,
+        create_options: FileCreateOptions,
+        file_attributes: u32,
+    ) -> Result<(FileObject<FS>, FileCreateInformation), NtStatus> {
+        self.check_file_sharing(&path, desired_access, share_access)?;
         if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
             return self.open_or_create_directory(
                 &path,
@@ -575,7 +713,88 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
 
-        let existed_before_open = self.fs.file_status(&path).is_ok();
+        let (fd, is_directory, information) = self.open_backing_fd(
+            &path,
+            desired_access,
+            create_disposition,
+            create_options,
+            file_attributes,
+        )?;
+        Ok((
+            FileObject {
+                path,
+                backing: FileObjectBacking::Filesystem { fd, is_directory },
+                granted_access: desired_access,
+                share_access,
+                create_options,
+            },
+            information,
+        ))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "ConDrv creation validates the parsed NtCreateFile fields at the device boundary"
+    )]
+    fn open_condrv_target(
+        &self,
+        object: CondrvObject,
+        desired_access: FileAccess,
+        share_access: FileShareAccess,
+        create_disposition: CreateDisposition,
+        create_options: FileCreateOptions,
+        file_attributes: u32,
+        ea_buffer: Option<ConstPtr<Platform, u8>>,
+        ea_length: u32,
+    ) -> Result<(FileObject<FS>, FileCreateInformation), NtStatus> {
+        if object == CondrvObject::Connect {
+            condrv::validate_connect_server_ea::<Platform>(ea_buffer, ea_length)?;
+        } else if ea_buffer.is_some() || ea_length != 0 {
+            return Err(NtStatus::EAS_NOT_SUPPORTED);
+        }
+        if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
+            return Err(NtStatus::NOT_A_DIRECTORY);
+        }
+
+        let path = String::from(object.handle_path());
+        self.check_file_sharing(&path, desired_access, share_access)?;
+        let (backing, information) = match object {
+            CondrvObject::Input | CondrvObject::Output => {
+                let (fd, _, information) = self.open_backing_fd(
+                    &path,
+                    desired_access,
+                    create_disposition,
+                    create_options,
+                    file_attributes,
+                )?;
+                (FileObjectBacking::CondrvStream { object, fd }, information)
+            }
+            CondrvObject::Server | CondrvObject::Reference | CondrvObject::Connect => (
+                FileObjectBacking::CondrvControl(object),
+                FileCreateInformation::Opened,
+            ),
+        };
+        Ok((
+            FileObject {
+                path,
+                backing,
+                granted_access: desired_access,
+                share_access,
+                create_options,
+            },
+            information,
+        ))
+    }
+
+    fn open_backing_fd(
+        &self,
+        path: &str,
+        desired_access: FileAccess,
+        create_disposition: CreateDisposition,
+        create_options: FileCreateOptions,
+        file_attributes: u32,
+    ) -> Result<(TypedFd<FS>, bool, FileCreateInformation), NtStatus> {
+        let existed_before_open = self.fs.file_status(path).is_ok();
         if create_disposition == CreateDisposition::Supersede
             && existed_before_open
             && !desired_access.contains(FileAccess::DELETE)
@@ -585,7 +804,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let flags = desired_access.open_flags(create_disposition, create_options);
         let fd = self
             .fs
-            .open(&path, flags, create_mode(file_attributes))
+            .open(path, flags, create_mode(file_attributes))
             .map_err(|error| map_open_error(error, create_disposition))?;
         let file_status = match self.fs.fd_file_status(&fd) {
             Ok(file_status) => file_status,
@@ -601,15 +820,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
         }
         let information = create_disposition.success_information(existed_before_open);
-        let handle = self.insert_file_handle(FileObject {
-            path,
+        Ok((
             fd,
-            granted_access: desired_access,
-            share_access,
-            is_directory: file_status.file_type == FileType::Directory,
-            create_options,
-        })?;
-        Ok((handle, information))
+            file_status.file_type == FileType::Directory,
+            information,
+        ))
     }
 
     fn open_or_create_directory(
@@ -620,7 +835,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
         file_attributes: u32,
-    ) -> Result<(Handle, FileCreateInformation), NtStatus> {
+    ) -> Result<(FileObject<FS>, FileCreateInformation), NtStatus> {
         if matches!(
             create_disposition,
             CreateDisposition::Supersede
@@ -662,37 +877,48 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .open(path, flags, Mode::empty())
             .map_err(|error| map_open_error(error, create_disposition))?;
         let information = create_disposition.success_information(existed_before_open);
-        let handle = self.insert_file_handle(FileObject {
-            path: String::from(path),
-            fd,
-            granted_access: desired_access,
-            share_access,
-            is_directory: true,
-            create_options,
-        })?;
-        Ok((handle, information))
+        Ok((
+            FileObject {
+                path: String::from(path),
+                backing: FileObjectBacking::Filesystem {
+                    fd,
+                    is_directory: true,
+                },
+                granted_access: desired_access,
+                share_access,
+                create_options,
+            },
+            information,
+        ))
     }
 
-    fn object_attributes_to_fs_path(
+    fn object_attributes_to_file_target(
         &self,
         object_attributes: ObjectAttributes,
-    ) -> Result<String, NtStatus> {
+    ) -> Result<FileTarget, NtStatus> {
         let object_name_ptr =
             ConstPtr::<Platform, UnicodeString>::from_usize(object_attributes.object_name);
         let object_name = object_name_ptr
             .read_at_offset(0)
             .ok_or(NtStatus::ACCESS_VIOLATION)?;
         let object_name = object_name.read_string::<Platform>()?;
-        if object_attributes.root_directory.is_null() || is_absolute_windows_path(&object_name) {
-            return absolute_nt_file_name_to_fs_path(&object_name);
+        let resolver = FilePathResolver::new(&self.process.object_manager);
+        if object_attributes.root_directory.is_null() {
+            return resolver.resolve(FilePathRoot::Namespace, &object_name);
         }
 
         let root_file = self.file_entry(object_attributes.root_directory)?;
         root_file.with_entry(|root_file| {
-            if !root_file.is_directory {
-                return Err(NtStatus::NOT_A_DIRECTORY);
+            if let Some(parent) = root_file.condrv_object() {
+                return resolver.resolve(FilePathRoot::Condrv(parent), &object_name);
             }
-            relative_nt_file_name_to_fs_path(&root_file.path, &object_name)
+            resolver.resolve(
+                FilePathRoot::Filesystem {
+                    path: &root_file.path,
+                    is_directory: root_file.is_directory(),
+                },
+                &object_name,
+            )
         })
     }
 
@@ -843,120 +1069,6 @@ fn create_directory_mode(file_attributes: u32) -> Mode {
     create_mode(file_attributes) | Mode::XUSR
 }
 
-/// Convert the NT file-name forms we currently support at the object-manager to
-/// filesystem seam.
-///
-/// Native NT reaches this seam by walking object-manager directories until it
-/// reaches a device object, then the device parse routine hands the remaining
-/// path to the filesystem driver. LiteBox intentionally uses the Wine-style
-/// shortcut here instead: known NT prefixes are recognized as strings and then
-/// mapped directly into the sandbox filesystem. Today that includes `\??\`,
-/// `\\?\`, any drive-letter prefix, both `\SystemRoot\` and `/SystemRoot/`,
-/// `\Device\HarddiskVolume1\`, and `\Device\ConDrv\`. A unified object-manager
-/// walk through device objects into the backing filesystem namespace remains
-/// outside this file-path mapper.
-fn absolute_nt_file_name_to_fs_path(name: &str) -> Result<String, NtStatus> {
-    let mut name = name;
-    if let Some(rest) = strip_case_insensitive_prefix(name, "\\??\\") {
-        name = rest;
-    } else if let Some(rest) = strip_case_insensitive_prefix(name, "\\\\?\\") {
-        name = rest;
-    }
-
-    if name.len() >= 3 && name.as_bytes()[1] == b':' && matches!(name.as_bytes()[2], b'\\' | b'/') {
-        name = &name[2..];
-    } else if let Some(rest) = strip_case_insensitive_prefix(name, "\\SystemRoot\\") {
-        return join_absolute_components("/Windows", rest);
-    } else if let Some(rest) = strip_case_insensitive_prefix(name, "/SystemRoot/") {
-        return join_absolute_components("/Windows", rest);
-    } else if let Some(rest) = strip_case_insensitive_prefix(name, "\\Device\\HarddiskVolume1\\") {
-        return join_absolute_components("/", rest);
-    } else if let Some(device_name) = strip_case_insensitive_prefix(name, "\\Device\\ConDrv\\") {
-        return condrv_device_file(device_name).ok_or(NtStatus::OBJECT_NAME_NOT_FOUND);
-    }
-
-    let path = name.trim_start_matches(['\\', '/']);
-    join_absolute_components("/", path)
-}
-
-fn relative_nt_file_name_to_fs_path(root_path: &str, name: &str) -> Result<String, NtStatus> {
-    if is_absolute_windows_path(name) {
-        return absolute_nt_file_name_to_fs_path(name);
-    }
-    join_absolute_components(root_path, name)
-}
-
-fn join_absolute_components(root_path: &str, components: &str) -> Result<String, NtStatus> {
-    let mut path = String::from(root_path.trim_end_matches('/'));
-    if path.is_empty() {
-        path.push('/');
-    }
-    for component in components.split(['\\', '/']) {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".." {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        if !path.ends_with('/') {
-            path.push('/');
-        }
-        append_windows_component(&mut path, component);
-    }
-    Ok(path)
-}
-
-fn condrv_device_file(device_name: &str) -> Option<String> {
-    if device_name.eq_ignore_ascii_case(CONDRV_INPUT_OBJECT) {
-        return Some(String::from("/dev/stdin"));
-    }
-    if device_name.eq_ignore_ascii_case(CONDRV_OUTPUT_OBJECT) {
-        return Some(String::from("/dev/stdout"));
-    }
-    if device_name.eq_ignore_ascii_case(CONDRV_SERVER_DEVICE)
-        || device_name.eq_ignore_ascii_case(CONDRV_REFERENCE_OBJECT)
-        || device_name.eq_ignore_ascii_case(CONDRV_CONNECT_OBJECT)
-    {
-        return Some(String::from("/dev/null"));
-    }
-    None
-}
-
-fn append_windows_component(path: &mut String, component: &str) {
-    if component.eq_ignore_ascii_case("Windows") {
-        path.push_str("Windows");
-    } else if component.eq_ignore_ascii_case("System32") {
-        path.push_str("System32");
-    } else if ends_with_ignore_ascii_case(component, ".dll")
-        || ends_with_ignore_ascii_case(component, ".nls")
-    {
-        path.push_str(&component.to_ascii_lowercase());
-    } else {
-        path.push_str(component);
-    }
-}
-
-fn strip_case_insensitive_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        .then(|| &value[prefix.len()..])
-}
-
-fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
-    value
-        .get(value.len().saturating_sub(suffix.len())..)
-        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
-}
-
-fn is_absolute_windows_path(name: &str) -> bool {
-    name.starts_with(['\\', '/'])
-        || name
-            .as_bytes()
-            .get(1..3)
-            .is_some_and(|bytes| bytes[0] == b':' && matches!(bytes[1], b'\\' | b'/'))
-}
-
 fn map_open_error(error: OpenError, create_disposition: CreateDisposition) -> NtStatus {
     match error {
         OpenError::PathError(error) => match error {
@@ -1105,6 +1217,97 @@ mod tests {
         handle
     }
 
+    fn open_condrv_server(task: &Task<TestPlatform, TestFS>) -> Handle {
+        let (_server_path, _server_name, server_attributes) =
+            open_object_attributes(r"\Device\ConDrv\Server");
+        let mut io_status = IoStatusBlock::default();
+        task.do_nt_create_file(
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            server_attributes,
+            mut_ptr(&mut io_status),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            CreateDisposition::Open,
+            FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+            None,
+            0,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn open_condrv_reference(task: &Task<TestPlatform, TestFS>, server_handle: Handle) -> Handle {
+        let (_reference_path, _reference_name, mut reference_attributes) =
+            open_object_attributes(r"\Reference");
+        reference_attributes.root_directory = server_handle;
+        let mut io_status = IoStatusBlock::default();
+        task.do_nt_create_file(
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            reference_attributes,
+            mut_ptr(&mut io_status),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            CreateDisposition::Open,
+            FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+            None,
+            0,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn nt_create_file_follows_condrv_server_reference_connect_sequence() {
+        let task = crate::tests::test_task();
+        let server_handle = open_condrv_server(&task);
+        let reference_handle = open_condrv_reference(&task, server_handle);
+        let (_connect_path, _connect_name, mut connect_attributes) =
+            open_object_attributes(r"\Connect");
+        connect_attributes.root_directory = reference_handle;
+        let ea = condrv::ea_buffer(b"server", 1340);
+        let mut connect_handle = Handle::default();
+        let mut io_status = IoStatusBlock::default();
+
+        assert_eq!(
+            task.file_entry(server_handle)
+                .unwrap()
+                .with_entry(FileObject::condrv_object),
+            Some(CondrvObject::Server)
+        );
+        assert_eq!(
+            task.file_entry(reference_handle)
+                .unwrap()
+                .with_entry(FileObject::condrv_object),
+            Some(CondrvObject::Reference)
+        );
+        assert_eq!(
+            task.sys_nt_create_file(
+                mut_ptr(&mut connect_handle),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                Some(const_ptr(&connect_attributes)),
+                mut_ptr(&mut io_status),
+                None,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                Some(const_ptr(&ea[0])),
+                u32::try_from(ea.len()).unwrap(),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.file_entry(connect_handle)
+                .unwrap()
+                .with_entry(FileObject::condrv_object),
+            Some(CondrvObject::Connect)
+        );
+
+        assert_eq!(task.sys_nt_close(connect_handle), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(reference_handle), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(server_handle), NtStatus::SUCCESS);
+    }
+
     #[test]
     fn nt_query_volume_information_file_returns_fs_device_information() {
         run_with_test_platform_pointers(|| {
@@ -1245,7 +1448,8 @@ mod tests {
             .unwrap();
         create_existing_file(&task, "/tmp/dir/child.txt", b"child");
 
-        let (_path, _name, attributes) = open_object_attributes("\\tmp\\dir-file-root.txt");
+        let (_path, _name, attributes) =
+            open_object_attributes(r"\Device\HarddiskVolume1\tmp\dir-file-root.txt");
         let mut handle = Handle::default();
         let mut io_status = IoStatusBlock::default();
         assert_eq!(
@@ -1265,7 +1469,8 @@ mod tests {
             usize::from(FileCreateInformation::Opened)
         );
 
-        let (_path, _name, directory_attributes) = open_object_attributes("\\tmp\\dir");
+        let (_path, _name, directory_attributes) =
+            open_object_attributes(r"\Device\HarddiskVolume1\tmp\dir");
         let directory_handle = task
             .do_nt_create_file(
                 FILE_GENERIC_READ,
@@ -1819,37 +2024,6 @@ mod tests {
 
         assert_eq!(status, Err(NtStatus::ACCESS_VIOLATION));
         assert_eq!(handle, original_handle);
-    }
-
-    #[test]
-    fn nt_create_file_maps_dos_paths_into_the_sandbox_fs() {
-        assert_eq!(
-            absolute_nt_file_name_to_fs_path(r"\??\C:\Windows\System32\ntdll.dll").unwrap(),
-            "/Windows/System32/ntdll.dll"
-        );
-        assert_eq!(
-            absolute_nt_file_name_to_fs_path(r"\??\c:\windows\system32\KERNEL32.DLL").unwrap(),
-            "/Windows/System32/kernel32.dll"
-        );
-        assert_eq!(
-            absolute_nt_file_name_to_fs_path(
-                r"\Device\HarddiskVolume1\Windows\System32\c_1252.NLS"
-            )
-            .unwrap(),
-            "/Windows/System32/c_1252.nls"
-        );
-        assert_eq!(
-            absolute_nt_file_name_to_fs_path(r"\SystemRoot\System32\kernel32.dll").unwrap(),
-            "/Windows/System32/kernel32.dll"
-        );
-        assert_eq!(
-            absolute_nt_file_name_to_fs_path(r"\Device\ConDrv\Output").unwrap(),
-            "/dev/stdout"
-        );
-        assert_eq!(
-            absolute_nt_file_name_to_fs_path(r"\Device\ConDrv\Connect").unwrap(),
-            "/dev/null"
-        );
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

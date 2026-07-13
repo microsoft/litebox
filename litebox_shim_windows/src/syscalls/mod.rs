@@ -2,8 +2,10 @@
 // Licensed under the MIT license.
 
 pub(crate) mod apphelp;
+pub(crate) mod condrv;
 pub(crate) mod event;
 pub(crate) mod file;
+pub(crate) mod file_path;
 pub(crate) mod iocp;
 pub(crate) mod mm;
 pub(crate) mod nls;
@@ -312,6 +314,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         fs_information: Platform::RawMutPointer<u8>,
         length: u32,
         fs_information_class: u32,
+    },
+    NtDeviceIoControlFile {
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<Platform::RawConstPointer<u8>>,
+        apc_context: Option<Platform::RawConstPointer<u8>>,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        io_control_code: u32,
+        input_buffer: Option<Platform::RawConstPointer<u8>>,
+        input_buffer_length: u32,
+        output_buffer: Option<Platform::RawMutPointer<u8>>,
+        output_buffer_length: u32,
     },
     NtApphelpCacheControl {
         service_class: u32,
@@ -724,6 +738,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 fs_information:*,
                 length,
                 fs_information_class,
+            })),
+            NtSysno::NtDeviceIoControlFile => Some(sys_req!(NtDeviceIoControlFile {
+                file_handle:{Handle::from_raw},
+                event:{Handle::from_raw},
+                apc_routine:*,
+                apc_context:*,
+                io_status_block:*,
+                io_control_code,
+                input_buffer:*,
+                input_buffer_length,
+                output_buffer:*,
+                output_buffer_length,
             })),
             NtSysno::NtApphelpCacheControl => Some(sys_req!(NtApphelpCacheControl {
                 service_class,

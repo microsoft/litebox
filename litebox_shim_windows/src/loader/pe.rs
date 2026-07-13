@@ -35,7 +35,7 @@ use crate::syscalls::process::{INITIAL_PROCESS_ID, INITIAL_THREAD_ID};
 use crate::{MutPtr, ShimFS};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
-const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
+const NTDLL_PATH: &str = "/Windows/System32/ntdll.dll";
 const RUNTIME_FUNCTION_ENTRY_SIZE: usize = 12;
 const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
@@ -1038,26 +1038,24 @@ fn load_ntdll<Platform: crate::ShimPlatform, FS: crate::ShimFS>(
     fs: Arc<FS>,
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<Option<LoadedNtDll>, WindowsLoadError> {
-    for path in NTDLL_PATHS {
-        match load_image_with_writable_sections(
-            fs.clone(),
-            path,
-            platform,
-            page_manager,
-            NTDLL_WRITABLE_SECTIONS,
-        ) {
-            Ok(image) => {
-                let exports = ntdll_exports::<Platform>(&image)?;
-                litebox_util_log::debug!(path:% = path; "Loaded guest ntdll.dll");
-                return Ok(Some(LoadedNtDll { image, exports }));
-            }
-            Err(error) if is_missing_file_error(&error) => {}
-            Err(error) => return Err(error),
+    match load_image_with_writable_sections(
+        fs,
+        NTDLL_PATH,
+        platform,
+        page_manager,
+        NTDLL_WRITABLE_SECTIONS,
+    ) {
+        Ok(image) => {
+            let exports = ntdll_exports::<Platform>(&image)?;
+            litebox_util_log::debug!(path:% = NTDLL_PATH; "Loaded guest ntdll.dll");
+            Ok(Some(LoadedNtDll { image, exports }))
         }
+        Err(error) if is_missing_file_error(&error) => {
+            litebox_util_log::debug!("Guest ntdll.dll was not found in the initial filesystem");
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
-
-    litebox_util_log::debug!("Guest ntdll.dll was not found in the initial filesystem");
-    Ok(None)
 }
 
 fn load_image<Platform: crate::ShimPlatform, FS: ShimFS>(

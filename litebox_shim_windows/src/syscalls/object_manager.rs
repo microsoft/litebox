@@ -58,6 +58,8 @@ const SEEDED_DIRECTORY_PATHS: &[&str] = &[
 // Wine's wineboot and ReactOS SMSS create KnownDllPath so ntdll can open/query
 // the DOS path prefix for known DLL lookups during loader initialization.
 const SEEDED_SYMLINK_PATHS: &[(&str, &str)] = &[
+    (r"\??\C:", r"\Device\HarddiskVolume1"),
+    (r"\SystemRoot", r"\Device\HarddiskVolume1\Windows"),
     (r"\KnownDlls\KnownDllPath", r"C:\Windows\System32"),
     // TODO(windows-sessions): resolve this through the current session id once
     // the shim supports multiple Windows sessions.
@@ -138,6 +140,12 @@ pub(crate) struct ObjectManager<Platform: crate::ShimPlatform> {
     root: Arc<ObjectNode<Platform>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FileDeviceObject {
+    Filesystem { root_path: String },
+    ConsoleDriver,
+}
+
 enum NamedObject<Platform: crate::ShimPlatform> {
     Directory {
         children: BTreeMap<ObjectName, Arc<ObjectNode<Platform>>>,
@@ -150,6 +158,9 @@ enum NamedObject<Platform: crate::ShimPlatform> {
     },
     Section {
         section: Weak<SectionObject<Platform>>,
+    },
+    FileDevice {
+        device: FileDeviceObject,
     },
 }
 
@@ -319,6 +330,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         new_symlink(target: String) => NamedObject::Symlink { target };
         new_event(event: Weak<EventObject<Platform>>) => NamedObject::Event { event };
         new_section(section: Weak<SectionObject<Platform>>) => NamedObject::Section { section };
+        new_file_device(device: FileDeviceObject) => NamedObject::FileDevice { device };
     }
 
     fn child(&self, name: &str) -> Option<Arc<Self>> {
@@ -353,11 +365,16 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         matches!(&*self.body.read(), NamedObject::Symlink { .. })
     }
 
+    fn is_file_device(&self) -> bool {
+        matches!(&*self.body.read(), NamedObject::FileDevice { .. })
+    }
+
     object_leaf_accessors! {
         directory_object, ObjectLeafLookup<()>, NamedObject::Directory { .. } => ObjectLeafLookup::Live(());
         pub(super) symlink_target, ObjectLeafLookup<String>, NamedObject::Symlink { target } => ObjectLeafLookup::Live(target.clone());
         event_object, ObjectLeafLookup<Arc<EventObject<Platform>>>, NamedObject::Event { event } => ObjectLeafLookup::from_weak(event);
         section_object, ObjectLeafLookup<Arc<SectionObject<Platform>>>, NamedObject::Section { section } => ObjectLeafLookup::from_weak(section);
+        file_device_object, ObjectLeafLookup<FileDeviceObject>, NamedObject::FileDevice { device } => ObjectLeafLookup::Live(device.clone());
     }
 
     fn type_name(&self) -> Option<&'static str> {
@@ -366,6 +383,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
             NamedObject::Symlink { .. } => Some("SymbolicLink"),
             NamedObject::Event { event } => event.upgrade().map(|_| "Event"),
             NamedObject::Section { section } => section.upgrade().map(|_| "Section"),
+            NamedObject::FileDevice { .. } => Some("Device"),
         }
     }
 
@@ -476,6 +494,17 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         )
     }
 
+    fn create_file_device(&self, path: &str, device: FileDeviceObject) -> NtStatus {
+        self.create_child(
+            path,
+            |node| node.file_device_object(),
+            |path, parent, name| ObjectNode::new_file_device(path, parent, name, device),
+            NtStatus::OBJECT_TYPE_MISMATCH,
+            |_| NtStatus::OBJECT_NAME_EXISTS,
+            |_| NtStatus::SUCCESS,
+        )
+    }
+
     fn create_child<T>(
         &self,
         path: &str,
@@ -509,8 +538,11 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
             return NtStatus::OBJECT_NAME_INVALID;
         }
 
-        let parent = match self.resolve_tail(parent_tail, NtStatus::OBJECT_PATH_NOT_FOUND, false) {
-            Ok(parent) => parent,
+        let parent = match self.resolve_tail(parent_tail, NtStatus::OBJECT_PATH_NOT_FOUND, true) {
+            Ok((parent, remaining)) if remaining.is_empty() => parent,
+            Ok((_, remaining)) => {
+                return unresolved_tail_status(&remaining, NtStatus::OBJECT_PATH_NOT_FOUND);
+            }
             Err(status) => return status,
         };
         let mut body = parent.body.write();
@@ -545,7 +577,7 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         &self,
         path: &str,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| {
+        self.resolve_object_leaf(path, true, |node| {
             node.directory_object().map(|()| Arc::clone(node))
         })
     }
@@ -553,32 +585,58 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
     pub(super) fn resolve_symlink(
         &self,
         path: &str,
-        open_final_symlink: bool,
+        follow_final_symlink: bool,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, open_final_symlink, |node| {
+        self.resolve_object_leaf(path, follow_final_symlink, |node| {
             node.symlink_target().map(|_| Arc::clone(node))
         })
     }
 
     pub(super) fn resolve_event(&self, path: &str) -> Result<Arc<EventObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, true, |node| node.event_object())
+        self.resolve_object_leaf(path, false, |node| node.event_object())
     }
 
     pub(super) fn resolve_section(
         &self,
         path: &str,
     ) -> Result<Arc<SectionObject<Platform>>, NtStatus> {
-        self.resolve_object_leaf(path, false, |node| node.section_object())
+        self.resolve_object_leaf(path, true, |node| node.section_object())
+    }
+
+    pub(crate) fn resolve_file_device(
+        &self,
+        path: &str,
+    ) -> Result<(FileDeviceObject, String), NtStatus> {
+        let tail = absolute_path_tail(path)?;
+        let (node, remaining) = self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, true)?;
+        if node.is_file_device() {
+            return Ok((node.file_device_object().into_result()?, remaining));
+        }
+        if remaining.is_empty() {
+            Err(NtStatus::OBJECT_TYPE_MISMATCH)
+        } else {
+            Err(unresolved_tail_status(
+                &remaining,
+                NtStatus::OBJECT_NAME_NOT_FOUND,
+            ))
+        }
     }
 
     fn resolve_object_leaf<T>(
         &self,
         path: &str,
-        open_final_symlink: bool,
+        follow_final_symlink: bool,
         lookup: impl FnOnce(&Arc<ObjectNode<Platform>>) -> ObjectLeafLookup<T>,
     ) -> Result<T, NtStatus> {
         let tail = absolute_path_tail(path)?;
-        let node = self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, open_final_symlink)?;
+        let (node, remaining) =
+            self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, follow_final_symlink)?;
+        if !remaining.is_empty() {
+            return Err(unresolved_tail_status(
+                &remaining,
+                NtStatus::OBJECT_NAME_NOT_FOUND,
+            ));
+        }
         lookup(&node).into_result()
     }
 
@@ -603,18 +661,32 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         );
     }
 
+    fn seed_file_device(&self, path: &str, device: FileDeviceObject) {
+        let status = self.create_file_device(path, device);
+        assert!(
+            status == NtStatus::SUCCESS,
+            "seeded NT file device must have seeded ancestors: {status:?}"
+        );
+    }
+
     fn resolve_tail(
         &self,
         tail: &str,
         final_missing_status: NtStatus,
-        open_final_symlink: bool,
-    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+        follow_final_symlink: bool,
+    ) -> Result<(Arc<ObjectNode<Platform>>, String), NtStatus> {
         let mut tail = tail.to_string();
         for _ in 0..=MAX_SYMLINK_REPARSE_DEPTH {
-            match self.resolve_tail_once(&tail, final_missing_status, open_final_symlink)? {
-                TailResolution::Resolved(node) => return Ok(node),
-                TailResolution::Reparse(next_tail) => tail = next_tail,
+            let (node, remaining) = match self.resolve_tail_once(&tail) {
+                Ok(resolution) => resolution,
+                Err(NtStatus::OBJECT_NAME_NOT_FOUND) => return Err(final_missing_status),
+                Err(status) => return Err(status),
+            };
+            if node.is_symlink() && (!remaining.is_empty() || follow_final_symlink) {
+                tail = reparse_tail(&node, &remaining)?;
+                continue;
             }
+            return Ok((node, remaining));
         }
         Err(NtStatus::NAME_TOO_LONG)
     }
@@ -622,11 +694,9 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
     fn resolve_tail_once(
         &self,
         tail: &str,
-        final_missing_status: NtStatus,
-        open_final_symlink: bool,
-    ) -> Result<TailResolution<Platform>, NtStatus> {
+    ) -> Result<(Arc<ObjectNode<Platform>>, String), NtStatus> {
         if tail.is_empty() {
-            return Ok(TailResolution::Resolved(Arc::clone(&self.root)));
+            return Ok((Arc::clone(&self.root), String::new()));
         }
 
         let mut current = Arc::clone(&self.root);
@@ -637,35 +707,46 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
             }
             let final_component = components.peek().is_none();
             let missing_status = if final_component {
-                final_missing_status
+                NtStatus::OBJECT_NAME_NOT_FOUND
             } else {
                 NtStatus::OBJECT_PATH_NOT_FOUND
             };
             let child = current.child(component).ok_or(missing_status)?;
-            if child.is_symlink() && (!final_component || !open_final_symlink) {
-                // This is the lazy-resolution point paired with
-                // NtCreateSymbolicLinkObject storing the target without lookup.
-                let target = normalize_reparse_target(&child.symlink_target().into_result()?)?;
-                let target_tail = absolute_path_tail(&target)?;
-                let remaining = components.collect::<Vec<_>>().join("\\");
-                let next_tail = if target_tail.is_empty() {
-                    remaining
-                } else if remaining.is_empty() {
-                    target_tail.to_string()
-                } else {
-                    alloc::format!("{target_tail}\\{remaining}")
-                };
-                return Ok(TailResolution::Reparse(next_tail));
+            if !child.is_directory() {
+                return Ok((child, components.collect::<Vec<_>>().join("\\")));
             }
             current = child;
         }
-        Ok(TailResolution::Resolved(current))
+        Ok((current, String::new()))
     }
 }
 
-enum TailResolution<Platform: crate::ShimPlatform> {
-    Resolved(Arc<ObjectNode<Platform>>),
-    Reparse(String),
+fn reparse_tail<Platform: crate::ShimPlatform>(
+    node: &ObjectNode<Platform>,
+    remaining: &str,
+) -> Result<String, NtStatus> {
+    // This is the lazy-resolution point paired with NtCreateSymbolicLinkObject
+    // storing the target without lookup.
+    let target = normalize_reparse_target(&node.symlink_target().into_result()?)?;
+    let target_tail = absolute_path_tail(&target)?;
+    if target_tail.is_empty() {
+        Ok(remaining.to_string())
+    } else if remaining.is_empty() {
+        Ok(target_tail.to_string())
+    } else {
+        Ok(alloc::format!("{target_tail}\\{remaining}"))
+    }
+}
+
+fn unresolved_tail_status(remaining: &str, final_missing_status: NtStatus) -> NtStatus {
+    debug_assert!(!remaining.is_empty());
+    if remaining.split('\\').any(str::is_empty) {
+        NtStatus::OBJECT_NAME_INVALID
+    } else if remaining.contains('\\') {
+        NtStatus::OBJECT_PATH_NOT_FOUND
+    } else {
+        final_missing_status
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1239,6 +1320,13 @@ pub(crate) fn seed_object_manager<Platform: crate::ShimPlatform>()
     for path in SEEDED_DIRECTORY_PATHS {
         object_manager.seed_directory(path);
     }
+    object_manager.seed_file_device(
+        r"\Device\HarddiskVolume1",
+        FileDeviceObject::Filesystem {
+            root_path: "/".to_string(),
+        },
+    );
+    object_manager.seed_file_device(r"\Device\ConDrv", FileDeviceObject::ConsoleDriver);
     for (path, target) in SEEDED_SYMLINK_PATHS {
         object_manager.seed_symlink(path, target);
     }
@@ -1444,7 +1532,7 @@ mod tests {
             );
 
             let shortcut = object_manager
-                .resolve_symlink(WINDOWS_SHARED_SECTION_OBJECT, true)
+                .resolve_symlink(WINDOWS_SHARED_SECTION_OBJECT, false)
                 .expect("Windows shared section shortcut is a symbolic link");
             assert_eq!(
                 shortcut.symlink_target().into_result(),
@@ -1455,6 +1543,43 @@ mod tests {
                 .expect("Windows shared section shortcut resolves to session section");
             assert!(Arc::ptr_eq(&resolved, &shared_section));
         });
+    }
+
+    #[test]
+    fn seeded_file_devices_resolve_through_object_manager() {
+        let object_manager = seed_object_manager::<TestPlatform>();
+
+        assert_eq!(
+            object_manager.resolve_file_device(r"\Device\HarddiskVolume1\Windows"),
+            Ok((
+                FileDeviceObject::Filesystem {
+                    root_path: "/".to_string(),
+                },
+                "Windows".to_string(),
+            ))
+        );
+        assert_eq!(
+            object_manager.resolve_file_device(r"\??\C:\Windows\System32"),
+            Ok((
+                FileDeviceObject::Filesystem {
+                    root_path: "/".to_string(),
+                },
+                r"Windows\System32".to_string(),
+            ))
+        );
+        assert_eq!(
+            object_manager.resolve_file_device(r"\SystemRoot\System32"),
+            Ok((
+                FileDeviceObject::Filesystem {
+                    root_path: "/".to_string(),
+                },
+                r"Windows\System32".to_string(),
+            ))
+        );
+        assert_eq!(
+            object_manager.resolve_file_device(r"\Device\ConDrv\Output"),
+            Ok((FileDeviceObject::ConsoleDriver, "Output".to_string()))
+        );
     }
 
     #[test]

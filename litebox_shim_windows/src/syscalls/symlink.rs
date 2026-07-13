@@ -210,7 +210,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let link = match self
             .process
             .object_manager
-            .resolve_symlink(&link_name.original_path, true)
+            .resolve_symlink(&link_name.original_path, false)
         {
             Ok(link) => link,
             Err(status) => return status,
@@ -706,9 +706,9 @@ mod tests {
             let task = test_task();
             let real = create_directory(&task, r"\BaseNamedObjects\LiteBoxDriveTarget");
             let child = create_directory(&task, r"\BaseNamedObjects\LiteBoxDriveTarget\Child");
-            let link = create_link(&task, r"\??\C:", r"\BaseNamedObjects\LiteBoxDriveTarget");
+            let link = create_link(&task, r"\??\Z:", r"\BaseNamedObjects\LiteBoxDriveTarget");
 
-            let opened = open_directory(&task, r"\??\C:\Child");
+            let opened = open_directory(&task, r"\??\Z:\Child");
             assert_eq!(task.sys_nt_close(opened), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(link), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(child), NtStatus::SUCCESS);

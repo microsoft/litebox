@@ -1093,6 +1093,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtDeviceIoControlFile {
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                io_control_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+            } => {
+                let status = self.sys_nt_device_io_control_file(
+                    file_handle,
+                    event,
+                    apc_routine,
+                    apc_context,
+                    io_status_block,
+                    io_control_code,
+                    input_buffer,
+                    input_buffer_length,
+                    output_buffer,
+                    output_buffer_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtApphelpCacheControl {
                 service_class,
                 service_data,
