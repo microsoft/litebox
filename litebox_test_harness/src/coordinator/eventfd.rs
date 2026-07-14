@@ -54,6 +54,11 @@ struct EpollLevelOut {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct EpollCrossThreadOut {
+    detail: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct CrossAgentArgs {
     reader_name: String,
 }
@@ -72,6 +77,10 @@ const EPOLL_ZERO_COUNTER: HandlerToken<(), EpollLevelOut> =
     HandlerToken::new("eventfd.epoll_zero_counter");
 const EPOLL_DRAIN_CLEARS: HandlerToken<(), EpollLevelOut> =
     HandlerToken::new("eventfd.epoll_drain_clears");
+const EPOLL_CROSS_THREAD_DRAIN_CLEARS: HandlerToken<(), EpollCrossThreadOut> =
+    HandlerToken::new("eventfd.epoll_cross_thread_drain_clears");
+const EPOLL_FORK_DRAIN_CLEARS: HandlerToken<ForkDrainClearsArgs, ForkInheritOut> =
+    HandlerToken::new("eventfd.epoll_fork_drain_clears");
 const EPOLL_MASKS_EVENTS: HandlerToken<(), EpollLevelOut> =
     HandlerToken::new("eventfd.epoll_masks_events");
 const EPOLL_NESTED_ZERO_COUNTER: HandlerToken<(), EpollLevelOut> =
@@ -205,6 +214,59 @@ async fn handle_epoll_drain_clears(
     }
     Ok(EpollLevelOut {
         detail: "write produced EPOLLIN and drain cleared readiness".to_string(),
+    })
+}
+
+async fn handle_epoll_cross_thread_drain_clears(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<EpollCrossThreadOut, HandlerError> {
+    let ev = std::sync::Arc::new(
+        EventFd::open(0, "nonblock|cloexec")
+            .map_err(|e| HandlerError(format!("eventfd open: {e}")))?,
+    );
+    let mut ep = Epoll::new().map_err(|e| HandlerError(format!("epoll create: {e}")))?;
+    ep.add_fd(
+        ev.as_raw_fd(),
+        "in",
+        EpollTarget {
+            kind: "eventfd",
+            id: 1,
+        },
+    )
+    .map_err(|e| HandlerError(format!("epoll add eventfd: {e}")))?;
+
+    ev.write(1)
+        .map_err(|e| HandlerError(format!("eventfd write: {e}")))?;
+    let first = ep
+        .wait(1000, 1)
+        .map_err(|e| HandlerError(format!("first epoll wait: {e}")))?;
+    if first.len() != 1 || !first[0].observed_events.split('|').any(|name| name == "in") {
+        return Err(HandlerError(format!(
+            "written eventfd did not report EPOLLIN: events={first:?}"
+        )));
+    }
+
+    let reader_ev = std::sync::Arc::clone(&ev);
+    let reader = std::thread::spawn(move || reader_ev.read());
+    let value = reader
+        .join()
+        .map_err(|_| HandlerError("reader thread panicked".to_string()))?
+        .map_err(|e| HandlerError(format!("reader eventfd read: {e}")))?;
+    if value != 1 {
+        return Err(HandlerError(format!("reader got {value}, want 1")));
+    }
+
+    let second = ep
+        .wait(100, 1)
+        .map_err(|e| HandlerError(format!("second epoll wait: {e}")))?;
+    if !second.is_empty() {
+        return Err(HandlerError(format!(
+            "eventfd drained by peer thread still reported ready: events={second:?}"
+        )));
+    }
+    Ok(EpollCrossThreadOut {
+        detail: "peer thread drain cleared eventfd EPOLLIN readiness".to_string(),
     })
 }
 
@@ -384,6 +446,11 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
     register_handler!(EPOLLET, handle_epollet);
     register_handler!(EPOLL_ZERO_COUNTER, handle_epoll_zero_counter);
     register_handler!(EPOLL_DRAIN_CLEARS, handle_epoll_drain_clears);
+    register_handler!(
+        EPOLL_CROSS_THREAD_DRAIN_CLEARS,
+        handle_epoll_cross_thread_drain_clears
+    );
+    register_handler!(EPOLL_FORK_DRAIN_CLEARS, handle_fork_drain_clears);
     register_handler!(EPOLL_MASKS_EVENTS, handle_epoll_masks_events);
     register_handler!(EPOLL_NESTED_ZERO_COUNTER, handle_epoll_nested_zero_counter);
     register_handler!(EPOLL_NESTED_DRAIN_CLEARS, handle_epoll_nested_drain_clears);
@@ -438,6 +505,14 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
             Ok(out.detail.clone())
         });
     }
+    reg.single_agent_handler_test(
+        "vscode",
+        "eventfd",
+        "EV.epoll_cross_thread_drain_clears",
+        AgentName::Dpg1,
+        &EPOLL_CROSS_THREAD_DRAIN_CLEARS,
+        |out| Ok(out.detail.clone()),
+    );
 
     // Legacy share-registry semantics forwarded the read through the creator.
     for &(creator, reader) in &[
@@ -465,6 +540,7 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
             });
     }
 
+    register_fork_drain_clears_tests(reg);
     register_tokio_runtime_drop_tests(reg);
     register_fork_inherit_tests(reg);
 }
@@ -517,6 +593,12 @@ async fn run_cross_agent(
 //   that cross-worker poll wake-up survives the inheritance.
 
 #[derive(Serialize, Deserialize, Debug)]
+struct ForkDrainClearsArgs {
+    child_binary: String,
+    timeout_ms: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct ForkInheritArgs {
     child_binary: String,
     /// Sentinel value parent writes to the eventfd after exec.
@@ -541,6 +623,134 @@ const FORK_INHERIT: HandlerToken<ForkInheritArgs, ForkInheritOut> =
     HandlerToken::new("eventfd.fork_inherit");
 const FORK_INHERIT_POLL: HandlerToken<ForkInheritPollArgs, ForkInheritOut> =
     HandlerToken::new("eventfd.fork_inherit_poll");
+
+async fn handle_fork_drain_clears(
+    args: ForkDrainClearsArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ForkInheritOut, HandlerError> {
+    let ev =
+        EventFd::open(0, "nonblock").map_err(|e| HandlerError(format!("eventfd open: {e}")))?;
+    let ev_raw = ev.as_raw_fd();
+
+    // SAFETY: fcntl on a live fd we own.
+    let fc = unsafe { libc::fcntl(ev_raw, libc::F_SETFD, 0) };
+    if fc != 0 {
+        return Err(HandlerError(format!(
+            "fcntl(eventfd F_SETFD, 0): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let mut ready_pipe = [0; 2];
+    let mut first_pipe = [0; 2];
+    let mut continue_pipe = [0; 2];
+    for (name, pipefd) in [
+        ("ready", &mut ready_pipe),
+        ("first", &mut first_pipe),
+        ("continue", &mut continue_pipe),
+    ] {
+        // SAFETY: pipefd points to two valid i32 slots for libc::pipe to fill.
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return Err(HandlerError(format!(
+                "pipe {name}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        for &fd in pipefd.iter() {
+            // SAFETY: fcntl on a live fd we own.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } != 0 {
+                return Err(HandlerError(format!(
+                    "fcntl(pipe {name} fd {fd} F_SETFD, 0): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+    }
+
+    let mut cmd = std::process::Command::new(&args.child_binary);
+    cmd.args([
+        "eventfd-test",
+        "epoll-fork-drain-clears-child",
+        &ev_raw.to_string(),
+        &ready_pipe[1].to_string(),
+        &first_pipe[1].to_string(),
+        &continue_pipe[0].to_string(),
+        &args.timeout_ms.to_string(),
+    ])
+    .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+
+    close_fd(ready_pipe[1]);
+    close_fd(first_pipe[1]);
+    close_fd(continue_pipe[0]);
+
+    read_exact_fd(ready_pipe[0], "child-ready")?;
+    ev.write(1)
+        .map_err(|e| HandlerError(format!("eventfd write: {e}")))?;
+    read_exact_fd(first_pipe[0], "child-first-epoll")?;
+    let value = ev
+        .read()
+        .map_err(|e| HandlerError(format!("parent drain eventfd: {e}")))?;
+    if value != 1 {
+        return Err(HandlerError(format!("parent drain got {value}, want 1")));
+    }
+    write_all_fd(continue_pipe[1], "continue-child")?;
+    close_fd(ready_pipe[0]);
+    close_fd(first_pipe[0]);
+    close_fd(continue_pipe[1]);
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| HandlerError(format!("wait: {e}")))?;
+    Ok(ForkInheritOut {
+        exit_code: output.status.code().unwrap_or(-1),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+fn read_exact_fd(fd: i32, label: &str) -> Result<(), HandlerError> {
+    let mut byte = [0u8; 1];
+    loop {
+        // SAFETY: byte is a valid one-byte output buffer and fd is expected live.
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        match n {
+            1 => return Ok(()),
+            0 => return Err(HandlerError(format!("{label}: unexpected EOF"))),
+            -1 => {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(HandlerError(format!("{label}: read: {err}")));
+                }
+            }
+            other => return Err(HandlerError(format!("{label}: short read {other}"))),
+        }
+    }
+}
+
+fn write_all_fd(fd: i32, label: &str) -> Result<(), HandlerError> {
+    let byte = [1u8; 1];
+    loop {
+        // SAFETY: byte is a valid one-byte input buffer and fd is expected live.
+        let n = unsafe { libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1) };
+        match n {
+            1 => return Ok(()),
+            -1 => {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(HandlerError(format!("{label}: write: {err}")));
+                }
+            }
+            other => return Err(HandlerError(format!("{label}: short write {other}"))),
+        }
+    }
+}
+
+fn close_fd(fd: i32) {
+    // SAFETY: closing an fd is safe; errors are intentionally ignored in cleanup.
+    let _ = unsafe { libc::close(fd) };
+}
 
 async fn handle_fork_inherit(
     args: ForkInheritArgs,
@@ -631,6 +841,50 @@ async fn handle_fork_inherit_poll(
         exit_code: output.status.code().unwrap_or(-1),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+fn register_fork_drain_clears_tests(reg: &mut Registry<'_>) {
+    for &bt in crate::BinaryType::ALL {
+        let bt_label = bt.label();
+        reg.test(
+            "vscode",
+            "eventfd",
+            format!("EV.epoll_fork_drain_clears.{bt_label}"),
+        )
+        .timeout(30)
+        .build(move |cx| {
+            let agent = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let self_exe = run.self_exe().to_string();
+                    let child_binary = crate::binary_path(bt, &self_exe);
+                    let result = run
+                        .send_named_typed(
+                            &agent,
+                            &EPOLL_FORK_DRAIN_CLEARS,
+                            ForkDrainClearsArgs {
+                                child_binary,
+                                timeout_ms: 200,
+                            },
+                        )
+                        .await;
+                    match result {
+                        Ok(out) if out.exit_code == 0 => TestOutcome::new(
+                            "Dpg1",
+                            true,
+                            "child epoll blocked after parent drained inherited eventfd",
+                        ),
+                        Ok(out) => TestOutcome::new(
+                            "Dpg1",
+                            false,
+                            format!("exit_code={} stderr={:?}", out.exit_code, out.stderr),
+                        ),
+                        Err(e) => TestOutcome::new("Dpg1", false, format!("handler: {e}")),
+                    }
+                })
+            })
+        });
+    }
 }
 
 fn register_tokio_runtime_drop_tests(reg: &mut Registry<'_>) {
@@ -766,6 +1020,7 @@ mod leaf_subcmd {
         match sub {
             "read-inherited" => read_inherited(args),
             "read-inherited-poll" => read_inherited_poll(args),
+            "epoll-fork-drain-clears-child" => epoll_fork_drain_clears_child(args),
             "tokio-release-after-deregister" => tokio_release_after_deregister(),
             other => {
                 eprintln!("eventfd-test: unknown subcommand: {other}");
@@ -860,6 +1115,113 @@ mod leaf_subcmd {
         terminate_child(child);
         println!("PASS tokio runtime wake survived late fd releases");
         0
+    }
+
+    /// `eventfd-test epoll-fork-drain-clears-child <eventfd> <ready_w> <first_w> <continue_r> <timeout_ms>`
+    ///
+    /// Fresh-process child for the cross-worker inherited-eventfd topology. The
+    /// child owns the epoll instance; the parent writes and then drains the same
+    /// eventfd. The second epoll_wait must time out after the parent drain.
+    fn epoll_fork_drain_clears_child(args: &[String]) -> i32 {
+        let Some((event_fd, ready_w, first_w, continue_r, timeout_ms)) = parse_child_args(args)
+        else {
+            return 2;
+        };
+        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epfd < 0 {
+            eprintln!("child epoll_create1: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: 1,
+        };
+        let ctl = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, event_fd, &raw mut ev) };
+        if ctl != 0 {
+            eprintln!("child epoll_ctl ADD: {}", std::io::Error::last_os_error());
+            close_fd(epfd);
+            return 1;
+        }
+        if write_one(ready_w, "ready") != 0 {
+            close_fd(epfd);
+            return 1;
+        }
+        close_fd(ready_w);
+
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
+        let first = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1, 5000) };
+        let first_events = events[0].events;
+        if first != 1 || first_events & libc::EPOLLIN as u32 == 0 {
+            eprintln!("child first epoll_wait rc={first} events=0x{first_events:x}");
+            close_fd(epfd);
+            return 1;
+        }
+        if write_one(first_w, "first") != 0 {
+            close_fd(epfd);
+            return 1;
+        }
+        close_fd(first_w);
+        if read_one(continue_r, "continue") != 0 {
+            close_fd(epfd);
+            return 1;
+        }
+        close_fd(continue_r);
+
+        events[0] = libc::epoll_event { events: 0, u64: 0 };
+        let second = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1, timeout_ms) };
+        close_fd(epfd);
+        let second_events = events[0].events;
+        if second != 0 {
+            eprintln!(
+                "child second epoll_wait after parent drain returned rc={second} events=0x{second_events:x}"
+            );
+            return 1;
+        }
+        0
+    }
+
+    fn parse_child_args(args: &[String]) -> Option<(i32, i32, i32, i32, i32)> {
+        Some((
+            args.get(3)?.parse().ok()?,
+            args.get(4)?.parse().ok()?,
+            args.get(5)?.parse().ok()?,
+            args.get(6)?.parse().ok()?,
+            args.get(7)?.parse().ok()?,
+        ))
+    }
+
+    fn write_one(fd: i32, label: &str) -> i32 {
+        let byte = [1u8; 1];
+        loop {
+            let n = unsafe { libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), 1) };
+            if n == 1 {
+                return 0;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("child write {label}: {err}");
+                return 1;
+            }
+        }
+    }
+
+    fn read_one(fd: i32, label: &str) -> i32 {
+        let mut byte = [0u8; 1];
+        loop {
+            let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+            if n == 1 {
+                return 0;
+            }
+            if n == 0 {
+                eprintln!("child read {label}: EOF");
+                return 1;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("child read {label}: {err}");
+                return 1;
+            }
+        }
     }
 
     fn close_fd(fd: i32) {
