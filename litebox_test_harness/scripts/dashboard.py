@@ -5345,12 +5345,19 @@ def _wd_parked_tips(
             if not ref or not sha:
                 continue
             live.add(ref)
-            agg = conn.execute(
-                "SELECT COUNT(*) univ, "
-                "COALESCE(SUM(classification!='not_run'),0) cov "
-                "FROM regression_class WHERE branch_sha=?", (sha,)
+            # TRUE fill coverage (distinct test×mode run vs the fill matrix
+            # universe), NOT the regression_class comparable set — which
+            # reads cov>=univ at a fresh sha even at 3% filled, hiding a
+            # parked tip. fill-drain runs the whole matrix, so covered ~=
+            # drained.
+            crow = conn.execute(
+                "SELECT COUNT(DISTINCT rr.test_id || '/' || rr.mode) cov, "
+                "MAX(r.universe_size) univ FROM run_results rr "
+                "JOIN runs r ON rr.run_id = r.run_id WHERE r.commit_sha=?",
+                (sha,)
             ).fetchone()
-            univ, cov = (agg["univ"], agg["cov"]) if agg else (0, 0)
+            cov = (crow["cov"] or 0) if crow else 0
+            univ = (crow["univ"] or 0) if crow else 0
             rate = conn.execute(
                 "SELECT COUNT(*) FROM run_results rr JOIN runs run ON "
                 "run.run_id=rr.run_id WHERE run.commit_sha=? AND "
@@ -5360,7 +5367,7 @@ def _wd_parked_tips(
             if ts is None or ts.get("sha") != sha:
                 ts = {"sha": sha, "first_seen_ms": now,
                       "last_progress_ms": now}
-            covered = univ > 0 and cov >= univ
+            covered = univ > 0 and cov >= 0.99 * univ
             if covered or rate > 0:
                 ts["last_progress_ms"] = now
             tip_state[ref] = ts
@@ -5380,30 +5387,29 @@ def _wd_parked_tips(
 def _wd_stuck_plan(
     infra_fails: int, parked: list[tuple[str, str]], st: dict, now: int,
 ) -> dict:
-    """Pure remediation decision for an UP-but-stuck supervisor. Returns
-    ``{restart, fix_docker, reason, mark, stale}``. At most one restart per
-    ``_WD_REMEDIATION_COOLDOWN_MS``; a tip already remediated at its current
-    sha is ``stale`` (a genuine build failure → log, never restart again).
-    Kept pure so the risky decision is unit-tested in isolation."""
-    remediated = st.get("remediated_parks", {})
-    new_parks = [(b, s) for (b, s) in parked if remediated.get(b) != s]
-    stale = [(b, s) for (b, s) in parked if remediated.get(b) == s]
+    """Pure decision for an UP supervisor. A build-failure LOOP
+    (BUILD_FAILING, fresh heartbeat) is infra-wide → restart (fix docker
+    first), cooldown-guarded. A PARKED tip (COVERAGE_GAP) is tip-specific:
+    restarting the whole supervisor to un-park one agent tip is
+    disproportionate and, for both real causes — a transient build race
+    (now fixed at the build layer) or a genuine compile error — futile, so
+    it is SURFACED (logged once per (tip, sha)), never restart-looped. The
+    tip re-covers naturally when its sha moves or picks up the build-layer
+    retry fix. Returns ``{restart, fix_docker, reason, log}``; kept pure so
+    the risky decision is unit-tested in isolation."""
+    logged = st.get("logged_parks", {})
+    new_parks = [(b, s) for (b, s) in parked if logged.get(b) != s]
     on_cooldown = (now - st.get("last_remediation_ms", 0)) \
         < _WD_REMEDIATION_COOLDOWN_MS
     build_failing = infra_fails > _WD_INFRA_FAIL_ALARM
     if build_failing and not on_cooldown:
         return {"restart": True, "fix_docker": True,
                 "reason": f"BUILD_FAILING ({infra_fails} new build-fails)",
-                "mark": [], "stale": stale}
-    if new_parks and not on_cooldown:
-        names = ",".join(b for b, _ in new_parks)
-        return {"restart": True, "fix_docker": False,
-                "reason": f"COVERAGE_GAP (parked: {names})",
-                "mark": new_parks, "stale": stale}
-    reason = "stuck but on remediation cooldown" \
-        if (build_failing or new_parks) and on_cooldown else ""
+                "log": new_parks}
+    reason = "BUILD_FAILING but on remediation cooldown" \
+        if build_failing and on_cooldown else ""
     return {"restart": False, "fix_docker": False, "reason": reason,
-            "mark": [], "stale": stale}
+            "log": new_parks}
 
 
 def _wd_fix_docker_config(quiet: bool) -> bool:
@@ -5517,19 +5523,30 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
     except (json.JSONDecodeError, OSError):
         spec = {}
     if status == "up":
-        # Beyond liveness: catch the two "UP but not doing its job" modes a
-        # heartbeat check misses, and remediate (cooldown/dedup-guarded).
+        # Beyond liveness: catch BUILD_FAILING (looping on infra build
+        # failures with a fresh heartbeat) → restart; and COVERAGE_GAP (a
+        # live tip parked/under-covered) → SURFACE it durably (log once per
+        # tip+sha). We do NOT restart the whole supervisor for one parked
+        # agent tip — it's disproportionate and futile for both real causes
+        # (a transient build race, now fixed at the build layer, or a genuine
+        # compile error); the tip re-covers on its next commit.
         wst = _wd_load_state(state_dir)
         infra_fails = _wd_scan_infra_failures(state_dir, wst)
         parked = _wd_parked_tips(args, state_dir, wst, now_ms())
         plan = _wd_stuck_plan(infra_fails, parked, wst, now_ms())
-        logged = wst.setdefault("logged_stale", {})
-        for b, s in plan["stale"]:
-            if logged.get(b) != s:
-                print(f"[watchdog] {b} @ {s[:8]} STILL parked after prior "
-                      f"remediation — genuine build failure? needs attention",
-                      file=sys.stderr)
-                logged[b] = s
+        logged = wst.setdefault("logged_parks", {})
+        for b, s in plan["log"]:
+            msg = (f"COVERAGE_GAP: {b} @ {s[:8]} parked (under-covered, "
+                   f"stalled) — re-covers on its next commit / build-layer "
+                   f"retry; not restarting the supervisor for one tip")
+            print(f"[watchdog] {msg}", file=sys.stderr)
+            try:
+                with open(state_dir / "auto.log", "a") as lf:
+                    lf.write(f"\n=== {_dt.datetime.now():%H:%M:%S} "
+                             f"watchdog {msg} ===\n")
+            except OSError:
+                pass
+            logged[b] = s
         if plan["restart"]:
             if plan["fix_docker"]:
                 _wd_fix_docker_config(quiet=args.quiet)
@@ -5544,21 +5561,18 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
                 pass
             _wd_restart_supervisor(state_dir, pf, spec, quiet=args.quiet)
             wst["last_remediation_ms"] = now_ms()
-            for b, s in plan["mark"]:
-                wst.setdefault("remediated_parks", {})[b] = s
         elif not args.quiet:
             extra = f"; {plan['reason']}" if plan["reason"] else ""
             print(f"[watchdog] supervisor healthy "
                   f"(pid {pf.get('supervisor_pid')}, {_fmt_hb_age(age)})"
                   f"{extra}")
-        # Forget remediation/stale bookkeeping for tips no longer parked so
-        # a recovered tip that later re-parks is treated as new.
+        # Forget park-logging bookkeeping for tips no longer parked so a
+        # recovered tip that later re-parks is surfaced again.
         parked_refs = {b for b, _ in parked}
-        for tbl in ("remediated_parks", "logged_stale"):
-            d = wst.get(tbl, {})
-            for b in list(d):
-                if b not in parked_refs:
-                    d.pop(b, None)
+        d = wst.get("logged_parks", {})
+        for b in list(d):
+            if b not in parked_refs:
+                d.pop(b, None)
         _wd_save_state(state_dir, wst)
         return 0
     reason = "no pidfile" if pf is None else (
