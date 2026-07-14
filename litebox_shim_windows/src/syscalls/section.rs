@@ -89,6 +89,12 @@ pub(crate) struct MapViewOfSectionParameters<Platform: ShimPlatform> {
     pub(crate) page_protection: u32,
 }
 
+pub(super) struct ClientPortSectionView {
+    pub(super) base: usize,
+    pub(super) mapped_size: usize,
+    pub(super) view_size: usize,
+}
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct SectionAllocationAttributes: u32 {
@@ -705,6 +711,102 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
         );
         NtStatus::SUCCESS
+    }
+
+    pub(super) fn map_client_port_section(
+        &self,
+        section_handle: Handle,
+        requested_view_size: usize,
+    ) -> Result<ClientPortSectionView, NtStatus> {
+        let entry = self.section_entry(section_handle)?;
+        let section = entry.with_entry(|entry| {
+            entry
+                .granted_access
+                .require(SectionAccess::MAP_READ | SectionAccess::MAP_WRITE)
+                .map(|()| Arc::clone(&entry.section))
+        })?;
+        let view_size = if requested_view_size == 0 {
+            section.size
+        } else {
+            requested_view_size
+        };
+        if view_size == 0 || view_size > section.size {
+            return Err(NtStatus::INVALID_VIEW_SIZE);
+        }
+        let Some(mapped_size) = view_size.checked_next_multiple_of(PAGE_SIZE) else {
+            return Err(NtStatus::INVALID_VIEW_SIZE);
+        };
+        if mapped_size > WINDOWS_SHARED_SECTION_SIZE {
+            return Err(NtStatus::INVALID_VIEW_SIZE);
+        }
+        let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(mapped_size) else {
+            return Err(NtStatus::INVALID_VIEW_SIZE);
+        };
+        match section.backing {
+            SectionBacking::Pagefile => {}
+            SectionBacking::CsrSharedSection { .. } | SectionBacking::ImageFile => {
+                return Err(NtStatus::INVALID_FILE_FOR_SECTION);
+            }
+        }
+        let page_protection = PageProtection::PAGE_READWRITE;
+        let Some((_, permissions)) = parse_page_protection(page_protection.bits()) else {
+            return Err(NtStatus::INVALID_PAGE_PROTECTION);
+        };
+        if !pagefile_view_protection_is_compatible(section.protection, page_protection) {
+            return Err(NtStatus::SECTION_PROTECTION);
+        }
+        if section.pagefile_view_active.swap(true, Ordering::AcqRel) {
+            return Err(NtStatus::NOT_SUPPORTED);
+        }
+        let mapping = create_pages(
+            &self.global.page_manager,
+            None,
+            length,
+            CreatePagesFlags::empty(),
+            permissions,
+            |_| Ok(0),
+        )
+        .map_err(|_| {
+            section.pagefile_view_active.store(false, Ordering::Release);
+            NtStatus::NO_MEMORY
+        })?;
+        let base = mapping.as_usize();
+        self.process.section_views.write().insert(
+            base,
+            WindowsSectionView {
+                size: mapped_size,
+                section_offset: 0,
+                section: Some(Arc::clone(&section)),
+            },
+        );
+        self.process.virtual_allocations.write().insert(
+            base,
+            crate::WindowsVirtualAllocation {
+                base,
+                size: mapped_size,
+                allocation_protect: section.protection,
+                type_: MemoryType::MEM_MAPPED,
+                pages: committed_pages(base, mapped_size, page_protection),
+            },
+        );
+        Ok(ClientPortSectionView {
+            base,
+            mapped_size,
+            view_size,
+        })
+    }
+
+    pub(super) fn rollback_client_port_section_view(&self, base_address: usize) {
+        let Some((view_base, view)) = self.remove_section_view_for_address(base_address) else {
+            return;
+        };
+        if let Some(section) = &view.section
+            && matches!(section.backing, SectionBacking::Pagefile)
+        {
+            section.pagefile_view_active.store(false, Ordering::Release);
+        }
+        let _ = remove_view_pages::<Platform>(&self.global.page_manager, view_base, view.size);
+        self.process.virtual_allocations.write().remove(&view_base);
     }
 
     fn map_csr_shared_section(

@@ -33,6 +33,7 @@ use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
+use crate::syscalls::lpc::{LpcPortHandleObject, LpcPortSubsystem};
 use crate::syscalls::object_manager::{
     DirectoryHandleObject, DirectoryObjectSubsystem, ObjectManager,
 };
@@ -404,6 +405,7 @@ fn windows_user_shared_data() -> nt_types::KUserSharedData {
     shared_data
 }
 
+#[cfg(test)]
 fn map_csr_server_shared_memory<Platform: crate::ShimPlatform>(
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Option<usize> {
@@ -439,13 +441,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         #[cfg(not(target_os = "windows"))]
         let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
-        let windows_shared_section_addr = map_csr_server_shared_memory(&self.0.page_manager)
-            .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
-        let windows_shared_section =
-            crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_addr);
-
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
+        let windows_shared_section_addr = read_field_at_offset::<Platform, usize>(
+            load_info.environment.peb,
+            core::mem::offset_of!(
+                crate::nt_types::ProcessEnvironmentBlock,
+                read_only_shared_memory_base
+            ),
+        )
+        .ok_or(loader::WindowsLoadError::MemoryAccess)?;
+        let windows_shared_section =
+            crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_addr);
         let mut process =
             Process::default(Some(load_info.virtual_allocations), windows_shared_section);
         process.ntdll_mapping = load_info.ntdll_mapping;
@@ -813,6 +820,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     number_of_concurrent_threads,
                 );
                 (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtConnectPort {
+                port_handle,
+                port_name,
+                security_qos,
+                client_view,
+                server_view,
+                max_message_length,
+                connection_information,
+                connection_information_length,
+            } => {
+                let status = self.sys_nt_connect_port(syscalls::lpc::ConnectPortParameters {
+                    port_handle,
+                    port_name,
+                    security_qos,
+                    client_view,
+                    server_view,
+                    max_message_length,
+                    connection_information,
+                    connection_information_length,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSecureConnectPort => {
+                litebox_util_log::debug!(
+                    "Rejected NtSecureConnectPort; only the CSR NtConnectPort subset is modeled"
+                );
+                (NtStatus::NOT_SUPPORTED, ContinueOperation::Resume)
             }
             SyscallRequest::NtCreateSection {
                 section_handle,
@@ -1604,6 +1639,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, LpcPortSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |lpc_port| visitor.lpc_port(lpc_port),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         if remove_raw_handle_by_raw_fd::<Platform, TimerSubsystem<Platform>>(
             &self.global.litebox,
             &self.process.handles,
@@ -1664,6 +1707,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
 
+    fn lpc_port(&self, lpc_port: LpcPortHandleObject);
+
     fn timer(&self, timer: TimerHandleObject<Platform>);
 
     fn wait_completion_packet(
@@ -1705,6 +1750,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
         Task::<Platform, FS>::close_io_completion(io_completion);
+    }
+
+    fn lpc_port(&self, lpc_port: LpcPortHandleObject) {
+        Task::<Platform, FS>::close_lpc_port(lpc_port);
     }
 
     fn timer(&self, timer: TimerHandleObject<Platform>) {
