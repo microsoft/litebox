@@ -2013,6 +2013,64 @@ fn ensure_docker_image(ws_root: &Path) {
     assert!(status.success(), "Docker build failed for {tag}");
 }
 
+/// Run a cargo build `cmd`, retrying on the transient shadow-target
+/// *fingerprint race* — `failed to write .../.fingerprint/.../
+/// invoked.timestamp: No such file or directory` — that surfaces when
+/// concurrent shadow builds churn a target dir under the dashboard's
+/// per-tip reconciler. A clean retry (the racing writer gone) succeeds; a
+/// genuine build failure (or an exhausted budget) still panics with the
+/// real error. The first attempt inherits stdio so normal builds stream
+/// compile progress to the log; only retries capture output (to classify
+/// transient-race vs real failure without masking compile errors).
+fn run_cargo_build_retrying(mut cmd: Command, label: &str) {
+    const MAX_ATTEMPTS: u32 = 5;
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("cargo build ({label}): spawn failed: {e}"));
+    if status.success() {
+        return;
+    }
+    for attempt in 2..=MAX_ATTEMPTS {
+        std::thread::sleep(std::time::Duration::from_millis(
+            500 * u64::from(attempt - 1),
+        ));
+        let out = cmd
+            .output()
+            .unwrap_or_else(|e| panic!("cargo build ({label}): spawn failed: {e}"));
+        {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&out.stdout);
+            let _ = std::io::stderr().write_all(&out.stderr);
+        }
+        if out.status.success() {
+            eprintln!(
+                "cargo build ({label}) succeeded on retry {attempt}/{MAX_ATTEMPTS} \
+                 — transient shadow-target fingerprint race cleared"
+            );
+            return;
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let transient = stderr.contains("invoked.timestamp")
+            || (stderr.contains("failed to write")
+                && stderr.contains("No such file or directory")
+                && stderr.contains(".fingerprint"));
+        if !transient {
+            panic!(
+                "cargo build ({label}) failed with a non-transient error on \
+                 attempt {attempt}/{MAX_ATTEMPTS} (see captured output above)"
+            );
+        }
+        eprintln!(
+            "cargo build ({label}) hit the transient fingerprint race \
+             (attempt {attempt}/{MAX_ATTEMPTS}); retrying"
+        );
+    }
+    panic!(
+        "cargo build ({label}) still failing after {MAX_ATTEMPTS} attempts \
+         (transient fingerprint race not clearing)"
+    );
+}
+
 /// Build all required binaries (5 legs of `BinaryType`) to the
 /// target directory.
 ///
@@ -2050,12 +2108,9 @@ fn ensure_binaries_built(ws_root: &Path) {
         build_args.push("--features");
         build_args.push(&lock_tracing_feature_runner);
     }
-    let status = Command::new("cargo")
-        .current_dir(ws_root)
-        .args(&build_args)
-        .status()
-        .expect("cargo build");
-    assert!(status.success(), "cargo build (PIE-glibc) failed");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(ws_root).args(&build_args);
+    run_cargo_build_retrying(cmd, "PIE-glibc");
 
     build_companion_binary(
         ws_root,
@@ -2131,10 +2186,7 @@ fn build_companion_binary(
     if let Some(flag) = extra_cflag {
         cmd.args(["--", "-C", flag]);
     }
-    let status = cmd
-        .status()
-        .unwrap_or_else(|e| panic!("cargo rustc {label}: {e}"));
-    assert!(status.success(), "cargo build ({label}) failed");
+    run_cargo_build_retrying(cmd, label);
 }
 
 /// Verify the requested rust target is installed via rustup. If it
@@ -2180,18 +2232,16 @@ fn setup() -> (PathBuf, BinaryPaths) {
             // test_harness variants below. It lives in the default
             // target dir; ensure_binaries_built already pulls it in
             // transitively but be explicit.
-            let rewriter_status = Command::new("cargo")
-                .current_dir(&ws_root)
-                .args([
-                    "build",
-                    "--target-dir",
-                    &target_dir().to_string_lossy(),
-                    "-p",
-                    "litebox_syscall_rewriter",
-                ])
-                .status()
-                .expect("cargo build litebox_syscall_rewriter");
-            assert!(rewriter_status.success(), "cargo build rewriter failed");
+            let rw_td = target_dir();
+            let mut rewriter_cmd = Command::new("cargo");
+            rewriter_cmd.current_dir(&ws_root).args([
+                "build",
+                "--target-dir",
+                &rw_td.to_string_lossy(),
+                "-p",
+                "litebox_syscall_rewriter",
+            ]);
+            run_cargo_build_retrying(rewriter_cmd, "syscall_rewriter");
             assert!(
                 rewriter_path().exists(),
                 "rewriter binary missing at {}",
