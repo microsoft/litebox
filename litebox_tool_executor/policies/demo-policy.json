@@ -13,7 +13,8 @@
             "**/workspaces/**",
             "**/.vscode-server/**",
             "/proc/self/fd/**",
-            "/run/dropbear.pid"
+            "/run/dropbear.pid",
+            "/var/run/dropbear.pid"
         ],
         "deny": [
             "**/.ssh/id_*",
