@@ -1589,16 +1589,17 @@ class ReconcileRunnersTests(unittest.TestCase):
 
 
 class WatchdogStuckPlanTests(unittest.TestCase):
-    """Pure remediation decision for an UP-but-stuck supervisor. Cooldown-
-    and dedup-guarded so the durable 3-min systemd timer can never turn a
-    persistent failure into a restart storm."""
+    """Pure decision for an UP supervisor. Restart is reserved for infra
+    (BUILD_FAILING), cooldown-guarded; a parked tip is SURFACED (logged once
+    per tip+sha), never restarted — so the durable 3-min timer can't churn
+    the whole supervisor for one agent tip."""
 
     NOW = 1_000_000_000_000
 
     def test_healthy_no_restart(self):
         p = dashboard._wd_stuck_plan(0, [], {}, self.NOW)
         self.assertFalse(p["restart"])
-        self.assertEqual(p["stale"], [])
+        self.assertEqual(p["log"], [])
 
     def test_build_failing_restarts_and_fixes_docker(self):
         p = dashboard._wd_stuck_plan(
@@ -1614,34 +1615,33 @@ class WatchdogStuckPlanTests(unittest.TestCase):
         self.assertFalse(p["restart"])
         self.assertIn("cooldown", p["reason"])
 
-    def test_new_park_restarts_and_marks(self):
-        p = dashboard._wd_stuck_plan(
-            0, [("wportnoy/x", "sha1")], {}, self.NOW)
-        self.assertTrue(p["restart"])
-        self.assertFalse(p["fix_docker"])   # a park is not a docker issue
-        self.assertIn("COVERAGE_GAP", p["reason"])
-        self.assertEqual(p["mark"], [("wportnoy/x", "sha1")])
+    def test_parked_tip_is_logged_not_restarted(self):
+        # A parked tip is surfaced; it never triggers a supervisor restart.
+        p = dashboard._wd_stuck_plan(0, [("wportnoy/x", "sha1")], {}, self.NOW)
+        self.assertFalse(p["restart"])
+        self.assertEqual(p["log"], [("wportnoy/x", "sha1")])
 
-    def test_already_remediated_park_is_stale_no_restart(self):
-        st = {"remediated_parks": {"wportnoy/x": "sha1"}}
+    def test_parked_tip_logged_once_per_sha(self):
+        # Already surfaced at this sha → not logged again (no log spam).
+        st = {"logged_parks": {"wportnoy/x": "sha1"}}
         p = dashboard._wd_stuck_plan(0, [("wportnoy/x", "sha1")], st, self.NOW)
-        self.assertFalse(p["restart"])   # genuine build failure — don't loop
-        self.assertEqual(p["stale"], [("wportnoy/x", "sha1")])
-        self.assertEqual(p["mark"], [])
+        self.assertFalse(p["restart"])
+        self.assertEqual(p["log"], [])
 
-    def test_park_at_new_sha_is_fresh(self):
-        # A new commit (sha move) earns a fresh remediation attempt.
-        st = {"remediated_parks": {"wportnoy/x": "OLDsha"}}
+    def test_parked_at_new_sha_is_surfaced_again(self):
+        st = {"logged_parks": {"wportnoy/x": "OLDsha"}}
         p = dashboard._wd_stuck_plan(0, [("wportnoy/x", "sha2")], st, self.NOW)
-        self.assertTrue(p["restart"])
-        self.assertEqual(p["mark"], [("wportnoy/x", "sha2")])
+        self.assertEqual(p["log"], [("wportnoy/x", "sha2")])
 
-    def test_build_failing_precedes_coverage_gap(self):
+    def test_build_failing_restarts_even_with_parked(self):
+        # Infra BUILD_FAILING still restarts; the parked tip is also logged.
         p = dashboard._wd_stuck_plan(
             dashboard._WD_INFRA_FAIL_ALARM + 1,
             [("wportnoy/x", "sha1")], {}, self.NOW)
-        self.assertTrue(p["fix_docker"])   # took the BUILD_FAILING branch
+        self.assertTrue(p["restart"])
+        self.assertTrue(p["fix_docker"])
         self.assertIn("BUILD_FAILING", p["reason"])
+        self.assertEqual(p["log"], [("wportnoy/x", "sha1")])
 
 
 class FmtRcRegressionsTests(unittest.TestCase):
