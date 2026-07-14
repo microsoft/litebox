@@ -138,7 +138,7 @@ pub(crate) fn validate_connect_server_ea<Platform: crate::ShimPlatform>(
     let Some(ea_buffer) = ea_buffer else {
         return Err(NtStatus::EAS_NOT_SUPPORTED);
     };
-    let ea_length = usize::try_from(ea_length).unwrap();
+    let ea_length = ea_length as usize;
     let Some(entry) = ConstPtr::<Platform, FileFullEaInformation>::from_usize(ea_buffer.as_usize())
         .read_at_offset(0)
     else {
@@ -146,8 +146,8 @@ pub(crate) fn validate_connect_server_ea<Platform: crate::ShimPlatform>(
     };
 
     let name_offset = size_of::<FileFullEaInformation>();
-    let name_length = usize::from(entry.ea_name_length);
-    let value_length = usize::from(entry.ea_value_length);
+    let name_length = entry.ea_name_length as usize;
+    let value_length = entry.ea_value_length as usize;
     let value_offset = name_offset
         .checked_add(name_length)
         .and_then(|offset| offset.checked_add(1))
@@ -162,23 +162,23 @@ pub(crate) fn validate_connect_server_ea<Platform: crate::ShimPlatform>(
     let Some(name_address) = ea_buffer.as_usize().checked_add(name_offset) else {
         return Err(NtStatus::EAS_NOT_SUPPORTED);
     };
-    let Some(name) = ConstPtr::<Platform, u8>::from_usize(name_address).to_owned_slice(name_length)
+    let Some(name_with_nul) =
+        ConstPtr::<Platform, u8>::from_usize(name_address).to_owned_slice(name_length + 1)
     else {
         return Err(NtStatus::ACCESS_VIOLATION);
     };
-    let Some(nul_address) = name_address.checked_add(name_length) else {
+    let Some((&0, name)) = name_with_nul.split_last() else {
         return Err(NtStatus::EAS_NOT_SUPPORTED);
     };
-    let Some(nul) = ConstPtr::<Platform, u8>::from_usize(nul_address).read_at_offset(0) else {
-        return Err(NtStatus::ACCESS_VIOLATION);
-    };
-    if nul != 0 || !name.eq_ignore_ascii_case(CD_SERVER_EA_NAME) {
+    if !name.eq_ignore_ascii_case(CD_SERVER_EA_NAME) {
         return Err(NtStatus::EAS_NOT_SUPPORTED);
     }
 
     let Some(value_address) = ea_buffer.as_usize().checked_add(value_offset) else {
         return Err(NtStatus::EAS_NOT_SUPPORTED);
     };
+    // The ConDrv "server" EA value format is undocumented; probe the declared payload without
+    // interpreting it until its semantics are understood.
     if ConstPtr::<Platform, u8>::from_usize(value_address)
         .to_owned_slice(value_length)
         .is_none()
