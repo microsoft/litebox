@@ -264,7 +264,7 @@ impl Task {
             let result = pta.invoke_command(self, cmd_id, params);
             // Best-effort write-back of the return origin, matching OP-TEE OS
             // (`syscall_invoke_ta_command`): the copy result is ignored.
-            let _ = ret_orig.write_at_offset(0, TeeOrigin::Tee);
+            let _ = ret_orig.write_at_offset(0, TeeOrigin::TrustedApp);
             result
         } else {
             #[cfg(debug_assertions)]

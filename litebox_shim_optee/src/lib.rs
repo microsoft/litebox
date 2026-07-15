@@ -973,11 +973,11 @@ where
         let result = syscall_fn(task, state, &src_slice, &mut kernel_buf, &mut length);
         match result {
             Ok(()) => {
+                dst.copy_from_slice(0, &kernel_buf[..length])
+                    .ok_or(TeeResult::OutOfMemory)?;
                 dst_len
                     .write_at_offset(0, length as u64)
-                    .ok_or(TeeResult::AccessDenied)?;
-                dst.copy_from_slice(0, &kernel_buf[..length])
-                    .ok_or(TeeResult::OutOfMemory)
+                    .ok_or(TeeResult::AccessDenied)
             }
             Err(TeeResult::ShortBuffer) => {
                 dst_len
