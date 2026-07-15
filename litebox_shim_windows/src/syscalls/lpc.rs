@@ -254,7 +254,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 fn is_csr_api_port(port_name: &str) -> bool {
-    port_name.eq_ignore_ascii_case(WINDOWS_API_PORT)
+    port_name == WINDOWS_API_PORT
 }
 
 fn size_u32<T>() -> Option<u32> {
@@ -497,6 +497,41 @@ mod tests {
         let mut peb = ProcessEnvironmentBlock::new_zeroed();
         let task = task_with_peb(&mut peb);
         let (_name_units, name) = api_port_name(r"\NotWindows\ApiPort");
+        let qos = security_qos();
+        let mut handle = Handle::default();
+        let mut client_view = PortView {
+            length: test_size_u32::<PortView>(),
+            padding: 0,
+            section_handle: Handle::default(),
+            section_offset: 0,
+            view_size: crate::PAGE_SIZE,
+            view_base: 0,
+            view_remote_base: 0,
+        };
+        let mut connection_info = empty_connect_info();
+        let mut connection_info_len = test_size_u32::<CsrApiConnectInfo>();
+
+        assert_eq!(
+            task.sys_nt_connect_port(ConnectPortParameters {
+                port_handle: mut_ptr(&mut handle),
+                port_name: const_ptr(&name),
+                security_qos: const_ptr(&qos),
+                client_view: Some(mut_ptr(&mut client_view)),
+                server_view: None,
+                max_message_length: None,
+                connection_information: Some(mut_byte_ptr(&mut connection_info)),
+                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
+            }),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn nt_connect_port_rejects_api_port_case_variant() {
+        let mut peb = ProcessEnvironmentBlock::new_zeroed();
+        let task = task_with_peb(&mut peb);
+        let (_name_units, name) = api_port_name(r"\WINDOWS\APIPORT");
         let qos = security_qos();
         let mut handle = Handle::default();
         let mut client_view = PortView {
