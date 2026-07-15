@@ -92,7 +92,13 @@ impl Task {
                 if prop_set != TeePropSet::CurrentClient {
                     return Err(TeeResult::BadParameters);
                 }
+                prop_type
+                    .write_at_offset(0, UserTaPropType::Identity as u32)
+                    .ok_or(TeeResult::AccessDenied)?;
                 if prop_buf.len() < core::mem::size_of::<TeeIdentity>() {
+                    prop_len
+                        .write_at_offset(0, core::mem::size_of::<TeeIdentity>().trunc())
+                        .ok_or(TeeResult::AccessDenied)?;
                     return Err(TeeResult::ShortBuffer);
                 }
                 let identity = self.current_client_identity();
@@ -101,9 +107,6 @@ impl Task {
                 prop_len
                     .write_at_offset(0, core::mem::size_of::<TeeIdentity>().trunc())
                     .ok_or(TeeResult::AccessDenied)?;
-                prop_type
-                    .write_at_offset(0, UserTaPropType::Identity as u32)
-                    .ok_or(TeeResult::AccessDenied)?;
                 Ok(())
             }
             GpdPropertyIndex::ClientEndian => {
@@ -111,7 +114,13 @@ impl Task {
                 if prop_set != TeePropSet::CurrentClient {
                     return Err(TeeResult::BadParameters);
                 }
+                prop_type
+                    .write_at_offset(0, UserTaPropType::U32 as u32)
+                    .ok_or(TeeResult::AccessDenied)?;
                 if prop_buf.len() < core::mem::size_of::<u32>() {
+                    prop_len
+                        .write_at_offset(0, core::mem::size_of::<u32>().trunc())
+                        .ok_or(TeeResult::AccessDenied)?;
                     return Err(TeeResult::ShortBuffer);
                 }
                 prop_buf[..core::mem::size_of::<u32>()]
@@ -119,25 +128,25 @@ impl Task {
                 prop_len
                     .write_at_offset(0, core::mem::size_of::<u32>().trunc())
                     .ok_or(TeeResult::AccessDenied)?;
-                prop_type
-                    .write_at_offset(0, UserTaPropType::U32 as u32)
-                    .ok_or(TeeResult::AccessDenied)?;
                 Ok(())
             }
             GpdPropertyIndex::CurrentTaUuid => {
                 if prop_set != TeePropSet::CurrentTa {
                     return Err(TeeResult::BadParameters);
                 }
+                prop_type
+                    .write_at_offset(0, UserTaPropType::Uuid as u32)
+                    .ok_or(TeeResult::AccessDenied)?;
                 if prop_buf.len() < core::mem::size_of::<TeeUuid>() {
+                    prop_len
+                        .write_at_offset(0, core::mem::size_of::<TeeUuid>().trunc())
+                        .ok_or(TeeResult::AccessDenied)?;
                     return Err(TeeResult::ShortBuffer);
                 }
                 let ta_uuid = self.ta_app_id;
                 prop_buf[..core::mem::size_of::<TeeUuid>()].copy_from_slice(ta_uuid.as_bytes());
                 prop_len
                     .write_at_offset(0, core::mem::size_of::<TeeUuid>().trunc())
-                    .ok_or(TeeResult::AccessDenied)?;
-                prop_type
-                    .write_at_offset(0, UserTaPropType::Uuid as u32)
                     .ok_or(TeeResult::AccessDenied)?;
                 Ok(())
             }
@@ -252,11 +261,11 @@ impl Task {
     ) -> Result<Cleanup, TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
         if let Some(pta) = self.pta_for_session(ta_sess_id) {
-            let cleanup = pta.invoke_command(self, cmd_id, params)?;
+            let result = pta.invoke_command(self, cmd_id, params);
             // Best-effort write-back of the return origin, matching OP-TEE OS
             // (`syscall_invoke_ta_command`): the copy result is ignored.
-            let _ = ret_orig.write_at_offset(0, TeeOrigin::Tee);
-            Ok(cleanup)
+            let _ = ret_orig.write_at_offset(0, TeeOrigin::TrustedApp);
+            result
         } else {
             #[cfg(debug_assertions)]
             todo!("support inter TA interaction");

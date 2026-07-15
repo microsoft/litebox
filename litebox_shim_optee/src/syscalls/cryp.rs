@@ -167,43 +167,43 @@ impl Task {
         last_block: bool,
     ) -> Result<(), TeeResult> {
         let tee_cryp_state_map = &self.tee_cryp_state_map;
+        let Some(mut map) = tee_cryp_state_map.get_mut(state) else {
+            return Err(TeeResult::BadParameters);
+        };
         if dst_slice.len() < src_slice.len() {
+            *dst_len = src_slice.len();
             return Err(TeeResult::ShortBuffer);
         }
-        if let Some(mut map) = tee_cryp_state_map.get_mut(state) {
-            // Check last_block before applying the cipher so we don't mutate
-            // dst_slice and then return an error.
-            if last_block {
-                #[cfg(debug_assertions)]
-                todo!("support algorithms which have a certain finalization logic");
-                #[cfg(not(debug_assertions))]
-                return Err(TeeResult::NotSupported);
-            }
-            if let Some(state_entry) = map.get_mut(&state)
-                && let Some(cipher) = state_entry.get_mut_cipher()
-            {
-                dst_slice[..src_slice.len()].copy_from_slice(src_slice);
-                match cipher {
-                    Cipher::Aes128Ctr(aes128ctr) => {
-                        aes128ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
-                    }
-                    Cipher::Aes192Ctr(aes192ctr) => {
-                        aes192ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
-                    }
-                    Cipher::Aes256Ctr(aes256ctr) => {
-                        aes256ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
-                    }
+        // Check last_block before applying the cipher so we don't mutate
+        // dst_slice and then return an error.
+        if last_block {
+            #[cfg(debug_assertions)]
+            todo!("support algorithms which have a certain finalization logic");
+            #[cfg(not(debug_assertions))]
+            return Err(TeeResult::NotSupported);
+        }
+        if let Some(state_entry) = map.get_mut(&state)
+            && let Some(cipher) = state_entry.get_mut_cipher()
+        {
+            dst_slice[..src_slice.len()].copy_from_slice(src_slice);
+            match cipher {
+                Cipher::Aes128Ctr(aes128ctr) => {
+                    aes128ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
                 }
-                *dst_len = src_slice.len();
-                Ok(())
-            } else {
-                #[cfg(debug_assertions)]
-                todo!("handle unimplemented cipher");
-                #[cfg(not(debug_assertions))]
-                Err(TeeResult::NotImplemented)
+                Cipher::Aes192Ctr(aes192ctr) => {
+                    aes192ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
+                }
+                Cipher::Aes256Ctr(aes256ctr) => {
+                    aes256ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
+                }
             }
+            *dst_len = src_slice.len();
+            Ok(())
         } else {
-            Err(TeeResult::BadParameters)
+            #[cfg(debug_assertions)]
+            todo!("handle unimplemented cipher");
+            #[cfg(not(debug_assertions))]
+            Err(TeeResult::NotImplemented)
         }
     }
 
