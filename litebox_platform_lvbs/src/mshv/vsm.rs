@@ -786,8 +786,7 @@ pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
             .remove_patch_data(&freed_init_patch_targets);
     }
 
-    result?;
-    Ok(0)
+    result.map(|()| 0)
 }
 
 /// VSM function for supporting the unloading of a guest kernel module.
