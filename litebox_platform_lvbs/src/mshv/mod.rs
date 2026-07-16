@@ -74,9 +74,9 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
 type Vtl0PhysConstPtr<T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, crate::Vmap>;
 
-/// Mutable VTL0 pointer reserved for the HEKI text patching (validated) and log ring
-/// buffer (fixed address). It bypasses `protected_frames` rejection and locking.
-/// DO NOT USE IT for other VTL0 destinations which could enable confused-deputy writes.
+/// Mutable VTL0 pointer reserved for validated HEKI text patching and the fixed-address log ring
+/// buffer. It bypasses ordinary protected-frame access checks and synchronization. Do not use it for other
+/// VTL0 destinations that could enable confused-deputy writes.
 type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, PrivilegedVmap>;
 

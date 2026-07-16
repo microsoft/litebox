@@ -46,12 +46,12 @@ pub mod mshv;
 
 pub mod syscall_entry;
 
-/// Mapping info returned by LVBS vmap paths. Ordinary writable mappings retain their
-/// `protected_frames` guard here until unmap.
+/// Mapping metadata. Ordinary writable mappings retain an opaque protected-frame access guard for
+/// the mapping's lifetime.
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
-    protected_frames_guard: Option<spin::rwlock::RwLockReadGuard<'static, rangemap::RangeSet<u64>>>,
+    protected_frame_access: Option<crate::mshv::vsm::ProtectedFrameAccessGuard<'static>>,
 }
 
 impl LvbsPhysPageMapInfo {
@@ -59,7 +59,7 @@ impl LvbsPhysPageMapInfo {
         Self {
             base,
             size,
-            protected_frames_guard: None,
+            protected_frame_access: None,
         }
     }
 }
@@ -1130,12 +1130,10 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<Self::MapInfo, PhysPointerError> {
-        let protected_frames = if perms.contains(PhysPageMapPermissions::WRITE) {
+        let protected_frame_access = if perms.contains(PhysPageMapPermissions::WRITE) {
             // This shared guard spans map/copy/unmap. It permits concurrent foreign-memory writes
             // but does not support re-entry into a VTL protection change.
-            let guard = crate::mshv::vsm::protected_frames().read();
-            crate::mshv::vsm::validate_mutable_vtl0_pages(&guard, pages)?;
-            Some(guard)
+            Some(crate::mshv::vsm::protected_frame_registry().acquire_access_guard(pages)?)
         } else {
             None
         };
@@ -1143,7 +1141,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         // the guard is retained through map, access, and unmap. `vmap_privileged` provides the
         // shared raw mapping implementation.
         let mut map_info = unsafe { self.vmap_privileged(pages, perms)? };
-        map_info.protected_frames_guard = protected_frames;
+        map_info.protected_frame_access = protected_frame_access;
         Ok(map_info)
     }
 
@@ -1329,7 +1327,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         }
 
         let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
-            // VTL1 wants to write data to the pages, preventing VTL0 from reading/executing the pages.
+            // VTL1 needs writable access, so deny VTL0 all access.
             crate::mshv::heki::MemAttr::empty()
         } else if perms.contains(PhysPageMapPermissions::READ) {
             // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
@@ -1344,7 +1342,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
             );
-            crate::mshv::vsm::set_vtl0_memory_protection(frame_range, mem_attr)
+            crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
                 .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
         }
 
