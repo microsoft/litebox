@@ -98,7 +98,12 @@ fn run_tree(mut file: std::fs::File, follow: bool, color: bool) -> Result<(), St
         .map_err(|e| format!("read: {e}"))?;
     for line in content.lines() {
         let trimmed = line.trim();
+        // Cheap pre-filter: only broker policy events carry an `"event":` key;
+        // the syscall-trace lines (the vast majority of the file) don't, so skip
+        // them without paying for a full JSON parse — the tree only consumes
+        // policy events (fs_*/tcp_*/dns_*).
         if trimmed.starts_with('{')
+            && trimmed.contains("\"event\":")
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
         {
             frontier.ingest(&v);
