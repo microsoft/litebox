@@ -443,9 +443,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
-        let windows_shared_section = crate::syscalls::section::load_time_windows_shared_section(
-            load_info.environment.windows_shared_section,
-        );
+        let windows_shared_section_addr = read_field_at_offset::<Platform, usize>(
+            load_info.environment.peb,
+            core::mem::offset_of!(
+                crate::nt_types::ProcessEnvironmentBlock,
+                read_only_shared_memory_base
+            ),
+        )
+        .ok_or(loader::WindowsLoadError::MemoryAccess)?;
+        // TODO(csr-shared-section): model shared backing with distinct client and CSRSS
+        // virtual addresses instead of aliasing both PEB bases to this single mapping.
+        let windows_shared_section =
+            crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_addr);
         let mut process =
             Process::default(Some(load_info.virtual_allocations), windows_shared_section);
         process.ntdll_mapping = load_info.ntdll_mapping;
@@ -456,7 +465,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
                 crate::nt_types::ProcessEnvironmentBlock,
                 csr_server_read_only_shared_memory_base
             ),
-            u64::try_from(load_info.environment.windows_shared_section)
+            u64::try_from(windows_shared_section_addr)
                 .map_err(|_| loader::WindowsLoadError::MemoryAccess)?,
         )
         .ok_or(loader::WindowsLoadError::MemoryAccess)?;

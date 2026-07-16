@@ -64,7 +64,6 @@ pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
     pub(crate) teb: usize,
     pub(crate) context: usize,
-    pub(crate) windows_shared_section: usize,
 }
 
 pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
@@ -341,10 +340,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             GuestMemoryAllocator::new(read_only_shared_memory_base, WINDOWS_SHARED_SECTION_SIZE)?;
         let read_only_static_server_data =
             initialize_windows_static_server_data::<Platform>(&mut shared_heap)?;
-        let windows_shared_section = create_pages(WINDOWS_SHARED_SECTION_SIZE)?;
-        let mut server_shared_heap =
-            GuestMemoryAllocator::new(windows_shared_section, WINDOWS_SHARED_SECTION_SIZE)?;
-        initialize_windows_static_server_data::<Platform>(&mut server_shared_heap)?;
         let mut peb = ProcessEnvironmentBlock::new_zeroed();
         peb.image_base_address = input.image_base_address;
         if input.image_base_address != input.image.image_base() || input.image.has_dynamic_base() {
@@ -407,7 +402,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             peb: peb_ptr,
             teb: teb_ptr,
             context: ctx_ptr,
-            windows_shared_section,
         })
     }
 }
