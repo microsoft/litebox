@@ -42,9 +42,6 @@ const PML4_SHIFT: u32 = 39;
 /// Mask for a 9-bit page-table index (512 entries per table).
 const PML4_INDEX_MASK: u64 = 0x1FF;
 
-/// Number of bytes of virtual address space covered by one PML4 slot (512 GiB).
-const PML4_SLOT_SIZE: u64 = 1 << PML4_SHIFT;
-
 /// PML4 index of the first VTL1-kernel slot (`PA + KERNEL_OFFSET`).
 ///
 /// Only slots `>= KERNEL_PML4_START` are safe to share between page tables:
@@ -308,10 +305,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         // `0 ..= KERNEL_PML4_START * PML4_SLOT_SIZE - 1`. The kernel region at
         // and above `KERNEL_PML4_START` is base-owned/shared.
         let start = Page::<Size4KiB>::from_start_address(VirtAddr::new(0)).unwrap();
-        let end = Page::<Size4KiB>::containing_address(VirtAddr::new(
-            KERNEL_PML4_START as u64 * PML4_SLOT_SIZE - 1,
-        ));
+        let end = Page::<Size4KiB>::containing_address(VirtAddr::new(crate::KERNEL_OFFSET - 1));
         // Safety: The page table is being destroyed and will not be reused.
+        // This function crosses the non-canonical hole.
         unsafe {
             self.inner
                 .lock()
