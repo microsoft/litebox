@@ -450,6 +450,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             Process::default(Some(load_info.virtual_allocations), windows_shared_section);
         process.ntdll_mapping = load_info.ntdll_mapping;
         process.peb_address = load_info.environment.peb;
+        write_field_at_offset::<Platform, _>(
+            process.peb_address,
+            core::mem::offset_of!(
+                crate::nt_types::ProcessEnvironmentBlock,
+                csr_server_read_only_shared_memory_base
+            ),
+            u64::try_from(load_info.environment.windows_shared_section)
+                .map_err(|_| loader::WindowsLoadError::MemoryAccess)?,
+        )
+        .ok_or(loader::WindowsLoadError::MemoryAccess)?;
         let process = Arc::new(process);
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {

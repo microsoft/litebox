@@ -341,8 +341,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             GuestMemoryAllocator::new(read_only_shared_memory_base, WINDOWS_SHARED_SECTION_SIZE)?;
         let read_only_static_server_data =
             initialize_windows_static_server_data::<Platform>(&mut shared_heap)?;
-        // Windows reports distinct client and CSRSS addresses for the shared section.
-        // LiteBox materializes both views because shared backing is not modeled yet.
         let windows_shared_section = create_pages(WINDOWS_SHARED_SECTION_SIZE)?;
         let mut server_shared_heap =
             GuestMemoryAllocator::new(windows_shared_section, WINDOWS_SHARED_SECTION_SIZE)?;
@@ -381,8 +379,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         peb.image_subsystem_minor_version = u32::from(input.image.minor_subsystem_version());
         peb.read_only_shared_memory_base = read_only_shared_memory_base;
         peb.read_only_static_server_data = read_only_static_server_data;
-        peb.csr_server_read_only_shared_memory_base = u64::try_from(windows_shared_section)
-            .map_err(|_| PeImageAccessError::AddressOverflow)?;
 
         write_guest_value::<Platform, _>(peb_ptr, peb)?;
 
@@ -2396,26 +2392,6 @@ mod tests {
                     / size_of::<u16>(),
             ),
             utf16_environment_units(&["a=one", "B=two", "c=three"])
-        );
-    }
-
-    #[test]
-    fn csr_client_and_server_shared_memory_bases_are_distinct() {
-        let created = created_process_environment_snapshot();
-        let server_base = usize::try_from(created.peb.csr_server_read_only_shared_memory_base)
-            .expect("the CSR server base fits in the guest address space");
-
-        assert_ne!(created.peb.read_only_shared_memory_base, server_base);
-        assert_eq!(created.environment.windows_shared_section, server_base);
-        assert!(
-            (created.peb.read_only_shared_memory_base
-                ..created.peb.read_only_shared_memory_base + WINDOWS_SHARED_SECTION_SIZE)
-                .contains(&created.peb.read_only_static_server_data)
-        );
-        let base_server_data =
-            read_guest_value::<usize>(server_base + BASESRV_SERVERDLL_INDEX * size_of::<usize>());
-        assert!(
-            (server_base..server_base + WINDOWS_SHARED_SECTION_SIZE).contains(&base_server_data)
         );
     }
 

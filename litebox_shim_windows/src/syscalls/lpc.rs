@@ -237,13 +237,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn csr_api_connect_info(&self) -> Option<CsrApiConnectInfo> {
-        let peb =
-            ConstPtr::<Platform, ProcessEnvironmentBlock>::from_usize(self.process.peb_address)
-                .read_at_offset(0)?;
+        let read_only_shared_memory_base = crate::read_field_at_offset::<Platform, usize>(
+            self.process.peb_address,
+            core::mem::offset_of!(ProcessEnvironmentBlock, read_only_shared_memory_base),
+        )?;
+        let read_only_static_server_data = crate::read_field_at_offset::<Platform, usize>(
+            self.process.peb_address,
+            core::mem::offset_of!(ProcessEnvironmentBlock, read_only_static_server_data),
+        )?;
         Some(CsrApiConnectInfo {
-            shared_section_base: peb.read_only_shared_memory_base,
-            shared_static_server_data: peb.read_only_static_server_data,
-            shared_section_heap: peb.read_only_shared_memory_base,
+            shared_section_base: read_only_shared_memory_base,
+            shared_static_server_data: read_only_static_server_data,
+            shared_section_heap: read_only_shared_memory_base,
             debug_flags: 0,
             size_of_peb_data: size_u32::<ProcessEnvironmentBlock>()?,
             size_of_teb_data: size_u32::<ThreadEnvironmentBlock>()?,
