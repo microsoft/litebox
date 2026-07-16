@@ -1954,7 +1954,16 @@ impl<FS: ShimFS> Task<FS> {
                             .litebox
                             .descriptor_table()
                             .with_metadata(fd, |stream: &StdioStream| *stream)
-                            .map_err(|_| Errno::ENOTTY)?;
+                            .map_err(|_| {
+                                // TODO: Handle missing `StdioStream` metadata (could happen if
+                                // `/dev/stdin`, `/dev/stdout`, or `/dev/stderr` was reopened).
+                                // XXX(jayb): likely we might want to have some backend-specific
+                                // metadata layer in our file system?
+                                litebox_util_log::error!(
+                                    "standard stream is missing StdioStream metadata"
+                                );
+                                Errno::ENOTTY
+                            })?;
                         if self.global.platform.is_a_tty(stream) {
                             self.stdio_ioctl(&arg)
                         } else {
