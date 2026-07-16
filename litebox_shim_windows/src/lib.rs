@@ -629,8 +629,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
+            let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
+                .read_at_offset(0)
+                .unwrap_or_default();
             litebox_util_log::error!(
-                syscall:? = NtSysno::from_raw(ctx.orig_rax);
+                syscall:? = NtSysno::from_raw(ctx.orig_rax),
+                rip:% = format_args!("{:#x}", ctx.rip),
+                caller:% = format_args!("{caller:#x}"),
+                arg0:% = format_args!("{:#x}", ctx.r10),
+                arg1:% = format_args!("{:#x}", ctx.rdx),
+                arg2:% = format_args!("{:#x}", ctx.r8),
+                arg3:% = format_args!("{:#x}", ctx.r9);
                 "Unsupported Windows syscall; terminating Windows guest"
             );
             return ContinueOperation::Terminate;
