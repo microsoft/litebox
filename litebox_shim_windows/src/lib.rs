@@ -1575,94 +1575,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         raw_fd: usize,
         visitor: impl RawHandleVisitor<Platform, FS>,
     ) -> NtStatus {
-        if remove_raw_handle_by_raw_fd::<Platform, FileObjectSubsystem<FS>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |file| visitor.file(file),
-        ) {
-            return NtStatus::SUCCESS;
+        macro_rules! try_close {
+            ($subsystem:ty, $visit:ident) => {
+                if remove_raw_handle_by_raw_fd::<Platform, $subsystem>(
+                    &self.global.litebox,
+                    &self.process.handles,
+                    raw_fd,
+                    |entry| visitor.$visit(entry),
+                ) {
+                    return NtStatus::SUCCESS;
+                }
+            };
         }
-        if remove_raw_handle_by_raw_fd::<Platform, RegistryKeySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |key| visitor.registry_key(key),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, EventSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |event| visitor.event(event),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, DirectoryObjectSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |directory| visitor.directory(directory),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, SymbolicLinkSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |link| visitor.symbolic_link(link),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, IoCompletionSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |io_completion| visitor.io_completion(io_completion),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, LpcPortSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |lpc_port| visitor.lpc_port(lpc_port),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, TimerSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |timer| visitor.timer(timer),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, WaitCompletionPacketSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |wait_completion_packet| visitor.wait_completion_packet(wait_completion_packet),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, WorkerFactorySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |worker_factory| visitor.worker_factory(worker_factory),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, SectionSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |section| visitor.section(section),
-        ) {
-            return NtStatus::SUCCESS;
-        }
+
+        try_close!(FileObjectSubsystem<FS>, file);
+        try_close!(RegistryKeySubsystem<Platform>, registry_key);
+        try_close!(EventSubsystem<Platform>, event);
+        try_close!(DirectoryObjectSubsystem<Platform>, directory);
+        try_close!(SymbolicLinkSubsystem<Platform>, symbolic_link);
+        try_close!(IoCompletionSubsystem<Platform>, io_completion);
+        try_close!(LpcPortSubsystem<Platform>, lpc_port);
+        try_close!(TimerSubsystem<Platform>, timer);
+        try_close!(
+            WaitCompletionPacketSubsystem<Platform>,
+            wait_completion_packet
+        );
+        try_close!(WorkerFactorySubsystem<Platform>, worker_factory);
+        try_close!(SectionSubsystem<Platform>, section);
+
         NtStatus::INVALID_HANDLE
     }
 
