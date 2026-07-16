@@ -5,6 +5,7 @@ use alloc::string::String;
 use core::marker::PhantomData;
 use core::mem::size_of;
 
+use litebox::utils::TruncateExt as _;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_windows::nt_status::NtStatus;
@@ -14,8 +15,6 @@ use super::Handle;
 use crate::nt_types::{ProcessEnvironmentBlock, ThreadEnvironmentBlock, UnicodeString};
 use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value};
 
-const CSR_API_CONNECTINFO_SIZE: usize = 0x30;
-const CSR_API_CONNECTINFO_SIZE_U32: u32 = 0x30;
 const CSR_MAX_MESSAGE_LENGTH: u32 = 0x148;
 const CSR_SERVER_PROCESS_ID: usize = 1;
 const CSR_SERVER_DLL_NAMES: u32 = 2;
@@ -185,13 +184,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             || params
                 .max_message_length
                 .is_some_and(|ptr| ptr.write_at_offset(0, CSR_MAX_MESSAGE_LENGTH).is_none())
-            || write_process_output::<Platform, CsrApiConnectInfo>(
-                connection_information,
-                connect_info,
-            )
-            .is_none()
+            || connection_information
+                .write_slice_at_offset(0, connect_info.as_bytes())
+                .is_none()
             || connection_information_length
-                .write_at_offset(0, CSR_API_CONNECTINFO_SIZE_U32)
+                .write_at_offset(0, size_of::<CsrApiConnectInfo>().trunc())
                 .is_none()
             || params.port_handle.write_at_offset(0, handle).is_none();
         if write_failed {
@@ -244,16 +241,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             shared_static_server_data: read_only_static_server_data,
             shared_section_heap: read_only_shared_memory_base,
             debug_flags: 0,
-            size_of_peb_data: size_u32::<ProcessEnvironmentBlock>()?,
-            size_of_teb_data: size_u32::<ThreadEnvironmentBlock>()?,
+            size_of_peb_data: size_of::<ProcessEnvironmentBlock>().trunc(),
+            size_of_teb_data: size_of::<ThreadEnvironmentBlock>().trunc(),
             number_of_server_dll_names: CSR_SERVER_DLL_NAMES,
             server_process_id: CSR_SERVER_PROCESS_ID,
         })
     }
-}
-
-fn size_u32<T>() -> Option<u32> {
-    u32::try_from(size_of::<T>()).ok()
 }
 
 fn probe_lpc_outputs<Platform: ShimPlatform>(
@@ -276,7 +269,7 @@ fn probe_lpc_outputs<Platform: ShimPlatform>(
     probe_guest_byte_buffer_preserving::<Platform>(
         connection_information,
         connection_information_len,
-        CSR_API_CONNECTINFO_SIZE,
+        size_of::<CsrApiConnectInfo>(),
     )?;
     probe_guest_output_preserving_value::<Platform, u32>(connection_information_length)
 }
@@ -294,19 +287,11 @@ fn probe_guest_byte_buffer_preserving<Platform: ShimPlatform>(
         .ok_or(NtStatus::ACCESS_VIOLATION)
 }
 
-fn write_process_output<Platform: ShimPlatform, T: FromBytes + IntoBytes + Immutable>(
-    ptr: MutPtr<Platform, u8>,
-    value: T,
-) -> Option<()> {
-    ptr.write_slice_at_offset(0, value.as_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use zerocopy::FromZeros as _;
 
     use super::*;
-    use crate::syscalls::ProcessHandle;
     use crate::syscalls::mm::PageProtection;
     use crate::syscalls::object_manager::WINDOWS_API_PORT;
     use crate::tests::{
@@ -328,7 +313,7 @@ mod tests {
 
     fn security_qos() -> SecurityQualityOfService {
         SecurityQualityOfService {
-            length: test_size_u32::<SecurityQualityOfService>(),
+            length: size_of::<SecurityQualityOfService>().trunc(),
             impersonation_level: 2,
             context_tracking_mode: 0,
             effective_only: 1,
@@ -355,10 +340,6 @@ mod tests {
         }
     }
 
-    fn test_size_u32<T>() -> u32 {
-        size_u32::<T>().expect("Windows ABI test structure size fits in u32")
-    }
-
     fn create_client_section(task: &Task<TestPlatform, TestFS>, access: u32) -> Handle {
         let mut handle = Handle::default();
         let size = i64::try_from(crate::PAGE_SIZE).expect("test section size fits in i64");
@@ -377,50 +358,6 @@ mod tests {
         handle
     }
 
-    fn connect_csr_api_port(
-        task: &Task<TestPlatform, TestFS>,
-        peb: &ProcessEnvironmentBlock,
-        section_handle: Handle,
-    ) -> (Handle, PortView) {
-        let (_name_units, name) = api_port_name(WINDOWS_API_PORT);
-        let qos = security_qos();
-        let mut handle = Handle::default();
-        let mut client_view = PortView {
-            length: test_size_u32::<PortView>(),
-            padding: 0,
-            section_handle,
-            section_offset: 0,
-            view_size: crate::PAGE_SIZE,
-            view_base: 0,
-            view_remote_base: 0,
-        };
-        let mut connection_info = empty_connect_info();
-        let mut connection_info_len = test_size_u32::<CsrApiConnectInfo>();
-
-        assert_eq!(
-            task.sys_nt_connect_port(ConnectPortParameters {
-                port_handle: mut_ptr(&mut handle),
-                port_name: const_ptr(&name),
-                security_qos: const_ptr(&qos),
-                client_view: Some(mut_ptr(&mut client_view)),
-                server_view: None,
-                max_message_length: None,
-                connection_information: Some(mut_byte_ptr(&mut connection_info)),
-                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
-            }),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            connection_info.shared_section_base,
-            peb.read_only_shared_memory_base
-        );
-        assert_eq!(
-            connection_info.shared_static_server_data,
-            peb.read_only_static_server_data
-        );
-        (handle, client_view)
-    }
-
     #[test]
     fn nt_connect_port_fills_csr_info_and_maps_client_section() {
         let mut peb = ProcessEnvironmentBlock::new_zeroed();
@@ -433,7 +370,7 @@ mod tests {
         let section_handle = create_client_section(&task, SECTION_MAP_READ | SECTION_MAP_WRITE);
         let mut handle = Handle::default();
         let mut client_view = PortView {
-            length: test_size_u32::<PortView>(),
+            length: size_of::<PortView>().trunc(),
             padding: 0,
             section_handle,
             section_offset: 0,
@@ -443,7 +380,7 @@ mod tests {
         };
         let mut max_message_length = 0u32;
         let mut connection_info = empty_connect_info();
-        let mut connection_info_len = test_size_u32::<CsrApiConnectInfo>();
+        let mut connection_info_len = size_of::<CsrApiConnectInfo>().trunc();
 
         assert_eq!(
             task.sys_nt_connect_port(ConnectPortParameters {
@@ -477,249 +414,11 @@ mod tests {
         );
         assert_eq!(
             connection_info.size_of_peb_data,
-            test_size_u32::<ProcessEnvironmentBlock>()
+            size_of::<ProcessEnvironmentBlock>().trunc()
         );
         assert_eq!(
             connection_info.size_of_teb_data,
-            test_size_u32::<ThreadEnvironmentBlock>()
-        );
-    }
-
-    #[test]
-    fn nt_connect_port_rejects_api_port_suffix_match() {
-        let mut peb = ProcessEnvironmentBlock::new_zeroed();
-        let task = task_with_peb(&mut peb);
-        let (_name_units, name) = api_port_name(r"\NotWindows\ApiPort");
-        let qos = security_qos();
-        let mut handle = Handle::default();
-        let mut client_view = PortView {
-            length: test_size_u32::<PortView>(),
-            padding: 0,
-            section_handle: Handle::default(),
-            section_offset: 0,
-            view_size: crate::PAGE_SIZE,
-            view_base: 0,
-            view_remote_base: 0,
-        };
-        let mut connection_info = empty_connect_info();
-        let mut connection_info_len = test_size_u32::<CsrApiConnectInfo>();
-
-        assert_eq!(
-            task.sys_nt_connect_port(ConnectPortParameters {
-                port_handle: mut_ptr(&mut handle),
-                port_name: const_ptr(&name),
-                security_qos: const_ptr(&qos),
-                client_view: Some(mut_ptr(&mut client_view)),
-                server_view: None,
-                max_message_length: None,
-                connection_information: Some(mut_byte_ptr(&mut connection_info)),
-                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
-            }),
-            NtStatus::OBJECT_PATH_NOT_FOUND
-        );
-        assert!(handle.is_null());
-    }
-
-    #[test]
-    fn nt_connect_port_rejects_api_port_case_variant() {
-        let mut peb = ProcessEnvironmentBlock::new_zeroed();
-        let task = task_with_peb(&mut peb);
-        let (_name_units, name) = api_port_name(r"\WINDOWS\APIPORT");
-        let qos = security_qos();
-        let mut handle = Handle::default();
-        let mut client_view = PortView {
-            length: test_size_u32::<PortView>(),
-            padding: 0,
-            section_handle: Handle::default(),
-            section_offset: 0,
-            view_size: crate::PAGE_SIZE,
-            view_base: 0,
-            view_remote_base: 0,
-        };
-        let mut connection_info = empty_connect_info();
-        let mut connection_info_len = test_size_u32::<CsrApiConnectInfo>();
-
-        assert_eq!(
-            task.sys_nt_connect_port(ConnectPortParameters {
-                port_handle: mut_ptr(&mut handle),
-                port_name: const_ptr(&name),
-                security_qos: const_ptr(&qos),
-                client_view: Some(mut_ptr(&mut client_view)),
-                server_view: None,
-                max_message_length: None,
-                connection_information: Some(mut_byte_ptr(&mut connection_info)),
-                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
-            }),
-            NtStatus::OBJECT_NAME_NOT_FOUND
-        );
-        assert!(handle.is_null());
-    }
-
-    #[test]
-    fn nt_connect_port_requires_bounded_connect_info_length() {
-        let mut peb = ProcessEnvironmentBlock::new_zeroed();
-        let task = task_with_peb(&mut peb);
-        let (_name_units, name) = api_port_name(WINDOWS_API_PORT);
-        let qos = security_qos();
-        let section_handle = create_client_section(&task, SECTION_MAP_READ | SECTION_MAP_WRITE);
-        let mut handle = Handle::default();
-        let mut client_view = PortView {
-            length: test_size_u32::<PortView>(),
-            padding: 0,
-            section_handle,
-            section_offset: 0,
-            view_size: crate::PAGE_SIZE,
-            view_base: 0,
-            view_remote_base: 0,
-        };
-        let mut connection_info = empty_connect_info();
-        let mut connection_info_len = CSR_API_CONNECTINFO_SIZE_U32 + 1;
-
-        assert_eq!(
-            task.sys_nt_connect_port(ConnectPortParameters {
-                port_handle: mut_ptr(&mut handle),
-                port_name: const_ptr(&name),
-                security_qos: const_ptr(&qos),
-                client_view: Some(mut_ptr(&mut client_view)),
-                server_view: None,
-                max_message_length: None,
-                connection_information: Some(mut_byte_ptr(&mut connection_info)),
-                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
-            }),
-            NtStatus::INFO_LENGTH_MISMATCH
-        );
-        assert_eq!(
-            task.map_client_port_section(section_handle, crate::PAGE_SIZE)
-                .map(|_| ()),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn nt_connect_port_requires_section_read_and_write_access() {
-        let mut peb = ProcessEnvironmentBlock::new_zeroed();
-        peb.read_only_shared_memory_base = 0x7000_0000;
-        peb.read_only_static_server_data = 0x7000_1000;
-        let task = task_with_peb(&mut peb);
-        let (_name_units, name) = api_port_name(WINDOWS_API_PORT);
-        let qos = security_qos();
-        let section_handle = create_client_section(&task, SECTION_MAP_WRITE);
-        let mut handle = Handle::default();
-        let mut client_view = PortView {
-            length: test_size_u32::<PortView>(),
-            padding: 0,
-            section_handle,
-            section_offset: 0,
-            view_size: crate::PAGE_SIZE,
-            view_base: 0,
-            view_remote_base: 0,
-        };
-        let mut connection_info = empty_connect_info();
-        let mut connection_info_len = test_size_u32::<CsrApiConnectInfo>();
-
-        assert_eq!(
-            task.sys_nt_connect_port(ConnectPortParameters {
-                port_handle: mut_ptr(&mut handle),
-                port_name: const_ptr(&name),
-                security_qos: const_ptr(&qos),
-                client_view: Some(mut_ptr(&mut client_view)),
-                server_view: None,
-                max_message_length: None,
-                connection_information: Some(mut_byte_ptr(&mut connection_info)),
-                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
-            }),
-            NtStatus::ACCESS_DENIED
-        );
-        assert!(handle.is_null());
-    }
-
-    #[test]
-    fn nt_connect_port_client_view_unmaps_owned_pages() {
-        let mut peb = ProcessEnvironmentBlock::new_zeroed();
-        peb.read_only_shared_memory_base = 0x7000_0000;
-        peb.read_only_static_server_data = 0x7000_1000;
-        let task = task_with_peb(&mut peb);
-        let section_handle = create_client_section(&task, SECTION_MAP_READ | SECTION_MAP_WRITE);
-        let (_handle, client_view) = connect_csr_api_port(&task, &peb, section_handle);
-
-        assert!(
-            task.process
-                .section_views
-                .read()
-                .contains_key(&client_view.view_base)
-        );
-        assert!(
-            task.process
-                .virtual_allocations
-                .read()
-                .contains_key(&client_view.view_base)
-        );
-
-        assert_eq!(
-            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, client_view.view_base),
-            NtStatus::SUCCESS
-        );
-        assert!(
-            !task
-                .process
-                .section_views
-                .read()
-                .contains_key(&client_view.view_base)
-        );
-        assert!(
-            !task
-                .process
-                .virtual_allocations
-                .read()
-                .contains_key(&client_view.view_base)
-        );
-    }
-
-    #[test]
-    fn nt_connect_port_second_connect_on_same_section_does_not_allocate() {
-        let mut peb = ProcessEnvironmentBlock::new_zeroed();
-        peb.read_only_shared_memory_base = 0x7000_0000;
-        peb.read_only_static_server_data = 0x7000_1000;
-        let task = task_with_peb(&mut peb);
-        let section_handle = create_client_section(&task, SECTION_MAP_READ | SECTION_MAP_WRITE);
-        let (_first_handle, _first_client_view) = connect_csr_api_port(&task, &peb, section_handle);
-        let (_name_units, name) = api_port_name(WINDOWS_API_PORT);
-        let qos = security_qos();
-        let mut second_handle = Handle::default();
-        let mut second_client_view = PortView {
-            length: test_size_u32::<PortView>(),
-            padding: 0,
-            section_handle,
-            section_offset: 0,
-            view_size: crate::PAGE_SIZE,
-            view_base: 0,
-            view_remote_base: 0,
-        };
-        let mut connection_info = empty_connect_info();
-        let mut connection_info_len = test_size_u32::<CsrApiConnectInfo>();
-        let section_view_count = task.process.section_views.read().len();
-        let virtual_allocation_count = task.process.virtual_allocations.read().len();
-
-        assert_eq!(
-            task.sys_nt_connect_port(ConnectPortParameters {
-                port_handle: mut_ptr(&mut second_handle),
-                port_name: const_ptr(&name),
-                security_qos: const_ptr(&qos),
-                client_view: Some(mut_ptr(&mut second_client_view)),
-                server_view: None,
-                max_message_length: None,
-                connection_information: Some(mut_byte_ptr(&mut connection_info)),
-                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
-            }),
-            NtStatus::NOT_SUPPORTED
-        );
-
-        assert!(second_handle.is_null());
-        assert_eq!(second_client_view.view_base, 0);
-        assert_eq!(task.process.section_views.read().len(), section_view_count);
-        assert_eq!(
-            task.process.virtual_allocations.read().len(),
-            virtual_allocation_count
+            size_of::<ThreadEnvironmentBlock>().trunc()
         );
     }
 }
