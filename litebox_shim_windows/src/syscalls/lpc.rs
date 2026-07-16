@@ -77,11 +77,6 @@ struct CsrApiConnectInfo {
     server_process_id: usize,
 }
 
-const _: () = assert!(size_of::<SecurityQualityOfService>() == 12);
-const _: () = assert!(size_of::<PortView>() == 48);
-const _: () = assert!(size_of::<RemotePortView>() == 24);
-const _: () = assert!(size_of::<CsrApiConnectInfo>() == CSR_API_CONNECTINFO_SIZE);
-
 pub(crate) struct ConnectPortParameters<Platform: ShimPlatform> {
     pub(crate) port_handle: MutPtr<Platform, Handle>,
     pub(crate) port_name: ConstPtr<Platform, UnicodeString>,

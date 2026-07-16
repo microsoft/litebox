@@ -64,6 +64,7 @@ pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
     pub(crate) teb: usize,
     pub(crate) context: usize,
+    pub(crate) windows_shared_section: usize,
 }
 
 pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
@@ -374,6 +375,9 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         peb.image_subsystem_minor_version = u32::from(input.image.minor_subsystem_version());
         peb.read_only_shared_memory_base = read_only_shared_memory_base;
         peb.read_only_static_server_data = read_only_static_server_data;
+        // TODO(csr-shared-section): model shared backing with distinct client and CSRSS
+        // virtual addresses instead of aliasing both PEB bases to this single mapping.
+        peb.csr_server_read_only_shared_memory_base = read_only_shared_memory_base as u64;
 
         write_guest_value::<Platform, _>(peb_ptr, peb)?;
 
@@ -402,6 +406,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             peb: peb_ptr,
             teb: teb_ptr,
             context: ctx_ptr,
+            windows_shared_section: read_only_shared_memory_base,
         })
     }
 }

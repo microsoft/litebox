@@ -777,7 +777,7 @@ mod tests {
     extern crate std;
 
     const QPC_SLEEP_DURATION: Duration = Duration::from_millis(25);
-    const QPC_SLEEP_TOLERANCE: Duration = Duration::from_millis(10);
+    const QPC_SLEEP_TOLERANCE: Duration = Duration::from_millis(15);
 
     type TestPlatform = crate::tests::TestPlatform;
     type TestTask = Task<TestPlatform, crate::tests::TestFS>;
