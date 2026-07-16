@@ -292,7 +292,7 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
                 continue;
             }
 
-            protect_physical_memory_range(
+            set_vtl0_memory_protection(
                 PhysFrame::range(
                     // `HekiRange::is_valid` already validated both physical addresses.
                     PhysFrame::containing_address(PhysAddr::new(pa)),
@@ -425,7 +425,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     // fails, letting kdata load proceed so that heki is not broken.
     if !kexec_trampoline_insert_failed {
         for kexec_trampoline_range in &kexec_trampoline_metadata {
-            protect_physical_memory_range(
+            set_vtl0_memory_protection(
                 kexec_trampoline_range.phys_frame_range,
                 MemAttr::MEM_ATTR_READ,
             )?;
@@ -511,7 +511,7 @@ impl FrameReservation {
     ///
     /// The claim is inserted into `protected_frames` atomically under its lock together with the
     /// overlap check. Each claimed frame is a "maybe-non-writable" entry that is later resolved by
-    /// [`apply_vtl_protection`]: promotion to RX/RO keeps it, promotion to RW (or release on failure)
+    /// [`update_vtl0_memory_protection`]: promotion to RX/RO keeps it, promotion to RW (or rollback)
     /// removes it. On rejection, this call's inserts are rolled back. The returned status for each
     /// input identifies whether that occurrence added a new claim.
     fn reserve(
@@ -545,7 +545,6 @@ impl FrameReservation {
             } else {
                 classify_reservation(&owned_before, &protected, range.clone())
             };
-            seen.insert(range.clone());
             let status = match status {
                 Ok(status) => status,
                 Err(error) => {
@@ -559,6 +558,7 @@ impl FrameReservation {
                     return Err(error);
                 }
             };
+            seen.insert(range.clone());
             if status == ReservationStatus::AlreadyOwned {
                 statuses.push(status);
                 continue;
@@ -585,7 +585,7 @@ impl Drop for FrameReservation {
         // Rollback: attempt to release every reserved range back to VTL0. Drop cannot report a
         // release failure, so debug builds assert it instead.
         for &phys_frame_range in &self.owned_ranges {
-            let result = release_physical_memory_range(phys_frame_range);
+            let result = restore_vtl0_memory_access(phys_frame_range);
             debug_assert!(
                 result.is_ok(),
                 "Failed to release reserved VTL0 memory protection"
@@ -662,11 +662,10 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
     let mut frame_guard = FrameReservation::new();
     let _ = frame_guard.reserve(module_memory_metadata.iter().map(|r| r.phys_frame_range))?;
 
-    // Write-protect the frames that will become non-writable (RX/RO) BEFORE copying, so VTL0 cannot
-    // change them between the copy/validation and the final permission promotion.
+    // Freeze frames that require immutable copy/validation to avoid TOCTOU.
     for mod_mem_range in &module_memory_metadata {
         if !mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type).contains(MemAttr::MEM_ATTR_WRITE) {
-            protect_physical_memory_range(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
+            set_vtl0_memory_protection(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
         }
     }
 
@@ -703,7 +702,7 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
 
     // once a module is verified and validated, change the permission of its memory ranges based on their types
     for mod_mem_range in &module_memory_metadata {
-        protect_physical_memory_range(
+        set_vtl0_memory_protection(
             mod_mem_range.phys_frame_range,
             mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
         )?;
@@ -753,11 +752,11 @@ pub fn mshv_vsm_free_guest_module_init(token: i64) -> Result<i64, VsmError> {
         for mod_mem_range in entry.iter_mem_ranges() {
             let range_result = match mod_mem_range.mod_mem_type {
                 ModMemType::InitText | ModMemType::InitData | ModMemType::InitRoData => {
-                    release_physical_memory_range(mod_mem_range.phys_frame_range)
+                    restore_vtl0_memory_access(mod_mem_range.phys_frame_range)
                 }
                 ModMemType::RoAfterInit => {
                     // make this memory range read-only after initialization
-                    protect_physical_memory_range(
+                    set_vtl0_memory_protection(
                         mod_mem_range.phys_frame_range,
                         MemAttr::MEM_ATTR_READ,
                     )
@@ -808,7 +807,7 @@ pub fn mshv_vsm_unload_guest_module(token: i64) -> Result<i64, VsmError> {
         .iter_entry(token)
     {
         for mod_mem_range in entry.iter_mem_ranges() {
-            release_physical_memory_range(mod_mem_range.phys_frame_range)?;
+            restore_vtl0_memory_access(mod_mem_range.phys_frame_range)?;
         }
     }
 
@@ -864,7 +863,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
 
     // invalidate (i.e., remove protection and clear) the kexec memory ranges which were loaded in the past
     for old_kexec_mem_range in kexec_metadata_ref.iter_guarded().iter_mem_ranges() {
-        release_physical_memory_range(old_kexec_mem_range.phys_frame_range)?;
+        restore_vtl0_memory_access(old_kexec_mem_range.phys_frame_range)?;
     }
     kexec_metadata_ref.clear_memory();
 
@@ -909,7 +908,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
     let mut frame_guard = FrameReservation::new();
     let _ = frame_guard.reserve(kexec_memory_metadata.iter().map(|r| r.phys_frame_range))?;
     for kexec_mem_range in &kexec_memory_metadata {
-        protect_physical_memory_range(kexec_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
+        set_vtl0_memory_protection(kexec_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
     }
 
     kexec_image
@@ -940,10 +939,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
             frame_guard.reserve(segment_ranges.iter().map(|r| r.phys_frame_range))?;
         for (segment_range, status) in segment_ranges.into_iter().zip(reservation_statuses) {
             if status == ReservationStatus::New {
-                protect_physical_memory_range(
-                    segment_range.phys_frame_range,
-                    MemAttr::MEM_ATTR_READ,
-                )?;
+                set_vtl0_memory_protection(segment_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
                 kexec_memory_metadata.insert_memory_range(segment_range);
             }
         }
@@ -1100,7 +1096,7 @@ fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i6
         .ok_or(VsmError::IntegerOverflow)
         .and_then(|end| PhysAddr::try_new(end).map_err(|_| VsmError::InvalidPhysicalAddress))?;
     let phys_addr = PhysAddr::new(phys_addr);
-    protect_physical_memory_range(
+    set_vtl0_memory_protection(
         PhysFrame::range(
             PhysFrame::from_start_address(phys_addr)
                 .map_err(|_| VsmError::AddressNotPageAligned)?,
@@ -1501,8 +1497,11 @@ impl ModuleMemoryMetadataMap {
     }
 
     /// Drop a module's freed init ranges from its metadata after [`mshv_vsm_free_guest_module_init`]
-    /// hands them back to VTL0, so a later free/unload does not re-release them. Return the patch
-    /// targets that fell within the freed init frames to drop their precomputed patches.
+    /// hands them back to VTL0, so a later free/unload does not re-release them.
+    ///
+    /// It also returns patch targets that fell within this freed init frames. These patch targets
+    /// are no longer valid (i.e., potential patch-after-free) and thus their corresponding
+    /// precomputed patches should be removed (we can't remove them here due to locks).
     fn remove_init_ranges(&self, key: i64) -> Vec<PhysAddr> {
         let is_init = |t| {
             matches!(
@@ -1644,9 +1643,10 @@ pub(crate) fn validate_mutable_vtl0_pages<const ALIGN: usize>(
     Ok(())
 }
 
-/// Update the locked registry after a protection change. Holding the exclusive guard across the
-/// hypercall and update synchronizes transitions with ordinary writable mappings; privileged HEKI
-/// and ring-buffer mappings intentionally bypass it.
+/// Update the locked registry after a protection change.
+///
+/// This function assumes that the caller holds the exclusive guard across the hypercall and
+/// update synchronizes transitions with ordinary writable mappings.
 fn record_frame_protection(
     set: &mut RangeSet<u64>,
     phys_frame_range: PhysFrameRange<Size4KiB>,
@@ -1676,28 +1676,26 @@ fn record_frame_protection(
 ///
 /// `phys_frame_range` specifies the physical frame range to protect (must belong to VTL0).
 /// `mem_attr` specifies the memory attributes (VTL0's allowed access) to be applied.
-pub(crate) fn protect_physical_memory_range(
+pub(crate) fn set_vtl0_memory_protection(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
 ) -> Result<(), VsmError> {
-    apply_vtl_protection(phys_frame_range, mem_attr)
+    update_vtl0_memory_protection(phys_frame_range, mem_attr)
 }
 
 /// Hands a VTL0 physical memory range back to VTL0 (read-write), which also clears its protection.
-fn release_physical_memory_range(
-    phys_frame_range: PhysFrameRange<Size4KiB>,
-) -> Result<(), VsmError> {
-    apply_vtl_protection(
+fn restore_vtl0_memory_access(phys_frame_range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError> {
+    update_vtl0_memory_protection(
         phys_frame_range,
         MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
     )
 }
 
-/// Shared implementation of [`protect_physical_memory_range`] / [`release_physical_memory_range`].
+/// Shared implementation of [`set_vtl0_memory_protection`] / [`restore_vtl0_memory_access`].
 /// Applies `mem_attr` to the VTL0 portions of `phys_frame_range` (skipping any VTL1 working memory)
 /// and updates the registry from the result: a frame non-writable by VTL0 (RO/RX) is recorded as
 /// protected; a VTL0-writable frame is removed.
-fn apply_vtl_protection(
+fn update_vtl0_memory_protection(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
 ) -> Result<(), VsmError> {
@@ -1750,8 +1748,8 @@ fn apply_vtl_protection(
     Ok(())
 }
 
-/// This function is a variant of [`protect_physical_memory_range`] to protect a VTL1 physical memory range.
-/// Unlike [`protect_physical_memory_range`], this is intended exclusively for securing VTL1's own pages.
+/// This function is a variant of [`set_vtl0_memory_protection`] to protect a VTL1 physical memory range.
+/// Unlike [`set_vtl0_memory_protection`], this is intended exclusively for securing VTL1's own pages.
 /// VTL0 should never access VTL1 memory, so the memory attribute is always empty (no read, write, or execute).
 ///
 /// Note. This function doesn't check whether `phys_frame_range` belongs to VTL1 because it is called by BSP

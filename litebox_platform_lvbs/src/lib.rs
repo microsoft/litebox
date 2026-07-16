@@ -1344,7 +1344,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
             );
-            crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
+            crate::mshv::vsm::set_vtl0_memory_protection(frame_range, mem_attr)
                 .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
         }
 
