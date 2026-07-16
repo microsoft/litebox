@@ -1404,6 +1404,13 @@ impl Server {
             return error_response(libc::EPERM as u32);
         }
 
+        // Create authorized — record the allowed write for the frontier
+        // (de-duplicated inside the audit log), symmetric with the fs_denied
+        // paths above so the "allowed" tree shows creations, not just opens.
+        if let Some(ref al) = self.audit_log {
+            al.fs_allowed(resolved_target.to_str().unwrap_or("?"), "create");
+        }
+
         let mut opts = fs::OpenOptions::new();
         opts.read(true).write(true).create(true);
         if flags.contains(fcall::LOpenFlags::O_EXCL) {
@@ -1490,6 +1497,10 @@ impl Server {
                 al.fs_denied(target.to_str().unwrap_or("?"), "symlink");
             }
             return error_response(libc::EPERM as u32);
+        }
+
+        if let Some(ref al) = self.audit_log {
+            al.fs_allowed(target.to_str().unwrap_or("?"), "symlink");
         }
 
         let link_target = std::ffi::OsStr::from_bytes(&symtgt);
@@ -1703,6 +1714,9 @@ impl Server {
                 }
                 return error_response(libc::EPERM as u32);
             }
+            if let Some(ref al) = self.audit_log {
+                al.fs_allowed(resolved.to_str().unwrap_or("?"), "chmod");
+            }
             let perms = fs_compat::permissions_from_mode(req.stat.mode);
             if let Err(e) = fs::set_permissions(&resolved, perms) {
                 return io_error_response(e);
@@ -1723,6 +1737,9 @@ impl Server {
                     al.fs_denied(resolved.to_str().unwrap_or("?"), "truncate");
                 }
                 return error_response(libc::EPERM as u32);
+            }
+            if let Some(ref al) = self.audit_log {
+                al.fs_allowed(resolved.to_str().unwrap_or("?"), "truncate");
             }
             let open_file = {
                 let state = read_lock(&fid_arc, "fid");
@@ -1863,6 +1880,10 @@ impl Server {
             return error_response(libc::EPERM as u32);
         }
 
+        if let Some(ref al) = self.audit_log {
+            al.fs_allowed(target.to_str().unwrap_or("?"), "mkdir");
+        }
+
         if let Err(e) = fs::create_dir(&target) {
             // EEXIST is benign when the directory already exists — callers
             // like rustup do `mkdir` unconditionally and expect success.
@@ -1999,6 +2020,10 @@ impl Server {
             return error_response(libc::EPERM as u32);
         }
 
+        if let Some(ref al) = self.audit_log {
+            al.fs_allowed(dst.to_str().unwrap_or("?"), "rename");
+        }
+
         match fs::rename(&resolved_src, &dst) {
             Ok(()) => {
                 // Update the FID's path to the new location
@@ -2081,6 +2106,10 @@ impl Server {
                 al.fs_denied(dst.to_str().unwrap_or("?"), "rename");
             }
             return error_response(libc::EPERM as u32);
+        }
+
+        if let Some(ref al) = self.audit_log {
+            al.fs_allowed(dst.to_str().unwrap_or("?"), "rename");
         }
 
         match fs::rename(&src, &dst) {
@@ -2891,6 +2920,42 @@ mod tests {
                 && audit.contains(r#""action":"write""#)
                 && audit.contains("denied"),
             "missing create/write denial audit event: {audit}"
+        );
+    }
+
+    #[test]
+    fn lcreate_policy_allow_emits_fs_allowed_audit_event() {
+        let root = temp_root();
+        let audit_path = root.path().join("audit.jsonl");
+        let mut server = Server::new(
+            root.path().to_path_buf(),
+            Arc::new(crate::policy::AllowAllPolicy),
+            false,
+            Arc::new(InotifyDispatcher::new()),
+        );
+        server.set_audit_log(crate::audit::AuditLog::open(&audit_path).expect("open audit log"));
+        insert_closed_fid(&server, 1, root.path());
+
+        assert!(matches!(
+            server.handle_lcreate(
+                1,
+                "created".to_string(),
+                fcall::LOpenFlags::O_WRONLY,
+                0o644,
+                0
+            ),
+            Fcall::Rlcreate(_)
+        ));
+
+        // An allowed create must surface on the "allowed" frontier symmetrically
+        // with the denial case above — otherwise a `touch newfile` (a create that
+        // is never subsequently opened) would be invisible in the tree.
+        let audit = fs::read_to_string(&audit_path).expect("read audit log");
+        assert!(
+            audit.contains(r#""event":"fs_allowed""#)
+                && audit.contains(r#""action":"create""#)
+                && audit.contains("created"),
+            "missing allowed create audit event: {audit}"
         );
     }
 
