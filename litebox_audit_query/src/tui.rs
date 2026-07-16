@@ -68,7 +68,11 @@ fn event_loop(
                 let line: Vec<u8> = carry.drain(..=pos).collect();
                 let text = String::from_utf8_lossy(&line);
                 let trimmed = text.trim();
+                // Cheap pre-filter: only broker policy events carry an
+                // `"event":` key; skip the syscall-trace lines without a full
+                // JSON parse (the tree only consumes policy events).
                 if trimmed.starts_with('{')
+                    && trimmed.contains("\"event\":")
                     && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
                 {
                     dirty |= frontier.ingest(&v);
