@@ -416,6 +416,8 @@ fn initialize_windows_static_server_data<Platform: RawPointerProvider>(
 ) -> Result<usize, PeImageAccessError> {
     let read_only_static_server_data =
         shared_heap.allocate_array::<Platform, usize>(CSR_SERVER_DLL_MAX)?;
+    // TODO(csr-server-dlls): populate CSRSRV (0), CONSRV (2), and USERSRV (3)
+    // when their shared static server data is modeled.
     let client_base_static_server_data =
         shared_heap.allocate::<Platform, BaseStaticServerData>()?;
     initialize_static_server_data::<Platform>(shared_heap, client_base_static_server_data)?;

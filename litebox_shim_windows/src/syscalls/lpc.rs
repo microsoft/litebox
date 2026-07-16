@@ -5,9 +5,9 @@ use alloc::string::String;
 use core::marker::PhantomData;
 use core::mem::size_of;
 
-use litebox::utils::TruncateExt as _;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -17,7 +17,8 @@ use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_pre
 
 const CSR_MAX_MESSAGE_LENGTH: u32 = 0x148;
 const CSR_SERVER_PROCESS_ID: usize = 1;
-const CSR_SERVER_DLL_NAMES: u32 = 2;
+// TODO(csr-server-dll-names): report names once the CSR connect contract models them.
+const CSR_NUMBER_OF_SERVER_DLL_NAMES: u32 = 0;
 
 pub(crate) struct LpcPortSubsystem<Platform>(PhantomData<fn(Platform)>);
 
@@ -243,7 +244,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             debug_flags: 0,
             size_of_peb_data: size_of::<ProcessEnvironmentBlock>().trunc(),
             size_of_teb_data: size_of::<ThreadEnvironmentBlock>().trunc(),
-            number_of_server_dll_names: CSR_SERVER_DLL_NAMES,
+            number_of_server_dll_names: CSR_NUMBER_OF_SERVER_DLL_NAMES,
             server_process_id: CSR_SERVER_PROCESS_ID,
         })
     }
