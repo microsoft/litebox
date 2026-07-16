@@ -405,27 +405,6 @@ fn windows_user_shared_data() -> nt_types::KUserSharedData {
     shared_data
 }
 
-#[cfg(test)]
-fn map_csr_server_shared_memory<Platform: crate::ShimPlatform>(
-    page_manager: &crate::WindowsPageManager<Platform>,
-) -> Option<usize> {
-    let length = litebox::mm::linux::NonZeroPageSize::new(
-        crate::syscalls::section::WINDOWS_SHARED_SECTION_SIZE,
-    )?;
-    // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` leaves address
-    // selection to the page manager, so this cannot replace an existing mapping.
-    unsafe {
-        page_manager.create_writable_pages(
-            None,
-            length,
-            litebox::mm::linux::CreatePagesFlags::empty(),
-            |_| Ok(0),
-        )
-    }
-    .map(|mapping| mapping.as_usize())
-    .ok()
-}
-
 pub struct WindowsShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platform, FS>>);
 
 impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
