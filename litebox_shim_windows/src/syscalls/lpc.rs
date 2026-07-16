@@ -438,6 +438,7 @@ mod tests {
         let mut peb = ProcessEnvironmentBlock::new_zeroed();
         peb.read_only_shared_memory_base = 0x7000_0000;
         peb.read_only_static_server_data = 0x7000_1000;
+        peb.csr_server_read_only_shared_memory_base = 0x7100_0000;
         let task = task_with_peb(&mut peb);
         let (_name_units, name) = api_port_name(WINDOWS_API_PORT);
         let qos = security_qos();
@@ -481,6 +482,10 @@ mod tests {
         assert_eq!(
             connection_info.shared_static_server_data,
             peb.read_only_static_server_data
+        );
+        assert_ne!(
+            u64::try_from(connection_info.shared_section_base).unwrap(),
+            peb.csr_server_read_only_shared_memory_base
         );
         assert_eq!(
             connection_info.size_of_peb_data,

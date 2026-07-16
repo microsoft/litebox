@@ -443,29 +443,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
-        let windows_shared_section_addr = read_field_at_offset::<Platform, usize>(
-            load_info.environment.peb,
-            core::mem::offset_of!(
-                crate::nt_types::ProcessEnvironmentBlock,
-                read_only_shared_memory_base
-            ),
-        )
-        .ok_or(loader::WindowsLoadError::MemoryAccess)?;
-        let windows_shared_section =
-            crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_addr);
+        let windows_shared_section = crate::syscalls::section::load_time_windows_shared_section(
+            load_info.environment.windows_shared_section,
+        );
         let mut process =
             Process::default(Some(load_info.virtual_allocations), windows_shared_section);
         process.ntdll_mapping = load_info.ntdll_mapping;
         process.peb_address = load_info.environment.peb;
-        write_field_at_offset::<Platform, _>(
-            process.peb_address,
-            core::mem::offset_of!(
-                crate::nt_types::ProcessEnvironmentBlock,
-                csr_server_read_only_shared_memory_base
-            ),
-            windows_shared_section_addr,
-        )
-        .ok_or(loader::WindowsLoadError::MemoryAccess)?;
         let process = Arc::new(process);
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
