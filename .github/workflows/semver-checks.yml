@@ -127,7 +127,7 @@ jobs:
             BASE_NOTE=":information_source: **Note:** This semver check was run against the \`${{ steps.baseline.outputs.ref }}\` branch, not \`main\` or \`ulitebox\`.\n\n"
           fi
           if [ "${{ steps.packages.outputs.has_packages }}" != "true" ]; then
-            BODY="${BASE_NOTE}:robot: SemverChecks :robot: No semver-relevant crate changes detected; skipped cargo-semver-checks."
+            BODY="$(echo -e "${BASE_NOTE}"':robot: SemverChecks :robot: No semver-relevant crate changes detected; skipped cargo-semver-checks.')"
           elif [ -s /tmp/semver-checks-stdout ]; then
             BODY="$(echo -e "${BASE_NOTE}"':robot: SemverChecks :robot: :warning: Potential breaking API changes detected :warning:\n\n<details><summary>Click for details</summary>\n\n```'"$(cat /tmp/semver-checks-stdout)"'\n```\n</details>')"
           else
