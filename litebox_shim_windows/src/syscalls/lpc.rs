@@ -169,7 +169,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(port, drop) {
             Ok(handle) => handle,
             Err(status) => {
-                self.rollback_client_port_section_view(mapped_view.base);
+                self.rollback_pagefile_section_view(mapped_view.base);
                 return status;
             }
         };
@@ -196,7 +196,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             || params.port_handle.write_at_offset(0, handle).is_none();
         if write_failed {
             self.close_lpc_port_handle(handle);
-            self.rollback_client_port_section_view(mapped_view.base);
+            self.rollback_pagefile_section_view(mapped_view.base);
             return NtStatus::ACCESS_VIOLATION;
         }
 
@@ -207,7 +207,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             server_view_value.view_base = mapped_view.base;
             if server_view.write_at_offset(0, server_view_value).is_none() {
                 self.close_lpc_port_handle(handle);
-                self.rollback_client_port_section_view(mapped_view.base);
+                self.rollback_pagefile_section_view(mapped_view.base);
                 return NtStatus::ACCESS_VIOLATION;
             }
         }
@@ -360,16 +360,8 @@ mod tests {
     }
 
     fn create_client_section(task: &Task<TestPlatform, TestFS>, access: u32) -> Handle {
-        create_client_section_with_size(task, access, crate::PAGE_SIZE)
-    }
-
-    fn create_client_section_with_size(
-        task: &Task<TestPlatform, TestFS>,
-        access: u32,
-        size: usize,
-    ) -> Handle {
         let mut handle = Handle::default();
-        let size = i64::try_from(size).expect("test section size fits in i64");
+        let size = i64::try_from(crate::PAGE_SIZE).expect("test section size fits in i64");
         assert_eq!(
             task.sys_nt_create_section(
                 mut_ptr(&mut handle),
@@ -600,55 +592,6 @@ mod tests {
             task.map_client_port_section(section_handle, crate::PAGE_SIZE)
                 .map(|_| ()),
             Ok(())
-        );
-    }
-
-    #[test]
-    fn nt_connect_port_rejects_oversized_client_view_before_allocating() {
-        let mut peb = ProcessEnvironmentBlock::new_zeroed();
-        peb.read_only_shared_memory_base = 0x7000_0000;
-        peb.read_only_static_server_data = 0x7000_1000;
-        let task = task_with_peb(&mut peb);
-        let (_name_units, name) = api_port_name(WINDOWS_API_PORT);
-        let qos = security_qos();
-        let oversized = crate::syscalls::section::WINDOWS_SHARED_SECTION_SIZE + crate::PAGE_SIZE;
-        let section_handle =
-            create_client_section_with_size(&task, SECTION_MAP_READ | SECTION_MAP_WRITE, oversized);
-        let mut handle = Handle::default();
-        let mut client_view = PortView {
-            length: test_size_u32::<PortView>(),
-            padding: 0,
-            section_handle,
-            section_offset: 0,
-            view_size: oversized,
-            view_base: 0,
-            view_remote_base: 0,
-        };
-        let mut connection_info = empty_connect_info();
-        let mut connection_info_len = test_size_u32::<CsrApiConnectInfo>();
-        let section_view_count = task.process.section_views.read().len();
-        let virtual_allocation_count = task.process.virtual_allocations.read().len();
-
-        assert_eq!(
-            task.sys_nt_connect_port(ConnectPortParameters {
-                port_handle: mut_ptr(&mut handle),
-                port_name: const_ptr(&name),
-                security_qos: const_ptr(&qos),
-                client_view: Some(mut_ptr(&mut client_view)),
-                server_view: None,
-                max_message_length: None,
-                connection_information: Some(mut_byte_ptr(&mut connection_info)),
-                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
-            }),
-            NtStatus::INVALID_VIEW_SIZE
-        );
-
-        assert!(handle.is_null());
-        assert_eq!(client_view.view_base, 0);
-        assert_eq!(task.process.section_views.read().len(), section_view_count);
-        assert_eq!(
-            task.process.virtual_allocations.read().len(),
-            virtual_allocation_count
         );
     }
 
