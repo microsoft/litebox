@@ -2004,7 +2004,7 @@ mod tests {
 
     fn dump_api_set_namespace(api_set_map: ApiSetNamespace, bytes: &[u8], label: &str) {
         std::println!("{label}");
-        std::println!("API_SET_NAMESPACE len={:#x}", bytes.len(),);
+        std::println!("API_SET_NAMESPACE len={:#x}", bytes.len());
         std::println!("     version: {:#010x}", api_set_map.version);
         std::println!("        size: {:#010x}", api_set_map.size);
         std::println!("       flags: {:#010x}", api_set_map.flags);
