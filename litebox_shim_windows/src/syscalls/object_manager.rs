@@ -28,6 +28,7 @@ use crate::syscalls::section::{
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 const MAX_SYMLINK_REPARSE_DEPTH: usize = 64;
+pub(crate) const WINDOWS_API_PORT: &str = r"\Windows\ApiPort";
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
     | AccessMask::READ_CONTROL.bits()
     | AccessMask::WRITE_DAC.bits()
@@ -162,6 +163,7 @@ enum NamedObject<Platform: crate::ShimPlatform> {
     FileDevice {
         device: FileDeviceObject,
     },
+    Port,
 }
 
 pub(super) enum ObjectLeafLookup<T> {
@@ -331,6 +333,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         new_event(event: Weak<EventObject<Platform>>) => NamedObject::Event { event };
         new_section(section: Weak<SectionObject<Platform>>) => NamedObject::Section { section };
         new_file_device(device: FileDeviceObject) => NamedObject::FileDevice { device };
+        new_port() => NamedObject::Port;
     }
 
     fn child(&self, name: &str) -> Option<Arc<Self>> {
@@ -375,6 +378,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         event_object, ObjectLeafLookup<Arc<EventObject<Platform>>>, NamedObject::Event { event } => ObjectLeafLookup::from_weak(event);
         section_object, ObjectLeafLookup<Arc<SectionObject<Platform>>>, NamedObject::Section { section } => ObjectLeafLookup::from_weak(section);
         file_device_object, ObjectLeafLookup<FileDeviceObject>, NamedObject::FileDevice { device } => ObjectLeafLookup::Live(device.clone());
+        port_object, ObjectLeafLookup<()>, NamedObject::Port => ObjectLeafLookup::Live(());
     }
 
     fn type_name(&self) -> Option<&'static str> {
@@ -384,6 +388,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
             NamedObject::Event { event } => event.upgrade().map(|_| "Event"),
             NamedObject::Section { section } => section.upgrade().map(|_| "Section"),
             NamedObject::FileDevice { .. } => Some("Device"),
+            NamedObject::Port => Some("Port"),
         }
     }
 
@@ -505,6 +510,17 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         )
     }
 
+    fn create_port(&self, path: &str) -> NtStatus {
+        self.create_child(
+            path,
+            |node| node.port_object(),
+            ObjectNode::new_port,
+            NtStatus::OBJECT_TYPE_MISMATCH,
+            |()| NtStatus::OBJECT_NAME_EXISTS,
+            |_| NtStatus::SUCCESS,
+        )
+    }
+
     fn create_child<T>(
         &self,
         path: &str,
@@ -622,6 +638,16 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         }
     }
 
+    pub(crate) fn resolve_port(&self, path: &str) -> Result<(), NtStatus> {
+        self.resolve_object_leaf(path, false, |node| {
+            if node.path == path {
+                node.port_object()
+            } else {
+                ObjectLeafLookup::Stale
+            }
+        })
+    }
+
     fn resolve_object_leaf<T>(
         &self,
         path: &str,
@@ -666,6 +692,14 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
         assert!(
             status == NtStatus::SUCCESS,
             "seeded NT file device must have seeded ancestors: {status:?}"
+        );
+    }
+
+    fn seed_port(&self, path: &str) {
+        let status = self.create_port(path);
+        assert!(
+            status == NtStatus::SUCCESS,
+            "seeded NT port must have seeded ancestors: {status:?}"
         );
     }
 
@@ -1327,6 +1361,7 @@ pub(crate) fn seed_object_manager<Platform: crate::ShimPlatform>()
         },
     );
     object_manager.seed_file_device(r"\Device\ConDrv", FileDeviceObject::ConsoleDriver);
+    object_manager.seed_port(WINDOWS_API_PORT);
     for (path, target) in SEEDED_SYMLINK_PATHS {
         object_manager.seed_symlink(path, target);
     }

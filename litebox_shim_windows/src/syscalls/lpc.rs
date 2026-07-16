@@ -14,7 +14,6 @@ use super::Handle;
 use crate::nt_types::{ProcessEnvironmentBlock, ThreadEnvironmentBlock, UnicodeString};
 use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value};
 
-const WINDOWS_API_PORT: &str = r"\Windows\ApiPort";
 const CSR_API_CONNECTINFO_SIZE: usize = 0x30;
 const CSR_API_CONNECTINFO_SIZE_U32: u32 = 0x30;
 const CSR_MAX_MESSAGE_LENGTH: u32 = 0x148;
@@ -102,8 +101,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(name) => name,
             Err(status) => return status,
         };
-        if !is_csr_api_port(&port_name) {
-            return NtStatus::OBJECT_NAME_NOT_FOUND;
+        if let Err(status) = self.process.object_manager.resolve_port(&port_name) {
+            return status;
         }
 
         let Some(client_view) = params.client_view else {
@@ -253,10 +252,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-fn is_csr_api_port(port_name: &str) -> bool {
-    port_name == WINDOWS_API_PORT
-}
-
 fn size_u32<T>() -> Option<u32> {
     u32::try_from(size_of::<T>()).ok()
 }
@@ -313,6 +308,7 @@ mod tests {
     use super::*;
     use crate::syscalls::ProcessHandle;
     use crate::syscalls::mm::PageProtection;
+    use crate::syscalls::object_manager::WINDOWS_API_PORT;
     use crate::tests::{
         TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task, unicode_string,
         utf16_units,
@@ -527,7 +523,7 @@ mod tests {
                 connection_information: Some(mut_byte_ptr(&mut connection_info)),
                 connection_information_length: Some(mut_ptr(&mut connection_info_len)),
             }),
-            NtStatus::OBJECT_NAME_NOT_FOUND
+            NtStatus::OBJECT_PATH_NOT_FOUND
         );
         assert!(handle.is_null());
     }
