@@ -45,15 +45,6 @@ use super::{
     inode_allocator::InodeAllocator,
 };
 
-/// Just a random constant that is distinct from other file systems. In this case, it is
-/// `b'Taro'.hex()`.
-const DEVICE_ID: usize = 0x5461726f;
-
-/// TODO(jayb): Replace this proper auto-incrementing inode number storage (although that will
-/// currently only applies to directories and can be revisited when/if something is actually
-/// checking for directory inodes.
-const TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER: usize = 0xFACE;
-
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
 const BLOCK_SIZE: usize = 0;
@@ -190,22 +181,20 @@ impl super::backend::Backend for TarRo {
             .children
             .iter()
             .map(|(name, child)| {
-                let (file_type, ino) = match *child {
-                    IndexedChild::File(idx) => {
-                        (FileType::RegularFile, self.tar_index.files[idx].ino)
-                    }
-                    IndexedChild::Dir(_) => {
-                        (FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER)
-                    }
+                let (file_type, node_info) = match *child {
+                    IndexedChild::File(idx) => (
+                        FileType::RegularFile,
+                        self.tar_index.files[idx].node_info.clone(),
+                    ),
+                    IndexedChild::Dir(idx) => (
+                        FileType::Directory,
+                        self.tar_index.dirs[idx].node_info.clone(),
+                    ),
                 };
                 DirEntry {
                     name: name.clone(),
                     file_type,
-                    ino_info: Some(NodeInfo {
-                        dev: DEVICE_ID,
-                        ino,
-                        rdev: None,
-                    }),
+                    ino_info: Some(node_info),
                 }
             })
             .collect())
@@ -243,11 +232,7 @@ impl super::backend::Backend for TarRo {
             mode: file.mode,
             size: file.data_range.len(),
             owner: file.owner,
-            node_info: NodeInfo {
-                dev: DEVICE_ID,
-                ino: file.ino,
-                rdev: None,
-            },
+            node_info: file.node_info.clone(),
             blksize: BLOCK_SIZE,
         })
     }
@@ -262,11 +247,7 @@ impl super::backend::Backend for TarRo {
             mode: DEFAULT_DIR_MODE,
             size: super::DEFAULT_DIRECTORY_SIZE,
             owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-            node_info: NodeInfo {
-                dev: DEVICE_ID,
-                ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
-                rdev: None,
-            },
+            node_info: dir.node_info.clone(),
             blksize: BLOCK_SIZE,
         })
     }
@@ -364,11 +345,12 @@ struct IndexedFile {
     data_range: Range<usize>,
     mode: Mode,
     owner: UserInfo,
-    ino: usize,
+    node_info: NodeInfo,
 }
 
 struct IndexedDir {
     owner: Option<UserInfo>,
+    node_info: NodeInfo,
     children: HashMap<String, IndexedChild>,
 }
 
@@ -382,11 +364,6 @@ struct TarIndex {
     tar_data: alloc::borrow::Cow<'static, [u8]>,
     files: Vec<IndexedFile>,
     dirs: Vec<IndexedDir>,
-    #[expect(
-        dead_code,
-        reason = "jayb: will be used soon before PR is made, DO NOT COMMIT"
-    )]
-    inode_allocator: InodeAllocator,
 }
 
 impl TarIndex {
@@ -396,7 +373,7 @@ impl TarIndex {
 
         let mut files = Vec::new();
         let mut files_by_path: HashMap<String, usize> = HashMap::new();
-        for (idx, entry) in archive.entries().enumerate() {
+        for entry in archive.entries() {
             let filename = entry.filename();
             let Ok(path) = filename.as_str() else {
                 continue;
@@ -412,8 +389,7 @@ impl TarIndex {
                 data_range: start..end,
                 mode: mode_of_modeflags(entry.posix_header().mode.to_flags().unwrap()),
                 owner: owner_from_posix_header(entry.posix_header()),
-                // ino starts at 1 (zero represents deleted file)
-                ino: idx + 1,
+                node_info: inode_allocator.next(),
             };
 
             let file_idx = files.len();
@@ -427,6 +403,7 @@ impl TarIndex {
 
         let mut dirs = alloc::vec![IndexedDir {
             owner: None,
+            node_info: inode_allocator.next(),
             children: HashMap::new(),
         }];
         let mut dirs_by_path: HashMap<String, usize> = [(String::new(), 0)].into_iter().collect();
@@ -459,6 +436,7 @@ impl TarIndex {
                 let child_dir_idx = *dirs_by_path.entry(parent.clone()).or_insert_with(|| {
                     dirs.push(IndexedDir {
                         owner: Some(file.owner),
+                        node_info: inode_allocator.next(),
                         children: HashMap::new(),
                     });
                     dirs.len() - 1
@@ -475,7 +453,6 @@ impl TarIndex {
             tar_data,
             files,
             dirs,
-            inode_allocator,
         }
     }
 

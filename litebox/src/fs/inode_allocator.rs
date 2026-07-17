@@ -19,7 +19,7 @@ impl InodeAllocator {
     pub fn for_device(device_id: u64) -> Self {
         Self {
             device_id,
-            counter: AtomicU64::new(0),
+            counter: AtomicU64::new(1),
         }
     }
 
