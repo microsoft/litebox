@@ -23,8 +23,9 @@
   (definitions below). Path-level A is an **over-count** — several A-by-path
   merges are internally broker- or fork-migration-coupled and fail content
   review. **Content review is authoritative.**
-- **Verified-ready dual-target candidates today:** the advisory-sockopt
-  accepts (`IP_TOS`, `SO_RCVBUF`, `SO_SNDBUF`). See "Verified-ready".
+- **Verified-ready dual-target `main` candidates:** 3 — the advisory-sockopt
+  accepts (`IP_TOS`, `SO_RCVBUF`, `SO_SNDBUF`) and the `SIG_DFL` stop-signal
+  no-op; plus 1 to re-check, 2 sliceable, 1 feature. See the Bucket-A ranking.
 - **Approval gate:** no PR is opened for any bucket without explicit sign-off
   on that specific candidate.
 
@@ -99,13 +100,45 @@ through both the A-path and B-path pools. It is **Bucket C** conceptually —
 obviates it; main has no broker/worker-host model). Content review routes these
 out of the dual-target set.
 
-## Bucket A — dual-target substrate candidates (all 66, small-first)
+## Bucket A — dual-target substrate candidates (content-reviewed)
 
-The `hint` column is a **keyword heuristic only** (`cleanish` / `broker` /
-`forkmig` / `review`) — it has known false positives (e.g. "non-PIE loader"
-tags `cleanish` but its payload is a worker-migration decision; the 20K-line
-"line-endings" row is pure CRLF normalization). **Trust content review, not the
-hint.**
+**Only ~4–6 of the 66 A-by-path merges are genuinely clean dual-target `main`
+fixes; the rest route to ulitebox (B) or neither (C/D) on content review.** The
+ranking below is authoritative (coupling-symbol scan of each merge's shared-crate
+diff + subject semantics + `origin/main` presence check). The raw size-ordered
+table is kept as a `<details>` reference at the end of this section.
+
+Verdict tally: **A-READY**=3, **A-CHECK**=1, **A-SLICE**=2, **A-FEAT**=1,
+**->review**=1, **->B**=24, **->C**=26, **->D**=3, **REJECT**=5.
+
+Legend: **A-READY** = verified clean + broker-independent + still-buggy on
+`main` (extract now) · **A-CHECK** = clean-looking, one `main`-diff check pending
+· **A-SLICE** = a portable fix bundled inside a broker merge (extract the hunk) ·
+**A-FEAT** = portable but a feature `main` deliberately rejects (product call) ·
+**->B**/**->C**/**->D** = content review re-routes an A-by-path merge to
+ulitebox-broker / fork-migration-neither / tooling · **REJECT** = no-op on main,
+model mismatch, or noise. **A-SLICE extraction:** cherry-pick the merge,
+`git reset` the broker hunks, keep only the substrate hunk + inline its test.
+
+| verdict | size | sha | work-stream — description | why |
+|:--|--:|:--|:--|:--|
+| A-READY | `7/1` | `fc2b3134d` | session-iptos-shim-fix — accept setsockopt(SOL_IP, IP_TOS) | main net.rs:388 still EOPNOTSUPP; broker-indep |
+| A-READY | `11/4` | `30782b911` | session-rcvbuf-sndbuf-fix — accept SO_RCVBUF/SO_SNDBUF | main net.rs:399+unix.rs:1517 EOPNOTSUPP |
+| A-READY | `140/5` | `27393b02a` | SIG_DFL Stop signals as no-op (SIGTTIN-cascade) | main signal/mod.rs:587 still Stop=>terminate; 1 file |
+| A-CHECK | `15/3` | `fd51b53cb` | TUI mode startup — 5 shim signal divergences | signal/mod.rs; sibling of sig_dfl — verify vs main |
+| A-SLICE | `141/46` | `13b12131b` | wave10 — SCM eventfd refs + **sendfile** | sendfile portable; slice from SCM-eventfd broker refs |
+| A-SLICE | `262/281` | `e7e59d2b6` | Phase 3 r5 — **WIFSIGNALED** encoding + pidfd delegation | wait-status encoding portable; slice from pidfd |
+| A-FEAT | `136/6` | `15f57bdda` | netlink-getifaddrs | main returns EAFNOSUPPORT — feature, product call |
+| ->review | `176/14` | `704336e24` | orphan-kpx | process-lifecycle — needs a manual look |
+| ->B (24 merges) | 6/3 … 6065/1329 | — | broker TCP/pipe/PTY/pidfd/scm/socketpair/cwfd/epoll-local, wave-*, broker-exit-status | broker-coupled — adapt into ulitebox 6-crate broker |
+| ->C (26 merges) | 6/4 … 4685/383 | — | fork-restore, vfork-quiesce, delayed-fork, CoW, seal-descriptor-table, wave-cleanup, invariants, clone-hang | fork-migration / refactor — neither target |
+| ->D (3 merges) | 83/3, 632/96, 923/50 | — | audit-log-improvements, --ssh mode, audit-canonical-names | tooling (audit_query / tool_executor) |
+| REJECT (5) | 4/0 … 20288/20288 | — | munmap/madvise allowlist, /dev/pts, TIOCGPTN, non-PIE-loader, line-endings | no-op / model-mismatch / noise on main |
+
+The full per-merge ->B/->C/->D/REJECT rows are in the `<details>` raw table plus
+the git analysis; the summarized rows above collapse them by verdict.
+
+<details><summary>Raw size-ordered A-by-path table (reference; the <code>hint</code> column is a keyword heuristic with known false positives — trust the verdict ranking above)</summary>
 
 | size (+/-) | hint | crates | work-stream — description |
 |---:|:--|:--|:--|
@@ -175,6 +208,8 @@ hint.**
 | `4685/383` | forkmig | lb_shim_linux, lb_test_harness | wportnoy/wave-cleanup — vfork CoW substrate fix + broker-held simplifications + 911 new tests |
 | `6065/1329` | review | .github, litebox, lb_shim_linux, lb_test_harness | wportnoy/binary-types-matrix-merge-blockers — 5-leg BinaryType axis + VS Code blocker fixes |
 | `20288/20288` | review | lb_shim_linux | Merge branch 'fix/cleanup-line-endings' into wportnoy/vscode-server-in-litebox |
+
+</details>
 
 ### Verified-ready (content-reviewed, dual-target, not-yet-present on `main`)
 
