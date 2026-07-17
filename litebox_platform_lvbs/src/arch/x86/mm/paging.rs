@@ -559,41 +559,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         flags: PageTableFlags,
         exec_ranges: Option<&[Range<PhysAddr>]>,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
-        self.map_phys_frame_range_with(frame_range, flags, exec_ranges, M::pa_to_va)
-    }
-
-    /// Map physical frame range to the page table using the direct-map offset
-    /// ([`MemoryProvider::pa_to_va_direct`], i.e., `PA + GVA_OFFSET`).
-    ///
-    /// Use this for VTL0 / external physical memory that should be accessible
-    /// through the direct-map region.
-    pub(crate) fn map_phys_frame_range_direct(
-        &self,
-        frame_range: PhysFrameRange<Size4KiB>,
-        flags: PageTableFlags,
-        exec_ranges: Option<&[Range<PhysAddr>]>,
-    ) -> Result<*mut u8, MapToError<Size4KiB>> {
-        self.map_phys_frame_range_with(frame_range, flags, exec_ranges, M::pa_to_va_direct)
-    }
-
-    /// Common implementation for [`Self::map_phys_frame_range`] and
-    /// [`Self::map_phys_frame_range_direct`].
-    ///
-    /// `pa_to_va` selects how physical addresses are translated to virtual
-    /// addresses — either via `KERNEL_OFFSET` or `GVA_OFFSET`.
-    fn map_phys_frame_range_with(
-        &self,
-        frame_range: PhysFrameRange<Size4KiB>,
-        flags: PageTableFlags,
-        exec_ranges: Option<&[Range<PhysAddr>]>,
-        pa_to_va: fn(PhysAddr) -> VirtAddr,
-    ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
 
         let mut inner = self.inner.lock();
         for target_frame in frame_range {
             let page: Page<Size4KiB> =
-                Page::containing_address(pa_to_va(target_frame.start_address()));
+                Page::containing_address(M::pa_to_va(target_frame.start_address()));
 
             match inner.translate(page.start_address()) {
                 TranslateResult::Mapped {
@@ -655,12 +626,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         }
 
         let start_page =
-            Page::<Size4KiB>::containing_address(pa_to_va(frame_range.start.start_address()));
+            Page::<Size4KiB>::containing_address(M::pa_to_va(frame_range.start.start_address()));
         let count =
             (frame_range.end.start_address() - frame_range.start.start_address()) / Size4KiB::SIZE;
         flush_tlb_range(start_page, count.trunc());
 
-        Ok(pa_to_va(frame_range.start.start_address()).as_mut_ptr())
+        Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
 
     /// Map non-contiguous physical frames to virtually contiguous addresses.
