@@ -295,8 +295,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
 
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        shim_builder.default_fs(in_mem, tar_ro)
+        shim_builder.default_fs(in_mem, tar_data.into())
     };
 
     // We need to get the file path before enabling seccomp.

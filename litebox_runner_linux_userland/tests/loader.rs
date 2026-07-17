@@ -30,15 +30,12 @@ impl TestLauncher {
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to set permissions on root");
         });
-        let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
-            litebox,
-            if tar_data.is_empty() {
-                litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
-            } else {
-                tar_data.into()
-            },
-        );
-        let fs = shim_builder.default_fs(in_mem_fs, tar_ro_fs);
+        let tar_data = if tar_data.is_empty() {
+            litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
+        } else {
+            tar_data.into()
+        };
+        let fs = shim_builder.default_fs(in_mem_fs, tar_data);
         let mut this = Self {
             platform,
             shim_builder,

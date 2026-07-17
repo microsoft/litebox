@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -62,7 +63,7 @@ pub(crate) type LinuxFS<Platform> = litebox::fs::layered::FileSystem<
     litebox::fs::layered::FileSystem<
         Platform,
         litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
-        litebox::fs::tar_ro::FileSystem<Platform>,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
     >,
 >;
 
@@ -217,13 +218,13 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         &self.litebox
     }
 
-    /// Create a default layered file system with the given in-memory and tar read-only layers.
+    /// Create a default layered file system with the given in-memory layer and tar data.
     pub fn default_fs(
         &self,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
-        tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
+        tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
+        default_fs(&self.litebox, in_mem_fs, tar_data)
     }
 
     /// Build the shim.
@@ -374,11 +375,11 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
     }
 }
 
-/// Create a default layered file system with the given in-memory and tar read-only layers.
+/// Create a default layered file system with the given in-memory layer and tar data.
 fn default_fs<Platform: ShimPlatform>(
     litebox: &LiteBox<Platform>,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
-    tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
+    tar_data: Cow<'static, [u8]>,
 ) -> LinuxFS<Platform> {
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
@@ -389,13 +390,22 @@ fn default_fs<Platform: ShimPlatform>(
             .build()
             .unwrap(),
     );
+    let tar_ro = litebox::fs::resolver::Resolver::new(
+        litebox,
+        litebox::fs::composer::Composer::builder()
+            .mount("/", |allocator| {
+                litebox::fs::tar_ro::TarRo::new(tar_data, allocator)
+            })
+            .build()
+            .unwrap(),
+    );
     litebox::fs::layered::FileSystem::new(
         litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
             litebox,
             dev_stdio,
-            tar_ro_fs,
+            tar_ro,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,

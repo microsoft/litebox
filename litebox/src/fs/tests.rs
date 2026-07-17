@@ -1,6 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+fn tar_ro_fs(
+    litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>,
+    tar_data: alloc::borrow::Cow<'static, [u8]>,
+) -> crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform, crate::fs::tar_ro::TarRo> {
+    crate::fs::resolver::Resolver::new(
+        litebox,
+        crate::fs::tar_ro::TarRo::new(
+            tar_data,
+            crate::fs::inode_allocator::InodeAllocator::standalone(),
+        ),
+    )
+}
+
 mod in_mem {
     use crate::LiteBox;
     use crate::fs::in_mem;
@@ -912,7 +925,6 @@ mod in_mem {
 
 mod tar_ro {
     use crate::LiteBox;
-    use crate::fs::tar_ro;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
@@ -924,7 +936,7 @@ mod tar_ro {
     #[test]
     fn file_read() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let fd = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
@@ -948,7 +960,7 @@ mod tar_ro {
     #[test]
     fn dir_and_nonexist_checks() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         assert!(matches!(
             fs.open("bar/ba", OFlags::RDONLY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
@@ -964,7 +976,7 @@ mod tar_ro {
     #[test]
     fn o_directory_flag_tests() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
 
         // Test O_DIRECTORY on a directory (should succeed)
         let fd = fs
@@ -1004,7 +1016,7 @@ mod tar_ro {
     #[test]
     fn read_dir_subdirectory() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
 
         // Read root directory
         let fd = fs
@@ -1053,7 +1065,7 @@ mod tar_ro {
     #[test]
     fn read_dir_file_not_directory() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
 
         let fd = fs
             .open("foo", OFlags::RDONLY, Mode::empty())
@@ -1071,7 +1083,7 @@ mod tar_ro {
 mod layered {
     use crate::LiteBox;
     use crate::fs::{FileSystem as _, FileType, Mode, OFlags};
-    use crate::fs::{in_mem, layered, tar_ro};
+    use crate::fs::{in_mem, layered};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1085,7 +1097,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd = fs
@@ -1125,7 +1137,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         assert!(matches!(
@@ -1161,7 +1173,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem_fs,
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd1 = fs
@@ -1212,7 +1224,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem_fs,
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd1 = fs
@@ -1248,7 +1260,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd = fs
@@ -1305,7 +1317,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem_fs,
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
@@ -1380,7 +1392,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem_fs,
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
         let fd = fs
@@ -1401,7 +1413,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
@@ -1444,7 +1456,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem_fs,
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
@@ -1503,7 +1515,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem_fs,
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
@@ -1614,7 +1626,7 @@ mod layered {
                 .expect("Failed to chmod / in upper layer");
         });
 
-        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
             &litebox,
             upper,
@@ -1658,7 +1670,7 @@ mod layered {
                 .expect("Failed to chmod / in upper layer");
         });
 
-        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
             &litebox,
             upper,
@@ -1706,7 +1718,7 @@ mod layered {
                 .expect("Failed to chmod / in upper layer");
         });
 
-        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
             &litebox,
             upper,
@@ -1749,7 +1761,7 @@ mod layered {
     fn open_with_trunc() {
         let litebox = LiteBox::new(MockPlatform::new());
 
-        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let mut upper = in_mem::FileSystem::new(&litebox);
         // Set up write permissions on the upper layer
         upper.with_root_privileges(|fs| {
@@ -1806,7 +1818,7 @@ mod layered {
                 .expect("chmod / failed");
         });
 
-        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
             &litebox,
             upper,
@@ -1847,7 +1859,7 @@ mod layered {
         upper.with_root_privileges(|fs| {
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
         });
-        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
             &litebox,
             upper,
@@ -1893,7 +1905,7 @@ mod layered {
 
         let litebox = LiteBox::new(MockPlatform::new());
         let upper = in_mem::FileSystem::new(&litebox); // empty
-        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
             &litebox,
             upper,
@@ -1915,7 +1927,7 @@ mod layered {
         upper.with_root_privileges(|fs| {
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
         });
-        let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
             &litebox,
             upper,
@@ -1957,7 +1969,7 @@ mod layered {
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem_fs,
-            tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into()),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
             layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
