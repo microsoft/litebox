@@ -148,8 +148,11 @@ fn parse_optee_msg_args(
 /// frame. The Linux OP-TEE driver packs multiple `optee_msg_arg`s into sub-page slots and hands
 /// out one slot per in-flight call (bitmap under `shm_arg_cache.mutex`), so concurrent cores touch
 /// disjoint slots. Each access maps the frame into its own private, transient VA window (see the
-/// `vmap`-based `PhysMutPtr`), so no page-table conflict arises either. A malicious normal world
-/// that overlaps slots is contained by the copy-once + `FromBytes` + re-validate discipline above.
+/// `vmap`-based `PhysMutPtr`), so no page-table conflict arises either. A malicious normal-world
+/// kernel can provide overlapped slots, but this only results in copying invalid `optee_msg_arg`
+/// and/or corrupting normal-world memory - the malicious kernel can easily do these even without
+/// slot overlaps. Our fallible memcpy with `FromBytes` ensures this copy-in does not result in
+/// Rust safety/soundness issues.
 ///
 /// VTL0 physical memory layout at `phys_addr`:
 ///
