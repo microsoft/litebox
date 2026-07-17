@@ -124,8 +124,15 @@ impl super::backend::Backend for TarRo {
         })
     }
 
-    fn owned_dir_at(&self, dir: WalkingDirHandle<'_>) -> DirHandle {
-        DirHandle::from_typed::<Self>(dir.into_typed::<Self>())
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        if flags.intersects(OFlags::CREAT | OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR) {
+            return Err(OpenError::ReadOnlyFileSystem);
+        }
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {

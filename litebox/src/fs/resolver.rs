@@ -179,6 +179,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(Some((parent, name)))
     }
 
+    fn owned_parent_dir(&self, dir: WalkingDirHandle<'_>) -> Result<DirHandle, WalkError> {
+        self.backend
+            .owned_dir_at(dir, OFlags::PATH)
+            .map_err(|error| match error {
+                OpenError::PathError(PathError::NoSuchFileOrDirectory) => {
+                    PathError::MissingComponent.into()
+                }
+                OpenError::PathError(error) => error.into(),
+                _ => WalkError::Io,
+            })
+    }
+
     fn walk_to_directory<'a>(
         &'a self,
         context: &Context,
@@ -191,7 +203,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             return Ok(from);
         }
 
-        let outcome = self.backend.walk_directories(from, components)?;
+        let outcome =
+            self.backend
+                .walk_directories(from, components)
+                .map_err(|error| match error {
+                    WalkError::PathError(PathError::NoSuchFileOrDirectory) => {
+                        PathError::MissingComponent.into()
+                    }
+                    error => error,
+                })?;
         Self::check_walk_permissions(
             context,
             #[cfg(debug_assertions)]
@@ -335,7 +355,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 return Err(OpenError::AlreadyExists);
             }
             return Ok(insert(
-                OwnedHandle::Dir(self.backend.owned_dir_at(self.backend.root())),
+                OwnedHandle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
                 SeekBehavior::NonSeekable,
             ));
         }
@@ -354,7 +374,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(OpenError::AlreadyExists);
                 }
                 Ok(insert(
-                    OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last)),
+                    OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
                     SeekBehavior::NonSeekable,
                 ))
             }
@@ -400,7 +420,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         WalkError::Io => OpenError::Io,
                         WalkError::PathError(error) => error.into(),
                     })?;
-                let parent = self.backend.owned_dir_at(parent);
+                let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+                    WalkError::Io => OpenError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?;
                 let file = self.backend.create_file_at(parent, name, mode)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
                 Ok(insert(OwnedHandle::File(file), seek_behavior))
@@ -594,8 +617,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             // TODO(jayb): Add backend support for mutating the root directory itself.
             unimplemented!("chmod root directory")
         };
-        self.backend
-            .chmod_at(self.backend.owned_dir_at(parent), name, mode)
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => ChmodError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.chmod_at(parent, name, mode)
     }
 
     fn chown(
@@ -616,8 +642,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             // TODO(jayb): Add backend support for mutating the root directory itself.
             unimplemented!("chown root directory")
         };
-        self.backend
-            .chown_at(self.backend.owned_dir_at(parent), name, user, group)
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => ChownError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.chown_at(parent, name, user, group)
     }
 
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
@@ -632,8 +661,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(UnlinkError::IsADirectory);
         };
-        self.backend
-            .unlink_at(self.backend.owned_dir_at(parent), name)
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => UnlinkError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.unlink_at(parent, name)
     }
 
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
@@ -648,9 +680,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(MkdirError::AlreadyExists);
         };
-        self.backend
-            .mkdir_at(self.backend.owned_dir_at(parent), name, mode)
-            .map(|_| ())
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => MkdirError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.mkdir_at(parent, name, mode).map(|_| ())
     }
 
     fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
@@ -665,8 +699,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(RmdirError::Busy);
         };
-        self.backend
-            .rmdir_at(self.backend.owned_dir_at(parent), name)
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => RmdirError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.rmdir_at(parent, name)
     }
 
     fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<super::DirEntry>, ReadDirError> {

@@ -1014,6 +1014,19 @@ mod tar_ro {
     }
 
     #[test]
+    fn write_or_truncate_open_of_directory_fails() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+
+        for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::TRUNC] {
+            assert!(matches!(
+                fs.open("bar", flags, Mode::empty()),
+                Err(crate::fs::errors::OpenError::ReadOnlyFileSystem)
+            ));
+        }
+    }
+
+    #[test]
     fn read_dir_subdirectory() {
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());

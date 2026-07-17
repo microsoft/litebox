@@ -60,8 +60,12 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError>;
 
-    /// Take an owned handle to a `dir` found via a walk.
-    fn owned_dir_at(&self, dir: WalkingDirHandle<'_>) -> DirHandle;
+    /// Take an owned handle to a `dir` found via a walk, validating any open `flags`.
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        flags: OFlags,
+    ) -> Result<DirHandle, OpenError>;
 
     /// Obtain a walking handle to an existing owned dir.
     ///

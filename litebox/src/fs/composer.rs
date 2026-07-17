@@ -534,24 +534,29 @@ impl Backend for Composer {
         })
     }
 
-    fn owned_dir_at(&self, dir: WalkingDirHandle<'_>) -> DirHandle {
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
         let dir = dir.into_typed::<Self>();
-        DirHandle::from_typed::<Self>(ComposerDirHandle {
-            inner: match dir.inner {
-                ComposerWalkingDirHandleInner::Virtual { path } => {
-                    ComposerDirHandleInner::Virtual { path }
-                }
-                ComposerWalkingDirHandleInner::Mounted {
-                    path,
-                    mount_index,
-                    handle,
-                } => ComposerDirHandleInner::Mounted {
-                    path,
-                    mount_index,
-                    handle: self.mounts[mount_index].backend.owned_dir_at(handle),
-                },
+        let inner = match dir.inner {
+            ComposerWalkingDirHandleInner::Virtual { path } => {
+                ComposerDirHandleInner::Virtual { path }
+            }
+            ComposerWalkingDirHandleInner::Mounted {
+                path,
+                mount_index,
+                handle,
+            } => ComposerDirHandleInner::Mounted {
+                path,
+                mount_index,
+                handle: self.mounts[mount_index]
+                    .backend
+                    .owned_dir_at(handle, flags)?,
             },
-        })
+        };
+        Ok(DirHandle::from_typed::<Self>(ComposerDirHandle { inner }))
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {

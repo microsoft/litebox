@@ -210,8 +210,12 @@ where
         })
     }
 
-    fn owned_dir_at(&self, dir: WalkingDirHandle<'_>) -> DirHandle {
-        DirHandle::from_typed::<Self>(dir.into_typed::<Self>())
+    fn owned_dir_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
