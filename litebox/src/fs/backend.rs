@@ -318,10 +318,6 @@ pub(super) enum PermissionCheck {
     /// The backend is self-enforcing permissions for this item.
     ByBackend,
     /// The resolver should check this permission metadata.
-    #[expect(
-        dead_code,
-        reason = "only backend-self-enforced devices exist during migration"
-    )]
     ByResolver(PermissionInfo),
 }
 

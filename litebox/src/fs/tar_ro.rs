@@ -38,10 +38,12 @@ use crate::{
 
 use super::{
     Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
+    backend::{DirHandle, FileHandle, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
     },
+    inode_allocator::InodeAllocator,
 };
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
@@ -56,6 +58,275 @@ const TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER: usize = 0xFACE;
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
 const BLOCK_SIZE: usize = 0;
+
+/// A [`super::backend::Backend`] that stores all files in-memory, via a read-only `.tar` file.
+pub struct TarRo {
+    tar_index: TarIndex,
+}
+
+impl TarRo {
+    /// Construct a tar backend using a caller-provided inode allocator.
+    #[must_use]
+    pub fn new(
+        tar_data: alloc::borrow::Cow<'static, [u8]>,
+        inode_allocator: InodeAllocator,
+    ) -> Self {
+        Self {
+            tar_index: TarIndex::new(tar_data, inode_allocator),
+        }
+    }
+}
+
+impl super::backend::private::Sealed for TarRo {}
+
+/// Directory handle
+#[derive(Clone)]
+pub struct TarRoDirHandle {
+    idx: usize,
+}
+/// File handle
+#[derive(Clone)]
+pub struct TarRoFileHandle {
+    idx: usize,
+}
+impl super::backend::BackendHandles for TarRo {
+    type WalkingDirHandle<'a> = TarRoDirHandle;
+    type FileHandle = TarRoFileHandle;
+    type DirHandle = TarRoDirHandle;
+}
+
+impl super::backend::Backend for TarRo {
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(TarRoDirHandle { idx: 0 })
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<super::backend::WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let mut current = from.into_typed::<Self>();
+        let mut walked_components = Vec::with_capacity(components.len());
+        for component in components {
+            let child = self.tar_index.dirs[current.idx]
+                .children
+                .get(*component)
+                .ok_or(WalkError::PathError(PathError::NoSuchFileOrDirectory))?;
+            let IndexedChild::Dir(child_idx) = *child else {
+                return Ok(super::backend::WalkOutcome {
+                    components: walked_components,
+                    last: WalkingDirHandle::from_typed::<Self>(current),
+                    stop_reason: super::backend::WalkStopReason::StoppedAtNonDirectory,
+                });
+            };
+
+            let child = &self.tar_index.dirs[child_idx];
+            walked_components.push(super::backend::WalkedComponent {
+                permissions: super::backend::PermissionCheck::ByResolver(
+                    super::backend::PermissionInfo {
+                        mode: DEFAULT_DIR_MODE,
+                        owner: child.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
+                    },
+                ),
+            });
+            current = TarRoDirHandle { idx: child_idx };
+        }
+        Ok(super::backend::WalkOutcome {
+            components: walked_components,
+            last: WalkingDirHandle::from_typed::<Self>(current),
+            stop_reason: super::backend::WalkStopReason::CompleteDirectory,
+        })
+    }
+
+    fn owned_dir_at(&self, dir: WalkingDirHandle<'_>) -> DirHandle {
+        DirHandle::from_typed::<Self>(dir.into_typed::<Self>())
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            dir.get_typed::<Self>().clone(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
+        flags: OFlags,
+    ) -> Result<super::backend::Permissioned<FileHandle>, OpenError> {
+        let dir = dir.into_typed::<Self>();
+        let child = self.tar_index.dirs[dir.idx]
+            .children
+            .get(name)
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+        let IndexedChild::File(file_idx) = *child else {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        };
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+        }
+        if !(flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL))
+            && (flags.contains(OFlags::CREAT)
+                || flags.contains(OFlags::TRUNC)
+                || flags.contains(OFlags::WRONLY)
+                || flags.contains(OFlags::RDWR))
+        {
+            return Err(OpenError::ReadOnlyFileSystem);
+        }
+        let file = &self.tar_index.files[file_idx];
+        Ok(super::backend::Permissioned {
+            item: FileHandle::from_typed::<Self>(TarRoFileHandle { idx: file_idx }),
+            permissions: super::backend::PermissionCheck::ByResolver(
+                super::backend::PermissionInfo {
+                    mode: file.mode,
+                    owner: file.owner,
+                },
+            ),
+        })
+    }
+
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let handle = handle.into_typed::<Self>();
+        Ok(self.tar_index.dirs[handle.idx]
+            .children
+            .iter()
+            .map(|(name, child)| {
+                let (file_type, ino) = match *child {
+                    IndexedChild::File(idx) => {
+                        (FileType::RegularFile, self.tar_index.files[idx].ino)
+                    }
+                    IndexedChild::Dir(_) => {
+                        (FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER)
+                    }
+                };
+                DirEntry {
+                    name: name.clone(),
+                    file_type,
+                    ino_info: Some(NodeInfo {
+                        dev: DEVICE_ID,
+                        ino,
+                        rdev: None,
+                    }),
+                }
+            })
+            .collect())
+    }
+
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+        let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
+        let start = offset.min(file.len());
+        let end = offset.checked_add(buf.len()).unwrap().min(file.len());
+        debug_assert!(start <= end);
+        let len = end - start;
+        buf[..len].copy_from_slice(&file[start..end]);
+        Ok(len)
+    }
+
+    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate(&self, _h: &FileHandle, _length: usize) -> Result<(), TruncateError> {
+        Err(TruncateError::NotForWriting)
+    }
+
+    fn seek_behavior(&self, _h: &FileHandle) -> super::backend::SeekBehavior {
+        super::backend::SeekBehavior::PositionBased
+    }
+
+    fn file_status(
+        &self,
+        h: &FileHandle,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        let file = &self.tar_index.files[h.get_typed::<Self>().idx];
+        Ok(super::FileStatus {
+            file_type: FileType::RegularFile,
+            mode: file.mode,
+            size: file.data_range.len(),
+            owner: file.owner,
+            node_info: NodeInfo {
+                dev: DEVICE_ID,
+                ino: file.ino,
+                rdev: None,
+            },
+            blksize: BLOCK_SIZE,
+        })
+    }
+
+    fn dir_status(
+        &self,
+        h: &DirHandle,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
+        Ok(super::FileStatus {
+            file_type: FileType::Directory,
+            mode: DEFAULT_DIR_MODE,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
+            node_info: NodeInfo {
+                dev: DEVICE_ID,
+                ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
+                rdev: None,
+            },
+            blksize: BLOCK_SIZE,
+        })
+    }
+
+    fn create_file_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError> {
+        let dir = dir.into_typed::<Self>();
+        match self.tar_index.dirs[dir.idx].children.get(name) {
+            Some(IndexedChild::Dir(_)) => Err(UnlinkError::IsADirectory),
+            Some(IndexedChild::File(_)) => Err(UnlinkError::ReadOnlyFileSystem),
+            None => Err(PathError::NoSuchFileOrDirectory.into()),
+        }
+    }
+
+    fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError> {
+        let dir = dir.into_typed::<Self>();
+        match self.tar_index.dirs[dir.idx].children.get(name) {
+            Some(IndexedChild::Dir(_)) => Err(RmdirError::ReadOnlyFileSystem),
+            Some(IndexedChild::File(_)) => Err(RmdirError::NotADirectory),
+            None => Err(PathError::NoSuchFileOrDirectory.into()),
+        }
+    }
+
+    fn chmod_at(&self, dir: DirHandle, name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        let dir = dir.into_typed::<Self>();
+        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
+            Err(ChmodError::ReadOnlyFileSystem)
+        } else {
+            Err(PathError::NoSuchFileOrDirectory.into())
+        }
+    }
+
+    fn chown_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let dir = dir.into_typed::<Self>();
+        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
+            Err(ChownError::ReadOnlyFileSystem)
+        } else {
+            Err(PathError::NoSuchFileOrDirectory.into())
+        }
+    }
+}
 
 /// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
 /// a read-only `.tar` file.
@@ -82,9 +353,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
+        // TODO DO NOT COMMIT migrate this over to just being a wrap around the backend
         Self {
             litebox: litebox.clone(),
-            tar_index: TarIndex::new(tar_data),
+            tar_index: TarIndex::new(tar_data, InodeAllocator::standalone()),
             current_working_dir: "/".into(),
         }
     }
@@ -115,7 +387,13 @@ struct IndexedFile {
 
 struct IndexedDir {
     owner: Option<UserInfo>,
-    children: HashMap<String, (FileType, usize)>,
+    children: HashMap<String, IndexedChild>,
+}
+
+#[derive(Clone, Copy)]
+enum IndexedChild {
+    File(usize),
+    Dir(usize),
 }
 
 struct TarIndex {
@@ -124,10 +402,11 @@ struct TarIndex {
     files_by_path: HashMap<String, usize>,
     dirs: Vec<IndexedDir>,
     dirs_by_path: HashMap<String, usize>,
+    inode_allocator: InodeAllocator,
 }
 
 impl TarIndex {
-    fn new(tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
+    fn new(tar_data: alloc::borrow::Cow<'static, [u8]>, inode_allocator: InodeAllocator) -> Self {
         let archive = tar_no_std::TarArchiveRef::new(tar_data.as_ref()).expect("invalid tar data");
         let base_ptr = tar_data.as_ptr() as usize;
 
@@ -178,18 +457,12 @@ impl TarIndex {
             let mut parent_dir_idx = 0;
             for (component_idx, component) in components.iter().enumerate() {
                 let is_last_component = component_idx + 1 == components.len();
-                let (file_type, ino) = if is_last_component {
-                    (FileType::RegularFile, file.ino)
-                } else {
-                    (FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER)
-                };
-
                 dirs[parent_dir_idx].owner.get_or_insert(file.owner);
-                dirs[parent_dir_idx]
-                    .children
-                    .insert((*component).into(), (file_type, ino));
 
                 if is_last_component {
+                    dirs[parent_dir_idx]
+                        .children
+                        .insert((*component).into(), IndexedChild::File(file_idx));
                     break;
                 }
 
@@ -206,6 +479,9 @@ impl TarIndex {
                     });
                     dirs.len() - 1
                 });
+                dirs[parent_dir_idx]
+                    .children
+                    .insert((*component).into(), IndexedChild::Dir(child_dir_idx));
                 dirs[child_dir_idx].owner.get_or_insert(file.owner);
                 parent_dir_idx = child_dir_idx;
             }
@@ -217,6 +493,7 @@ impl TarIndex {
             files_by_path,
             dirs,
             dirs_by_path,
+            inode_allocator,
         }
     }
 
@@ -502,19 +779,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }),
         });
 
-        out.extend(
-            dir.children
-                .iter()
-                .map(|(name, (file_type, ino))| DirEntry {
-                    name: name.clone(),
-                    file_type: file_type.clone(),
-                    ino_info: Some(NodeInfo {
-                        dev: DEVICE_ID,
-                        ino: *ino,
-                        rdev: None,
-                    }),
+        out.extend(dir.children.iter().map(|(name, child)| {
+            let (file_type, ino) = match *child {
+                IndexedChild::File(idx) => (FileType::RegularFile, self.tar_index.files[idx].ino),
+                IndexedChild::Dir(_) => {
+                    (FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER)
+                }
+            };
+            DirEntry {
+                name: name.clone(),
+                file_type,
+                ino_info: Some(NodeInfo {
+                    dev: DEVICE_ID,
+                    ino,
+                    rdev: None,
                 }),
-        );
+            }
+        }));
         Ok(out)
     }
 
