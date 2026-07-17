@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false, optional = true }
-bitflags = "2.6.0"
+bitflags = "2.13.1"
 either = { version = "1.13.0", default-features = false }
 hashbrown = "0.15.2"
 smallvec = "1.13.2"
