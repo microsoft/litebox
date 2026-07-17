@@ -21,15 +21,25 @@ const CD_SERVER_EA_NAME: &[u8] = b"server";
 pub(crate) enum CondrvObject {
     Input = 0,
     Output = 1,
-    Server = 2,
-    Reference = 3,
-    Connect = 4,
+    CurrentInput = 2,
+    CurrentOutput = 3,
+    ScreenBuffer = 4,
+    Server = 5,
+    Reference = 6,
+    Connect = 7,
 }
 
 impl CondrvObject {
     pub(crate) fn from_device_name(name: &str) -> Result<Self, NtStatus> {
         match Self::from_component(name) {
-            Some(object @ (Self::Input | Self::Output | Self::Server)) => Ok(object),
+            Some(
+                object @ (Self::Input
+                | Self::Output
+                | Self::CurrentInput
+                | Self::CurrentOutput
+                | Self::ScreenBuffer
+                | Self::Server),
+            ) => Ok(object),
             Some(Self::Reference) => Err(NtStatus::INVALID_HANDLE),
             Some(Self::Connect) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
             None => Err(NtStatus::OBJECT_NAME_NOT_FOUND),
@@ -41,6 +51,12 @@ impl CondrvObject {
             Some(Self::Input)
         } else if name.eq_ignore_ascii_case("Output") {
             Some(Self::Output)
+        } else if name.eq_ignore_ascii_case("CurrentIn") {
+            Some(Self::CurrentInput)
+        } else if name.eq_ignore_ascii_case("CurrentOut") {
+            Some(Self::CurrentOutput)
+        } else if name.eq_ignore_ascii_case("ScreenBuffer") {
+            Some(Self::ScreenBuffer)
         } else if name.eq_ignore_ascii_case("Server") {
             Some(Self::Server)
         } else if name.eq_ignore_ascii_case("Reference") {
@@ -54,41 +70,39 @@ impl CondrvObject {
 
     pub(crate) fn relative_child(self, name: &str) -> Result<Self, NtStatus> {
         let name = name.strip_prefix('\\').ok_or(NtStatus::NOT_FOUND)?;
-        let child = if self == Self::Connect {
-            if name.eq_ignore_ascii_case("CurrentIn") {
-                Self::Input
-            } else if name.eq_ignore_ascii_case("CurrentOut")
-                || name.eq_ignore_ascii_case("ScreenBuffer")
-            {
-                Self::Output
-            } else {
-                Self::from_component(name).ok_or(NtStatus::NOT_FOUND)?
-            }
-        } else {
-            Self::from_component(name).ok_or(NtStatus::NOT_FOUND)?
-        };
+        let child = Self::from_component(name).ok_or(NtStatus::NOT_FOUND)?;
 
-        match (self, child) {
-            (Self::Server, Self::Server | Self::Reference)
-            | (Self::Reference, Self::Server | Self::Connect | Self::Input | Self::Output)
-            | (Self::Input | Self::Output, Self::Server | Self::Input | Self::Output)
-            | (Self::Connect, Self::Server | Self::Reference | Self::Input | Self::Output) => {
-                Ok(child)
+        match child {
+            Self::Server => Ok(child),
+            Self::Reference => match self {
+                Self::Server | Self::Connect => Ok(child),
+                _ => Err(NtStatus::OBJECT_TYPE_MISMATCH),
+            },
+            Self::Connect => {
+                if self == Self::Reference {
+                    Ok(child)
+                } else {
+                    Err(NtStatus::INVALID_HANDLE)
+                }
             }
-            (Self::Server, Self::Input | Self::Output) => Err(NtStatus::INVALID_DEVICE_STATE),
-            (Self::Reference | Self::Input | Self::Output, Self::Reference) => {
-                Err(NtStatus::OBJECT_TYPE_MISMATCH)
-            }
-            (Self::Server | Self::Input | Self::Output | Self::Connect, Self::Connect) => {
-                Err(NtStatus::INVALID_HANDLE)
+            Self::Input
+            | Self::Output
+            | Self::CurrentInput
+            | Self::CurrentOutput
+            | Self::ScreenBuffer => {
+                if self == Self::Server {
+                    Err(NtStatus::INVALID_DEVICE_STATE)
+                } else {
+                    Ok(child)
+                }
             }
         }
     }
 
     pub(crate) fn handle_path(self) -> &'static str {
         match self {
-            Self::Input => "/dev/stdin",
-            Self::Output => "/dev/stdout",
+            Self::Input | Self::CurrentInput => "/dev/stdin",
+            Self::Output | Self::CurrentOutput | Self::ScreenBuffer => "/dev/stdout",
             Self::Server => r"\Device\ConDrv\Server",
             Self::Reference => r"\Device\ConDrv\Reference",
             Self::Connect => r"\Device\ConDrv\Connect",
@@ -288,7 +302,9 @@ mod tests {
 
     #[test]
     fn relative_children_match_host_parse_contexts() {
-        use CondrvObject::{Connect, Input, Output, Reference, Server};
+        use CondrvObject::{
+            Connect, CurrentInput, CurrentOutput, Input, Output, Reference, ScreenBuffer, Server,
+        };
 
         for (parent, name, expected) in [
             (Server, r"\Server", Ok(Server)),
@@ -317,9 +333,9 @@ mod tests {
             (Output, r"\Connect", Err(NtStatus::INVALID_HANDLE)),
             (Connect, r"\Input", Ok(Input)),
             (Connect, r"\Output", Ok(Output)),
-            (Connect, r"\CurrentIn", Ok(Input)),
-            (Connect, r"\CurrentOut", Ok(Output)),
-            (Connect, r"\ScreenBuffer", Ok(Output)),
+            (Connect, r"\CurrentIn", Ok(CurrentInput)),
+            (Connect, r"\CurrentOut", Ok(CurrentOutput)),
+            (Connect, r"\ScreenBuffer", Ok(ScreenBuffer)),
             (Connect, r"\Server", Ok(Server)),
             (Connect, r"\Reference", Ok(Reference)),
             (Connect, r"\Connect", Err(NtStatus::INVALID_HANDLE)),

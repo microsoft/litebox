@@ -755,12 +755,20 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let path = String::from(object.handle_path());
-        self.check_file_sharing(&path, desired_access, share_access)?;
+        if object != CondrvObject::ScreenBuffer {
+            self.check_file_sharing(&path, desired_access, share_access)?;
+        }
         let (backing, information) = match object {
-            CondrvObject::Input | CondrvObject::Output => {
+            CondrvObject::Input
+            | CondrvObject::Output
+            | CondrvObject::CurrentInput
+            | CondrvObject::CurrentOutput
+            | CondrvObject::ScreenBuffer => {
                 let backing_access = match object {
-                    CondrvObject::Input => FileAccess::READ_DATA,
-                    CondrvObject::Output => FileAccess::WRITE_DATA,
+                    CondrvObject::Input | CondrvObject::CurrentInput => FileAccess::READ_DATA,
+                    CondrvObject::Output
+                    | CondrvObject::CurrentOutput
+                    | CondrvObject::ScreenBuffer => FileAccess::WRITE_DATA,
                     _ => unreachable!(),
                 };
                 let (fd, _, information) = self.open_backing_fd(
@@ -945,7 +953,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 continue;
             };
             let conflicts = entry.with_entry(|file| {
-                file.path == path
+                file.condrv_object() != Some(CondrvObject::ScreenBuffer)
+                    && file.path == path
                     && (desired_access.conflicts_with_share(file.share_access)
                         || file.granted_access.conflicts_with_share(share_access))
             });
@@ -1388,6 +1397,78 @@ mod tests {
         assert_eq!(current_input_status, NtStatus::SUCCESS);
         assert_eq!(current_output_status, NtStatus::SUCCESS);
         assert_eq!(screen_buffer_status, NtStatus::SUCCESS);
+        assert_eq!(
+            task.file_entry(current_input_handle)
+                .unwrap()
+                .with_entry(FileObject::condrv_object),
+            Some(CondrvObject::CurrentInput)
+        );
+        assert_eq!(
+            task.file_entry(current_output_handle)
+                .unwrap()
+                .with_entry(FileObject::condrv_object),
+            Some(CondrvObject::CurrentOutput)
+        );
+        assert_eq!(
+            task.file_entry(screen_buffer_handle)
+                .unwrap()
+                .with_entry(FileObject::condrv_object),
+            Some(CondrvObject::ScreenBuffer)
+        );
+
+        for (path, desired_access, expected_object) in [
+            (
+                r"\Device\ConDrv\CurrentIn",
+                FILE_GENERIC_READ,
+                CondrvObject::CurrentInput,
+            ),
+            (
+                r"\Device\ConDrv\CurrentOut",
+                FILE_GENERIC_WRITE,
+                CondrvObject::CurrentOutput,
+            ),
+            (
+                r"\Device\ConDrv\ScreenBuffer",
+                FILE_GENERIC_WRITE,
+                CondrvObject::ScreenBuffer,
+            ),
+        ] {
+            let (status, handle, _) = create_file(&task, path, desired_access, FILE_OPEN);
+            assert_eq!(status, NtStatus::SUCCESS, "{path}");
+            assert_eq!(
+                task.file_entry(handle)
+                    .unwrap()
+                    .with_entry(FileObject::condrv_object),
+                Some(expected_object),
+                "{path}"
+            );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        }
+
+        let (_path, _name, screen_buffer_attributes) =
+            open_object_attributes(r"\Device\ConDrv\ScreenBuffer");
+        let mut exclusive_screen_buffers = [Handle::default(); 2];
+        for handle in &mut exclusive_screen_buffers {
+            assert_eq!(
+                task.sys_nt_create_file(
+                    mut_ptr(handle),
+                    FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                    Some(const_ptr(&screen_buffer_attributes)),
+                    mut_ptr(&mut io_status),
+                    None,
+                    0,
+                    0,
+                    FILE_OPEN,
+                    FileCreateOptions::NON_DIRECTORY_FILE.bits(),
+                    None,
+                    0,
+                ),
+                NtStatus::SUCCESS
+            );
+        }
+        for handle in exclusive_screen_buffers {
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        }
 
         assert_eq!(task.sys_nt_close(screen_buffer_handle), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(current_output_handle), NtStatus::SUCCESS);
@@ -2247,23 +2328,28 @@ mod tests {
             );
             let console_handle = Handle::from_raw(process_parameters.console_handle);
 
+            let success = [NtStatus::SUCCESS];
+            let screen_buffer = [NtStatus::SUCCESS, NtStatus::INVALID_PARAMETER];
+            let invalid_handle = [NtStatus::INVALID_HANDLE];
+            let not_found = [NtStatus::NOT_FOUND];
             for (name, expected) in [
-                (r"\Input", NtStatus::SUCCESS),
-                (r"\Output", NtStatus::SUCCESS),
-                (r"\CurrentIn", NtStatus::SUCCESS),
-                (r"\CurrentOut", NtStatus::SUCCESS),
-                (r"\ScreenBuffer", NtStatus::SUCCESS),
-                (r"\Server", NtStatus::SUCCESS),
-                (r"\Reference", NtStatus::SUCCESS),
-                (r"\Connect", NtStatus::INVALID_HANDLE),
-                (r"\Bogus", NtStatus::NOT_FOUND),
+                (r"\Input", success.as_slice()),
+                (r"\Output", success.as_slice()),
+                (r"\CurrentIn", success.as_slice()),
+                (r"\CurrentOut", success.as_slice()),
+                // Headless and pseudoconsole hosts may not support creating a bound legacy
+                // screen buffer even though their connected root supports CurrentOut.
+                (r"\ScreenBuffer", screen_buffer.as_slice()),
+                (r"\Server", success.as_slice()),
+                (r"\Reference", success.as_slice()),
+                (r"\Connect", invalid_handle.as_slice()),
+                (r"\Bogus", not_found.as_slice()),
             ] {
                 let (status, handle) = host_create_file(console_handle, name);
-                assert_eq!(
-                    status,
-                    expected,
-                    "{name:?} under console handle {:#x}",
-                    console_handle.as_raw()
+                assert!(
+                    expected.contains(&status),
+                    "{name:?} under console handle {:#x}: expected one of {expected:?}, got {status:?}",
+                    console_handle.as_raw(),
                 );
                 if status == NtStatus::SUCCESS {
                     assert!(!handle.is_null());
