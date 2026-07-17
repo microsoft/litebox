@@ -755,6 +755,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let path = String::from(object.handle_path());
+        // TODO(condrv-screenbuffer-identity): CreateConsoleScreenBuffer creates a new,
+        // independently shared object in Wine server/console.c and ReactOS ConDrv; a native probe
+        // likewise opened two exclusive buffers concurrently. LiteBox collapses every instance
+        // onto /dev/stdout, so sharing is bypassed until the backing layer has per-object identity.
         if object != CondrvObject::ScreenBuffer {
             self.check_file_sharing(&path, desired_access, share_access)?;
         }

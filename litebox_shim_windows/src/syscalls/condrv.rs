@@ -16,6 +16,9 @@ use crate::{ConstPtr, MutPtr};
 const FILE_DEVICE_CONSOLE: u32 = 0x50;
 const CD_SERVER_EA_NAME: &[u8] = b"server";
 
+// TODO(condrv-backing-fidelity): LiteBox exposes only stdin/stdout/stderr backing streams, so
+// these endpoint kinds cannot yet carry the distinct console-object state modeled by Wine's
+// server/console.c and ReactOS ConDrv. Faithful behavior needs per-object console infrastructure.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
 pub(crate) enum CondrvObject {
@@ -100,6 +103,9 @@ impl CondrvObject {
     }
 
     pub(crate) fn handle_path(self) -> &'static str {
+        // TODO(condrv-bound-endpoint): CurrentIn and CurrentOut are bound to the attached
+        // console's input and active screen buffer in Wine server/console.c and ReactOS ConDrv.
+        // Mapping them to the same host streams as Input and Output makes that distinction nominal.
         match self {
             Self::Input | Self::CurrentInput => "/dev/stdin",
             Self::Output | Self::CurrentOutput | Self::ScreenBuffer => "/dev/stdout",
