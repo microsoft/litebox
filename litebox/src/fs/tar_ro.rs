@@ -32,7 +32,6 @@ use hashbrown::HashMap;
 use crate::{
     LiteBox,
     fs::{DirEntry, FileType},
-    path::Arg as _,
     sync,
 };
 
@@ -332,9 +331,7 @@ impl super::backend::Backend for TarRo {
 /// a read-only `.tar` file.
 pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
-    tar_index: TarIndex,
-    // cwd invariant: always ends with a `/`
-    current_working_dir: String,
+    resolver: super::resolver::Resolver<Platform, TarRo>,
 }
 
 /// An empty tar file to support an empty file system.
@@ -353,27 +350,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
-        // TODO DO NOT COMMIT migrate this over to just being a wrap around the backend
         Self {
             litebox: litebox.clone(),
-            tar_index: TarIndex::new(tar_data, InodeAllocator::standalone()),
-            current_working_dir: "/".into(),
-        }
-    }
-
-    /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
-    /// for any relative paths from current working directory.
-    ///
-    /// Note: does NOT account for symlinks.
-    fn absolute_path(&self, path: impl crate::path::Arg) -> Result<String, PathError> {
-        assert!(self.current_working_dir.ends_with('/'));
-        let path = path.as_rust_str()?;
-        if path.starts_with('/') {
-            // Absolute path
-            Ok(path.normalized()?)
-        } else {
-            // Relative path
-            Ok((self.current_working_dir.clone() + path.as_rust_str()?).normalized()?)
+            resolver: super::resolver::Resolver::new(
+                litebox,
+                TarRo::new(tar_data, InodeAllocator::standalone()),
+            ),
         }
     }
 }
@@ -399,9 +381,11 @@ enum IndexedChild {
 struct TarIndex {
     tar_data: alloc::borrow::Cow<'static, [u8]>,
     files: Vec<IndexedFile>,
-    files_by_path: HashMap<String, usize>,
     dirs: Vec<IndexedDir>,
-    dirs_by_path: HashMap<String, usize>,
+    #[expect(
+        dead_code,
+        reason = "jayb: will be used soon before PR is made, DO NOT COMMIT"
+    )]
     inode_allocator: InodeAllocator,
 }
 
@@ -490,9 +474,7 @@ impl TarIndex {
         Self {
             tar_data,
             files,
-            files_by_path,
             dirs,
-            dirs_by_path,
             inode_allocator,
         }
     }
@@ -500,16 +482,6 @@ impl TarIndex {
     fn file_data(&self, file_idx: usize) -> &[u8] {
         let range = self.files[file_idx].data_range.clone();
         &self.tar_data[range]
-    }
-
-    fn file_by_path(&self, path: &str) -> Option<(usize, &IndexedFile)> {
-        let file_idx = *self.files_by_path.get(path)?;
-        Some((file_idx, &self.files[file_idx]))
-    }
-
-    fn dir_by_path(&self, path: &str) -> Option<(usize, &IndexedDir)> {
-        let dir_idx = *self.dirs_by_path.get(path)?;
-        Some((dir_idx, &self.dirs[dir_idx]))
     }
 }
 
@@ -527,117 +499,52 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         &self,
         path: impl crate::path::Arg,
         flags: OFlags,
-        _mode: Mode,
+        mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
-        use super::OFlags;
-        let currently_supported_oflags: OFlags = OFlags::RDONLY
-            | OFlags::WRONLY
-            | OFlags::RDWR
-            | OFlags::CREAT
-            | OFlags::EXCL
-            | OFlags::TRUNC
-            | OFlags::NOCTTY
-            | OFlags::DIRECTORY
-            | OFlags::NONBLOCK
-            | OFlags::LARGEFILE
-            | OFlags::NOFOLLOW
-            | OFlags::APPEND;
-        if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!("{flags:?}")
-        }
-        if flags.contains(OFlags::CREAT) {
-            return Err(OpenError::ReadOnlyFileSystem);
-        }
-        let path = self.absolute_path(path)?;
-        if path.is_empty() {
-            // We are at the root directory, we should just return early.
-            let (idx, _) = self
-                .tar_index
-                .dir_by_path("")
-                .expect("root directory always exists");
-            return Ok(self
-                .litebox
-                .descriptor_table_mut()
-                .insert(Descriptor::Dir { idx }));
-        }
-        assert!(path.starts_with('/'));
-        let path = &path[1..];
-        if flags.contains(OFlags::RDWR) || flags.contains(OFlags::WRONLY) {
-            return Err(OpenError::ReadOnlyFileSystem);
-        }
-        assert!(flags.contains(OFlags::RDONLY));
-        let fd = if let Some((idx, _)) = self.tar_index.file_by_path(path) {
-            if flags.contains(OFlags::DIRECTORY) {
-                return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-            }
-            self.litebox
-                .descriptor_table_mut()
-                .insert(Descriptor::File { idx, position: 0 })
-        } else if let Some((idx, _)) = self.tar_index.dir_by_path(path) {
-            self.litebox
-                .descriptor_table_mut()
-                .insert(Descriptor::Dir { idx })
-        } else {
-            return Err(PathError::NoSuchFileOrDirectory)?;
-        };
-        if flags.contains(OFlags::TRUNC) {
-            match self.truncate(&fd, 0, true) {
-                Ok(()) => {}
-                Err(e) => {
-                    self.close(&fd).unwrap();
-                    return Err(e.into());
-                }
-            }
-        }
-        Ok(fd)
+        let fd = super::FileSystem::open(&self.resolver, path, flags, mode)?;
+        Ok(self
+            .litebox
+            .descriptor_table_mut()
+            .insert(Descriptor { fd }))
     }
 
     fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
-        Ok(())
+        let Some(descriptor) = self.litebox.descriptor_table_mut().remove(fd) else {
+            return Ok(());
+        };
+        super::FileSystem::close(&self.resolver, &descriptor.entry.fd)
     }
 
     fn read(
         &self,
         fd: &FileFd<Platform>,
         buf: &mut [u8],
-        mut offset: Option<usize>,
+        offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::File { idx, position } = &mut descriptor_table
-            .get_entry_mut(fd)
-            .ok_or(ReadError::ClosedFd)?
-            .entry
-        else {
-            return Err(ReadError::NotAFile);
-        };
-        let position = offset.as_mut().unwrap_or(position);
-        let file = self.tar_index.file_data(*idx);
-        let start = (*position).min(file.len());
-        let end = position.checked_add(buf.len()).unwrap().min(file.len());
-        debug_assert!(start <= end);
-        let retlen = end - start;
-        buf[..retlen].copy_from_slice(&file[start..end]);
-        *position = end;
-        Ok(retlen)
+        let descriptor = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ReadError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::read(&self.resolver, &descriptor.entry.fd, buf, offset)
+        })
     }
 
     fn write(
         &self,
         fd: &FileFd<Platform>,
-        _buf: &[u8],
-        _offset: Option<usize>,
+        buf: &[u8],
+        offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        match self
+        let descriptor = self
             .litebox
             .descriptor_table()
-            .get_entry(fd)
-            .ok_or(WriteError::ClosedFd)?
-            .entry
-        {
-            Descriptor::File { .. } => Err(WriteError::NotForWriting),
-            Descriptor::Dir { .. } => Err(WriteError::NotAFile),
-        }
+            .entry_handle(fd)
+            .ok_or(WriteError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::write(&self.resolver, &descriptor.entry.fd, buf, offset)
+        })
     }
 
     fn seek(
@@ -646,243 +553,94 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::File { idx, position } = &mut descriptor_table
-            .get_entry_mut(fd)
-            .ok_or(SeekError::ClosedFd)?
-            .entry
-        else {
-            return Err(SeekError::NotAFile);
-        };
-        let file_len = self.tar_index.files[*idx].data_range.len();
-        let base = match whence {
-            SeekWhence::RelativeToBeginning => 0,
-            SeekWhence::RelativeToCurrentOffset => *position,
-            SeekWhence::RelativeToEnd => file_len,
-        };
-        let new_posn = base
-            .checked_add_signed(offset)
-            .ok_or(SeekError::InvalidOffset)?;
-        if new_posn > file_len {
-            Err(SeekError::InvalidOffset)
-        } else {
-            *position = new_posn;
-            Ok(new_posn)
-        }
+        let descriptor = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(SeekError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::seek(&self.resolver, &descriptor.entry.fd, offset, whence)
+        })
     }
 
     fn truncate(
         &self,
         fd: &FileFd<Platform>,
-        _length: usize,
-        _reset_offset: bool,
+        length: usize,
+        reset_offset: bool,
     ) -> Result<(), TruncateError> {
-        match self
+        let descriptor = self
             .litebox
             .descriptor_table()
-            .get_entry(fd)
-            .ok_or(TruncateError::ClosedFd)?
-            .entry
-        {
-            Descriptor::File { .. } => Err(TruncateError::NotForWriting),
-            Descriptor::Dir { .. } => Err(TruncateError::IsDirectory),
-        }
+            .entry_handle(fd)
+            .ok_or(TruncateError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::truncate(&self.resolver, &descriptor.entry.fd, length, reset_offset)
+        })
     }
 
-    fn chmod(&self, path: impl crate::path::Arg, _mode: Mode) -> Result<(), ChmodError> {
-        let path = self.absolute_path(path)?;
-        assert!(path.starts_with('/'));
-        let path = &path[1..];
-        if self.tar_index.file_by_path(path).is_some() || self.tar_index.dir_by_path(path).is_some()
-        {
-            Err(ChmodError::ReadOnlyFileSystem)
-        } else {
-            Err(PathError::NoSuchFileOrDirectory)?
-        }
+    fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
+        super::FileSystem::chmod(&self.resolver, path, mode)
     }
 
     fn chown(
         &self,
         path: impl crate::path::Arg,
-        _user: Option<u16>,
-        _group: Option<u16>,
+        user: Option<u16>,
+        group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let path = self.absolute_path(path)?;
-        assert!(path.starts_with('/'));
-        let path = &path[1..];
-        if self.tar_index.file_by_path(path).is_some() || self.tar_index.dir_by_path(path).is_some()
-        {
-            Err(ChownError::ReadOnlyFileSystem)
-        } else {
-            Err(PathError::NoSuchFileOrDirectory)?
-        }
+        super::FileSystem::chown(&self.resolver, path, user, group)
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
-        let path = self.absolute_path(path)?;
-        assert!(path.starts_with('/'));
-        let path = &path[1..];
-        if self.tar_index.file_by_path(path).is_some() {
-            Err(UnlinkError::ReadOnlyFileSystem)
-        } else if self.tar_index.dir_by_path(path).is_some() {
-            Err(UnlinkError::IsADirectory)
-        } else {
-            Err(PathError::NoSuchFileOrDirectory)?
-        }
+        super::FileSystem::unlink(&self.resolver, path)
     }
 
-    fn mkdir(&self, _path: impl crate::path::Arg, _mode: Mode) -> Result<(), MkdirError> {
-        // TODO: Do we need to do the type of checks that are happening in the other functions, or
-        // should the other functions be simplified to this?
-        Err(MkdirError::ReadOnlyFileSystem)
+    fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
+        super::FileSystem::mkdir(&self.resolver, path, mode)
     }
 
-    fn rmdir(&self, _path: impl crate::path::Arg) -> Result<(), RmdirError> {
-        // TODO: Do we need to do the type of checks that are happening in the other functions, or
-        // should the other functions be simplified to this?
-        Err(RmdirError::ReadOnlyFileSystem)
+    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
+        super::FileSystem::rmdir(&self.resolver, path)
     }
 
     fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::Dir { idx } = &descriptor_table
-            .get_entry(fd)
-            .ok_or(ReadDirError::ClosedFd)?
-            .entry
-        else {
-            return Err(ReadDirError::NotADirectory);
-        };
-        let dir = &self.tar_index.dirs[*idx];
-
-        // Add "." and ".." entries first.
-        // In this read-only tar FS we don't maintain distinct inode numbers per-dir,
-        // so use the same directory inode constant for directories (including root).
-        let mut out: Vec<DirEntry> = Vec::new();
-
-        out.push(DirEntry {
-            name: ".".into(),
-            file_type: FileType::Directory,
-            ino_info: Some(NodeInfo {
-                dev: DEVICE_ID,
-                ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
-                rdev: None,
-            }),
-        });
-
-        out.push(DirEntry {
-            name: "..".into(),
-            file_type: FileType::Directory,
-            ino_info: Some(NodeInfo {
-                dev: DEVICE_ID,
-                ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
-                rdev: None,
-            }),
-        });
-
-        out.extend(dir.children.iter().map(|(name, child)| {
-            let (file_type, ino) = match *child {
-                IndexedChild::File(idx) => (FileType::RegularFile, self.tar_index.files[idx].ino),
-                IndexedChild::Dir(_) => {
-                    (FileType::Directory, TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER)
-                }
-            };
-            DirEntry {
-                name: name.clone(),
-                file_type,
-                ino_info: Some(NodeInfo {
-                    dev: DEVICE_ID,
-                    ino,
-                    rdev: None,
-                }),
-            }
-        }));
-        Ok(out)
+        let descriptor = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ReadDirError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::read_dir(&self.resolver, &descriptor.entry.fd)
+        })
     }
 
     fn file_status(
         &self,
         path: impl crate::path::Arg,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let path = self.absolute_path(path)?;
-        let path = if path.is_empty() {
-            ""
-        } else {
-            assert!(path.starts_with('/'));
-            &path[1..]
-        };
-        if let Some((_, file)) = self.tar_index.file_by_path(path) {
-            Ok(super::FileStatus {
-                file_type: super::FileType::RegularFile,
-                mode: file.mode,
-                size: file.data_range.len(),
-                owner: file.owner,
-                node_info: NodeInfo {
-                    dev: DEVICE_ID,
-                    ino: file.ino,
-                    rdev: None,
-                },
-                blksize: BLOCK_SIZE,
-            })
-        } else if let Some((_, dir)) = self.tar_index.dir_by_path(path) {
-            Ok(super::FileStatus {
-                file_type: super::FileType::Directory,
-                mode: DEFAULT_DIR_MODE,
-                size: super::DEFAULT_DIRECTORY_SIZE,
-                owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-                node_info: NodeInfo {
-                    dev: DEVICE_ID,
-                    ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
-                    rdev: None,
-                },
-                blksize: BLOCK_SIZE,
-            })
-        } else {
-            Err(PathError::NoSuchFileOrDirectory)?
-        }
+        super::FileSystem::file_status(&self.resolver, path)
     }
 
     fn fd_file_status(
         &self,
         fd: &FileFd<Platform>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        match &self
+        let descriptor = self
             .litebox
             .descriptor_table()
-            .get_entry(fd)
-            .ok_or(super::errors::FileStatusError::ClosedFd)?
-            .entry
-        {
-            Descriptor::File { idx, .. } => {
-                let file = &self.tar_index.files[*idx];
-                Ok(super::FileStatus {
-                    file_type: super::FileType::RegularFile,
-                    mode: file.mode,
-                    size: file.data_range.len(),
-                    owner: file.owner,
-                    node_info: NodeInfo {
-                        dev: DEVICE_ID,
-                        ino: file.ino,
-                        rdev: None,
-                    },
-                    blksize: BLOCK_SIZE,
-                })
-            }
-            Descriptor::Dir { idx } => {
-                let dir = &self.tar_index.dirs[*idx];
-                Ok(super::FileStatus {
-                    file_type: super::FileType::Directory,
-                    mode: DEFAULT_DIR_MODE,
-                    size: super::DEFAULT_DIRECTORY_SIZE,
-                    owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-                    node_info: NodeInfo {
-                        dev: DEVICE_ID,
-                        ino: TEMPORARY_DEFAULT_CONSTANT_INODE_NUMBER,
-                        rdev: None,
-                    },
-                    blksize: BLOCK_SIZE,
-                })
-            }
-        }
+            .entry_handle(fd)
+            .ok_or(super::errors::FileStatusError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::fd_file_status(&self.resolver, &descriptor.entry.fd)
+        })
+    }
+
+    fn get_static_backing_data(&self, fd: &FileFd<Platform>) -> Option<&'static [u8]> {
+        let descriptor = self.litebox.descriptor_table().entry_handle(fd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::get_static_backing_data(&self.resolver, &descriptor.entry.fd)
+        })
     }
 }
 
@@ -916,14 +674,15 @@ fn owner_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> UserInfo {
     }
 }
 
-enum Descriptor {
-    File { idx: usize, position: usize },
-    Dir { idx: usize },
+// TODO(jayb): migrate away from these as soon as the wrapper is cleaned up
+struct Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
+    fd: super::resolver::ResolverFd<Platform, TarRo>,
 }
 
 crate::fd::enable_fds_for_subsystem! {
     @ Platform: { sync::RawSyncPrimitivesProvider };
     FileSystem<Platform>;
-    Descriptor;
+    @ Platform: { sync::RawSyncPrimitivesProvider };
+    Descriptor<Platform>;
     -> FileFd<Platform>;
 }
