@@ -29,18 +29,14 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
 
-use crate::{
-    LiteBox,
-    fs::{DirEntry, FileType},
-    sync,
-};
+use crate::fs::{DirEntry, FileType};
 
 use super::{
-    Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
+    Mode, NodeInfo, OFlags, UserInfo,
     backend::{DirHandle, FileHandle, WalkingDirHandle},
     errors::{
-        ChmodError, ChownError, CloseError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
+        ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
+        RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
@@ -308,38 +304,8 @@ impl super::backend::Backend for TarRo {
     }
 }
 
-/// A backing implementation for [`FileSystem`](super::FileSystem), storing all files in-memory, via
-/// a read-only `.tar` file.
-pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
-    litebox: LiteBox<Platform>,
-    resolver: super::resolver::Resolver<Platform, TarRo>,
-}
-
 /// An empty tar file to support an empty file system.
 pub const EMPTY_TAR_FILE: &[u8] = &[0u8; 10240];
-
-impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
-    /// Construct a new `FileSystem` instance from provided `tar_data`.
-    ///
-    /// The filesystem stores the provided bytes and builds an index up-front for O(1) lookups.
-    /// Using `Cow` avoids an unnecessary copy while allowing either borrowed or owned input.
-    ///
-    /// Use [`EMPTY_TAR_FILE`] if you need an empty file system.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the provided `tar_data` is found to be an invalid `.tar` file.
-    #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>, tar_data: alloc::borrow::Cow<'static, [u8]>) -> Self {
-        Self {
-            litebox: litebox.clone(),
-            resolver: super::resolver::Resolver::new(
-                litebox,
-                TarRo::new(tar_data, InodeAllocator::standalone()),
-            ),
-        }
-    }
-}
 
 struct IndexedFile {
     data_range: Range<usize>,
@@ -462,163 +428,11 @@ impl TarIndex {
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
-
 /// Strip the `./` prefix from tar filenames if present.
 ///
 /// This is helpful for tar files that have been created via `tar cvf foo.tar .`
 fn normalize_tar_filename(filename: &str) -> &str {
     filename.strip_prefix("./").unwrap_or(filename)
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
-    fn open(
-        &self,
-        path: impl crate::path::Arg,
-        flags: OFlags,
-        mode: Mode,
-    ) -> Result<FileFd<Platform>, OpenError> {
-        let fd = super::FileSystem::open(&self.resolver, path, flags, mode)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert(Descriptor { fd }))
-    }
-
-    fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
-        let Some(descriptor) = self.litebox.descriptor_table_mut().remove(fd) else {
-            return Ok(());
-        };
-        super::FileSystem::close(&self.resolver, &descriptor.entry.fd)
-    }
-
-    fn read(
-        &self,
-        fd: &FileFd<Platform>,
-        buf: &mut [u8],
-        offset: Option<usize>,
-    ) -> Result<usize, ReadError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(ReadError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::read(&self.resolver, &descriptor.entry.fd, buf, offset)
-        })
-    }
-
-    fn write(
-        &self,
-        fd: &FileFd<Platform>,
-        buf: &[u8],
-        offset: Option<usize>,
-    ) -> Result<usize, WriteError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(WriteError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::write(&self.resolver, &descriptor.entry.fd, buf, offset)
-        })
-    }
-
-    fn seek(
-        &self,
-        fd: &FileFd<Platform>,
-        offset: isize,
-        whence: SeekWhence,
-    ) -> Result<usize, SeekError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(SeekError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::seek(&self.resolver, &descriptor.entry.fd, offset, whence)
-        })
-    }
-
-    fn truncate(
-        &self,
-        fd: &FileFd<Platform>,
-        length: usize,
-        reset_offset: bool,
-    ) -> Result<(), TruncateError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(TruncateError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::truncate(&self.resolver, &descriptor.entry.fd, length, reset_offset)
-        })
-    }
-
-    fn chmod(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), ChmodError> {
-        super::FileSystem::chmod(&self.resolver, path, mode)
-    }
-
-    fn chown(
-        &self,
-        path: impl crate::path::Arg,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        super::FileSystem::chown(&self.resolver, path, user, group)
-    }
-
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
-        super::FileSystem::unlink(&self.resolver, path)
-    }
-
-    fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
-        super::FileSystem::mkdir(&self.resolver, path, mode)
-    }
-
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
-        super::FileSystem::rmdir(&self.resolver, path)
-    }
-
-    fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(ReadDirError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::read_dir(&self.resolver, &descriptor.entry.fd)
-        })
-    }
-
-    fn file_status(
-        &self,
-        path: impl crate::path::Arg,
-    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        super::FileSystem::file_status(&self.resolver, path)
-    }
-
-    fn fd_file_status(
-        &self,
-        fd: &FileFd<Platform>,
-    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(super::errors::FileStatusError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::fd_file_status(&self.resolver, &descriptor.entry.fd)
-        })
-    }
-
-    fn get_static_backing_data(&self, fd: &FileFd<Platform>) -> Option<&'static [u8]> {
-        let descriptor = self.litebox.descriptor_table().entry_handle(fd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::get_static_backing_data(&self.resolver, &descriptor.entry.fd)
-        })
-    }
 }
 
 const DEFAULT_DIR_MODE: Mode =
@@ -649,17 +463,4 @@ fn owner_from_posix_header(posix_header: &tar_no_std::PosixHeader) -> UserInfo {
         user: posix_header.uid.as_number().unwrap(),
         group: posix_header.gid.as_number().unwrap(),
     }
-}
-
-// TODO(jayb): migrate away from these as soon as the wrapper is cleaned up
-struct Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
-    fd: super::resolver::ResolverFd<Platform, TarRo>,
-}
-
-crate::fd::enable_fds_for_subsystem! {
-    @ Platform: { sync::RawSyncPrimitivesProvider };
-    FileSystem<Platform>;
-    @ Platform: { sync::RawSyncPrimitivesProvider };
-    Descriptor<Platform>;
-    -> FileFd<Platform>;
 }
