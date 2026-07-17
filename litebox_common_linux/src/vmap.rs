@@ -42,6 +42,21 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
         Err(PhysPointerError::UnsupportedOperation)
     }
 
+    /// Map pages while bypassing platform-defined ordinary access checks. Ordinary [`Self::vmap`]
+    /// may delegate here after performing those checks. The default is deny.
+    ///
+    /// # Safety
+    ///
+    /// In addition to [`Self::vmap`]'s raw-mapping requirements, the caller must independently
+    /// authorize bypassing the omitted platform checks.
+    unsafe fn vmap_privileged(
+        &self,
+        _pages: &PhysPageAddrArray<ALIGN>,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<Self::MapInfo, PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
+    }
+
     /// Unmap the previously mapped virtually contiguous addresses ([`Self::MapInfo`]).
     ///
     /// This function is analogous to Linux kernel's `vunmap()`.
@@ -78,7 +93,7 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     /// platform-defined foreign-memory VA ranges, never through LiteBox-owned VA ranges.
     fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError>;
 
-    /// Protect the given physical pages to ensure concurrent read or exclusive write access:
+    /// Protect the given physical pages according to `perms`:
     /// - Read protection: prevent others from writing to the pages.
     /// - Read/write protection: prevent others from reading or writing to the pages.
     /// - No protection: allow others to read and write the pages.
@@ -92,7 +107,7 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     ///
     /// This function relies on hypercalls or other privileged hardware features and assumes those features
     /// are safe to use.
-    /// The caller should unprotect the pages when they are no longer needed to access them.
+    /// Callers should restore ordinary access when protection is no longer needed.
     unsafe fn protect(
         &self,
         pages: &PhysPageAddrArray<ALIGN>,

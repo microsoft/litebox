@@ -15,6 +15,71 @@ pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
+use litebox_common_linux::vmap::{
+    GlobalVmapManager, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
+};
+
+/// Provider for MSHV operations authorized to modify protected VTL0 frames.
+struct PrivilegedVmap;
+
+impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for PrivilegedVmap {
+    type Manager = PrivilegedVmap;
+
+    fn manager() -> &'static Self::Manager {
+        &PrivilegedVmap
+    }
+}
+
+unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
+    type MapInfo = crate::LvbsPhysPageMapInfo;
+
+    unsafe fn vmap(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<Self::MapInfo, PhysPointerError> {
+        // SAFETY: callers uphold the raw mapping contract. This provider is used only for
+        // independently authorized HEKI patch and ring-buffer writes.
+        unsafe { crate::platform_low().vmap_privileged(pages, perms) }
+    }
+
+    unsafe fn vunmap(
+        &self,
+        map_info: Self::MapInfo,
+    ) -> Result<(), (PhysPointerError, Self::MapInfo)> {
+        // SAFETY: `map_info` came from the same LVBS mapper and has no outstanding uses beyond the
+        // physical-pointer guard that is dropping it.
+        unsafe {
+            <crate::host::LvbsLinuxKernel as VmapManager<ALIGN>>::vunmap(
+                crate::platform_low(),
+                map_info,
+            )
+        }
+    }
+
+    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
+        crate::platform_low().validate_unowned(pages)
+    }
+
+    unsafe fn protect(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<(), PhysPointerError> {
+        // SAFETY: callers uphold `VmapManager::protect`; this forwards unchanged to LVBS.
+        unsafe { crate::platform_low().protect(pages, perms) }
+    }
+}
+
+type Vtl0PhysConstPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, crate::Vmap>;
+
+/// Mutable VTL0 pointer reserved for validated HEKI text patching and the fixed-address log ring
+/// buffer. It bypasses ordinary protected-frame access checks and synchronization. Do not use it for other
+/// VTL0 destinations that could enable confused-deputy writes.
+type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, PrivilegedVmap>;
+
 use crate::arch::MAX_CORES;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use modular_bitfield::prelude::*;

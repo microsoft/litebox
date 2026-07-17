@@ -48,15 +48,21 @@ pub mod mshv;
 
 pub mod syscall_entry;
 
-/// Mapping info returned by [`LinuxKernel`]'s [`VmapManager::vmap`].
+/// Mapping metadata. Ordinary writable mappings retain an opaque protected-frame access guard for
+/// the mapping's lifetime.
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
+    protected_frame_access: Option<crate::mshv::vsm::ProtectedFrameAccessGuard<'static>>,
 }
 
 impl LvbsPhysPageMapInfo {
     fn new(base: *mut u8, size: usize) -> Self {
-        Self { base, size }
+        Self {
+            base,
+            size,
+            protected_frame_access: None,
+        }
     }
 }
 
@@ -474,11 +480,6 @@ impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
         crate::platform_low()
     }
 }
-
-pub type Vtl0PhysConstPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, Vmap>;
-pub type Vtl0PhysMutPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, Vmap>;
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
@@ -1165,6 +1166,26 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<Self::MapInfo, PhysPointerError> {
+        let protected_frame_access = if perms.contains(PhysPageMapPermissions::WRITE) {
+            // This shared guard spans map/copy/unmap. It permits concurrent foreign-memory writes
+            // but does not support re-entry into a VTL protection change.
+            Some(crate::mshv::vsm::protected_frame_registry().acquire_access_guard(pages)?)
+        } else {
+            None
+        };
+        // SAFETY: ordinary writable mappings were checked against protected and in-flight frames;
+        // the guard is retained through map, access, and unmap. `vmap_privileged` provides the
+        // shared raw mapping implementation.
+        let mut map_info = unsafe { self.vmap_privileged(pages, perms)? };
+        map_info.protected_frame_access = protected_frame_access;
+        Ok(map_info)
+    }
+
+    unsafe fn vmap_privileged(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<Self::MapInfo, PhysPointerError> {
         if pages.is_empty() {
             return Err(PhysPointerError::InvalidPhysicalAddress(0));
         }
@@ -1342,7 +1363,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         }
 
         let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
-            // VTL1 wants to write data to the pages, preventing VTL0 from reading/executing the pages.
+            // VTL1 needs writable access, so deny VTL0 all access.
             crate::mshv::heki::MemAttr::empty()
         } else if perms.contains(PhysPageMapPermissions::READ) {
             // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
