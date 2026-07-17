@@ -739,10 +739,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn file_status(&self, path: impl Arg) -> Result<super::FileStatus, FileStatusError> {
-        // TODO(jayb): Improve this. Opening just to stat forces the resolver to choose open flags,
-        // but stat itself should be access-neutral.
         let fd = self
-            .open(path, OFlags::RDONLY, Mode::empty())
+            .open(path, OFlags::PATH, Mode::empty())
             .map_err(|error| match error {
                 OpenError::PathError(error) => error.into(),
                 OpenError::Io
