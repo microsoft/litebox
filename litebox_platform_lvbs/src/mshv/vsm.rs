@@ -698,13 +698,18 @@ pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Res
         return Err(VsmError::ModuleRelocationInvalid);
     }
 
-    // Once a module is verified and validated, change the permission of its memory ranges based on
-    // their types. Frozen frames will remain as RO; some of them will turn into RX.
+    // Both read-only and executable frames have been frozen above.
+    // Thus, only promote executable frames to RX.
     for mod_mem_range in &module_memory_metadata {
-        protect_physical_memory_range(
-            mod_mem_range.phys_frame_range,
-            mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
-        )?;
+        if matches!(
+            mod_mem_range.mod_mem_type,
+            ModMemType::Text | ModMemType::InitText
+        ) {
+            protect_physical_memory_range(
+                mod_mem_range.phys_frame_range,
+                mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
+            )?;
+        }
     }
 
     // Commit the module's pre-computed patch data (transactional).
