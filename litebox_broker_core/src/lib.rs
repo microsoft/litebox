@@ -31,7 +31,7 @@ use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
-pub use policy::{PolicyEngine, PolicyProfile, PrincipalRights};
+pub use policy::{PolicyEngine, PolicyProfile};
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights};
 

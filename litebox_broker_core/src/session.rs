@@ -48,19 +48,6 @@ pub(crate) enum ObjectEntry {
     Event(EventObject),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ObjectKind {
-    Event,
-}
-
-impl ObjectEntry {
-    fn kind(self) -> ObjectKind {
-        match self {
-            Self::Event(_) => ObjectKind::Event,
-        }
-    }
-}
-
 /// Broker-owned authority token for one authenticated caller session.
 ///
 /// User mode does not choose this value. The broker entry layer authenticates
@@ -92,7 +79,7 @@ impl BrokerSession {
         let rights = self
             .core
             .policy
-            .principal_object_rights(self.caller_credential, object.kind())?;
+            .principal_object_rights(self.caller_credential)?;
         let mut references = self.core.references.write();
         if references.len() >= self.core.limits.max_references {
             return Err(BrokerError::ResourceExhausted);
@@ -178,7 +165,7 @@ impl Drop for BrokerSession {
 #[cfg(test)]
 mod tests {
     use crate::{
-        BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, PrincipalRights,
+        BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
     };
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption, ReadinessState};
@@ -186,7 +173,7 @@ mod tests {
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let broker = BrokerCore::new_with_limits(
-            PolicyEngine::with_unauthenticated_rights(PrincipalRights::all()),
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
             BrokerCoreLimits::new(1),
         )
         .unwrap();

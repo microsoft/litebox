@@ -3,7 +3,7 @@
 
 use std::os::unix::net::UnixStream;
 
-use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
+use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, serve_connection};
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::event::ReadinessState;
@@ -14,7 +14,7 @@ use litebox_broker_transport::unix_socket::{
 #[test]
 fn host_serves_control_requests_over_paired_userland_channels() {
     let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
-        PrincipalRights::all(),
+        ObjectRights::all(),
     ))
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();

@@ -479,7 +479,7 @@ console.log(content);
         &control_socket_path,
         &notification_socket_path,
         litebox_broker_core::PolicyEngine::with_unauthenticated_rights(
-            litebox_broker_core::PrincipalRights::all(),
+            litebox_broker_core::ObjectRights::all(),
         ),
         3,
     );

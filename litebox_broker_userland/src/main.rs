@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use clap::Parser;
-use litebox_broker_core::{BrokerCore, PolicyEngine, PrincipalRights};
+use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::serve_connection;
 use litebox_broker_transport::unix_socket::{
     UnixStreamHostControlChannel, UnixStreamHostNotificationChannel,
@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let control_listener = UnixListener::bind(&control_socket_path)?;
     let notification_listener = UnixListener::bind(&notification_socket_path)?;
     let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
-        PrincipalRights::all(),
+        ObjectRights::all(),
     ))?;
 
     let mut runner_command = Command::new(&args.runner);
