@@ -85,13 +85,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Default for Pollee<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> Default for Pollee<Platform> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> Pollee<Platform> {
     /// Create a new pollee.
     pub fn new() -> Self {
         Self {
@@ -114,7 +114,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
         nonblock: bool,
         events: Events,
         try_op: impl FnMut() -> Result<R, TryOpError<E>>,
-    ) -> Result<R, TryOpError<E>> {
+    ) -> Result<R, TryOpError<E>>
+    where
+        Platform: TimeProvider,
+    {
         cx.wait_on_events(
             nonblock,
             events,

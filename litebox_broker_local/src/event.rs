@@ -5,11 +5,12 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
-    EventConsumeMode, ReadinessState, WaitEventRequest,
+    EventConsumeMode, WaitEventRequest,
 };
 use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, EventRequest, EventResponse,
 };
+use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
@@ -38,7 +39,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued event request.
-    pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<ReadinessState, Channel::Error> {
+    pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<ReadinessFlags, Channel::Error> {
         let response = self.request_event(EventRequest::Wait(WaitEventRequest { handle }))?;
         match response {
             EventResponse::Wait(response) => Ok(response.readiness),
@@ -56,7 +57,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         &mut self,
         handle: ObjectHandle,
         value: u64,
-    ) -> Result<ReadinessState, Channel::Error> {
+    ) -> Result<ReadinessFlags, Channel::Error> {
         let response = self.request_event(EventRequest::Add(AddEventRequest { handle, value }))?;
         match response {
             EventResponse::Add(response) => Ok(response.readiness),

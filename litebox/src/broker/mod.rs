@@ -10,10 +10,10 @@ use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
-use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode, ReadinessState};
+use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
+use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::event::{Events, polling::Pollee};
-use crate::platform::TimeProvider;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 pub(crate) mod error;
@@ -37,13 +37,13 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn wait_event(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<ReadinessState, BrokerControlError>;
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
 
     fn add_event(
         &self,
         handle: ObjectHandle,
         value: u64,
-    ) -> core::result::Result<ReadinessState, BrokerControlError>;
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
 
     fn consume_event(
         &self,
@@ -83,29 +83,29 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
         }
     }
 
-    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessState)
-    where
-        Platform: TimeProvider,
-    {
-        let mut handles = self.handles.lock();
-        let Some(entry) = handles.get_mut(&handle) else {
+    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessFlags) {
+        let events = readiness_events(readiness);
+        if events.is_empty() {
             return;
+        }
+        let pollables = {
+            let mut handles = self.handles.lock();
+            let Some(entry) = handles.get_mut(&handle) else {
+                return;
+            };
+            entry.prune_stale_pollables();
+            let pollables = entry
+                .pollables
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            if entry.is_empty() {
+                handles.remove(&handle);
+            }
+            pollables
         };
-        entry.prune_stale_pollables();
-        if entry.is_empty() {
-            handles.remove(&handle);
-            return;
-        }
-
-        let mut events = Events::empty();
-        if readiness.read_ready {
-            events |= Events::IN;
-        }
-        if readiness.write_ready {
-            events |= Events::OUT;
-        }
-        if !events.is_empty() {
-            entry.notify_pollables(events);
+        for pollee in pollables {
+            pollee.notify_observers(events);
         }
     }
 }
@@ -136,17 +136,6 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleEntry<Platform> {
     fn prune_stale_pollables(&mut self) {
         self.pollables
             .retain(|registered| registered.strong_count() > 0);
-    }
-
-    fn notify_pollables(&self, events: Events)
-    where
-        Platform: TimeProvider,
-    {
-        for registered in &self.pollables {
-            if let Some(pollee) = registered.upgrade() {
-                pollee.notify_observers(events);
-            }
-        }
     }
 
     fn is_empty(&self) -> bool {
@@ -187,7 +176,7 @@ where
     fn wait_event(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<ReadinessState, BrokerControlError> {
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
         Ok(self.local.lock().wait_event(handle)?)
     }
 
@@ -195,7 +184,7 @@ where
         &self,
         handle: ObjectHandle,
         value: u64,
-    ) -> core::result::Result<ReadinessState, BrokerControlError> {
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
         Ok(self.local.lock().add_event(handle, value)?)
     }
 
@@ -210,4 +199,13 @@ where
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {
         Ok(self.local.lock().close_object(handle)?)
     }
+}
+
+pub(crate) fn readiness_events(readiness: ReadinessFlags) -> Events {
+    let mut events = Events::empty();
+    events.set(Events::IN, readiness.0 & ReadinessFlags::READ.0 != 0);
+    events.set(Events::OUT, readiness.0 & ReadinessFlags::WRITE.0 != 0);
+    events.set(Events::HUP, readiness.0 & ReadinessFlags::HANGUP.0 != 0);
+    events.set(Events::ERR, readiness.0 & ReadinessFlags::ERROR.0 != 0);
+    events
 }

@@ -2,15 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::ObjectHandle;
-
-/// Broker-authoritative readiness state for one object.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReadinessState {
-    /// Whether an event read/consume operation can complete without blocking.
-    pub read_ready: bool,
-    /// Whether an event write/add operation can complete without blocking.
-    pub write_ready: bool,
-}
+use crate::readiness::ReadinessFlags;
 
 /// How a broker event consume operation should remove readiness credits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +38,7 @@ pub struct WaitEventRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WaitEventResponse {
     /// Current readiness state.
-    pub readiness: ReadinessState,
+    pub readiness: ReadinessFlags,
 }
 
 /// Request to add readiness credits to an event.
@@ -62,7 +54,7 @@ pub struct AddEventRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddEventResponse {
     /// Readiness state after adding credits.
-    pub readiness: ReadinessState,
+    pub readiness: ReadinessFlags,
 }
 
 /// Request to consume readiness credits from an event.
@@ -80,7 +72,7 @@ pub struct EventConsumption {
     /// Number of readiness credits consumed.
     pub value: u64,
     /// Readiness state after consuming credits.
-    pub readiness: ReadinessState,
+    pub readiness: ReadinessFlags,
 }
 
 /// Response to an event consume request.

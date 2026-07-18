@@ -168,7 +168,8 @@ mod tests {
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
     };
     use litebox_broker_protocol::ObjectHandle;
-    use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption, ReadinessState};
+    use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
+    use litebox_broker_protocol::readiness::ReadinessFlags;
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
@@ -199,26 +200,17 @@ mod tests {
 
         assert_eq!(
             crate::event::wait(&session, handle),
-            Ok(ReadinessState {
-                read_ready: false,
-                write_ready: true,
-            })
+            Ok(ReadinessFlags::WRITE)
         );
         assert_eq!(
             crate::event::add(&session, handle, 1),
-            Ok(ReadinessState {
-                read_ready: true,
-                write_ready: true,
-            })
+            Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
         assert_eq!(
             crate::event::consume(&session, handle, EventConsumeMode::One),
             Ok(EventConsumption {
                 value: 1,
-                readiness: ReadinessState {
-                    read_ready: false,
-                    write_ready: true,
-                },
+                readiness: ReadinessFlags::WRITE,
             })
         );
         assert_eq!(

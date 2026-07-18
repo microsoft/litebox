@@ -4,8 +4,9 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::event::ConsumeEventResponse;
 pub use litebox_broker_protocol::event::EventConsumeMode as EventCounterReadMode;
-use litebox_broker_protocol::event::{ConsumeEventResponse, ReadinessState};
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use thiserror::Error;
 
 use crate::{
@@ -13,6 +14,7 @@ use crate::{
     broker::{
         BrokerControl, BrokerHandleRegistry,
         error::{BrokerControlError, BrokerObjectError},
+        readiness_events,
     },
     event::{
         Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
@@ -86,7 +88,7 @@ where
     ) -> Result<u64, TryOpError<EventCounterError>> {
         self.pollee.wait(cx, nonblock, Events::IN, || {
             let response = self.consume(mode)?;
-            if response.readiness.write_ready {
+            if response.readiness.0 & ReadinessFlags::WRITE.0 != 0 {
                 self.pollee.notify_observers(Events::OUT);
             }
             Ok(response.value)
@@ -105,7 +107,7 @@ where
         }
         self.pollee.wait(cx, nonblock, Events::OUT, || {
             let readiness = self.add(value)?;
-            if value != 0 && readiness.read_ready {
+            if value != 0 && readiness.0 & ReadinessFlags::READ.0 != 0 {
                 self.pollee.notify_observers(Events::IN);
             }
             Ok(core::mem::size_of::<u64>())
@@ -121,7 +123,7 @@ where
             .map_err(|error| self.broker_request_error(error))
     }
 
-    fn add(&self, value: u64) -> Result<ReadinessState, BrokerObjectError> {
+    fn add(&self, value: u64) -> Result<ReadinessFlags, BrokerObjectError> {
         self.broker
             .add_event(self.handle, value)
             .map_err(|error| self.broker_request_error(error))
@@ -164,14 +166,7 @@ where
             Err(BrokerObjectError::WouldBlock) => return Events::empty(),
             Err(_) => return Events::ERR,
         };
-        let mut events = Events::empty();
-        if readiness.read_ready {
-            events |= Events::IN;
-        }
-        if readiness.write_ready {
-            events |= Events::OUT;
-        }
-        events
+        readiness_events(readiness)
     }
 }
 
@@ -185,11 +180,12 @@ mod tests {
     use litebox_broker_local::BrokerLocal;
     use litebox_broker_protocol::channel::LocalControlChannel;
     use litebox_broker_protocol::error::ErrorCode;
-    use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption, ReadinessState};
+    use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-        BrokerResponse, EventReadinessNotification, EventRequest, EventResponse,
+        BrokerResponse, EventRequest, EventResponse, ReadinessNotification,
     };
+    use litebox_broker_protocol::readiness::ReadinessFlags;
 
     use super::*;
     use crate::LiteBox;
@@ -234,13 +230,10 @@ mod tests {
             std::thread::yield_now();
         }
         read_ready.store(true, Ordering::SeqCst);
-        litebox.dispatch_broker_notification(BrokerNotification::EventReadiness(
-            EventReadinessNotification {
+        litebox.dispatch_broker_notification(BrokerNotification::Readiness(
+            ReadinessNotification {
                 handle,
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: true,
-                },
+                events: ReadinessFlags::READ | ReadinessFlags::WRITE,
             },
         ));
 
@@ -300,10 +293,7 @@ mod tests {
                     if self.read_ready.swap(false, Ordering::SeqCst) {
                         BrokerResponse::Event(EventResponse::Consume(EventConsumption {
                             value: 1,
-                            readiness: ReadinessState {
-                                read_ready: false,
-                                write_ready: true,
-                            },
+                            readiness: ReadinessFlags::WRITE,
                         }))
                     } else {
                         BrokerResponse::Error(ErrorCode::WouldBlock)

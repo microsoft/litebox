@@ -337,18 +337,13 @@ mod tests {
             &channel.responses[1..],
             [
                 BrokerResponse::Event(EventResponse::Add(AddEventResponse {
-                    readiness: litebox_broker_protocol::event::ReadinessState {
-                        read_ready: true,
-                        write_ready: true,
-                    },
+                    readiness: litebox_broker_protocol::readiness::ReadinessFlags::READ
+                        | litebox_broker_protocol::readiness::ReadinessFlags::WRITE,
                 })),
                 BrokerResponse::Event(EventResponse::Consume(
                     litebox_broker_protocol::event::ConsumeEventResponse {
                         value: 1,
-                        readiness: litebox_broker_protocol::event::ReadinessState {
-                            read_ready: false,
-                            write_ready: true,
-                        },
+                        readiness: litebox_broker_protocol::readiness::ReadinessFlags::WRITE,
                     }
                 )),
             ]

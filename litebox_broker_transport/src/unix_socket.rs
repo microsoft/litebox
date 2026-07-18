@@ -443,13 +443,10 @@ mod tests {
         let (local_stream, host_stream) = UnixStream::pair().unwrap();
         let mut local = UnixStreamLocalNotificationChannel::from_connected(local_stream);
         let mut host = UnixStreamHostNotificationChannel::from_accepted(host_stream);
-        let notification = BrokerNotification::EventReadiness(
-            litebox_broker_protocol::message::EventReadinessNotification {
+        let notification = BrokerNotification::Readiness(
+            litebox_broker_protocol::message::ReadinessNotification {
                 handle: litebox_broker_protocol::ObjectHandle(7),
-                readiness: litebox_broker_protocol::event::ReadinessState {
-                    read_ready: true,
-                    write_ready: false,
-                },
+                events: litebox_broker_protocol::readiness::ReadinessFlags::READ,
             },
         );
 

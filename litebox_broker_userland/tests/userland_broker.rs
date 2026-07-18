@@ -9,7 +9,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::event::ReadinessState;
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
 };
@@ -84,26 +84,14 @@ fn run_fake_runner(args: &[OsString]) {
     let mut local = BrokerLocal::negotiate(control_channel).unwrap();
 
     let handle = local.create_event_with_count(0).unwrap();
-    assert_eq!(
-        local.wait_event(handle).unwrap(),
-        ReadinessState {
-            read_ready: false,
-            write_ready: true,
-        }
-    );
+    assert_eq!(local.wait_event(handle).unwrap(), ReadinessFlags::WRITE);
 
-    let readiness = ReadinessState {
-        read_ready: true,
-        write_ready: true,
-    };
+    let readiness = ReadinessFlags::READ | ReadinessFlags::WRITE;
     assert_eq!(local.add_event(handle, 1).unwrap(), readiness);
 
     assert_eq!(
         local.wait_event(handle).unwrap(),
-        ReadinessState {
-            read_ready: true,
-            write_ready: true,
-        }
+        ReadinessFlags::READ | ReadinessFlags::WRITE
     );
     drop(local);
 

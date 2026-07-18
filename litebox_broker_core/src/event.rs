@@ -6,7 +6,8 @@
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result};
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption, ReadinessState};
+use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
+use litebox_broker_protocol::readiness::ReadinessFlags;
 
 pub(crate) const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
 
@@ -24,18 +25,15 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
 /// Blocking is intentionally outside BrokerCore for the first proof of
 /// concept. Userland or kernel deployments can block on deployment-specific
 /// wait primitives after BrokerCore authorizes and reports readiness state.
-pub fn wait(session: &BrokerSession, handle: ObjectHandle) -> Result<ReadinessState> {
+pub fn wait(session: &BrokerSession, handle: ObjectHandle) -> Result<ReadinessFlags> {
     let required_rights = ObjectRights::WAIT;
     session.with_authorized_object(handle, required_rights, |object| match object {
-        ObjectEntry::Event(event) => Ok(ReadinessState {
-            read_ready: event.count > 0,
-            write_ready: event.count < MAX_EVENT_COUNT,
-        }),
+        ObjectEntry::Event(event) => Ok(event.readiness()),
     })
 }
 
 /// Adds readiness credits to a broker-owned event object.
-pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<ReadinessState> {
+pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<ReadinessFlags> {
     let required_rights = ObjectRights::WRITE;
     session.with_authorized_object_mut(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => event.add(value),
@@ -64,16 +62,13 @@ impl EventObject {
         Self { count }
     }
 
-    fn add(&mut self, value: u64) -> Result<ReadinessState> {
+    fn add(&mut self, value: u64) -> Result<ReadinessFlags> {
         self.count = self
             .count
             .checked_add(value)
             .filter(|count| *count <= MAX_EVENT_COUNT)
             .ok_or(BrokerError::WouldBlock)?;
-        Ok(ReadinessState {
-            read_ready: self.count > 0,
-            write_ready: self.count < MAX_EVENT_COUNT,
-        })
+        Ok(self.readiness())
     }
 
     fn consume(&mut self, mode: EventConsumeMode) -> Result<EventConsumption> {
@@ -88,10 +83,18 @@ impl EventObject {
         self.count -= value;
         Ok(EventConsumption {
             value,
-            readiness: ReadinessState {
-                read_ready: self.count > 0,
-                write_ready: self.count < MAX_EVENT_COUNT,
-            },
+            readiness: self.readiness(),
         })
+    }
+
+    fn readiness(self) -> ReadinessFlags {
+        let mut readiness = ReadinessFlags::default();
+        if self.count > 0 {
+            readiness = readiness | ReadinessFlags::READ;
+        }
+        if self.count < MAX_EVENT_COUNT {
+            readiness = readiness | ReadinessFlags::WRITE;
+        }
+        readiness
     }
 }

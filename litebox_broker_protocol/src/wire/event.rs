@@ -3,10 +3,10 @@
 
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
-    CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState, WaitEventRequest,
-    WaitEventResponse,
+    CreateEventResponse, EventConsumeMode, EventConsumption, WaitEventRequest, WaitEventResponse,
 };
 use crate::message::{EventRequest, EventResponse};
+use crate::readiness::ReadinessFlags;
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
@@ -79,16 +79,16 @@ pub(super) fn encode_event_response(encoder: &mut Encoder, response: EventRespon
         }
         EventResponse::Wait(response) => {
             encoder.u8(EVENT_RESPONSE_TAG_WAITED);
-            encode_readiness(encoder, response.readiness);
+            encoder.u32(response.readiness.0);
         }
         EventResponse::Add(response) => {
             encoder.u8(EVENT_RESPONSE_TAG_ADDED);
-            encode_readiness(encoder, response.readiness);
+            encoder.u32(response.readiness.0);
         }
         EventResponse::Consume(response) => {
             encoder.u8(EVENT_RESPONSE_TAG_CONSUMED);
             encoder.u64(response.value);
-            encode_readiness(encoder, response.readiness);
+            encoder.u32(response.readiness.0);
         }
     }
 }
@@ -99,31 +99,19 @@ pub(super) fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<EventRe
             handle: decoder.handle()?,
         }),
         EVENT_RESPONSE_TAG_WAITED => EventResponse::Wait(WaitEventResponse {
-            readiness: decode_readiness(decoder)?,
+            readiness: ReadinessFlags(decoder.u32()?),
         }),
         EVENT_RESPONSE_TAG_ADDED => EventResponse::Add(AddEventResponse {
-            readiness: decode_readiness(decoder)?,
+            readiness: ReadinessFlags(decoder.u32()?),
         }),
         EVENT_RESPONSE_TAG_CONSUMED => EventResponse::Consume(EventConsumption {
             value: decoder.u64()?,
-            readiness: decode_readiness(decoder)?,
+            readiness: ReadinessFlags(decoder.u32()?),
         }),
         _ => return Err(WireError::InvalidTag),
     };
 
     Ok(response)
-}
-
-pub(super) fn encode_readiness(encoder: &mut Encoder, readiness: ReadinessState) {
-    encoder.bool(readiness.read_ready);
-    encoder.bool(readiness.write_ready);
-}
-
-pub(super) fn decode_readiness(decoder: &mut Decoder<'_>) -> Result<ReadinessState, WireError> {
-    Ok(ReadinessState {
-        read_ready: decoder.bool()?,
-        write_ready: decoder.bool()?,
-    })
 }
 
 fn encode_consume_mode(encoder: &mut Encoder, mode: EventConsumeMode) {

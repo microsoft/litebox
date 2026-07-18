@@ -21,8 +21,9 @@ use thiserror::Error;
 use crate::error::ErrorCode;
 use crate::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-    BrokerResponse, EventReadinessNotification,
+    BrokerResponse, ReadinessNotification,
 };
+use crate::readiness::ReadinessFlags;
 
 use primitive::{Decoder, Encoder};
 
@@ -39,7 +40,7 @@ const RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
 const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
 
-const NOTIFICATION_TAG_EVENT_READINESS: u8 = 0;
+const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -49,8 +50,6 @@ pub enum WireError {
     TruncatedFrame,
     #[error("trailing broker wire bytes")]
     TrailingBytes,
-    #[error("invalid broker wire boolean")]
-    InvalidBoolean,
     #[error("invalid broker wire tag")]
     InvalidTag,
     #[error("broker wire message is not valid in this protocol phase")]
@@ -218,10 +217,10 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
 pub fn encode_notification(notification: BrokerNotification) -> Vec<u8> {
     let mut encoder = Encoder::default();
     match notification {
-        BrokerNotification::EventReadiness(notification) => {
-            encoder.u8(NOTIFICATION_TAG_EVENT_READINESS);
+        BrokerNotification::Readiness(notification) => {
+            encoder.u8(NOTIFICATION_TAG_READINESS);
             encoder.handle(notification.handle);
-            event::encode_readiness(&mut encoder, notification.readiness);
+            encoder.u32(notification.events.0);
         }
     }
     encoder.finish()
@@ -232,12 +231,10 @@ pub fn decode_notification(frame: &[u8]) -> Result<BrokerNotification, WireError
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     let notification = match tag {
-        NOTIFICATION_TAG_EVENT_READINESS => {
-            BrokerNotification::EventReadiness(EventReadinessNotification {
-                handle: decoder.handle()?,
-                readiness: event::decode_readiness(&mut decoder)?,
-            })
-        }
+        NOTIFICATION_TAG_READINESS => BrokerNotification::Readiness(ReadinessNotification {
+            handle: decoder.handle()?,
+            events: ReadinessFlags(decoder.u32()?),
+        }),
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -249,7 +246,7 @@ mod tests {
     use super::*;
     use crate::event::{
         AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
-        CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState, WaitEventRequest,
+        CreateEventResponse, EventConsumeMode, EventConsumption, WaitEventRequest,
         WaitEventResponse,
     };
     use crate::message::{EventRequest, EventResponse};
@@ -328,29 +325,17 @@ mod tests {
             BrokerResponse::ObjectClosed,
             BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle })),
             BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: false,
-                },
+                readiness: ReadinessFlags::READ,
             })),
             BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
-                readiness: ReadinessState {
-                    read_ready: false,
-                    write_ready: true,
-                },
+                readiness: ReadinessFlags::WRITE,
             })),
             BrokerResponse::Event(EventResponse::Add(AddEventResponse {
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: true,
-                },
+                readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
             })),
             BrokerResponse::Event(EventResponse::Consume(EventConsumption {
                 value: 3,
-                readiness: ReadinessState {
-                    read_ready: false,
-                    write_ready: true,
-                },
+                readiness: ReadinessFlags::WRITE,
             })),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
             BrokerResponse::Error(ErrorCode::WouldBlock),
@@ -368,15 +353,10 @@ mod tests {
     #[test]
     fn notification_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
-        let notifications = [BrokerNotification::EventReadiness(
-            EventReadinessNotification {
-                handle,
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: false,
-                },
-            },
-        )];
+        let notifications = [BrokerNotification::Readiness(ReadinessNotification {
+            handle,
+            events: ReadinessFlags::READ | ReadinessFlags::HANGUP,
+        })];
 
         for notification in notifications {
             assert_eq!(
@@ -498,22 +478,21 @@ mod tests {
         );
         assert_eq!(
             decode_response(&[1, 1, 0xff]),
-            Err(WireError::InvalidBoolean)
+            Err(WireError::TruncatedFrame)
         );
         assert_eq!(
             decode_response(&[2, 0xff, 0xff]),
             Err(WireError::InvalidTag)
         );
 
-        let mut invalid_bool = [1, 2, 2, 0];
-        assert_eq!(
-            decode_response(&invalid_bool),
-            Err(WireError::InvalidBoolean)
-        );
+        let truncated = [1, 2, 2, 0];
+        assert_eq!(decode_response(&truncated), Err(WireError::TruncatedFrame));
 
-        invalid_bool[2] = 1;
-        invalid_bool[3] = 1;
-        let mut frame = invalid_bool.to_vec();
+        let mut frame = encode_response(BrokerResponse::Event(EventResponse::Add(
+            AddEventResponse {
+                readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
+            },
+        )));
         frame.push(0xff);
         assert_eq!(decode_response(&frame), Err(WireError::TrailingBytes));
     }
@@ -525,34 +504,26 @@ mod tests {
             Err(WireError::InvalidTag)
         );
         assert_eq!(
-            decode_notification(&[NOTIFICATION_TAG_EVENT_READINESS]),
+            decode_notification(&[NOTIFICATION_TAG_READINESS]),
             Err(WireError::TruncatedFrame)
         );
 
-        let mut invalid_bool = encode_notification(BrokerNotification::EventReadiness(
-            EventReadinessNotification {
+        let mut truncated =
+            encode_notification(BrokerNotification::Readiness(ReadinessNotification {
                 handle: ObjectHandle(13),
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: false,
-                },
-            },
-        ));
-        *invalid_bool.last_mut().unwrap() = 0xff;
+                events: ReadinessFlags::READ,
+            }));
+        truncated.pop();
         assert_eq!(
-            decode_notification(&invalid_bool),
-            Err(WireError::InvalidBoolean)
+            decode_notification(&truncated),
+            Err(WireError::TruncatedFrame)
         );
 
-        let mut trailing = encode_notification(BrokerNotification::EventReadiness(
-            EventReadinessNotification {
+        let mut trailing =
+            encode_notification(BrokerNotification::Readiness(ReadinessNotification {
                 handle: ObjectHandle(13),
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: false,
-                },
-            },
-        ));
+                events: ReadinessFlags::READ,
+            }));
         trailing.push(0xff);
         assert_eq!(
             decode_notification(&trailing),
@@ -565,29 +536,21 @@ mod tests {
         assert_eq!(
             encode_response(BrokerResponse::Event(EventResponse::Add(
                 AddEventResponse {
-                    readiness: ReadinessState {
-                        read_ready: true,
-                        write_ready: false,
-                    },
+                    readiness: ReadinessFlags::READ,
                 }
             ))),
-            [1, 2, 1, 0]
+            [1, 2, 1, 0, 0, 0]
         );
     }
 
     #[test]
-    fn event_readiness_notification_wire_shape_is_pinned() {
+    fn readiness_notification_wire_shape_is_pinned() {
         assert_eq!(
-            encode_notification(BrokerNotification::EventReadiness(
-                EventReadinessNotification {
-                    handle: ObjectHandle(13),
-                    readiness: ReadinessState {
-                        read_ready: true,
-                        write_ready: false,
-                    },
-                }
-            )),
-            [0, 13, 0, 0, 0, 0, 0, 0, 0, 1, 0]
+            encode_notification(BrokerNotification::Readiness(ReadinessNotification {
+                handle: ObjectHandle(13),
+                events: ReadinessFlags::READ | ReadinessFlags::HANGUP,
+            })),
+            [0, 13, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]
         );
     }
 }

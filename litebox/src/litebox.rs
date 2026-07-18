@@ -12,7 +12,6 @@ use litebox_broker_protocol::message::BrokerNotification;
 use crate::{
     broker,
     fd::Descriptors,
-    platform::TimeProvider,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -145,22 +144,19 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     }
 
     /// Dispatches one broker notification to the matching local-core object.
-    pub fn dispatch_broker_notification(&self, notification: BrokerNotification)
-    where
-        Platform: TimeProvider,
-    {
+    pub fn dispatch_broker_notification(&self, notification: BrokerNotification) {
         match notification {
-            BrokerNotification::EventReadiness(notification) => self
+            BrokerNotification::Readiness(notification) => self
                 .x
                 .broker_handles
-                .notify_readiness(notification.handle, notification.readiness),
+                .notify_readiness(notification.handle, notification.events),
         }
     }
 
     /// Returns a narrow dispatcher for moving broker notification handling into deployment code.
     pub fn broker_notification_dispatcher(&self) -> impl Fn(BrokerNotification) + Send + 'static
     where
-        Platform: TimeProvider + 'static,
+        Platform: 'static,
     {
         let litebox = self.clone();
         move |notification| {
