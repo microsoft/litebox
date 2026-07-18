@@ -153,7 +153,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             BrokerNotification::Readiness(notification) => self
                 .x
                 .broker_handles
-                .notify_readiness(notification.handle, notification.events),
+                .notify_readiness(notification.handle, notification.readiness),
         }
     }
 

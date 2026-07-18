@@ -233,7 +233,7 @@ mod tests {
         litebox.dispatch_broker_notification(BrokerNotification::Readiness(
             ReadinessNotification {
                 handle,
-                events: ReadinessFlags::READ | ReadinessFlags::WRITE,
+                readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
             },
         ));
 

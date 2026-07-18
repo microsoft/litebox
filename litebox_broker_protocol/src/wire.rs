@@ -220,7 +220,7 @@ pub fn encode_notification(notification: BrokerNotification) -> Vec<u8> {
         BrokerNotification::Readiness(notification) => {
             encoder.u8(NOTIFICATION_TAG_READINESS);
             encoder.handle(notification.handle);
-            encoder.u32(notification.events.0);
+            encoder.u32(notification.readiness.0);
         }
     }
     encoder.finish()
@@ -233,7 +233,7 @@ pub fn decode_notification(frame: &[u8]) -> Result<BrokerNotification, WireError
     let notification = match tag {
         NOTIFICATION_TAG_READINESS => BrokerNotification::Readiness(ReadinessNotification {
             handle: decoder.handle()?,
-            events: ReadinessFlags(decoder.u32()?),
+            readiness: ReadinessFlags(decoder.u32()?),
         }),
         _ => return Err(WireError::InvalidTag),
     };
@@ -355,7 +355,7 @@ mod tests {
         let handle = ObjectHandle(13);
         let notifications = [BrokerNotification::Readiness(ReadinessNotification {
             handle,
-            events: ReadinessFlags::READ | ReadinessFlags::HANGUP,
+            readiness: ReadinessFlags::READ | ReadinessFlags::HANGUP,
         })];
 
         for notification in notifications {
@@ -511,7 +511,7 @@ mod tests {
         let mut truncated =
             encode_notification(BrokerNotification::Readiness(ReadinessNotification {
                 handle: ObjectHandle(13),
-                events: ReadinessFlags::READ,
+                readiness: ReadinessFlags::READ,
             }));
         truncated.pop();
         assert_eq!(
@@ -522,7 +522,7 @@ mod tests {
         let mut trailing =
             encode_notification(BrokerNotification::Readiness(ReadinessNotification {
                 handle: ObjectHandle(13),
-                events: ReadinessFlags::READ,
+                readiness: ReadinessFlags::READ,
             }));
         trailing.push(0xff);
         assert_eq!(
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(
             encode_notification(BrokerNotification::Readiness(ReadinessNotification {
                 handle: ObjectHandle(13),
-                events: ReadinessFlags::READ | ReadinessFlags::HANGUP,
+                readiness: ReadinessFlags::READ | ReadinessFlags::HANGUP,
             })),
             [0, 13, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]
         );

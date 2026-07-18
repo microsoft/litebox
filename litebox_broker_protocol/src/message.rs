@@ -103,5 +103,5 @@ pub struct ReadinessNotification {
     /// Broker object handle.
     pub handle: ObjectHandle,
     /// Current broker-authoritative readiness snapshot.
-    pub events: ReadinessFlags,
+    pub readiness: ReadinessFlags,
 }

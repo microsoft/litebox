@@ -446,7 +446,7 @@ mod tests {
         let notification = BrokerNotification::Readiness(
             litebox_broker_protocol::message::ReadinessNotification {
                 handle: litebox_broker_protocol::ObjectHandle(7),
-                events: litebox_broker_protocol::readiness::ReadinessFlags::READ,
+                readiness: litebox_broker_protocol::readiness::ReadinessFlags::READ,
             },
         );
 

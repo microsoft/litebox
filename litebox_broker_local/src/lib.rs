@@ -249,7 +249,7 @@ mod tests {
     fn notification_receiver_returns_broker_notifications() {
         let notification = BrokerNotification::Readiness(ReadinessNotification {
             handle: ObjectHandle(7),
-            events: ReadinessFlags::READ,
+            readiness: ReadinessFlags::READ,
         });
         let mut receiver = BrokerNotifications::new(FakeNotificationChannel {
             notification: Some(notification.clone()),
