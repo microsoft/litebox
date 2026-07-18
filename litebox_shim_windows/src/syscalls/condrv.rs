@@ -3,8 +3,7 @@
 
 //! Windows console driver support.
 
-use alloc::collections::BTreeMap;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::mem::size_of;
 
 use int_enum::IntEnum;
@@ -41,15 +40,8 @@ pub(crate) struct CondrvStreamObject {
     id: u64,
 }
 
-pub(crate) struct CondrvStreamOpen {
-    pub(crate) object: Arc<CondrvStreamObject>,
-}
-
 struct CondrvConsoleState {
     next_object_id: u64,
-    // Weak entries keep handle lifetime authoritative while retaining an object-id registry for
-    // future activation and cross-process lookup.
-    objects: BTreeMap<u64, Weak<CondrvStreamObject>>,
     bound_input: Arc<CondrvStreamObject>,
     active_output: Arc<CondrvStreamObject>,
 }
@@ -68,34 +60,32 @@ impl<Platform: crate::ShimPlatform> CondrvConsole<Platform> {
     pub(crate) fn new() -> Self {
         let bound_input = Arc::new(CondrvStreamObject { id: 1 });
         let active_output = Arc::new(CondrvStreamObject { id: 2 });
-        let mut objects = BTreeMap::new();
-        objects.insert(bound_input.id, Arc::downgrade(&bound_input));
-        objects.insert(active_output.id, Arc::downgrade(&active_output));
         Self {
             state: litebox::sync::Mutex::new(CondrvConsoleState {
                 next_object_id: 3,
-                objects,
                 bound_input,
                 active_output,
             }),
         }
     }
 
-    pub(crate) fn open_stream(&self, endpoint: CondrvObject) -> Result<CondrvStreamOpen, NtStatus> {
+    pub(crate) fn open_stream(
+        &self,
+        endpoint: CondrvObject,
+    ) -> Result<Arc<CondrvStreamObject>, NtStatus> {
         let mut state = self.state.lock();
-        let object = match endpoint {
-            CondrvObject::CurrentInput => Arc::clone(&state.bound_input),
+        match endpoint {
+            CondrvObject::CurrentInput => Ok(Arc::clone(&state.bound_input)),
             // TODO(condrv-activate-buffer): update this pointer when LiteBox implements and
             // host-validates the ConDrv activate-buffer IOCTL.
-            CondrvObject::CurrentOutput => Arc::clone(&state.active_output),
+            CondrvObject::CurrentOutput => Ok(Arc::clone(&state.active_output)),
             CondrvObject::Input | CondrvObject::Output | CondrvObject::ScreenBuffer => {
-                state.allocate_object()?
+                state.allocate_object()
             }
             CondrvObject::Server | CondrvObject::Reference | CondrvObject::Connect => {
-                return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+                Err(NtStatus::OBJECT_TYPE_MISMATCH)
             }
-        };
-        Ok(CondrvStreamOpen { object })
+        }
     }
 }
 
@@ -103,10 +93,7 @@ impl CondrvConsoleState {
     fn allocate_object(&mut self) -> Result<Arc<CondrvStreamObject>, NtStatus> {
         let id = self.next_object_id;
         self.next_object_id = id.checked_add(1).ok_or(NtStatus::QUOTA_EXCEEDED)?;
-        let object = Arc::new(CondrvStreamObject { id });
-        self.objects.retain(|_, object| object.strong_count() != 0);
-        self.objects.insert(id, Arc::downgrade(&object));
-        Ok(object)
+        Ok(Arc::new(CondrvStreamObject { id }))
     }
 }
 

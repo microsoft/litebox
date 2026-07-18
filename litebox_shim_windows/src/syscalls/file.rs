@@ -786,9 +786,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let path = String::from(object.handle_path());
         let (backing, information) = if let Some(direction) = object.stream_direction() {
-            let stream_open = self.process.condrv_console.open_stream(object)?;
+            let stream_object = self.process.condrv_console.open_stream(object)?;
             self.check_file_sharing(
-                FileSharingIdentity::CondrvObject(stream_open.object.id()),
+                FileSharingIdentity::CondrvObject(stream_object.id()),
                 desired_access,
                 share_access,
             )?;
@@ -806,7 +806,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             (
                 FileObjectBacking::CondrvStream {
                     object,
-                    stream_object: stream_open.object,
+                    stream_object,
                     fd,
                 },
                 information,
