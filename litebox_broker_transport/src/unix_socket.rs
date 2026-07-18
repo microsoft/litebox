@@ -8,6 +8,7 @@
 //! no_std protocol, local, core, and host crates.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -32,6 +33,11 @@ const MAX_FRAME_LEN: usize = 64 * 1024;
 pub struct UnixStreamLocalControlChannel {
     stream: UnixStream,
     setup_deadline: Option<Instant>,
+}
+
+/// Independently owned handle for interrupting local control-channel I/O.
+pub struct UnixStreamLocalControlCancellation {
+    stream: UnixStream,
 }
 
 impl UnixStreamLocalControlChannel {
@@ -61,6 +67,29 @@ impl UnixStreamLocalControlChannel {
             stream,
             setup_deadline: Some(deadline),
         })
+    }
+
+    /// Creates a handle that can interrupt pending control-channel I/O.
+    pub fn cancellation_handle(&self) -> IoResult<UnixStreamLocalControlCancellation> {
+        self.stream
+            .try_clone()
+            .map(|stream| UnixStreamLocalControlCancellation { stream })
+    }
+}
+
+impl UnixStreamLocalControlCancellation {
+    /// Shuts down the control stream, unblocking pending reads or writes.
+    pub fn cancel(&self) -> IoResult<()> {
+        match self.stream.shutdown(Shutdown::Both) {
+            Err(error) if error.kind() == ErrorKind::NotConnected => Ok(()),
+            result => result,
+        }
+    }
+}
+
+impl Drop for UnixStreamLocalControlChannel {
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -401,6 +430,47 @@ mod tests {
             matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
             "unexpected timeout error kind: {error:?}"
         );
+    }
+
+    #[test]
+    fn local_control_cancellation_unblocks_response_read() {
+        let (local_stream, _host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let cancellation = channel.cancellation_handle().unwrap();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let reader_completed = completed.clone();
+        let reader = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            result_sender.send(channel.recv_response()).unwrap();
+            reader_completed.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
+        cancellation.cancel().unwrap();
+
+        assert!(result_receiver.recv_timeout(Duration::from_secs(1)).is_ok());
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_local_control_closes_connection_with_cancellation_clone() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let _cancellation = channel.cancellation_handle().unwrap();
+        host_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        drop(channel);
+
+        let mut byte = [0];
+        assert_eq!(host_stream.read(&mut byte).unwrap(), 0);
     }
 
     #[test]

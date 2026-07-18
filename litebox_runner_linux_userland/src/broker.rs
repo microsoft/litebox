@@ -10,7 +10,8 @@ use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_transport::unix_socket::{
-    UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
+    UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
+    UnixStreamLocalNotificationChannel,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,6 +23,7 @@ pub(crate) fn connect(
 ) -> Result<(
     BrokerLocal<UnixStreamLocalControlChannel>,
     BrokerNotifications<UnixStreamLocalNotificationChannel>,
+    UnixStreamLocalControlCancellation,
 )> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let control_channel = connect_with_retry(
@@ -48,26 +50,40 @@ pub(crate) fn connect(
             notification_socket_path.display()
         )
     })?;
+    let control_cancellation = control_channel
+        .cancellation_handle()
+        .context("failed to create broker control cancellation handle")?;
     let local = BrokerLocal::negotiate(control_channel).context("broker negotiation failed")?;
-    Ok((local, BrokerNotifications::new(notification_channel)))
+    Ok((
+        local,
+        BrokerNotifications::new(notification_channel),
+        control_cancellation,
+    ))
 }
 
 pub(crate) fn start_notification_receiver(
     mut notifications: BrokerNotifications<UnixStreamLocalNotificationChannel>,
+    control_cancellation: UnixStreamLocalControlCancellation,
     dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
+    dispatch_failure: impl Fn() + Send + 'static,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("litebox-broker-notifications".to_owned())
         .spawn(move || {
-            loop {
+            let receive_error = loop {
                 match notifications.recv_notification() {
                     Ok(Some(notification)) => dispatch_notification(notification),
-                    Ok(None) => break,
-                    Err(error) => {
-                        eprintln!("failed to receive broker notification: {error}");
-                        break;
-                    }
+                    Ok(None) => break None,
+                    Err(error) => break Some(error),
                 }
+            };
+            let cancellation_error = control_cancellation.cancel().err();
+            dispatch_failure();
+            if let Some(error) = receive_error {
+                eprintln!("failed to receive broker notification: {error}");
+            }
+            if let Some(error) = cancellation_error {
+                eprintln!("failed to cancel broker control channel: {error}");
             }
         })
         .context("failed to start broker notification receiver")?;
