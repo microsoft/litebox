@@ -115,8 +115,7 @@ impl BrokerSession {
         {
             return Err(BrokerError::ResourceExhausted);
         }
-        let first_handle = self.core.allocate_reference_handle()?;
-        let second_handle = self.core.allocate_reference_handle()?;
+        let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
         for (handle, object) in [(first_handle, first), (second_handle, second)] {
             references.insert(
                 handle,
@@ -349,8 +348,17 @@ mod tests {
 
         {
             let mut next_reference_handle = broker.next_reference_handle.write();
-            *next_reference_handle = u64::MAX;
+            *next_reference_handle = u64::MAX - 1;
         }
+        assert_eq!(
+            crate::pipe::create(&session, 4, 2),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(*broker.next_reference_handle.read(), u64::MAX - 1);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        let handle = crate::event::create(&session, 0).unwrap();
+        assert_eq!(handle, ObjectHandle(u64::MAX - 1));
+        assert_eq!(session.close_object_reference(handle), Ok(()));
         assert_eq!(
             crate::event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)

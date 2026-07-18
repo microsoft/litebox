@@ -122,6 +122,22 @@ impl BrokerCore {
         Ok(handle)
     }
 
+    pub(crate) fn allocate_reference_handle_pair(&self) -> Result<(ObjectHandle, ObjectHandle)> {
+        let mut next_reference_handle = self.next_reference_handle.write();
+        let first = ObjectHandle(*next_reference_handle);
+        let second = ObjectHandle(
+            first
+                .0
+                .checked_add(1)
+                .ok_or(BrokerError::ResourceExhausted)?,
+        );
+        *next_reference_handle = second
+            .0
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        Ok((first, second))
+    }
+
     /// Allocates broker authority state for one authenticated caller session.
     pub fn create_session(&self, caller_credential: CallerCredential) -> Result<BrokerSession> {
         let mut next_session_id = self.next_session_id.write();
