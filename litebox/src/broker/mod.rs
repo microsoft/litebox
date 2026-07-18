@@ -57,11 +57,11 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn fail_connection(&self);
 }
 
-pub(crate) struct BrokerHandleRegistry<Platform: RawSyncPrimitivesProvider> {
-    handles: Mutex<Platform, HashMap<ObjectHandle, BrokerHandleEntry<Platform>>>,
+pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
+    handles: Mutex<Platform, HashMap<ObjectHandle, BrokerPollableEntry<Platform>>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     pub(crate) fn new() -> Self {
         Self {
             handles: Mutex::new(HashMap::new()),
@@ -72,7 +72,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
         self.handles
             .lock()
             .entry(handle)
-            .or_insert_with(BrokerHandleEntry::new)
+            .or_insert_with(BrokerPollableEntry::new)
             .register_pollable(pollee);
     }
 
@@ -134,11 +134,11 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
     }
 }
 
-struct BrokerHandleEntry<Platform: RawSyncPrimitivesProvider> {
+struct BrokerPollableEntry<Platform: RawSyncPrimitivesProvider> {
     pollables: Vec<Weak<Pollee<Platform>>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> BrokerHandleEntry<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> BrokerPollableEntry<Platform> {
     fn new() -> Self {
         Self {
             pollables: Vec::new(),
@@ -167,7 +167,7 @@ pub(crate) struct BrokerLocalControl<
     Channel: LocalControlChannel + Send,
 > {
     local: Mutex<Platform, Option<BrokerLocal<Channel>>>,
-    handles: Arc<BrokerHandleRegistry<Platform>>,
+    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
@@ -177,11 +177,11 @@ where
 {
     pub(crate) fn new(
         local: BrokerLocal<Channel>,
-        handles: Arc<BrokerHandleRegistry<Platform>>,
+        pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     ) -> Self {
         Self {
             local: Mutex::new(Some(local)),
-            handles,
+            pollable_registry,
         }
     }
 
@@ -207,7 +207,7 @@ where
         };
         if let Some(connection) = failed_connection {
             drop(connection);
-            self.handles.notify_all(Events::ERR);
+            self.pollable_registry.notify_all(Events::ERR);
         }
         result
     }
@@ -256,7 +256,7 @@ where
         let connection = self.local.lock().take();
         if let Some(connection) = connection {
             drop(connection);
-            self.handles.notify_all(Events::ERR);
+            self.pollable_registry.notify_all(Events::ERR);
         }
     }
 }
