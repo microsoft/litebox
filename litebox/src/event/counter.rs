@@ -143,8 +143,7 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn drop(&mut self) {
-        self.pollable_registry
-            .unregister_pollable(self.handle, &self.pollee);
+        self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
     }
 }
@@ -203,7 +202,7 @@ mod tests {
         let read_ready = Arc::new(AtomicBool::new(false));
         let request_count = Arc::new(AtomicUsize::new(0));
         let local = BrokerLocal::negotiate(FakeLocalControlChannel {
-            handle,
+            next_handle: handle.0,
             consume_attempts: consume_attempts.clone(),
             read_ready: read_ready.clone(),
             request_count,
@@ -259,7 +258,7 @@ mod tests {
         let consume_attempts = Arc::new(AtomicUsize::new(0));
         let request_count = Arc::new(AtomicUsize::new(0));
         let local = BrokerLocal::negotiate(FakeLocalControlChannel {
-            handle,
+            next_handle: handle.0,
             consume_attempts: Arc::clone(&consume_attempts),
             read_ready: Arc::new(AtomicBool::new(false)),
             request_count: Arc::clone(&request_count),
@@ -308,7 +307,7 @@ mod tests {
         let request_count = Arc::new(AtomicUsize::new(0));
         let fail_requests = Arc::new(AtomicBool::new(false));
         let local = BrokerLocal::negotiate(FakeLocalControlChannel {
-            handle,
+            next_handle: handle.0,
             consume_attempts: Arc::new(AtomicUsize::new(0)),
             read_ready: Arc::new(AtomicBool::new(false)),
             request_count: Arc::clone(&request_count),
@@ -342,7 +341,7 @@ mod tests {
         let handle = ObjectHandle(7);
         let request_count = Arc::new(AtomicUsize::new(0));
         let local = BrokerLocal::negotiate(FakeLocalControlChannel {
-            handle,
+            next_handle: handle.0,
             consume_attempts: Arc::new(AtomicUsize::new(0)),
             read_ready: Arc::new(AtomicBool::new(false)),
             request_count: Arc::clone(&request_count),
@@ -393,7 +392,7 @@ mod tests {
     }
 
     struct FakeLocalControlChannel {
-        handle: ObjectHandle,
+        next_handle: u64,
         consume_attempts: Arc<AtomicUsize>,
         read_ready: Arc<AtomicBool>,
         request_count: Arc<AtomicUsize>,
@@ -435,13 +434,11 @@ mod tests {
             }
             let response = match self.last_request.take().unwrap() {
                 BrokerRequest::Event(EventRequest::Create(_)) => {
-                    BrokerResponse::Event(EventResponse::Create(CreateEventResponse {
-                        handle: self.handle,
-                    }))
+                    let handle = ObjectHandle(self.next_handle);
+                    self.next_handle += 1;
+                    BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }))
                 }
-                BrokerRequest::Event(EventRequest::Consume(request))
-                    if request.handle == self.handle =>
-                {
+                BrokerRequest::Event(EventRequest::Consume(_)) => {
                     self.consume_attempts.fetch_add(1, Ordering::SeqCst);
                     if self.read_ready.swap(false, Ordering::SeqCst) {
                         BrokerResponse::Event(EventResponse::Consume(EventConsumption {
@@ -452,10 +449,10 @@ mod tests {
                         BrokerResponse::Error(ErrorCode::WouldBlock)
                     }
                 }
-                BrokerRequest::CloseObject(handle) if handle == self.handle => {
-                    BrokerResponse::ObjectClosed
+                BrokerRequest::CloseObject(_) => BrokerResponse::ObjectClosed,
+                request @ BrokerRequest::Event(_) => {
+                    panic!("unexpected broker request: {request:?}")
                 }
-                request => panic!("unexpected broker request: {request:?}"),
             };
             Ok(Some(response))
         }

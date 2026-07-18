@@ -58,32 +58,26 @@ pub(crate) trait BrokerControl: Send + Sync {
 }
 
 pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
-    handles: Mutex<Platform, HashMap<ObjectHandle, BrokerPollableEntry<Platform>>>,
+    pollables: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     pub(crate) fn new() -> Self {
         Self {
-            handles: Mutex::new(HashMap::new()),
+            pollables: Mutex::new(HashMap::new()),
         }
     }
 
     pub(crate) fn register_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
-        self.handles
-            .lock()
-            .entry(handle)
-            .or_insert_with(BrokerPollableEntry::new)
-            .register_pollable(pollee);
+        let previous = self.pollables.lock().insert(handle, Arc::downgrade(pollee));
+        assert!(
+            previous.is_none(),
+            "broker handle already has a registered pollable"
+        );
     }
 
-    pub(crate) fn unregister_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
-        let mut handles = self.handles.lock();
-        if let Some(entry) = handles.get_mut(&handle) {
-            entry.unregister_pollable(pollee);
-            if entry.pollables.is_empty() {
-                handles.remove(&handle);
-            }
-        }
+    pub(crate) fn unregister_pollable(&self, handle: ObjectHandle) {
+        self.pollables.lock().remove(&handle);
     }
 
     pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessFlags)
@@ -94,23 +88,15 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
         if events.is_empty() {
             return;
         }
-        let pollables = {
-            let mut handles = self.handles.lock();
-            let Some(entry) = handles.get_mut(&handle) else {
-                return;
-            };
-            entry.prune_stale_pollables();
-            let pollables = entry
-                .pollables
-                .iter()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
-            if entry.pollables.is_empty() {
-                handles.remove(&handle);
+        let pollee = {
+            let mut pollables = self.pollables.lock();
+            let pollee = pollables.get(&handle).and_then(Weak::upgrade);
+            if pollee.is_none() {
+                pollables.remove(&handle);
             }
-            pollables
+            pollee
         };
-        for pollee in pollables {
+        if let Some(pollee) = pollee {
             pollee.notify_observers(events);
         }
     }
@@ -121,10 +107,12 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     {
         let pollables = {
             let mut pollables = Vec::new();
-            self.handles.lock().retain(|_, entry| {
-                entry.prune_stale_pollables();
-                pollables.extend(entry.pollables.iter().filter_map(Weak::upgrade));
-                !entry.pollables.is_empty()
+            self.pollables.lock().retain(|_, registered| {
+                let Some(pollee) = registered.upgrade() else {
+                    return false;
+                };
+                pollables.push(pollee);
+                true
             });
             pollables
         };
@@ -134,34 +122,6 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     }
 }
 
-struct BrokerPollableEntry<Platform: RawSyncPrimitivesProvider> {
-    pollables: Vec<Weak<Pollee<Platform>>>,
-}
-
-impl<Platform: RawSyncPrimitivesProvider> BrokerPollableEntry<Platform> {
-    fn new() -> Self {
-        Self {
-            pollables: Vec::new(),
-        }
-    }
-
-    fn register_pollable(&mut self, pollee: &Arc<Pollee<Platform>>) {
-        self.pollables.push(Arc::downgrade(pollee));
-    }
-
-    fn unregister_pollable(&mut self, pollee: &Arc<Pollee<Platform>>) {
-        self.pollables.retain(|registered| {
-            registered
-                .upgrade()
-                .is_some_and(|registered| !Arc::ptr_eq(&registered, pollee))
-        });
-    }
-
-    fn prune_stale_pollables(&mut self) {
-        self.pollables
-            .retain(|registered| registered.strong_count() > 0);
-    }
-}
 pub(crate) struct BrokerLocalControl<
     Platform: RawSyncPrimitivesProvider,
     Channel: LocalControlChannel + Send,
