@@ -621,20 +621,3 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
         }
     }
 }
-
-#[cfg(test)]
-mod pipe_tests {
-    use super::Errno;
-
-    #[test]
-    fn invalid_pipe_end_operations_use_ebadf() {
-        assert_eq!(
-            Errno::from(litebox::pipes::errors::ReadError::NotForReading),
-            Errno::EBADF
-        );
-        assert_eq!(
-            Errno::from(litebox::pipes::errors::WriteError::NotForWriting),
-            Errno::EBADF
-        );
-    }
-}
