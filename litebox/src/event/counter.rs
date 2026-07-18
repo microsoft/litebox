@@ -335,11 +335,57 @@ mod tests {
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
     }
 
+    #[test]
+    fn broker_dispatchers_follow_objects_that_outlive_litebox() {
+        let platform = MockPlatform::new();
+        let handle = ObjectHandle(7);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let local = BrokerLocal::negotiate(FakeLocalControlChannel {
+            handle,
+            consume_attempts: Arc::new(AtomicUsize::new(0)),
+            read_ready: Arc::new(AtomicBool::new(false)),
+            request_count: Arc::clone(&request_count),
+            fail_requests: Arc::new(AtomicBool::new(false)),
+            last_request: None,
+        })
+        .unwrap();
+        let litebox = LiteBox::new_with_broker_local(platform, local);
+        let counter = EventCounter::new(&litebox, 0).unwrap();
+        let read_observer = Arc::new(ReadObserver(AtomicBool::new(false)));
+        let read_observer_dyn: Arc<dyn Observer<Events>> = read_observer.clone();
+        counter.register_observer(Arc::downgrade(&read_observer_dyn), Events::IN);
+        let litebox_weak = Arc::downgrade(&litebox.x);
+        let dispatch_notification = litebox.broker_notification_dispatcher();
+        let dispatch_failure = litebox.broker_failure_dispatcher();
+
+        drop(litebox);
+
+        assert!(litebox_weak.upgrade().is_none());
+        dispatch_notification(BrokerNotification::Readiness(ReadinessNotification {
+            handle,
+            readiness: ReadinessFlags::READ,
+        }));
+        assert!(read_observer.0.load(Ordering::SeqCst));
+        dispatch_failure();
+        assert_eq!(counter.check_io_events(), Events::ERR);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
     struct ErrorObserver(AtomicBool);
 
     impl Observer<Events> for ErrorObserver {
         fn on_events(&self, events: &Events) {
             if events.contains(Events::ERR) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    struct ReadObserver(AtomicBool);
+
+    impl Observer<Events> for ReadObserver {
+        fn on_events(&self, events: &Events) {
+            if events.contains(Events::IN) {
                 self.0.store(true, Ordering::SeqCst);
             }
         }

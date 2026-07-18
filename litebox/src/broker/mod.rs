@@ -5,7 +5,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
@@ -116,13 +115,16 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
         }
     }
 
-    fn notify_all(&self, events: Events) {
+    fn notify_all(&self, events: Events)
+    where
+        Platform: TimeProvider,
+    {
         let pollables = {
             let mut pollables = Vec::new();
             self.handles.lock().retain(|_, entry| {
                 entry.prune_stale_pollables();
                 pollables.extend(entry.pollables.iter().filter_map(Weak::upgrade));
-                !entry.is_empty()
+                !entry.pollables.is_empty()
             });
             pollables
         };
@@ -166,12 +168,11 @@ pub(crate) struct BrokerLocalControl<
 > {
     local: Mutex<Platform, Option<BrokerLocal<Channel>>>,
     handles: Arc<BrokerHandleRegistry<Platform>>,
-    failed: AtomicBool,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
 where
-    Platform: RawSyncPrimitivesProvider,
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalControlChannel + Send,
 {
     pub(crate) fn new(
@@ -181,7 +182,6 @@ where
         Self {
             local: Mutex::new(Some(local)),
             handles,
-            failed: AtomicBool::new(false),
         }
     }
 
@@ -191,43 +191,31 @@ where
             &mut BrokerLocal<Channel>,
         ) -> litebox_broker_local::Result<T, Channel::Error>,
     ) -> core::result::Result<T, BrokerControlError> {
-        if self.failed.load(Ordering::Acquire) {
-            return Err(BrokerControlError::Transport);
-        }
-        let (result, notify_failure) = {
+        let (result, failed_connection) = {
             let mut local = self.local.lock();
-            if self.failed.load(Ordering::Acquire) {
+            let Some(connection) = local.as_mut() else {
                 return Err(BrokerControlError::Transport);
-            }
-            let result = request(
-                local
-                    .as_mut()
-                    .expect("active broker connection must retain its control channel"),
-            )
-            .map_err(BrokerControlError::from);
-            let notify_failure = matches!(result.as_ref(), Err(BrokerControlError::Transport))
-                && !self.failed.swap(true, Ordering::AcqRel);
-            if matches!(result.as_ref(), Err(BrokerControlError::Transport)) {
-                local.take();
-            }
-            (result, notify_failure)
+            };
+            let result = request(connection).map_err(BrokerControlError::from);
+            let failed_connection = if matches!(result.as_ref(), Err(BrokerControlError::Transport))
+            {
+                local.take()
+            } else {
+                None
+            };
+            (result, failed_connection)
         };
-        if notify_failure {
+        if let Some(connection) = failed_connection {
+            drop(connection);
             self.handles.notify_all(Events::ERR);
         }
         result
-    }
-
-    fn mark_failed(&self) {
-        if !self.failed.swap(true, Ordering::AcqRel) {
-            self.handles.notify_all(Events::ERR);
-        }
     }
 }
 
 impl<Platform, Channel> BrokerControl for BrokerLocalControl<Platform, Channel>
 where
-    Platform: RawSyncPrimitivesProvider,
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalControlChannel + Send,
 {
     fn create_event_with_count(
@@ -265,7 +253,11 @@ where
     }
 
     fn fail_connection(&self) {
-        self.mark_failed();
+        let connection = self.local.lock().take();
+        if let Some(connection) = connection {
+            drop(connection);
+            self.handles.notify_all(Events::ERR);
+        }
     }
 }
 

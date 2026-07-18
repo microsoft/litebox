@@ -49,6 +49,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         broker_local: BrokerLocal<Channel>,
     ) -> Self
     where
+        Platform: TimeProvider,
         Channel: LocalControlChannel + Send + 'static,
     {
         let broker_handles = Arc::new(broker::BrokerHandleRegistry::new());
@@ -167,17 +168,24 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     where
         Platform: TimeProvider + 'static,
     {
-        let litebox = self.clone();
+        let broker_handles = Arc::downgrade(&self.x.broker_handles);
         move |notification| {
-            litebox.dispatch_broker_notification(notification);
+            if let Some(broker_handles) = broker_handles.upgrade() {
+                match notification {
+                    BrokerNotification::Readiness(notification) => {
+                        broker_handles
+                            .notify_readiness(notification.handle, notification.readiness);
+                    }
+                }
+            }
         }
     }
 
     /// Returns a dispatcher that fails all broker-backed objects when the association closes.
     pub fn broker_failure_dispatcher(&self) -> impl Fn() + Send + 'static {
-        let litebox = self.clone();
+        let broker = self.x.broker.as_ref().map(Arc::downgrade);
         move || {
-            if let Some(broker) = &litebox.x.broker {
+            if let Some(broker) = broker.as_ref().and_then(alloc::sync::Weak::upgrade) {
                 broker.fail_connection();
             }
         }
