@@ -212,6 +212,17 @@ mod tests {
             BrokerCoreLimits::new(2, 4),
         )
         .unwrap();
+
+        check_event_reference_lifecycle(&broker);
+        check_session_drop_releases_references(&broker);
+        check_pipe_lifecycle(&broker);
+        check_pipe_reader_closure(&broker);
+        check_pair_handle_exhaustion(&broker);
+
+        assert!(broker.references.read().is_empty());
+    }
+
+    fn check_event_reference_lifecycle(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -268,7 +279,9 @@ mod tests {
             session.close_object_reference(handle),
             Err(BrokerError::UnknownObject)
         );
+    }
 
+    fn check_session_drop_releases_references(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -284,7 +297,9 @@ mod tests {
             let references = broker.references.read();
             assert!(references.is_empty());
         }
+    }
 
+    fn check_pipe_lifecycle(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -330,7 +345,12 @@ mod tests {
         );
         assert_eq!(session.close_object_reference(reader), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+    }
 
+    fn check_pipe_reader_closure(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
         let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(session.close_object_reference(reader), Ok(()));
@@ -345,7 +365,12 @@ mod tests {
         );
         assert_eq!(session.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+    }
 
+    fn check_pair_handle_exhaustion(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
         {
             let mut next_reference_handle = broker.next_reference_handle.write();
             *next_reference_handle = u64::MAX - 1;
@@ -363,7 +388,5 @@ mod tests {
             crate::event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
         );
-        let references = broker.references.read();
-        assert!(references.is_empty());
     }
 }
