@@ -4,6 +4,7 @@
 //! Broker-owned byte pipe operations.
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
@@ -192,20 +193,20 @@ enum PipeEndpoint {
 }
 
 struct PipeCapacityReservation {
-    reserved_capacity: Arc<RwLock<usize>>,
+    reserved_capacity: Arc<AtomicUsize>,
     capacity: usize,
 }
 
 impl PipeCapacityReservation {
     fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
         let reserved_capacity = Arc::clone(&session.core.reserved_pipe_capacity);
-        {
-            let mut reserved = reserved_capacity.write();
-            *reserved = reserved
-                .checked_add(capacity)
-                .filter(|total| *total <= session.core.limits.max_total_pipe_capacity)
-                .ok_or(BrokerError::ResourceExhausted)?;
-        }
+        reserved_capacity
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved
+                    .checked_add(capacity)
+                    .filter(|total| *total <= session.core.limits.max_total_pipe_capacity)
+            })
+            .map_err(|_| BrokerError::ResourceExhausted)?;
         Ok(Self {
             reserved_capacity,
             capacity,
@@ -215,9 +216,10 @@ impl PipeCapacityReservation {
 
 impl Drop for PipeCapacityReservation {
     fn drop(&mut self) {
-        let mut reserved = self.reserved_capacity.write();
-        *reserved = reserved
-            .checked_sub(self.capacity)
+        self.reserved_capacity
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved.checked_sub(self.capacity)
+            })
             .expect("reserved pipe capacity must include every live pipe");
     }
 }

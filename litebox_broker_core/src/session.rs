@@ -197,6 +197,8 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::Ordering;
+
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
     };
@@ -255,7 +257,7 @@ mod tests {
             crate::pipe::create(&session, 4, 2),
             Err(BrokerError::ResourceExhausted)
         );
-        assert_eq!(*broker.reserved_pipe_capacity.read(), 0);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
         assert_eq!(session.close_object_reference(second_handle), Ok(()));
 
         assert_eq!(session.close_object_reference(handle), Ok(()));
@@ -291,9 +293,9 @@ mod tests {
             crate::pipe::create(&session, 5, 2),
             Err(BrokerError::ResourceExhausted)
         );
-        assert_eq!(*broker.reserved_pipe_capacity.read(), 0);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
         let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
-        assert_eq!(*broker.reserved_pipe_capacity.read(), 4);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
             crate::pipe::check_readiness(&session, reader),
             Ok(ReadinessFlags::default())
@@ -314,7 +316,7 @@ mod tests {
         );
         assert_eq!(crate::pipe::write(&session, writer, &[5, 6]), Ok(2));
         assert_eq!(session.close_object_reference(writer), Ok(()));
-        assert_eq!(*broker.reserved_pipe_capacity.read(), 4);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
             crate::pipe::check_readiness(&session, reader),
             Ok(ReadinessFlags::READ | ReadinessFlags::HANGUP)
@@ -328,10 +330,10 @@ mod tests {
             Ok(std::vec::Vec::new())
         );
         assert_eq!(session.close_object_reference(reader), Ok(()));
-        assert_eq!(*broker.reserved_pipe_capacity.read(), 0);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
 
         let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
-        assert_eq!(*broker.reserved_pipe_capacity.read(), 4);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(session.close_object_reference(reader), Ok(()));
         assert_eq!(crate::pipe::write(&session, writer, &[]), Ok(0));
         assert_eq!(
@@ -343,7 +345,7 @@ mod tests {
             Ok(ReadinessFlags::WRITE | ReadinessFlags::ERROR)
         );
         assert_eq!(session.close_object_reference(writer), Ok(()));
-        assert_eq!(*broker.reserved_pipe_capacity.read(), 0);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
 
         {
             let mut next_reference_handle = broker.next_reference_handle.write();

@@ -25,7 +25,7 @@ mod policy;
 mod session;
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -85,7 +85,7 @@ pub struct BrokerCore {
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
-    pub(crate) reserved_pipe_capacity: Arc<RwLock<usize>>,
+    pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -108,7 +108,7 @@ impl BrokerCore {
             next_session_id: Arc::new(RwLock::new(1)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
-            reserved_pipe_capacity: Arc::new(RwLock::new(0)),
+            reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
         })
     }
 
