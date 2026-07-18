@@ -576,8 +576,8 @@ impl From<litebox::sync::futex::FutexError> for Errno {
 impl From<litebox::pipes::errors::ReadError> for Errno {
     fn from(value: litebox::pipes::errors::ReadError) -> Self {
         match value {
-            litebox::pipes::errors::ReadError::ClosedFd => Errno::EBADFD,
-            litebox::pipes::errors::ReadError::NotForReading => Errno::EINVAL,
+            litebox::pipes::errors::ReadError::ClosedFd
+            | litebox::pipes::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::pipes::errors::ReadError::WouldBlock => Errno::EWOULDBLOCK,
             _ => todo!(),
         }
@@ -589,7 +589,7 @@ impl From<litebox::pipes::errors::WriteError> for Errno {
         match value {
             litebox::pipes::errors::WriteError::ClosedFd => Errno::EBADF,
             litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
-            litebox::pipes::errors::WriteError::NotForWriting => Errno::EINVAL,
+            litebox::pipes::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::pipes::errors::WriteError::WouldBlock => Errno::EWOULDBLOCK,
             _ => todo!(),
         }
@@ -619,5 +619,22 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
             litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::TruncateError::Io => Errno::EIO,
         }
+    }
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::Errno;
+
+    #[test]
+    fn invalid_pipe_end_operations_use_ebadf() {
+        assert_eq!(
+            Errno::from(litebox::pipes::errors::ReadError::NotForReading),
+            Errno::EBADF
+        );
+        assert_eq!(
+            Errno::from(litebox::pipes::errors::WriteError::NotForWriting),
+            Errno::EBADF
+        );
     }
 }

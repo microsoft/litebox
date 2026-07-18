@@ -403,11 +403,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
         if self.is_shutdown() {
             return Err(TryOpError::Other(PipeError::ThisEndShutdown));
         }
-        if self.is_peer_shutdown() {
-            return Err(TryOpError::Other(PipeError::PeerShutdown));
-        }
         if buf.is_empty() {
             return Ok(0);
+        }
+        if self.is_peer_shutdown() {
+            return Err(TryOpError::Other(PipeError::PeerShutdown));
         }
 
         let write_len = {
@@ -437,15 +437,25 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
     where
         T: Copy,
     {
-        self.endpoint
-            .pollee
-            .wait(
-                cx,
-                self.get_status().contains(OFlags::NONBLOCK),
-                Events::OUT,
-                || self.try_write(buf),
-            )
-            .map_err(PipeError::from)
+        if self.get_status().contains(OFlags::NONBLOCK) {
+            return self
+                .endpoint
+                .pollee
+                .wait(cx, true, Events::OUT, || self.try_write(buf))
+                .map_err(PipeError::from);
+        }
+
+        let mut total_written = 0;
+        while total_written < buf.len() {
+            match self.endpoint.pollee.wait(cx, false, Events::OUT, || {
+                self.try_write(&buf[total_written..])
+            }) {
+                Ok(written) => total_written += written,
+                Err(_) if total_written != 0 => return Ok(total_written),
+                Err(error) => return Err(PipeError::from(error)),
+            }
+        }
+        Ok(total_written)
     }
 
     common_functions_for_channel!();
@@ -629,6 +639,41 @@ mod tests {
     extern crate std;
 
     #[test]
+    fn local_zero_length_write_succeeds_after_reader_closes() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let litebox = crate::LiteBox::new(platform);
+        let pipes = super::Pipes::new(&litebox);
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None);
+
+        pipes.close(&reader).unwrap();
+
+        assert_eq!(
+            pipes
+                .write(&WaitState::new(platform).context(), &writer, &[])
+                .unwrap(),
+            0
+        );
+        pipes.close(&writer).unwrap();
+    }
+
+    #[test]
+    fn local_pipe_rejects_operations_on_the_wrong_endpoint() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let litebox = crate::LiteBox::new(platform);
+        let pipes = super::Pipes::new(&litebox);
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None);
+
+        assert!(matches!(
+            pipes.read(&WaitState::new(platform).context(), &writer, &mut [0]),
+            Err(ReadError::NotForReading)
+        ));
+        assert!(matches!(
+            pipes.write(&WaitState::new(platform).context(), &reader, &[1]),
+            Err(WriteError::NotForWriting)
+        ));
+    }
+
+    #[test]
     fn test_blocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = &crate::LiteBox::new(platform);
@@ -644,6 +689,7 @@ mod tests {
                     let ret = pipes
                         .write(&WaitState::new(platform).context(), &prod, &data[i..])
                         .unwrap();
+                    assert_eq!(ret, data.len() - i);
                     i += ret;
                 }
                 pipes.close(&prod).unwrap();
