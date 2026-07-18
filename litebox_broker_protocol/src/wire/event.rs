@@ -14,12 +14,12 @@ use super::primitive::{Decoder, Encoder};
 // Event operation tags live with the event family. Future event operations
 // should add tags here; unrelated object families should get their own module.
 const EVENT_REQUEST_TAG_CREATE: u8 = 0;
-const EVENT_REQUEST_TAG_ADD: u8 = 2;
-const EVENT_REQUEST_TAG_CONSUME: u8 = 3;
+const EVENT_REQUEST_TAG_ADD: u8 = 1;
+const EVENT_REQUEST_TAG_CONSUME: u8 = 2;
 
 const EVENT_RESPONSE_TAG_CREATED: u8 = 0;
-const EVENT_RESPONSE_TAG_ADDED: u8 = 2;
-const EVENT_RESPONSE_TAG_CONSUMED: u8 = 3;
+const EVENT_RESPONSE_TAG_ADDED: u8 = 1;
+const EVENT_RESPONSE_TAG_CONSUMED: u8 = 2;
 
 const EVENT_CONSUME_MODE_TAG_ALL: u8 = 1;
 const EVENT_CONSUME_MODE_TAG_ONE: u8 = 2;
