@@ -36,7 +36,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         initial_count: u64,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
-    fn wait_event(
+    fn check_readiness(
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
@@ -70,11 +70,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         data: &[u8],
     ) -> core::result::Result<usize, BrokerControlError>;
-
-    fn check_pipe_readiness(
-        &self,
-        handle: ObjectHandle,
-    ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 
@@ -209,11 +204,11 @@ where
         self.request(|local| local.create_event_with_count(initial_count))
     }
 
-    fn wait_event(
+    fn check_readiness(
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
-        self.request(|local| local.wait_event(handle))
+        self.request(|local| local.check_readiness(handle))
     }
 
     fn add_event(
@@ -254,13 +249,6 @@ where
         data: &[u8],
     ) -> core::result::Result<usize, BrokerControlError> {
         self.request(|local| local.write_pipe(handle, data))
-    }
-
-    fn check_pipe_readiness(
-        &self,
-        handle: ObjectHandle,
-    ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
-        self.request(|local| local.check_pipe_readiness(handle))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {

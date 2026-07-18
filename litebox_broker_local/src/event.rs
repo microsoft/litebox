@@ -5,7 +5,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
-    EventConsumeMode, WaitEventRequest,
+    EventConsumeMode,
 };
 use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, EventRequest, EventResponse,
@@ -29,20 +29,6 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             self.request_event(EventRequest::Create(CreateEventRequest { initial_count }))?;
         match response {
             EventResponse::Create(response) => Ok(response.handle),
-            response => panic!("broker returned unexpected event response: {response:?}"),
-        }
-    }
-
-    /// Checks whether an event wait would complete now.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker reports an unrecoverable error or returns a protocol
-    /// response that does not match the issued event request.
-    pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<ReadinessFlags, Channel::Error> {
-        let response = self.request_event(EventRequest::Wait(WaitEventRequest { handle }))?;
-        match response {
-            EventResponse::Wait(response) => Ok(response.readiness),
             response => panic!("broker returned unexpected event response: {response:?}"),
         }
     }
@@ -88,7 +74,9 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         match self.request(BrokerRequest::Event(request))? {
             BrokerResponse::Event(response) => Ok(response),
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response @ (BrokerResponse::ObjectClosed | BrokerResponse::Pipe(_)) => {
+            response @ (BrokerResponse::ObjectClosed
+            | BrokerResponse::Readiness(_)
+            | BrokerResponse::Pipe(_)) => {
                 panic!("broker returned unexpected event response: {response:?}");
             }
         }

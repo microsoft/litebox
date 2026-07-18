@@ -4,11 +4,11 @@
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CreateEventRequest, CreateEventResponse, WaitEventRequest, WaitEventResponse,
+    CreateEventRequest, CreateEventResponse,
 };
 use crate::pipe::{
-    CheckPipeReadinessRequest, CheckPipeReadinessResponse, CreatePipeRequest, CreatePipeResponse,
-    ReadPipeRequest, ReadPipeResponse, WritePipeRequest, WritePipeResponse,
+    CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
+    WritePipeResponse,
 };
 use crate::readiness::ReadinessFlags;
 use crate::{ObjectHandle, ProtocolVersion};
@@ -25,6 +25,8 @@ pub struct BrokerHandshakeRequest {
 pub enum BrokerRequest {
     /// Close one broker object reference.
     CloseObject(ObjectHandle),
+    /// Check the current readiness of a broker-owned object.
+    CheckReadiness(ObjectHandle),
     /// Event object request family.
     Event(EventRequest),
     /// Pipe object request family.
@@ -60,8 +62,6 @@ pub enum BrokerHandshakeResponse {
 pub enum EventRequest {
     /// Create a broker-owned event object.
     Create(CreateEventRequest),
-    /// Check whether an event wait would complete now.
-    Wait(WaitEventRequest),
     /// Add readiness credits to an event.
     Add(AddEventRequest),
     /// Consume readiness credits from an event.
@@ -77,8 +77,6 @@ pub enum PipeRequest {
     Read(ReadPipeRequest),
     /// Write bytes to a pipe.
     Write(WritePipeRequest),
-    /// Query one endpoint's readiness.
-    CheckReadiness(CheckPipeReadinessRequest),
 }
 
 /// Broker response sent over an active control channel.
@@ -86,6 +84,8 @@ pub enum PipeRequest {
 pub enum BrokerResponse {
     /// Object close operation completed.
     ObjectClosed,
+    /// Current readiness of a broker-owned object.
+    Readiness(ReadinessFlags),
     /// Event object response family.
     Event(EventResponse),
     /// Pipe object response family.
@@ -99,8 +99,6 @@ pub enum BrokerResponse {
 pub enum EventResponse {
     /// Create operation response.
     Create(CreateEventResponse),
-    /// Wait operation response.
-    Wait(WaitEventResponse),
     /// Add operation response.
     Add(AddEventResponse),
     /// Consume operation response.
@@ -116,8 +114,6 @@ pub enum PipeResponse {
     Read(ReadPipeResponse),
     /// Write operation response.
     Write(WritePipeResponse),
-    /// Readiness query response.
-    CheckReadiness(CheckPipeReadinessResponse),
 }
 
 /// Broker-initiated asynchronous notification.

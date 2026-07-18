@@ -3,7 +3,7 @@
 
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
-    CreateEventResponse, EventConsumeMode, EventConsumption, WaitEventRequest, WaitEventResponse,
+    CreateEventResponse, EventConsumeMode, EventConsumption,
 };
 use crate::message::{EventRequest, EventResponse};
 use crate::readiness::ReadinessFlags;
@@ -14,12 +14,10 @@ use super::primitive::{Decoder, Encoder};
 // Event operation tags live with the event family. Future event operations
 // should add tags here; unrelated object families should get their own module.
 const EVENT_REQUEST_TAG_CREATE: u8 = 0;
-const EVENT_REQUEST_TAG_WAIT: u8 = 1;
 const EVENT_REQUEST_TAG_ADD: u8 = 2;
 const EVENT_REQUEST_TAG_CONSUME: u8 = 3;
 
 const EVENT_RESPONSE_TAG_CREATED: u8 = 0;
-const EVENT_RESPONSE_TAG_WAITED: u8 = 1;
 const EVENT_RESPONSE_TAG_ADDED: u8 = 2;
 const EVENT_RESPONSE_TAG_CONSUMED: u8 = 3;
 
@@ -31,10 +29,6 @@ pub(super) fn encode_event_request(encoder: &mut Encoder, request: EventRequest)
         EventRequest::Create(request) => {
             encoder.u8(EVENT_REQUEST_TAG_CREATE);
             encoder.u64(request.initial_count);
-        }
-        EventRequest::Wait(request) => {
-            encoder.u8(EVENT_REQUEST_TAG_WAIT);
-            encoder.handle(request.handle);
         }
         EventRequest::Add(request) => {
             encoder.u8(EVENT_REQUEST_TAG_ADD);
@@ -53,9 +47,6 @@ pub(super) fn decode_event_request(decoder: &mut Decoder<'_>) -> Result<EventReq
     let request = match decoder.u8()? {
         EVENT_REQUEST_TAG_CREATE => EventRequest::Create(CreateEventRequest {
             initial_count: decoder.u64()?,
-        }),
-        EVENT_REQUEST_TAG_WAIT => EventRequest::Wait(WaitEventRequest {
-            handle: decoder.handle()?,
         }),
         EVENT_REQUEST_TAG_ADD => EventRequest::Add(AddEventRequest {
             handle: decoder.handle()?,
@@ -77,10 +68,6 @@ pub(super) fn encode_event_response(encoder: &mut Encoder, response: EventRespon
             encoder.u8(EVENT_RESPONSE_TAG_CREATED);
             encoder.handle(response.handle);
         }
-        EventResponse::Wait(response) => {
-            encoder.u8(EVENT_RESPONSE_TAG_WAITED);
-            encoder.u32(response.readiness.0);
-        }
         EventResponse::Add(response) => {
             encoder.u8(EVENT_RESPONSE_TAG_ADDED);
             encoder.u32(response.readiness.0);
@@ -97,9 +84,6 @@ pub(super) fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<EventRe
     let response = match decoder.u8()? {
         EVENT_RESPONSE_TAG_CREATED => EventResponse::Create(CreateEventResponse {
             handle: decoder.handle()?,
-        }),
-        EVENT_RESPONSE_TAG_WAITED => EventResponse::Wait(WaitEventResponse {
-            readiness: ReadinessFlags(decoder.u32()?),
         }),
         EVENT_RESPONSE_TAG_ADDED => EventResponse::Add(AddEventResponse {
             readiness: ReadinessFlags(decoder.u32()?),

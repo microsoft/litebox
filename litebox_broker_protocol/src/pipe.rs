@@ -4,7 +4,6 @@
 use alloc::vec::Vec;
 
 use crate::ObjectHandle;
-use crate::readiness::ReadinessFlags;
 
 /// Maximum pipe payload carried by one control-path request or response.
 ///
@@ -60,18 +59,4 @@ pub struct WritePipeRequest {
 pub struct WritePipeResponse {
     /// Number of bytes appended to the pipe.
     pub written: u32,
-}
-
-/// Request to query one pipe endpoint's readiness.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CheckPipeReadinessRequest {
-    /// Pipe endpoint handle.
-    pub handle: ObjectHandle,
-}
-
-/// Response to a pipe readiness query.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CheckPipeReadinessResponse {
-    /// Current endpoint readiness.
-    pub readiness: ReadinessFlags,
 }

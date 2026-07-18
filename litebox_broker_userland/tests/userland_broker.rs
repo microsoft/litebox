@@ -84,13 +84,16 @@ fn run_fake_runner(args: &[OsString]) {
     let mut local = BrokerLocal::negotiate(control_channel).unwrap();
 
     let handle = local.create_event_with_count(0).unwrap();
-    assert_eq!(local.wait_event(handle).unwrap(), ReadinessFlags::WRITE);
+    assert_eq!(
+        local.check_readiness(handle).unwrap(),
+        ReadinessFlags::WRITE
+    );
 
     let readiness = ReadinessFlags::READ | ReadinessFlags::WRITE;
     assert_eq!(local.add_event(handle, 1).unwrap(), readiness);
 
     assert_eq!(
-        local.wait_event(handle).unwrap(),
+        local.check_readiness(handle).unwrap(),
         ReadinessFlags::READ | ReadinessFlags::WRITE
     );
     drop(local);

@@ -3,10 +3,9 @@
 
 use crate::message::{PipeRequest, PipeResponse};
 use crate::pipe::{
-    CheckPipeReadinessRequest, CheckPipeReadinessResponse, CreatePipeRequest, CreatePipeResponse,
-    ReadPipeRequest, ReadPipeResponse, WritePipeRequest, WritePipeResponse,
+    CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
+    WritePipeResponse,
 };
-use crate::readiness::ReadinessFlags;
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
@@ -14,12 +13,10 @@ use super::primitive::{Decoder, Encoder};
 const PIPE_REQUEST_TAG_CREATE: u8 = 0;
 const PIPE_REQUEST_TAG_READ: u8 = 1;
 const PIPE_REQUEST_TAG_WRITE: u8 = 2;
-const PIPE_REQUEST_TAG_CHECK_READINESS: u8 = 3;
 
 const PIPE_RESPONSE_TAG_CREATED: u8 = 0;
 const PIPE_RESPONSE_TAG_READ: u8 = 1;
 const PIPE_RESPONSE_TAG_WRITTEN: u8 = 2;
-const PIPE_RESPONSE_TAG_READINESS: u8 = 3;
 
 pub(super) fn encode_pipe_request(encoder: &mut Encoder, request: PipeRequest) {
     match request {
@@ -38,10 +35,6 @@ pub(super) fn encode_pipe_request(encoder: &mut Encoder, request: PipeRequest) {
             encoder.handle(request.handle);
             encoder.bytes(&request.data);
         }
-        PipeRequest::CheckReadiness(request) => {
-            encoder.u8(PIPE_REQUEST_TAG_CHECK_READINESS);
-            encoder.handle(request.handle);
-        }
     }
 }
 
@@ -59,11 +52,6 @@ pub(super) fn decode_pipe_request(decoder: &mut Decoder<'_>) -> Result<PipeReque
             handle: decoder.handle()?,
             data: decoder.bytes()?,
         })),
-        PIPE_REQUEST_TAG_CHECK_READINESS => {
-            Ok(PipeRequest::CheckReadiness(CheckPipeReadinessRequest {
-                handle: decoder.handle()?,
-            }))
-        }
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -83,10 +71,6 @@ pub(super) fn encode_pipe_response(encoder: &mut Encoder, response: PipeResponse
             encoder.u8(PIPE_RESPONSE_TAG_WRITTEN);
             encoder.u32(response.written);
         }
-        PipeResponse::CheckReadiness(response) => {
-            encoder.u8(PIPE_RESPONSE_TAG_READINESS);
-            encoder.u32(response.readiness.0);
-        }
     }
 }
 
@@ -102,11 +86,6 @@ pub(super) fn decode_pipe_response(decoder: &mut Decoder<'_>) -> Result<PipeResp
         PIPE_RESPONSE_TAG_WRITTEN => Ok(PipeResponse::Write(WritePipeResponse {
             written: decoder.u32()?,
         })),
-        PIPE_RESPONSE_TAG_READINESS => {
-            Ok(PipeResponse::CheckReadiness(CheckPipeReadinessResponse {
-                readiness: ReadinessFlags(decoder.u32()?),
-            }))
-        }
         _ => Err(WireError::InvalidTag),
     }
 }

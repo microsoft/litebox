@@ -8,6 +8,7 @@ use crate::pipe::PipeObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
 /// Caller identity information supplied by the broker entry layer.
@@ -157,6 +158,16 @@ impl BrokerSession {
         f(&mut object)
     }
 
+    /// Returns the current readiness of a broker-owned object.
+    pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
+        self.with_authorized_object(handle, ObjectRights::WAIT, |object| {
+            Ok(match object {
+                ObjectEntry::Event(event) => event.readiness(),
+                ObjectEntry::Pipe(pipe) => pipe.readiness(),
+            })
+        })
+    }
+
     fn authorize_use_object(
         &self,
         references: &HashMap<ObjectHandle, ObjectReference>,
@@ -234,7 +245,7 @@ mod tests {
 
         assert_ne!(unknown_handle, handle);
         assert_eq!(
-            crate::event::wait(&session, unknown_handle),
+            session.check_readiness(unknown_handle),
             Err(BrokerError::UnknownObject)
         );
 
@@ -243,10 +254,7 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        assert_eq!(
-            crate::event::wait(&session, handle),
-            Ok(ReadinessFlags::WRITE)
-        );
+        assert_eq!(session.check_readiness(handle), Ok(ReadinessFlags::WRITE));
         assert_eq!(
             crate::event::add(&session, handle, 1),
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
@@ -311,7 +319,7 @@ mod tests {
         let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
-            crate::pipe::check_readiness(&session, reader),
+            session.check_readiness(reader),
             Ok(ReadinessFlags::default())
         );
         assert_eq!(
@@ -332,7 +340,7 @@ mod tests {
         assert_eq!(session.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
-            crate::pipe::check_readiness(&session, reader),
+            session.check_readiness(reader),
             Ok(ReadinessFlags::READ | ReadinessFlags::HANGUP)
         );
         assert_eq!(
@@ -360,7 +368,7 @@ mod tests {
             Err(BrokerError::PeerClosed)
         );
         assert_eq!(
-            crate::pipe::check_readiness(&session, writer),
+            session.check_readiness(writer),
             Ok(ReadinessFlags::WRITE | ReadinessFlags::ERROR)
         );
         assert_eq!(session.close_object_reference(writer), Ok(()));

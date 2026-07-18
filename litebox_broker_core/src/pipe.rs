@@ -75,14 +75,6 @@ pub fn write(session: &BrokerSession, handle: ObjectHandle, data: &[u8]) -> Resu
     })
 }
 
-/// Returns the current readiness of one pipe endpoint.
-pub fn check_readiness(session: &BrokerSession, handle: ObjectHandle) -> Result<ReadinessFlags> {
-    session.with_authorized_object(handle, ObjectRights::WAIT, |object| match object {
-        ObjectEntry::Pipe(pipe) => Ok(pipe.readiness()),
-        ObjectEntry::Event(_) => Err(BrokerError::InvalidRights),
-    })
-}
-
 pub(crate) struct PipeObject {
     state: Arc<RwLock<PipeState>>,
     endpoint: PipeEndpoint,
@@ -150,7 +142,7 @@ impl PipeObject {
         Ok(write_len)
     }
 
-    fn readiness(&self) -> ReadinessFlags {
+    pub(crate) fn readiness(&self) -> ReadinessFlags {
         let state = self.state.read();
         match self.endpoint {
             PipeEndpoint::Read => {

@@ -18,14 +18,12 @@ use litebox_broker_protocol::channel::{
     HostControlChannel, HostNotificationChannel, HostReceive, PeerCredential,
 };
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse, WaitEventResponse};
+use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerRequest, BrokerResponse, EventRequest, EventResponse,
     PipeRequest, PipeResponse,
 };
-use litebox_broker_protocol::pipe::{
-    CheckPipeReadinessResponse, CreatePipeResponse, ReadPipeResponse, WritePipeResponse,
-};
+use litebox_broker_protocol::pipe::{CreatePipeResponse, ReadPipeResponse, WritePipeResponse};
 
 mod error;
 
@@ -122,6 +120,10 @@ fn handle_request(session: &BrokerSession, request: BrokerRequest) -> BrokerResp
             Ok(()) => BrokerResponse::ObjectClosed,
             Err(error) => BrokerResponse::Error(error.into()),
         },
+        BrokerRequest::CheckReadiness(handle) => match session.check_readiness(handle) {
+            Ok(readiness) => BrokerResponse::Readiness(readiness),
+            Err(error) => BrokerResponse::Error(error.into()),
+        },
         BrokerRequest::Event(request) => handle_event_request(session, request),
         BrokerRequest::Pipe(request) => handle_pipe_request(session, request),
     }
@@ -153,11 +155,6 @@ fn handle_pipe_request(session: &BrokerSession, request: PipeRequest) -> BrokerR
                 },
             )
         }
-        PipeRequest::CheckReadiness(request) => {
-            litebox_broker_core::pipe::check_readiness(session, request.handle).map(|readiness| {
-                PipeResponse::CheckReadiness(CheckPipeReadinessResponse { readiness })
-            })
-        }
     };
 
     match response {
@@ -172,14 +169,6 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
             match litebox_broker_core::event::create(session, request.initial_count) {
                 Ok(handle) => {
                     BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }))
-                }
-                Err(error) => BrokerResponse::Error(error.into()),
-            }
-        }
-        EventRequest::Wait(request) => {
-            match litebox_broker_core::event::wait(session, request.handle) {
-                Ok(readiness) => {
-                    BrokerResponse::Event(EventResponse::Wait(WaitEventResponse { readiness }))
                 }
                 Err(error) => BrokerResponse::Error(error.into()),
             }
@@ -217,7 +206,6 @@ mod tests {
     use litebox_broker_core::{ObjectRights, PolicyEngine};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
-        WaitEventRequest,
     };
     use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerNotification};
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion};
@@ -414,10 +402,7 @@ mod tests {
             BrokerResponse::ObjectClosed
         );
         assert_eq!(
-            handle_request(
-                &session,
-                BrokerRequest::Event(EventRequest::Wait(WaitEventRequest { handle }))
-            ),
+            handle_request(&session, BrokerRequest::CheckReadiness(handle)),
             BrokerResponse::Error(ErrorCode::UnknownObject)
         );
         assert_eq!(

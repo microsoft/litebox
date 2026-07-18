@@ -502,7 +502,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
     }
 
     fn readiness(&self) -> Result<ReadinessFlags, BrokerControlError> {
-        self.broker.check_pipe_readiness(self.handle)
+        self.broker.check_readiness(self.handle)
     }
 }
 
@@ -1206,6 +1206,9 @@ mod tests {
                     }
                 },
                 BrokerRequest::CloseObject(_) => Ok(Some(BrokerResponse::ObjectClosed)),
+                BrokerRequest::CheckReadiness(_) => {
+                    Ok(Some(BrokerResponse::Readiness(ReadinessFlags::default())))
+                }
                 request @ (BrokerRequest::Pipe(_) | BrokerRequest::Event(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }

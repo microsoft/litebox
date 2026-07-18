@@ -7,10 +7,8 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse, PipeRequest, PipeResponse};
 use litebox_broker_protocol::pipe::{
-    CheckPipeReadinessRequest, CreatePipeRequest, CreatePipeResponse, ReadPipeRequest,
-    WritePipeRequest,
+    CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, WritePipeRequest,
 };
-use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
@@ -72,29 +70,13 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Checks one broker-owned pipe endpoint's readiness.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker reports an unrecoverable error or returns a
-    /// response that does not match the issued pipe request.
-    pub fn check_pipe_readiness(
-        &mut self,
-        handle: ObjectHandle,
-    ) -> Result<ReadinessFlags, Channel::Error> {
-        match self.request_pipe(PipeRequest::CheckReadiness(CheckPipeReadinessRequest {
-            handle,
-        }))? {
-            PipeResponse::CheckReadiness(response) => Ok(response.readiness),
-            response => panic!("broker returned unexpected pipe response: {response:?}"),
-        }
-    }
-
     fn request_pipe(&mut self, request: PipeRequest) -> Result<PipeResponse, Channel::Error> {
         match self.request(BrokerRequest::Pipe(request))? {
             BrokerResponse::Pipe(response) => Ok(response),
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response @ (BrokerResponse::ObjectClosed | BrokerResponse::Event(_)) => {
+            response @ (BrokerResponse::ObjectClosed
+            | BrokerResponse::Readiness(_)
+            | BrokerResponse::Event(_)) => {
                 panic!("broker returned unexpected pipe response: {response:?}");
             }
         }

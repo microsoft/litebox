@@ -20,19 +20,6 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
     session.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count)))
 }
 
-/// Checks whether an event wait would complete now.
-///
-/// Blocking is intentionally outside BrokerCore for the first proof of
-/// concept. Userland or kernel deployments can block on deployment-specific
-/// wait primitives after BrokerCore authorizes and reports readiness state.
-pub fn wait(session: &BrokerSession, handle: ObjectHandle) -> Result<ReadinessFlags> {
-    let required_rights = ObjectRights::WAIT;
-    session.with_authorized_object(handle, required_rights, |object| match object {
-        ObjectEntry::Event(event) => Ok(event.readiness()),
-        ObjectEntry::Pipe(_) => Err(BrokerError::InvalidRights),
-    })
-}
-
 /// Adds readiness credits to a broker-owned event object.
 pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<ReadinessFlags> {
     let required_rights = ObjectRights::WRITE;
@@ -90,7 +77,7 @@ impl EventObject {
         })
     }
 
-    fn readiness(self) -> ReadinessFlags {
+    pub(crate) fn readiness(self) -> ReadinessFlags {
         let mut readiness = ReadinessFlags::default();
         if self.count > 0 {
             readiness = readiness | ReadinessFlags::READ;

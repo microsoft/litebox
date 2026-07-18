@@ -27,20 +27,6 @@ pub struct CreateEventResponse {
     pub handle: ObjectHandle,
 }
 
-/// Request to check whether an event wait would complete now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WaitEventRequest {
-    /// Event handle.
-    pub handle: ObjectHandle,
-}
-
-/// Response to an event wait request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WaitEventResponse {
-    /// Current readiness state.
-    pub readiness: ReadinessFlags,
-}
-
 /// Request to add readiness credits to an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddEventRequest {

@@ -26,6 +26,7 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
     BrokerResponse,
 };
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle};
 
 pub use error::{BrokerLocalError, Result};
@@ -118,7 +119,25 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             },
             response @ (BrokerResponse::Event(_)
             | BrokerResponse::Pipe(_)
-            | BrokerResponse::ObjectClosed) => Ok(response),
+            | BrokerResponse::ObjectClosed
+            | BrokerResponse::Readiness(_)) => Ok(response),
+        }
+    }
+
+    /// Checks the current readiness of a broker-owned object.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a
+    /// response that does not match the issued readiness request.
+    pub fn check_readiness(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<ReadinessFlags, Channel::Error> {
+        match self.request(BrokerRequest::CheckReadiness(handle))? {
+            BrokerResponse::Readiness(readiness) => Ok(readiness),
+            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected readiness response: {response:?}"),
         }
     }
 
@@ -132,7 +151,9 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         match self.request(BrokerRequest::CloseObject(handle))? {
             BrokerResponse::ObjectClosed => Ok(()),
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response @ (BrokerResponse::Event(_) | BrokerResponse::Pipe(_)) => {
+            response @ (BrokerResponse::Event(_)
+            | BrokerResponse::Pipe(_)
+            | BrokerResponse::Readiness(_)) => {
                 panic!("broker returned unexpected close response: {response:?}");
             }
         }
