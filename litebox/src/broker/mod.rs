@@ -14,6 +14,7 @@ use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::event::{Events, polling::Pollee};
+use crate::platform::TimeProvider;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 pub(crate) mod error;
@@ -77,13 +78,16 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
         let mut handles = self.handles.lock();
         if let Some(entry) = handles.get_mut(&handle) {
             entry.unregister_pollable(pollee);
-            if entry.is_empty() {
+            if entry.pollables.is_empty() {
                 handles.remove(&handle);
             }
         }
     }
 
-    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessFlags) {
+    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessFlags)
+    where
+        Platform: TimeProvider,
+    {
         let events = readiness_events(readiness);
         if events.is_empty() {
             return;
@@ -99,7 +103,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
                 .iter()
                 .filter_map(Weak::upgrade)
                 .collect::<Vec<_>>();
-            if entry.is_empty() {
+            if entry.pollables.is_empty() {
                 handles.remove(&handle);
             }
             pollables
@@ -136,10 +140,6 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleEntry<Platform> {
     fn prune_stale_pollables(&mut self) {
         self.pollables
             .retain(|registered| registered.strong_count() > 0);
-    }
-
-    fn is_empty(&self) -> bool {
-        self.pollables.is_empty()
     }
 }
 pub(crate) struct BrokerLocalControl<
