@@ -3,6 +3,8 @@
 
 //! Windows console driver support.
 
+use alloc::collections::BTreeMap;
+use alloc::sync::{Arc, Weak};
 use core::mem::size_of;
 
 use int_enum::IntEnum;
@@ -16,9 +18,6 @@ use crate::{ConstPtr, MutPtr};
 const FILE_DEVICE_CONSOLE: u32 = 0x50;
 const CD_SERVER_EA_NAME: &[u8] = b"server";
 
-// TODO(condrv-backing-fidelity): LiteBox exposes only stdin/stdout/stderr backing streams, so
-// these endpoint kinds cannot yet carry the distinct console-object state modeled by Wine's
-// server/console.c and ReactOS ConDrv. Faithful behavior needs per-object console infrastructure.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
 pub(crate) enum CondrvObject {
@@ -30,6 +29,85 @@ pub(crate) enum CondrvObject {
     Server = 5,
     Reference = 6,
     Connect = 7,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CondrvStreamDirection {
+    Input,
+    Output,
+}
+
+pub(crate) struct CondrvStreamObject {
+    id: u64,
+}
+
+pub(crate) struct CondrvStreamOpen {
+    pub(crate) object: Arc<CondrvStreamObject>,
+}
+
+struct CondrvConsoleState {
+    next_object_id: u64,
+    // Weak entries keep handle lifetime authoritative while retaining an object-id registry for
+    // future activation and cross-process lookup.
+    objects: BTreeMap<u64, Weak<CondrvStreamObject>>,
+    bound_input: Arc<CondrvStreamObject>,
+    active_output: Arc<CondrvStreamObject>,
+}
+
+pub(crate) struct CondrvConsole<Platform: crate::ShimPlatform> {
+    state: litebox::sync::Mutex<Platform, CondrvConsoleState>,
+}
+
+impl CondrvStreamObject {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl<Platform: crate::ShimPlatform> CondrvConsole<Platform> {
+    pub(crate) fn new() -> Self {
+        let bound_input = Arc::new(CondrvStreamObject { id: 1 });
+        let active_output = Arc::new(CondrvStreamObject { id: 2 });
+        let mut objects = BTreeMap::new();
+        objects.insert(bound_input.id, Arc::downgrade(&bound_input));
+        objects.insert(active_output.id, Arc::downgrade(&active_output));
+        Self {
+            state: litebox::sync::Mutex::new(CondrvConsoleState {
+                next_object_id: 3,
+                objects,
+                bound_input,
+                active_output,
+            }),
+        }
+    }
+
+    pub(crate) fn open_stream(&self, endpoint: CondrvObject) -> Result<CondrvStreamOpen, NtStatus> {
+        let mut state = self.state.lock();
+        let object = match endpoint {
+            CondrvObject::CurrentInput => Arc::clone(&state.bound_input),
+            // TODO(condrv-activate-buffer): update this pointer when LiteBox implements and
+            // host-validates the ConDrv activate-buffer IOCTL.
+            CondrvObject::CurrentOutput => Arc::clone(&state.active_output),
+            CondrvObject::Input | CondrvObject::Output | CondrvObject::ScreenBuffer => {
+                state.allocate_object()?
+            }
+            CondrvObject::Server | CondrvObject::Reference | CondrvObject::Connect => {
+                return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+            }
+        };
+        Ok(CondrvStreamOpen { object })
+    }
+}
+
+impl CondrvConsoleState {
+    fn allocate_object(&mut self) -> Result<Arc<CondrvStreamObject>, NtStatus> {
+        let id = self.next_object_id;
+        self.next_object_id = id.checked_add(1).ok_or(NtStatus::QUOTA_EXCEEDED)?;
+        let object = Arc::new(CondrvStreamObject { id });
+        self.objects.retain(|_, object| object.strong_count() != 0);
+        self.objects.insert(id, Arc::downgrade(&object));
+        Ok(object)
+    }
 }
 
 impl CondrvObject {
@@ -103,15 +181,22 @@ impl CondrvObject {
     }
 
     pub(crate) fn handle_path(self) -> &'static str {
-        // TODO(condrv-bound-endpoint): CurrentIn and CurrentOut are bound to the attached
-        // console's input and active screen buffer in Wine server/console.c and ReactOS ConDrv.
-        // Mapping them to the same host streams as Input and Output makes that distinction nominal.
         match self {
             Self::Input | Self::CurrentInput => "/dev/stdin",
             Self::Output | Self::CurrentOutput | Self::ScreenBuffer => "/dev/stdout",
             Self::Server => r"\Device\ConDrv\Server",
             Self::Reference => r"\Device\ConDrv\Reference",
             Self::Connect => r"\Device\ConDrv\Connect",
+        }
+    }
+
+    pub(crate) fn stream_direction(self) -> Option<CondrvStreamDirection> {
+        match self {
+            Self::Input | Self::CurrentInput => Some(CondrvStreamDirection::Input),
+            Self::Output | Self::CurrentOutput | Self::ScreenBuffer => {
+                Some(CondrvStreamDirection::Output)
+            }
+            Self::Server | Self::Reference | Self::Connect => None,
         }
     }
 }

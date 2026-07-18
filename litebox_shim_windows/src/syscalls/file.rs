@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::mem::size_of;
 
@@ -17,7 +18,7 @@ use crate::nt_types::{
     AccessMask, IoStatusBlock, ObjectAttributes, UnicodeString, read_object_attributes,
 };
 use crate::syscalls::Handle;
-use crate::syscalls::condrv::{self, CondrvObject};
+use crate::syscalls::condrv::{self, CondrvObject, CondrvStreamDirection, CondrvStreamObject};
 use crate::syscalls::file_path::{FilePathResolver, FilePathRoot, FileTarget};
 use crate::{
     ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
@@ -102,9 +103,27 @@ enum FileObjectBacking<FS: ShimFS> {
     },
     CondrvStream {
         object: CondrvObject,
+        stream_object: Arc<CondrvStreamObject>,
         fd: TypedFd<FS>,
     },
     CondrvControl(CondrvObject),
+}
+
+#[derive(Clone, Copy)]
+enum FileSharingIdentity<'a> {
+    Path(&'a str),
+    // TODO(condrv-share-access): native CONIN$/CONOUT$ permits multiple share-access-zero opens
+    // of the same bound object; determine which ConDrv opens ignore sharing before enforcing it.
+    CondrvObject(u64),
+}
+
+impl FileSharingIdentity<'_> {
+    fn matches<FS: ShimFS>(self, file: &FileObject<FS>) -> bool {
+        match self {
+            Self::Path(path) => file.condrv_stream_object_id().is_none() && file.path == path,
+            Self::CondrvObject(object_id) => file.condrv_stream_object_id() == Some(object_id),
+        }
+    }
 }
 
 impl<FS: ShimFS> FileObject<FS> {
@@ -113,6 +132,13 @@ impl<FS: ShimFS> FileObject<FS> {
             FileObjectBacking::CondrvStream { object, .. }
             | FileObjectBacking::CondrvControl(object) => Some(object),
             FileObjectBacking::Filesystem { .. } => None,
+        }
+    }
+
+    fn condrv_stream_object_id(&self) -> Option<u64> {
+        match &self.backing {
+            FileObjectBacking::CondrvStream { stream_object, .. } => Some(stream_object.id()),
+            FileObjectBacking::Filesystem { .. } | FileObjectBacking::CondrvControl(_) => None,
         }
     }
 
@@ -700,7 +726,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         create_options: FileCreateOptions,
         file_attributes: u32,
     ) -> Result<(FileObject<FS>, FileCreateInformation), NtStatus> {
-        self.check_file_sharing(&path, desired_access, share_access)?;
+        self.check_file_sharing(
+            FileSharingIdentity::Path(&path),
+            desired_access,
+            share_access,
+        )?;
         if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
             return self.open_or_create_directory(
                 &path,
@@ -755,39 +785,42 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let path = String::from(object.handle_path());
-        // TODO(condrv-screenbuffer-identity): CreateConsoleScreenBuffer creates a new,
-        // independently shared object in Wine server/console.c and ReactOS ConDrv; a native probe
-        // likewise opened two exclusive buffers concurrently. LiteBox collapses every instance
-        // onto /dev/stdout, so sharing is bypassed until the backing layer has per-object identity.
-        if object != CondrvObject::ScreenBuffer {
-            self.check_file_sharing(&path, desired_access, share_access)?;
-        }
-        let (backing, information) = match object {
-            CondrvObject::Input
-            | CondrvObject::Output
-            | CondrvObject::CurrentInput
-            | CondrvObject::CurrentOutput
-            | CondrvObject::ScreenBuffer => {
-                let backing_access = match object {
-                    CondrvObject::Input | CondrvObject::CurrentInput => FileAccess::READ_DATA,
-                    CondrvObject::Output
-                    | CondrvObject::CurrentOutput
-                    | CondrvObject::ScreenBuffer => FileAccess::WRITE_DATA,
-                    _ => unreachable!(),
-                };
-                let (fd, _, information) = self.open_backing_fd(
-                    &path,
-                    backing_access,
-                    create_disposition,
-                    create_options,
-                    Mode::empty(),
-                )?;
-                (FileObjectBacking::CondrvStream { object, fd }, information)
-            }
-            CondrvObject::Server | CondrvObject::Reference | CondrvObject::Connect => (
+        let (backing, information) = if let Some(direction) = object.stream_direction() {
+            let stream_open = self.process.condrv_console.open_stream(object)?;
+            self.check_file_sharing(
+                FileSharingIdentity::CondrvObject(stream_open.object.id()),
+                desired_access,
+                share_access,
+            )?;
+            let backing_access = match direction {
+                CondrvStreamDirection::Input => FileAccess::READ_DATA,
+                CondrvStreamDirection::Output => FileAccess::WRITE_DATA,
+            };
+            let (fd, _, information) = self.open_backing_fd(
+                &path,
+                backing_access,
+                create_disposition,
+                create_options,
+                Mode::empty(),
+            )?;
+            (
+                FileObjectBacking::CondrvStream {
+                    object,
+                    stream_object: stream_open.object,
+                    fd,
+                },
+                information,
+            )
+        } else {
+            self.check_file_sharing(
+                FileSharingIdentity::Path(&path),
+                desired_access,
+                share_access,
+            )?;
+            (
                 FileObjectBacking::CondrvControl(object),
                 FileCreateInformation::Opened,
-            ),
+            )
         };
         Ok((
             FileObject {
@@ -939,7 +972,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn check_file_sharing(
         &self,
-        path: &str,
+        identity: FileSharingIdentity<'_>,
         desired_access: FileAccess,
         share_access: FileShareAccess,
     ) -> Result<(), NtStatus> {
@@ -957,8 +990,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 continue;
             };
             let conflicts = entry.with_entry(|file| {
-                file.condrv_object() != Some(CondrvObject::ScreenBuffer)
-                    && file.path == path
+                identity.matches(file)
                     && (desired_access.conflicts_with_share(file.share_access)
                         || file.granted_access.conflicts_with_share(share_access))
             });
@@ -1401,63 +1433,82 @@ mod tests {
         assert_eq!(current_input_status, NtStatus::SUCCESS);
         assert_eq!(current_output_status, NtStatus::SUCCESS);
         assert_eq!(screen_buffer_status, NtStatus::SUCCESS);
-        assert_eq!(
-            task.file_entry(current_input_handle)
-                .unwrap()
-                .with_entry(FileObject::condrv_object),
-            Some(CondrvObject::CurrentInput)
-        );
-        assert_eq!(
-            task.file_entry(current_output_handle)
-                .unwrap()
-                .with_entry(FileObject::condrv_object),
-            Some(CondrvObject::CurrentOutput)
-        );
-        assert_eq!(
-            task.file_entry(screen_buffer_handle)
-                .unwrap()
-                .with_entry(FileObject::condrv_object),
-            Some(CondrvObject::ScreenBuffer)
-        );
+        let stream_identity = |handle| {
+            task.file_entry(handle).unwrap().with_entry(|file| {
+                (
+                    file.condrv_object().unwrap(),
+                    file.condrv_stream_object_id().unwrap(),
+                )
+            })
+        };
+        let input_identity = stream_identity(input_handle);
+        let output_identity = stream_identity(output_handle);
+        let current_input_identity = stream_identity(current_input_handle);
+        let current_output_identity = stream_identity(current_output_handle);
+        let screen_buffer_identity = stream_identity(screen_buffer_handle);
+        assert_eq!(current_input_identity.0, CondrvObject::CurrentInput);
+        assert_eq!(current_output_identity.0, CondrvObject::CurrentOutput);
+        assert_eq!(screen_buffer_identity.0, CondrvObject::ScreenBuffer);
+        assert_ne!(input_identity.1, current_input_identity.1);
+        assert_ne!(output_identity.1, current_output_identity.1);
+        assert_ne!(output_identity.1, screen_buffer_identity.1);
+        assert_ne!(current_output_identity.1, screen_buffer_identity.1);
+        for handle in [output_handle, current_output_handle, screen_buffer_handle] {
+            assert_eq!(
+                task.file_entry(handle)
+                    .unwrap()
+                    .with_entry(|file| file.path.clone()),
+                "/dev/stdout"
+            );
+        }
 
-        for (path, desired_access, expected_object) in [
+        for (path, desired_access, expected_object, expected_bound_id) in [
             (
                 r"\Device\ConDrv\CurrentIn",
                 FILE_GENERIC_READ,
                 CondrvObject::CurrentInput,
+                Some(current_input_identity.1),
             ),
             (
                 r"\Device\ConDrv\CurrentOut",
                 FILE_GENERIC_WRITE,
                 CondrvObject::CurrentOutput,
+                Some(current_output_identity.1),
             ),
             (
                 r"\Device\ConDrv\ScreenBuffer",
                 FILE_GENERIC_WRITE,
                 CondrvObject::ScreenBuffer,
+                None,
             ),
         ] {
             let (status, handle, _) = create_file(&task, path, desired_access, FILE_OPEN);
             assert_eq!(status, NtStatus::SUCCESS, "{path}");
-            assert_eq!(
-                task.file_entry(handle)
-                    .unwrap()
-                    .with_entry(FileObject::condrv_object),
-                Some(expected_object),
-                "{path}"
-            );
+            let identity = stream_identity(handle);
+            assert_eq!(identity.0, expected_object, "{path}");
+            if let Some(expected_bound_id) = expected_bound_id {
+                assert_eq!(identity.1, expected_bound_id, "{path}");
+            } else {
+                assert_ne!(identity.1, screen_buffer_identity.1, "{path}");
+            }
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         }
 
-        let (_path, _name, screen_buffer_attributes) =
-            open_object_attributes(r"\Device\ConDrv\ScreenBuffer");
-        let mut exclusive_screen_buffers = [Handle::default(); 2];
-        for handle in &mut exclusive_screen_buffers {
+        assert_eq!(task.sys_nt_close(current_output_handle), NtStatus::SUCCESS);
+        let mut exclusive_handles = alloc::vec::Vec::new();
+        for path in [
+            r"\Device\ConDrv\Output",
+            r"\Device\ConDrv\CurrentOut",
+            r"\Device\ConDrv\ScreenBuffer",
+            r"\Device\ConDrv\ScreenBuffer",
+        ] {
+            let (_path, _name, attributes) = open_object_attributes(path);
+            let mut handle = Handle::default();
             assert_eq!(
                 task.sys_nt_create_file(
-                    mut_ptr(handle),
+                    mut_ptr(&mut handle),
                     FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-                    Some(const_ptr(&screen_buffer_attributes)),
+                    Some(const_ptr(&attributes)),
                     mut_ptr(&mut io_status),
                     None,
                     0,
@@ -1467,15 +1518,41 @@ mod tests {
                     None,
                     0,
                 ),
-                NtStatus::SUCCESS
+                NtStatus::SUCCESS,
+                "{path}"
             );
+            exclusive_handles.push(handle);
         }
-        for handle in exclusive_screen_buffers {
+        let exclusive_identities: alloc::vec::Vec<_> = exclusive_handles
+            .iter()
+            .map(|handle| stream_identity(*handle))
+            .collect();
+        assert_eq!(exclusive_identities[0].0, CondrvObject::Output);
+        assert_eq!(exclusive_identities[1].0, CondrvObject::CurrentOutput);
+        assert_eq!(
+            exclusive_identities[1].1, current_output_identity.1,
+            "CurrentOut must reference the active output object"
+        );
+        assert_ne!(exclusive_identities[0].1, exclusive_identities[1].1);
+        assert_ne!(exclusive_identities[2].1, exclusive_identities[3].1);
+        let closed_screen_buffer_id = exclusive_identities[2].1;
+        for handle in exclusive_handles {
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         }
+        let (status, reopened_screen_buffer, _) = create_file(
+            &task,
+            r"\Device\ConDrv\ScreenBuffer",
+            FILE_GENERIC_WRITE,
+            FILE_OPEN,
+        );
+        assert_eq!(status, NtStatus::SUCCESS);
+        assert_ne!(
+            stream_identity(reopened_screen_buffer).1,
+            closed_screen_buffer_id
+        );
+        assert_eq!(task.sys_nt_close(reopened_screen_buffer), NtStatus::SUCCESS);
 
         assert_eq!(task.sys_nt_close(screen_buffer_handle), NtStatus::SUCCESS);
-        assert_eq!(task.sys_nt_close(current_output_handle), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(current_input_handle), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(output_handle), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(input_handle), NtStatus::SUCCESS);

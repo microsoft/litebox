@@ -464,6 +464,7 @@ pub struct Process<Platform: ShimPlatform> {
     ntdll_mapping: Option<MappingInfo>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
+    condrv_console: syscalls::condrv::CondrvConsole<Platform>,
     object_manager: WindowsObjectManager<Platform>,
     section_views: WindowsSectionViews<Platform>,
     // TODO: move this into `GlobalState` once we have a proper shared mapping implementation.
@@ -507,6 +508,9 @@ impl<Platform: ShimPlatform> Process<Platform> {
             ntdll_mapping: None,
             peb_address: 0,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
+            // TODO(condrv-shared-console): move console ownership to shared state or a broker when
+            // LiteBox supports AttachConsole/IOCTL_CONDRV_BIND_PID across guest processes.
+            condrv_console: syscalls::condrv::CondrvConsole::new(),
             object_manager,
             windows_shared_section,
             section_views: WindowsSectionViews::<Platform>::new(BTreeMap::new()),
