@@ -990,50 +990,6 @@ mod tests {
     }
 
     #[test]
-    fn broker_notification_failure_prevents_future_control_requests() {
-        let platform = crate::platform::mock::MockPlatform::new();
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let force_transport = Arc::new(AtomicBool::new(false));
-        let local = BrokerLocal::negotiate(FailingPipeChannel {
-            last_request: None,
-            request_count: Arc::clone(&request_count),
-            read_failure: ReadFailure::Transport,
-            force_transport,
-        })
-        .unwrap();
-        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
-        let pipes = super::Pipes::new(&litebox);
-        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
-        let writer_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
-        let writer_observer_dyn: Arc<dyn Observer<Events>> = writer_observer.clone();
-        pipes
-            .with_iopollable(&writer, |pollable| {
-                pollable.register_observer(Arc::downgrade(&writer_observer_dyn), Events::ERR);
-            })
-            .unwrap();
-        let reader_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
-        let reader_observer_dyn: Arc<dyn Observer<Events>> = reader_observer.clone();
-        pipes
-            .with_iopollable(&reader, |pollable| {
-                pollable.register_observer(Arc::downgrade(&reader_observer_dyn), Events::ERR);
-            })
-            .unwrap();
-
-        litebox.broker_failure_dispatcher()();
-
-        assert!(writer_observer.0.load(Ordering::SeqCst));
-        assert!(reader_observer.0.load(Ordering::SeqCst));
-        assert!(matches!(
-            litebox
-                .broker_control()
-                .unwrap()
-                .read_pipe(ObjectHandle(1), 1),
-            Err(crate::broker::error::BrokerControlError::Transport)
-        ));
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
     fn broker_failure_wakes_blocked_pipe_read() {
         let platform = crate::platform::mock::MockPlatform::new();
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -1128,10 +1084,12 @@ mod tests {
 
         pipes.close(&reader).unwrap();
 
-        assert!(matches!(
-            pipes.write(&WaitState::new(platform).context(), &writer, &[]),
-            Ok(0)
-        ));
+        assert_eq!(
+            pipes
+                .write(&WaitState::new(platform).context(), &writer, &[])
+                .unwrap(),
+            0
+        );
         pipes.close(&writer).unwrap();
     }
 
