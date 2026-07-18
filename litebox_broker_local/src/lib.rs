@@ -11,11 +11,14 @@
 
 #![no_std]
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 
 mod error;
 mod event;
+mod pipe;
 
 use litebox_broker_protocol::channel::{LocalControlChannel, LocalNotificationChannel};
 use litebox_broker_protocol::error::ErrorCode;
@@ -103,7 +106,9 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 | ErrorCode::UnknownObject
                 | ErrorCode::InvalidRights
                 | ErrorCode::ResourceExhausted
-                | ErrorCode::WouldBlock => Err(BrokerLocalError::Broker(error)),
+                | ErrorCode::WouldBlock
+                | ErrorCode::PeerClosed
+                | ErrorCode::OutOfMemory => Err(BrokerLocalError::Broker(error)),
                 ErrorCode::UnsupportedVersion
                 | ErrorCode::MalformedRequest
                 | ErrorCode::ProtocolState
@@ -111,7 +116,9 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
                 _ => panic!("broker returned unsupported error: {error}"),
             },
-            response @ (BrokerResponse::Event(_) | BrokerResponse::ObjectClosed) => Ok(response),
+            response @ (BrokerResponse::Event(_)
+            | BrokerResponse::Pipe(_)
+            | BrokerResponse::ObjectClosed) => Ok(response),
         }
     }
 
@@ -125,7 +132,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         match self.request(BrokerRequest::CloseObject(handle))? {
             BrokerResponse::ObjectClosed => Ok(()),
             BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response @ BrokerResponse::Event(_) => {
+            response @ (BrokerResponse::Event(_) | BrokerResponse::Pipe(_)) => {
                 panic!("broker returned unexpected close response: {response:?}");
             }
         }

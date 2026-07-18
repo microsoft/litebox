@@ -635,10 +635,11 @@ mod test {
     #[test]
     fn test_epoll_with_pipe() {
         let (task, epoll) = setup_epoll();
-        let (producer, consumer) =
-            task.global
-                .pipes
-                .create_pipe(2, litebox::pipes::Flags::empty(), None);
+        let (producer, consumer) = task
+            .global
+            .pipes
+            .create_pipe(2, litebox::pipes::Flags::empty(), None)
+            .unwrap();
         let consumer = Arc::new(consumer);
         let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
         epoll

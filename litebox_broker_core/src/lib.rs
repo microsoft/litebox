@@ -20,6 +20,7 @@ extern crate std;
 
 mod error;
 pub mod event;
+pub mod pipe;
 mod policy;
 mod session;
 
@@ -46,17 +47,23 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 pub struct BrokerCoreLimits {
     /// Maximum live object references.
     pub max_references: usize,
+    /// Maximum total capacity in bytes reserved by live pipes.
+    pub max_total_pipe_capacity: usize,
 }
 
 impl BrokerCoreLimits {
     /// Conservative default limits for initial broker deployments.
     pub const DEFAULT: Self = Self {
         max_references: 4096,
+        max_total_pipe_capacity: 64 * 1024 * 1024,
     };
 
     /// Creates a broker core limit set.
-    pub const fn new(max_references: usize) -> Self {
-        Self { max_references }
+    pub const fn new(max_references: usize, max_total_pipe_capacity: usize) -> Self {
+        Self {
+            max_references,
+            max_total_pipe_capacity,
+        }
     }
 }
 
@@ -78,6 +85,7 @@ pub struct BrokerCore {
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
+    pub(crate) reserved_pipe_capacity: Arc<RwLock<usize>>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -100,6 +108,7 @@ impl BrokerCore {
             next_session_id: Arc::new(RwLock::new(1)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
+            reserved_pipe_capacity: Arc::new(RwLock::new(0)),
         })
     }
 

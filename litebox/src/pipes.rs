@@ -12,6 +12,10 @@ use core::{
 };
 
 use alloc::sync::{Arc, Weak};
+use either::Either;
+use litebox_broker_protocol::{
+    ObjectHandle, pipe::MAX_PIPE_TRANSFER_SIZE, readiness::ReadinessFlags,
+};
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Consumer as _, Observer as _, Producer as _, Split as _},
@@ -20,6 +24,11 @@ use thiserror::Error;
 
 use crate::{
     LiteBox,
+    broker::{
+        BrokerControl, BrokerHandleRegistry,
+        error::{BrokerControlError, BrokerObjectError},
+        readiness_events,
+    },
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -65,15 +74,31 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         capacity: usize,
         flags: Flags,
         atomic_slice_guarantee_size: Option<NonZeroUsize>,
-    ) -> (PipeFd<Platform>, PipeFd<Platform>) {
-        let (sender, receiver) =
-            new_pipe::<Platform, u8>(capacity, OFlags::from(flags), atomic_slice_guarantee_size);
-        let sender = PipeEnd::Sender(sender);
-        let receiver = PipeEnd::Receiver(receiver);
+    ) -> Result<(PipeFd<Platform>, PipeFd<Platform>), errors::CreateError> {
+        let (sender, receiver) = if let Some(broker) = self.litebox.broker_control() {
+            let (sender, receiver) = new_broker_pipe(
+                broker,
+                self.litebox.broker_handle_registry(),
+                capacity,
+                OFlags::from(flags),
+                atomic_slice_guarantee_size,
+            )?;
+            (
+                PipeEnd::BrokerSender(sender),
+                PipeEnd::BrokerReceiver(receiver),
+            )
+        } else {
+            let (sender, receiver) = new_pipe::<Platform, u8>(
+                capacity,
+                OFlags::from(flags),
+                atomic_slice_guarantee_size,
+            );
+            (PipeEnd::Sender(sender), PipeEnd::Receiver(receiver))
+        };
         let mut dt = self.litebox.descriptor_table_mut();
         let sender = dt.insert(sender);
         let receiver = dt.insert(receiver);
-        (sender, receiver)
+        Ok((sender, receiver))
     }
 
     /// Close the pipe at `fd`.
@@ -99,11 +124,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ) -> Result<usize, errors::ReadError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
-            PipeEnd::Receiver(p) => Arc::clone(p),
-            PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
+            PipeEnd::Receiver(p) => Either::Left(Arc::clone(p)),
+            PipeEnd::BrokerReceiver(p) => Either::Right(Arc::clone(p)),
+            PipeEnd::Sender(_) | PipeEnd::BrokerSender(_) => {
+                return Err(errors::ReadError::NotForReading);
+            }
         };
         drop(dt);
-        p.read(cx, buf).map_err(From::from)
+        match p {
+            Either::Left(p) => p.read(cx, buf).map_err(From::from),
+            Either::Right(p) => p.read(cx, buf).map_err(From::from),
+        }
     }
 
     /// Write the values in `buf` into the pipe, returning the number of elements written.
@@ -117,11 +148,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ) -> Result<usize, errors::WriteError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?.entry {
-            PipeEnd::Sender(p) => Arc::clone(p),
-            PipeEnd::Receiver(_) => return Err(errors::WriteError::NotForWriting),
+            PipeEnd::Sender(p) => Either::Left(Arc::clone(p)),
+            PipeEnd::BrokerSender(p) => Either::Right(Arc::clone(p)),
+            PipeEnd::Receiver(_) | PipeEnd::BrokerReceiver(_) => {
+                return Err(errors::WriteError::NotForWriting);
+            }
         };
         drop(dt);
-        p.write(cx, buf).map_err(From::from)
+        match p {
+            Either::Left(p) => p.write(cx, buf).map_err(From::from),
+            Either::Right(p) => p.write(cx, buf).map_err(From::from),
+        }
     }
 
     /// Whether the provided FD points to a reader or a writer end.
@@ -131,8 +168,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ) -> Result<HalfPipeType, errors::ClosedError> {
         let dt = self.litebox.descriptor_table();
         match dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
-            PipeEnd::Sender(_) => Ok(HalfPipeType::SenderHalf),
-            PipeEnd::Receiver(_) => Ok(HalfPipeType::ReceiverHalf),
+            PipeEnd::Sender(_) | PipeEnd::BrokerSender(_) => Ok(HalfPipeType::SenderHalf),
+            PipeEnd::Receiver(_) | PipeEnd::BrokerReceiver(_) => Ok(HalfPipeType::ReceiverHalf),
         }
     }
 
@@ -142,6 +179,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         let oflags = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.get_status(),
             PipeEnd::Sender(p) => p.get_status(),
+            PipeEnd::BrokerReceiver(p) | PipeEnd::BrokerSender(p) => p.get_status(),
         };
         Ok(Flags::from_oflags_truncate(oflags))
     }
@@ -159,6 +197,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.set_status(OFlags::from(mask), on),
             PipeEnd::Sender(p) => p.set_status(OFlags::from(mask), on),
+            PipeEnd::BrokerReceiver(p) | PipeEnd::BrokerSender(p) => {
+                p.set_status(OFlags::from(mask), on);
+            }
         }
         Ok(())
     }
@@ -173,6 +214,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Ok(f(p)),
             PipeEnd::Sender(p) => Ok(f(p)),
+            PipeEnd::BrokerReceiver(p) | PipeEnd::BrokerSender(p) => Ok(f(p)),
         }
     }
 }
@@ -187,6 +229,8 @@ pub enum HalfPipeType {
 enum PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Receiver(Arc<ReadEnd<Platform, u8>>),
     Sender(Arc<WriteEnd<Platform, u8>>),
+    BrokerReceiver(Arc<BrokerPipeEnd<Platform>>),
+    BrokerSender(Arc<BrokerPipeEnd<Platform>>),
 }
 
 bitflags::bitflags! {
@@ -226,6 +270,20 @@ pub mod errors {
 
     use thiserror::Error;
 
+    /// Possible errors from [`Pipes::create_pipe`].
+    #[non_exhaustive]
+    #[derive(Error, Debug)]
+    pub enum CreateError {
+        #[error("pipe resource exhausted")]
+        ResourceExhausted,
+        #[error("pipe memory allocation failed")]
+        OutOfMemory,
+        #[error("pipe permission denied")]
+        PermissionDenied,
+        #[error("pipe broker I/O failed")]
+        Io,
+    }
+
     /// Possible errors from [`Pipes::close`]
     #[non_exhaustive]
     #[derive(Error, Debug)]
@@ -243,6 +301,8 @@ pub mod errors {
         WouldBlock,
         #[error("wait error")]
         WaitError(WaitError),
+        #[error("pipe I/O failed")]
+        Io,
     }
 
     /// Possible errors from [`Pipes::write`]
@@ -259,6 +319,8 @@ pub mod errors {
         WouldBlock,
         #[error("wait error")]
         WaitError(WaitError),
+        #[error("pipe I/O failed")]
+        Io,
     }
 
     /// Possible errors from functions that always succeed unless the descriptor is closed.
@@ -266,6 +328,236 @@ pub mod errors {
     pub enum ClosedError {
         #[error("not an open file descriptor")]
         ClosedFd,
+    }
+}
+
+struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    broker: Arc<dyn BrokerControl>,
+    handle: ObjectHandle,
+    registry: Arc<BrokerHandleRegistry<Platform>>,
+    pollee: Arc<Pollee<Platform>>,
+    peer: Weak<Self>,
+    endpoint_type: HalfPipeType,
+    status: AtomicU32,
+}
+
+#[expect(
+    clippy::type_complexity,
+    reason = "a type alias would not make the two pipe endpoint result clearer"
+)]
+fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
+    broker: Arc<dyn BrokerControl>,
+    registry: Arc<BrokerHandleRegistry<Platform>>,
+    capacity: usize,
+    flags: OFlags,
+    atomic_slice_guarantee_size: Option<NonZeroUsize>,
+) -> Result<(Arc<BrokerPipeEnd<Platform>>, Arc<BrokerPipeEnd<Platform>>), errors::CreateError> {
+    let atomic_write_size = atomic_slice_guarantee_size
+        .map(NonZeroUsize::get)
+        .unwrap_or_default();
+    if atomic_write_size > MAX_PIPE_TRANSFER_SIZE as usize {
+        return Err(errors::CreateError::ResourceExhausted);
+    }
+    let response = broker
+        .create_pipe(
+            capacity
+                .try_into()
+                .map_err(|_| errors::CreateError::ResourceExhausted)?,
+            atomic_write_size
+                .try_into()
+                .map_err(|_| errors::CreateError::ResourceExhausted)?,
+        )
+        .map_err(BrokerObjectError::from)
+        .map_err(errors::CreateError::from)?;
+
+    let mut writer = Arc::new(BrokerPipeEnd {
+        broker: Arc::clone(&broker),
+        handle: response.write_handle,
+        registry: Arc::clone(&registry),
+        pollee: Arc::new(Pollee::new()),
+        peer: Weak::new(),
+        endpoint_type: HalfPipeType::SenderHalf,
+        status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
+    });
+    let reader = Arc::new_cyclic(|weak_reader| {
+        Arc::get_mut(&mut writer)
+            .expect("new pipe writer must be uniquely owned")
+            .peer = weak_reader.clone();
+        BrokerPipeEnd {
+            broker,
+            handle: response.read_handle,
+            registry: Arc::clone(&registry),
+            pollee: Arc::new(Pollee::new()),
+            peer: Arc::downgrade(&writer),
+            endpoint_type: HalfPipeType::ReceiverHalf,
+            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
+        }
+    });
+
+    registry.register_pollable(response.write_handle, &writer.pollee);
+    registry.register_pollable(response.read_handle, &reader.pollee);
+    Ok((writer, reader))
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform> {
+    fn get_status(&self) -> OFlags {
+        OFlags::from_bits(self.status.load(Relaxed)).unwrap() & OFlags::STATUS_FLAGS_MASK
+    }
+
+    fn set_status(&self, mask: OFlags, on: bool) {
+        if on {
+            self.status.fetch_or(mask.bits(), Relaxed);
+        } else {
+            self.status.fetch_and(mask.complement().bits(), Relaxed);
+        }
+    }
+
+    fn read(&self, cx: &WaitContext<'_, Platform>, buf: &mut [u8]) -> Result<usize, PipeError> {
+        let length = buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize);
+        if length == 0 {
+            return Ok(0);
+        }
+        let request_length = length
+            .try_into()
+            .expect("pipe transfer limit must fit in u32");
+
+        self.pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
+                Events::IN,
+                || {
+                    let data = self
+                        .broker
+                        .read_pipe(self.handle, request_length)
+                        .map_err(|error| self.broker_request_error(error))?;
+                    if data.len() > length {
+                        return Err(TryOpError::Other(PipeError::Io));
+                    }
+                    buf[..data.len()].copy_from_slice(&data);
+                    if !data.is_empty()
+                        && let Some(peer) = self.peer.upgrade()
+                    {
+                        peer.pollee.notify_observers(Events::OUT);
+                    }
+                    Ok(data.len())
+                },
+            )
+            .map_err(PipeError::from)
+    }
+
+    fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, PipeError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let nonblock = self.get_status().contains(OFlags::NONBLOCK);
+        if nonblock {
+            let data = &buf[..buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize)];
+            return self
+                .pollee
+                .wait(cx, nonblock, Events::OUT, || self.try_write(data))
+                .map_err(PipeError::from);
+        }
+
+        let mut total_written = 0;
+        while total_written < buf.len() {
+            let end = total_written
+                .saturating_add(MAX_PIPE_TRANSFER_SIZE as usize)
+                .min(buf.len());
+            let data = &buf[total_written..end];
+            match self
+                .pollee
+                .wait(cx, false, Events::OUT, || self.try_write(data))
+            {
+                Ok(written) => total_written += written,
+                Err(_) if total_written != 0 => return Ok(total_written),
+                Err(error) => return Err(PipeError::from(error)),
+            }
+        }
+        Ok(total_written)
+    }
+
+    fn try_write(&self, data: &[u8]) -> Result<usize, TryOpError<PipeError>> {
+        let written = self
+            .broker
+            .write_pipe(self.handle, data)
+            .map_err(|error| self.broker_request_error(error))?;
+        if written > data.len() || (written == 0 && !data.is_empty()) {
+            return Err(TryOpError::Other(PipeError::Io));
+        }
+        if written != 0
+            && let Some(peer) = self.peer.upgrade()
+        {
+            peer.pollee.notify_observers(Events::IN);
+        }
+        Ok(written)
+    }
+
+    fn broker_request_error(&self, error: BrokerControlError) -> BrokerObjectError {
+        let error = error.into();
+        if error != BrokerObjectError::WouldBlock {
+            self.pollee.notify_observers(Events::ERR);
+        }
+        error
+    }
+
+    fn readiness(&self) -> Result<ReadinessFlags, BrokerControlError> {
+        self.broker.check_pipe_readiness(self.handle)
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerPipeEnd<Platform> {
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, filter: Events) {
+        self.pollee.register_observer(observer, filter);
+    }
+
+    fn check_io_events(&self) -> Events {
+        match self.readiness() {
+            Ok(readiness) => readiness_events(readiness),
+            Err(_) => Events::ERR,
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for BrokerPipeEnd<Platform> {
+    fn drop(&mut self) {
+        self.registry.unregister_pollable(self.handle, &self.pollee);
+        let _ = self.broker.close_object(self.handle);
+        if let Some(peer) = self.peer.upgrade() {
+            let event = match self.endpoint_type {
+                HalfPipeType::SenderHalf => Events::HUP,
+                HalfPipeType::ReceiverHalf => Events::ERR,
+            };
+            peer.pollee.notify_observers(event);
+        }
+    }
+}
+
+impl From<BrokerObjectError> for TryOpError<PipeError> {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::WouldBlock => TryOpError::TryAgain,
+            BrokerObjectError::PeerClosed => TryOpError::Other(PipeError::PeerShutdown),
+            BrokerObjectError::Control
+            | BrokerObjectError::InvalidObject
+            | BrokerObjectError::ResourceExhausted
+            | BrokerObjectError::PermissionDenied
+            | BrokerObjectError::OutOfMemory => TryOpError::Other(PipeError::Io),
+        }
+    }
+}
+
+impl From<BrokerObjectError> for errors::CreateError {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::ResourceExhausted => Self::ResourceExhausted,
+            BrokerObjectError::OutOfMemory => Self::OutOfMemory,
+            BrokerObjectError::PermissionDenied => Self::PermissionDenied,
+            BrokerObjectError::Control
+            | BrokerObjectError::InvalidObject
+            | BrokerObjectError::WouldBlock
+            | BrokerObjectError::PeerClosed => Self::Io,
+        }
     }
 }
 
@@ -351,15 +643,15 @@ enum PipeError {
     WouldBlock,
     #[error("wait error")]
     WaitError(WaitError),
+    #[error("pipe I/O failed")]
+    Io,
 }
 
 impl From<PipeError> for errors::ReadError {
     fn from(err: PipeError) -> Self {
         match err {
             PipeError::ThisEndShutdown => errors::ReadError::ClosedFd,
-            PipeError::PeerShutdown => {
-                unreachable!("unreachable for now; see documentation of `read`")
-            }
+            PipeError::PeerShutdown | PipeError::Io => errors::ReadError::Io,
             PipeError::WouldBlock => errors::ReadError::WouldBlock,
             PipeError::WaitError(e) => errors::ReadError::WaitError(e),
         }
@@ -372,6 +664,7 @@ impl From<PipeError> for errors::WriteError {
             PipeError::PeerShutdown => errors::WriteError::ReadEndClosed,
             PipeError::WouldBlock => errors::WriteError::WouldBlock,
             PipeError::WaitError(e) => errors::WriteError::WaitError(e),
+            PipeError::Io => errors::WriteError::Io,
         }
     }
 }
@@ -631,29 +924,291 @@ fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use alloc::sync::Arc;
+    use litebox_broker_local::BrokerLocal;
+    use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::error::ErrorCode;
+    use litebox_broker_protocol::message::{
+        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
+        BrokerResponse, PipeRequest, PipeResponse, ReadinessNotification,
+    };
+    use litebox_broker_protocol::pipe::CreatePipeResponse;
+    use litebox_broker_protocol::readiness::ReadinessFlags;
+    use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle};
+
     use crate::{
-        event::wait::WaitState,
+        event::{Events, observer::Observer, wait::WaitState},
         pipes::errors::{ReadError, WriteError},
     };
 
     extern crate std;
 
     #[test]
+    fn broker_control_failure_notifies_all_pipe_observers() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let force_transport = Arc::new(AtomicBool::new(false));
+        let local = BrokerLocal::negotiate(FailingPipeChannel {
+            last_request: None,
+            request_count: Arc::clone(&request_count),
+            read_failure: ReadFailure::Transport,
+            force_transport,
+        })
+        .unwrap();
+        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
+        let pipes = super::Pipes::new(&litebox);
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+        let writer_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let writer_observer_dyn: Arc<dyn Observer<Events>> = writer_observer.clone();
+        pipes
+            .with_iopollable(&writer, |pollable| {
+                pollable.register_observer(Arc::downgrade(&writer_observer_dyn), Events::ERR);
+            })
+            .unwrap();
+        let reader_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let reader_observer_dyn: Arc<dyn Observer<Events>> = reader_observer.clone();
+        pipes
+            .with_iopollable(&reader, |pollable| {
+                pollable.register_observer(Arc::downgrade(&reader_observer_dyn), Events::ERR);
+            })
+            .unwrap();
+
+        let mut value = 0;
+        assert!(matches!(
+            pipes.read(
+                &WaitState::new(platform).context(),
+                &reader,
+                core::slice::from_mut(&mut value),
+            ),
+            Err(ReadError::Io)
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert!(writer_observer.0.load(Ordering::SeqCst));
+        assert!(reader_observer.0.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn broker_notification_failure_prevents_future_control_requests() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let force_transport = Arc::new(AtomicBool::new(false));
+        let local = BrokerLocal::negotiate(FailingPipeChannel {
+            last_request: None,
+            request_count: Arc::clone(&request_count),
+            read_failure: ReadFailure::Transport,
+            force_transport,
+        })
+        .unwrap();
+        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
+        let pipes = super::Pipes::new(&litebox);
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+        let writer_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let writer_observer_dyn: Arc<dyn Observer<Events>> = writer_observer.clone();
+        pipes
+            .with_iopollable(&writer, |pollable| {
+                pollable.register_observer(Arc::downgrade(&writer_observer_dyn), Events::ERR);
+            })
+            .unwrap();
+        let reader_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let reader_observer_dyn: Arc<dyn Observer<Events>> = reader_observer.clone();
+        pipes
+            .with_iopollable(&reader, |pollable| {
+                pollable.register_observer(Arc::downgrade(&reader_observer_dyn), Events::ERR);
+            })
+            .unwrap();
+
+        litebox.broker_failure_dispatcher()();
+
+        assert!(writer_observer.0.load(Ordering::SeqCst));
+        assert!(reader_observer.0.load(Ordering::SeqCst));
+        assert!(matches!(
+            litebox
+                .broker_control()
+                .unwrap()
+                .read_pipe(ObjectHandle(1), 1),
+            Err(crate::broker::error::BrokerControlError::Transport)
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn broker_failure_wakes_blocked_pipe_read() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let force_transport = Arc::new(AtomicBool::new(false));
+        let local = BrokerLocal::negotiate(FailingPipeChannel {
+            last_request: None,
+            request_count: Arc::clone(&request_count),
+            read_failure: ReadFailure::WouldBlock,
+            force_transport: Arc::clone(&force_transport),
+        })
+        .unwrap();
+        let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));
+        let pipes = super::Pipes::new(&litebox);
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let read_litebox = Arc::clone(&litebox);
+        let read_thread = std::thread::spawn(move || {
+            let pipes = super::Pipes::new(&read_litebox);
+            let mut value = 0;
+            result_sender
+                .send(pipes.read(
+                    &WaitState::new(platform).context(),
+                    &reader,
+                    core::slice::from_mut(&mut value),
+                ))
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut setup_completed = true;
+        while request_count.load(Ordering::SeqCst) < 3 {
+            if std::time::Instant::now() >= deadline {
+                setup_completed = false;
+                force_transport.store(true, Ordering::SeqCst);
+                let _ = pipes.close(&writer);
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        if setup_completed {
+            litebox.dispatch_broker_notification(BrokerNotification::Readiness(
+                ReadinessNotification {
+                    handle: ObjectHandle(1),
+                    events: ReadinessFlags::READ,
+                },
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while request_count.load(Ordering::SeqCst) < 4 {
+                if std::time::Instant::now() >= deadline {
+                    setup_completed = false;
+                    force_transport.store(true, Ordering::SeqCst);
+                    let _ = pipes.close(&writer);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        if setup_completed {
+            litebox.broker_failure_dispatcher()();
+        }
+
+        let initial_read_result = result_receiver.recv_timeout(std::time::Duration::from_secs(1));
+        let woke_without_cleanup = initial_read_result.is_ok();
+        let mut read_result = initial_read_result.ok();
+        if read_result.is_none() {
+            force_transport.store(true, Ordering::SeqCst);
+            let _ = pipes.close(&writer);
+            read_result = result_receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .ok();
+        }
+        if read_result.is_some() {
+            read_thread.join().unwrap();
+        } else {
+            std::process::abort();
+        }
+
+        assert!(setup_completed);
+        assert!(woke_without_cleanup);
+        assert!(matches!(read_result, Some(Err(ReadError::Io))));
+        assert_eq!(request_count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
     fn local_zero_length_write_succeeds_after_reader_closes() {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = crate::LiteBox::new(platform);
         let pipes = super::Pipes::new(&litebox);
-        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None);
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
 
         pipes.close(&reader).unwrap();
 
-        assert_eq!(
-            pipes
-                .write(&WaitState::new(platform).context(), &writer, &[])
-                .unwrap(),
-            0
-        );
+        assert!(matches!(
+            pipes.write(&WaitState::new(platform).context(), &writer, &[]),
+            Ok(0)
+        ));
         pipes.close(&writer).unwrap();
+    }
+
+    struct ErrorObserver(AtomicBool);
+
+    impl Observer<Events> for ErrorObserver {
+        fn on_events(&self, events: &Events) {
+            if events.contains(Events::ERR) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingPipeChannel {
+        last_request: Option<BrokerRequest>,
+        request_count: Arc<AtomicUsize>,
+        read_failure: ReadFailure,
+        force_transport: Arc<AtomicBool>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadFailure {
+        Transport,
+        WouldBlock,
+    }
+
+    impl LocalControlChannel for FailingPipeChannel {
+        type Error = ();
+
+        fn send_handshake_request(
+            &mut self,
+            _request: &BrokerHandshakeRequest,
+        ) -> core::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn recv_handshake_response(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
+            Ok(Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            }))
+        }
+
+        fn send_request(
+            &mut self,
+            request: &BrokerRequest,
+        ) -> core::result::Result<(), Self::Error> {
+            self.last_request = Some(request.clone());
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
+            match self.last_request.take().unwrap() {
+                BrokerRequest::Pipe(PipeRequest::Create(_)) => Ok(Some(BrokerResponse::Pipe(
+                    PipeResponse::Create(CreatePipeResponse {
+                        read_handle: ObjectHandle(1),
+                        write_handle: ObjectHandle(2),
+                    }),
+                ))),
+                BrokerRequest::Pipe(PipeRequest::Read(_))
+                    if self.force_transport.load(Ordering::SeqCst) =>
+                {
+                    Err(())
+                }
+                BrokerRequest::Pipe(PipeRequest::Read(_)) => match self.read_failure {
+                    ReadFailure::Transport => Err(()),
+                    ReadFailure::WouldBlock => {
+                        Ok(Some(BrokerResponse::Error(ErrorCode::WouldBlock)))
+                    }
+                },
+                BrokerRequest::CloseObject(_) => Ok(Some(BrokerResponse::ObjectClosed)),
+                request => panic!("unexpected broker request: {request:?}"),
+            }
+        }
     }
 
     #[test]
@@ -662,7 +1217,7 @@ mod tests {
         let litebox = &crate::LiteBox::new(platform);
         let pipes = &super::Pipes::new(litebox);
 
-        let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None);
+        let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
@@ -696,7 +1251,9 @@ mod tests {
         let litebox = &crate::LiteBox::new(platform);
         let pipes = &super::Pipes::new(litebox);
 
-        let (prod, cons) = pipes.create_pipe(2, super::Flags::NON_BLOCKING, None);
+        let (prod, cons) = pipes
+            .create_pipe(2, super::Flags::NON_BLOCKING, None)
+            .unwrap();
 
         std::thread::scope(|scope| {
             scope.spawn(move || {

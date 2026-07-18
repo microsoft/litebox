@@ -16,6 +16,7 @@ pub mod channel;
 pub mod error;
 pub mod event;
 pub mod message;
+pub mod pipe;
 pub mod readiness;
 pub mod wire;
 

@@ -10,7 +10,7 @@ use std::{
 };
 
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c"];
+const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c"];
 
 #[must_use]
 struct Runner {
@@ -473,6 +473,12 @@ console.log(content);
     let true_path = run_which("true");
     let node_path = run_which("node");
     let target = common::compile("./tests/eventfd.c", "broker_eventfd_rewriter", false, false);
+    let pipe_target = common::compile(
+        "./tests/pipe_broker.c",
+        "broker_pipe_rewriter",
+        false,
+        false,
+    );
     let control_socket_path = unique_test_socket_path("runner-broker-control");
     let notification_socket_path = unique_test_socket_path("runner-broker-notification");
     let broker_thread = spawn_test_broker(
@@ -481,7 +487,7 @@ console.log(content);
         litebox_broker_core::PolicyEngine::with_unauthenticated_rights(
             litebox_broker_core::ObjectRights::all(),
         ),
-        3,
+        4,
     );
 
     Runner::new(&true_path, "broker_true_rewriter")
@@ -494,6 +500,12 @@ console.log(content);
         .run();
     // eventfd.c creates thirteen eventfd objects; each should release one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 13);
+
+    Runner::new(&pipe_target, "broker_pipe_rewriter")
+        .broker_sockets(&control_socket_path, &notification_socket_path)
+        .run();
+    // pipe_broker.c creates five pipes; each endpoint owns one broker object.
+    assert_eq!(broker_thread.next_close_object_count(), 10);
 
     Runner::new(&node_path, "hello_node_broker_rewriter")
         .broker_sockets(&control_socket_path, &notification_socket_path)

@@ -21,6 +21,10 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse, WaitEventResponse};
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerRequest, BrokerResponse, EventRequest, EventResponse,
+    PipeRequest, PipeResponse,
+};
+use litebox_broker_protocol::pipe::{
+    CheckPipeReadinessResponse, CreatePipeResponse, ReadPipeResponse, WritePipeResponse,
 };
 
 mod error;
@@ -119,6 +123,46 @@ fn handle_request(session: &BrokerSession, request: BrokerRequest) -> BrokerResp
             Err(error) => BrokerResponse::Error(error.into()),
         },
         BrokerRequest::Event(request) => handle_event_request(session, request),
+        BrokerRequest::Pipe(request) => handle_pipe_request(session, request),
+    }
+}
+
+fn handle_pipe_request(session: &BrokerSession, request: PipeRequest) -> BrokerResponse {
+    let response = match request {
+        PipeRequest::Create(request) => {
+            litebox_broker_core::pipe::create(session, request.capacity, request.atomic_write_size)
+                .map(|(read_handle, write_handle)| {
+                    PipeResponse::Create(CreatePipeResponse {
+                        read_handle,
+                        write_handle,
+                    })
+                })
+        }
+        PipeRequest::Read(request) => {
+            litebox_broker_core::pipe::read(session, request.handle, request.length)
+                .map(|data| PipeResponse::Read(ReadPipeResponse { data }))
+        }
+        PipeRequest::Write(request) => {
+            litebox_broker_core::pipe::write(session, request.handle, &request.data).and_then(
+                |written| {
+                    Ok(PipeResponse::Write(WritePipeResponse {
+                        written: written
+                            .try_into()
+                            .map_err(|_| litebox_broker_core::BrokerError::ResourceExhausted)?,
+                    }))
+                },
+            )
+        }
+        PipeRequest::CheckReadiness(request) => {
+            litebox_broker_core::pipe::check_readiness(session, request.handle).map(|readiness| {
+                PipeResponse::CheckReadiness(CheckPipeReadinessResponse { readiness })
+            })
+        }
+    };
+
+    match response {
+        Ok(response) => BrokerResponse::Pipe(response),
+        Err(error) => BrokerResponse::Error(error.into()),
     }
 }
 
