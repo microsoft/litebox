@@ -25,7 +25,7 @@ use thiserror::Error;
 use crate::{
     LiteBox,
     broker::{
-        BrokerControl, BrokerHandleRegistry,
+        BrokerControl, BrokerPollableRegistry,
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
@@ -78,7 +78,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         let (sender, receiver) = if let Some(broker) = self.litebox.broker_control() {
             let (sender, receiver) = new_broker_pipe(
                 broker,
-                self.litebox.broker_handle_registry(),
+                self.litebox.broker_pollable_registry(),
                 capacity,
                 OFlags::from(flags),
                 atomic_slice_guarantee_size,
@@ -334,7 +334,7 @@ pub mod errors {
 struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
-    registry: Arc<BrokerHandleRegistry<Platform>>,
+    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
     peer: Weak<Self>,
     endpoint_type: HalfPipeType,
@@ -347,7 +347,7 @@ struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 )]
 fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
     broker: Arc<dyn BrokerControl>,
-    registry: Arc<BrokerHandleRegistry<Platform>>,
+    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     capacity: usize,
     flags: OFlags,
     atomic_slice_guarantee_size: Option<NonZeroUsize>,
@@ -373,7 +373,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
     let mut writer = Arc::new(BrokerPipeEnd {
         broker: Arc::clone(&broker),
         handle: response.write_handle,
-        registry: Arc::clone(&registry),
+        pollable_registry: Arc::clone(&pollable_registry),
         pollee: Arc::new(Pollee::new()),
         peer: Weak::new(),
         endpoint_type: HalfPipeType::SenderHalf,
@@ -386,7 +386,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         BrokerPipeEnd {
             broker,
             handle: response.read_handle,
-            registry: Arc::clone(&registry),
+            pollable_registry: Arc::clone(&pollable_registry),
             pollee: Arc::new(Pollee::new()),
             peer: Arc::downgrade(&writer),
             endpoint_type: HalfPipeType::ReceiverHalf,
@@ -394,8 +394,8 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         }
     });
 
-    registry.register_pollable(response.write_handle, &writer.pollee);
-    registry.register_pollable(response.read_handle, &reader.pollee);
+    pollable_registry.register_pollable(response.write_handle, &writer.pollee);
+    pollable_registry.register_pollable(response.read_handle, &reader.pollee);
     Ok((writer, reader))
 }
 
@@ -521,7 +521,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerPi
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for BrokerPipeEnd<Platform> {
     fn drop(&mut self) {
-        self.registry.unregister_pollable(self.handle, &self.pollee);
+        self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
         if let Some(peer) = self.peer.upgrade() {
             let event = match self.endpoint_type {
@@ -1078,7 +1078,7 @@ mod tests {
             litebox.dispatch_broker_notification(BrokerNotification::Readiness(
                 ReadinessNotification {
                     handle: ObjectHandle(1),
-                    events: ReadinessFlags::READ,
+                    readiness: ReadinessFlags::READ,
                 },
             ));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -1206,7 +1206,9 @@ mod tests {
                     }
                 },
                 BrokerRequest::CloseObject(_) => Ok(Some(BrokerResponse::ObjectClosed)),
-                request => panic!("unexpected broker request: {request:?}"),
+                request @ (BrokerRequest::Pipe(_) | BrokerRequest::Event(_)) => {
+                    panic!("unexpected broker request: {request:?}")
+                }
             }
         }
     }

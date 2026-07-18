@@ -450,7 +450,7 @@ mod tests {
                     }
                 }
                 BrokerRequest::CloseObject(_) => BrokerResponse::ObjectClosed,
-                request @ BrokerRequest::Event(_) => {
+                request @ (BrokerRequest::Event(_) | BrokerRequest::Pipe(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
             };
