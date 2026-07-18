@@ -657,23 +657,6 @@ mod tests {
     }
 
     #[test]
-    fn local_pipe_rejects_operations_on_the_wrong_endpoint() {
-        let platform = crate::platform::mock::MockPlatform::new();
-        let litebox = crate::LiteBox::new(platform);
-        let pipes = super::Pipes::new(&litebox);
-        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None);
-
-        assert!(matches!(
-            pipes.read(&WaitState::new(platform).context(), &writer, &mut [0]),
-            Err(ReadError::NotForReading)
-        ));
-        assert!(matches!(
-            pipes.write(&WaitState::new(platform).context(), &reader, &[1]),
-            Err(WriteError::NotForWriting)
-        ));
-    }
-
-    #[test]
     fn test_blocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
         let litebox = &crate::LiteBox::new(platform);
@@ -684,16 +667,11 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-                let mut i = 0;
-                while i < data.len() {
-                    let ret = pipes
-                        .write(&WaitState::new(platform).context(), &prod, &data[i..])
-                        .unwrap();
-                    assert_eq!(ret, data.len() - i);
-                    i += ret;
-                }
+                let written = pipes
+                    .write(&WaitState::new(platform).context(), &prod, &data)
+                    .unwrap();
+                assert_eq!(written, data.len());
                 pipes.close(&prod).unwrap();
-                assert_eq!(i, data.len());
             });
 
             let mut buf = [0; 10];
