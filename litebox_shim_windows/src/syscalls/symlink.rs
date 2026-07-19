@@ -48,14 +48,6 @@ impl SymbolicLinkAccess {
             Self::ALL_ACCESS.bits(),
         ))
     }
-
-    fn require(self, required: Self) -> Result<(), NtStatus> {
-        if self.contains(required) {
-            Ok(())
-        } else {
-            Err(NtStatus::ACCESS_DENIED)
-        }
-    }
 }
 
 pub(crate) struct SymbolicLinkSubsystem<Platform>(PhantomData<fn(Platform)>);
@@ -65,6 +57,22 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for SymbolicLinkSubsystem
 }
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for SymbolicLinkHandleObject<Platform> {}
+
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+    for SymbolicLinkSubsystem<Platform>
+{
+    fn granted_access(entry: &Self::Entry) -> u32 {
+        entry.granted_access.bits()
+    }
+
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        SymbolicLinkAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn maximum_allowed_access() -> u32 {
+        SymbolicLinkAccess::ALL_ACCESS.bits()
+    }
+}
 
 pub(crate) struct SymbolicLinkHandleObject<Platform: crate::ShimPlatform> {
     link: Arc<ObjectNode<Platform>>,
@@ -234,15 +242,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         link_target: MutPtr<Platform, UnicodeString>,
         returned_length: Option<MutPtr<Platform, u32>>,
     ) -> NtStatus {
+        if let Err(status) = self.require_handle_access::<SymbolicLinkSubsystem<Platform>>(
+            link_handle,
+            SymbolicLinkAccess::QUERY.bits(),
+        ) {
+            return status;
+        }
         let entry = match self.symbolic_link_entry(link_handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        if let Err(status) =
-            entry.with_entry(|entry| entry.granted_access.require(SymbolicLinkAccess::QUERY))
-        {
-            return status;
-        }
         if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(link_target) {
             return status;
         }

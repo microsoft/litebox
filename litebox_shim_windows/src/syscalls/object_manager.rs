@@ -107,14 +107,6 @@ impl DirectoryAccess {
             Self::ALL_ACCESS.bits(),
         ))
     }
-
-    fn require(self, required: Self) -> Result<(), NtStatus> {
-        if self.contains(required) {
-            Ok(())
-        } else {
-            Err(NtStatus::ACCESS_DENIED)
-        }
-    }
 }
 
 pub(crate) struct DirectoryObjectSubsystem<Platform>(PhantomData<fn(Platform)>);
@@ -124,6 +116,22 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for DirectoryObjectSubsys
 }
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for DirectoryHandleObject<Platform> {}
+
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+    for DirectoryObjectSubsystem<Platform>
+{
+    fn granted_access(entry: &Self::Entry) -> u32 {
+        entry.granted_access.bits()
+    }
+
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        DirectoryAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn maximum_allowed_access() -> u32 {
+        DirectoryAccess::ALL_ACCESS.bits()
+    }
+}
 
 pub(crate) struct DirectoryHandleObject<Platform: crate::ShimPlatform> {
     directory: Arc<ObjectNode<Platform>>,
@@ -998,11 +1006,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         handle: Handle,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+        self.require_handle_access::<DirectoryObjectSubsystem<Platform>>(
+            handle,
+            DirectoryAccess::TRAVERSE.bits(),
+        )?;
         let entry = self.directory_entry(handle)?;
-        entry.with_entry(|entry| {
-            entry.granted_access.require(DirectoryAccess::TRAVERSE)?;
-            Ok(Arc::clone(&entry.directory))
-        })
+        Ok(entry.with_entry(|entry| Arc::clone(&entry.directory)))
     }
 
     pub(super) fn read_directory_object_attributes(
@@ -1223,15 +1232,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         params: DirectoryQueryParameters<Platform>,
     ) -> NtStatus {
+        if let Err(status) = self.require_handle_access::<DirectoryObjectSubsystem<Platform>>(
+            params.directory_handle,
+            DirectoryAccess::QUERY.bits(),
+        ) {
+            return status;
+        }
         let entry = match self.directory_entry(params.directory_handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        if let Err(status) =
-            entry.with_entry(|entry| entry.granted_access.require(DirectoryAccess::QUERY))
-        {
-            return status;
-        }
         let directory = entry.with_entry(|entry| Arc::clone(&entry.directory));
         let entries = match directory.children_snapshot() {
             Ok(entries) => entries,

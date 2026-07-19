@@ -12,9 +12,7 @@ use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 const TIMER2_ATTRIBUTE_IR_TIMER: u32 = 0x0000_0002;
 const TIMER2_ATTRIBUTE_HIGH_RESOLUTION: u32 = 0x0000_0004;
@@ -74,19 +72,23 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for TimerSubsystem<Platfo
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for TimerHandleObject<Platform> {}
 
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for TimerSubsystem<Platform> {
+    fn granted_access(entry: &Self::Entry) -> u32 {
+        entry.granted_access.bits()
+    }
+
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        TimerAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn maximum_allowed_access() -> u32 {
+        TimerAccess::ALL_ACCESS.bits()
+    }
+}
+
 pub(crate) struct TimerHandleObject<Platform: crate::ShimPlatform> {
     _timer: Arc<TimerObject<Platform>>,
     granted_access: TimerAccess,
-}
-
-impl<Platform: crate::ShimPlatform> TimerHandleObject<Platform> {
-    pub(crate) fn require_access(&self, required: TimerAccess) -> Result<(), NtStatus> {
-        if self.granted_access.contains(required) {
-            Ok(())
-        } else {
-            Err(NtStatus::ACCESS_DENIED)
-        }
-    }
 }
 
 pub(crate) struct TimerObject<Platform: crate::ShimPlatform> {
@@ -131,18 +133,6 @@ fn validate_timer2_after_output<Platform: RawPointerProvider>(
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    fn timer_entry(
-        &self,
-        handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, TimerSubsystem<Platform>>, NtStatus> {
-        raw_handle_entry::<Platform, TimerSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-        )
-        .ok_or(NtStatus::INVALID_HANDLE)
-    }
-
     fn insert_timer_handle(
         &self,
         timer: Arc<TimerObject<Platform>>,
@@ -201,16 +191,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         period: Option<ConstPtr<Platform, i64>>,
         parameters: Option<ConstPtr<Platform, u8>>,
     ) -> NtStatus {
-        let timer = match self.timer_entry(timer_handle) {
-            Ok(timer) => timer,
-            Err(status) => return status,
-        };
-        if let Err(status) =
-            timer.with_entry(|timer| timer.require_access(TimerAccess::MODIFY_STATE))
-        {
+        if let Err(status) = self.require_handle_access::<TimerSubsystem<Platform>>(
+            timer_handle,
+            TimerAccess::MODIFY_STATE.bits(),
+        ) {
             return status;
         }
-
         let _due_time = match due_time {
             Some(due_time) => match due_time.read_at_offset(0) {
                 Some(due_time) => Some(due_time),

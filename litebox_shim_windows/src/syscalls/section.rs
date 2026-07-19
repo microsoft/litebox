@@ -61,6 +61,20 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for SectionSubsystem<Platform> {
 
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for SectionHandleObject<Platform> {}
 
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for SectionSubsystem<Platform> {
+    fn granted_access(entry: &Self::Entry) -> u32 {
+        entry.granted_access.bits()
+    }
+
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        SectionAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn maximum_allowed_access() -> u32 {
+        SectionAccess::ALL_ACCESS.bits()
+    }
+}
+
 pub(crate) struct SectionHandleObject<Platform: ShimPlatform> {
     section: Arc<SectionObject<Platform>>,
     granted_access: SectionAccess,
@@ -165,14 +179,6 @@ impl SectionAccess {
             access.insert(Self::ALL_ACCESS);
         }
         access
-    }
-
-    fn require(self, required: Self) -> Result<(), NtStatus> {
-        if self.contains(required) {
-            Ok(())
-        } else {
-            Err(NtStatus::ACCESS_DENIED)
-        }
     }
 }
 
@@ -451,20 +457,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         else {
             return NtStatus::INVALID_INFO_CLASS;
         };
+        if let Err(status) = self.require_handle_access::<SectionSubsystem<Platform>>(
+            section_handle,
+            SectionAccess::QUERY.bits(),
+        ) {
+            return status;
+        }
         let entry = match self.section_entry(section_handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        let result = entry.with_entry(|entry| {
-            entry
-                .granted_access
-                .require(SectionAccess::QUERY)
-                .map(|()| Arc::clone(&entry.section))
-        });
-        let section = match result {
-            Ok(section) => section,
-            Err(status) => return status,
-        };
+        let section = entry.with_entry(|entry| Arc::clone(&entry.section));
         match information_class {
             SectionInformationClass::Basic => write_section_basic_information::<Platform>(
                 &section,
@@ -516,20 +519,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
+        if let Err(status) = self.require_handle_access::<SectionSubsystem<Platform>>(
+            request.section_handle,
+            required_map_access(page_protection).bits(),
+        ) {
+            return status;
+        }
         let entry = match self.section_entry(request.section_handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        let result = entry.with_entry(|entry| {
-            entry
-                .granted_access
-                .require(required_map_access(page_protection))
-                .map(|()| Arc::clone(&entry.section))
-        });
-        let section = match result {
-            Ok(section) => section,
-            Err(status) => return status,
-        };
+        let section = entry.with_entry(|entry| Arc::clone(&entry.section));
         match section.backing {
             SectionBacking::Pagefile => self.map_pagefile_section(
                 request,
@@ -659,13 +659,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         section_handle: Handle,
         requested_view_size: usize,
     ) -> Result<MappedPagefileSectionView, NtStatus> {
+        self.require_handle_access::<SectionSubsystem<Platform>>(
+            section_handle,
+            (SectionAccess::MAP_READ | SectionAccess::MAP_WRITE).bits(),
+        )?;
         let entry = self.section_entry(section_handle)?;
-        let section = entry.with_entry(|entry| {
-            entry
-                .granted_access
-                .require(SectionAccess::MAP_READ | SectionAccess::MAP_WRITE)
-                .map(|()| Arc::clone(&entry.section))
-        })?;
+        let section = entry.with_entry(|entry| Arc::clone(&entry.section));
         let page_protection = PageProtection::PAGE_READWRITE;
         let Some((_, permissions)) = parse_page_protection(page_protection.bits()) else {
             return Err(NtStatus::INVALID_PAGE_PROTECTION);

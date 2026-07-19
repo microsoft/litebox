@@ -70,14 +70,6 @@ impl EventAccess {
             Self::ALL_ACCESS.bits(),
         ))
     }
-
-    fn require(self, required: Self) -> Result<(), NtStatus> {
-        if self.contains(required) {
-            Ok(())
-        } else {
-            Err(NtStatus::ACCESS_DENIED)
-        }
-    }
 }
 
 pub(crate) struct EventSubsystem<Platform>(PhantomData<fn(Platform)>);
@@ -87,6 +79,20 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for EventSubsystem<Platfo
 }
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for EventHandleObject<Platform> {}
+
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for EventSubsystem<Platform> {
+    fn granted_access(entry: &Self::Entry) -> u32 {
+        entry.granted_access.bits()
+    }
+
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        EventAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn maximum_allowed_access() -> u32 {
+        EventAccess::ALL_ACCESS.bits()
+    }
+}
 
 pub(crate) struct EventHandleObject<Platform: crate::ShimPlatform> {
     event: Arc<EventObject<Platform>>,
@@ -158,10 +164,6 @@ impl<Platform: crate::ShimPlatform> EventObject<Platform> {
 }
 
 impl<Platform: crate::ShimPlatform> EventHandleObject<Platform> {
-    pub(crate) fn require_access(&self, required: EventAccess) -> Result<(), NtStatus> {
-        self.granted_access.require(required)
-    }
-
     pub(crate) fn is_signaled(&self) -> bool {
         self.event.is_signaled()
     }
@@ -411,8 +413,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn check_event_modify_access(&self, event_handle: Handle) -> Result<(), NtStatus> {
-        let entry = self.event_entry(event_handle)?;
-        entry.with_entry(|entry| entry.granted_access.require(EventAccess::MODIFY_STATE))
+        self.require_handle_access::<EventSubsystem<Platform>>(
+            event_handle,
+            EventAccess::MODIFY_STATE.bits(),
+        )
     }
 
     pub(crate) fn sys_nt_reset_event(
@@ -488,19 +492,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
-        let Ok(entry) = self.event_entry(event_handle) else {
-            return NtStatus::INVALID_HANDLE;
-        };
-        let query = entry.with_entry(|entry| {
-            entry
-                .granted_access
-                .require(EventAccess::QUERY_STATE)
-                .map(|()| entry.event.query())
-        });
-        let info = match query {
-            Ok(info) => info,
+        if let Err(status) = self.require_handle_access::<EventSubsystem<Platform>>(
+            event_handle,
+            EventAccess::QUERY_STATE.bits(),
+        ) {
+            return status;
+        }
+        let entry = match self.event_entry(event_handle) {
+            Ok(entry) => entry,
             Err(status) => return status,
         };
+        let info = entry.with_entry(|entry| entry.event.query());
         if event_information.write_at_offset(0, info).is_none() {
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -520,11 +522,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         previous_state: Option<MutPtr<Platform, i32>>,
         op: impl FnOnce(&EventObject<Platform>) -> Result<i32, NtStatus>,
     ) -> Result<(), NtStatus> {
+        self.require_handle_access::<EventSubsystem<Platform>>(
+            event_handle,
+            EventAccess::MODIFY_STATE.bits(),
+        )?;
         let entry = self.event_entry(event_handle)?;
-        let previous = entry.with_entry(|entry| {
-            entry.granted_access.require(EventAccess::MODIFY_STATE)?;
-            op(&entry.event)
-        })?;
+        let previous = entry.with_entry(|entry| op(&entry.event))?;
         if let Some(previous_state) = previous_state
             && previous_state.write_at_offset(0, previous).is_none()
         {

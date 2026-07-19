@@ -124,6 +124,15 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtClose {
         handle: Handle,
     },
+    NtDuplicateObject {
+        source_process_handle: ProcessHandle,
+        source_handle: Handle,
+        target_process_handle: ProcessHandle,
+        target_handle: Option<Platform::RawMutPointer<Handle>>,
+        desired_access: u32,
+        handle_attributes: u32,
+        options: u32,
+    },
     NtCreateEvent {
         event_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -554,6 +563,15 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         match NtSysno::from_raw(pt_regs.orig_rax)? {
             NtSysno::NtClose => Some(sys_req!(NtClose {
                 handle: { Handle::from_raw },
+            })),
+            NtSysno::NtDuplicateObject => Some(sys_req!(NtDuplicateObject {
+                source_process_handle: { ProcessHandle::from_raw },
+                source_handle: { Handle::from_raw },
+                target_process_handle: { ProcessHandle::from_raw },
+                target_handle:*,
+                desired_access,
+                handle_attributes,
+                options,
             })),
             NtSysno::NtCreateEvent => Some(sys_req!(NtCreateEvent {
                 event_handle:*,

@@ -169,3 +169,453 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         teb_address: 0,
     }
 }
+
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
+const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+const DUPLICATE_SAME_ATTRIBUTES: u32 = 0x0000_0004;
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+
+fn create_event(task: &Task<TestPlatform, TestFS>, desired_access: u32) -> Handle {
+    let mut handle = Handle::default();
+    assert_eq!(
+        task.sys_nt_create_event(mut_ptr(&mut handle), desired_access, None, 0, 0,),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    handle
+}
+
+#[test]
+fn nt_duplicate_object_preserves_identity_with_independent_access() {
+    let task = test_task();
+    let source = create_event(&task, SYNCHRONIZE);
+    let mut duplicate = Handle::default();
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut duplicate)),
+            EVENT_MODIFY_STATE,
+            0,
+            0,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_ne!(source, duplicate);
+    assert_eq!(
+        task.sys_nt_set_event(source, None),
+        litebox_common_windows::nt_status::NtStatus::ACCESS_DENIED
+    );
+    assert_eq!(
+        task.sys_nt_set_event(duplicate, None),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(source),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_set_event(duplicate, None),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(duplicate),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+}
+
+#[test]
+fn nt_duplicate_object_can_atomically_replace_the_source_handle() {
+    let task = test_task();
+    let source = create_event(&task, EVENT_MODIFY_STATE);
+    let mut duplicate = Handle::default();
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut duplicate)),
+            0,
+            0,
+            DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(source),
+        litebox_common_windows::nt_status::NtStatus::INVALID_HANDLE
+    );
+    assert_eq!(
+        task.sys_nt_set_event(duplicate, None),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(duplicate),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+}
+
+#[test]
+fn nt_duplicate_object_closes_source_even_when_duplication_fails() {
+    let task = test_task();
+    let source = create_event(&task, EVENT_MODIFY_STATE);
+    let mut duplicate = Handle::from_raw(0x7777);
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::from_raw(0x1234),
+            Some(mut_ptr(&mut duplicate)),
+            0,
+            0,
+            DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS,
+        ),
+        litebox_common_windows::nt_status::NtStatus::INVALID_HANDLE
+    );
+    assert_eq!(
+        task.sys_nt_close(source),
+        litebox_common_windows::nt_status::NtStatus::INVALID_HANDLE
+    );
+    assert!(duplicate.is_null());
+}
+
+#[test]
+fn nt_duplicate_object_supports_close_only_calls() {
+    let task = test_task();
+    let source = create_event(&task, EVENT_MODIFY_STATE);
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::from_raw(0),
+            None,
+            0,
+            0,
+            0,
+        ),
+        litebox_common_windows::nt_status::NtStatus::INVALID_PARAMETER
+    );
+    assert_eq!(
+        task.sys_nt_set_event(source, None),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::from_raw(0),
+            None,
+            0,
+            0,
+            DUPLICATE_CLOSE_SOURCE,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(source),
+        litebox_common_windows::nt_status::NtStatus::INVALID_HANDLE
+    );
+}
+
+#[test]
+fn nt_duplicate_object_null_output_retains_inaccessible_duplicate() {
+    let task = test_task();
+    let source = create_event(&task, EVENT_MODIFY_STATE);
+    let handles_before = task.process.handles.read().iter_alive().count();
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::CURRENT,
+            None,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.process.handles.read().iter_alive().count(),
+        handles_before + 1
+    );
+    assert_eq!(
+        task.sys_nt_close(source),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.process.handles.read().iter_alive().count(),
+        handles_before
+    );
+}
+
+#[test]
+fn nt_duplicate_object_ignores_unknown_flags_and_copies_attributes() {
+    let task = test_task();
+    let source = create_event(&task, EVENT_MODIFY_STATE);
+    let mut first_duplicate = Handle::default();
+    let mut second_duplicate = Handle::default();
+    let mut unprotected_duplicate = Handle::default();
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut first_duplicate)),
+            0,
+            0x8000_0001,
+            DUPLICATE_SAME_ACCESS | 0x8000_0000,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            first_duplicate,
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut second_duplicate)),
+            0,
+            0x4000_0000,
+            DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            first_duplicate,
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut unprotected_duplicate)),
+            0,
+            0,
+            DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(source),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(first_duplicate),
+        litebox_common_windows::nt_status::NtStatus::HANDLE_NOT_CLOSABLE
+    );
+    assert_eq!(
+        task.sys_nt_close(second_duplicate),
+        litebox_common_windows::nt_status::NtStatus::HANDLE_NOT_CLOSABLE
+    );
+    assert_eq!(
+        task.sys_nt_close(unprotected_duplicate),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+}
+
+#[test]
+fn nt_duplicate_object_grants_maximum_allowed_access() {
+    let task = test_task();
+    let source = create_event(&task, SYNCHRONIZE);
+    let mut duplicate = Handle::default();
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut duplicate)),
+            MAXIMUM_ALLOWED,
+            0,
+            0,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_set_event(source, None),
+        litebox_common_windows::nt_status::NtStatus::ACCESS_DENIED
+    );
+    assert_eq!(
+        task.sys_nt_set_event(duplicate, None),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(source),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(duplicate),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn host_nt_duplicate_object_failure_and_access_matrix() {
+    use core::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateEventW(
+            event_attributes: *const c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtClose(handle: *mut c_void) -> i32;
+        fn NtSetEvent(handle: *mut c_void, previous_state: *mut i32) -> i32;
+        fn NtDuplicateObject(
+            source_process_handle: *mut c_void,
+            source_handle: *mut c_void,
+            target_process_handle: *mut c_void,
+            target_handle: *mut c_void,
+            desired_access: u32,
+            handle_attributes: u32,
+            options: u32,
+        ) -> i32;
+    }
+
+    // SAFETY: All pointers are either documented pseudo-handles, null, or valid local outputs.
+    unsafe {
+        let source = CreateEventW(core::ptr::null(), 0, 0, core::ptr::null());
+        assert!(!source.is_null());
+        let mut duplicate: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            NtDuplicateObject(
+                usize::MAX as *mut c_void,
+                source,
+                0x1234usize as *mut c_void,
+                (&raw mut duplicate).cast(),
+                0,
+                0,
+                DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS,
+            ),
+            litebox_common_windows::nt_status::NtStatus::INVALID_HANDLE.as_raw()
+        );
+        assert_eq!(
+            NtClose(source),
+            litebox_common_windows::nt_status::NtStatus::INVALID_HANDLE.as_raw()
+        );
+        assert!(duplicate.is_null());
+
+        let source = CreateEventW(core::ptr::null(), 0, 0, core::ptr::null());
+        assert!(!source.is_null());
+        let mut duplicate = usize::MAX as *mut c_void;
+        assert_eq!(
+            NtDuplicateObject(
+                usize::MAX as *mut c_void,
+                source,
+                core::ptr::null_mut(),
+                (&raw mut duplicate).cast(),
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            ),
+            litebox_common_windows::nt_status::NtStatus::INVALID_PARAMETER.as_raw()
+        );
+        assert!(duplicate.is_null());
+        assert_eq!(
+            NtClose(source),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+
+        let source = CreateEventW(core::ptr::null(), 0, 0, core::ptr::null());
+        assert!(!source.is_null());
+        assert_eq!(
+            NtDuplicateObject(
+                usize::MAX as *mut c_void,
+                source,
+                usize::MAX as *mut c_void,
+                core::ptr::null_mut(),
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            ),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+        assert_eq!(
+            NtClose(source),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+
+        let source = CreateEventW(core::ptr::null(), 0, 0, core::ptr::null());
+        assert!(!source.is_null());
+        assert_eq!(
+            NtDuplicateObject(
+                usize::MAX as *mut c_void,
+                source,
+                usize::MAX as *mut c_void,
+                core::ptr::dangling_mut::<c_void>(),
+                0,
+                0,
+                DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS,
+            ),
+            litebox_common_windows::nt_status::NtStatus::ACCESS_VIOLATION.as_raw()
+        );
+        assert_eq!(
+            NtSetEvent(source, core::ptr::null_mut()),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+        assert_eq!(
+            NtClose(source),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+
+        let source = CreateEventW(core::ptr::null(), 0, 0, core::ptr::null());
+        assert!(!source.is_null());
+        let mut reduced: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            NtDuplicateObject(
+                usize::MAX as *mut c_void,
+                source,
+                usize::MAX as *mut c_void,
+                (&raw mut reduced).cast(),
+                SYNCHRONIZE,
+                0,
+                0,
+            ),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+        let mut expanded: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            NtDuplicateObject(
+                usize::MAX as *mut c_void,
+                reduced,
+                usize::MAX as *mut c_void,
+                (&raw mut expanded).cast(),
+                EVENT_MODIFY_STATE,
+                0,
+                0,
+            ),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+        assert_eq!(
+            NtSetEvent(reduced, core::ptr::null_mut()),
+            litebox_common_windows::nt_status::NtStatus::ACCESS_DENIED.as_raw()
+        );
+        assert_eq!(
+            NtSetEvent(expanded, core::ptr::null_mut()),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+        assert_eq!(
+            NtClose(source),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+        assert_eq!(
+            NtClose(reduced),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+        assert_eq!(
+            NtClose(expanded),
+            litebox_common_windows::nt_status::NtStatus::SUCCESS.as_raw()
+        );
+    }
+}

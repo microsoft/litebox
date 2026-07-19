@@ -28,6 +28,20 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for LpcPortSubsystem<Platform> {
 
 impl FdEnabledSubsystemEntry for LpcPortHandleObject {}
 
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for LpcPortSubsystem<Platform> {
+    fn granted_access(_entry: &Self::Entry) -> u32 {
+        0
+    }
+
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        desired_access
+    }
+
+    fn maximum_allowed_access() -> u32 {
+        0
+    }
+}
+
 pub(crate) struct LpcPortHandleObject {
     _port_name: String,
 }

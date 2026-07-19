@@ -13,7 +13,9 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProv
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, read_object_attributes};
-use crate::syscalls::iocp::{IoCompletionAccess, IoCompletionObject, IoCompletionSubsystem};
+use crate::syscalls::iocp::{
+    IoCompletionAccess, IoCompletionHandleObject, IoCompletionObject, IoCompletionSubsystem,
+};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
@@ -54,14 +56,6 @@ impl WorkerFactoryAccess {
             Self::ALL_ACCESS.bits(),
         ))
     }
-
-    fn require(self, required: Self) -> Result<(), NtStatus> {
-        if self.contains(required) {
-            Ok(())
-        } else {
-            Err(NtStatus::ACCESS_DENIED)
-        }
-    }
 }
 
 #[repr(u32)]
@@ -94,6 +88,22 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for WorkerFactorySubsyste
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry
     for WorkerFactoryHandleObject<Platform>
 {
+}
+
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+    for WorkerFactorySubsystem<Platform>
+{
+    fn granted_access(entry: &Self::Entry) -> u32 {
+        entry.granted_access.bits()
+    }
+
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        WorkerFactoryAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn maximum_allowed_access() -> u32 {
+        WorkerFactoryAccess::ALL_ACCESS.bits()
+    }
 }
 
 pub(crate) struct WorkerFactoryHandleObject<Platform: crate::ShimPlatform> {
@@ -181,26 +191,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         handle: Handle,
     ) -> Result<Arc<IoCompletionObject<Platform>>, NtStatus> {
-        let Some(raw_fd) = handle.raw_fd() else {
-            return Err(NtStatus::INVALID_HANDLE);
-        };
-        let typed = {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<IoCompletionSubsystem<Platform>>(raw_fd) {
-                Ok(typed) => typed,
-                Err(ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
-                Err(ErrRawIntFd::InvalidSubsystem) => {
-                    return Err(NtStatus::OBJECT_TYPE_MISMATCH);
-                }
-            }
-        };
-        let Some(entry) = self.global.litebox.descriptor_table().entry_handle(&typed) else {
-            return Err(NtStatus::INVALID_HANDLE);
-        };
-        entry.with_entry(|entry| {
-            entry.require_access(IoCompletionAccess::MODIFY_STATE)?;
-            Ok(entry.port())
-        })
+        self.require_handle_access::<IoCompletionSubsystem<Platform>>(
+            handle,
+            IoCompletionAccess::MODIFY_STATE.bits(),
+        )?;
+        let entry = self.typed_handle_entry::<IoCompletionSubsystem<Platform>>(handle)?;
+        Ok(entry.with_entry(IoCompletionHandleObject::port))
     }
 
     fn validate_worker_process_handle(
@@ -327,11 +323,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(entry) => entry,
             Err(status) => return status,
         };
+        if let Err(status) = self.require_handle_access::<WorkerFactorySubsystem<Platform>>(
+            handle,
+            WorkerFactoryAccess::SET_INFORMATION.bits(),
+        ) {
+            return status;
+        }
         entry
             .with_entry(|entry| {
-                entry
-                    .granted_access
-                    .require(WorkerFactoryAccess::SET_INFORMATION)?;
                 // TODO: enforce these limits against real worker creation/drain behavior
                 // once worker threads are modeled; today they are only recorded.
                 match information_class {
@@ -384,15 +383,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        let factory = match entry.with_entry(|entry| {
-            entry
-                .granted_access
-                .require(WorkerFactoryAccess::SHUTDOWN)?;
-            Ok(Arc::clone(&entry.factory))
-        }) {
-            Ok(factory) => factory,
-            Err(status) => return status,
-        };
+        if let Err(status) = self.require_handle_access::<WorkerFactorySubsystem<Platform>>(
+            handle,
+            WorkerFactoryAccess::SHUTDOWN.bits(),
+        ) {
+            return status;
+        }
+        let factory = entry.with_entry(|entry| Arc::clone(&entry.factory));
         // TODO: report the actual pending worker count and wake/release workers once worker
         // threads are modeled; the current subset has no workers to drain.
         commit_worker_factory_shutdown(&factory, pending_worker_count)

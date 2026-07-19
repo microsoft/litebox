@@ -41,14 +41,6 @@ impl IoCompletionAccess {
             Self::ALL_ACCESS.bits(),
         ))
     }
-
-    pub(crate) fn require(self, required: Self) -> Result<(), NtStatus> {
-        if self.contains(required) {
-            Ok(())
-        } else {
-            Err(NtStatus::ACCESS_DENIED)
-        }
-    }
 }
 
 pub(crate) struct IoCompletionSubsystem<Platform>(PhantomData<fn(Platform)>);
@@ -58,6 +50,22 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for IoCompletionSubsystem
 }
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for IoCompletionHandleObject<Platform> {}
+
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+    for IoCompletionSubsystem<Platform>
+{
+    fn granted_access(entry: &Self::Entry) -> u32 {
+        entry.granted_access.bits()
+    }
+
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        IoCompletionAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn maximum_allowed_access() -> u32 {
+        IoCompletionAccess::ALL_ACCESS.bits()
+    }
+}
 
 pub(crate) struct IoCompletionHandleObject<Platform: crate::ShimPlatform> {
     port: Arc<IoCompletionObject<Platform>>,
@@ -81,10 +89,6 @@ impl<Platform: crate::ShimPlatform> IoCompletionObject<Platform> {
 impl<Platform: crate::ShimPlatform> IoCompletionHandleObject<Platform> {
     pub(crate) fn port(&self) -> Arc<IoCompletionObject<Platform>> {
         self.port.clone()
-    }
-
-    pub(crate) fn require_access(&self, required: IoCompletionAccess) -> Result<(), NtStatus> {
-        self.granted_access.require(required)
     }
 }
 

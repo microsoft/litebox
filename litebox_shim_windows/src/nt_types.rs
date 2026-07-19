@@ -143,6 +143,7 @@ bitflags::bitflags! {
         const WRITE_DAC = 0x0004_0000;
         const WRITE_OWNER = 0x0008_0000;
         const SYNCHRONIZE = 0x0010_0000;
+        const MAXIMUM_ALLOWED = 0x0200_0000;
         const STANDARD_RIGHTS_READ = Self::READ_CONTROL.bits();
         const STANDARD_RIGHTS_WRITE = Self::READ_CONTROL.bits();
         const STANDARD_RIGHTS_EXECUTE = Self::READ_CONTROL.bits();

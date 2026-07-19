@@ -62,6 +62,22 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for RegistryKeySubsystem<
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for RegistryKeyObject<Platform> {}
 
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+    for RegistryKeySubsystem<Platform>
+{
+    fn granted_access(entry: &Self::Entry) -> u32 {
+        entry.granted_access.bits()
+    }
+
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        RegistryKeyAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn maximum_allowed_access() -> u32 {
+        RegistryKeyAccess::ALL_ACCESS.bits()
+    }
+}
+
 pub(crate) struct RegistryKeyObject<Platform: crate::ShimPlatform> {
     path: String,
     fd: TypedFd<RegistryFileSystem<Platform>>,
@@ -132,6 +148,18 @@ bitflags::bitflags! {
     }
 }
 
+impl RegistryKeyAccess {
+    fn from_desired_access(desired_access: u32) -> Self {
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::READ.bits(),
+            Self::WRITE.bits(),
+            Self::EXECUTE.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
+    }
+}
+
 impl From<RegistryKeyAccess> for OFlags {
     fn from(desired_access: RegistryKeyAccess) -> Self {
         let wants_read = desired_access.intersects(RegistryKeyAccess::FS_READ_ACCESS);
@@ -143,16 +171,6 @@ impl From<RegistryKeyAccess> for OFlags {
             _ => OFlags::RDONLY,
         };
         access | OFlags::DIRECTORY
-    }
-}
-
-impl RegistryKeyAccess {
-    fn can_query_value(self) -> bool {
-        const QUERY_ACCESS_BITS: u32 = RegistryKeyAccess::QUERY_VALUE.bits()
-            | AccessMask::GENERIC_READ.bits()
-            | AccessMask::GENERIC_EXECUTE.bits()
-            | AccessMask::GENERIC_ALL.bits();
-        self.intersects(Self::from_bits_retain(QUERY_ACCESS_BITS))
     }
 }
 
@@ -426,7 +444,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .with_entry(|root_key| relative_nt_key_name_to_fs_path(&root_key.path, &key_name))?
         };
 
-        let desired_access = RegistryKeyAccess::from_bits_retain(desired_access);
+        let desired_access = RegistryKeyAccess::from_desired_access(desired_access);
         let fd = self
             .global
             .registry
@@ -493,12 +511,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
+        self.require_handle_access::<RegistryKeySubsystem<Platform>>(
+            key_handle,
+            RegistryKeyAccess::QUERY_VALUE.bits(),
+        )?;
         let key = self.registry_key_entry(key_handle)?;
         let value_name = value_name.read_string::<Platform>()?;
         let value = key.with_entry(|key| {
-            if !key.granted_access.can_query_value() {
-                return Err(NtStatus::ACCESS_DENIED);
-            }
             // TODO: Open the value relative to `key.fd` once the FS has an openat-style API.
             self.global
                 .registry
