@@ -10,7 +10,7 @@ libc = { version = "0.2.169", default-features = false }
 litebox = { version = "0.1.0", path = "../litebox" }
 litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local" }
 litebox_broker_protocol = { version = "0.1.0", path = "../litebox_broker_protocol" }
-litebox_broker_transport = { version = "0.1.0", path = "../litebox_broker_transport" }
+litebox_broker_transport = { version = "0.1.0", path = "../litebox_broker_transport", features = ["unix"] }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platform_linux_userland" }
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_linux_userland"] }

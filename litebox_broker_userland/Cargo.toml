@@ -7,7 +7,7 @@ edition = "2024"
 clap = { version = "4.5.33", features = ["derive"] }
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
-litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0", features = ["unix"] }
 tempfile = { version = "3", default-features = false }
 
 [[bin]]
