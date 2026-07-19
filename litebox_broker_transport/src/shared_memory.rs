@@ -53,10 +53,14 @@ impl MemfdSharedMemory {
         Self::map(fd, length)
     }
 
-    /// Validates and maps a received memfd.
+    /// Validates and maps a received memfd with `expected_length` bytes.
     ///
-    /// The descriptor must have a nonzero size sealed against changes.
-    pub fn from_received_fd(fd: OwnedFd) -> IoResult<Self> {
+    /// The descriptor must have the expected nonzero size sealed against
+    /// changes.
+    pub fn from_received_fd(fd: OwnedFd, expected_length: usize) -> IoResult<Self> {
+        if expected_length == 0 {
+            return Err(invalid_data("shared memory cannot be empty"));
+        }
         // Verify the size seals before reading the size so it cannot change
         // between validation and mapping.
         let seals = fcntl_get_seals(&fd)?;
@@ -65,8 +69,10 @@ impl MemfdSharedMemory {
         }
         let length = usize::try_from(fstat(&fd)?.st_size)
             .map_err(|_| invalid_data("invalid shared-memory length"))?;
-        if length == 0 {
-            return Err(invalid_data("shared memory cannot be empty"));
+        if length != expected_length {
+            return Err(invalid_data(
+                "shared-memory length does not match expected size",
+            ));
         }
         Self::map(fd, length)
     }
@@ -182,7 +188,7 @@ mod tests {
     fn mappings_share_bytes_and_validate_ranges() {
         let first = MemfdSharedMemory::create(64).unwrap();
         let second =
-            MemfdSharedMemory::from_received_fd(first.as_fd().try_clone_to_owned().unwrap())
+            MemfdSharedMemory::from_received_fd(first.as_fd().try_clone_to_owned().unwrap(), 64)
                 .unwrap();
 
         first.write(0, &[1, 2, 3]).unwrap();
@@ -201,13 +207,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsealed_and_oversized_mappings() {
+    fn rejects_unsealed_mismatched_and_oversized_mappings() {
         let fd = memfd_create("litebox-broker-shm-test", MemfdFlags::CLOEXEC).unwrap();
         ftruncate(&fd, 1).unwrap();
         assert_eq!(
-            MemfdSharedMemory::from_received_fd(fd)
+            MemfdSharedMemory::from_received_fd(fd, 1)
                 .err()
                 .expect("unsealed memfd should fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let memory = MemfdSharedMemory::create(64).unwrap();
+        assert_eq!(
+            MemfdSharedMemory::from_received_fd(memory.as_fd().try_clone_to_owned().unwrap(), 32,)
+                .err()
+                .expect("mismatched memfd size should fail")
                 .kind(),
             std::io::ErrorKind::InvalidData
         );
