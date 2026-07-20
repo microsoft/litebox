@@ -61,10 +61,6 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for SymbolicLinkHand
 impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
     for SymbolicLinkSubsystem<Platform>
 {
-    fn granted_access(entry: &Self::Entry) -> u32 {
-        entry.granted_access.bits()
-    }
-
     fn normalize_desired_access(desired_access: u32) -> u32 {
         SymbolicLinkAccess::from_desired_access(desired_access).bits()
     }
@@ -76,7 +72,6 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
 
 pub(crate) struct SymbolicLinkHandleObject<Platform: crate::ShimPlatform> {
     link: Arc<ObjectNode<Platform>>,
-    granted_access: SymbolicLinkAccess,
 }
 
 fn utf16_units(value: &str) -> Result<Vec<u16>, NtStatus> {
@@ -105,10 +100,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         granted_access: SymbolicLinkAccess,
     ) -> Result<Handle, NtStatus> {
         self.insert_typed_handle::<SymbolicLinkSubsystem<Platform>>(
-            SymbolicLinkHandleObject {
-                link,
-                granted_access,
-            },
+            SymbolicLinkHandleObject { link },
+            granted_access.bits(),
             drop,
         )
     }

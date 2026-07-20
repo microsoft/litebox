@@ -73,10 +73,6 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for TimerSubsystem<Platfo
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for TimerHandleObject<Platform> {}
 
 impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for TimerSubsystem<Platform> {
-    fn granted_access(entry: &Self::Entry) -> u32 {
-        entry.granted_access.bits()
-    }
-
     fn normalize_desired_access(desired_access: u32) -> u32 {
         TimerAccess::from_desired_access(desired_access).bits()
     }
@@ -88,7 +84,6 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for TimerSubsy
 
 pub(crate) struct TimerHandleObject<Platform: crate::ShimPlatform> {
     _timer: Arc<TimerObject<Platform>>,
-    granted_access: TimerAccess,
 }
 
 pub(crate) struct TimerObject<Platform: crate::ShimPlatform> {
@@ -139,10 +134,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         granted_access: TimerAccess,
     ) -> Result<Handle, NtStatus> {
         self.insert_typed_handle::<TimerSubsystem<Platform>>(
-            TimerHandleObject {
-                _timer: timer,
-                granted_access,
-            },
+            TimerHandleObject { _timer: timer },
+            granted_access.bits(),
             drop,
         )
     }

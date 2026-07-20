@@ -119,8 +119,6 @@ struct WindowsHandleMetadata {
 }
 
 pub(crate) trait WindowsHandleSubsystem: litebox::fd::FdEnabledSubsystem {
-    fn granted_access(entry: &Self::Entry) -> u32;
-
     fn normalize_desired_access(desired_access: u32) -> u32;
 
     fn maximum_allowed_access() -> u32;
@@ -691,12 +689,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn insert_typed_handle<Subsystem>(
         &self,
         entry: Subsystem::Entry,
+        granted_access: u32,
         cleanup_entry: impl FnOnce(Subsystem::Entry),
     ) -> Result<syscalls::Handle, NtStatus>
     where
         Subsystem: WindowsHandleSubsystem,
     {
-        let granted_access = Subsystem::granted_access(&entry);
         let typed = {
             let mut descriptors = self.global.litebox.descriptor_table_mut();
             let typed = descriptors.insert::<Subsystem>(entry);

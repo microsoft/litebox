@@ -81,10 +81,6 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for EventSubsystem<Platfo
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for EventHandleObject<Platform> {}
 
 impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for EventSubsystem<Platform> {
-    fn granted_access(entry: &Self::Entry) -> u32 {
-        entry.granted_access.bits()
-    }
-
     fn normalize_desired_access(desired_access: u32) -> u32 {
         EventAccess::from_desired_access(desired_access).bits()
     }
@@ -96,7 +92,6 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for EventSubsy
 
 pub(crate) struct EventHandleObject<Platform: crate::ShimPlatform> {
     event: Arc<EventObject<Platform>>,
-    granted_access: EventAccess,
 }
 
 pub(crate) struct EventObject<Platform: crate::ShimPlatform> {
@@ -264,10 +259,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         granted_access: EventAccess,
     ) -> Result<Handle, NtStatus> {
         self.insert_typed_handle::<EventSubsystem<Platform>>(
-            EventHandleObject {
-                event,
-                granted_access,
-            },
+            EventHandleObject { event },
+            granted_access.bits(),
             drop,
         )
     }

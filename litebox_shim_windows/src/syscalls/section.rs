@@ -62,10 +62,6 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for SectionSubsystem<Platform> {
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for SectionHandleObject<Platform> {}
 
 impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for SectionSubsystem<Platform> {
-    fn granted_access(entry: &Self::Entry) -> u32 {
-        entry.granted_access.bits()
-    }
-
     fn normalize_desired_access(desired_access: u32) -> u32 {
         SectionAccess::from_desired_access(desired_access).bits()
     }
@@ -77,7 +73,6 @@ impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for SectionSubsystem<
 
 pub(crate) struct SectionHandleObject<Platform: ShimPlatform> {
     section: Arc<SectionObject<Platform>>,
-    granted_access: SectionAccess,
 }
 
 pub(crate) struct SectionObject<Platform: ShimPlatform> {
@@ -238,10 +233,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         granted_access: SectionAccess,
     ) -> Result<Handle, NtStatus> {
         self.insert_typed_handle::<SectionSubsystem<Platform>>(
-            SectionHandleObject {
-                section,
-                granted_access,
-            },
+            SectionHandleObject { section },
+            granted_access.bits(),
             drop,
         )
     }

@@ -63,10 +63,6 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry
 impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
     for WaitCompletionPacketSubsystem<Platform>
 {
-    fn granted_access(entry: &Self::Entry) -> u32 {
-        entry.granted_access.bits()
-    }
-
     fn normalize_desired_access(desired_access: u32) -> u32 {
         WaitCompletionPacketAccess::from_desired_access(desired_access).bits()
     }
@@ -78,7 +74,6 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
 
 pub(crate) struct WaitCompletionPacketHandleObject<Platform: crate::ShimPlatform> {
     packet: Arc<WaitCompletionPacketObject<Platform>>,
-    granted_access: WaitCompletionPacketAccess,
 }
 
 pub(crate) struct WaitCompletionPacketObject<Platform: crate::ShimPlatform> {
@@ -252,10 +247,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         granted_access: WaitCompletionPacketAccess,
     ) -> Result<Handle, NtStatus> {
         self.insert_typed_handle::<WaitCompletionPacketSubsystem<Platform>>(
-            WaitCompletionPacketHandleObject {
-                packet,
-                granted_access,
-            },
+            WaitCompletionPacketHandleObject { packet },
+            granted_access.bits(),
             drop,
         )
     }

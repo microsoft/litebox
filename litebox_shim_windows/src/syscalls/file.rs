@@ -89,10 +89,6 @@ impl<FS: ShimFS> FdEnabledSubsystem for FileObjectSubsystem<FS> {
 impl<FS: ShimFS> FdEnabledSubsystemEntry for FileObject<FS> {}
 
 impl<FS: ShimFS> crate::WindowsHandleSubsystem for FileObjectSubsystem<FS> {
-    fn granted_access(entry: &Self::Entry) -> u32 {
-        entry.granted_access.bits()
-    }
-
     fn normalize_desired_access(desired_access: u32) -> u32 {
         FileAccess::from_desired_access(desired_access).bits()
     }
@@ -109,11 +105,11 @@ impl<FS: ShimFS> crate::WindowsHandleSubsystem for FileObjectSubsystem<FS> {
         let maximum_allowed = desired_access & AccessMask::MAXIMUM_ALLOWED.bits() != 0;
         let explicit_access =
             FileAccess::from_desired_access(desired_access & !AccessMask::MAXIMUM_ALLOWED.bits());
-        if !entry.granted_access.contains(explicit_access) {
+        if !entry.create_time_access.contains(explicit_access) {
             return Err(NtStatus::ACCESS_DENIED);
         }
         Ok(if maximum_allowed {
-            entry.granted_access.bits()
+            entry.create_time_access.bits()
         } else {
             explicit_access.bits()
         })
@@ -123,7 +119,7 @@ impl<FS: ShimFS> crate::WindowsHandleSubsystem for FileObjectSubsystem<FS> {
 pub(crate) struct FileObject<FS: ShimFS> {
     path: String,
     backing: FileObjectBacking<FS>,
-    granted_access: FileAccess,
+    create_time_access: FileAccess,
     share_access: FileShareAccess,
     create_options: FileCreateOptions,
 }
@@ -430,7 +426,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn insert_file_handle(&self, file: FileObject<FS>) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<FileObjectSubsystem<FS>>(file, |file| self.close_file(file))
+        let granted_access = file.create_time_access.bits();
+        self.insert_typed_handle::<FileObjectSubsystem<FS>>(file, granted_access, |file| {
+            self.close_file(file);
+        })
     }
 
     pub(crate) fn close_file_handle(&self, handle: Handle) {
@@ -785,7 +784,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             FileObject {
                 path,
                 backing: FileObjectBacking::Filesystem { fd, is_directory },
-                granted_access: desired_access,
+                create_time_access: desired_access,
                 share_access,
                 create_options,
             },
@@ -858,7 +857,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             FileObject {
                 path,
                 backing,
-                granted_access: desired_access,
+                create_time_access: desired_access,
                 share_access,
                 create_options,
             },
@@ -964,7 +963,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     fd,
                     is_directory: true,
                 },
-                granted_access: desired_access,
+                create_time_access: desired_access,
                 share_access,
                 create_options,
             },
@@ -1024,7 +1023,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let conflicts = entry.with_entry(|file| {
                 identity.matches(file)
                     && (desired_access.conflicts_with_share(file.share_access)
-                        || file.granted_access.conflicts_with_share(share_access))
+                        || file.create_time_access.conflicts_with_share(share_access))
             });
             if conflicts {
                 return Err(NtStatus::SHARING_VIOLATION);
