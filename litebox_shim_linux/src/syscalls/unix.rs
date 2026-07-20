@@ -31,7 +31,7 @@ use litebox_common_linux::{
 };
 
 use crate::{
-    ConstPtr, FileFd, GlobalState, MutPtr, ShimFS, Task,
+    FileFd, GlobalState, ShimFS, Task, UserPtr, UserPtrMut,
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
@@ -1464,7 +1464,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         &self,
         global: &GlobalState<FS>,
         optname: SocketOptionName,
-        optval: ConstPtr<u8>,
+        optval: UserPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
         match global.setsockopt_common(optname, optval, optlen, |so, value| {
@@ -1523,7 +1523,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         &self,
         global: &GlobalState<FS>,
         optname: SocketOptionName,
-        optval: MutPtr<u8>,
+        optval: UserPtrMut<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
         match global.getsockopt_common(optname, optval, len, |sopt| match sopt {

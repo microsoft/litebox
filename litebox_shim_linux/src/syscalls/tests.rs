@@ -2,12 +2,11 @@
 // Licensed under the MIT license.
 
 use litebox::fs::{FileSystem as _, Mode, OFlags};
-use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
 use litebox_platform_multiplex::{Platform, set_platform};
 use zerocopy::FromBytes as _;
 
-use crate::MutPtr;
+use crate::UserPtrMut;
 
 extern crate std;
 
@@ -184,7 +183,7 @@ fn test_getdent64() {
     let bytes_read = task
         .sys_getdirent64(
             dir_fd,
-            MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
             buffer.len(),
         )
         .expect("Failed to read directory entries");
@@ -266,7 +265,7 @@ fn test_getdent64() {
     assert_eq!(
         task.sys_getdirent64(
             dir_fd,
-            MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
             buffer.len()
         )
         .expect("Failed to read directory entries"),
@@ -284,7 +283,7 @@ fn test_getdent64() {
     let bytes = task
         .sys_getdirent64(
             dir_fd,
-            MutPtr::from_usize(small_buffer.as_mut_ptr() as usize),
+            UserPtrMut::from_usize(small_buffer.as_mut_ptr() as usize),
             small_buffer.len(),
         )
         .expect("Failed to read directory entries");
@@ -305,7 +304,7 @@ fn test_getdent64() {
     // Test 3: Invalid file descriptor
     let result = task.sys_getdirent64(
         -1,
-        MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
         buffer.len(),
     );
     assert_eq!(
@@ -322,7 +321,7 @@ fn test_getdent64() {
 
     let result = task.sys_getdirent64(
         file1_fd,
-        MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
         buffer.len(),
     );
     assert_eq!(
@@ -333,7 +332,11 @@ fn test_getdent64() {
     task.sys_close(file1_fd).expect("Failed to close file");
 
     // Test 5: Zero-length buffer
-    let result = task.sys_getdirent64(dir_fd, MutPtr::from_usize(buffer.as_mut_ptr() as usize), 0);
+    let result = task.sys_getdirent64(
+        dir_fd,
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+        0,
+    );
     assert_eq!(
         result,
         Err(Errno::EINVAL),
@@ -357,7 +360,7 @@ fn test_getdent64() {
         let bytes_read = task
             .sys_getdirent64(
                 dir_fd2,
-                MutPtr::from_usize(chunk_buffer.as_mut_ptr() as usize),
+                UserPtrMut::from_usize(chunk_buffer.as_mut_ptr() as usize),
                 chunk_buffer.len(),
             )
             .expect("Failed to read directory chunk");

@@ -25,12 +25,12 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
-    platform::{RawConstPointer as _, RawMutPointer as _, TimeProvider},
+    platform::TimeProvider,
     shim::ContinueOperation,
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
-use litebox_common_linux::{SyscallRequest, errno::Errno};
+use litebox_common_linux::{SyscallRequest, UserPtr, UserPtrMut, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
@@ -394,10 +394,6 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     }
 }
 
-// Convenience type aliases
-type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
-type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
-
 impl<FS: ShimFS> Task<FS> {
     fn close_on_exec(&self) {
         let files = self.files.borrow();
@@ -484,7 +480,7 @@ impl<FS: ShimFS> Task<FS> {
     fn pread_with_user_buf(
         &self,
         fd: i32,
-        buf: MutPtr<u8>,
+        buf: UserPtrMut<u8>,
         count: usize,
         offset: i64,
     ) -> Result<usize, Errno> {
@@ -499,7 +495,7 @@ impl<FS: ShimFS> Task<FS> {
             ) {
                 Ok(0) => break, // EOF
                 Ok(size) => {
-                    buf.copy_from_slice(read_total, &kernel_buf[..size])
+                    buf.copy_from_slice::<Platform>(read_total, &kernel_buf[..size])
                         .ok_or(Errno::EFAULT)?;
                     read_total += size;
                 }
@@ -536,8 +532,7 @@ impl<FS: ShimFS> Task<FS> {
 
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
-        let request =
-            SyscallRequest::<Platform>::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+        let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
         match request {
             SyscallRequest::Exit { status } => {
@@ -559,7 +554,7 @@ impl<FS: ShimFS> Task<FS> {
                 if count <= MAX_KERNEL_BUF_SIZE {
                     let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                     self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
-                        buf.copy_from_slice(0, &kernel_buf[..size])
+                        buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
                             .map(|()| size)
                             .ok_or(Errno::EFAULT)
                     })
@@ -596,7 +591,8 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 }
             }
-            SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice(count) {
+            SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice::<Platform>(count)
+            {
                 Some(buf) => self.sys_write(fd, &buf, None),
                 None => Err(Errno::EFAULT),
             },
@@ -611,11 +607,13 @@ impl<FS: ShimFS> Task<FS> {
                 dirfd,
                 pathname,
                 mode,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                syscall!(sys_mkdirat(dirfd, path, mode))
-            }),
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_mkdirat(dirfd, path, mode))
+                }),
             SyscallRequest::Chdir { pathname } => pathname
-                .to_cstring()
+                .to_cstring::<Platform>()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
             SyscallRequest::RtSigprocmask {
                 how,
@@ -642,7 +640,7 @@ impl<FS: ShimFS> Task<FS> {
                 buf,
                 count,
                 offset,
-            } => match buf.to_owned_slice(count) {
+            } => match buf.to_owned_slice::<Platform>(count) {
                 Some(buf) => self.sys_pwrite64(fd, &buf, offset),
                 None => Err(Errno::EFAULT),
             },
@@ -697,9 +695,11 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 mode,
                 flags,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                syscall!(sys_faccessat(dirfd, path, mode, flags))
-            }),
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_faccessat(dirfd, path, mode, flags))
+                }),
             SyscallRequest::Madvise {
                 addr,
                 length,
@@ -801,7 +801,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_getcwd(&mut kernel_buf).and_then(|size| {
-                    buf.copy_from_slice(0, &kernel_buf[..size])
+                    buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
                         .map(|()| size)
                         .ok_or(Errno::EFAULT)
                 })
@@ -834,14 +834,16 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 buf,
                 bufsiz,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
-                self.sys_readlink(path, &mut kernel_buf).and_then(|size| {
-                    buf.copy_from_slice(0, &kernel_buf[..size])
-                        .map(|()| size)
-                        .ok_or(Errno::EFAULT)
-                })
-            }),
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
+                    self.sys_readlink(path, &mut kernel_buf).and_then(|size| {
+                        buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
+                            .map(|()| size)
+                            .ok_or(Errno::EFAULT)
+                    })
+                }),
             SyscallRequest::Ppoll {
                 fds,
                 nfds,
@@ -862,15 +864,17 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 buf,
                 bufsiz,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
-                self.sys_readlinkat(dirfd, path, &mut kernel_buf)
-                    .and_then(|size| {
-                        buf.copy_from_slice(0, &kernel_buf[..size])
-                            .map(|()| size)
-                            .ok_or(Errno::EFAULT)
-                    })
-            }),
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
+                    self.sys_readlinkat(dirfd, path, &mut kernel_buf)
+                        .and_then(|size| {
+                            buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
+                                .map(|()| size)
+                                .ok_or(Errno::EFAULT)
+                        })
+                }),
             SyscallRequest::Gettimeofday { tv, tz } => syscall!(sys_gettimeofday(tv, tz)),
             SyscallRequest::ClockGettime { clockid, tp } => {
                 litebox_common_linux::ClockId::try_from(clockid)
@@ -909,45 +913,55 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 flags,
                 mode,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                syscall!(sys_openat(dirfd, path, flags, mode))
-            }),
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_openat(dirfd, path, flags, mode))
+                }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
             SyscallRequest::Mknodat {
                 dirfd,
                 pathname,
                 mode_and_type,
                 dev,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                syscall!(sys_mknodat(dirfd, path, mode_and_type, dev))
-            }),
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_mknodat(dirfd, path, mode_and_type, dev))
+                }),
             SyscallRequest::Unlinkat {
                 dirfd,
                 pathname,
                 flags,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                syscall!(sys_unlinkat(dirfd, path, flags))
-            }),
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_unlinkat(dirfd, path, flags))
+                }),
             SyscallRequest::Stat { pathname, buf } => {
-                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                    self.sys_stat(path).and_then(|stat| {
-                        buf.write_at_offset(0, stat)
-                            .ok_or(Errno::EFAULT)
-                            .map(|()| 0)
+                pathname
+                    .to_cstring::<Platform>()
+                    .map_or(Err(Errno::EFAULT), |path| {
+                        self.sys_stat(path).and_then(|stat| {
+                            buf.write_at_offset::<Platform>(0, stat)
+                                .ok_or(Errno::EFAULT)
+                                .map(|()| 0)
+                        })
                     })
-                })
             }
             SyscallRequest::Lstat { pathname, buf } => {
-                pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                    self.sys_lstat(path).and_then(|stat| {
-                        buf.write_at_offset(0, stat)
-                            .ok_or(Errno::EFAULT)
-                            .map(|()| 0)
+                pathname
+                    .to_cstring::<Platform>()
+                    .map_or(Err(Errno::EFAULT), |path| {
+                        self.sys_lstat(path).and_then(|stat| {
+                            buf.write_at_offset::<Platform>(0, stat)
+                                .ok_or(Errno::EFAULT)
+                                .map(|()| 0)
+                        })
                     })
-                })
             }
             SyscallRequest::Fstat { fd, buf } => self.sys_fstat(fd).and_then(|stat| {
-                buf.write_at_offset(0, stat)
+                buf.write_at_offset::<Platform>(0, stat)
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }),
@@ -957,13 +971,15 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 buf,
                 flags,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
-                    buf.write_at_offset(0, stat)
-                        .ok_or(Errno::EFAULT)
-                        .map(|()| 0)
-                })
-            }),
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                        buf.write_at_offset::<Platform>(0, stat)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
+                }),
             SyscallRequest::Statx {
                 dirfd,
                 pathname,
@@ -977,12 +993,12 @@ impl<FS: ShimFS> Task<FS> {
                         Ok(c"".into()),
                         flags | litebox_common_linux::AtFlags::AT_EMPTY_PATH,
                     ),
-                    Some(p) => (p.to_cstring().ok_or(Errno::EFAULT), flags),
+                    Some(p) => (p.to_cstring::<Platform>().ok_or(Errno::EFAULT), flags),
                 };
                 path.and_then(|path| {
                     self.sys_statx(dirfd, path, flags, mask).and_then(|sx| {
                         statxbuf
-                            .write_at_offset(0, sx)
+                            .write_at_offset::<Platform>(0, sx)
                             .ok_or(Errno::EFAULT)
                             .map(|()| 0)
                     })
@@ -993,8 +1009,12 @@ impl<FS: ShimFS> Task<FS> {
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
-                    pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT)?;
-                    pipefd.write_at_offset(1, write_fd).ok_or(Errno::EFAULT)?;
+                    pipefd
+                        .write_at_offset::<Platform>(0, read_fd)
+                        .ok_or(Errno::EFAULT)?;
+                    pipefd
+                        .write_at_offset::<Platform>(1, write_fd)
+                        .ok_or(Errno::EFAULT)?;
                     Ok(0)
                 })
             }
@@ -1030,8 +1050,11 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::GetRobustList { pid, head, len } => self
                 .sys_get_robust_list(pid, head)
                 .and_then(|()| {
-                    len.write_at_offset(0, size_of::<litebox_common_linux::RobustListHead>())
-                        .ok_or(Errno::EFAULT)
+                    len.write_at_offset::<Platform>(
+                        0,
+                        size_of::<litebox_common_linux::RobustListHead>(),
+                    )
+                    .ok_or(Errno::EFAULT)
                 })
                 .map(|()| 0),
             SyscallRequest::GetRandom { buf, count, flags } => {
@@ -1045,7 +1068,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
-                buf.write_at_offset(0, sysinfo)
+                buf.write_at_offset::<Platform>(0, sysinfo)
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
@@ -1062,7 +1085,7 @@ impl<FS: ShimFS> Task<FS> {
                     Err(Errno::EINVAL)
                 } else {
                     let raw_bytes = cpuset.as_bytes();
-                    mask.copy_from_slice(0, raw_bytes)
+                    mask.copy_from_slice::<Platform>(0, raw_bytes)
                         .map(|()| raw_bytes.len())
                         .ok_or(Errno::EFAULT)
                 }

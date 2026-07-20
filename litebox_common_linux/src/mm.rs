@@ -10,7 +10,7 @@ use litebox::{
     platform::{RawConstPointer, page_mgmt::DeallocationError},
 };
 
-use crate::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+use crate::{MRemapFlags, MapFlags, ProtFlags, UserPtrMut, errno::Errno};
 
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 
@@ -25,8 +25,9 @@ pub fn do_mmap<
     prot: ProtFlags,
     flags: MapFlags,
     ensure_space_after: bool,
-    op: impl FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, litebox::mm::linux::MappingError>,
-) -> Result<Platform::RawMutPointer<u8>, litebox::mm::linux::MappingError> {
+    op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, litebox::mm::linux::MappingError>,
+) -> Result<UserPtrMut<u8>, litebox::mm::linux::MappingError> {
+    let op = |p: Platform::RawMutPointer<u8>| op(UserPtrMut::from_usize(p.as_usize()));
     let flags = {
         let mut create_flags = CreatePagesFlags::empty();
         // MAP_FIXED_NOREPLACE implies MAP_FIXED behavior (exact address, not a hint)
@@ -82,6 +83,7 @@ pub fn do_mmap<
             }
         }
     }
+    .map(|p| UserPtrMut::from_usize(p.as_usize()))
 }
 
 /// Handle syscall `munmap`
@@ -91,7 +93,7 @@ pub fn sys_munmap<
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
     pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
-    addr: Platform::RawMutPointer<u8>,
+    addr: UserPtrMut<u8>,
     len: usize,
 ) -> Result<(), Errno> {
     if addr.as_usize() & !PAGE_MASK != 0 {
@@ -107,7 +109,7 @@ pub fn sys_munmap<
         return Err(Errno::EINVAL);
     }
 
-    match unsafe { pm.remove_pages(addr, aligned_len) } {
+    match unsafe { pm.remove_pages(addr.to_platform_ptr::<Platform>(), aligned_len) } {
         Err(VmemUnmapError::UnAligned) => Err(Errno::EINVAL),
         Err(VmemUnmapError::UnmapError(e)) => match e {
             DeallocationError::Unaligned => Err(Errno::EINVAL),
@@ -126,7 +128,7 @@ pub fn sys_mprotect<
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
     pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
-    addr: Platform::RawMutPointer<u8>,
+    addr: UserPtrMut<u8>,
     len: usize,
     prot: ProtFlags,
 ) -> Result<(), Errno> {
@@ -137,6 +139,7 @@ pub fn sys_mprotect<
         return Ok(());
     }
 
+    let addr = addr.to_platform_ptr::<Platform>();
     match prot {
         ProtFlags::PROT_READ_EXEC => unsafe { pm.make_pages_executable(addr, len) },
         ProtFlags::PROT_READ_WRITE => unsafe { pm.make_pages_writable(addr, len) },
@@ -160,12 +163,12 @@ pub fn sys_mremap<
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
     pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
-    old_addr: Platform::RawMutPointer<u8>,
+    old_addr: UserPtrMut<u8>,
     old_size: usize,
     new_size: usize,
     flags: MRemapFlags,
     _new_addr: usize,
-) -> Result<Platform::RawMutPointer<u8>, Errno> {
+) -> Result<UserPtrMut<u8>, Errno> {
     if flags.intersects(
         (MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_DONTUNMAP)
             .complement(),
@@ -207,12 +210,13 @@ pub fn sys_mremap<
 
     unsafe {
         pm.remap_pages(
-            old_addr,
+            old_addr.to_platform_ptr::<Platform>(),
             old_size,
             new_size,
             flags.contains(MRemapFlags::MREMAP_MAYMOVE),
         )
     }
+    .map(|p| UserPtrMut::from_usize(p.as_usize()))
     .map_err(Errno::from)
 }
 
@@ -222,7 +226,7 @@ pub fn sys_brk<
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
     pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
-    addr: Platform::RawMutPointer<u8>,
+    addr: UserPtrMut<u8>,
 ) -> Result<usize, Errno> {
     unsafe { pm.brk(addr.as_usize()) }.map_err(Errno::from)
 }
@@ -233,7 +237,7 @@ pub fn sys_madvise<
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
     pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
-    addr: Platform::RawMutPointer<u8>,
+    addr: UserPtrMut<u8>,
     len: usize,
     advice: crate::MadviseBehavior,
 ) -> Result<(), Errno> {
@@ -252,6 +256,7 @@ pub fn sys_madvise<
         return Err(Errno::EINVAL);
     };
 
+    let addr = addr.to_platform_ptr::<Platform>();
     match advice {
         crate::MadviseBehavior::Normal
         | crate::MadviseBehavior::DontFork

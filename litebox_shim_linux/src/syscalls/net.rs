@@ -23,7 +23,7 @@ use litebox::{
         errors::AcceptError,
         socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy, SocketState},
     },
-    platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
+    platform::{Instant as _, TimeProvider as _},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
@@ -33,12 +33,12 @@ use litebox_common_linux::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::{ConstPtr, MutPtr, syscalls::signal};
 use crate::{GlobalState, ShimFS, Task};
 use crate::{
     Platform,
     syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
 };
+use crate::{UserPtr, UserPtrMut, syscalls::signal};
 
 /// Linux's hard cap on the number of iovecs per `*msg`-style call, and on the
 /// number of entries per `sendmmsg`. See `UIO_MAXIOV` in `<uapi/linux/uio.h>`.
@@ -275,7 +275,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     pub(super) fn setsockopt_common<F>(
         &self,
         optname: SocketOptionName,
-        optval: ConstPtr<u8>,
+        optval: UserPtr<u8>,
         optlen: usize,
         set_option: F,
     ) -> Result<(), Errno>
@@ -318,7 +318,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         &self,
         fd: &SocketFd,
         optname: SocketOptionName,
-        optval: ConstPtr<u8>,
+        optval: UserPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
@@ -406,7 +406,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 TcpOption::CONGESTION => {
                     const TCP_CONGESTION_NAME_MAX: usize = 16;
                     let data = optval
-                        .to_owned_slice(TCP_CONGESTION_NAME_MAX.min(optlen))
+                        .to_owned_slice::<Platform>(TCP_CONGESTION_NAME_MAX.min(optlen))
                         .ok_or(Errno::EFAULT)?;
                     let name = core::str::from_utf8(&data).map_err(|_| Errno::EINVAL)?;
                     self.net.lock().set_tcp_option(
@@ -484,7 +484,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     pub(super) fn getsockopt_common<F>(
         &self,
         optname: SocketOptionName,
-        optval: MutPtr<u8>,
+        optval: UserPtrMut<u8>,
         len: u32,
         get_option: F,
     ) -> Result<usize, Errno>
@@ -518,7 +518,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         &self,
         fd: &SocketFd,
         optname: SocketOptionName,
-        optval: MutPtr<u8>,
+        optval: UserPtrMut<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
         match self.getsockopt_common(optname, optval, len, |sopt| {
@@ -585,7 +585,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                         };
                         let len = name.len().min(len as usize);
                         optval
-                            .write_slice_at_offset(0, &name.as_bytes()[..len])
+                            .write_slice_at_offset::<Platform>(0, &name.as_bytes()[..len])
                             .ok_or(Errno::EFAULT)?;
                         return Ok(len);
                     }
@@ -1004,7 +1004,7 @@ impl<FS: ShimFS> Task<FS> {
         domain: u32,
         type_and_flags: u32,
         protocol: u8,
-        sockvec: MutPtr<u32>,
+        sockvec: UserPtrMut<u32>,
     ) -> Result<(), Errno> {
         let (ty, flags) = parse_type_and_flags(type_and_flags)?;
         let domain = AddressFamily::try_from(domain).map_err(|_| {
@@ -1012,8 +1012,12 @@ impl<FS: ShimFS> Task<FS> {
             Errno::EINVAL
         })?;
         let (sock1, sock2) = self.do_socketpair(domain, ty, flags, protocol)?;
-        sockvec.write_at_offset(0, sock1).ok_or(Errno::EFAULT)?;
-        sockvec.write_at_offset(1, sock2).ok_or(Errno::EFAULT)?;
+        sockvec
+            .write_at_offset::<Platform>(0, sock1)
+            .ok_or(Errno::EFAULT)?;
+        sockvec
+            .write_at_offset::<Platform>(1, sock2)
+            .ok_or(Errno::EFAULT)?;
         Ok(())
     }
     fn do_socketpair(
@@ -1062,31 +1066,33 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 pub(crate) fn read_sockaddr_from_user(
-    sockaddr: ConstPtr<u8>,
+    sockaddr: UserPtr<u8>,
     addrlen: usize,
 ) -> Result<SocketAddress, Errno> {
     if addrlen < 2 {
         return Err(Errno::EINVAL);
     }
 
-    let ptr: ConstPtr<u16> = ConstPtr::from_usize(sockaddr.as_usize());
-    let family = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+    let ptr: UserPtr<u16> = UserPtr::from_usize(sockaddr.as_usize());
+    let family = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
     let family = AddressFamily::try_from(u32::from(family)).map_err(|_| Errno::EAFNOSUPPORT)?;
     match family {
         AddressFamily::INET => {
             if addrlen < size_of::<CSockInetAddr>() {
                 return Err(Errno::EINVAL);
             }
-            let ptr: ConstPtr<CSockInetAddr> = ConstPtr::from_usize(sockaddr.as_usize());
+            let ptr: UserPtr<CSockInetAddr> = UserPtr::from_usize(sockaddr.as_usize());
             // Note it reads the first 2 bytes (i.e., sa_family) again, but it is not used.
             // SocketAddrV4 only needs the port and addr.
-            let inet_addr = ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let inet_addr = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
             Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::from(
                 inet_addr,
             ))))
         }
         AddressFamily::UNIX => {
-            let path = sockaddr.to_owned_slice(addrlen).ok_or(Errno::EFAULT)?;
+            let path = sockaddr
+                .to_owned_slice::<Platform>(addrlen)
+                .ok_or(Errno::EFAULT)?;
             // skip the first two bytes (sa_family)
             let path = &path[offset_of!(CSockUnixAddr, path)..];
             if path.is_empty() {
@@ -1108,10 +1114,10 @@ pub(crate) fn read_sockaddr_from_user(
 
 pub(crate) fn write_sockaddr_to_user(
     sock_addr: SocketAddress,
-    addr: crate::MutPtr<u8>,
-    addrlen: crate::MutPtr<u32>,
+    addr: crate::UserPtrMut<u8>,
+    addrlen: crate::UserPtrMut<u32>,
 ) -> Result<(), Errno> {
-    let addrlen_val = addrlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
+    let addrlen_val = addrlen.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
     if addrlen_val >= i32::MAX as u32 {
         return Err(Errno::EINVAL);
     }
@@ -1120,14 +1126,14 @@ pub(crate) fn write_sockaddr_to_user(
             let addrlen_val = size_of::<CSockInetAddr>().min(addrlen_val as usize);
             let c_addr: CSockInetAddr = v4_addr.into();
             let bytes: &[u8] = c_addr.as_bytes();
-            addr.write_slice_at_offset(0, &bytes[..addrlen_val])
+            addr.write_slice_at_offset::<Platform>(0, &bytes[..addrlen_val])
                 .ok_or(Errno::EFAULT)?;
             size_of::<CSockInetAddr>()
         }
         SocketAddress::Unix(v) => {
-            let family_ptr = MutPtr::<u16>::from_usize(addr.as_usize());
+            let family_ptr = UserPtrMut::<u16>::from_usize(addr.as_usize());
             family_ptr
-                .write_at_offset(0, AddressFamily::UNIX as u16)
+                .write_at_offset::<Platform>(0, AddressFamily::UNIX as u16)
                 .ok_or(Errno::EFAULT)?;
             match v {
                 UnixSocketAddr::Unnamed => {
@@ -1137,10 +1143,10 @@ pub(crate) fn write_sockaddr_to_user(
                 UnixSocketAddr::Abstract(name) => {
                     let offset = offset_of!(CSockUnixAddr, path);
                     if addrlen_val as usize > offset {
-                        addr.write_at_offset(isize::try_from(offset).unwrap(), 0)
+                        addr.write_at_offset::<Platform>(isize::try_from(offset).unwrap(), 0)
                             .ok_or(Errno::EFAULT)?;
                         let max_len = addrlen_val as usize - offset - 1;
-                        addr.write_slice_at_offset(
+                        addr.write_slice_at_offset::<Platform>(
                             isize::try_from(offset + 1).unwrap(),
                             &name[..name.len().min(max_len)],
                         )
@@ -1152,12 +1158,12 @@ pub(crate) fn write_sockaddr_to_user(
                     let offset = offset_of!(CSockUnixAddr, path);
                     let max_len = addrlen_val as usize - offset;
                     let name = &path.as_bytes()[..path.len().min(max_len)];
-                    addr.write_slice_at_offset(isize::try_from(offset).unwrap(), name)
+                    addr.write_slice_at_offset::<Platform>(isize::try_from(offset).unwrap(), name)
                         .ok_or(Errno::EFAULT)?;
                     let null_offset = offset + name.len();
                     // write null terminator if there is space
                     if addrlen_val as usize > null_offset {
-                        addr.write_at_offset(isize::try_from(null_offset).unwrap(), 0)
+                        addr.write_at_offset::<Platform>(isize::try_from(null_offset).unwrap(), 0)
                             .ok_or(Errno::EFAULT)?;
                     }
                     offset + path.len() + 1
@@ -1167,15 +1173,12 @@ pub(crate) fn write_sockaddr_to_user(
         SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
     }
     .trunc();
-    addrlen.write_at_offset(0, len).ok_or(Errno::EFAULT)
+    addrlen
+        .write_at_offset::<Platform>(0, len)
+        .ok_or(Errno::EFAULT)
 }
 
-fn copy_iovs_to_vec<P>(
-    iovs: &[litebox_common_linux::IoVec<P>],
-) -> Result<alloc::vec::Vec<u8>, Errno>
-where
-    P: litebox::platform::RawMutPointer<u8>,
-{
+fn copy_iovs_to_vec(iovs: &[litebox_common_linux::IoVec]) -> Result<alloc::vec::Vec<u8>, Errno> {
     let total_len = iovs.iter().try_fold(0usize, |total_len, iov| {
         total_len.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
     })?;
@@ -1192,7 +1195,7 @@ where
         for (byte_offset, byte) in (0_isize..).zip(data[offset..end].iter_mut()) {
             *byte = iov
                 .iov_base
-                .read_at_offset(byte_offset)
+                .read_at_offset::<Platform>(byte_offset)
                 .ok_or(Errno::EFAULT)?;
         }
         offset = end;
@@ -1205,8 +1208,8 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_accept(
         &self,
         sockfd: i32,
-        addr: Option<MutPtr<u8>>,
-        addrlen: Option<MutPtr<u32>>,
+        addr: Option<UserPtrMut<u8>>,
+        addrlen: Option<UserPtrMut<u32>>,
         flags: SockFlags,
     ) -> Result<u32, Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
@@ -1285,7 +1288,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_connect(
         &self,
         fd: i32,
-        sockaddr: ConstPtr<u8>,
+        sockaddr: UserPtr<u8>,
         addrlen: usize,
     ) -> Result<(), Errno> {
         let Ok(fd) = u32::try_from(fd) else {
@@ -1313,7 +1316,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_bind(
         &self,
         sockfd: i32,
-        sockaddr: ConstPtr<u8>,
+        sockaddr: UserPtr<u8>,
         addrlen: usize,
     ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
@@ -1357,10 +1360,10 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_sendto(
         &self,
         fd: i32,
-        buf: ConstPtr<u8>,
+        buf: UserPtr<u8>,
         len: usize,
         flags: SendFlags,
-        addr: Option<ConstPtr<u8>>,
+        addr: Option<UserPtr<u8>>,
         addrlen: u32,
     ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
@@ -1369,7 +1372,7 @@ impl<FS: ShimFS> Task<FS> {
         let sockaddr = addr
             .map(|addr| read_sockaddr_from_user(addr, addrlen as usize))
             .transpose()?;
-        let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
+        let buf = buf.to_owned_slice::<Platform>(len).ok_or(Errno::EFAULT)?;
         self.do_sendto(fd, &buf, flags, sockaddr)
     }
     fn do_sendto(
@@ -1410,25 +1413,25 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_sendmsg(
         &self,
         fd: i32,
-        msg: ConstPtr<litebox_common_linux::UserMsgHdr<Platform>>,
+        msg: UserPtr<litebox_common_linux::UserMsgHdr>,
         flags: SendFlags,
     ) -> Result<usize, Errno> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        let msg = msg.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let msg = msg.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         self.do_sendmsg(fd, &msg, flags)
     }
     fn do_sendmsg(
         &self,
         sockfd: u32,
-        msg: &litebox_common_linux::UserMsgHdr<Platform>,
+        msg: &litebox_common_linux::UserMsgHdr,
         flags: SendFlags,
     ) -> Result<usize, Errno> {
         let msg_name = msg.msg_name;
         let sock_addr = if msg_name.as_usize() != 0 {
             Some(read_sockaddr_from_user(
-                ConstPtr::from_usize(msg_name.as_usize()),
+                UserPtr::from_usize(msg_name.as_usize()),
                 msg.msg_namelen as usize,
             )?)
         } else {
@@ -1446,7 +1449,7 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             Some(
                 msg.msg_iov
-                    .to_owned_slice(msg.msg_iovlen)
+                    .to_owned_slice::<Platform>(msg.msg_iovlen)
                     .ok_or(Errno::EFAULT)?,
             )
         };
@@ -1483,7 +1486,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_sendmmsg(
         &self,
         fd: i32,
-        msgvec: MutPtr<litebox_common_linux::UserMmsgHdr<Platform>>,
+        msgvec: UserPtrMut<litebox_common_linux::UserMmsgHdr>,
         vlen: u32,
         flags: SendFlags,
     ) -> Result<usize, Errno> {
@@ -1506,14 +1509,13 @@ impl<FS: ShimFS> Task<FS> {
             return Ok(0);
         }
 
-        let stride = core::mem::size_of::<litebox_common_linux::UserMmsgHdr<Platform>>();
-        let msg_len_off =
-            core::mem::offset_of!(litebox_common_linux::UserMmsgHdr<Platform>, msg_len);
+        let stride = core::mem::size_of::<litebox_common_linux::UserMmsgHdr>();
+        let msg_len_off = core::mem::offset_of!(litebox_common_linux::UserMmsgHdr, msg_len);
 
         let mut sent: usize = 0;
         for i in 0..vlen {
             let bail = |e: Errno| if sent > 0 { Ok(sent) } else { Err(e) };
-            let Some(mmh) = msgvec.read_at_offset(isize::try_from(i).unwrap()) else {
+            let Some(mmh) = msgvec.read_at_offset::<Platform>(isize::try_from(i).unwrap()) else {
                 return bail(Errno::EFAULT);
             };
             let inner = mmh.msg_hdr;
@@ -1522,8 +1524,11 @@ impl<FS: ShimFS> Task<FS> {
                 Err(e) => return bail(e),
             };
             let msg_len_ptr =
-                MutPtr::<u32>::from_usize(msgvec.as_usize() + i * stride + msg_len_off);
-            if msg_len_ptr.write_at_offset(0, n.trunc()).is_none() {
+                UserPtrMut::<u32>::from_usize(msgvec.as_usize() + i * stride + msg_len_off);
+            if msg_len_ptr
+                .write_at_offset::<Platform>(0, n.trunc())
+                .is_none()
+            {
                 return bail(Errno::EFAULT);
             }
             sent += 1;
@@ -1535,11 +1540,11 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_recvfrom(
         &self,
         fd: i32,
-        buf: MutPtr<u8>,
+        buf: UserPtrMut<u8>,
         len: usize,
         flags: ReceiveFlags,
-        addr: Option<MutPtr<u8>>,
-        addrlen: MutPtr<u32>,
+        addr: Option<UserPtrMut<u8>>,
+        addrlen: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
         const MAX_LEN: usize = 4096;
         let Ok(sockfd) = u32::try_from(fd) else {
@@ -1559,7 +1564,7 @@ impl<FS: ShimFS> Task<FS> {
             },
         )?;
         let capped_size = size.min(recv_buf.len());
-        buf.copy_from_slice(0, &recv_buf[..capped_size])
+        buf.copy_from_slice::<Platform>(0, &recv_buf[..capped_size])
             .ok_or(Errno::EFAULT)?;
         if let Some(src_addr) = source_addr
             && let Some(sock_ptr) = addr
@@ -1634,7 +1639,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_recvmsg(
         &self,
         fd: i32,
-        msg_ptr: MutPtr<litebox_common_linux::UserMsgHdr<Platform>>,
+        msg_ptr: UserPtrMut<litebox_common_linux::UserMsgHdr>,
         flags: ReceiveFlags,
     ) -> Result<usize, Errno> {
         let Ok(sockfd) = u32::try_from(fd) else {
@@ -1652,10 +1657,10 @@ impl<FS: ShimFS> Task<FS> {
     fn do_recvmsg(
         &self,
         sockfd: u32,
-        msg_ptr: MutPtr<litebox_common_linux::UserMsgHdr<Platform>>,
+        msg_ptr: UserPtrMut<litebox_common_linux::UserMsgHdr>,
         flags: ReceiveFlags,
     ) -> Result<usize, Errno> {
-        let msg = msg_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let msg = msg_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
 
         // Copy fields out of the packed struct to avoid unaligned references.
         let msg_name = msg.msg_name;
@@ -1670,7 +1675,9 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EMSGSIZE);
         }
 
-        let iovs = msg_iov.to_owned_slice(msg_iovlen).ok_or(Errno::EFAULT)?;
+        let iovs = msg_iov
+            .to_owned_slice::<Platform>(msg_iovlen)
+            .ok_or(Errno::EFAULT)?;
 
         let total_iov_capacity = iovs.iter().try_fold(0usize, |capacity, iov| {
             capacity.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
@@ -1715,7 +1722,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             let chunk = (data_to_copy - offset).min(iov.iov_len);
             iov.iov_base
-                .copy_from_slice(0, &recv_buf[offset..offset + chunk])
+                .copy_from_slice::<Platform>(0, &recv_buf[offset..offset + chunk])
                 .ok_or(Errno::EFAULT)?;
             offset += chunk;
         }
@@ -1730,33 +1737,34 @@ impl<FS: ShimFS> Task<FS> {
 
         // Write back source address if requested.
         if want_source {
-            let addrlen_ptr = MutPtr::<u32>::from_usize(
+            let addrlen_ptr = UserPtrMut::<u32>::from_usize(
                 msg_ptr.as_usize()
-                    + core::mem::offset_of!(
-                        litebox_common_linux::UserMsgHdr<Platform>,
-                        msg_namelen
-                    ),
+                    + core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_namelen),
             );
             if let Some(src_addr) = source_addr {
                 write_sockaddr_to_user(src_addr, msg_name, addrlen_ptr)?;
             } else {
                 // No source address (e.g. connected stream socket) — zero out msg_namelen.
-                addrlen_ptr.write_at_offset(0, 0u32).ok_or(Errno::EFAULT)?;
+                addrlen_ptr
+                    .write_at_offset::<Platform>(0, 0u32)
+                    .ok_or(Errno::EFAULT)?;
             }
         }
 
         // Ancillary data is not supported, so report that no control bytes were delivered.
         let controllen_offset =
-            core::mem::offset_of!(litebox_common_linux::UserMsgHdr<Platform>, msg_controllen);
-        let controllen_ptr = MutPtr::<usize>::from_usize(msg_ptr.as_usize() + controllen_offset);
-        controllen_ptr.write_at_offset(0, 0).ok_or(Errno::EFAULT)?;
+            core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_controllen);
+        let controllen_ptr =
+            UserPtrMut::<usize>::from_usize(msg_ptr.as_usize() + controllen_offset);
+        controllen_ptr
+            .write_at_offset::<Platform>(0, 0)
+            .ok_or(Errno::EFAULT)?;
 
         // Write back msg_flags with any status flags (e.g. MSG_TRUNC).
-        let flags_offset =
-            core::mem::offset_of!(litebox_common_linux::UserMsgHdr<Platform>, msg_flags);
-        let flags_ptr = MutPtr::<ReceiveFlags>::from_usize(msg_ptr.as_usize() + flags_offset);
+        let flags_offset = core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_flags);
+        let flags_ptr = UserPtrMut::<ReceiveFlags>::from_usize(msg_ptr.as_usize() + flags_offset);
         flags_ptr
-            .write_at_offset(0, ret_flags)
+            .write_at_offset::<Platform>(0, ret_flags)
             .ok_or(Errno::EFAULT)?;
 
         Ok(total_received)
@@ -1766,10 +1774,10 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_recvmmsg(
         &self,
         fd: i32,
-        msgvec: MutPtr<litebox_common_linux::UserMmsgHdr<Platform>>,
+        msgvec: UserPtrMut<litebox_common_linux::UserMmsgHdr>,
         vlen: u32,
         flags: ReceiveFlags,
-        timeout: litebox_common_linux::TimeParam<Platform>,
+        timeout: litebox_common_linux::TimeParam,
     ) -> Result<usize, Errno> {
         let supported_flags =
             ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::WAITFORONE;
@@ -1780,7 +1788,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Linux's `do_recvmmsg` validates the timespec before looking up the fd,
         // so a bad timeout takes precedence over EBADF.
-        let timeout_duration = timeout.read()?;
+        let timeout_duration = timeout.read::<Platform>()?;
 
         let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
@@ -1805,8 +1813,8 @@ impl<FS: ShimFS> Task<FS> {
         // — both are treated as "no deadline".
         let deadline = timeout_duration.and_then(|d| self.global.platform.now().checked_add(d));
 
-        let stride = size_of::<UserMmsgHdr<Platform>>();
-        let msg_len_off = offset_of!(UserMmsgHdr<Platform>, msg_len);
+        let stride = size_of::<UserMmsgHdr>();
+        let msg_len_off = offset_of!(UserMmsgHdr, msg_len);
         let msgvec_base = msgvec.as_usize();
         let msgvec_len = vlen.checked_mul(stride).ok_or(Errno::EFAULT)?;
         if msgvec_base.checked_add(msgvec_len).is_none() {
@@ -1821,7 +1829,7 @@ impl<FS: ShimFS> Task<FS> {
         let mut async_error_to_restore = None;
         for i in 0..vlen {
             let base = msgvec_base + i * stride;
-            let inner_ptr = MutPtr::<UserMsgHdr<Platform>>::from_usize(base);
+            let inner_ptr = UserPtrMut::<UserMsgHdr>::from_usize(base);
             let n = match self.do_recvmsg(sockfd, inner_ptr, iter_flags) {
                 Ok(n) => n,
                 Err(e) => {
@@ -1832,8 +1840,11 @@ impl<FS: ShimFS> Task<FS> {
                     break;
                 }
             };
-            let msg_len_ptr = MutPtr::<u32>::from_usize(base + msg_len_off);
-            if msg_len_ptr.write_at_offset(0, n.trunc()).is_none() {
+            let msg_len_ptr = UserPtrMut::<u32>::from_usize(base + msg_len_off);
+            if msg_len_ptr
+                .write_at_offset::<Platform>(0, n.trunc())
+                .is_none()
+            {
                 last_err = Some(Errno::EFAULT);
                 break;
             }
@@ -1868,7 +1879,7 @@ impl<FS: ShimFS> Task<FS> {
         let remaining = deadline
             .and_then(|d| d.checked_duration_since(&self.global.platform.now()))
             .unwrap_or(core::time::Duration::ZERO);
-        timeout.write(remaining)?;
+        timeout.write::<Platform>(remaining)?;
 
         Ok(received)
     }
@@ -1878,7 +1889,7 @@ impl<FS: ShimFS> Task<FS> {
         sockfd: i32,
         level: u32,
         optname: u32,
-        optval: ConstPtr<u8>,
+        optval: UserPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
@@ -1894,7 +1905,7 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         sockfd: u32,
         optname: SocketOptionName,
-        optval: ConstPtr<u8>,
+        optval: UserPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
         self.files.borrow().with_socket(
@@ -1911,8 +1922,8 @@ impl<FS: ShimFS> Task<FS> {
         sockfd: i32,
         level: u32,
         optname: u32,
-        optval: MutPtr<u8>,
-        optlen: MutPtr<u32>,
+        optval: UserPtrMut<u8>,
+        optlen: UserPtrMut<u32>,
     ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
@@ -1921,13 +1932,13 @@ impl<FS: ShimFS> Task<FS> {
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
         })?;
-        let len = optlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let len = optlen.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if len > i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }
         let new_len = self.do_getsockopt(sockfd, optname, optval, len)?;
         optlen
-            .write_at_offset(0, new_len.trunc())
+            .write_at_offset::<Platform>(0, new_len.trunc())
             .ok_or(Errno::EFAULT)?;
         Ok(())
     }
@@ -1938,7 +1949,7 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         sockfd: u32,
         optname: SocketOptionName,
-        optval: MutPtr<u8>,
+        optval: UserPtrMut<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
         self.files.borrow().with_socket(
@@ -1953,8 +1964,8 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_getsockname(
         &self,
         sockfd: i32,
-        addr: MutPtr<u8>,
-        addrlen: MutPtr<u32>,
+        addr: UserPtrMut<u8>,
+        addrlen: UserPtrMut<u32>,
     ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
@@ -1982,8 +1993,8 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_getpeername(
         &self,
         sockfd: i32,
-        addr: MutPtr<u8>,
-        addrlen: MutPtr<u32>,
+        addr: UserPtrMut<u8>,
+        addrlen: UserPtrMut<u32>,
     ) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
@@ -2045,7 +2056,6 @@ mod tests {
     use core::net::SocketAddr;
 
     use alloc::string::ToString as _;
-    use litebox::platform::RawConstPointer as _;
     use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
         AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
@@ -2055,7 +2065,7 @@ mod tests {
 
     use super::SocketAddress;
     use crate::{
-        ConstPtr, MutPtr,
+        UserPtr, UserPtrMut,
         syscalls::{
             net::{CSockInetAddr, read_sockaddr_from_user},
             tests::init_platform,
@@ -2067,7 +2077,7 @@ mod tests {
 
     // Compile-time layout check: UserMsgHdr must match Linux's struct user_msghdr.
     const _USER_MSG_HDR_SIZE: () = assert!(
-        core::mem::size_of::<litebox_common_linux::UserMsgHdr<crate::Platform>>()
+        core::mem::size_of::<litebox_common_linux::UserMsgHdr>()
             == core::mem::size_of::<libc::msghdr>()
     );
 
@@ -2090,7 +2100,7 @@ mod tests {
             .do_getsockopt(
                 sockfd,
                 SocketOptionName::Socket(SocketOption::ERROR),
-                MutPtr::from_usize((&raw mut optval).cast::<u8>() as usize),
+                UserPtrMut::from_usize((&raw mut optval).cast::<u8>() as usize),
                 core::mem::size_of::<u32>().trunc(),
             )
             .expect("getsockopt SO_ERROR failed");
@@ -2109,7 +2119,7 @@ mod tests {
             data: u64::from(target_fd),
         };
         let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
-        let ev_const = crate::ConstPtr::from_usize(ev_ptr as usize);
+        let ev_const = crate::UserPtr::from_usize(ev_ptr as usize);
         task.sys_epoll_ctl(
             epfd,
             litebox_common_linux::EpollOp::EpollCtlAdd,
@@ -2124,7 +2134,7 @@ mod tests {
         epfd: i32,
         events: &mut [litebox_common_linux::EpollEvent],
     ) -> usize {
-        let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
+        let events_ptr = crate::UserPtrMut::from_usize(events.as_mut_ptr() as usize);
         task.sys_epoll_pwait(epfd, events_ptr, events.len().trunc(), -1, None, 0)
             .expect("epoll_wait failed")
     }
@@ -2239,17 +2249,17 @@ mod tests {
                 let buf2 = " world!\n";
                 let iovec = [
                     litebox_common_linux::IoVec {
-                        iov_base: MutPtr::from_usize(buf1.as_ptr().expose_provenance()),
+                        iov_base: UserPtrMut::from_usize(buf1.as_ptr().expose_provenance()),
                         iov_len: buf1.len(),
                     },
                     litebox_common_linux::IoVec {
-                        iov_base: MutPtr::from_usize(buf2.as_ptr().expose_provenance()),
+                        iov_base: UserPtrMut::from_usize(buf2.as_ptr().expose_provenance()),
                         iov_len: buf2.len(),
                     },
                 ];
                 let hdr = {
-                    let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
-                    h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+                    let mut h = litebox_common_linux::UserMsgHdr::new_zeroed();
+                    h.msg_iov = UserPtr::from_usize(iovec.as_ptr() as usize);
                     h.msg_iovlen = iovec.len();
                     h
                 };
@@ -2288,14 +2298,15 @@ mod tests {
                         .expect("Failed to receive data"),
                     "recvmsg" => {
                         let iovec = [litebox_common_linux::IoVec {
-                            iov_base: MutPtr::from_usize(recv_buf.as_mut_ptr().expose_provenance()),
+                            iov_base: UserPtrMut::from_usize(
+                                recv_buf.as_mut_ptr().expose_provenance(),
+                            ),
                             iov_len: recv_buf.len(),
                         }];
-                        let mut msg_hdr =
-                            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
-                        msg_hdr.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+                        let mut msg_hdr = litebox_common_linux::UserMsgHdr::new_zeroed();
+                        msg_hdr.msg_iov = UserPtr::from_usize(iovec.as_ptr() as usize);
                         msg_hdr.msg_iovlen = iovec.len();
-                        let msg_ptr = MutPtr::from_usize(&raw mut msg_hdr as usize);
+                        let msg_ptr = UserPtrMut::from_usize(&raw mut msg_hdr as usize);
                         task.sys_recvmsg(i32::try_from(client_fd).unwrap(), msg_ptr, flags)
                             .expect("failed to recvmsg")
                     }
@@ -2454,7 +2465,7 @@ mod tests {
             onoff: 1,   // enable linger
             linger: 60, // timeout in seconds
         };
-        let optval = ConstPtr::from_usize((&raw const linger).cast::<u8>() as usize);
+        let optval = UserPtr::from_usize((&raw const linger).cast::<u8>() as usize);
         task.do_setsockopt(
             client_fd,
             SocketOptionName::Socket(SocketOption::LINGER),
@@ -2563,25 +2574,25 @@ mod tests {
                 let mut addrlen = core::mem::size_of::<CSockInetAddr>();
                 task.sys_recvfrom(
                     i32::try_from(server_fd).unwrap(),
-                    MutPtr::from_usize(recv_buf.as_mut_ptr() as usize),
+                    UserPtrMut::from_usize(recv_buf.as_mut_ptr() as usize),
                     recv_len,
                     recv_flags,
-                    Some(MutPtr::from_usize(source_addr.as_ptr() as usize)),
-                    MutPtr::from_usize(&raw mut addrlen as usize),
+                    Some(UserPtrMut::from_usize(source_addr.as_ptr() as usize)),
+                    UserPtrMut::from_usize(&raw mut addrlen as usize),
                 )
                 .expect("recvfrom failed")
             }
             "recvmsg" => {
                 let iovec = [litebox_common_linux::IoVec {
-                    iov_base: MutPtr::from_usize(recv_buf.as_mut_ptr() as usize),
+                    iov_base: UserPtrMut::from_usize(recv_buf.as_mut_ptr() as usize),
                     iov_len: recv_len,
                 }];
-                let mut msg_hdr = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
-                msg_hdr.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+                let mut msg_hdr = litebox_common_linux::UserMsgHdr::new_zeroed();
+                msg_hdr.msg_iov = UserPtr::from_usize(iovec.as_ptr() as usize);
                 msg_hdr.msg_iovlen = iovec.len();
-                msg_hdr.msg_name = MutPtr::from_usize(source_addr.as_ptr() as usize);
+                msg_hdr.msg_name = UserPtrMut::from_usize(source_addr.as_ptr() as usize);
                 msg_hdr.msg_namelen = source_addr.len().trunc();
-                let msg_ptr = MutPtr::from_usize(&raw mut msg_hdr as usize);
+                let msg_ptr = UserPtrMut::from_usize(&raw mut msg_hdr as usize);
                 let n = task
                     .sys_recvmsg(i32::try_from(server_fd).unwrap(), msg_ptr, recv_flags)
                     .expect("recvmsg failed");
@@ -2594,7 +2605,7 @@ mod tests {
             _ => panic!("Unknown operation"),
         };
         let sender_addr = read_sockaddr_from_user(
-            ConstPtr::from_usize(source_addr.as_ptr() as usize),
+            UserPtr::from_usize(source_addr.as_ptr() as usize),
             source_addr.len(),
         )
         .ok();
@@ -2705,7 +2716,7 @@ mod tests {
             .do_getsockopt(
                 sockfd,
                 SocketOptionName::TCP(TcpOption::CONGESTION),
-                MutPtr::from_usize(congestion_name.as_mut_ptr() as usize),
+                UserPtrMut::from_usize(congestion_name.as_mut_ptr() as usize),
                 congestion_name.len().trunc(),
             )
             .expect("Failed to get TCP_CONGESTION");
@@ -2718,7 +2729,7 @@ mod tests {
         task.do_setsockopt(
             sockfd,
             SocketOptionName::TCP(TcpOption::CONGESTION),
-            ConstPtr::from_usize(congestion_name.as_ptr() as usize),
+            UserPtr::from_usize(congestion_name.as_ptr() as usize),
             optlen,
         )
         .expect("Failed to set TCP_CONGESTION");
@@ -2728,14 +2739,14 @@ mod tests {
             .do_setsockopt(
                 sockfd,
                 SocketOptionName::TCP(TcpOption::CONGESTION),
-                ConstPtr::from_usize(congestion_name.as_ptr() as usize),
+                UserPtr::from_usize(congestion_name.as_ptr() as usize),
                 congestion_name.len(),
             )
             .unwrap_err();
         assert_eq!(err, Errno::EINVAL);
 
         let val: u32 = 1;
-        let optval = ConstPtr::from_usize((&raw const val).cast::<u8>() as usize);
+        let optval = UserPtr::from_usize((&raw const val).cast::<u8>() as usize);
         task.do_setsockopt(
             sockfd,
             SocketOptionName::Socket(SocketOption::KEEPALIVE),
@@ -2746,7 +2757,7 @@ mod tests {
 
         // Verify SO_KEEPALIVE is enabled
         let mut result: u32 = 0;
-        let optval_out = MutPtr::from_usize((&raw mut result).cast::<u8>() as usize);
+        let optval_out = UserPtrMut::from_usize((&raw mut result).cast::<u8>() as usize);
         let len = task
             .do_getsockopt(
                 sockfd,
@@ -2811,14 +2822,14 @@ mod unix_tests {
     use core::time::Duration;
 
     use alloc::{string::ToString, vec::Vec};
-    use litebox::{event::Events, platform::RawConstPointer};
+    use litebox::event::Events;
     use litebox_common_linux::{
         AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
         SocketOptionName, TimeParam, errno::Errno,
     };
 
     use crate::{
-        ConstPtr, MutPtr, Task,
+        Task, UserPtr, UserPtrMut,
         syscalls::{net::SocketAddress, tests::init_platform, unix::UnixSocketAddr},
     };
 
@@ -2857,7 +2868,7 @@ mod unix_tests {
 
         let n = task
             .sys_ppoll(
-                MutPtr::from_usize(pollfd.as_mut_ptr() as usize),
+                UserPtrMut::from_usize(pollfd.as_mut_ptr() as usize),
                 1,
                 TimeParam::None,
                 None,
@@ -3227,7 +3238,7 @@ mod unix_tests {
     fn unix_socketpair_bidirectional(ty: SockType, is_nonblocking: bool) {
         let task = init_platform(None);
         let mut sv_ptr = alloc::vec![0u32; 2];
-        let sv_mut_ptr = MutPtr::from_usize(sv_ptr.as_mut_ptr() as usize);
+        let sv_mut_ptr = UserPtrMut::from_usize(sv_ptr.as_mut_ptr() as usize);
 
         let ty_and_flags = if is_nonblocking {
             SockFlags::NONBLOCK.bits()
@@ -3297,7 +3308,7 @@ mod unix_tests {
             .expect("socketpair failed");
         let timeout = Duration::from_millis(200);
         let tv = litebox_common_linux::TimeVal::from(timeout);
-        let optval = ConstPtr::from_usize((&raw const tv).cast::<u8>() as usize);
+        let optval = UserPtr::from_usize((&raw const tv).cast::<u8>() as usize);
         task.do_setsockopt(
             sock1,
             SocketOptionName::Socket(SocketOption::RCVTIMEO),

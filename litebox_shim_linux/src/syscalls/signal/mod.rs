@@ -12,16 +12,11 @@ use x86_64 as arch;
 use zerocopy::FromZeros;
 
 use crate::syscalls::process::ExitStatus;
-use crate::{ConstPtr, MutPtr, ShimFS, Task};
+use crate::{ShimFS, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
-use litebox::{
-    platform::{RawConstPointer as _, RawMutPointer as _},
-    shim::Exception,
-    sync::Mutex,
-    utils::ReinterpretUnsignedExt as _,
-};
+use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_common_linux::signal::{
     MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
     SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
@@ -392,22 +387,24 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_rt_sigprocmask(
         &self,
         how: SigmaskHow,
-        set_ptr: Option<crate::ConstPtr<SigSet>>,
-        oldset_ptr: Option<crate::MutPtr<SigSet>>,
+        set_ptr: Option<crate::UserPtr<SigSet>>,
+        oldset_ptr: Option<crate::UserPtrMut<SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigsetsize != core::mem::size_of::<SigSet>() {
             return Err(Errno::EINVAL);
         }
         let set = if let Some(set_ptr) = set_ptr {
-            Some(set_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
+            Some(set_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
 
         if let Some(oldset_ptr) = oldset_ptr {
             let oldset = self.signals.blocked.get();
-            oldset_ptr.write_at_offset(0, oldset).ok_or(Errno::EFAULT)?;
+            oldset_ptr
+                .write_at_offset::<Platform>(0, oldset)
+                .ok_or(Errno::EFAULT)?;
         }
 
         if let Some(set) = set {
@@ -431,8 +428,8 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn sys_sigaltstack(
         &self,
-        ss_ptr: Option<ConstPtr<SigAltStack>>,
-        old_ss_ptr: Option<MutPtr<SigAltStack>>,
+        ss_ptr: Option<UserPtr<SigAltStack>>,
+        old_ss_ptr: Option<UserPtrMut<SigAltStack>>,
         ctx: &PtRegs,
     ) -> Result<usize, Errno> {
         let mut old_ss = self.signals.altstack.get();
@@ -441,13 +438,15 @@ impl<FS: ShimFS> Task<FS> {
             if is_on_stack {
                 old_ss.flags |= SsFlags::ONSTACK;
             }
-            old_ss_ptr.write_at_offset(0, old_ss).ok_or(Errno::EFAULT)?;
+            old_ss_ptr
+                .write_at_offset::<Platform>(0, old_ss)
+                .ok_or(Errno::EFAULT)?;
         }
         if let Some(ss_ptr) = ss_ptr {
             if is_on_stack {
                 return Err(Errno::EPERM);
             }
-            let ss = ss_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let ss = ss_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
             self.signals.set_sigaltstack(ss)?;
         }
         Ok(0)
@@ -455,8 +454,8 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
         let uctx_addr = arch::uctx_addr(ctx);
-        let uctx_ptr = ConstPtr::<Ucontext>::from_usize(uctx_addr);
-        let Some(uctx) = uctx_ptr.read_at_offset(0) else {
+        let uctx_ptr = UserPtr::<Ucontext>::from_usize(uctx_addr);
+        let Some(uctx) = uctx_ptr.read_at_offset::<Platform>(0) else {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };
@@ -472,8 +471,8 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_rt_sigaction(
         &self,
         signal: Signal,
-        act_ptr: Option<ConstPtr<SigAction>>,
-        oldact_ptr: Option<MutPtr<SigAction>>,
+        act_ptr: Option<UserPtr<SigAction>>,
+        oldact_ptr: Option<UserPtrMut<SigAction>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
@@ -483,7 +482,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
         let act = if let Some(act_ptr) = act_ptr {
-            Some(act_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
+            Some(act_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
@@ -504,7 +503,7 @@ impl<FS: ShimFS> Task<FS> {
 
         if let Some(oldact_ptr) = oldact_ptr {
             oldact_ptr
-                .write_at_offset(0, old_act)
+                .write_at_offset::<Platform>(0, old_act)
                 .ok_or(Errno::EFAULT)?;
         }
 

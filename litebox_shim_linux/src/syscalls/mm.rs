@@ -8,16 +8,17 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
-        PageManagementProvider, RawConstPointer, RawMutPointer, SystemInfoProvider,
+        PageManagementProvider, RawConstPointer, SystemInfoProvider,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
     },
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
-use crate::MutPtr;
 use crate::ShimFS;
 use crate::Task;
+use crate::UserPtrMut;
 use litebox::utils::TruncateExt as _;
+use litebox_platform_multiplex::Platform;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
 
@@ -82,8 +83,8 @@ impl<FS: ShimFS> Task<FS> {
         prot: ProtFlags,
         flags: MapFlags,
         ensure_space_after: bool,
-        op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
-    ) -> Result<MutPtr<u8>, MappingError> {
+        op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
         litebox_common_linux::mm::do_mmap(
             &self.global.pm,
             suggested_addr,
@@ -102,7 +103,7 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-    ) -> Result<MutPtr<u8>, MappingError> {
+    ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |_| Ok(0);
         self.do_mmap(suggested_addr, len, prot, flags, false, op)
     }
@@ -115,7 +116,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
-    ) -> Result<MutPtr<u8>, MappingError> {
+    ) -> Result<UserPtrMut<u8>, MappingError> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
 
         // Perform the normal mmap first (CoW or memcpy fallback).
@@ -172,7 +173,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: &MapFlags,
         fd: i32,
         offset: usize,
-    ) -> Option<Result<MutPtr<u8>, MappingError>> {
+    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
         if !len.is_multiple_of(PAGE_SIZE) {
             return None;
         }
@@ -259,7 +260,7 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 }
                 .unwrap();
-                Some(Ok(ptr))
+                Some(Ok(UserPtrMut::from_usize(ptr.as_usize())))
             }
             Err(_cow_not_supported) => None,
         }
@@ -275,8 +276,8 @@ impl<FS: ShimFS> Task<FS> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
-    ) -> Result<MutPtr<u8>, MappingError> {
-        let op = |ptr: MutPtr<u8>| -> Result<usize, MappingError> {
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
             // Note a malicious user may unmap ptr while we are reading.
             // `sys_read` does not handle page faults, so we need to use a
             // temporary buffer to read the data from fs (without worrying page
@@ -297,7 +298,8 @@ impl<FS: ShimFS> Task<FS> {
                     break;
                 }
                 // ptr is a valid pointer returned by do_mmap.
-                ptr.copy_from_slice(copied, &buffer[..size]).unwrap();
+                ptr.copy_from_slice::<Platform>(copied, &buffer[..size])
+                    .unwrap();
                 copied += size;
                 file_offset += size;
             }
@@ -325,7 +327,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
-    ) -> Result<MutPtr<u8>, Errno> {
+    ) -> Result<UserPtrMut<u8>, Errno> {
         // check alignment
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
@@ -377,7 +379,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `munmap`
     #[inline]
-    pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
+    pub(crate) fn sys_munmap(&self, addr: crate::UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
         let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
             self.clear_file_mappings_for_range(addr.as_usize(), len);
@@ -388,7 +390,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Raw munmap without clearing file_mappings — used internally by the
     /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
     #[inline]
-    fn sys_munmap_raw(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
+    fn sys_munmap_raw(&self, addr: crate::UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
         litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
     }
 
@@ -414,7 +416,7 @@ impl<FS: ShimFS> Task<FS> {
     #[inline]
     pub(crate) fn sys_mprotect(
         &self,
-        addr: crate::MutPtr<u8>,
+        addr: crate::UserPtrMut<u8>,
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
@@ -433,7 +435,7 @@ impl<FS: ShimFS> Task<FS> {
     #[inline]
     fn sys_mprotect_raw(
         &self,
-        addr: crate::MutPtr<u8>,
+        addr: crate::UserPtrMut<u8>,
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
@@ -443,12 +445,12 @@ impl<FS: ShimFS> Task<FS> {
     #[inline]
     pub(crate) fn sys_mremap(
         &self,
-        old_addr: crate::MutPtr<u8>,
+        old_addr: crate::UserPtrMut<u8>,
         old_size: usize,
         new_size: usize,
         flags: MRemapFlags,
         new_addr: usize,
-    ) -> Result<crate::MutPtr<u8>, Errno> {
+    ) -> Result<crate::UserPtrMut<u8>, Errno> {
         litebox_common_linux::mm::sys_mremap(
             &self.global.pm,
             old_addr,
@@ -461,7 +463,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `brk`
     #[inline]
-    pub(crate) fn sys_brk(&self, addr: MutPtr<u8>) -> Result<usize, Errno> {
+    pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
         litebox_common_linux::mm::sys_brk(&self.global.pm, addr)
     }
 
@@ -469,7 +471,7 @@ impl<FS: ShimFS> Task<FS> {
     #[inline]
     pub(crate) fn sys_madvise(
         &self,
-        addr: MutPtr<u8>,
+        addr: UserPtrMut<u8>,
         len: usize,
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
@@ -483,7 +485,7 @@ impl<FS: ShimFS> Task<FS> {
     /// becomes executable.
     fn maybe_patch_on_mprotect_exec(
         &self,
-        addr: crate::MutPtr<u8>,
+        addr: crate::UserPtrMut<u8>,
         len: usize,
         syscall_entry: usize,
     ) {
@@ -535,7 +537,7 @@ impl<FS: ShimFS> Task<FS> {
             if patch_len == 0 {
                 continue;
             }
-            let mapped_addr = MutPtr::<u8>::from_usize(patch_start);
+            let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
             self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry, None);
         }
     }
@@ -716,7 +718,12 @@ impl<FS: ShimFS> Task<FS> {
     /// and the initial mprotect RW is skipped.
     ///
     /// Panics on infrastructure failures (mprotect/read/write/disassembly).
-    fn apply_trap_fallback(&self, mapped_addr: crate::MutPtr<u8>, len: usize, already_rw: bool) {
+    fn apply_trap_fallback(
+        &self,
+        mapped_addr: crate::UserPtrMut<u8>,
+        len: usize,
+        already_rw: bool,
+    ) {
         if !already_rw {
             self.sys_mprotect_raw(
                 mapped_addr,
@@ -727,7 +734,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Read, patch using the rewriter (proper disassembly), write back.
-        let Some(code_owned) = mapped_addr.to_owned_slice(len) else {
+        let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
             panic!("fatal: failed to read code segment for trap fallback");
         };
         let mut code_buf = code_owned.into_vec();
@@ -743,7 +750,9 @@ impl<FS: ShimFS> Task<FS> {
             );
         }
         assert!(
-            mapped_addr.copy_from_slice(0, &code_buf).is_some(),
+            mapped_addr
+                .copy_from_slice::<Platform>(0, &code_buf)
+                .is_some(),
             "fatal: failed to write trap bytes back to code segment"
         );
 
@@ -769,7 +778,7 @@ impl<FS: ShimFS> Task<FS> {
     /// trampoline address.
     fn maybe_patch_exec_segment(
         &self,
-        mapped_addr: MutPtr<u8>,
+        mapped_addr: UserPtrMut<u8>,
         len: usize,
         fd: i32,
         syscall_entry: usize,
@@ -812,14 +821,15 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 let actual_addr = alloc_ptr.as_usize();
                 if actual_addr != tramp_addr {
-                    let _ = self.sys_munmap_raw(MutPtr::<u8>::from_usize(actual_addr), tramp_len);
+                    let _ =
+                        self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), tramp_len);
                     return false;
                 }
 
                 // Read trampoline data from the file.
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset.trunc();
-                let tramp_ptr = MutPtr::<u8>::from_usize(tramp_addr);
+                let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
                 match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
                     Ok(n) if n == tramp_data.len() => {}
                     _ => {
@@ -834,7 +844,10 @@ impl<FS: ShimFS> Task<FS> {
                 }
 
                 // Write to the mapped region.
-                if tramp_ptr.copy_from_slice(0, &tramp_data).is_none() {
+                if tramp_ptr
+                    .copy_from_slice::<Platform>(0, &tramp_data)
+                    .is_none()
+                {
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
                     return false;
                 }
@@ -902,7 +915,7 @@ impl<FS: ShimFS> Task<FS> {
                     distance:? = distance;
                     "trampoline too far from code segment, skipping patching"
                 );
-                let _ = self.sys_munmap_raw(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
                 self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
@@ -910,13 +923,13 @@ impl<FS: ShimFS> Task<FS> {
             state.trampoline_addr = actual_addr;
 
             // Write the 8-byte syscall entry point at the start.
-            let entry_ptr = MutPtr::<u8>::from_usize(actual_addr);
+            let entry_ptr = UserPtrMut::<u8>::from_usize(actual_addr);
             if entry_ptr
-                .copy_from_slice(0, &syscall_entry.to_le_bytes())
+                .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
                 .is_none()
             {
                 litebox_util_log::warn!("failed to write syscall entry point to trampoline");
-                let _ = self.sys_munmap_raw(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
                 self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
@@ -935,7 +948,7 @@ impl<FS: ShimFS> Task<FS> {
         let restore_trampoline_rx = |task: &Self, state: &ElfPatchState| {
             if state.trampoline_mapped_len > 0 {
                 let _ = task.sys_mprotect_raw(
-                    MutPtr::<u8>::from_usize(state.trampoline_addr),
+                    UserPtrMut::<u8>::from_usize(state.trampoline_addr),
                     state.trampoline_mapped_len,
                     ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                 );
@@ -946,7 +959,7 @@ impl<FS: ShimFS> Task<FS> {
         if state.trampoline_mapped_len > 0
             && self
                 .sys_mprotect_raw(
-                    MutPtr::<u8>::from_usize(state.trampoline_addr),
+                    UserPtrMut::<u8>::from_usize(state.trampoline_addr),
                     state.trampoline_mapped_len,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 )
@@ -967,7 +980,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Read the mapped code into a buffer, patch it, write back.
-        let Some(code_owned) = mapped_addr.to_owned_slice(len) else {
+        let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
             let _ = self.sys_mprotect_raw(
                 mapped_addr,
                 len,
@@ -1035,8 +1048,11 @@ impl<FS: ShimFS> Task<FS> {
                 // Write stubs before patching the code so rewritten jumps
                 // never target an uninitialized trampoline.
                 let tramp_write_ptr =
-                    MutPtr::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
-                if tramp_write_ptr.copy_from_slice(0, &stubs).is_none() {
+                    UserPtrMut::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
+                if tramp_write_ptr
+                    .copy_from_slice::<Platform>(0, &stubs)
+                    .is_none()
+                {
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
@@ -1047,8 +1063,11 @@ impl<FS: ShimFS> Task<FS> {
                 }
 
                 // Write patched code back to the mapped region.
-                if mapped_addr.copy_from_slice(0, &code_buf).is_none() {
-                    let _ = mapped_addr.copy_from_slice(0, &original_code);
+                if mapped_addr
+                    .copy_from_slice::<Platform>(0, &code_buf)
+                    .is_none()
+                {
+                    let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
@@ -1064,9 +1083,12 @@ impl<FS: ShimFS> Task<FS> {
                 // No trampoline stubs were generated, but the rewriter may
                 // have replaced unpatchable syscalls with trap instructions.
                 // Write back the modified code if it changed.
-                if code_buf != original_code && mapped_addr.copy_from_slice(0, &code_buf).is_none()
+                if code_buf != original_code
+                    && mapped_addr
+                        .copy_from_slice::<Platform>(0, &code_buf)
+                        .is_none()
                 {
-                    let _ = mapped_addr.copy_from_slice(0, &original_code);
+                    let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
                     panic!("fatal: failed to write trap bytes back to code segment");
                 }
                 // Fall through to restore RX protections below.
@@ -1102,7 +1124,10 @@ impl<FS: ShimFS> Task<FS> {
         {
             let tramp_len = state.trampoline_mapped_len;
             if tramp_len > 0 {
-                let _ = self.sys_munmap(MutPtr::<u8>::from_usize(state.trampoline_addr), tramp_len);
+                let _ = self.sys_munmap(
+                    UserPtrMut::<u8>::from_usize(state.trampoline_addr),
+                    tramp_len,
+                );
             }
         }
     }
@@ -1112,9 +1137,10 @@ impl<FS: ShimFS> Task<FS> {
 mod tests {
     use litebox::{
         fs::{Mode, OFlags},
-        platform::{PageManagementProvider, RawConstPointer, RawMutPointer},
+        platform::PageManagementProvider,
     };
     use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox_platform_multiplex::Platform;
 
     use crate::syscalls::tests::init_platform;
 
@@ -1132,8 +1158,9 @@ mod tests {
                 0,
             )
             .unwrap();
-        addr.write_slice_at_offset(0, &[0xff; 0x2000]).unwrap();
-        assert_eq!(addr.read_at_offset(0x1000).unwrap(), 0xff,);
+        addr.write_slice_at_offset::<Platform>(0, &[0xff; 0x2000])
+            .unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0x1000).unwrap(), 0xff,);
         task.sys_munmap(addr, 0x2000).unwrap();
     }
 
@@ -1158,7 +1185,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            addr.to_owned_slice(content.len()).unwrap().as_ref(),
+            addr.to_owned_slice::<Platform>(content.len())
+                .unwrap()
+                .as_ref(),
             content.as_slice(),
         );
         task.sys_munmap(addr, 0x1000).unwrap();
@@ -1397,7 +1426,7 @@ mod tests {
         // grow the mapping without MREMAP_MAYMOVE should fail as the new region collides with the global allocator
         let err = task
             .sys_mremap(
-                crate::MutPtr::from_usize(addr - 0x1000),
+                crate::UserPtrMut::from_usize(addr - 0x1000),
                 0x1000,
                 0x2000,
                 MRemapFlags::empty(),
@@ -1424,13 +1453,14 @@ mod tests {
             .unwrap();
 
         // Reading should work
-        let _val: u8 = addr.read_at_offset(0).unwrap();
+        let _val: u8 = addr.read_at_offset::<Platform>(0).unwrap();
 
         // Anonymous shared mappings allow permission changes including write
         task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
             .unwrap();
-        addr.write_slice_at_offset(0, &[0xab; 0x10]).unwrap();
-        assert_eq!(addr.read_at_offset(0).unwrap(), 0xab_u8);
+        addr.write_slice_at_offset::<Platform>(0, &[0xab; 0x10])
+            .unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xab_u8);
 
         // mprotect to read-only or read-exec should also succeed
         task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ)
@@ -1457,8 +1487,9 @@ mod tests {
             )
             .unwrap();
 
-        addr.write_slice_at_offset(0, &[0xcd; 0x10]).unwrap();
-        assert_eq!(addr.read_at_offset(0).unwrap(), 0xcd_u8);
+        addr.write_slice_at_offset::<Platform>(0, &[0xcd; 0x10])
+            .unwrap();
+        assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xcd_u8);
 
         task.sys_munmap(addr, 0x1000).unwrap();
     }
@@ -1481,7 +1512,9 @@ mod tests {
 
         // Data should match
         assert_eq!(
-            addr.to_owned_slice(content.len()).unwrap().as_ref(),
+            addr.to_owned_slice::<Platform>(content.len())
+                .unwrap()
+                .as_ref(),
             content.as_slice(),
         );
 
@@ -1510,7 +1543,8 @@ mod tests {
             )
             .unwrap();
 
-        addr.write_slice_at_offset(0, &[0xff; 0x10]).unwrap();
+        addr.write_slice_at_offset::<Platform>(0, &[0xff; 0x10])
+            .unwrap();
 
         // Test MADV_NORMAL
         assert!(
@@ -1528,9 +1562,12 @@ mod tests {
             .is_ok()
         );
 
-        addr.to_owned_slice(0x10).unwrap().iter().for_each(|&x| {
-            assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED
-        });
+        addr.to_owned_slice::<Platform>(0x10)
+            .unwrap()
+            .iter()
+            .for_each(|&x| {
+                assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED
+            });
 
         task.sys_munmap(addr, 0x2000).unwrap();
     }
@@ -1541,8 +1578,8 @@ mod tests {
     fn test_fallible_read() {
         let _ = init_platform(None);
 
-        let ptr = crate::MutPtr::<u8>::from_usize(0xdeadbeef);
-        let result = ptr.read_at_offset(0);
+        let ptr = crate::UserPtrMut::<u8>::from_usize(0xdeadbeef);
+        let result = ptr.read_at_offset::<Platform>(0);
         assert!(result.is_none());
     }
 }

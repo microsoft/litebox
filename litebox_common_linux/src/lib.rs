@@ -11,7 +11,6 @@ use core::time::Duration;
 use int_enum::IntEnum;
 use litebox::{
     fs::OFlags,
-    platform::{RawConstPointer, RawMutPointer},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use syscalls::Sysno;
@@ -24,9 +23,12 @@ pub mod loader;
 pub mod mm;
 pub mod physical_pointers;
 pub mod signal;
+pub mod user_pointers;
 pub mod vmap;
 
 extern crate alloc;
+
+pub use user_pointers::{UserPtr, UserPtrMut};
 
 /// Number of AArch64 general-purpose registers saved by the Linux user ABI
 /// (`x0` through `x30`).
@@ -344,39 +346,23 @@ pub struct FileStat {
 }
 
 /// Linux's `iovec` struct for `writev`
-#[derive(FromBytes, IntoBytes)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C, packed)]
-pub struct IoWriteVec<P: RawConstPointer<u8>> {
-    pub iov_base: P,
+pub struct IoWriteVec {
+    pub iov_base: UserPtr<u8>,
     pub iov_len: usize,
 }
 
 /// Linux's `iovec` struct for `readv`
-#[derive(FromBytes, IntoBytes)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C, packed)]
-pub struct IoReadVec<P: RawMutPointer<u8>> {
-    pub iov_base: P,
+pub struct IoReadVec {
+    pub iov_base: UserPtrMut<u8>,
     pub iov_len: usize,
 }
 
 /// `iovec` struct for both read and write
-pub type IoVec<P> = IoReadVec<P>;
-
-impl<P: RawConstPointer<u8>> Clone for IoWriteVec<P> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<P: RawConstPointer<u8>> Copy for IoWriteVec<P> {}
-
-impl<P: RawMutPointer<u8>> Clone for IoReadVec<P> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<P: RawMutPointer<u8>> Copy for IoReadVec<P> {}
+pub type IoVec = IoReadVec;
 
 impl From<litebox::fs::FileStatus> for FileStat {
     fn from(value: litebox::fs::FileStatus) -> Self {
@@ -592,7 +578,7 @@ impl From<FileStat> for Statx {
 /// Commands for use with `fcntl`.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum FcntlArg<Platform: litebox::platform::RawPointerProvider> {
+pub enum FcntlArg {
     /// Get the file descriptor flags
     GETFD,
     /// Set the file descriptor flags
@@ -602,11 +588,11 @@ pub enum FcntlArg<Platform: litebox::platform::RawPointerProvider> {
     /// Set descriptor status flags
     SETFL(OFlags),
     /// Get a file lock
-    GETLK(Platform::RawMutPointer<Flock>),
+    GETLK(UserPtrMut<Flock>),
     /// Set a file lock
-    SETLK(Platform::RawConstPointer<Flock>),
+    SETLK(UserPtr<Flock>),
     /// Set a file lock and wait if blocked
-    SETLKW(Platform::RawConstPointer<Flock>),
+    SETLKW(UserPtr<Flock>),
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
 }
@@ -663,16 +649,16 @@ bitflags::bitflags! {
     }
 }
 
-impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
+impl FcntlArg {
     pub fn try_from(cmd: i32, arg: usize) -> Option<Self> {
         Some(match cmd {
             F_GETFD => Self::GETFD,
             F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.trunc())),
             F_GETFL => Self::GETFL,
             F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.trunc())),
-            F_GETLK => Self::GETLK(Platform::RawMutPointer::from_usize(arg)),
-            F_SETLK => Self::SETLK(Platform::RawConstPointer::from_usize(arg)),
-            F_SETLKW => Self::SETLKW(Platform::RawConstPointer::from_usize(arg)),
+            F_GETLK => Self::GETLK(UserPtrMut::from_usize(arg)),
+            F_SETLK => Self::SETLK(UserPtr::from_usize(arg)),
+            F_SETLKW => Self::SETLKW(UserPtr::from_usize(arg)),
             F_DUPFD => Self::DUPFD {
                 cloexec: false,
                 min_fd: arg.trunc(),
@@ -729,23 +715,23 @@ pub const TIOCGPTN: u32 = 0x80045430;
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
+pub enum IoctlArg {
     /// Get the current serial port settings.
-    TCGETS(Platform::RawMutPointer<Termios>),
+    TCGETS(UserPtrMut<Termios>),
     /// Set the current serial port settings.
-    TCSETS(Platform::RawConstPointer<Termios>),
+    TCSETS(UserPtr<Termios>),
     /// Get window size.
-    TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
+    TIOCGWINSZ(UserPtrMut<Winsize>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
-    TIOCGPTN(Platform::RawMutPointer<u32>),
+    TIOCGPTN(UserPtrMut<u32>),
     /// Enables or disables non-blocking mode
-    FIONBIO(Platform::RawConstPointer<i32>),
+    FIONBIO(UserPtr<i32>),
     /// Set close on exec
     FIOCLEX,
     Raw {
         cmd: u32,
-        arg: Platform::RawMutPointer<u8>,
+        arg: UserPtrMut<u8>,
     },
 }
 
@@ -1080,19 +1066,15 @@ pub enum ArchPrctlCode {
 /// Argument for the `arch_prctl` syscall, corresponding to the [`ArchPrctlCode`] enum.
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum ArchPrctlArg<Platform: litebox::platform::RawPointerProvider> {
+pub enum ArchPrctlArg {
     #[cfg(target_arch = "x86_64")]
     SetFs(usize),
     #[cfg(target_arch = "x86_64")]
-    GetFs(Platform::RawMutPointer<usize>),
+    GetFs(UserPtrMut<usize>),
 
     CETStatus,
     CETDisable,
     CETLock,
-
-    #[doc(hidden)]
-    #[allow(non_camel_case_types)]
-    __Phantom(core::marker::PhantomData<Platform>),
 }
 
 /// Reads the FS segment base address
@@ -1698,25 +1680,25 @@ bitflags::bitflags! {
 
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
+pub enum FutexArgs {
     Wait {
-        addr: Platform::RawMutPointer<u32>,
+        addr: UserPtrMut<u32>,
         flags: FutexFlags,
         val: u32,
         /// Note: for FUTEX_WAIT, timeout is interpreted as a relative
         /// value. This differs from other futex operations, where
         /// timeout is interpreted as an absolute value.
-        timeout: TimeParam<Platform>,
+        timeout: TimeParam,
     },
     WaitBitset {
-        addr: Platform::RawMutPointer<u32>,
+        addr: UserPtrMut<u32>,
         flags: FutexFlags,
         val: u32,
-        timeout: TimeParam<Platform>,
+        timeout: TimeParam,
         bitmask: u32,
     },
     Wake {
-        addr: Platform::RawMutPointer<u32>,
+        addr: UserPtrMut<u32>,
         flags: FutexFlags,
         count: u32,
     },
@@ -1778,9 +1760,9 @@ pub enum PrctlOption {
 
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
-    SetName(Platform::RawConstPointer<u8>),
-    GetName(Platform::RawMutPointer<u8>),
+pub enum PrctlArg {
+    SetName(UserPtr<u8>),
+    GetName(UserPtrMut<u8>),
     CapBSetRead(usize),
 }
 
@@ -1855,16 +1837,16 @@ bitflags::bitflags! {
 /// Packaged sigset pointer with its size, used by `pselect6` syscall.
 #[derive(Clone, Copy, FromBytes)]
 #[repr(C)]
-pub struct SigSetPack<Platform: litebox::platform::RawPointerProvider> {
-    pub sigset: Platform::RawConstPointer<SigSet>,
+pub struct SigSetPack {
+    pub sigset: UserPtr<SigSet>,
     pub size: usize,
 }
 
-#[derive(Debug, FromBytes, IntoBytes)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C, packed)]
-pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
+pub struct UserMsgHdr {
     /// ptr to socket address structure
-    pub msg_name: Platform::RawMutPointer<u8>,
+    pub msg_name: UserPtrMut<u8>,
     /// size of socket address structure
     pub msg_namelen: u32,
     /// Explicit padding to match the 4-byte gap that Linux's naturally-aligned
@@ -1872,11 +1854,11 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     #[cfg(target_pointer_width = "64")]
     _pad: u32,
     /// ptr to an array of `iovec` structures
-    pub msg_iov: Platform::RawConstPointer<IoVec<Platform::RawMutPointer<u8>>>,
+    pub msg_iov: UserPtr<IoVec>,
     /// number of elements in msg_iov
     pub msg_iovlen: usize,
     /// ptr to ancillary data
-    pub msg_control: Platform::RawConstPointer<u8>,
+    pub msg_control: UserPtr<u8>,
     /// number of bytes of ancillary data
     pub msg_controllen: usize,
     /// flags on received message
@@ -1887,34 +1869,18 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     _pad2: u32,
 }
 
-impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platform> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<Platform: litebox::platform::RawPointerProvider> Copy for UserMsgHdr<Platform> {}
-
 /// Linux's `struct mmsghdr`: a `msghdr` paired with the number of bytes
 /// transmitted, used by `sendmmsg`/`recvmmsg`.
-#[derive(Debug, FromBytes, IntoBytes)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C, packed)]
-pub struct UserMmsgHdr<Platform: litebox::platform::RawPointerProvider> {
+pub struct UserMmsgHdr {
     /// the per-message `msghdr`
-    pub msg_hdr: UserMsgHdr<Platform>,
+    pub msg_hdr: UserMsgHdr,
     /// bytes transmitted for this entry, written back by the kernel
     pub msg_len: u32,
     #[cfg(target_pointer_width = "64")]
     _pad: u32,
 }
-
-impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMmsgHdr<Platform> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<Platform: litebox::platform::RawPointerProvider> Copy for UserMmsgHdr<Platform> {}
 
 #[repr(i32)]
 #[derive(Debug, IntEnum)]
@@ -1969,7 +1935,7 @@ impl ShutdownHow {
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
+pub enum SyscallRequest {
     Exit {
         status: i32,
     },
@@ -1978,12 +1944,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Read {
         fd: i32,
-        buf: Platform::RawMutPointer<u8>,
+        buf: UserPtrMut<u8>,
         count: usize,
     },
     Write {
         fd: i32,
-        buf: Platform::RawConstPointer<u8>,
+        buf: UserPtr<u8>,
         count: usize,
     },
     Lseek {
@@ -1995,24 +1961,24 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
     },
     Stat {
-        pathname: Platform::RawConstPointer<c_char>,
-        buf: Platform::RawMutPointer<FileStat>,
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<FileStat>,
     },
     Fstat {
         fd: i32,
-        buf: Platform::RawMutPointer<FileStat>,
+        buf: UserPtrMut<FileStat>,
     },
     Lstat {
-        pathname: Platform::RawConstPointer<c_char>,
-        buf: Platform::RawMutPointer<FileStat>,
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<FileStat>,
     },
     Mkdirat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<c_char>,
+        pathname: UserPtr<c_char>,
         mode: u32,
     },
     Chdir {
-        pathname: Platform::RawConstPointer<c_char>,
+        pathname: UserPtr<c_char>,
     },
     Mmap {
         addr: usize,
@@ -2023,34 +1989,34 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         offset: usize,
     },
     Mprotect {
-        addr: Platform::RawMutPointer<u8>,
+        addr: UserPtrMut<u8>,
         length: usize,
         prot: ProtFlags,
     },
     Munmap {
-        addr: Platform::RawMutPointer<u8>,
+        addr: UserPtrMut<u8>,
         length: usize,
     },
     Mremap {
-        old_addr: Platform::RawMutPointer<u8>,
+        old_addr: UserPtrMut<u8>,
         old_size: usize,
         new_size: usize,
         flags: MRemapFlags,
         new_addr: usize,
     },
     Brk {
-        addr: Platform::RawMutPointer<u8>,
+        addr: UserPtrMut<u8>,
     },
     RtSigprocmask {
         how: signal::SigmaskHow,
-        set: Option<Platform::RawConstPointer<SigSet>>,
-        oldset: Option<Platform::RawMutPointer<SigSet>>,
+        set: Option<UserPtr<SigSet>>,
+        oldset: Option<UserPtrMut<SigSet>>,
         sigsetsize: usize,
     },
     RtSigaction {
         signum: signal::Signal,
-        act: Option<Platform::RawConstPointer<signal::SigAction>>,
-        oldact: Option<Platform::RawMutPointer<signal::SigAction>>,
+        act: Option<UserPtr<signal::SigAction>>,
+        oldact: Option<UserPtrMut<signal::SigAction>>,
         sigsetsize: usize,
     },
     RtSigreturn,
@@ -2068,63 +2034,63 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sig: i32,
     },
     Sigaltstack {
-        ss: Option<Platform::RawConstPointer<signal::SigAltStack>>,
-        old_ss: Option<Platform::RawMutPointer<signal::SigAltStack>>,
+        ss: Option<UserPtr<signal::SigAltStack>>,
+        old_ss: Option<UserPtrMut<signal::SigAltStack>>,
     },
     Ioctl {
         fd: i32,
-        arg: IoctlArg<Platform>,
+        arg: IoctlArg,
     },
     Pread64 {
         fd: i32,
-        buf: Platform::RawMutPointer<u8>,
+        buf: UserPtrMut<u8>,
         count: usize,
         offset: i64,
     },
     Pwrite64 {
         fd: i32,
-        buf: Platform::RawConstPointer<u8>,
+        buf: UserPtr<u8>,
         count: usize,
         offset: i64,
     },
     Sendfile {
         out_fd: i32,
         in_fd: i32,
-        offset: Option<Platform::RawMutPointer<i64>>,
+        offset: Option<UserPtrMut<i64>>,
         count: usize,
     },
     Readv {
         fd: i32,
-        iovec: Platform::RawConstPointer<IoReadVec<Platform::RawMutPointer<u8>>>,
+        iovec: UserPtr<IoReadVec>,
         iovcnt: usize,
     },
     Writev {
         fd: i32,
-        iovec: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
+        iovec: UserPtr<IoWriteVec>,
         iovcnt: usize,
     },
     Preadv {
         fd: i32,
-        iovec: Platform::RawConstPointer<IoReadVec<Platform::RawMutPointer<u8>>>,
+        iovec: UserPtr<IoReadVec>,
         iovcnt: usize,
         pos_l: usize,
         pos_h: usize,
     },
     Pwritev {
         fd: i32,
-        iovec: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
+        iovec: UserPtr<IoWriteVec>,
         iovcnt: usize,
         pos_l: usize,
         pos_h: usize,
     },
     Faccessat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<c_char>,
+        pathname: UserPtr<c_char>,
         mode: AccessFlags,
         flags: AtFlags,
     },
     Madvise {
-        addr: Platform::RawMutPointer<u8>,
+        addr: UserPtrMut<u8>,
         length: usize,
         behavior: MadviseBehavior,
     },
@@ -2142,57 +2108,57 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         domain: u32,
         type_and_flags: u32,
         protocol: u8,
-        sockvec: Platform::RawMutPointer<u32>,
+        sockvec: UserPtrMut<u32>,
     },
     Connect {
         sockfd: i32,
-        sockaddr: Platform::RawConstPointer<u8>,
+        sockaddr: UserPtr<u8>,
         addrlen: usize,
     },
     Accept {
         sockfd: i32,
-        addr: Option<Platform::RawMutPointer<u8>>,
-        addrlen: Option<Platform::RawMutPointer<u32>>,
+        addr: Option<UserPtrMut<u8>>,
+        addrlen: Option<UserPtrMut<u32>>,
         flags: SockFlags,
     },
     Sendto {
         sockfd: i32,
-        buf: Platform::RawConstPointer<u8>,
+        buf: UserPtr<u8>,
         len: usize,
         flags: SendFlags,
-        addr: Option<Platform::RawConstPointer<u8>>,
+        addr: Option<UserPtr<u8>>,
         addrlen: u32,
     },
     Sendmsg {
         sockfd: i32,
-        msg: Platform::RawConstPointer<UserMsgHdr<Platform>>,
+        msg: UserPtr<UserMsgHdr>,
         flags: SendFlags,
     },
     Sendmmsg {
         sockfd: i32,
-        msgvec: Platform::RawMutPointer<UserMmsgHdr<Platform>>,
+        msgvec: UserPtrMut<UserMmsgHdr>,
         vlen: u32,
         flags: SendFlags,
     },
     Recvfrom {
         sockfd: i32,
-        buf: Platform::RawMutPointer<u8>,
+        buf: UserPtrMut<u8>,
         len: usize,
         flags: ReceiveFlags,
-        addr: Option<Platform::RawMutPointer<u8>>,
-        addrlen: Platform::RawMutPointer<u32>,
+        addr: Option<UserPtrMut<u8>>,
+        addrlen: UserPtrMut<u32>,
     },
     Recvmsg {
         sockfd: i32,
-        msg: Platform::RawMutPointer<UserMsgHdr<Platform>>,
+        msg: UserPtrMut<UserMsgHdr>,
         flags: ReceiveFlags,
     },
     Recvmmsg {
         sockfd: i32,
-        msgvec: Platform::RawMutPointer<UserMmsgHdr<Platform>>,
+        msgvec: UserPtrMut<UserMmsgHdr>,
         vlen: u32,
         flags: ReceiveFlags,
-        timeout: TimeParam<Platform>,
+        timeout: TimeParam,
     },
     Shutdown {
         sockfd: i32,
@@ -2200,7 +2166,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Bind {
         sockfd: i32,
-        sockaddr: Platform::RawConstPointer<u8>,
+        sockaddr: UserPtr<u8>,
         addrlen: usize,
     },
     Listen {
@@ -2211,49 +2177,49 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sockfd: i32,
         level: u32,
         optname: u32,
-        optval: Platform::RawConstPointer<u8>,
+        optval: UserPtr<u8>,
         optlen: usize,
     },
     Getsockopt {
         sockfd: i32,
         level: u32,
         optname: u32,
-        optval: Platform::RawMutPointer<u8>,
-        optlen: Platform::RawMutPointer<u32>,
+        optval: UserPtrMut<u8>,
+        optlen: UserPtrMut<u32>,
     },
     Getsockname {
         sockfd: i32,
-        addr: Platform::RawMutPointer<u8>,
-        addrlen: Platform::RawMutPointer<u32>,
+        addr: UserPtrMut<u8>,
+        addrlen: UserPtrMut<u32>,
     },
     Getpeername {
         sockfd: i32,
-        addr: Platform::RawMutPointer<u8>,
-        addrlen: Platform::RawMutPointer<u32>,
+        addr: UserPtrMut<u8>,
+        addrlen: UserPtrMut<u32>,
     },
     Uname {
-        buf: Platform::RawMutPointer<Utsname>,
+        buf: UserPtrMut<Utsname>,
     },
     Fcntl {
         fd: i32,
-        arg: FcntlArg<Platform>,
+        arg: FcntlArg,
     },
     Getcwd {
-        buf: Platform::RawMutPointer<u8>,
+        buf: UserPtrMut<u8>,
         size: usize,
     },
     EpollCtl {
         epfd: i32,
         op: EpollOp,
         fd: i32,
-        event: Platform::RawConstPointer<EpollEvent>,
+        event: UserPtr<EpollEvent>,
     },
     EpollPwait {
         epfd: i32,
-        events: Platform::RawMutPointer<EpollEvent>,
+        events: UserPtrMut<EpollEvent>,
         maxevents: u32,
         timeout: i32,
-        sigmask: Option<Platform::RawConstPointer<SigSet>>,
+        sigmask: Option<UserPtr<SigSet>>,
         sigsetsize: usize,
     },
     EpollCreate {
@@ -2261,37 +2227,37 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: EpollCreateFlags,
     },
     Ppoll {
-        fds: Platform::RawMutPointer<Pollfd>,
+        fds: UserPtrMut<Pollfd>,
         nfds: usize,
-        timeout: TimeParam<Platform>,
-        sigmask: Option<Platform::RawConstPointer<SigSet>>,
+        timeout: TimeParam,
+        sigmask: Option<UserPtr<SigSet>>,
         sigsetsize: usize,
     },
     Pselect {
         nfds: u32,
-        readfds: Option<Platform::RawMutPointer<usize>>,
-        writefds: Option<Platform::RawMutPointer<usize>>,
-        exceptfds: Option<Platform::RawMutPointer<usize>>,
-        timeout: TimeParam<Platform>,
-        sigsetpack: Option<Platform::RawConstPointer<SigSetPack<Platform>>>,
+        readfds: Option<UserPtrMut<usize>>,
+        writefds: Option<UserPtrMut<usize>>,
+        exceptfds: Option<UserPtrMut<usize>>,
+        timeout: TimeParam,
+        sigsetpack: Option<UserPtr<SigSetPack>>,
     },
     ArchPrctl {
-        arg: ArchPrctlArg<Platform>,
+        arg: ArchPrctlArg,
     },
     Readlink {
-        pathname: Platform::RawConstPointer<c_char>,
-        buf: Platform::RawMutPointer<u8>,
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<u8>,
         bufsiz: usize,
     },
     Readlinkat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<c_char>,
-        buf: Platform::RawMutPointer<u8>,
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<u8>,
         bufsiz: usize,
     },
     Openat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<c_char>,
+        pathname: UserPtr<c_char>,
         flags: litebox::fs::OFlags,
         mode: litebox::fs::Mode,
     },
@@ -2301,19 +2267,19 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     Mknodat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<c_char>,
+        pathname: UserPtr<c_char>,
         mode_and_type: u32,
         dev: u32,
     },
     Unlinkat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<c_char>,
+        pathname: UserPtr<c_char>,
         flags: AtFlags,
     },
     Newfstatat {
         dirfd: i32,
-        pathname: Platform::RawConstPointer<c_char>,
-        buf: Platform::RawMutPointer<FileStat>,
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<FileStat>,
         flags: AtFlags,
     },
     Eventfd2 {
@@ -2321,48 +2287,48 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         flags: EfdFlags,
     },
     Pipe2 {
-        pipefd: Platform::RawMutPointer<u32>,
+        pipefd: UserPtrMut<u32>,
         flags: litebox::fs::OFlags,
     },
     Clone {
         args: CloneArgs,
     },
     Clone3 {
-        args: Platform::RawConstPointer<CloneArgs>,
+        args: UserPtr<CloneArgs>,
     },
     /// Manipulate thread-local storage information.
     /// Returns `ENOSYS` on x86_64.
     SetThreadArea {
-        user_desc: Platform::RawMutPointer<u8>,
+        user_desc: UserPtrMut<u8>,
     },
     ClockGettime {
         clockid: i32,
-        tp: TimeParam<Platform>,
+        tp: TimeParam,
     },
     ClockGetres {
         clockid: i32,
-        res: TimeParam<Platform>,
+        res: TimeParam,
     },
     ClockNanosleep {
         clockid: i32,
         flags: TimerFlags,
-        request: TimeParam<Platform>,
-        remain: TimeParam<Platform>,
+        request: TimeParam,
+        remain: TimeParam,
     },
     Gettimeofday {
-        tv: Option<Platform::RawMutPointer<TimeVal>>,
-        tz: Option<Platform::RawMutPointer<TimeZone>>,
+        tv: Option<UserPtrMut<TimeVal>>,
+        tz: Option<UserPtrMut<TimeZone>>,
     },
     Time {
-        tloc: Option<Platform::RawMutPointer<time_t>>,
+        tloc: Option<UserPtrMut<time_t>>,
     },
     Getrlimit {
         resource: RlimitResource,
-        rlim: Platform::RawMutPointer<Rlimit>,
+        rlim: UserPtrMut<Rlimit>,
     },
     Setrlimit {
         resource: RlimitResource,
-        rlim: Platform::RawConstPointer<Rlimit>,
+        rlim: UserPtr<Rlimit>,
     },
     Prlimit {
         pid: i32,
@@ -2370,13 +2336,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         resource: RlimitResource,
         /// If the new_limit argument is not a None, then the rlimit structure to which it points
         /// is used to set new values for the soft and hard limits for resource.
-        new_limit: Option<Platform::RawConstPointer<Rlimit64>>,
+        new_limit: Option<UserPtr<Rlimit64>>,
         /// If the old_limit argument is not a None, then a successful call to prlimit() places the
         /// previous soft and hard limits for resource in the rlimit structure pointed to by old_limit.
-        old_limit: Option<Platform::RawMutPointer<Rlimit64>>,
+        old_limit: Option<UserPtrMut<Rlimit64>>,
     },
     SetTidAddress {
-        tidptr: Platform::RawMutPointer<i32>,
+        tidptr: UserPtrMut<i32>,
     },
     Gettid,
     SetRobustList {
@@ -2384,11 +2350,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     GetRobustList {
         pid: Option<i32>,
-        head: Platform::RawMutPointer<usize>,
-        len: Platform::RawMutPointer<usize>,
+        head: UserPtrMut<usize>,
+        len: UserPtrMut<usize>,
     },
     GetRandom {
-        buf: Platform::RawMutPointer<u8>,
+        buf: UserPtrMut<u8>,
         count: usize,
         flags: RngFlags,
     },
@@ -2399,36 +2365,36 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Getgid,
     Getegid,
     Sysinfo {
-        buf: Platform::RawMutPointer<Sysinfo>,
+        buf: UserPtrMut<Sysinfo>,
     },
     CapGet {
-        header: Platform::RawMutPointer<CapHeader>,
-        data: Option<Platform::RawMutPointer<CapData>>,
+        header: UserPtrMut<CapHeader>,
+        data: Option<UserPtrMut<CapData>>,
     },
     GetDirent64 {
         fd: i32,
-        dirp: Platform::RawMutPointer<u8>,
+        dirp: UserPtrMut<u8>,
         count: usize,
     },
     SchedGetAffinity {
         pid: Option<i32>,
         len: usize,
-        mask: Platform::RawMutPointer<u8>,
+        mask: UserPtrMut<u8>,
     },
     SchedYield,
     Futex {
-        args: FutexArgs<Platform>,
+        args: FutexArgs,
     },
     Execve {
-        pathname: Platform::RawConstPointer<c_char>,
-        argv: Platform::RawConstPointer<Platform::RawConstPointer<c_char>>,
-        envp: Platform::RawConstPointer<Platform::RawConstPointer<c_char>>,
+        pathname: UserPtr<c_char>,
+        argv: UserPtr<UserPtr<c_char>>,
+        envp: UserPtr<UserPtr<c_char>>,
     },
     Umask {
         mask: u32,
     },
     Prctl {
-        args: PrctlArg<Platform>,
+        args: PrctlArg,
     },
     Alarm {
         seconds: u32,
@@ -2436,23 +2402,23 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Pause,
     SetITimer {
         which: IntervalTimer,
-        new_value: Option<Platform::RawConstPointer<ItimerVal>>,
-        old_value: Option<Platform::RawMutPointer<ItimerVal>>,
+        new_value: Option<UserPtr<ItimerVal>>,
+        old_value: Option<UserPtrMut<ItimerVal>>,
     },
     GetITimer {
         which: IntervalTimer,
-        curr_value: Platform::RawMutPointer<ItimerVal>,
+        curr_value: UserPtrMut<ItimerVal>,
     },
     Statx {
         dirfd: i32,
-        pathname: Option<Platform::RawConstPointer<c_char>>,
+        pathname: Option<UserPtr<c_char>>,
         flags: AtFlags,
         mask: StatxMask,
-        statxbuf: Platform::RawMutPointer<Statx>,
+        statxbuf: UserPtrMut<Statx>,
     },
 }
 
-impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
+impl SyscallRequest {
     /// Take the raw syscall number and arguments, and provide a stronger-typed `SyscallRequest`.
     ///
     /// Returns `Ok` if a valid translation exists, if no such translation exists, returns the [`Errno`](errno::Errno) for it.
@@ -2990,9 +2956,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
 
     fn parse_futex<T: FromBytes + IntoBytes>(
         ctx: &PtRegs,
-        time_param: impl FnOnce(Option<Platform::RawMutPointer<T>>) -> TimeParam<Platform>,
+        time_param: impl FnOnce(Option<UserPtrMut<T>>) -> TimeParam,
         unsupported_einval: impl Fn(core::fmt::Arguments<'_>) -> errno::Errno,
-    ) -> Result<SyscallRequest<Platform>, errno::Errno> {
+    ) -> Result<SyscallRequest, errno::Errno> {
         let addr = ctx.sys_req_ptr(0);
         let op_and_flags: i32 = ctx.sys_req_arg(1);
         let op = op_and_flags & FutexFlags::FUTEX_CMD_MASK.bits();
@@ -3028,38 +2994,40 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
 }
 
 #[derive(Debug)]
-pub enum TimeParam<Platform: litebox::platform::RawPointerProvider> {
+pub enum TimeParam {
     None,
     Milliseconds(i32),
-    TimeVal(Platform::RawMutPointer<TimeVal>),
-    Timespec32(Platform::RawMutPointer<Timespec32>),
-    Timespec64(Platform::RawMutPointer<Timespec>),
+    TimeVal(UserPtrMut<TimeVal>),
+    Timespec32(UserPtrMut<Timespec32>),
+    Timespec64(UserPtrMut<Timespec>),
 }
 
-impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
+impl TimeParam {
     /// Return a `TimeParam` for a 64-bit timespec pointer.
-    pub fn timespec64(tp: Option<Platform::RawMutPointer<Timespec>>) -> Self {
+    pub fn timespec64(tp: Option<UserPtrMut<Timespec>>) -> Self {
         tp.map_or(TimeParam::None, TimeParam::Timespec64)
     }
 
     /// Return a `TimeParam` for a 32-bit timespec pointer.
-    pub fn timespec32(tp: Option<Platform::RawMutPointer<Timespec32>>) -> Self {
+    pub fn timespec32(tp: Option<UserPtrMut<Timespec32>>) -> Self {
         tp.map_or(TimeParam::None, TimeParam::Timespec32)
     }
 
     /// Return a `TimeParam` for the old timespec pointer type, which is
     /// architecture dependent.
-    pub fn timespec_old(tp: Option<Platform::RawMutPointer<Timespec>>) -> Self {
+    pub fn timespec_old(tp: Option<UserPtrMut<Timespec>>) -> Self {
         Self::timespec64(tp)
     }
 
     /// Return a `TimeParam` for a timeval pointer.
-    pub fn timeval(tp: Option<Platform::RawMutPointer<TimeVal>>) -> Self {
+    pub fn timeval(tp: Option<UserPtrMut<TimeVal>>) -> Self {
         tp.map_or(TimeParam::None, TimeParam::TimeVal)
     }
 
     /// Convert a generic timeout argument into a `Timeout` enum.
-    pub fn read(&self) -> Result<Option<Duration>, errno::Errno> {
+    pub fn read<P: litebox::platform::RawPointerProvider>(
+        &self,
+    ) -> Result<Option<Duration>, errno::Errno> {
         let v = match *self {
             TimeParam::None => return Ok(None),
             TimeParam::Milliseconds(s) => {
@@ -3070,15 +3038,15 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
                 Duration::from_millis(s)
             }
             TimeParam::TimeVal(tv) => {
-                let tv = tv.read_at_offset(0).ok_or(errno::Errno::EFAULT)?;
+                let tv = tv.read_at_offset::<P>(0).ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(tv).map_err(|_| errno::Errno::EINVAL)?
             }
             TimeParam::Timespec32(ts) => {
-                let ts = ts.read_at_offset(0).ok_or(errno::Errno::EFAULT)?;
+                let ts = ts.read_at_offset::<P>(0).ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
             }
             TimeParam::Timespec64(ts) => {
-                let ts = ts.read_at_offset(0).ok_or(errno::Errno::EFAULT)?;
+                let ts = ts.read_at_offset::<P>(0).ok_or(errno::Errno::EFAULT)?;
                 Duration::try_from(ts).map_err(|_| errno::Errno::EINVAL)?
             }
         };
@@ -3086,24 +3054,27 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
     }
 
     /// Write a value to the time parameter.
-    pub fn write(&self, duration: Duration) -> Result<(), errno::Errno> {
+    pub fn write<P: litebox::platform::RawPointerProvider>(
+        &self,
+        duration: Duration,
+    ) -> Result<(), errno::Errno> {
         match *self {
             TimeParam::None | TimeParam::Milliseconds(_) => Ok(()),
             TimeParam::TimeVal(tv_ptr) => {
                 tv_ptr
-                    .write_at_offset(0, duration.into())
+                    .write_at_offset::<P>(0, duration.into())
                     .ok_or(errno::Errno::EFAULT)?;
                 Ok(())
             }
             TimeParam::Timespec32(ts_ptr) => {
                 ts_ptr
-                    .write_at_offset(0, duration.into())
+                    .write_at_offset::<P>(0, duration.into())
                     .ok_or(errno::Errno::EFAULT)?;
                 Ok(())
             }
             TimeParam::Timespec64(ts_ptr) => {
                 ts_ptr
-                    .write_at_offset(0, duration.into())
+                    .write_at_offset::<P>(0, duration.into())
                     .ok_or(errno::Errno::EFAULT)?;
                 Ok(())
             }
@@ -3441,17 +3412,31 @@ reinterpret_truncated_from_usize_for! {
 pub trait ReinterpretUsizeAsPtr<T>: Sized {
     fn reinterpret_usize_as_ptr(v: usize) -> Self;
 }
-impl<T: FromBytes, P: RawConstPointer<T>> ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>>
-    for P
-{
+impl<T> ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>> for UserPtr<T> {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
-        P::from_usize(v)
+        UserPtr::from_usize(v)
     }
 }
-impl<T: FromBytes, P: RawConstPointer<T>>
-    ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<P>
-{
+impl<T> ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>> for UserPtrMut<T> {
     fn reinterpret_usize_as_ptr(v: usize) -> Self {
-        if v == 0 { None } else { Some(P::from_usize(v)) }
+        UserPtrMut::from_usize(v)
+    }
+}
+impl<T> ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<UserPtr<T>> {
+    fn reinterpret_usize_as_ptr(v: usize) -> Self {
+        if v == 0 {
+            None
+        } else {
+            Some(UserPtr::from_usize(v))
+        }
+    }
+}
+impl<T> ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<UserPtrMut<T>> {
+    fn reinterpret_usize_as_ptr(v: usize) -> Self {
+        if v == 0 {
+            None
+        } else {
+            Some(UserPtrMut::from_usize(v))
+        }
     }
 }

@@ -14,7 +14,7 @@ use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
 use thiserror::Error;
 
 use crate::{
-    MutPtr,
+    UserPtrMut,
     loader::auxv::{AuxKey, AuxVec},
 };
 
@@ -116,10 +116,10 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
             align,
         );
         if let Some((addr, size)) = regions.head_unmap {
-            self.task.sys_munmap(MutPtr::from_usize(addr), size)?;
+            self.task.sys_munmap(UserPtrMut::from_usize(addr), size)?;
         }
         if let Some((addr, size)) = regions.tail_unmap {
-            self.task.sys_munmap(MutPtr::from_usize(addr), size)?;
+            self.task.sys_munmap(UserPtrMut::from_usize(addr), size)?;
         }
         Ok(regions.aligned_ptr)
     }
@@ -165,7 +165,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         len: usize,
         prot: &litebox_common_linux::loader::Protection,
     ) -> Result<(), Self::Error> {
-        let addr = crate::MutPtr::<u8>::from_usize(address);
+        let addr = crate::UserPtrMut::<u8>::from_usize(address);
         self.task.sys_mprotect(addr, len, prot.flags())
     }
 }
@@ -294,8 +294,11 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
         };
-        let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
-            .ok_or(ElfLoaderError::InvalidStackAddr)?;
+        let mut stack = UserStack::new(
+            UserPtrMut::from_usize(sp.as_usize()),
+            super::DEFAULT_STACK_SIZE,
+        )
+        .ok_or(ElfLoaderError::InvalidStackAddr)?;
         stack
             .init(argv, envp, aux)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;

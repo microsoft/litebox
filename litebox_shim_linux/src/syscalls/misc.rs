@@ -7,16 +7,18 @@
 
 use crate::{ShimFS, Task};
 use litebox::{
-    platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
+    platform::{Instant as _, TimeProvider as _},
     utils::TruncateExt as _,
 };
+use litebox_common_linux::UserPtrMut;
 use litebox_common_linux::errno::Errno;
+use litebox_platform_multiplex::Platform;
 
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `getrandom`.
     pub(crate) fn sys_getrandom(
         &self,
-        buf: crate::MutPtr<u8>,
+        buf: UserPtrMut<u8>,
         count: usize,
         _flags: litebox_common_linux::RngFlags,
     ) -> Result<usize, Errno> {
@@ -29,7 +31,8 @@ impl<FS: ShimFS> Task<FS> {
             let len = (count - offset).min(kbuf.len());
             let kbuf = &mut kbuf[..len];
             <_ as litebox::platform::CrngProvider>::fill_bytes_crng(self.global.platform, kbuf);
-            buf.copy_from_slice(offset, kbuf).ok_or(Errno::EFAULT)?;
+            buf.copy_from_slice::<Platform>(offset, kbuf)
+                .ok_or(Errno::EFAULT)?;
             offset += len;
             // TODO: check for interrupt here and break out.
         }
@@ -69,9 +72,10 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `uname`.
     pub(crate) fn sys_uname(
         &self,
-        buf: crate::MutPtr<litebox_common_linux::Utsname>,
+        buf: UserPtrMut<litebox_common_linux::Utsname>,
     ) -> Result<(), Errno> {
-        buf.write_at_offset(0, SYS_INFO).ok_or(Errno::EFAULT)
+        buf.write_at_offset::<Platform>(0, SYS_INFO)
+            .ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `sysinfo`.
@@ -107,10 +111,10 @@ impl<FS: ShimFS> Task<FS> {
     /// Note we don't support capabilities in LiteBox, so this returns empty capabilities.
     pub(crate) fn sys_capget(
         &self,
-        header: crate::MutPtr<litebox_common_linux::CapHeader>,
-        data: Option<crate::MutPtr<litebox_common_linux::CapData>>,
+        header: UserPtrMut<litebox_common_linux::CapHeader>,
+        data: Option<UserPtrMut<litebox_common_linux::CapData>>,
     ) -> Result<(), Errno> {
-        let hdr = header.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let hdr = header.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         match hdr.version {
             _LINUX_CAPABILITY_VERSION_1 => {
                 if let Some(data_ptr) = data {
@@ -119,7 +123,9 @@ impl<FS: ShimFS> Task<FS> {
                         permitted: 0,
                         inheritable: 0,
                     };
-                    data_ptr.write_at_offset(0, cap).ok_or(Errno::EFAULT)?;
+                    data_ptr
+                        .write_at_offset::<Platform>(0, cap)
+                        .ok_or(Errno::EFAULT)?;
                 }
                 Ok(())
             }
@@ -131,15 +137,17 @@ impl<FS: ShimFS> Task<FS> {
                         inheritable: 0,
                     };
                     data_ptr
-                        .write_at_offset(0, cap.clone())
+                        .write_at_offset::<Platform>(0, cap.clone())
                         .ok_or(Errno::EFAULT)?;
-                    data_ptr.write_at_offset(1, cap).ok_or(Errno::EFAULT)?;
+                    data_ptr
+                        .write_at_offset::<Platform>(1, cap)
+                        .ok_or(Errno::EFAULT)?;
                 }
                 Ok(())
             }
             _ => {
                 header
-                    .write_at_offset(
+                    .write_at_offset::<Platform>(
                         0,
                         litebox_common_linux::CapHeader {
                             version: _LINUX_CAPABILITY_VERSION_3,
@@ -169,7 +177,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut buf = [0u8; 16];
-        let ptr = crate::MutPtr::from_ptr(buf.as_mut_ptr());
+        let ptr = litebox_common_linux::UserPtrMut::from_ptr(buf.as_mut_ptr());
         let count = task
             .sys_getrandom(ptr, buf.len() - 1, RngFlags::empty())
             .expect("getrandom failed");
@@ -186,7 +194,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut utsname = litebox_common_linux::Utsname::new_zeroed();
-        let ptr = crate::MutPtr::from_ptr(&raw mut utsname);
+        let ptr = litebox_common_linux::UserPtrMut::from_ptr(&raw mut utsname);
         task.sys_uname(ptr).expect("uname failed");
 
         assert_eq!(utsname.sysname, super::SYS_INFO.sysname);
