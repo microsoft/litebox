@@ -72,43 +72,43 @@ impl<Memory: SharedMemory + ?Sized> SharedMemory for Box<Memory> {
     }
 }
 
-/// Error validating or accessing fixed-slot shared transfer memory.
+/// Error validating or accessing a fixed-slot shared buffer pool.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum SharedTransferError {
+pub enum SharedBufferError {
     /// The slot layout is empty or exceeds the addressable range.
-    #[error("invalid shared transfer layout")]
+    #[error("invalid shared buffer layout")]
     InvalidLayout,
     /// The backing shared-memory length does not match the slot layout.
     #[error("shared-memory length does not match the transfer layout")]
     MemoryLengthMismatch,
     /// The descriptor names a slot outside the layout.
-    #[error("shared transfer slot is out of bounds")]
+    #[error("shared buffer slot is out of bounds")]
     InvalidSlot,
-    /// The transfer does not fit in one slot.
-    #[error("shared transfer length exceeds the slot size")]
-    TransferTooLarge,
+    /// The described bytes do not fit in one slot.
+    #[error("shared buffer length exceeds the slot size")]
+    LengthExceedsSlot,
     /// The supplied buffer length does not match the descriptor.
-    #[error("buffer length does not match the shared transfer descriptor")]
+    #[error("buffer length does not match the shared buffer descriptor")]
     BufferLengthMismatch,
     /// The backing shared-memory access failed.
     #[error("shared-memory access failed: {0}")]
     SharedMemory(#[from] SharedMemoryError),
 }
 
-/// Immutable fixed-slot layout for association-scoped shared transfer memory.
+/// Immutable fixed-slot layout for an association-scoped shared buffer pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SharedTransferLayout {
+pub struct SharedBufferLayout {
     slot_size: u32,
     slot_count: u32,
     total_len: usize,
 }
 
-impl SharedTransferLayout {
+impl SharedBufferLayout {
     /// Creates a checked fixed-slot layout.
-    pub fn new(slot_size: u32, slot_count: u32) -> Result<Self, SharedTransferError> {
+    pub fn new(slot_size: u32, slot_count: u32) -> Result<Self, SharedBufferError> {
         if slot_size == 0 || slot_count == 0 {
-            return Err(SharedTransferError::InvalidLayout);
+            return Err(SharedBufferError::InvalidLayout);
         }
         let total_len = usize::try_from(slot_size)
             .ok()
@@ -118,7 +118,7 @@ impl SharedTransferLayout {
                     .and_then(|slot_count| slot_size.checked_mul(slot_count))
             })
             .filter(|total_len| isize::try_from(*total_len).is_ok())
-            .ok_or(SharedTransferError::InvalidLayout)?;
+            .ok_or(SharedBufferError::InvalidLayout)?;
         Ok(Self {
             slot_size,
             slot_count,
@@ -144,13 +144,13 @@ impl SharedTransferLayout {
     /// Validates a descriptor and returns its byte range in the shared memory.
     pub fn range(
         self,
-        descriptor: SharedTransferDescriptor,
-    ) -> Result<Range<usize>, SharedTransferError> {
+        descriptor: SharedBufferDescriptor,
+    ) -> Result<Range<usize>, SharedBufferError> {
         if descriptor.slot.index() >= self.slot_count {
-            return Err(SharedTransferError::InvalidSlot);
+            return Err(SharedBufferError::InvalidSlot);
         }
         if descriptor.length > self.slot_size {
-            return Err(SharedTransferError::TransferTooLarge);
+            return Err(SharedBufferError::LengthExceedsSlot);
         }
         let offset = usize::try_from(descriptor.slot.index())
             .ok()
@@ -159,23 +159,23 @@ impl SharedTransferLayout {
                     .ok()
                     .and_then(|slot_size| slot.checked_mul(slot_size))
             })
-            .ok_or(SharedTransferError::InvalidLayout)?;
+            .ok_or(SharedBufferError::InvalidLayout)?;
         let end = offset
             .checked_add(
                 usize::try_from(descriptor.length)
-                    .map_err(|_| SharedTransferError::TransferTooLarge)?,
+                    .map_err(|_| SharedBufferError::LengthExceedsSlot)?,
             )
-            .ok_or(SharedTransferError::TransferTooLarge)?;
+            .ok_or(SharedBufferError::LengthExceedsSlot)?;
         Ok(offset..end)
     }
 }
 
-/// Index of one fixed shared-transfer slot.
+/// Index of one fixed shared-buffer slot.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SharedTransferSlotIndex(u32);
+pub struct SharedBufferSlotIndex(u32);
 
-impl SharedTransferSlotIndex {
+impl SharedBufferSlotIndex {
     /// Creates a slot index.
     pub const fn new(index: u32) -> Self {
         Self(index)
@@ -187,43 +187,43 @@ impl SharedTransferSlotIndex {
     }
 }
 
-/// Location and length of one operation's bytes in shared transfer memory.
+/// Location and length of one operation's bytes in a shared buffer pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SharedTransferDescriptor {
+pub struct SharedBufferDescriptor {
     /// Fixed slot used by the operation.
-    pub slot: SharedTransferSlotIndex,
+    pub slot: SharedBufferSlotIndex,
     /// Number of bytes used from the start of the slot.
     pub length: u32,
 }
 
-impl SharedTransferDescriptor {
+impl SharedBufferDescriptor {
     /// Creates a descriptor for `length` bytes at the start of `slot`.
-    pub const fn new(slot: SharedTransferSlotIndex, length: u32) -> Self {
+    pub const fn new(slot: SharedBufferSlotIndex, length: u32) -> Self {
         Self { slot, length }
     }
 }
 
-/// A shared-memory resource viewed through an immutable fixed-slot layout.
+/// A shared-memory resource viewed as a fixed-slot buffer pool.
 ///
 /// Slot ownership, handoff, and reuse are protocol responsibilities. Accesses
 /// are not cross-process atomic, and consumers must not treat peer-writable
 /// bytes as trusted or stable without copying and validating them.
-pub struct SharedTransferMemory<Memory: SharedMemory> {
+pub struct SharedBufferPool<Memory: SharedMemory> {
     memory: Memory,
-    layout: SharedTransferLayout,
+    layout: SharedBufferLayout,
 }
 
-impl<Memory: SharedMemory> SharedTransferMemory<Memory> {
+impl<Memory: SharedMemory> SharedBufferPool<Memory> {
     /// Attaches a checked layout to an exact-size shared-memory resource.
-    pub fn new(memory: Memory, layout: SharedTransferLayout) -> Result<Self, SharedTransferError> {
+    pub fn new(memory: Memory, layout: SharedBufferLayout) -> Result<Self, SharedBufferError> {
         if memory.len() != layout.total_len() {
-            return Err(SharedTransferError::MemoryLengthMismatch);
+            return Err(SharedBufferError::MemoryLengthMismatch);
         }
         Ok(Self { memory, layout })
     }
 
     /// Returns the fixed-slot layout.
-    pub const fn layout(&self) -> SharedTransferLayout {
+    pub const fn layout(&self) -> SharedBufferLayout {
         self.layout
     }
 
@@ -240,12 +240,12 @@ impl<Memory: SharedMemory> SharedTransferMemory<Memory> {
     /// Copies `source` into `slot` and returns its validated descriptor.
     pub fn write(
         &self,
-        slot: SharedTransferSlotIndex,
+        slot: SharedBufferSlotIndex,
         source: &[u8],
-    ) -> Result<SharedTransferDescriptor, SharedTransferError> {
+    ) -> Result<SharedBufferDescriptor, SharedBufferError> {
         let length =
-            u32::try_from(source.len()).map_err(|_| SharedTransferError::TransferTooLarge)?;
-        let descriptor = SharedTransferDescriptor::new(slot, length);
+            u32::try_from(source.len()).map_err(|_| SharedBufferError::LengthExceedsSlot)?;
+        let descriptor = SharedBufferDescriptor::new(slot, length);
         let range = self.layout.range(descriptor)?;
         self.memory.write(range.start, source)?;
         Ok(descriptor)
@@ -254,11 +254,11 @@ impl<Memory: SharedMemory> SharedTransferMemory<Memory> {
     /// Copies the bytes described by `descriptor` into `destination`.
     pub fn read(
         &self,
-        descriptor: SharedTransferDescriptor,
+        descriptor: SharedBufferDescriptor,
         destination: &mut [u8],
-    ) -> Result<(), SharedTransferError> {
+    ) -> Result<(), SharedBufferError> {
         if usize::try_from(descriptor.length).ok() != Some(destination.len()) {
-            return Err(SharedTransferError::BufferLengthMismatch);
+            return Err(SharedBufferError::BufferLengthMismatch);
         }
         let range = self.layout.range(descriptor)?;
         self.memory.read(range.start, destination)?;
@@ -275,22 +275,20 @@ mod tests {
 
     #[test]
     fn fixed_slots_are_disjoint() {
-        let layout = SharedTransferLayout::new(8, 3).unwrap();
+        let layout = SharedBufferLayout::new(8, 3).unwrap();
         let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
-        let transfer = SharedTransferMemory::new(Arc::clone(&memory), layout).unwrap();
+        let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
 
-        let first = transfer
-            .write(SharedTransferSlotIndex::new(0), &[1, 2, 3])
+        let first = pool
+            .write(SharedBufferSlotIndex::new(0), &[1, 2, 3])
             .unwrap();
-        let third = transfer
-            .write(SharedTransferSlotIndex::new(2), &[4, 5])
-            .unwrap();
+        let third = pool.write(SharedBufferSlotIndex::new(2), &[4, 5]).unwrap();
 
         let mut first_bytes = [0; 3];
-        transfer.read(first, &mut first_bytes).unwrap();
+        pool.read(first, &mut first_bytes).unwrap();
         assert_eq!(first_bytes, [1, 2, 3]);
         let mut third_bytes = [0; 2];
-        transfer.read(third, &mut third_bytes).unwrap();
+        pool.read(third, &mut third_bytes).unwrap();
         assert_eq!(third_bytes, [4, 5]);
         assert_eq!(&memory.bytes()[8..16], &[0; 8]);
     }
@@ -298,51 +296,49 @@ mod tests {
     #[test]
     fn layout_and_backing_length_are_checked() {
         assert_eq!(
-            SharedTransferLayout::new(0, 1),
-            Err(SharedTransferError::InvalidLayout)
+            SharedBufferLayout::new(0, 1),
+            Err(SharedBufferError::InvalidLayout)
         );
         assert_eq!(
-            SharedTransferLayout::new(1, 0),
-            Err(SharedTransferError::InvalidLayout)
+            SharedBufferLayout::new(1, 0),
+            Err(SharedBufferError::InvalidLayout)
         );
         assert_eq!(
-            SharedTransferLayout::new(u32::MAX, u32::MAX),
-            Err(SharedTransferError::InvalidLayout)
+            SharedBufferLayout::new(u32::MAX, u32::MAX),
+            Err(SharedBufferError::InvalidLayout)
         );
 
-        let layout = SharedTransferLayout::new(8, 2).unwrap();
+        let layout = SharedBufferLayout::new(8, 2).unwrap();
         assert!(matches!(
-            SharedTransferMemory::new(TestSharedMemory::new(15), layout),
-            Err(SharedTransferError::MemoryLengthMismatch)
+            SharedBufferPool::new(TestSharedMemory::new(15), layout),
+            Err(SharedBufferError::MemoryLengthMismatch)
         ));
     }
 
     #[test]
     fn descriptors_and_buffer_lengths_are_checked() {
-        let layout = SharedTransferLayout::new(8, 2).unwrap();
-        let transfer =
-            SharedTransferMemory::new(TestSharedMemory::new(layout.total_len()), layout).unwrap();
+        let layout = SharedBufferLayout::new(8, 2).unwrap();
+        let pool =
+            SharedBufferPool::new(TestSharedMemory::new(layout.total_len()), layout).unwrap();
 
         assert_eq!(
-            transfer.write(SharedTransferSlotIndex::new(2), &[1]),
-            Err(SharedTransferError::InvalidSlot)
+            pool.write(SharedBufferSlotIndex::new(2), &[1]),
+            Err(SharedBufferError::InvalidSlot)
         );
         assert_eq!(
-            transfer.write(SharedTransferSlotIndex::new(1), &[0; 9]),
-            Err(SharedTransferError::TransferTooLarge)
+            pool.write(SharedBufferSlotIndex::new(1), &[0; 9]),
+            Err(SharedBufferError::LengthExceedsSlot)
         );
         assert_eq!(
-            transfer.read(
-                SharedTransferDescriptor::new(SharedTransferSlotIndex::new(0), 2),
+            pool.read(
+                SharedBufferDescriptor::new(SharedBufferSlotIndex::new(0), 2),
                 &mut [0; 1],
             ),
-            Err(SharedTransferError::BufferLengthMismatch)
+            Err(SharedBufferError::BufferLengthMismatch)
         );
 
-        let empty = transfer
-            .write(SharedTransferSlotIndex::new(1), &[])
-            .unwrap();
-        transfer.read(empty, &mut []).unwrap();
+        let empty = pool.write(SharedBufferSlotIndex::new(1), &[]).unwrap();
+        pool.read(empty, &mut []).unwrap();
     }
 
     struct TestSharedMemory(Mutex<Vec<u8>>);

@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux shared-memory exchange over connected Unix-domain sockets.
+//! Linux shared-buffer exchange over connected Unix-domain sockets.
 //!
-//! These helpers establish association-scoped transfer memory before ordinary
+//! These helpers establish an association-scoped buffer pool before ordinary
 //! broker framing begins. Callers must ensure exclusive access to the stream
 //! during the exchange.
 
@@ -13,7 +13,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use litebox_broker_protocol::shared_memory::{
-    SharedTransferError, SharedTransferLayout, SharedTransferMemory,
+    SharedBufferError, SharedBufferLayout, SharedBufferPool,
 };
 use rustix::io::Errno;
 use rustix::net::{
@@ -23,45 +23,45 @@ use rustix::net::{
 
 use crate::shared_memory::MemfdSharedMemory;
 
-const SHARED_TRANSFER_SETUP_VERSION: u8 = 1;
+const SHARED_BUFFER_SETUP_VERSION: u8 = 1;
 
 /// Creates sealed Linux shared memory with the exact length required by `layout`.
-pub fn create_shared_transfer_memory(
-    layout: SharedTransferLayout,
-) -> IoResult<SharedTransferMemory<MemfdSharedMemory>> {
+pub fn create_shared_buffer_pool(
+    layout: SharedBufferLayout,
+) -> IoResult<SharedBufferPool<MemfdSharedMemory>> {
     let memory = MemfdSharedMemory::create(layout.total_len())?;
-    SharedTransferMemory::new(memory, layout).map_err(shared_transfer_error)
+    SharedBufferPool::new(memory, layout).map_err(shared_buffer_error)
 }
 
-/// Sends one shared-transfer memfd over an exclusively owned connected stream.
+/// Sends one shared-buffer-pool memfd over an exclusively owned connected stream.
 ///
 /// `deadline` bounds setup I/O without leaving a changed socket timeout behind.
-pub fn send_shared_transfer_memory(
+pub fn send_shared_buffer_pool(
     stream: &mut UnixStream,
-    memory: &SharedTransferMemory<MemfdSharedMemory>,
+    pool: &SharedBufferPool<MemfdSharedMemory>,
     deadline: Option<Instant>,
 ) -> IoResult<()> {
     with_write_deadline(stream, deadline, |stream, deadline| {
-        send_fd(stream, memory.memory().as_fd(), deadline)
+        send_fd(stream, pool.memory().as_fd(), deadline)
     })
 }
 
-/// Receives, validates, and maps one shared-transfer memfd.
+/// Receives, validates, and maps one shared-buffer-pool memfd.
 ///
 /// `layout` supplies the trusted expected size. `deadline` bounds setup I/O
 /// without leaving a changed socket timeout behind.
-pub fn receive_shared_transfer_memory(
+pub fn receive_shared_buffer_pool(
     stream: &mut UnixStream,
-    layout: SharedTransferLayout,
+    layout: SharedBufferLayout,
     deadline: Option<Instant>,
-) -> IoResult<SharedTransferMemory<MemfdSharedMemory>> {
+) -> IoResult<SharedBufferPool<MemfdSharedMemory>> {
     let fd = with_read_deadline(stream, deadline, receive_fd)?;
     let memory = MemfdSharedMemory::from_received_fd(fd, layout.total_len())?;
-    SharedTransferMemory::new(memory, layout).map_err(shared_transfer_error)
+    SharedBufferPool::new(memory, layout).map_err(shared_buffer_error)
 }
 
 fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
-    let marker = [SHARED_TRANSFER_SETUP_VERSION];
+    let marker = [SHARED_BUFFER_SETUP_VERSION];
     let io = [IoSlice::new(&marker)];
     let fds = [fd];
     let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
@@ -77,7 +77,7 @@ fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant
             Ok(0) => {
                 return Err(Error::new(
                     ErrorKind::WriteZero,
-                    "failed to send shared transfer memory",
+                    "failed to send shared buffer pool",
                 ));
             }
             Ok(_) => return Err(invalid_data("oversized shared-memory setup write")),
@@ -132,7 +132,7 @@ fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Ow
             "shared-memory setup contained invalid descriptor data",
         ));
     }
-    if marker[0] != SHARED_TRANSFER_SETUP_VERSION {
+    if marker[0] != SHARED_BUFFER_SETUP_VERSION {
         return Err(invalid_data("unsupported shared-memory setup version"));
     }
     Ok(received_fds
@@ -205,7 +205,7 @@ fn invalid_data(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
 
-fn shared_transfer_error(error: SharedTransferError) -> Error {
+fn shared_buffer_error(error: SharedBufferError) -> Error {
     Error::new(ErrorKind::InvalidData, error)
 }
 
@@ -215,55 +215,52 @@ mod tests {
     use std::io::Write;
     use std::net::Shutdown;
 
-    use litebox_broker_protocol::shared_memory::{
-        SharedTransferDescriptor, SharedTransferSlotIndex,
-    };
+    use litebox_broker_protocol::shared_memory::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
     use rustix::io::FdFlags;
 
     #[test]
     fn transfers_exact_size_memory_with_close_on_exec() {
-        let layout = SharedTransferLayout::new(8, 3).unwrap();
-        let memory = create_shared_transfer_memory(layout).unwrap();
-        let descriptor = memory
-            .write(SharedTransferSlotIndex::new(2), &[1, 2, 3])
+        let layout = SharedBufferLayout::new(8, 3).unwrap();
+        let pool = create_shared_buffer_pool(layout).unwrap();
+        let descriptor = pool
+            .write(SharedBufferSlotIndex::new(2), &[1, 2, 3])
             .unwrap();
         let (mut local_stream, mut host_stream) = UnixStream::pair().unwrap();
 
-        send_shared_transfer_memory(&mut host_stream, &memory, None).unwrap();
-        let mapped_memory =
-            receive_shared_transfer_memory(&mut local_stream, layout, None).unwrap();
+        send_shared_buffer_pool(&mut host_stream, &pool, None).unwrap();
+        let mapped_pool = receive_shared_buffer_pool(&mut local_stream, layout, None).unwrap();
 
         let mut bytes = [0; 3];
-        mapped_memory.read(descriptor, &mut bytes).unwrap();
+        mapped_pool.read(descriptor, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2, 3]);
-        let flags = rustix::io::fcntl_getfd(mapped_memory.memory().as_fd()).unwrap();
+        let flags = rustix::io::fcntl_getfd(mapped_pool.memory().as_fd()).unwrap();
         assert!(flags.contains(FdFlags::CLOEXEC));
     }
 
     #[test]
     fn rejects_missing_multiple_and_truncated_descriptors() {
-        let layout = SharedTransferLayout::new(8, 1).unwrap();
+        let layout = SharedBufferLayout::new(8, 1).unwrap();
 
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        sender.write_all(&[SHARED_TRANSFER_SETUP_VERSION]).unwrap();
+        sender.write_all(&[SHARED_BUFFER_SETUP_VERSION]).unwrap();
         assert_eq!(
-            receive_shared_transfer_memory(&mut receiver, layout, None)
+            receive_shared_buffer_pool(&mut receiver, layout, None)
                 .err()
                 .expect("missing descriptor must be rejected")
                 .kind(),
             ErrorKind::InvalidData
         );
 
-        let memory = create_shared_transfer_memory(layout).unwrap();
+        let pool = create_shared_buffer_pool(layout).unwrap();
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
         send_test_fds(
             &mut sender,
-            SHARED_TRANSFER_SETUP_VERSION,
-            &[memory.memory().as_fd(), memory.memory().as_fd()],
+            SHARED_BUFFER_SETUP_VERSION,
+            &[pool.memory().as_fd(), pool.memory().as_fd()],
         );
         assert_eq!(
-            receive_shared_transfer_memory(&mut receiver, layout, None)
+            receive_shared_buffer_pool(&mut receiver, layout, None)
                 .err()
                 .expect("multiple descriptors must be rejected")
                 .kind(),
@@ -271,14 +268,14 @@ mod tests {
         );
 
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        let fd = memory.memory().as_fd();
+        let fd = pool.memory().as_fd();
         send_test_fds(
             &mut sender,
-            SHARED_TRANSFER_SETUP_VERSION,
+            SHARED_BUFFER_SETUP_VERSION,
             &[fd, fd, fd, fd, fd],
         );
         assert_eq!(
-            receive_shared_transfer_memory(&mut receiver, layout, None)
+            receive_shared_buffer_pool(&mut receiver, layout, None)
                 .err()
                 .expect("truncated descriptors must be rejected")
                 .kind(),
@@ -288,25 +285,24 @@ mod tests {
 
     #[test]
     fn rejects_wrong_version_size_and_unsealed_memory() {
-        let layout = SharedTransferLayout::new(8, 1).unwrap();
-        let memory = create_shared_transfer_memory(layout).unwrap();
+        let layout = SharedBufferLayout::new(8, 1).unwrap();
+        let pool = create_shared_buffer_pool(layout).unwrap();
 
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_test_fds(&mut sender, 2, &[memory.memory().as_fd()]);
+        send_test_fds(&mut sender, 2, &[pool.memory().as_fd()]);
         assert_eq!(
-            receive_shared_transfer_memory(&mut receiver, layout, None)
+            receive_shared_buffer_pool(&mut receiver, layout, None)
                 .err()
                 .expect("unsupported setup version must be rejected")
                 .kind(),
             ErrorKind::InvalidData
         );
 
-        let wrong_size =
-            create_shared_transfer_memory(SharedTransferLayout::new(7, 1).unwrap()).unwrap();
+        let wrong_size = create_shared_buffer_pool(SharedBufferLayout::new(7, 1).unwrap()).unwrap();
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_shared_transfer_memory(&mut sender, &wrong_size, None).unwrap();
+        send_shared_buffer_pool(&mut sender, &wrong_size, None).unwrap();
         assert_eq!(
-            receive_shared_transfer_memory(&mut receiver, layout, None)
+            receive_shared_buffer_pool(&mut receiver, layout, None)
                 .err()
                 .expect("wrong shared-memory size must be rejected")
                 .kind(),
@@ -318,11 +314,11 @@ mod tests {
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
         send_test_fds(
             &mut sender,
-            SHARED_TRANSFER_SETUP_VERSION,
+            SHARED_BUFFER_SETUP_VERSION,
             &[unsealed.as_fd()],
         );
         assert_eq!(
-            receive_shared_transfer_memory(&mut receiver, layout, None)
+            receive_shared_buffer_pool(&mut receiver, layout, None)
                 .err()
                 .expect("unsealed shared memory must be rejected")
                 .kind(),
@@ -332,11 +328,11 @@ mod tests {
 
     #[test]
     fn reports_eof_and_expired_deadline() {
-        let layout = SharedTransferLayout::new(8, 1).unwrap();
+        let layout = SharedBufferLayout::new(8, 1).unwrap();
         let (mut receiver, sender) = UnixStream::pair().unwrap();
         drop(sender);
         assert_eq!(
-            receive_shared_transfer_memory(&mut receiver, layout, None)
+            receive_shared_buffer_pool(&mut receiver, layout, None)
                 .err()
                 .expect("setup EOF must be reported")
                 .kind(),
@@ -348,7 +344,7 @@ mod tests {
         receiver.set_read_timeout(previous_timeout).unwrap();
         let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         assert_eq!(
-            receive_shared_transfer_memory(&mut receiver, layout, Some(expired))
+            receive_shared_buffer_pool(&mut receiver, layout, Some(expired))
                 .err()
                 .expect("expired setup deadline must be rejected")
                 .kind(),
@@ -356,11 +352,11 @@ mod tests {
         );
         assert_eq!(receiver.read_timeout().unwrap(), previous_timeout);
 
-        let memory = create_shared_transfer_memory(layout).unwrap();
+        let pool = create_shared_buffer_pool(layout).unwrap();
         let (_receiver, mut sender) = UnixStream::pair().unwrap();
         sender.set_write_timeout(previous_timeout).unwrap();
         assert_eq!(
-            send_shared_transfer_memory(&mut sender, &memory, Some(expired))
+            send_shared_buffer_pool(&mut sender, &pool, Some(expired))
                 .expect_err("expired send deadline must be rejected")
                 .kind(),
             ErrorKind::TimedOut
@@ -383,36 +379,34 @@ mod tests {
 
     #[test]
     fn descriptor_validation_remains_layout_scoped() {
-        let layout = SharedTransferLayout::new(8, 2).unwrap();
+        let layout = SharedBufferLayout::new(8, 2).unwrap();
         assert_eq!(
-            layout.range(SharedTransferDescriptor::new(
-                SharedTransferSlotIndex::new(2),
+            layout.range(SharedBufferDescriptor::new(
+                SharedBufferSlotIndex::new(2),
                 0,
             )),
-            Err(SharedTransferError::InvalidSlot)
+            Err(SharedBufferError::InvalidSlot)
         );
     }
 
     #[test]
     fn dropping_stream_after_send_does_not_affect_mapping() {
-        let layout = SharedTransferLayout::new(8, 1).unwrap();
-        let memory = create_shared_transfer_memory(layout).unwrap();
+        let layout = SharedBufferLayout::new(8, 1).unwrap();
+        let pool = create_shared_buffer_pool(layout).unwrap();
         let (mut local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        send_shared_transfer_memory(&mut host_stream, &memory, None).unwrap();
+        send_shared_buffer_pool(&mut host_stream, &pool, None).unwrap();
         host_stream.shutdown(Shutdown::Both).unwrap();
 
-        let mapped_memory =
-            receive_shared_transfer_memory(&mut local_stream, layout, None).unwrap();
-        mapped_memory
-            .write(SharedTransferSlotIndex::new(0), &[7])
+        let mapped_pool = receive_shared_buffer_pool(&mut local_stream, layout, None).unwrap();
+        mapped_pool
+            .write(SharedBufferSlotIndex::new(0), &[7])
             .unwrap();
         let mut byte = [0];
-        memory
-            .read(
-                SharedTransferDescriptor::new(SharedTransferSlotIndex::new(0), 1),
-                &mut byte,
-            )
-            .unwrap();
+        pool.read(
+            SharedBufferDescriptor::new(SharedBufferSlotIndex::new(0), 1),
+            &mut byte,
+        )
+        .unwrap();
         assert_eq!(byte, [7]);
     }
 }
