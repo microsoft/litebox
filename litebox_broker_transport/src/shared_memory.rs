@@ -4,22 +4,17 @@
 //! Reusable Linux memfd-backed shared memory.
 
 use std::io::{Error, Result as IoResult};
-#[cfg(feature = "unix-shared-memory")]
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-#[cfg(feature = "unix-shared-memory")]
 use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
 use std::sync::Mutex;
-#[cfg(feature = "unix-shared-memory")]
 use std::time::{Duration, Instant};
 
 use rustix::fs::{
     MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, fstat, ftruncate, memfd_create,
 };
-#[cfg(feature = "unix-shared-memory")]
 use rustix::io::Errno;
-#[cfg(feature = "unix-shared-memory")]
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags,
@@ -30,7 +25,6 @@ use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
 const REQUIRED_MEMFD_SEALS: SealFlags = SealFlags::from_bits_retain(
     SealFlags::GROW.bits() | SealFlags::SHRINK.bits() | SealFlags::SEAL.bits(),
 );
-#[cfg(feature = "unix-shared-memory")]
 const SHARED_MEMORY_SETUP_VERSION: u8 = 1;
 
 /// Linux memfd-backed shared memory usable by broker transports.
@@ -186,7 +180,6 @@ impl SharedMemory for MemfdSharedMemory {
 /// connected Unix stream.
 ///
 /// `deadline` bounds setup I/O without leaving a changed socket timeout behind.
-#[cfg(feature = "unix-shared-memory")]
 pub fn send_memfd(
     stream: &mut UnixStream,
     memory: &MemfdSharedMemory,
@@ -201,7 +194,6 @@ pub fn send_memfd(
 ///
 /// `expected_length` supplies the trusted expected size. `deadline` bounds
 /// setup I/O without leaving a changed socket timeout behind.
-#[cfg(feature = "unix-shared-memory")]
 pub fn receive_memfd(
     stream: &mut UnixStream,
     expected_length: usize,
@@ -211,7 +203,6 @@ pub fn receive_memfd(
     MemfdSharedMemory::from_received_fd(fd, expected_length)
 }
 
-#[cfg(feature = "unix-shared-memory")]
 fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
     let marker = [SHARED_MEMORY_SETUP_VERSION];
     let io = [IoSlice::new(&marker)];
@@ -239,7 +230,6 @@ fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant
     }
 }
 
-#[cfg(feature = "unix-shared-memory")]
 fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<OwnedFd> {
     let mut marker = [0];
     let mut io = [IoSliceMut::new(&mut marker)];
@@ -293,7 +283,6 @@ fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Ow
         .expect("exactly one received descriptor was validated"))
 }
 
-#[cfg(feature = "unix-shared-memory")]
 fn with_read_deadline<Output>(
     stream: &mut UnixStream,
     deadline: Option<Instant>,
@@ -307,7 +296,6 @@ fn with_read_deadline<Output>(
     combine_result_with_restore(result, stream.set_read_timeout(previous))
 }
 
-#[cfg(feature = "unix-shared-memory")]
 fn with_write_deadline<Output>(
     stream: &mut UnixStream,
     deadline: Option<Instant>,
@@ -321,7 +309,6 @@ fn with_write_deadline<Output>(
     combine_result_with_restore(result, stream.set_write_timeout(previous))
 }
 
-#[cfg(feature = "unix-shared-memory")]
 fn refresh_read_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
     if let Some(deadline) = deadline {
         stream.set_read_timeout(Some(io_timeout_for_deadline(deadline)?))?;
@@ -329,7 +316,6 @@ fn refresh_read_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoRe
     Ok(())
 }
 
-#[cfg(feature = "unix-shared-memory")]
 fn refresh_write_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
     if let Some(deadline) = deadline {
         stream.set_write_timeout(Some(io_timeout_for_deadline(deadline)?))?;
@@ -337,7 +323,6 @@ fn refresh_write_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoR
     Ok(())
 }
 
-#[cfg(feature = "unix-shared-memory")]
 fn combine_result_with_restore<Output>(
     result: IoResult<Output>,
     restore: IoResult<()>,
@@ -352,7 +337,6 @@ fn combine_result_with_restore<Output>(
     }
 }
 
-#[cfg(feature = "unix-shared-memory")]
 fn io_timeout_for_deadline(deadline: Instant) -> IoResult<Duration> {
     deadline
         .checked_duration_since(Instant::now())
@@ -376,11 +360,8 @@ fn invalid_data(message: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "unix-shared-memory")]
     use rustix::io::FdFlags;
-    #[cfg(feature = "unix-shared-memory")]
     use std::io::Write;
-    #[cfg(feature = "unix-shared-memory")]
     use std::net::Shutdown;
 
     #[test]
@@ -436,7 +417,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "unix-shared-memory")]
     #[test]
     fn transfers_exact_size_memory_with_close_on_exec() {
         let length = 24;
@@ -453,7 +433,6 @@ mod tests {
         assert!(flags.contains(FdFlags::CLOEXEC));
     }
 
-    #[cfg(feature = "unix-shared-memory")]
     #[test]
     fn rejects_missing_multiple_and_truncated_descriptors() {
         let length = 8;
@@ -499,7 +478,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "unix-shared-memory")]
     #[test]
     fn rejects_wrong_version_size_and_unsealed_memory() {
         let length = 8;
@@ -543,7 +521,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "unix-shared-memory")]
     #[test]
     fn reports_eof_and_expired_deadline() {
         let length = 8;
@@ -582,7 +559,6 @@ mod tests {
         assert_eq!(sender.write_timeout().unwrap(), previous_timeout);
     }
 
-    #[cfg(feature = "unix-shared-memory")]
     fn send_test_fds(stream: &mut UnixStream, marker: u8, fds: &[BorrowedFd<'_>]) {
         let marker = [marker];
         let io = [IoSlice::new(&marker)];
@@ -596,7 +572,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "unix-shared-memory")]
     #[test]
     fn dropping_stream_after_send_does_not_affect_mapping() {
         let length = 8;

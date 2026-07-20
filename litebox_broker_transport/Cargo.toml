@@ -5,9 +5,8 @@ edition = "2024"
 
 [features]
 std = []
-linux-shared-memory = ["std", "dep:libc", "dep:rustix", "rustix/fs"]
+linux-shared-memory = ["std", "dep:libc", "dep:rustix", "rustix/fs", "rustix/net"]
 unix = ["std"]
-unix-shared-memory = ["unix", "linux-shared-memory", "rustix/net"]
 
 [dependencies]
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
