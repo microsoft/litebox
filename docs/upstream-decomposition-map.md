@@ -48,8 +48,9 @@
   branch — **not** behavioral tests. Behavioral tests live inline as
   `#[cfg(test)]` in each crate's `src`. The amalgamation-only
   `litebox_test_harness` (Docker integration) does **not** exist on either
-  target, so harness tests do **not** port — **each ported fix must carry a
-  main-native inline test.**
+  target, so harness tests do **not** port — a ported fix should carry a
+  main-native inline test, **unless** it is extremely simple and the crate has
+  no existing test scaffold for it (e.g. the sockopt accept in PR #1054).
 
 ## The proven PR recipe (#891 / #908)
 
@@ -62,9 +63,24 @@
 - **PR #908 → `ulitebox`** — branch `wportnoy/ulitebox-reserve-page-align`,
   cherry-pick of #891, title suffixed `(cherry-pick of #891)`.
 
-**Cadence: both-PRs-per-fix** — each fix ships its `main` PR **and** its
-`ulitebox` cherry-pick PR *together*, not batched (the team is particular about
-PR structure + commit messages).
+**Cadence: both-PRs-per-fix, main-first.** Each fix ships as its own `main` PR
+**and** a separate `ulitebox` cherry-pick PR — but **sequentially**: open the
+`main` PR first, and only **after it merges** open the cherry-pick PR against
+`ulitebox` (as #908 followed #891). Never batch multiple fixes into one PR (the
+team is particular about PR structure + commit messages).
+
+**PR-description convention (litebox team):** 2–4 sentences describing the
+change, **no extra line breaks** (a single flowing paragraph), and **no
+nonessentials** — do not mention that tests pass / clippy is clean / how it was
+validated. Commit messages use conventional-commit titles (`fix(scope): …`);
+the standard `Co-authored-by: Copilot` + `Copilot-Session:` trailers are fine in
+**commit messages** but must **not** appear in the PR description body.
+
+### PRs in flight
+
+| candidate | main PR | ulitebox PR |
+|:--|:--|:--|
+| advisory-sockopt accept (IP_TOS, SO_RCVBUF, SO_SNDBUF) | **#1054** (open) | queued — after #1054 merges |
 
 ## Methodology (reproducible)
 
@@ -122,8 +138,8 @@ model mismatch, or noise. **A-SLICE extraction:** cherry-pick the merge,
 
 | verdict | size | sha | work-stream — description | why |
 |:--|--:|:--|:--|:--|
-| A-READY | `7/1` | `fc2b3134d` | session-iptos-shim-fix — accept setsockopt(SOL_IP, IP_TOS) | main net.rs:388 still EOPNOTSUPP; broker-indep |
-| A-READY | `11/4` | `30782b911` | session-rcvbuf-sndbuf-fix — accept SO_RCVBUF/SO_SNDBUF | main net.rs:399+unix.rs:1517 EOPNOTSUPP |
+| A-READY | `7/1` | `fc2b3134d` | session-iptos-shim-fix — accept setsockopt(SOL_IP, IP_TOS) | **main PR #1054 (open)**; broker-indep |
+| A-READY | `11/4` | `30782b911` | session-rcvbuf-sndbuf-fix — accept SO_RCVBUF/SO_SNDBUF | **main PR #1054 (open)**; net.rs+unix.rs |
 | A-READY | `140/5` | `27393b02a` | SIG_DFL Stop signals as no-op (SIGTTIN-cascade) | main signal/mod.rs:587 still Stop=>terminate; 1 file |
 | A-CHECK | `15/3` | `fd51b53cb` | TUI mode startup — 5 shim signal divergences | signal/mod.rs; sibling of sig_dfl — verify vs main |
 | A-SLICE | `141/46` | `13b12131b` | wave10 — SCM eventfd refs + **sendfile** | sendfile portable; slice from SCM-eventfd broker refs |
