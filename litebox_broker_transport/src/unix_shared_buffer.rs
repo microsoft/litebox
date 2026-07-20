@@ -12,7 +12,6 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use litebox_broker_protocol::shared_memory::SharedBufferRegion;
 use rustix::io::Errno;
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
@@ -24,11 +23,8 @@ use crate::shared_memory::MemfdSharedMemory;
 const SHARED_BUFFER_SETUP_VERSION: u8 = 1;
 
 /// Creates a sealed Linux shared buffer region with `length` bytes.
-pub fn create_shared_buffer_region(
-    length: usize,
-) -> IoResult<SharedBufferRegion<MemfdSharedMemory>> {
-    let memory = MemfdSharedMemory::create(length)?;
-    Ok(SharedBufferRegion::new(memory))
+pub fn create_shared_buffer_region(length: usize) -> IoResult<MemfdSharedMemory> {
+    MemfdSharedMemory::create(length)
 }
 
 /// Sends one shared-buffer-region memfd over an exclusively owned connected stream.
@@ -36,11 +32,11 @@ pub fn create_shared_buffer_region(
 /// `deadline` bounds setup I/O without leaving a changed socket timeout behind.
 pub fn send_shared_buffer_region(
     stream: &mut UnixStream,
-    region: &SharedBufferRegion<MemfdSharedMemory>,
+    region: &MemfdSharedMemory,
     deadline: Option<Instant>,
 ) -> IoResult<()> {
     with_write_deadline(stream, deadline, |stream, deadline| {
-        send_fd(stream, region.memory().as_fd(), deadline)
+        send_fd(stream, region.as_fd(), deadline)
     })
 }
 
@@ -52,10 +48,9 @@ pub fn receive_shared_buffer_region(
     stream: &mut UnixStream,
     expected_length: usize,
     deadline: Option<Instant>,
-) -> IoResult<SharedBufferRegion<MemfdSharedMemory>> {
+) -> IoResult<MemfdSharedMemory> {
     let fd = with_read_deadline(stream, deadline, receive_fd)?;
-    let memory = MemfdSharedMemory::from_received_fd(fd, expected_length)?;
-    Ok(SharedBufferRegion::new(memory))
+    MemfdSharedMemory::from_received_fd(fd, expected_length)
 }
 
 fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
@@ -209,7 +204,7 @@ mod tests {
     use std::io::Write;
     use std::net::Shutdown;
 
-    use litebox_broker_protocol::shared_memory::{SharedBufferDescriptor, SharedBufferError};
+    use litebox_broker_protocol::shared_memory::{SharedBufferDescriptor, SharedMemory};
     use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
     use rustix::io::FdFlags;
 
@@ -217,16 +212,18 @@ mod tests {
     fn transfers_exact_size_memory_with_close_on_exec() {
         let length = 24;
         let region = create_shared_buffer_region(length).unwrap();
-        let descriptor = region.write(16, &[1, 2, 3]).unwrap();
+        let descriptor = SharedBufferDescriptor::new(16, 3);
+        region.write(16, &[1, 2, 3]).unwrap();
         let (mut local_stream, mut host_stream) = UnixStream::pair().unwrap();
 
         send_shared_buffer_region(&mut host_stream, &region, None).unwrap();
         let mapped_region = receive_shared_buffer_region(&mut local_stream, length, None).unwrap();
 
         let mut bytes = [0; 3];
-        mapped_region.read(descriptor, &mut bytes).unwrap();
+        let range = descriptor.range(mapped_region.len()).unwrap();
+        mapped_region.read(range.start, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2, 3]);
-        let flags = rustix::io::fcntl_getfd(mapped_region.memory().as_fd()).unwrap();
+        let flags = rustix::io::fcntl_getfd(mapped_region.as_fd()).unwrap();
         assert!(flags.contains(FdFlags::CLOEXEC));
     }
 
@@ -249,7 +246,7 @@ mod tests {
         send_test_fds(
             &mut sender,
             SHARED_BUFFER_SETUP_VERSION,
-            &[region.memory().as_fd(), region.memory().as_fd()],
+            &[region.as_fd(), region.as_fd()],
         );
         assert_eq!(
             receive_shared_buffer_region(&mut receiver, length, None)
@@ -260,7 +257,7 @@ mod tests {
         );
 
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        let fd = region.memory().as_fd();
+        let fd = region.as_fd();
         send_test_fds(
             &mut sender,
             SHARED_BUFFER_SETUP_VERSION,
@@ -281,7 +278,7 @@ mod tests {
         let region = create_shared_buffer_region(length).unwrap();
 
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_test_fds(&mut sender, 2, &[region.memory().as_fd()]);
+        send_test_fds(&mut sender, 2, &[region.as_fd()]);
         assert_eq!(
             receive_shared_buffer_region(&mut receiver, length, None)
                 .err()
@@ -370,14 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_validation_remains_region_scoped() {
-        assert_eq!(
-            SharedBufferDescriptor::new(16, 1).range(16),
-            Err(SharedBufferError::InvalidRange)
-        );
-    }
-
-    #[test]
     fn dropping_stream_after_send_does_not_affect_mapping() {
         let length = 8;
         let region = create_shared_buffer_region(length).unwrap();
@@ -388,9 +377,7 @@ mod tests {
         let mapped_region = receive_shared_buffer_region(&mut local_stream, length, None).unwrap();
         mapped_region.write(0, &[7]).unwrap();
         let mut byte = [0];
-        region
-            .read(SharedBufferDescriptor::new(0, 1), &mut byte)
-            .unwrap();
+        region.read(0, &mut byte).unwrap();
         assert_eq!(byte, [7]);
     }
 }
