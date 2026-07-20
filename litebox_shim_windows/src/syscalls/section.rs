@@ -220,13 +220,6 @@ struct SectionImageInformation {
 const _: () = assert!(size_of::<SectionImageInformation>() == 64);
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    fn section_entry(
-        &self,
-        handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, SectionSubsystem<Platform>>, NtStatus> {
-        self.typed_handle_entry::<SectionSubsystem<Platform>>(handle)
-    }
-
     fn insert_section_handle(
         &self,
         section: Arc<SectionObject<Platform>>,
@@ -450,13 +443,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         else {
             return NtStatus::INVALID_INFO_CLASS;
         };
-        if let Err(status) = self.require_handle_access::<SectionSubsystem<Platform>>(
+        let entry = match self.typed_handle_entry_with_access::<SectionSubsystem<Platform>>(
             section_handle,
             SectionAccess::QUERY.bits(),
         ) {
-            return status;
-        }
-        let entry = match self.section_entry(section_handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
@@ -512,13 +502,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
-        if let Err(status) = self.require_handle_access::<SectionSubsystem<Platform>>(
+        let entry = match self.typed_handle_entry_with_access::<SectionSubsystem<Platform>>(
             request.section_handle,
             required_map_access(page_protection).bits(),
         ) {
-            return status;
-        }
-        let entry = match self.section_entry(request.section_handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
@@ -652,11 +639,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         section_handle: Handle,
         requested_view_size: usize,
     ) -> Result<MappedPagefileSectionView, NtStatus> {
-        self.require_handle_access::<SectionSubsystem<Platform>>(
+        let entry = self.typed_handle_entry_with_access::<SectionSubsystem<Platform>>(
             section_handle,
             (SectionAccess::MAP_READ | SectionAccess::MAP_WRITE).bits(),
         )?;
-        let entry = self.section_entry(section_handle)?;
         let section = entry.with_entry(|entry| Arc::clone(&entry.section));
         let page_protection = PageProtection::PAGE_READWRITE;
         let Some((_, permissions)) = parse_page_protection(page_protection.bits()) else {

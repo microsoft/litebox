@@ -87,13 +87,6 @@ fn utf16_units(value: &str) -> Result<Vec<u16>, NtStatus> {
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    fn symbolic_link_entry(
-        &self,
-        handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, SymbolicLinkSubsystem<Platform>>, NtStatus> {
-        self.typed_handle_entry::<SymbolicLinkSubsystem<Platform>>(handle)
-    }
-
     fn insert_symbolic_link_handle(
         &self,
         link: Arc<ObjectNode<Platform>>,
@@ -235,13 +228,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         link_target: MutPtr<Platform, UnicodeString>,
         returned_length: Option<MutPtr<Platform, u32>>,
     ) -> NtStatus {
-        if let Err(status) = self.require_handle_access::<SymbolicLinkSubsystem<Platform>>(
+        let entry = match self.typed_handle_entry_with_access::<SymbolicLinkSubsystem<Platform>>(
             link_handle,
             SymbolicLinkAccess::QUERY.bits(),
         ) {
-            return status;
-        }
-        let entry = match self.symbolic_link_entry(link_handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };

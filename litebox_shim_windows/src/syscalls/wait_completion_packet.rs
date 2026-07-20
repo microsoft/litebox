@@ -132,6 +132,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         };
+        self.require_typed_handle_access(&typed, WaitCompletionPacketAccess::SET_STATE.bits())?;
         self.global
             .litebox
             .descriptor_table()
@@ -155,6 +156,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Err(ErrRawIntFd::InvalidSubsystem) => return Err(NtStatus::OBJECT_TYPE_MISMATCH),
             }
         };
+        self.require_typed_handle_access(&typed, WaitCompletionPacketAccess::SET_STATE.bits())?;
         self.global
             .litebox
             .descriptor_table()
@@ -211,9 +213,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(entry) = self.global.litebox.descriptor_table().entry_handle(&typed) else {
             return Err(NtStatus::ACCESS_DENIED);
         };
-        let handle = Handle::from_raw_fd(raw_fd).ok_or(NtStatus::ACCESS_DENIED)?;
-        self.require_handle_access::<EventSubsystem<Platform>>(
-            handle,
+        self.require_typed_handle_access::<EventSubsystem<Platform>>(
+            &typed,
             AccessMask::SYNCHRONIZE.bits(),
         )?;
         Ok(Some(entry.with_entry(EventHandleObject::is_signaled)))
@@ -223,19 +224,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         raw_fd: usize,
     ) -> Result<Option<bool>, NtStatus> {
-        {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<TimerSubsystem<Platform>>(raw_fd) {
-                Ok(_) => {}
-                Err(ErrRawIntFd::NotFound) => return Err(NtStatus::ACCESS_DENIED),
-                Err(ErrRawIntFd::InvalidSubsystem) => return Ok(None),
-            }
-        }
         let handle = Handle::from_raw_fd(raw_fd).ok_or(NtStatus::ACCESS_DENIED)?;
-        self.require_handle_access::<TimerSubsystem<Platform>>(
+        match self.require_handle_access::<TimerSubsystem<Platform>>(
             handle,
             AccessMask::SYNCHRONIZE.bits(),
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return Ok(None),
+            Err(NtStatus::INVALID_HANDLE) => return Err(NtStatus::ACCESS_DENIED),
+            Err(status) => return Err(status),
+        }
         // TODO: return the timer object's real signaled state after NtSetTimer2 models
         // due-time expiration and periodic re-signaling.
         Ok(Some(false))
@@ -306,12 +304,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        if let Err(status) = self.require_handle_access::<WaitCompletionPacketSubsystem<Platform>>(
-            params.wait_completion_packet_handle,
-            WaitCompletionPacketAccess::SET_STATE.bits(),
-        ) {
-            return status;
-        }
         let packet = entry.with_entry(|entry| entry.packet.clone());
 
         if let Err(status) =
@@ -365,12 +357,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(entry) => entry,
                 Err(status) => return status,
             };
-        if let Err(status) = self.require_handle_access::<WaitCompletionPacketSubsystem<Platform>>(
-            wait_completion_packet_handle,
-            WaitCompletionPacketAccess::SET_STATE.bits(),
-        ) {
-            return status;
-        }
         let packet = entry.with_entry(|entry| Arc::clone(&entry.packet));
 
         let mut association = packet.association.lock();

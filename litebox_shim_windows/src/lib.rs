@@ -632,6 +632,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok_or(NtStatus::INVALID_HANDLE)
     }
 
+    fn typed_handle_entry_with_access<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+        required_access: u32,
+    ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let typed = self.typed_handle::<Subsystem>(handle)?;
+        self.require_typed_handle_access(&typed, required_access)?;
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&typed)
+            .ok_or(NtStatus::INVALID_HANDLE)
+    }
+
     fn typed_handle<Subsystem>(
         &self,
         handle: syscalls::Handle,
@@ -654,6 +671,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    fn typed_handle_granted_access<Subsystem>(
+        &self,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+    ) -> Result<u32, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        self.global
+            .litebox
+            .descriptor_table()
+            .with_metadata::<Subsystem, WindowsHandleMetadata, _>(typed, |metadata| {
+                metadata.granted_access
+            })
+            .map_err(|_| NtStatus::INVALID_HANDLE)
+    }
+
+    #[cfg(test)]
     pub(crate) fn handle_granted_access<Subsystem>(
         &self,
         handle: syscalls::Handle,
@@ -662,13 +696,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Subsystem: WindowsHandleSubsystem,
     {
         let typed = self.typed_handle::<Subsystem>(handle)?;
-        self.global
-            .litebox
-            .descriptor_table()
-            .with_metadata::<Subsystem, WindowsHandleMetadata, _>(&typed, |metadata| {
-                metadata.granted_access
-            })
-            .map_err(|_| NtStatus::INVALID_HANDLE)
+        self.typed_handle_granted_access(&typed)
     }
 
     pub(crate) fn require_handle_access<Subsystem>(
@@ -679,7 +707,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     where
         Subsystem: WindowsHandleSubsystem,
     {
-        if self.handle_granted_access::<Subsystem>(handle)? & required_access == required_access {
+        let typed = self.typed_handle::<Subsystem>(handle)?;
+        self.require_typed_handle_access(&typed, required_access)
+    }
+
+    pub(crate) fn require_typed_handle_access<Subsystem>(
+        &self,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+        required_access: u32,
+    ) -> Result<(), NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        if self.typed_handle_granted_access(typed)? & required_access == required_access {
             Ok(())
         } else {
             Err(NtStatus::ACCESS_DENIED)

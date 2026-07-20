@@ -19,9 +19,7 @@ use crate::nt_types::{
     AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString, read_object_attributes,
 };
 use crate::syscalls::Handle;
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
@@ -241,18 +239,6 @@ fn read_event_object_attributes<Platform: RawPointerProvider>(
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    fn event_entry(
-        &self,
-        handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, EventSubsystem<Platform>>, NtStatus> {
-        raw_handle_entry::<Platform, EventSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-        )
-        .ok_or(NtStatus::INVALID_HANDLE)
-    }
-
     fn insert_event_handle(
         &self,
         event: Arc<EventObject<Platform>>,
@@ -485,13 +471,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
-        if let Err(status) = self.require_handle_access::<EventSubsystem<Platform>>(
+        let entry = match self.typed_handle_entry_with_access::<EventSubsystem<Platform>>(
             event_handle,
             EventAccess::QUERY_STATE.bits(),
         ) {
-            return status;
-        }
-        let entry = match self.event_entry(event_handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
@@ -515,11 +498,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         previous_state: Option<MutPtr<Platform, i32>>,
         op: impl FnOnce(&EventObject<Platform>) -> Result<i32, NtStatus>,
     ) -> Result<(), NtStatus> {
-        self.require_handle_access::<EventSubsystem<Platform>>(
+        let entry = self.typed_handle_entry_with_access::<EventSubsystem<Platform>>(
             event_handle,
             EventAccess::MODIFY_STATE.bits(),
         )?;
-        let entry = self.event_entry(event_handle)?;
         let previous = entry.with_entry(|entry| op(&entry.event))?;
         if let Some(previous_state) = previous_state
             && previous_state.write_at_offset(0, previous).is_none()

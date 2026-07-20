@@ -1001,11 +1001,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         handle: Handle,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        self.require_handle_access::<DirectoryObjectSubsystem<Platform>>(
+        let entry = self.typed_handle_entry_with_access::<DirectoryObjectSubsystem<Platform>>(
             handle,
             DirectoryAccess::TRAVERSE.bits(),
         )?;
-        let entry = self.directory_entry(handle)?;
         Ok(entry.with_entry(|entry| Arc::clone(&entry.directory)))
     }
 
@@ -1225,13 +1224,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         params: DirectoryQueryParameters<Platform>,
     ) -> NtStatus {
-        if let Err(status) = self.require_handle_access::<DirectoryObjectSubsystem<Platform>>(
+        let entry = match self.typed_handle_entry_with_access::<DirectoryObjectSubsystem<Platform>>(
             params.directory_handle,
             DirectoryAccess::QUERY.bits(),
         ) {
-            return status;
-        }
-        let entry = match self.directory_entry(params.directory_handle) {
             Ok(entry) => entry,
             Err(status) => return status,
         };

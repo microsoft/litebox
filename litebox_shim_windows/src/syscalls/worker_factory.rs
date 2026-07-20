@@ -8,7 +8,7 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use litebox::fd::{ErrRawIntFd, FdEnabledSubsystem, FdEnabledSubsystemEntry};
+use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 
@@ -157,40 +157,14 @@ fn commit_worker_factory_shutdown<Platform: crate::ShimPlatform>(
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    fn worker_factory_entry(
-        &self,
-        handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, WorkerFactorySubsystem<Platform>>, NtStatus>
-    {
-        let Some(raw_fd) = handle.raw_fd() else {
-            return Err(NtStatus::INVALID_HANDLE);
-        };
-        let typed = {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<WorkerFactorySubsystem<Platform>>(raw_fd) {
-                Ok(typed) => typed,
-                Err(ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
-                Err(ErrRawIntFd::InvalidSubsystem) => {
-                    return Err(NtStatus::OBJECT_TYPE_MISMATCH);
-                }
-            }
-        };
-        self.global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&typed)
-            .ok_or(NtStatus::INVALID_HANDLE)
-    }
-
     fn io_completion_port(
         &self,
         handle: Handle,
     ) -> Result<Arc<IoCompletionObject<Platform>>, NtStatus> {
-        self.require_handle_access::<IoCompletionSubsystem<Platform>>(
+        let entry = self.typed_handle_entry_with_access::<IoCompletionSubsystem<Platform>>(
             handle,
             IoCompletionAccess::MODIFY_STATE.bits(),
         )?;
-        let entry = self.typed_handle_entry::<IoCompletionSubsystem<Platform>>(handle)?;
         Ok(entry.with_entry(IoCompletionHandleObject::port))
     }
 
@@ -312,16 +286,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .expect("ULONG input is four bytes"),
         );
 
-        let entry = match self.worker_factory_entry(handle) {
-            Ok(entry) => entry,
-            Err(status) => return status,
-        };
-        if let Err(status) = self.require_handle_access::<WorkerFactorySubsystem<Platform>>(
+        let entry = match self.typed_handle_entry_with_access::<WorkerFactorySubsystem<Platform>>(
             handle,
             WorkerFactoryAccess::SET_INFORMATION.bits(),
         ) {
-            return status;
-        }
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
         entry
             .with_entry(|entry| {
                 // TODO: enforce these limits against real worker creation/drain behavior
@@ -372,16 +343,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return status;
         }
-        let entry = match self.worker_factory_entry(handle) {
-            Ok(entry) => entry,
-            Err(status) => return status,
-        };
-        if let Err(status) = self.require_handle_access::<WorkerFactorySubsystem<Platform>>(
+        let entry = match self.typed_handle_entry_with_access::<WorkerFactorySubsystem<Platform>>(
             handle,
             WorkerFactoryAccess::SHUTDOWN.bits(),
         ) {
-            return status;
-        }
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
         let factory = entry.with_entry(|entry| Arc::clone(&entry.factory));
         // TODO: report the actual pending worker count and wake/release workers once worker
         // threads are modeled; the current subset has no workers to drain.
@@ -585,7 +553,7 @@ mod tests {
                 NtStatus::SUCCESS
             );
             let factory = task
-                .worker_factory_entry(worker_factory)
+                .typed_handle_entry::<WorkerFactorySubsystem<TestPlatform>>(worker_factory)
                 .expect("worker factory handle is valid")
                 .with_entry(|entry| Arc::clone(&entry.factory));
             assert!(!factory.shutdown.load(Ordering::Relaxed));

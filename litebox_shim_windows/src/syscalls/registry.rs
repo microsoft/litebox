@@ -507,11 +507,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        self.require_handle_access::<RegistryKeySubsystem<Platform>>(
+        let key = self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
             key_handle,
             RegistryKeyAccess::QUERY_VALUE.bits(),
         )?;
-        let key = self.registry_key_entry(key_handle)?;
         let value_name = value_name.read_string::<Platform>()?;
         let value = key.with_entry(|key| {
             // TODO: Open the value relative to `key.fd` once the FS has an openat-style API.
