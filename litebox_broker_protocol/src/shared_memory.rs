@@ -3,7 +3,6 @@
 
 //! Transport-neutral shared-memory resources.
 
-use alloc::{boxed::Box, sync::Arc};
 use core::ops::Range;
 
 use thiserror::Error;
@@ -42,34 +41,6 @@ pub trait SharedMemory: Send + Sync + 'static {
 
     /// Copies bytes from `source` into shared memory.
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError>;
-}
-
-impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
-    fn len(&self) -> usize {
-        (**self).len()
-    }
-
-    fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-        (**self).read(offset, destination)
-    }
-
-    fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-        (**self).write(offset, source)
-    }
-}
-
-impl<Memory: SharedMemory + ?Sized> SharedMemory for Box<Memory> {
-    fn len(&self) -> usize {
-        (**self).len()
-    }
-
-    fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-        (**self).read(offset, destination)
-    }
-
-    fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-        (**self).write(offset, source)
-    }
 }
 
 /// Error validating or accessing a shared buffer region.
@@ -187,8 +158,7 @@ mod tests {
 
     #[test]
     fn writes_and_reads_described_ranges() {
-        let memory = Arc::new(TestSharedMemory::new(24));
-        let region = SharedBufferRegion::new(Arc::clone(&memory));
+        let region = SharedBufferRegion::new(TestSharedMemory::new(24));
 
         let first = region.write(0, &[1, 2, 3]).unwrap();
         let third = region.write(16, &[4, 5]).unwrap();
@@ -199,7 +169,7 @@ mod tests {
         let mut third_bytes = [0; 2];
         region.read(third, &mut third_bytes).unwrap();
         assert_eq!(third_bytes, [4, 5]);
-        assert_eq!(&memory.bytes()[8..16], &[0; 8]);
+        assert_eq!(&region.memory().bytes()[8..16], &[0; 8]);
     }
 
     #[test]
