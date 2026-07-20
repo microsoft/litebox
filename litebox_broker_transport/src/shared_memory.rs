@@ -25,7 +25,6 @@ use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
 const REQUIRED_MEMFD_SEALS: SealFlags = SealFlags::from_bits_retain(
     SealFlags::GROW.bits() | SealFlags::SHRINK.bits() | SealFlags::SEAL.bits(),
 );
-const SHARED_MEMORY_SETUP_VERSION: u8 = 1;
 
 /// Linux memfd-backed shared memory usable by broker transports.
 pub struct MemfdSharedMemory {
@@ -204,8 +203,9 @@ pub fn receive_memfd(
 }
 
 fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
-    let marker = [SHARED_MEMORY_SETUP_VERSION];
-    let io = [IoSlice::new(&marker)];
+    // Unix streams require an ordinary data byte to carry ancillary data.
+    let carrier = [0];
+    let io = [IoSlice::new(&carrier)];
     let fds = [fd];
     let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = SendAncillaryBuffer::new(&mut control_space);
@@ -231,8 +231,8 @@ fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant
 }
 
 fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<OwnedFd> {
-    let mut marker = [0];
-    let mut io = [IoSliceMut::new(&mut marker)];
+    let mut carrier = [0];
+    let mut io = [IoSliceMut::new(&mut carrier)];
     let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
     let mut control = RecvAncillaryBuffer::new(&mut control_space);
     let received = loop {
@@ -264,7 +264,7 @@ fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Ow
             "broker closed during shared-memory setup",
         ));
     }
-    if received.bytes != marker.len()
+    if received.bytes != carrier.len()
         || received
             .flags
             .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
@@ -274,9 +274,6 @@ fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Ow
         return Err(invalid_data(
             "shared-memory setup contained invalid descriptor data",
         ));
-    }
-    if marker[0] != SHARED_MEMORY_SETUP_VERSION {
-        return Err(invalid_data("unsupported shared-memory setup version"));
     }
     Ok(received_fds
         .pop()
@@ -438,7 +435,7 @@ mod tests {
         let length = 8;
 
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        sender.write_all(&[SHARED_MEMORY_SETUP_VERSION]).unwrap();
+        sender.write_all(&[0]).unwrap();
         assert_eq!(
             receive_memfd(&mut receiver, length, None)
                 .err()
@@ -449,11 +446,7 @@ mod tests {
 
         let memory = MemfdSharedMemory::create(length).unwrap();
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_test_fds(
-            &mut sender,
-            SHARED_MEMORY_SETUP_VERSION,
-            &[memory.as_fd(), memory.as_fd()],
-        );
+        send_test_fds(&mut sender, &[memory.as_fd(), memory.as_fd()]);
         assert_eq!(
             receive_memfd(&mut receiver, length, None)
                 .err()
@@ -464,11 +457,7 @@ mod tests {
 
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
         let fd = memory.as_fd();
-        send_test_fds(
-            &mut sender,
-            SHARED_MEMORY_SETUP_VERSION,
-            &[fd, fd, fd, fd, fd],
-        );
+        send_test_fds(&mut sender, &[fd, fd, fd, fd, fd]);
         assert_eq!(
             receive_memfd(&mut receiver, length, None)
                 .err()
@@ -479,19 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_version_size_and_unsealed_memory() {
+    fn rejects_wrong_size_and_unsealed_memory() {
         let length = 8;
-        let memory = MemfdSharedMemory::create(length).unwrap();
-
-        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_test_fds(&mut sender, 2, &[memory.as_fd()]);
-        assert_eq!(
-            receive_memfd(&mut receiver, length, None)
-                .err()
-                .expect("unsupported setup version must be rejected")
-                .kind(),
-            ErrorKind::InvalidData
-        );
 
         let wrong_size = MemfdSharedMemory::create(7).unwrap();
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
@@ -507,11 +485,7 @@ mod tests {
         let unsealed = memfd_create("unsealed-transfer-test", MemfdFlags::CLOEXEC).unwrap();
         ftruncate(&unsealed, length.try_into().unwrap()).unwrap();
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_test_fds(
-            &mut sender,
-            SHARED_MEMORY_SETUP_VERSION,
-            &[unsealed.as_fd()],
-        );
+        send_test_fds(&mut sender, &[unsealed.as_fd()]);
         assert_eq!(
             receive_memfd(&mut receiver, length, None)
                 .err()
@@ -559,9 +533,9 @@ mod tests {
         assert_eq!(sender.write_timeout().unwrap(), previous_timeout);
     }
 
-    fn send_test_fds(stream: &mut UnixStream, marker: u8, fds: &[BorrowedFd<'_>]) {
-        let marker = [marker];
-        let io = [IoSlice::new(&marker)];
+    fn send_test_fds(stream: &mut UnixStream, fds: &[BorrowedFd<'_>]) {
+        let carrier = [0];
+        let io = [IoSlice::new(&carrier)];
         let mut control_space =
             [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
         let mut control = SendAncillaryBuffer::new(&mut control_space);
