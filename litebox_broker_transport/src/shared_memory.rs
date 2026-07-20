@@ -4,12 +4,25 @@
 //! Reusable Linux memfd-backed shared memory.
 
 use std::io::{Error, Result as IoResult};
+#[cfg(feature = "unix-shared-memory")]
+use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+#[cfg(feature = "unix-shared-memory")]
+use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
 use std::sync::Mutex;
+#[cfg(feature = "unix-shared-memory")]
+use std::time::{Duration, Instant};
 
 use rustix::fs::{
     MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, fstat, ftruncate, memfd_create,
+};
+#[cfg(feature = "unix-shared-memory")]
+use rustix::io::Errno;
+#[cfg(feature = "unix-shared-memory")]
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags,
 };
 
 use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
@@ -17,6 +30,8 @@ use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
 const REQUIRED_MEMFD_SEALS: SealFlags = SealFlags::from_bits_retain(
     SealFlags::GROW.bits() | SealFlags::SHRINK.bits() | SealFlags::SEAL.bits(),
 );
+#[cfg(feature = "unix-shared-memory")]
+const SHARED_MEMORY_SETUP_VERSION: u8 = 1;
 
 /// Linux memfd-backed shared memory usable by broker transports.
 pub struct MemfdSharedMemory {
@@ -167,6 +182,184 @@ impl SharedMemory for MemfdSharedMemory {
     }
 }
 
+/// Sends one memfd-backed shared-memory resource over an exclusively owned
+/// connected Unix stream.
+///
+/// `deadline` bounds setup I/O without leaving a changed socket timeout behind.
+#[cfg(feature = "unix-shared-memory")]
+pub fn send_memfd(
+    stream: &mut UnixStream,
+    memory: &MemfdSharedMemory,
+    deadline: Option<Instant>,
+) -> IoResult<()> {
+    with_write_deadline(stream, deadline, |stream, deadline| {
+        send_fd(stream, memory.as_fd(), deadline)
+    })
+}
+
+/// Receives, validates, and maps one memfd-backed shared-memory resource.
+///
+/// `expected_length` supplies the trusted expected size. `deadline` bounds
+/// setup I/O without leaving a changed socket timeout behind.
+#[cfg(feature = "unix-shared-memory")]
+pub fn receive_memfd(
+    stream: &mut UnixStream,
+    expected_length: usize,
+    deadline: Option<Instant>,
+) -> IoResult<MemfdSharedMemory> {
+    let fd = with_read_deadline(stream, deadline, receive_fd)?;
+    MemfdSharedMemory::from_received_fd(fd, expected_length)
+}
+
+#[cfg(feature = "unix-shared-memory")]
+fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
+    let marker = [SHARED_MEMORY_SETUP_VERSION];
+    let io = [IoSlice::new(&marker)];
+    let fds = [fd];
+    let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut control_space);
+    assert!(
+        control.push(SendAncillaryMessage::ScmRights(&fds)),
+        "SCM_RIGHTS control buffer is correctly sized"
+    );
+    loop {
+        refresh_write_deadline(stream, deadline)?;
+        match rustix::net::sendmsg(stream.as_fd(), &io, &mut control, SendFlags::NOSIGNAL) {
+            Ok(1) => return Ok(()),
+            Ok(0) => {
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to send shared-memory descriptor",
+                ));
+            }
+            Ok(_) => return Err(invalid_data("oversized shared-memory setup write")),
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(feature = "unix-shared-memory")]
+fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<OwnedFd> {
+    let mut marker = [0];
+    let mut io = [IoSliceMut::new(&mut marker)];
+    let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+    let mut control = RecvAncillaryBuffer::new(&mut control_space);
+    let received = loop {
+        refresh_read_deadline(stream, deadline)?;
+        match rustix::net::recvmsg(
+            stream.as_fd(),
+            &mut io,
+            &mut control,
+            RecvFlags::CMSG_CLOEXEC,
+        ) {
+            Ok(received) => break received,
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    };
+
+    let mut received_fds = Vec::new();
+    let mut unexpected_control_message = false;
+    for message in control.drain() {
+        match message {
+            RecvAncillaryMessage::ScmRights(fds) => received_fds.extend(fds),
+            _ => unexpected_control_message = true,
+        }
+    }
+
+    if received.bytes == 0 {
+        return Err(Error::new(
+            ErrorKind::UnexpectedEof,
+            "broker closed during shared-memory setup",
+        ));
+    }
+    if received.bytes != marker.len()
+        || received
+            .flags
+            .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
+        || unexpected_control_message
+        || received_fds.len() != 1
+    {
+        return Err(invalid_data(
+            "shared-memory setup contained invalid descriptor data",
+        ));
+    }
+    if marker[0] != SHARED_MEMORY_SETUP_VERSION {
+        return Err(invalid_data("unsupported shared-memory setup version"));
+    }
+    Ok(received_fds
+        .pop()
+        .expect("exactly one received descriptor was validated"))
+}
+
+#[cfg(feature = "unix-shared-memory")]
+fn with_read_deadline<Output>(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+    operation: impl FnOnce(&mut UnixStream, Option<Instant>) -> IoResult<Output>,
+) -> IoResult<Output> {
+    let Some(_) = deadline else {
+        return operation(stream, None);
+    };
+    let previous = stream.read_timeout()?;
+    let result = operation(stream, deadline);
+    combine_result_with_restore(result, stream.set_read_timeout(previous))
+}
+
+#[cfg(feature = "unix-shared-memory")]
+fn with_write_deadline<Output>(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+    operation: impl FnOnce(&mut UnixStream, Option<Instant>) -> IoResult<Output>,
+) -> IoResult<Output> {
+    let Some(_) = deadline else {
+        return operation(stream, None);
+    };
+    let previous = stream.write_timeout()?;
+    let result = operation(stream, deadline);
+    combine_result_with_restore(result, stream.set_write_timeout(previous))
+}
+
+#[cfg(feature = "unix-shared-memory")]
+fn refresh_read_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
+    if let Some(deadline) = deadline {
+        stream.set_read_timeout(Some(io_timeout_for_deadline(deadline)?))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "unix-shared-memory")]
+fn refresh_write_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
+    if let Some(deadline) = deadline {
+        stream.set_write_timeout(Some(io_timeout_for_deadline(deadline)?))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "unix-shared-memory")]
+fn combine_result_with_restore<Output>(
+    result: IoResult<Output>,
+    restore: IoResult<()>,
+) -> IoResult<Output> {
+    match (result, restore) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(operation), Err(restore)) => Err(Error::new(
+            operation.kind(),
+            format!("{operation}; additionally failed to restore socket timeout: {restore}"),
+        )),
+    }
+}
+
+#[cfg(feature = "unix-shared-memory")]
+fn io_timeout_for_deadline(deadline: Instant) -> IoResult<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|timeout| !timeout.is_zero())
+        .ok_or_else(|| Error::new(ErrorKind::TimedOut, "shared-memory setup deadline expired"))
+}
+
 impl Drop for MappedRegion {
     fn drop(&mut self) {
         // SAFETY: `address` and `length` describe the mapping exclusively owned
@@ -183,6 +376,12 @@ fn invalid_data(message: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "unix-shared-memory")]
+    use rustix::io::FdFlags;
+    #[cfg(feature = "unix-shared-memory")]
+    use std::io::Write;
+    #[cfg(feature = "unix-shared-memory")]
+    use std::net::Shutdown;
 
     #[test]
     fn mappings_share_bytes_and_validate_ranges() {
@@ -235,5 +434,181 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[cfg(feature = "unix-shared-memory")]
+    #[test]
+    fn transfers_exact_size_memory_with_close_on_exec() {
+        let length = 24;
+        let memory = MemfdSharedMemory::create(length).unwrap();
+        memory.write(16, &[1, 2, 3]).unwrap();
+        let (mut local_stream, mut host_stream) = UnixStream::pair().unwrap();
+
+        send_memfd(&mut host_stream, &memory, None).unwrap();
+        let mapped_memory = receive_memfd(&mut local_stream, length, None).unwrap();
+        let mut bytes = [0; 3];
+        mapped_memory.read(16, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3]);
+        let flags = rustix::io::fcntl_getfd(mapped_memory.as_fd()).unwrap();
+        assert!(flags.contains(FdFlags::CLOEXEC));
+    }
+
+    #[cfg(feature = "unix-shared-memory")]
+    #[test]
+    fn rejects_missing_multiple_and_truncated_descriptors() {
+        let length = 8;
+
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        sender.write_all(&[SHARED_MEMORY_SETUP_VERSION]).unwrap();
+        assert_eq!(
+            receive_memfd(&mut receiver, length, None)
+                .err()
+                .expect("missing descriptor must be rejected")
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let memory = MemfdSharedMemory::create(length).unwrap();
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        send_test_fds(
+            &mut sender,
+            SHARED_MEMORY_SETUP_VERSION,
+            &[memory.as_fd(), memory.as_fd()],
+        );
+        assert_eq!(
+            receive_memfd(&mut receiver, length, None)
+                .err()
+                .expect("multiple descriptors must be rejected")
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        let fd = memory.as_fd();
+        send_test_fds(
+            &mut sender,
+            SHARED_MEMORY_SETUP_VERSION,
+            &[fd, fd, fd, fd, fd],
+        );
+        assert_eq!(
+            receive_memfd(&mut receiver, length, None)
+                .err()
+                .expect("truncated descriptors must be rejected")
+                .kind(),
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(feature = "unix-shared-memory")]
+    #[test]
+    fn rejects_wrong_version_size_and_unsealed_memory() {
+        let length = 8;
+        let memory = MemfdSharedMemory::create(length).unwrap();
+
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        send_test_fds(&mut sender, 2, &[memory.as_fd()]);
+        assert_eq!(
+            receive_memfd(&mut receiver, length, None)
+                .err()
+                .expect("unsupported setup version must be rejected")
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let wrong_size = MemfdSharedMemory::create(7).unwrap();
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        send_memfd(&mut sender, &wrong_size, None).unwrap();
+        assert_eq!(
+            receive_memfd(&mut receiver, length, None)
+                .err()
+                .expect("wrong shared-memory size must be rejected")
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let unsealed = memfd_create("unsealed-transfer-test", MemfdFlags::CLOEXEC).unwrap();
+        ftruncate(&unsealed, length.try_into().unwrap()).unwrap();
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        send_test_fds(
+            &mut sender,
+            SHARED_MEMORY_SETUP_VERSION,
+            &[unsealed.as_fd()],
+        );
+        assert_eq!(
+            receive_memfd(&mut receiver, length, None)
+                .err()
+                .expect("unsealed shared memory must be rejected")
+                .kind(),
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(feature = "unix-shared-memory")]
+    #[test]
+    fn reports_eof_and_expired_deadline() {
+        let length = 8;
+        let (mut receiver, sender) = UnixStream::pair().unwrap();
+        drop(sender);
+        assert_eq!(
+            receive_memfd(&mut receiver, length, None)
+                .err()
+                .expect("setup EOF must be reported")
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+
+        let (mut receiver, _sender) = UnixStream::pair().unwrap();
+        let previous_timeout = Some(Duration::from_secs(2));
+        receiver.set_read_timeout(previous_timeout).unwrap();
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            receive_memfd(&mut receiver, length, Some(expired))
+                .err()
+                .expect("expired setup deadline must be rejected")
+                .kind(),
+            ErrorKind::TimedOut
+        );
+        assert_eq!(receiver.read_timeout().unwrap(), previous_timeout);
+
+        let memory = MemfdSharedMemory::create(length).unwrap();
+        let (_receiver, mut sender) = UnixStream::pair().unwrap();
+        sender.set_write_timeout(previous_timeout).unwrap();
+        assert_eq!(
+            send_memfd(&mut sender, &memory, Some(expired))
+                .expect_err("expired send deadline must be rejected")
+                .kind(),
+            ErrorKind::TimedOut
+        );
+        assert_eq!(sender.write_timeout().unwrap(), previous_timeout);
+    }
+
+    #[cfg(feature = "unix-shared-memory")]
+    fn send_test_fds(stream: &mut UnixStream, marker: u8, fds: &[BorrowedFd<'_>]) {
+        let marker = [marker];
+        let io = [IoSlice::new(&marker)];
+        let mut control_space =
+            [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
+        let mut control = SendAncillaryBuffer::new(&mut control_space);
+        assert!(control.push(SendAncillaryMessage::ScmRights(fds)));
+        assert_eq!(
+            rustix::net::sendmsg(stream.as_fd(), &io, &mut control, SendFlags::NOSIGNAL).unwrap(),
+            1
+        );
+    }
+
+    #[cfg(feature = "unix-shared-memory")]
+    #[test]
+    fn dropping_stream_after_send_does_not_affect_mapping() {
+        let length = 8;
+        let memory = MemfdSharedMemory::create(length).unwrap();
+        let (mut local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        send_memfd(&mut host_stream, &memory, None).unwrap();
+        host_stream.shutdown(Shutdown::Both).unwrap();
+
+        let mapped_memory = receive_memfd(&mut local_stream, length, None).unwrap();
+        mapped_memory.write(0, &[7]).unwrap();
+        let mut byte = [0];
+        memory.read(0, &mut byte).unwrap();
+        assert_eq!(byte, [7]);
     }
 }

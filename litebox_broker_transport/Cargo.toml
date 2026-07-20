@@ -7,7 +7,7 @@ edition = "2024"
 std = []
 linux-shared-memory = ["std", "dep:libc", "dep:rustix", "rustix/fs"]
 unix = ["std"]
-unix-shared-buffer = ["unix", "linux-shared-memory", "rustix/net"]
+unix-shared-memory = ["unix", "linux-shared-memory", "rustix/net"]
 
 [dependencies]
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
