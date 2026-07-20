@@ -12,7 +12,7 @@ use x86_64 as arch;
 use zerocopy::FromZeros;
 
 use crate::syscalls::process::ExitStatus;
-use crate::{ShimFS, Task, UserPtr, UserPtrMut};
+use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
@@ -22,9 +22,8 @@ use litebox_common_linux::signal::{
     SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, errno::Errno};
-use litebox_platform_multiplex::Platform;
 
-pub(crate) struct SignalState {
+pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// Pending thread signals.
     pending: RefCell<PendingSignals>,
     /// Pending process signals (shared across all threads).
@@ -32,14 +31,14 @@ pub(crate) struct SignalState {
     /// Currently blocked signals.
     blocked: Cell<SigSet>,
     /// Signal handlers.
-    handlers: RefCell<Arc<SignalHandlers>>,
+    handlers: RefCell<Arc<SignalHandlers<Platform>>>,
     /// Alternate signal stack.
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
 }
 
-impl SignalState {
+impl<Platform: ShimPlatform> SignalState<Platform> {
     pub fn new_process() -> Self {
         Self {
             pending: RefCell::new(PendingSignals::new()),
@@ -110,7 +109,7 @@ impl SignalState {
     }
 }
 
-struct SignalHandlers {
+struct SignalHandlers<Platform: ShimPlatform> {
     inner: Mutex<Platform, SignalHandlersInner>,
 }
 
@@ -147,7 +146,7 @@ struct Handler {
     immutable: bool,
 }
 
-impl SignalHandlers {
+impl<Platform: ShimPlatform> SignalHandlers<Platform> {
     fn new() -> Self {
         Self {
             inner: Mutex::new(SignalHandlersInner {
@@ -168,7 +167,7 @@ impl SignalHandlers {
     }
 }
 
-impl Clone for SignalHandlers {
+impl<Platform: ShimPlatform> Clone for SignalHandlers<Platform> {
     fn clone(&self) -> Self {
         Self {
             inner: Mutex::new(self.inner.lock().clone()),
@@ -288,7 +287,7 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     }
 }
 
-impl SignalState {
+impl<Platform: ShimPlatform> SignalState<Platform> {
     /// Updates the blocked signal mask.
     fn set_signal_mask(&self, mask: SigSet) {
         self.blocked.set(mask);
@@ -375,7 +374,7 @@ impl SignalState {
 /// A fault when delivering a signal.
 struct DeliverFault;
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
         let old = self.signals.blocked.get();
         self.signals.set_signal_mask(mask);
@@ -623,7 +622,6 @@ impl<FS: ShimFS> Task<FS> {
     #[cfg(feature = "alarm_fallback")]
     #[inline]
     pub(crate) fn check_alarm_deadline(&self) {
-        use litebox::platform::TimeProvider as _;
         let mut alarm = self.process().alarm_timer.lock();
         if alarm.handle.is_some() {
             // If the platform supports timers, we rely on those to trigger SIGALRM, so we don't need

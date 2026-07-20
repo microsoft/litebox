@@ -43,13 +43,16 @@ type DefaultFS = litebox::fs::layered::FileSystem<
     litebox::fs::layered::FileSystem<
         Platform,
         litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
-        litebox::fs::nine_p::FileSystem<Platform, litebox_shim_linux::transport::ShimTransport>,
+        litebox::fs::nine_p::FileSystem<
+            Platform,
+            litebox_shim_linux::transport::ShimTransport<Platform>,
+        >,
     >,
 >;
 
 // FUTURE: replace this with some kind of OnceLock, or just eliminate this
 // entirely (ideal).
-static mut SHIM: Option<litebox_shim_linux::LinuxShim<DefaultFS>> = None;
+static mut SHIM: Option<litebox_shim_linux::LinuxShim<Platform, DefaultFS>> = None;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn floating_point_handler(_pt_regs: &mut litebox_common_linux::PtRegs) {
@@ -95,8 +98,11 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
                 err:% = e;
                 "page fault failed"
             );
-            litebox_platform_multiplex::platform()
-                .terminate(globals::SM_SEV_TERM_SET, globals::SM_TERM_EXCEPTION);
+            let platform = {
+                let shim = &raw const SHIM;
+                unsafe { (*shim).as_ref().unwrap().platform() }
+            };
+            platform.terminate(globals::SM_SEV_TERM_SET, globals::SM_TERM_EXCEPTION);
         }
     }
 }
@@ -163,8 +169,7 @@ pub extern "C" fn sandbox_process_init(
     #[cfg(debug_assertions)]
     litebox_util_log::debug!("sandbox_process_init called");
 
-    litebox_platform_multiplex::set_platform(platform);
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let shim = shim_builder.build();
     unsafe { SHIM = Some(shim) };
 

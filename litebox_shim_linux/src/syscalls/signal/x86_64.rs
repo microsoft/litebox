@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use crate::ShimPlatform;
 use crate::UserPtrMut;
 use crate::syscalls::signal::{DeliverFault, SignalState};
 use core::mem::offset_of;
@@ -9,7 +10,6 @@ use litebox_common_linux::{
     PtRegs,
     signal::{SaFlags, SigAction, Siginfo, Ucontext, x86_64::Sigcontext},
 };
-use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, IntoBytes};
 
 #[repr(C)]
@@ -44,7 +44,7 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     frame_addr
 }
 
-impl SignalState {
+impl<Platform: ShimPlatform> SignalState<Platform> {
     pub(super) fn write_signal_frame(
         &self,
         frame_addr: usize,

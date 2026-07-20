@@ -8,17 +8,17 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
-        PageManagementProvider, RawConstPointer, SystemInfoProvider,
+        PageManagementProvider, RawConstPointer,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
     },
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::ShimFS;
+use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
 use litebox::utils::TruncateExt as _;
-use litebox_platform_multiplex::Platform;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
 
@@ -74,7 +74,7 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     #[inline]
     fn do_mmap(
         &self,
@@ -238,7 +238,7 @@ impl<FS: ShimFS> Task<FS> {
         // if a program races like this both threads will register the same mapping anyway. Updating
         // to a begin/attempt/commit scheme could close this race window entirely.
         match <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_allocate_cow_pages(
-            litebox_platform_multiplex::platform(),
+            self.global.platform,
             suggested_addr.unwrap_or(0),
             &static_data[offset..offset + len],
             permissions,
@@ -1130,8 +1130,8 @@ mod tests {
         platform::PageManagementProvider,
     };
     use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
-    use litebox_platform_multiplex::Platform;
 
+    use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
 
     #[test]
@@ -1331,10 +1331,7 @@ mod tests {
         task.sys_munmap(addr2, 0x1000).unwrap();
     }
 
-    #[cfg(any(
-        feature = "platform_linux_userland",
-        feature = "platform_windows_userland"
-    ))]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn test_collision_with_global_allocator() {
         let task = init_platform(None);
@@ -1347,14 +1344,14 @@ mod tests {
                 unused_variables,
                 reason = "the following features are mutually exclusive"
             )]
-            #[cfg(feature = "platform_windows_userland")]
+            #[cfg(target_os = "windows")]
             let addr = {
                 let buf = alloc::vec::Vec::<u8>::with_capacity(0x10_0000);
                 let addr = buf.as_ptr() as usize;
                 data.push(buf);
                 addr
             };
-            #[cfg(feature = "platform_linux_userland")]
+            #[cfg(target_os = "linux")]
             let addr = {
                 let addr = unsafe {
                     libc::mmap(
@@ -1373,7 +1370,10 @@ mod tests {
             };
 
             let mut included = false;
-            for r in <litebox_platform_multiplex::Platform as PageManagementProvider<4096>>::reserved_pages(platform) {
+            for r in <crate::syscalls::tests::TestPlatform as PageManagementProvider<
+                4096,
+            >>::reserved_pages(platform)
+            {
                 if r.contains(&addr) {
                     included = true;
                     break;

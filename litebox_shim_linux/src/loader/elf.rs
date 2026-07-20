@@ -7,11 +7,9 @@ use alloc::{ffi::CString, vec::Vec};
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    platform::SystemInfoProvider as _,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
-use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
 use crate::{
@@ -20,17 +18,17 @@ use crate::{
 };
 
 use super::stack::UserStack;
-use crate::{ShimFS, Task};
+use crate::{ShimFS, ShimPlatform, Task};
 
 // An opened elf file
-struct ElfFile<'a, FS: ShimFS> {
-    task: &'a Task<FS>,
+struct ElfFile<'a, Platform: ShimPlatform, FS: ShimFS> {
+    task: &'a Task<Platform, FS>,
     fd: i32,
     load_high: bool,
 }
 
-impl<'a, FS: ShimFS> ElfFile<'a, FS> {
-    fn new(task: &'a Task<FS>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
+impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfFile<'a, Platform, FS> {
+    fn new(task: &'a Task<Platform, FS>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
         let fd = task
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
@@ -42,13 +40,15 @@ impl<'a, FS: ShimFS> ElfFile<'a, FS> {
     }
 }
 
-impl<FS: ShimFS> Drop for ElfFile<'_, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Drop for ElfFile<'_, Platform, FS> {
     fn drop(&mut self) {
         self.task.sys_close(self.fd).expect("failed to close fd");
     }
 }
 
-impl<FS: ShimFS> litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::ReadAt
+    for &'_ ElfFile<'_, Platform, FS>
+{
     type Error = Errno;
 
     fn read_at(&mut self, mut offset: u64, mut buf: &mut [u8]) -> Result<(), Self::Error> {
@@ -74,7 +74,9 @@ impl<FS: ShimFS> litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_, FS> {
     }
 }
 
-impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
+    for ElfFile<'_, Platform, FS>
+{
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
@@ -179,19 +181,22 @@ pub struct ElfLoadInfo {
 }
 
 /// Loader for ELF files
-pub(crate) struct ElfLoader<'a, FS: ShimFS> {
+pub(crate) struct ElfLoader<'a, Platform: ShimPlatform, FS: ShimFS> {
     path: &'a str,
-    main: FileAndParsed<'a, FS>,
-    interp: Option<FileAndParsed<'a, FS>>,
+    main: FileAndParsed<'a, Platform, FS>,
+    interp: Option<FileAndParsed<'a, Platform, FS>>,
 }
 
-struct FileAndParsed<'a, FS: ShimFS> {
-    file: ElfFile<'a, FS>,
+struct FileAndParsed<'a, Platform: ShimPlatform, FS: ShimFS> {
+    file: ElfFile<'a, Platform, FS>,
     parsed: ElfParsedFile,
 }
 
-impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
-    fn new(task: &'a Task<FS>, path: impl litebox::path::Arg) -> Result<Self, ElfLoaderError> {
+impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
+    fn new(
+        task: &'a Task<Platform, FS>,
+        path: impl litebox::path::Arg,
+    ) -> Result<Self, ElfLoaderError> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
@@ -234,9 +239,9 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
     }
 }
 
-impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
+impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
     /// Parses an ELF file from the given path.
-    pub fn new(task: &'a Task<FS>, path: &'a str) -> Result<Self, ElfLoaderError> {
+    pub fn new(task: &'a Task<Platform, FS>, path: &'a str) -> Result<Self, ElfLoaderError> {
         // Parse the main ELF file.
         let main = FileAndParsed::new(task, path)?;
 
@@ -295,7 +300,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
         };
-        let mut stack = UserStack::new(
+        let mut stack = UserStack::<Platform>::new(
             UserPtrMut::from_platform_ptr::<Platform>(sp),
             super::DEFAULT_STACK_SIZE,
         )
@@ -349,11 +354,11 @@ mod tests {
 
     use alloc::vec::Vec;
 
+    use crate::syscalls::tests::TestPlatform;
     use litebox::{
         fs::{Mode, OFlags},
         platform::PageManagementProvider,
     };
-    use litebox_platform_multiplex::Platform;
 
     use super::*;
 
@@ -472,7 +477,11 @@ mod tests {
         buf
     }
 
-    fn write_file(task: &Task<crate::DefaultFS>, path: &str, data: &[u8]) {
+    fn write_file(
+        task: &Task<TestPlatform, crate::DefaultFS<TestPlatform>>,
+        path: &str,
+        data: &[u8],
+    ) {
         let fd = task
             .sys_open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("failed to create test ELF");
@@ -509,7 +518,7 @@ mod tests {
         // and push that gap below the very top slot (see `mm/linux.rs`). Assert
         // the invariant that matters — placement in the high half of the
         // address space, far above the low-heap region — not one exact slot.
-        let addr_max = <Platform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
+        let addr_max = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
         assert!(
             interp.base_addr >= addr_max / 2,
             "ET_EXEC interpreter loaded at {:#x}, near the low-heap region {:#x} rather than top-down high (>= {:#x})",

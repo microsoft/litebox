@@ -17,7 +17,7 @@ use litebox::{
 };
 use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
 
-use crate::{GlobalState, Platform, ShimFS};
+use crate::{GlobalState, ShimFS, ShimPlatform};
 
 const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
 
@@ -33,13 +33,16 @@ pub(crate) struct PipeStatusFlags(OFlags);
 ///
 /// `PipeFd` does not release the pipe on `Drop`; ends must either be inserted
 /// into the fd table or explicitly released via [`GlobalState::close_linux_pipe`].
-pub(crate) struct LinuxPipeEnds {
+pub(crate) struct LinuxPipeEnds<Platform: ShimPlatform> {
     pub(crate) reader: PipeFd<Platform>,
     pub(crate) writer: PipeFd<Platform>,
 }
 
-impl<FS: ShimFS> GlobalState<FS> {
-    pub(crate) fn create_linux_pipe(&self, flags: OFlags) -> Result<LinuxPipeEnds, Errno> {
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+    pub(crate) fn create_linux_pipe(
+        &self,
+        flags: OFlags,
+    ) -> Result<LinuxPipeEnds<Platform>, Errno> {
         let (pipe_flags, cloexec) = {
             let mut pipe_flags = Flags::empty();
             if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement())

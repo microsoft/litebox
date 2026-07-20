@@ -18,13 +18,14 @@ use litebox::{
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{EfdFlags, errno::Errno};
-use litebox_platform_multiplex::Platform;
 
-pub(crate) struct EventfdSubsystem;
-impl FdEnabledSubsystem for EventfdSubsystem {
+use crate::ShimPlatform;
+
+pub(crate) struct EventfdSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
+impl<Platform: ShimPlatform> FdEnabledSubsystem for EventfdSubsystem<Platform> {
     type Entry = EventFile<Platform>;
 }
-impl FdEnabledSubsystemEntry for EventFile<Platform> {}
+impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     counter: litebox::sync::Mutex<Platform, u64>,
@@ -126,11 +127,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
 
 #[cfg(test)]
 mod tests {
+    use crate::syscalls::tests::TestPlatform;
     use litebox::event::wait::WaitState;
     use litebox_common_linux::{EfdFlags, errno::Errno};
-    use litebox_platform_multiplex::platform;
 
     extern crate std;
+
+    fn platform() -> &'static TestPlatform {
+        crate::syscalls::tests::test_platform(None)
+    }
 
     #[test]
     fn test_semaphore_eventfd() {
@@ -218,8 +223,7 @@ mod tests {
             }
         });
 
-        let read = |eventfd: &super::EventFile<litebox_platform_multiplex::Platform>,
-                    expected_value: u64| {
+        let read = |eventfd: &super::EventFile<TestPlatform>, expected_value: u64| {
             loop {
                 match eventfd.read(&WaitState::new(platform()).context()) {
                     Ok(ret) => {

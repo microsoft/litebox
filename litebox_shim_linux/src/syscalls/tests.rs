@@ -3,7 +3,6 @@
 
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
-use litebox_platform_multiplex::{Platform, set_platform};
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
@@ -12,20 +11,40 @@ extern crate std;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 
-#[must_use]
-pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate::DefaultFS> {
-    static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
-    PLATFORM_INIT.call_once(|| {
+/// The concrete platform used by the shim's unit tests.
+///
+/// This is selected by the build target so the tests can run against whichever
+/// userland platform matches the host (Linux or Windows) rather than being
+/// hard-wired to one.
+#[cfg(target_os = "linux")]
+pub(crate) use litebox_platform_linux_userland::LinuxUserland as TestPlatform;
+#[cfg(target_os = "windows")]
+pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatform;
+
+/// Returns the process-wide test platform, initializing it once.
+pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatform {
+    static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
+    PLATFORM.get_or_init(|| {
+        // Only the Linux userland platform takes a tun device name.
         #[cfg(target_os = "linux")]
-        let platform = Platform::new(tun_device_name);
+        {
+            TestPlatform::new(tun_device_name)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = tun_device_name;
+            TestPlatform::new()
+        }
+    })
+}
 
-        #[cfg(not(target_os = "linux"))]
-        let platform = Platform::new();
+#[must_use]
+pub(crate) fn init_platform(
+    tun_device_name: Option<&str>,
+) -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
+    let platform = test_platform(tun_device_name);
 
-        set_platform(platform);
-    });
-
-    let shim_builder = crate::LinuxShimBuilder::new();
+    let shim_builder = crate::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
@@ -644,10 +663,7 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
     // We run the test many times to increase the probability of hitting the
     // exact interleaving, since we rely on sleep-based synchronization.
     for _ in 0..200 {
-        let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<
-            litebox_platform_multiplex::Platform,
-            u32,
-        >::new(0));
+        let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<TestPlatform, u32>::new(0));
         // Step 1: W1 acquires the write lock on the main thread.
         let mut w1_guard = lock.write();
 

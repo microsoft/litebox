@@ -4,11 +4,11 @@
 //! This module manages the stack layout for the user process.
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec::Vec};
+use core::marker::PhantomData;
 use litebox::utils::ReinterpretSignedExt as _;
-use litebox_platform_multiplex::Platform;
 
 use crate::{
-    UserPtrMut,
+    ShimPlatform, UserPtrMut,
     loader::auxv::{AuxKey, AuxVec},
 };
 
@@ -50,7 +50,7 @@ use crate::{
 ///
 /// NOTE: The above layout diagram is for 64-bit processes. Similar (but updated to use 32-bit
 /// values, rather than 64-bit values) is used for 32-bit processes.
-pub(super) struct UserStack {
+pub(super) struct UserStack<Platform: ShimPlatform> {
     /// The top of the stack (base address)
     stack_top: UserPtrMut<u8>,
     /// The length of the stack
@@ -58,9 +58,10 @@ pub(super) struct UserStack {
     len: usize,
     /// The current position of the stack pointer
     pos: usize,
+    _platform: PhantomData<Platform>,
 }
 
-impl UserStack {
+impl<Platform: ShimPlatform> UserStack<Platform> {
     /// Stack alignment required by libc ABI
     const STACK_ALIGNMENT: usize = 16;
 
@@ -78,6 +79,7 @@ impl UserStack {
             stack_top,
             len,
             pos: len,
+            _platform: PhantomData,
         })
     }
 

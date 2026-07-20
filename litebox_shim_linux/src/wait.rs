@@ -6,11 +6,11 @@
 //! Use a dedicated module to prevent code from accidentally accessing
 //! `wait_state` without going through `wait_cx()`.
 
-use crate::{Platform, ShimFS, Task};
+use crate::{ShimFS, ShimPlatform, Task};
 
-pub(crate) struct WaitState(litebox::event::wait::WaitState<Platform>);
+pub(crate) struct WaitState<Platform: ShimPlatform>(litebox::event::wait::WaitState<Platform>);
 
-impl WaitState {
+impl<Platform: ShimPlatform> WaitState<Platform> {
     pub(crate) fn new(platform: &'static Platform) -> Self {
         WaitState(litebox::event::wait::WaitState::new(platform))
     }
@@ -21,7 +21,7 @@ impl WaitState {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns a wait context to use to perform interruptible waits.
     pub(crate) fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, Platform> {
         self.wait_state.0.context().with_check_for_interrupt(self)
@@ -37,7 +37,6 @@ impl<FS: ShimFS> Task<FS> {
     #[must_use]
     pub(crate) fn prepare_to_run_guest(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
         self.wait_state.0.prepare_to_run_guest(|| {
-            use litebox::platform::SignalProvider as _;
             self.global.platform.take_pending_signals(|signal| {
                 self.queue_signals(signal);
             });
@@ -49,9 +48,10 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-impl<FS: ShimFS> litebox::event::wait::CheckForInterrupt for Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> litebox::event::wait::CheckForInterrupt
+    for Task<Platform, FS>
+{
     fn check_for_interrupt(&self) -> bool {
-        use litebox::platform::SignalProvider as _;
         self.global.platform.take_pending_signals(|sig| {
             self.queue_signals(sig);
         });

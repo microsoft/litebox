@@ -12,6 +12,8 @@ use litebox::{
 use litebox_common_linux::errno::Errno;
 use ringbuf::traits::{Consumer as _, Observer as _, Producer as _};
 
+use crate::ShimPlatform;
+
 macro_rules! common_functions_for_channel {
     () => {
         pub(crate) fn is_shutdown(&self) -> bool {
@@ -72,12 +74,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform,
     }
 }
 
-pub(crate) struct ReadEnd<T> {
-    endpoint: alloc::sync::Arc<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
-    peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
+pub(crate) struct ReadEnd<Platform: ShimPlatform, T> {
+    endpoint: alloc::sync::Arc<EndPointer<Platform, ringbuf::HeapCons<T>>>,
+    peer: alloc::sync::Weak<EndPointer<Platform, ringbuf::HeapProd<T>>>,
 }
 
-impl<T> ReadEnd<T> {
+impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
     fn update_pollee(&self) {
         if let Some(peer) = self.peer.upgrade() {
             peer.pollee.notify_observers(litebox::event::Events::OUT);
@@ -122,13 +124,21 @@ impl<T> ReadEnd<T> {
     common_functions_for_channel!();
 }
 
-#[derive(Clone)]
-pub(crate) struct WriteEnd<T> {
-    endpoint: alloc::sync::Arc<EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
-    peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
+pub(crate) struct WriteEnd<Platform: ShimPlatform, T> {
+    endpoint: alloc::sync::Arc<EndPointer<Platform, ringbuf::HeapProd<T>>>,
+    peer: alloc::sync::Weak<EndPointer<Platform, ringbuf::HeapCons<T>>>,
 }
 
-impl<T> WriteEnd<T> {
+impl<Platform: ShimPlatform, T> Clone for WriteEnd<Platform, T> {
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            peer: self.peer.clone(),
+        }
+    }
+}
+
+impl<Platform: ShimPlatform, T> WriteEnd<Platform, T> {
     pub(crate) fn try_write_one(&self, elem: T) -> Result<(), (T, Errno)> {
         if self.is_shutdown() || self.is_peer_shutdown() {
             return Err((elem, Errno::EPIPE));
@@ -150,7 +160,7 @@ impl<T> WriteEnd<T> {
         self.endpoint.rb.lock().is_full()
     }
 
-    pub(crate) fn is_pair(&self, reader: &ReadEnd<T>) -> bool {
+    pub(crate) fn is_pair(&self, reader: &ReadEnd<Platform, T>) -> bool {
         if let Some(peer) = self.peer.upgrade() {
             Arc::ptr_eq(&peer, &reader.endpoint)
         } else {
@@ -165,16 +175,16 @@ impl<T> WriteEnd<T> {
     common_functions_for_channel!();
 }
 
-pub(crate) struct Channel<T> {
-    writer: WriteEnd<T>,
-    reader: ReadEnd<T>,
+pub(crate) struct Channel<Platform: ShimPlatform, T> {
+    writer: WriteEnd<Platform, T>,
+    reader: ReadEnd<Platform, T>,
 }
 
-impl<T> Channel<T> {
+impl<Platform: ShimPlatform, T> Channel<Platform, T> {
     pub(crate) fn new(
         capacity: usize,
-        writer_pollee: Arc<Pollee<crate::Platform>>,
-        reader_pollee: Arc<Pollee<crate::Platform>>,
+        writer_pollee: Arc<Pollee<Platform>>,
+        reader_pollee: Arc<Pollee<Platform>>,
     ) -> Self {
         use ringbuf::traits::Split as _;
         let rb: ringbuf::HeapRb<T> = ringbuf::HeapRb::new(capacity);
@@ -196,7 +206,7 @@ impl<T> Channel<T> {
     }
 
     /// Turn the channel into a pair of its read and write ends.
-    pub(crate) fn split(self) -> (WriteEnd<T>, ReadEnd<T>) {
+    pub(crate) fn split(self) -> (WriteEnd<Platform, T>, ReadEnd<Platform, T>) {
         let Channel { writer, reader } = self;
         (writer, reader)
     }
@@ -205,11 +215,12 @@ impl<T> Channel<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syscalls::tests::TestPlatform;
     use core::sync::atomic::{AtomicBool, Ordering};
     use litebox::event::observer::Observer;
 
-    fn split_pair<T>() -> (WriteEnd<T>, ReadEnd<T>) {
-        Channel::<T>::new(4, Arc::new(Pollee::new()), Arc::new(Pollee::new())).split()
+    fn split_pair<T>() -> (WriteEnd<TestPlatform, T>, ReadEnd<TestPlatform, T>) {
+        Channel::<TestPlatform, T>::new(4, Arc::new(Pollee::new()), Arc::new(Pollee::new())).split()
     }
 
     /// Test observer that flips a flag the first time it is notified.
@@ -286,7 +297,7 @@ mod tests {
         let writer_pollee = Arc::new(Pollee::new());
         let reader_pollee = Arc::new(Pollee::new());
         let (_writer, reader) =
-            Channel::<u32>::new(4, writer_pollee.clone(), reader_pollee).split();
+            Channel::<TestPlatform, u32>::new(4, writer_pollee.clone(), reader_pollee).split();
         let flag = Arc::new(AtomicBool::new(false));
         let observer: Arc<FlagOnNotify> = Arc::new(FlagOnNotify(flag.clone()));
         // The peer of `reader` is the writer's endpoint, whose pollee is `writer_pollee`;

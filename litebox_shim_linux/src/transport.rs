@@ -12,7 +12,7 @@ use litebox::net::{ReceiveFlags, SendFlags};
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
-use crate::{GlobalState, Platform, ShimFS};
+use crate::{GlobalState, ShimFS, ShimPlatform};
 
 /// Handles socket cleanup on drop without exposing the `FS` generic.
 ///
@@ -23,12 +23,12 @@ trait DropGuard: Send + Sync {
 }
 
 /// Concrete, generic implementation of [`DropGuard`].
-struct SocketDropGuard<FS: ShimFS> {
-    global: Arc<GlobalState<FS>>,
-    sockfd: SocketFd,
+struct SocketDropGuard<Platform: ShimPlatform, FS: ShimFS> {
+    global: Arc<GlobalState<Platform, FS>>,
+    sockfd: SocketFd<Platform>,
 }
 
-impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> DropGuard for SocketDropGuard<Platform, FS> {
     fn close(&mut self) {
         let _ = self
             .global
@@ -48,12 +48,12 @@ impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
 /// (`try_read` / `try_write`), with spin-polling when data is not yet available.
 /// This avoids the need for a `WaitState` or any association with a particular
 /// guest `Task`.
-pub struct ShimTransport {
+pub struct ShimTransport<Platform: ShimPlatform> {
     drop_guard: Box<dyn DropGuard>,
     proxy: Arc<NetworkProxy<Platform>>,
 }
 
-impl ShimTransport {
+impl<Platform: ShimPlatform> ShimTransport<Platform> {
     /// Create a TCP socket, connect it to `addr`, and return a transport.
     ///
     /// The socket is created via [`litebox::net::Network::socket`] and initialised
@@ -63,7 +63,7 @@ impl ShimTransport {
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
     /// spin-polling when the operation cannot complete immediately.
     pub(crate) fn connect<FS: ShimFS>(
-        global: Arc<GlobalState<FS>>,
+        global: Arc<GlobalState<Platform, FS>>,
         addr: core::net::SocketAddr,
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
@@ -95,13 +95,13 @@ impl ShimTransport {
     }
 }
 
-impl Drop for ShimTransport {
+impl<Platform: ShimPlatform> Drop for ShimTransport<Platform> {
     fn drop(&mut self) {
         self.drop_guard.close();
     }
 }
 
-impl transport::Read for ShimTransport {
+impl<Platform: ShimPlatform> transport::Read for ShimTransport<Platform> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
         loop {
             match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
@@ -116,7 +116,7 @@ impl transport::Read for ShimTransport {
     }
 }
 
-impl transport::Write for ShimTransport {
+impl<Platform: ShimPlatform> transport::Write for ShimTransport<Platform> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
         loop {
             match self.proxy.try_write(buf, SendFlags::empty(), None) {
@@ -258,9 +258,15 @@ mod tests {
     }
 
     fn connect_9p(
-        task: &crate::Task<crate::DefaultFS>,
+        task: &crate::Task<
+            crate::syscalls::tests::TestPlatform,
+            crate::DefaultFS<crate::syscalls::tests::TestPlatform>,
+        >,
         server: &DiodServer,
-    ) -> nine_p::FileSystem<crate::Platform, ShimTransport> {
+    ) -> nine_p::FileSystem<
+        crate::syscalls::tests::TestPlatform,
+        ShimTransport<crate::syscalls::tests::TestPlatform>,
+    > {
         let addr = socket_addr([10, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");

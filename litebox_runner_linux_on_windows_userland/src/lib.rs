@@ -9,7 +9,7 @@ extern crate alloc;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use litebox_platform_multiplex::Platform;
+use litebox_platform_windows_userland::WindowsUserland as Platform;
 use std::path::PathBuf;
 
 /// Run Linux programs with LiteBox on unmodified Windows.
@@ -69,8 +69,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
 
     let platform = Platform::new();
-    litebox_platform_multiplex::set_platform(platform);
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
     // The program path is a Unix-style path inside the tar archive.

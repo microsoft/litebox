@@ -3,8 +3,7 @@
 
 //! Auxiliary vector support.
 
-use crate::{ShimFS, Task};
-use litebox::platform::SystemInfoProvider as _;
+use crate::{ShimFS, ShimPlatform, Task};
 
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -67,7 +66,7 @@ pub enum AuxKey {
 
 pub type AuxVec = alloc::collections::btree_map::BTreeMap<AuxKey, usize>;
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Initialize the auxiliary vector with user information and VDSO address.
     pub fn init_auxv(&self) -> AuxVec {
         let mut aux = AuxVec::new();

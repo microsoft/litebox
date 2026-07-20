@@ -5,16 +5,12 @@
 //!
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
-use crate::{ShimFS, Task};
-use litebox::{
-    platform::{Instant as _, TimeProvider as _},
-    utils::TruncateExt as _,
-};
+use crate::{ShimFS, ShimPlatform, Task};
+use litebox::{platform::Instant as _, utils::TruncateExt as _};
 use litebox_common_linux::errno::Errno;
 use litebox_common_linux::user_pointers::UserPtrMut;
-use litebox_platform_multiplex::Platform;
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `getrandom`.
     pub(crate) fn sys_getrandom(
         &self,
@@ -68,7 +64,7 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     domainname: to_fixed_size_array::<65>(""),
 };
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `uname`.
     pub(crate) fn sys_uname(
         &self,
@@ -105,7 +101,7 @@ const _LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
 const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
 const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `capget`.
     ///
     /// Note we don't support capabilities in LiteBox, so this returns empty capabilities.

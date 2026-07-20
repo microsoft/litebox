@@ -14,7 +14,7 @@ use litebox::{
     fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path,
-    platform::{StdioProvider, StdioStream},
+    platform::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -22,10 +22,9 @@ use litebox_common_linux::{
     InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
     signal::Signal,
 };
-use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
-use crate::{GlobalState, ShimFS, Task, UserPtr, UserPtrMut, syscalls::signal};
+use crate::{GlobalState, ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
@@ -44,7 +43,7 @@ impl From<litebox::fs::UserInfo> for AccessUserInfo {
 }
 
 /// Task state shared by `CLONE_FS`.
-pub(crate) struct FsState {
+pub(crate) struct FsState<Platform: ShimPlatform> {
     umask: core::sync::atomic::AtomicU32,
     /// The current working directory
     ///
@@ -52,7 +51,7 @@ pub(crate) struct FsState {
     cwd: litebox::sync::RwLock<Platform, String>,
 }
 
-impl Clone for FsState {
+impl<Platform: ShimPlatform> Clone for FsState<Platform> {
     fn clone(&self) -> Self {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
@@ -61,7 +60,7 @@ impl Clone for FsState {
     }
 }
 
-impl FsState {
+impl<Platform: ShimPlatform> FsState<Platform> {
     pub fn new() -> Self {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
@@ -75,7 +74,7 @@ impl FsState {
 }
 
 /// Task state shared by `CLONE_FILES`.
-pub(crate) struct FilesState<FS: ShimFS> {
+pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
     /// The filesystem implementation, shared across tasks that share file system.
     pub(crate) fs: alloc::sync::Arc<FS>,
     pub(crate) raw_descriptor_store:
@@ -83,7 +82,7 @@ pub(crate) struct FilesState<FS: ShimFS> {
     max_fd: AtomicUsize,
 }
 
-impl<FS: ShimFS> FilesState<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
     pub(crate) fn new(fs: alloc::sync::Arc<FS>) -> Self {
         Self {
             fs,
@@ -178,7 +177,7 @@ impl FsPath {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
     }
@@ -675,7 +674,7 @@ pub(crate) fn try_into_whence(value: i16) -> Result<SeekWhence, i16> {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `lseek`
     pub fn sys_lseek(&self, fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -750,18 +749,18 @@ impl<FS: ShimFS> Task<FS> {
         raw_fd: usize,
         replace: Option<TypedFd<S>>,
     ) -> Result<(), Errno> {
-        enum ConsumedFd<FS: ShimFS> {
+        enum ConsumedFd<Platform: ShimPlatform, FS: ShimFS> {
             Fs(alloc::sync::Arc<TypedFd<FS>>),
             Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
             Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
-            Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
-            Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<FS>>>),
-            Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<FS>>>),
+            Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
+            Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
+            Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>>),
         }
 
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
-        let consumed: ConsumedFd<FS> = match rds.fd_consume_raw_integer::<FS>(raw_fd) {
+        let consumed: ConsumedFd<Platform, FS> = match rds.fd_consume_raw_integer::<FS>(raw_fd) {
             Ok(fd) => ConsumedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
                 if let Some(new_fd) = replace {
@@ -780,15 +779,17 @@ impl<FS: ShimFS> Task<FS> {
                 {
                     ConsumedFd::Pipes(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                    rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Eventfd(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(raw_fd)
                 {
                     ConsumedFd::Epoll(fd)
-                } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                } else if let Ok(fd) = rds
+                    .fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<Platform, FS>>(
+                        raw_fd,
+                    )
                 {
                     ConsumedFd::Unix(fd)
                 } else {
@@ -869,7 +870,7 @@ impl<FS: ShimFS> Task<FS> {
             .to_owned_slice::<Platform>(iovcnt)
             .ok_or(Errno::EFAULT)?;
         let mut kernel_buffer = vec![0u8; PAGE_SIZE];
-        read_from_iovec(iovs, &mut kernel_buffer, |buf, total| {
+        read_from_iovec::<_, Platform>(iovs, &mut kernel_buffer, |buf, total| {
             let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
             self.sys_read(fd, buf, Some(cur_offset))
         })
@@ -890,7 +891,7 @@ impl<FS: ShimFS> Task<FS> {
             .to_owned_slice::<Platform>(iovcnt)
             .ok_or(Errno::EFAULT)?;
         // TODO: Linux ignores pwritev's offset for O_APPEND files; see the O_APPEND bug documented in pwrite(2).
-        write_to_iovec(iovs, |buf, total| {
+        write_to_iovec::<_, Platform>(iovs, |buf, total| {
             let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
             self.sys_write(fd, buf, Some(cur_offset))
         })
@@ -912,13 +913,13 @@ impl<FS: ShimFS> Task<FS> {
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        read_from_iovec(iovs, &mut kernel_buffer, |buf, _total| {
+        read_from_iovec::<_, Platform>(iovs, &mut kernel_buffer, |buf, _total| {
             self.sys_read(fd, buf, None)
         })
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn check_raw_fd_exists(&self, fd: i32) -> Result<(), Errno> {
         let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
         if self
@@ -960,7 +961,7 @@ fn check_iov_lens(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno
 }
 
 /// Drain reads into a sequence of user iovecs.
-fn read_from_iovec<F>(
+fn read_from_iovec<F, Platform: ShimPlatform>(
     iovs: &[IoReadVec],
     kernel_buffer: &mut [u8],
     mut read_fn: F,
@@ -1007,7 +1008,10 @@ where
 ///
 /// `write_fn` receives the contents of each iovec along with the total number of
 /// bytes already written from earlier iovecs.
-pub(super) fn write_to_iovec<F>(iovs: &[IoWriteVec], mut write_fn: F) -> Result<usize, Errno>
+pub(super) fn write_to_iovec<F, Platform: ShimPlatform>(
+    iovs: &[IoWriteVec],
+    mut write_fn: F,
+) -> Result<usize, Errno>
 where
     F: FnMut(&[u8], usize) -> Result<usize, Errno>,
 {
@@ -1053,7 +1057,7 @@ where
     Ok(total_written)
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `writev`
     pub(crate) fn sys_writev(
         &self,
@@ -1069,7 +1073,7 @@ impl<FS: ShimFS> Task<FS> {
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        write_to_iovec(iovs, |buf, _total| self.sys_write(fd, buf, None))
+        write_to_iovec::<_, Platform>(iovs, |buf, _total| self.sys_write(fd, buf, None))
     }
 
     fn validate_access_mode(mode: &AccessFlags) -> Result<(), Errno> {
@@ -1232,7 +1236,10 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-fn descriptor_stat<FS: ShimFS, T>(raw_fd: usize, task: &Task<FS>) -> Result<T, Errno>
+fn descriptor_stat<Platform: ShimPlatform, FS: ShimFS, T>(
+    raw_fd: usize,
+    task: &Task<Platform, FS>,
+) -> Result<T, Errno>
 where
     T: From<litebox::fs::FileStatus> + From<FileStat>,
 {
@@ -1278,15 +1285,15 @@ where
         .flatten()
 }
 
-pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
+pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
     raw_fd: usize,
-    global: &GlobalState<FS>,
-    files: &FilesState<FS>,
+    global: &GlobalState<Platform, FS>,
+    files: &FilesState<Platform, FS>,
 ) -> Result<FileDescriptorFlags, Errno> {
     // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
     // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
-    fn get_flags<FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<FS>,
+    fn get_flags<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+        global: &GlobalState<Platform, FS>,
         fd: &TypedFd<S>,
     ) -> FileDescriptorFlags {
         global
@@ -1306,14 +1313,14 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
     )
 }
 
-fn set_file_descriptor_flags<FS: ShimFS>(
+fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
     raw_fd: usize,
-    global: &GlobalState<FS>,
-    files: &FilesState<FS>,
+    global: &GlobalState<Platform, FS>,
+    files: &FilesState<Platform, FS>,
     flags: FileDescriptorFlags,
 ) -> Result<(), Errno> {
-    fn set_flags<FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<FS>,
+    fn set_flags<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+        global: &GlobalState<Platform, FS>,
         fd: &TypedFd<S>,
         flags: FileDescriptorFlags,
     ) {
@@ -1335,7 +1342,7 @@ fn set_file_descriptor_flags<FS: ShimFS>(
     Ok(())
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
@@ -1716,7 +1723,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
         let pipe = self.global.create_linux_pipe(flags)?;
@@ -1748,7 +1755,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags);
         let mut dt = self.global.litebox.descriptor_table_mut();
-        let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
+        let typed = dt.insert::<super::eventfd::EventfdSubsystem<Platform>>(eventfd);
         if flags.contains(EfdFlags::CLOEXEC) {
             let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
@@ -1990,7 +1997,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let epoll_file = super::epoll::EpollFile::new();
         let mut dt = self.global.litebox.descriptor_table_mut();
-        let typed = dt.insert::<super::epoll::EpollSubsystem<FS>>(epoll_file);
+        let typed = dt.insert::<super::epoll::EpollSubsystem<Platform, FS>>(epoll_file);
         if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC) {
             let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
@@ -2031,7 +2038,7 @@ impl<FS: ShimFS> Task<FS> {
         let epoll_fd = files
             .raw_descriptor_store
             .read()
-            .fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(epfd as usize)
+            .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(epfd as usize)
             .map_err(|_| Errno::EBADF)?;
         let file_descriptor = super::epoll::EpollDescriptor::try_from(&files, fd as usize)?;
 
@@ -2081,12 +2088,12 @@ impl<FS: ShimFS> Task<FS> {
             let files = self.files.borrow();
             {
                 let raw_fd = usize::try_from(epfd).or(Err(Errno::EBADF))?;
-                let Ok(fd) =
-                    files
-                        .raw_descriptor_store
-                        .read()
-                        .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<FS>>(raw_fd)
-                else {
+                let Ok(fd) = files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<Platform, FS>>(
+                    raw_fd,
+                ) else {
                     return Err(Errno::EBADF);
                 };
                 self.global
@@ -2352,9 +2359,9 @@ impl<FS: ShimFS> Task<FS> {
         flags: OFlags,
         target: DupFdRequest,
     ) -> Result<usize, DupFdError> {
-        fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
-            task: &Task<FS>,
-            files: &FilesState<FS>,
+        fn dup<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+            task: &Task<Platform, FS>,
+            files: &FilesState<Platform, FS>,
             fd: &TypedFd<S>,
             close_on_exec: bool,
             target: DupFdRequest,
@@ -2498,7 +2505,7 @@ struct Diroff(usize);
 const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
     core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `getdents64`
     pub(crate) fn sys_getdirent64(
         &self,
@@ -2606,19 +2613,20 @@ mod tests {
         ];
         let calls = Cell::new(0);
 
-        let result = write_to_iovec(&iovs, |buf, total| {
-            let call = calls.get();
-            calls.set(call + 1);
-            if call == 0 {
-                assert_eq!(buf, first);
-                assert_eq!(total, 0);
-                Ok(buf.len())
-            } else {
-                assert_eq!(buf, second);
-                assert_eq!(total, first.len());
-                Err(Errno::EPIPE)
-            }
-        });
+        let result =
+            write_to_iovec::<_, crate::syscalls::tests::TestPlatform>(&iovs, |buf, total| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    assert_eq!(buf, first);
+                    assert_eq!(total, 0);
+                    Ok(buf.len())
+                } else {
+                    assert_eq!(buf, second);
+                    assert_eq!(total, first.len());
+                    Err(Errno::EPIPE)
+                }
+            });
 
         assert_eq!(result, Ok(first.len()));
         assert_eq!(calls.get(), 2);
@@ -2641,18 +2649,22 @@ mod tests {
         let mut kernel_buffer = [0u8; 8];
         let calls = Cell::new(0);
 
-        let result = read_from_iovec(&iovs, &mut kernel_buffer, |buf, total| {
-            let call = calls.get();
-            calls.set(call + 1);
-            if call == 0 {
-                assert_eq!(total, 0);
-                buf.fill(b'a');
-                Ok(buf.len())
-            } else {
-                assert_eq!(total, 4);
-                Ok(0)
-            }
-        });
+        let result = read_from_iovec::<_, crate::syscalls::tests::TestPlatform>(
+            &iovs,
+            &mut kernel_buffer,
+            |buf, total| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    assert_eq!(total, 0);
+                    buf.fill(b'a');
+                    Ok(buf.len())
+                } else {
+                    assert_eq!(total, 4);
+                    Ok(0)
+                }
+            },
+        );
 
         assert_eq!(result, Ok(4));
         assert_eq!(calls.get(), 2);
@@ -2670,14 +2682,18 @@ mod tests {
         let mut kernel_buffer = [0u8; 4];
         let calls = Cell::new(0);
 
-        let result = read_from_iovec(&iovs, &mut kernel_buffer, |buf, total| {
-            assert_eq!(buf.len(), 4);
-            assert_eq!(total, calls.get() * 4);
-            let marker = b'a' + u8::try_from(calls.get()).unwrap();
-            buf.fill(marker);
-            calls.set(calls.get() + 1);
-            Ok(buf.len())
-        });
+        let result = read_from_iovec::<_, crate::syscalls::tests::TestPlatform>(
+            &iovs,
+            &mut kernel_buffer,
+            |buf, total| {
+                assert_eq!(buf.len(), 4);
+                assert_eq!(total, calls.get() * 4);
+                let marker = b'a' + u8::try_from(calls.get()).unwrap();
+                buf.fill(marker);
+                calls.set(calls.get() + 1);
+                Ok(buf.len())
+            },
+        );
 
         assert_eq!(result, Ok(12));
         assert_eq!(calls.get(), 3);
@@ -2701,18 +2717,22 @@ mod tests {
         let mut kernel_buffer = [0u8; 4];
         let calls = Cell::new(0);
 
-        let result = read_from_iovec(&iovs, &mut kernel_buffer, |buf, total| {
-            let call = calls.get();
-            calls.set(call + 1);
-            if call == 0 {
-                assert_eq!(total, 0);
-                buf.fill(b'x');
-                Ok(buf.len())
-            } else {
-                assert_eq!(total, 4);
-                Err(Errno::EIO)
-            }
-        });
+        let result = read_from_iovec::<_, crate::syscalls::tests::TestPlatform>(
+            &iovs,
+            &mut kernel_buffer,
+            |buf, total| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    assert_eq!(total, 0);
+                    buf.fill(b'x');
+                    Ok(buf.len())
+                } else {
+                    assert_eq!(total, 4);
+                    Err(Errno::EIO)
+                }
+            },
+        );
 
         assert_eq!(result, Ok(4));
         assert_eq!(calls.get(), 2);
