@@ -258,7 +258,8 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
         }
         VsmFunction::GenerateIdentitySigningKey => {
             let public_key_pa = params[1];
-            litebox_shim_optee::idk::generate_identity_signing_key(public_key_pa)
+            let key_alg = params[2];
+            litebox_shim_optee::idk::generate_identity_signing_key(public_key_pa, key_alg)
         }
         _ => vsm_dispatch(func_id, &params[1..]),
     }

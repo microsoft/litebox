@@ -8,6 +8,7 @@ use litebox::{
     utils::TruncateExt,
 };
 use litebox_common_linux::errno::Errno;
+use num_enum::TryFromPrimitive;
 use p384::{NonZeroScalar, elliptic_curve::sec1::ToEncodedPoint};
 use sha2::{Digest, Sha384};
 use zeroize::{Zeroize, Zeroizing};
@@ -15,9 +16,28 @@ use zeroize::{Zeroize, Zeroizing};
 const IDENTITY_SIGNING_KEY_DERIVATION_INFO: &[u8] = b"litebox-lvbs-identity-signing-key-p384-v1";
 const IDENTITY_SIGNING_PRIVATE_KEY_LEN: usize = 48;
 const IDENTITY_SIGNING_PUBLIC_KEY_LEN: usize = 97;
+const KEY_ALGORITHM_MASK: u64 = 0xff00;
+const KEY_VARIANT_MASK: u64 = 0xff;
+const KEY_ALGORITHM_VALUE_MASK: u64 = KEY_ALGORITHM_MASK | KEY_VARIANT_MASK;
 
-pub fn generate_identity_signing_key(public_key_pa: u64) -> i64 {
-    match generate_identity_signing_key_inner(public_key_pa) {
+#[derive(TryFromPrimitive)]
+#[repr(u8)]
+enum KeyAlgorithm {
+    Rsa = 0x01,
+    Ecdsa = 0x02,
+    Pqc = 0x04,
+}
+
+#[derive(TryFromPrimitive)]
+#[repr(u8)]
+enum EcdsaCurve {
+    P256 = 0x01,
+    P384 = 0x02,
+    P521 = 0x03,
+}
+
+pub fn generate_identity_signing_key(public_key_pa: u64, key_alg: u64) -> i64 {
+    match generate_identity_signing_key_inner(public_key_pa, key_alg) {
         Ok(res) => res,
         Err(e) => e.as_neg().into(),
     }
@@ -29,6 +49,7 @@ pub fn generate_identity_signing_key(public_key_pa: u64) -> i64 {
 /// - `public_key_pa`: VTL0/Normal-world physical address where an uncompressed SEC1 P-384
 ///   public key will be written. The corresponding private key is derived from the PRK
 ///   and never leaves VTL1/secure-world.
+/// - `key_alg`: Key algorithm namespace and variant. Only ECDSA P-384 is supported.
 ///
 /// We intentially uses the raw format. Any DER/SPKI wrapping or TCG event‑log construction
 /// is the VTL0's responsibility, allowing VTL1 ABI to be independent of verifier's format.
@@ -36,7 +57,9 @@ pub fn generate_identity_signing_key(public_key_pa: u64) -> i64 {
 /// This function assumes that the caller prepares a buffer at the given physical
 /// address (in a single or contiguous physical memory page(s)) whose length is equal to
 /// or greater than `IDENTITY_SIGNING_PUBLIC_KEY_LEN`.
-fn generate_identity_signing_key_inner(public_key_pa: u64) -> Result<i64, Errno> {
+fn generate_identity_signing_key_inner(public_key_pa: u64, key_alg: u64) -> Result<i64, Errno> {
+    validate_key_algorithm(key_alg)?;
+
     let pubkey_ptr =
         NormalWorldMutPtr::<[u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], PAGE_SIZE>::with_usize(
             public_key_pa.trunc(),
@@ -48,6 +71,29 @@ fn generate_identity_signing_key_inner(public_key_pa: u64) -> Result<i64, Errno>
         .write_at_offset(0, public_key)
         .map_err(|_| Errno::EFAULT)?;
     Ok(0)
+}
+
+fn validate_key_algorithm(key_alg: u64) -> Result<(), Errno> {
+    if key_alg & !KEY_ALGORITHM_VALUE_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    let algorithm = u8::try_from((key_alg & KEY_ALGORITHM_MASK) >> 8)
+        .ok()
+        .and_then(|value| KeyAlgorithm::try_from(value).ok())
+        .ok_or(Errno::EINVAL)?;
+    let variant = u8::try_from(key_alg & KEY_VARIANT_MASK).map_err(|_| Errno::EINVAL)?;
+    if variant == 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    match algorithm {
+        KeyAlgorithm::Ecdsa => match EcdsaCurve::try_from(variant).map_err(|_| Errno::EINVAL)? {
+            EcdsaCurve::P384 => Ok(()),
+            EcdsaCurve::P256 | EcdsaCurve::P521 => Err(Errno::EOPNOTSUPP),
+        },
+        KeyAlgorithm::Rsa | KeyAlgorithm::Pqc => Err(Errno::EOPNOTSUPP),
+    }
 }
 
 fn derive_identity_signing_public_key() -> Result<[u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], Errno> {
