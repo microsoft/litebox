@@ -204,7 +204,7 @@ mod tests {
     use std::io::Write;
     use std::net::Shutdown;
 
-    use litebox_broker_protocol::shared_memory::{SharedBufferDescriptor, SharedMemory};
+    use litebox_broker_protocol::shared_memory::SharedMemory;
     use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
     use rustix::io::FdFlags;
 
@@ -212,16 +212,13 @@ mod tests {
     fn transfers_exact_size_memory_with_close_on_exec() {
         let length = 24;
         let region = create_shared_buffer_region(length).unwrap();
-        let descriptor = SharedBufferDescriptor::new(16, 3);
         region.write(16, &[1, 2, 3]).unwrap();
         let (mut local_stream, mut host_stream) = UnixStream::pair().unwrap();
 
         send_shared_buffer_region(&mut host_stream, &region, None).unwrap();
         let mapped_region = receive_shared_buffer_region(&mut local_stream, length, None).unwrap();
-
         let mut bytes = [0; 3];
-        let range = descriptor.range(mapped_region.len()).unwrap();
-        mapped_region.read(range.start, &mut bytes).unwrap();
+        mapped_region.read(16, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2, 3]);
         let flags = rustix::io::fcntl_getfd(mapped_region.as_fd()).unwrap();
         assert!(flags.contains(FdFlags::CLOEXEC));
