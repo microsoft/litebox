@@ -120,15 +120,17 @@ out of the dual-target set.
 
 ## Bucket A — dual-target substrate candidates (content-reviewed)
 
-**Only ~3–5 of the 66 A-by-path merges are genuinely clean, upstream-quality
-dual-target `main` fixes; the rest route to ulitebox (B) or neither (C/D) on
-content review, or fail *quality* review even when portable.** The
+**Only ~2–4 of the 66 A-by-path merges are genuinely clean, upstream-quality
+dual-target `main` fixes** — and as content review proceeds the pool keeps
+shrinking (candidates turn out broker-/fork-migration-coupled, already
+independently implemented on `main`, or scenario-driven papering-over). So far
+the sockopt accept (**PR #1054**) is the only confirmed one. The
 ranking below is authoritative (coupling-symbol scan of each merge's shared-crate
 diff + subject semantics + `origin/main` presence check). The raw size-ordered
 table is kept as a `<details>` reference at the end of this section.
 
-Verdict tally: **A-READY**=2, **A-DROP**=1, **A-CHECK**=1, **A-SLICE**=2, **A-FEAT**=1,
-**->review**=1, **->B**=24, **->C**=26, **->D**=3, **REJECT**=5.
+Verdict tally: **A-READY**=2, **A-DROP**=1, **A-CHECK**=1, **A-SLICE**=1, **A-FEAT**=1,
+**->review**=1, **->B**=24, **->C**=26, **->D**=3, **REJECT**=6.
 
 Legend: **A-READY** = verified clean + broker-independent + still-buggy on
 `main` + **upstream-quality** (a real fix, not a silent papering-over of an
@@ -156,7 +158,7 @@ papering-over before promoting it.
 | A-READY | `11/4` | `30782b911` | session-rcvbuf-sndbuf-fix — accept SO_RCVBUF/SO_SNDBUF | **main PR #1054 (open)**; net.rs+unix.rs |
 | A-DROP | `140/5` | `27393b02a` | SIG_DFL Stop signals as no-op (SIGTTIN-cascade) | portable but a silent no-op that hides unimplemented STOP (removes the error log); dropped on quality review — `main` left terminating |
 | A-CHECK | `15/3` | `fd51b53cb` | TUI mode startup — 5 shim signal divergences | signal/mod.rs; sibling of dropped SIG_DFL — needs the same *quality* scrutiny, not just a main-diff |
-| A-SLICE | `141/46` | `13b12131b` | wave10 — SCM eventfd refs + **sendfile** | sendfile portable; slice from SCM-eventfd broker refs |
+| REJECT | `141/46` | `13b12131b` | wave10 — SCM eventfd refs + **sendfile** | `main` already has a complete independent `sys_sendfile` (file.rs:564); amalgamation's also uses `park_if_deferred` (delayed-fork) — redundant + coupled |
 | A-SLICE | `262/281` | `e7e59d2b6` | Phase 3 r5 — **WIFSIGNALED** encoding + pidfd delegation | wait-status encoding portable; slice from pidfd |
 | A-FEAT | `136/6` | `15f57bdda` | netlink-getifaddrs | main returns EAFNOSUPPORT — feature, product call |
 | ->review | `176/14` | `704336e24` | orphan-kpx | process-lifecycle — needs a manual look |
