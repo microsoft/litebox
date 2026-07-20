@@ -23,9 +23,11 @@
   (definitions below). Path-level A is an **over-count** — several A-by-path
   merges are internally broker- or fork-migration-coupled and fail content
   review. **Content review is authoritative.**
-- **Verified-ready dual-target `main` candidates:** 3 — the advisory-sockopt
-  accepts (`IP_TOS`, `SO_RCVBUF`, `SO_SNDBUF`) and the `SIG_DFL` stop-signal
-  no-op; plus 1 to re-check, 2 sliceable, 1 feature. See the Bucket-A ranking.
+- **Verified-ready dual-target `main` candidates:** 2 — the advisory-sockopt
+  accepts (`IP_TOS`, `SO_RCVBUF`, `SO_SNDBUF`), submitted as PR #1054. The
+  `SIG_DFL` stop-signal no-op was **dropped on quality review** (a silent no-op
+  that hides an unimplemented STOP; maintainer chose to leave `main` as-is).
+  Plus 1 to re-check, 2 sliceable, 1 feature. See the Bucket-A ranking.
 - **Approval gate:** no PR is opened for any bucket without explicit sign-off
   on that specific candidate.
 
@@ -118,17 +120,21 @@ out of the dual-target set.
 
 ## Bucket A — dual-target substrate candidates (content-reviewed)
 
-**Only ~4–6 of the 66 A-by-path merges are genuinely clean dual-target `main`
-fixes; the rest route to ulitebox (B) or neither (C/D) on content review.** The
+**Only ~3–5 of the 66 A-by-path merges are genuinely clean, upstream-quality
+dual-target `main` fixes; the rest route to ulitebox (B) or neither (C/D) on
+content review, or fail *quality* review even when portable.** The
 ranking below is authoritative (coupling-symbol scan of each merge's shared-crate
 diff + subject semantics + `origin/main` presence check). The raw size-ordered
 table is kept as a `<details>` reference at the end of this section.
 
-Verdict tally: **A-READY**=3, **A-CHECK**=1, **A-SLICE**=2, **A-FEAT**=1,
+Verdict tally: **A-READY**=2, **A-DROP**=1, **A-CHECK**=1, **A-SLICE**=2, **A-FEAT**=1,
 **->review**=1, **->B**=24, **->C**=26, **->D**=3, **REJECT**=5.
 
 Legend: **A-READY** = verified clean + broker-independent + still-buggy on
-`main` (extract now) · **A-CHECK** = clean-looking, one `main`-diff check pending
+`main` + **upstream-quality** (a real fix, not a silent papering-over of an
+unimplemented path) — extract now · **A-DROP** = portable but rejected on
+*quality* review (e.g. hides an unimplemented gap by going silent); left as-is
+on `main` · **A-CHECK** = clean-looking, one `main`-diff check pending
 · **A-SLICE** = a portable fix bundled inside a broker merge (extract the hunk) ·
 **A-FEAT** = portable but a feature `main` deliberately rejects (product call) ·
 **->B**/**->C**/**->D** = content review re-routes an A-by-path merge to
@@ -136,12 +142,20 @@ ulitebox-broker / fork-migration-neither / tooling · **REJECT** = no-op on main
 model mismatch, or noise. **A-SLICE extraction:** cherry-pick the merge,
 `git reset` the broker hunks, keep only the substrate hunk + inline its test.
 
+**Quality bar (learned from SIG_DFL):** portability is necessary but not
+sufficient. A fix that only lets *our* scenario progress by silencing a
+previously-loud unimplemented path (e.g. turning `terminate`-on-unimplemented
+into a silent no-op) violates this repo's "loud failure for unimplemented"
+principle and is **not** A-READY even though it compiles and is
+broker-independent. Scrutinize each candidate for whether it is a real fix or a
+papering-over before promoting it.
+
 | verdict | size | sha | work-stream — description | why |
 |:--|--:|:--|:--|:--|
 | A-READY | `7/1` | `fc2b3134d` | session-iptos-shim-fix — accept setsockopt(SOL_IP, IP_TOS) | **main PR #1054 (open)**; broker-indep |
 | A-READY | `11/4` | `30782b911` | session-rcvbuf-sndbuf-fix — accept SO_RCVBUF/SO_SNDBUF | **main PR #1054 (open)**; net.rs+unix.rs |
-| A-READY | `140/5` | `27393b02a` | SIG_DFL Stop signals as no-op (SIGTTIN-cascade) | main signal/mod.rs:587 still Stop=>terminate; 1 file |
-| A-CHECK | `15/3` | `fd51b53cb` | TUI mode startup — 5 shim signal divergences | signal/mod.rs; sibling of sig_dfl — verify vs main |
+| A-DROP | `140/5` | `27393b02a` | SIG_DFL Stop signals as no-op (SIGTTIN-cascade) | portable but a silent no-op that hides unimplemented STOP (removes the error log); dropped on quality review — `main` left terminating |
+| A-CHECK | `15/3` | `fd51b53cb` | TUI mode startup — 5 shim signal divergences | signal/mod.rs; sibling of dropped SIG_DFL — needs the same *quality* scrutiny, not just a main-diff |
 | A-SLICE | `141/46` | `13b12131b` | wave10 — SCM eventfd refs + **sendfile** | sendfile portable; slice from SCM-eventfd broker refs |
 | A-SLICE | `262/281` | `e7e59d2b6` | Phase 3 r5 — **WIFSIGNALED** encoding + pidfd delegation | wait-status encoding portable; slice from pidfd |
 | A-FEAT | `136/6` | `15f57bdda` | netlink-getifaddrs | main returns EAFNOSUPPORT — feature, product call |
