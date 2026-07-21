@@ -227,7 +227,7 @@ mod tests {
             }),
             None,
         );
-        let local = BrokerLocal::negotiate(channel, |_| Ok(test_shared_memory())).unwrap();
+        let local = BrokerLocal::negotiate(channel, |_| Ok(noop_shared_memory())).unwrap();
 
         assert_eq!(
             local.channel.sent_handshake_request,
@@ -247,7 +247,7 @@ mod tests {
         let channel = FakeControlChannel::new(None, Some(response.clone()));
         let mut local = BrokerLocal {
             channel,
-            shared_memory: test_shared_memory(),
+            shared_memory: noop_shared_memory(),
         };
 
         assert_eq!(local.request(request.clone()).unwrap(), response);
@@ -262,7 +262,7 @@ mod tests {
         let channel = FakeControlChannel::new(None, Some(response.clone()));
         let mut local = BrokerLocal {
             channel,
-            shared_memory: test_shared_memory(),
+            shared_memory: noop_shared_memory(),
         };
 
         assert!(local.close_object(handle).is_ok());
@@ -278,7 +278,7 @@ mod tests {
             FakeControlChannel::new(None, Some(BrokerResponse::Error(ErrorCode::WouldBlock)));
         let mut local = BrokerLocal {
             channel,
-            shared_memory: test_shared_memory(),
+            shared_memory: noop_shared_memory(),
         };
 
         assert!(matches!(
@@ -297,7 +297,7 @@ mod tests {
             FakeControlChannel::new(None, Some(BrokerResponse::Error(ErrorCode::Internal)));
         let mut local = BrokerLocal {
             channel,
-            shared_memory: test_shared_memory(),
+            shared_memory: noop_shared_memory(),
         };
 
         let _ = local.request(request);
@@ -315,7 +315,7 @@ mod tests {
         );
         let mut local = BrokerLocal {
             channel,
-            shared_memory: test_shared_memory(),
+            shared_memory: noop_shared_memory(),
         };
 
         let _ = local.request(request);
@@ -332,7 +332,7 @@ mod tests {
             None,
         );
 
-        let _ = BrokerLocal::negotiate(channel, |_| Ok(test_shared_memory()));
+        let _ = BrokerLocal::negotiate(channel, |_| Ok(noop_shared_memory()));
     }
 
     #[test]
@@ -363,7 +363,7 @@ mod tests {
         assert!(matches!(
             BrokerLocal::negotiate(channel, |_| {
                 setup_called.set(true);
-                Ok(test_shared_memory())
+                Ok(noop_shared_memory())
             }),
             Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
         ));
@@ -378,7 +378,7 @@ mod tests {
             None,
         );
 
-        let _ = BrokerLocal::negotiate(channel, |_| Ok(test_shared_memory()));
+        let _ = BrokerLocal::negotiate(channel, |_| Ok(noop_shared_memory()));
     }
 
     struct FakeControlChannel {
@@ -388,9 +388,9 @@ mod tests {
         response: Option<BrokerResponse>,
     }
 
-    struct TestSharedMemory;
+    struct NoopSharedMemory;
 
-    impl SharedMemory for TestSharedMemory {
+    impl SharedMemory for NoopSharedMemory {
         fn len(&self) -> usize {
             PIPE_TRANSFER_BUFFER_SIZE
         }
@@ -398,10 +398,11 @@ mod tests {
         fn read(
             &self,
             _offset: usize,
-            _destination: &mut [u8],
+            destination: &mut [u8],
         ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
         {
-            unreachable!("shared memory is not used by these tests")
+            destination.fill(0);
+            Ok(())
         }
 
         fn write(
@@ -410,12 +411,12 @@ mod tests {
             _source: &[u8],
         ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
         {
-            unreachable!("shared memory is not used by these tests")
+            Ok(())
         }
     }
 
-    fn test_shared_memory() -> Arc<dyn SharedMemory> {
-        Arc::new(TestSharedMemory)
+    fn noop_shared_memory() -> Arc<dyn SharedMemory> {
+        Arc::new(NoopSharedMemory)
     }
 
     impl FakeControlChannel {

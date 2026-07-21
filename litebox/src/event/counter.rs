@@ -210,7 +210,7 @@ mod tests {
                 fail_requests: Arc::new(AtomicBool::new(false)),
                 last_request: None,
             },
-            |_| Ok(Arc::new(TestSharedMemory)),
+            |_| Ok(Arc::new(NoopSharedMemory)),
         )
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
@@ -269,7 +269,7 @@ mod tests {
                 fail_requests: Arc::new(AtomicBool::new(false)),
                 last_request: None,
             },
-            |_| Ok(Arc::new(TestSharedMemory)),
+            |_| Ok(Arc::new(NoopSharedMemory)),
         )
         .unwrap();
         let litebox = Arc::new(LiteBox::new_with_broker_local(platform, local));
@@ -321,7 +321,7 @@ mod tests {
                 fail_requests: Arc::clone(&fail_requests),
                 last_request: None,
             },
-            |_| Ok(Arc::new(TestSharedMemory)),
+            |_| Ok(Arc::new(NoopSharedMemory)),
         )
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
@@ -358,7 +358,7 @@ mod tests {
                 fail_requests: Arc::new(AtomicBool::new(false)),
                 last_request: None,
             },
-            |_| Ok(Arc::new(TestSharedMemory)),
+            |_| Ok(Arc::new(NoopSharedMemory)),
         )
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
@@ -412,9 +412,9 @@ mod tests {
         last_request: Option<BrokerRequest>,
     }
 
-    struct TestSharedMemory;
+    struct NoopSharedMemory;
 
-    impl litebox_broker_protocol::shared_memory::SharedMemory for TestSharedMemory {
+    impl litebox_broker_protocol::shared_memory::SharedMemory for NoopSharedMemory {
         fn len(&self) -> usize {
             litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE
         }
@@ -422,10 +422,11 @@ mod tests {
         fn read(
             &self,
             _offset: usize,
-            _destination: &mut [u8],
+            destination: &mut [u8],
         ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
         {
-            unreachable!("event tests do not access shared memory")
+            destination.fill(0);
+            Ok(())
         }
 
         fn write(
@@ -434,7 +435,7 @@ mod tests {
             _source: &[u8],
         ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
         {
-            unreachable!("event tests do not access shared memory")
+            Ok(())
         }
     }
 

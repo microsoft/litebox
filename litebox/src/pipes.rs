@@ -957,7 +957,7 @@ mod tests {
                 read_failure: ReadFailure::Transport,
                 force_transport,
             },
-            |_| Ok(Arc::new(FakePipeSharedMemory)),
+            |_| Ok(Arc::new(NoopSharedMemory)),
         )
         .unwrap();
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
@@ -1004,7 +1004,7 @@ mod tests {
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
             },
-            |_| Ok(Arc::new(FakePipeSharedMemory)),
+            |_| Ok(Arc::new(NoopSharedMemory)),
         )
         .unwrap();
         let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));
@@ -1118,9 +1118,9 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct FakePipeSharedMemory;
+    struct NoopSharedMemory;
 
-    impl litebox_broker_protocol::shared_memory::SharedMemory for FakePipeSharedMemory {
+    impl litebox_broker_protocol::shared_memory::SharedMemory for NoopSharedMemory {
         fn len(&self) -> usize {
             litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE
         }
