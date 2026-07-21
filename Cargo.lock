@@ -1525,7 +1525,6 @@ name = "litebox_broker_userland"
 version = "0.1.0"
 dependencies = [
  "clap",
- "libc",
  "litebox_broker_core",
  "litebox_broker_host",
  "litebox_broker_local",

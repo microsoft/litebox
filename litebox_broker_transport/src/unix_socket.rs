@@ -31,6 +31,51 @@ use litebox_broker_protocol::wire::{
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
 
+/// Kernel-authenticated credentials for one Linux Unix-socket peer.
+#[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnixPeerCredentials {
+    pid: u32,
+    uid: u32,
+    gid: u32,
+}
+
+#[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
+impl UnixPeerCredentials {
+    /// Creates a credential value from raw Linux process, user, and group IDs.
+    pub const fn from_raw(pid: u32, uid: u32, gid: u32) -> Self {
+        Self { pid, uid, gid }
+    }
+
+    /// Returns the peer process ID.
+    pub const fn process_id(self) -> u32 {
+        self.pid
+    }
+
+    /// Returns the peer user ID.
+    pub const fn user_id(self) -> u32 {
+        self.uid
+    }
+
+    /// Returns the peer group ID.
+    pub const fn group_id(self) -> u32 {
+        self.gid
+    }
+}
+
+/// Returns Linux kernel-authenticated credentials for a connected Unix peer.
+#[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
+pub fn peer_credentials(stream: &UnixStream) -> IoResult<UnixPeerCredentials> {
+    let credentials = rustix::net::sockopt::socket_peercred(stream)?;
+    let process_id = u32::try_from(credentials.pid.as_raw_pid())
+        .map_err(|_| invalid_data("Unix peer process ID is invalid"))?;
+    Ok(UnixPeerCredentials::from_raw(
+        process_id,
+        credentials.uid.as_raw(),
+        credentials.gid.as_raw(),
+    ))
+}
+
 /// Local-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamLocalControlChannel {
     stream: UnixStream,
@@ -108,6 +153,8 @@ impl Drop for UnixStreamLocalControlChannel {
 /// Host-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamHostControlChannel {
     stream: UnixStream,
+    peer_credential: PeerCredential,
+    setup_deadline: Option<Instant>,
 }
 
 /// Local-side Unix-domain-socket notification channel for the hosted userland POC.
@@ -123,7 +170,21 @@ pub struct UnixStreamHostNotificationChannel {
 impl UnixStreamHostControlChannel {
     /// Creates a host control channel from an accepted Unix stream.
     pub const fn from_accepted(stream: UnixStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            peer_credential: PeerCredential::Unauthenticated,
+            setup_deadline: None,
+        }
+    }
+
+    /// Creates a host control channel after the deployment has authenticated
+    /// and bound the accepted peer. `setup_deadline` bounds handshake I/O.
+    pub const fn from_host_guaranteed(stream: UnixStream, setup_deadline: Instant) -> Self {
+        Self {
+            stream,
+            peer_credential: PeerCredential::HostGuaranteed,
+            setup_deadline: Some(setup_deadline),
+        }
     }
 
     /// Sends the memfd associated with this control channel.
@@ -195,13 +256,11 @@ impl HostControlChannel for UnixStreamHostControlChannel {
     type Error = Error;
 
     fn peer_credential(&self) -> IoResult<PeerCredential> {
-        // TODO(broker): replace the PoC placeholder with Unix peer credential extraction
-        // before this channel is used as an authenticated deployment boundary.
-        Ok(PeerCredential::Unauthenticated)
+        Ok(self.peer_credential)
     }
 
     fn recv_handshake_request(&mut self) -> IoResult<HostReceive<BrokerHandshakeRequest>> {
-        let Some(frame) = read_frame_with_deadline(&mut self.stream, None)? else {
+        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.setup_deadline)? else {
             return Ok(HostReceive::PeerClosed);
         };
         match decode_handshake_request(&frame) {
@@ -215,8 +274,15 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         write_frame_with_deadline(
             &mut self.stream,
             &encode_handshake_response(response.clone()),
-            None,
-        )
+            self.setup_deadline,
+        )?;
+        if matches!(response, BrokerHandshakeResponse::Negotiated { .. })
+            && self.setup_deadline.take().is_some()
+        {
+            self.stream.set_read_timeout(None)?;
+            self.stream.set_write_timeout(None)?;
+        }
+        Ok(())
     }
 
     fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
@@ -361,6 +427,17 @@ fn wire_error(error: WireError) -> Error {
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
+    #[test]
+    fn linux_peer_credentials_identify_connected_process() {
+        let (first, second) = UnixStream::pair().unwrap();
+
+        let first_peer = peer_credentials(&first).unwrap();
+        let second_peer = peer_credentials(&second).unwrap();
+        assert_eq!(first_peer, second_peer);
+        assert_eq!(first_peer.process_id(), std::process::id());
+    }
+
     #[test]
     fn frame_round_trip() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
@@ -452,6 +529,49 @@ mod tests {
             matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
             "unexpected timeout error kind: {error:?}"
         );
+    }
+
+    #[test]
+    fn host_handshake_request_read_setup_deadline_is_wall_clock() {
+        let (mut local_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_host_guaranteed(
+            host_stream,
+            Instant::now() + Duration::from_millis(50),
+        );
+
+        let reader = std::thread::spawn(move || channel.recv_handshake_request().unwrap_err());
+        local_stream.write_all(&8u32.to_le_bytes()).unwrap();
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(20));
+            if local_stream.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+
+        let error = reader.join().expect("timeout reader panicked");
+        assert!(
+            matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "unexpected timeout error kind: {error:?}"
+        );
+    }
+
+    #[test]
+    fn negotiated_host_handshake_clears_setup_deadline() {
+        let (_local_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_host_guaranteed(
+            host_stream,
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        channel
+            .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+            })
+            .unwrap();
+
+        assert_eq!(channel.setup_deadline, None);
+        assert_eq!(channel.stream.read_timeout().unwrap(), None);
+        assert_eq!(channel.stream.write_timeout().unwrap(), None);
     }
 
     #[test]

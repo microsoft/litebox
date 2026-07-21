@@ -19,6 +19,8 @@ use spin::rwlock::RwLock;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum CallerCredential {
+    /// The trusted broker entry layer authenticated and bound the caller.
+    HostGuaranteed,
     /// Explicit deployment mode for the initial unauthenticated userland POC.
     Unauthenticated,
 }

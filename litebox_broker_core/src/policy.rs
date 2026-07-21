@@ -14,6 +14,11 @@ pub enum PolicyProfile {
         /// Rights for the unauthenticated principal used by the initial POC.
         unauthenticated: ObjectRights,
     },
+    /// Static rights for a principal authenticated by the broker entry layer.
+    HostGuaranteed {
+        /// Rights granted to the host-guaranteed principal.
+        rights: ObjectRights,
+    },
 }
 
 /// Broker policy decision and audit component.
@@ -42,6 +47,11 @@ impl PolicyEngine {
         Self::new(PolicyProfile::Static { unauthenticated })
     }
 
+    /// Creates a policy engine with rights for a host-guaranteed principal.
+    pub const fn with_host_guaranteed_rights(rights: ObjectRights) -> Self {
+        Self::new(PolicyProfile::HostGuaranteed { rights })
+    }
+
     pub(crate) fn principal_object_rights(
         &self,
         caller_credential: CallerCredential,
@@ -50,7 +60,8 @@ impl PolicyEngine {
             (PolicyProfile::Static { unauthenticated }, CallerCredential::Unauthenticated) => {
                 unauthenticated
             }
-            (PolicyProfile::DefaultDeny, _) => return Err(BrokerError::PolicyDenied),
+            (PolicyProfile::HostGuaranteed { rights }, CallerCredential::HostGuaranteed) => rights,
+            _ => return Err(BrokerError::PolicyDenied),
         };
         if rights.is_empty() {
             return Err(BrokerError::PolicyDenied);
@@ -86,6 +97,20 @@ mod tests {
         assert_eq!(
             policy.principal_object_rights(CallerCredential::Unauthenticated),
             Ok(ObjectRights::WAIT)
+        );
+    }
+
+    #[test]
+    fn host_guaranteed_policy_returns_configured_principal_rights() {
+        let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::WAIT);
+
+        assert_eq!(
+            policy.principal_object_rights(CallerCredential::HostGuaranteed),
+            Ok(ObjectRights::WAIT)
+        );
+        assert_eq!(
+            policy.principal_object_rights(CallerCredential::Unauthenticated),
+            Err(BrokerError::PolicyDenied)
         );
     }
 

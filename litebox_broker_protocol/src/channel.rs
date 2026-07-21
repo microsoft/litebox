@@ -14,6 +14,9 @@ use crate::message::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum PeerCredential {
+    /// The trusted host or deployment authenticated and bound the peer before
+    /// constructing the channel.
+    HostGuaranteed,
     /// Explicit deployment mode for the initial unauthenticated userland POC.
     ///
     /// Channels that are expected to authenticate peers must return an error

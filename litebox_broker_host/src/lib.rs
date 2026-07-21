@@ -66,6 +66,7 @@ where
         .peer_credential()
         .map_err(BrokerHostError::Channel)?;
     let caller_credential = match peer_credential {
+        PeerCredential::HostGuaranteed => CallerCredential::HostGuaranteed,
         PeerCredential::Unauthenticated => CallerCredential::Unauthenticated,
         _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
     };

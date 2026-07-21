@@ -2,8 +2,7 @@
 // Licensed under the MIT license.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{Error, ErrorKind, Result};
-use std::os::unix::process::ExitStatusExt;
+use std::io::{ErrorKind, Result};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -51,7 +50,7 @@ fn run_parent_test() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Some(status) = broker.child.try_wait().unwrap() {
-            assert_eq!(status.signal(), Some(libc::SIGTERM));
+            assert!(status.success(), "broker failed with {status}");
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -119,17 +118,6 @@ fn run_fake_runner(args: &[OsString]) {
         data
     );
     drop(local);
-
-    // SAFETY: `getppid` takes no pointer arguments and has no Rust-side aliasing requirements.
-    let broker_pid = unsafe { libc::getppid() };
-    // SAFETY: `broker_pid` is the runner's parent process and `SIGTERM` is a valid signal number.
-    let kill_result = unsafe { libc::kill(broker_pid, libc::SIGTERM) };
-    assert_eq!(
-        kill_result,
-        0,
-        "failed to stop broker: {}",
-        Error::last_os_error()
-    );
 }
 
 struct ChildGuard {

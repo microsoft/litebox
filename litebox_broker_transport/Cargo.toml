@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 std = []
+linux-peer-credentials = ["unix", "dep:rustix", "rustix/net"]
 linux-shared-memory = ["std", "dep:libc", "dep:rustix", "rustix/fs", "rustix/net"]
 unix = ["std"]
 

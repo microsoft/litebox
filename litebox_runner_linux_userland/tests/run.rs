@@ -348,6 +348,16 @@ fn spawn_test_broker(
                 let (notification_stream, _) = notification_listener
                     .accept()
                     .expect("failed to accept broker local notification connection");
+                let control_credentials =
+                    litebox_broker_transport::unix_socket::peer_credentials(&control_stream)
+                        .expect("failed to read broker control peer credentials");
+                let notification_credentials =
+                    litebox_broker_transport::unix_socket::peer_credentials(&notification_stream)
+                        .expect("failed to read broker notification peer credentials");
+                assert_eq!(
+                    control_credentials, notification_credentials,
+                    "broker channels must belong to the same runner process"
+                );
                 control_stream
                     .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test read timeout");
@@ -361,7 +371,10 @@ fn spawn_test_broker(
                     .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker notification test write timeout");
                 let mut channel = CountingHostControlChannel {
-                    inner: litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(control_stream),
+                    inner: litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_host_guaranteed(
+                        control_stream,
+                        std::time::Instant::now() + BROKER_HELPER_TIMEOUT,
+                    ),
                     close_object_count: 0,
                 };
                 let mut notification_channel =
@@ -491,7 +504,7 @@ console.log(content);
     let broker_thread = spawn_test_broker(
         &control_socket_path,
         &notification_socket_path,
-        litebox_broker_core::PolicyEngine::with_unauthenticated_rights(
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         ),
         4,
