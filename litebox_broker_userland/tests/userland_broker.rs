@@ -3,7 +3,6 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Error, ErrorKind, Result};
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command};
@@ -136,9 +135,7 @@ impl Drop for ChildGuard {
 fn connect_control_with_retry(socket_path: &Path) -> Result<UnixStreamLocalControlChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixStream::connect(socket_path).map(|stream| {
-            UnixStreamLocalControlChannel::from_connected_with_setup_deadline(stream, deadline)
-        }) {
+        match UnixStreamLocalControlChannel::connect_with_setup_deadline(socket_path, deadline) {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != ErrorKind::NotFound

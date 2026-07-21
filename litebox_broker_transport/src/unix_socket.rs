@@ -51,18 +51,6 @@ impl UnixStreamLocalControlChannel {
         }
     }
 
-    /// Creates a local control channel from an already-connected Unix stream
-    /// with a deadline for handshake I/O.
-    pub const fn from_connected_with_setup_deadline(
-        stream: UnixStream,
-        setup_deadline: Instant,
-    ) -> Self {
-        Self {
-            stream,
-            setup_deadline: Some(setup_deadline),
-        }
-    }
-
     /// Connects to a userland broker Unix socket.
     pub fn connect(path: impl AsRef<Path>) -> IoResult<Self> {
         UnixStream::connect(path).map(Self::from_connected)
