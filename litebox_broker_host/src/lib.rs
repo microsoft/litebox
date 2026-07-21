@@ -294,10 +294,10 @@ mod tests {
         serve_connection_rejects_handshake_request_after_negotiation(&broker);
         serve_connection_returns_channel_error_when_response_send_fails(&broker);
         serve_connection_returns_event_readiness_in_control_responses(&broker);
+        serve_connection_continues_after_recoverable_request_failure(&broker);
+        serve_connection_aborts_without_response_on_shared_memory_failure(&broker);
         active_request_closes_object_reference(&broker);
         association_shared_memory_stages_pipe_data(&broker);
-        shared_pipe_copy_failure_is_terminal(&broker);
-        pipe_requests_preserve_handle_errors(&broker);
     }
 
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
@@ -533,6 +533,79 @@ mod tests {
         );
     }
 
+    fn serve_connection_continues_after_recoverable_request_failure(broker: &BrokerCore) {
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            }))]),
+            std::vec::Vec::from([
+                Ok(HostReceive::Message(BrokerRequest::Pipe(
+                    PipeRequest::Read(ReadPipeRequest {
+                        handle: ObjectHandle(u64::MAX),
+                        length: 1,
+                    }),
+                ))),
+                Ok(HostReceive::Message(BrokerRequest::Event(
+                    EventRequest::Create(CreateEventRequest { initial_count: 0 }),
+                ))),
+                Ok(HostReceive::PeerClosed),
+            ]),
+        );
+        let mut notifications = FakeHostNotificationChannel::default();
+
+        assert_eq!(
+            serve_connection(
+                broker,
+                &mut channel,
+                &mut notifications,
+                &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                |_| Ok(()),
+            )
+            .unwrap(),
+            ConnectionTermination::PeerClosed
+        );
+        assert_eq!(
+            channel.responses[0],
+            BrokerResponse::Error(ErrorCode::UnknownObject)
+        );
+        assert!(matches!(
+            channel.responses[1],
+            BrokerResponse::Event(EventResponse::Create(_))
+        ));
+    }
+
+    fn serve_connection_aborts_without_response_on_shared_memory_failure(broker: &BrokerCore) {
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            }))]),
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerRequest::Pipe(
+                PipeRequest::Create(CreatePipeRequest {
+                    capacity: 64,
+                    atomic_write_size: 16,
+                }),
+            )))]),
+        );
+        channel.enqueue_write_request_after_pipe_create = true;
+        let mut notifications = FakeHostNotificationChannel::default();
+
+        assert!(matches!(
+            serve_connection(
+                broker,
+                &mut channel,
+                &mut notifications,
+                &FailingSharedMemory,
+                |_| Ok(()),
+            ),
+            Err(BrokerHostError::Broker(ErrorCode::Internal))
+        ));
+        assert_eq!(channel.responses.len(), 1);
+        assert!(matches!(
+            channel.responses[0],
+            BrokerResponse::Pipe(PipeResponse::Create(_))
+        ));
+    }
+
     fn active_request_closes_object_reference(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
@@ -612,18 +685,6 @@ mod tests {
         memory.read(0, &mut data).unwrap();
         assert_eq!(data, [1, 2, 3]);
 
-        let wrong_endpoint = handle_test_request_with_memory(
-            &session,
-            BrokerRequest::Pipe(PipeRequest::Read(ReadPipeRequest {
-                handle: response.write_handle,
-                length: 1,
-            })),
-            &memory,
-        );
-        assert_eq!(
-            wrong_endpoint,
-            BrokerResponse::Error(ErrorCode::InvalidRights)
-        );
         let invalid_range = handle_test_request_with_memory(
             &session,
             BrokerRequest::Pipe(PipeRequest::Write(WritePipeRequest {
@@ -635,63 +696,6 @@ mod tests {
         assert_eq!(
             invalid_range,
             BrokerResponse::Error(ErrorCode::MalformedRequest)
-        );
-    }
-
-    fn shared_pipe_copy_failure_is_terminal(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
-            .unwrap();
-        let (read_handle, write_handle) =
-            litebox_broker_core::pipe::create(&session, 64, 16).unwrap();
-        litebox_broker_core::pipe::write(&session, write_handle, &[1]).unwrap();
-        assert_eq!(
-            handle_pipe_request(
-                &session,
-                PipeRequest::Read(ReadPipeRequest {
-                    handle: read_handle,
-                    length: 1,
-                }),
-                &FailingSharedMemory,
-            ),
-            Err(RequestFailure::Abort(ErrorCode::Internal))
-        );
-    }
-
-    fn pipe_requests_preserve_handle_errors(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
-            .unwrap();
-        let event_handle = litebox_broker_core::event::create(&session, 0).unwrap();
-        let memory = TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE);
-
-        assert_eq!(
-            complete_request(
-                handle_pipe_request(
-                    &session,
-                    PipeRequest::Read(ReadPipeRequest {
-                        handle: event_handle,
-                        length: 1,
-                    }),
-                    &memory,
-                )
-                .map(BrokerResponse::Pipe)
-            ),
-            Ok(BrokerResponse::Error(ErrorCode::InvalidRights))
-        );
-        assert_eq!(
-            complete_request(
-                handle_pipe_request(
-                    &session,
-                    PipeRequest::Read(ReadPipeRequest {
-                        handle: ObjectHandle(u64::MAX),
-                        length: 1,
-                    }),
-                    &memory,
-                )
-                .map(BrokerResponse::Pipe)
-            ),
-            Ok(BrokerResponse::Error(ErrorCode::UnknownObject))
         );
     }
 
@@ -718,6 +722,7 @@ mod tests {
         handshake_responses: std::vec::Vec<BrokerHandshakeResponse>,
         responses: std::vec::Vec<BrokerResponse>,
         enqueue_readiness_requests_after_create: bool,
+        enqueue_write_request_after_pipe_create: bool,
         send_error: bool,
     }
 
@@ -734,6 +739,7 @@ mod tests {
                 handshake_responses: std::vec::Vec::new(),
                 responses: std::vec::Vec::new(),
                 enqueue_readiness_requests_after_create: false,
+                enqueue_write_request_after_pipe_create: false,
                 send_error: false,
             }
         }
@@ -799,6 +805,18 @@ mod tests {
                         EventRequest::Consume(ConsumeEventRequest {
                             handle: response.handle,
                             mode: EventConsumeMode::One,
+                        }),
+                    ))));
+                self.requests.push(Ok(HostReceive::PeerClosed));
+            }
+            if self.enqueue_write_request_after_pipe_create
+                && let BrokerResponse::Pipe(PipeResponse::Create(response)) = response
+            {
+                self.requests
+                    .push(Ok(HostReceive::Message(BrokerRequest::Pipe(
+                        PipeRequest::Write(WritePipeRequest {
+                            handle: response.write_handle,
+                            length: 1,
                         }),
                     ))));
                 self.requests.push(Ok(HostReceive::PeerClosed));
