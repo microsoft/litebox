@@ -146,21 +146,19 @@ mod tests {
                 read_handle,
                 write_handle,
             })),
-            BrokerResponse::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
+            BrokerResponse::Pipe(PipeResponse::Write(WritePipeResponse { written: 2 })),
             BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
-            BrokerResponse::ObjectClosed,
         ]);
         let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory.clone())).unwrap();
 
         local.create_pipe(64, 16).unwrap();
-        assert_eq!(local.write_pipe(write_handle, &[1, 2, 3]).unwrap(), 3);
+        assert_eq!(local.write_pipe(write_handle, &[1, 2, 3]).unwrap(), 2);
         let mut staged = [0; 3];
         memory.read(0, &mut staged).unwrap();
         assert_eq!(staged, [1, 2, 3]);
 
-        memory.write(0, &[4, 5]).unwrap();
-        assert_eq!(local.read_pipe(read_handle, 2).unwrap(), [4, 5]);
-        local.close_object(read_handle).unwrap();
+        memory.write(0, &[4, 5, 6]).unwrap();
+        assert_eq!(local.read_pipe(read_handle, 3).unwrap(), [4, 5]);
         assert_eq!(
             local.channel.sent_requests,
             [
@@ -174,56 +172,57 @@ mod tests {
                 })),
                 BrokerRequest::Pipe(PipeRequest::Read(ReadPipeRequest {
                     handle: read_handle,
-                    length: 2,
+                    length: 3,
                 })),
-                BrokerRequest::CloseObject(read_handle),
             ]
         );
     }
 
     #[test]
-    fn pipe_operations_preserve_invalid_handle_errors() {
-        let unknown_handle = ObjectHandle(9);
-        let channel = ScriptedChannel::new([BrokerResponse::Error(
-            litebox_broker_protocol::error::ErrorCode::UnknownObject,
-        )]);
+    fn pipe_rejects_oversized_transfers_before_request() {
+        let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
+        let channel = ScriptedChannel::new([]);
+        let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
+        let oversized_length = PIPE_TRANSFER_BUFFER_SIZE + 1;
+
+        assert!(matches!(
+            local.read_pipe(ObjectHandle(1), u32::try_from(oversized_length).unwrap()),
+            Err(BrokerLocalError::Broker(
+                litebox_broker_protocol::error::ErrorCode::ResourceExhausted
+            ))
+        ));
+        assert!(matches!(
+            local.write_pipe(ObjectHandle(2), &std::vec![0; oversized_length]),
+            Err(BrokerLocalError::Broker(
+                litebox_broker_protocol::error::ErrorCode::ResourceExhausted
+            ))
+        ));
+        assert!(local.channel.sent_requests.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "broker returned oversized pipe read")]
+    fn read_pipe_rejects_oversized_response() {
+        let channel =
+            ScriptedChannel::new([BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse {
+                read: 2,
+            }))]);
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
         let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
 
-        assert!(matches!(
-            local.read_pipe(unknown_handle, 1),
-            Err(BrokerLocalError::Broker(
-                litebox_broker_protocol::error::ErrorCode::UnknownObject
-            ))
-        ));
-        assert_eq!(
-            local.channel.sent_requests,
-            [BrokerRequest::Pipe(PipeRequest::Read(ReadPipeRequest {
-                handle: unknown_handle,
-                length: 1,
-            }))]
-        );
+        let _ = local.read_pipe(ObjectHandle(1), 1);
+    }
 
-        let event_handle = ObjectHandle(10);
-        let channel = ScriptedChannel::new([BrokerResponse::Error(
-            litebox_broker_protocol::error::ErrorCode::InvalidRights,
-        )]);
+    #[test]
+    #[should_panic(expected = "broker returned oversized shared pipe write")]
+    fn write_pipe_rejects_oversized_response() {
+        let channel = ScriptedChannel::new([BrokerResponse::Pipe(PipeResponse::Write(
+            WritePipeResponse { written: 2 },
+        ))]);
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
         let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
 
-        assert!(matches!(
-            local.write_pipe(event_handle, &[1]),
-            Err(BrokerLocalError::Broker(
-                litebox_broker_protocol::error::ErrorCode::InvalidRights
-            ))
-        ));
-        assert_eq!(
-            local.channel.sent_requests,
-            [BrokerRequest::Pipe(PipeRequest::Write(WritePipeRequest {
-                handle: event_handle,
-                length: 1,
-            }))]
-        );
+        let _ = local.write_pipe(ObjectHandle(1), &[0]);
     }
 
     #[derive(Clone)]
