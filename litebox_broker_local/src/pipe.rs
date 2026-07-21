@@ -166,7 +166,7 @@ mod tests {
             BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
             BrokerResponse::ObjectClosed,
         ]);
-        let mut local = BrokerLocal::negotiate(channel, memory.clone()).unwrap();
+        let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory.clone())).unwrap();
 
         local.create_pipe(64, 16).unwrap();
         assert_eq!(local.write_pipe(write_handle, &[1, 2, 3]).unwrap(), 3);
@@ -204,7 +204,7 @@ mod tests {
             litebox_broker_protocol::error::ErrorCode::UnknownObject,
         )]);
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
-        let mut local = BrokerLocal::negotiate(channel, memory).unwrap();
+        let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
 
         assert!(matches!(
             local.read_pipe(unknown_handle, 1),
@@ -225,7 +225,7 @@ mod tests {
             litebox_broker_protocol::error::ErrorCode::InvalidRights,
         )]);
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
-        let mut local = BrokerLocal::negotiate(channel, memory).unwrap();
+        let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
 
         assert!(matches!(
             local.write_pipe(event_handle, &[1]),

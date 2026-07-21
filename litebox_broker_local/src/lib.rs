@@ -50,20 +50,6 @@ pub struct BrokerNotifications<Channel: LocalNotificationChannel> {
 }
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
-    /// Negotiates the broker protocol over an already-connected control channel
-    /// with its associated shared memory.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker reports an unrecoverable error or returns a protocol
-    /// response that does not match the negotiation request.
-    pub fn negotiate(
-        channel: Channel,
-        shared_memory: Arc<dyn SharedMemory>,
-    ) -> Result<Self, Channel::Error> {
-        Self::negotiate_with_setup(channel, |_| Ok(shared_memory))
-    }
-
     /// Negotiates the broker protocol, then establishes the association shared
     /// memory before active requests begin.
     ///
@@ -72,7 +58,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error, returns a protocol
     /// response that does not match the negotiation request, or setup returns
     /// shared memory with an invalid size.
-    pub fn negotiate_with_setup(
+    pub fn negotiate(
         mut channel: Channel,
         establish_shared_memory: impl FnOnce(
             &mut Channel,
@@ -241,7 +227,7 @@ mod tests {
             }),
             None,
         );
-        let local = BrokerLocal::negotiate(channel, test_shared_memory()).unwrap();
+        let local = BrokerLocal::negotiate(channel, |_| Ok(test_shared_memory())).unwrap();
 
         assert_eq!(
             local.channel.sent_handshake_request,
@@ -346,7 +332,7 @@ mod tests {
             None,
         );
 
-        let _ = BrokerLocal::negotiate(channel, test_shared_memory());
+        let _ = BrokerLocal::negotiate(channel, |_| Ok(test_shared_memory()));
     }
 
     #[test]
@@ -375,7 +361,7 @@ mod tests {
 
         let setup_called = Cell::new(false);
         assert!(matches!(
-            BrokerLocal::negotiate_with_setup(channel, |_| {
+            BrokerLocal::negotiate(channel, |_| {
                 setup_called.set(true);
                 Ok(test_shared_memory())
             }),
@@ -392,7 +378,7 @@ mod tests {
             None,
         );
 
-        let _ = BrokerLocal::negotiate(channel, test_shared_memory());
+        let _ = BrokerLocal::negotiate(channel, |_| Ok(test_shared_memory()));
     }
 
     struct FakeControlChannel {

@@ -210,7 +210,7 @@ mod tests {
                 fail_requests: Arc::new(AtomicBool::new(false)),
                 last_request: None,
             },
-            Arc::new(TestSharedMemory),
+            |_| Ok(Arc::new(TestSharedMemory)),
         )
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
@@ -269,7 +269,7 @@ mod tests {
                 fail_requests: Arc::new(AtomicBool::new(false)),
                 last_request: None,
             },
-            Arc::new(TestSharedMemory),
+            |_| Ok(Arc::new(TestSharedMemory)),
         )
         .unwrap();
         let litebox = Arc::new(LiteBox::new_with_broker_local(platform, local));
@@ -321,7 +321,7 @@ mod tests {
                 fail_requests: Arc::clone(&fail_requests),
                 last_request: None,
             },
-            Arc::new(TestSharedMemory),
+            |_| Ok(Arc::new(TestSharedMemory)),
         )
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
@@ -358,7 +358,7 @@ mod tests {
                 fail_requests: Arc::new(AtomicBool::new(false)),
                 last_request: None,
             },
-            Arc::new(TestSharedMemory),
+            |_| Ok(Arc::new(TestSharedMemory)),
         )
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);

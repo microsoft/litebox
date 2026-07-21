@@ -60,7 +60,7 @@ pub(crate) fn connect(
     let control_cancellation = control_channel
         .cancellation_handle()
         .context("failed to create broker control cancellation handle")?;
-    let local = BrokerLocal::negotiate_with_setup(control_channel, |channel| {
+    let local = BrokerLocal::negotiate(control_channel, |channel| {
         let shared_memory =
             channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, Some(setup_deadline))?;
         Ok(Arc::new(shared_memory))

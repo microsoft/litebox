@@ -957,7 +957,7 @@ mod tests {
                 read_failure: ReadFailure::Transport,
                 force_transport,
             },
-            Arc::new(FakePipeSharedMemory),
+            |_| Ok(Arc::new(FakePipeSharedMemory)),
         )
         .unwrap();
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
@@ -1004,7 +1004,7 @@ mod tests {
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
             },
-            Arc::new(FakePipeSharedMemory),
+            |_| Ok(Arc::new(FakePipeSharedMemory)),
         )
         .unwrap();
         let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));

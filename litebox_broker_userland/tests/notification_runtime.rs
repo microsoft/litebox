@@ -36,7 +36,7 @@ fn host_serves_control_requests_over_paired_userland_channels() {
         )
     });
 
-    let mut local = BrokerLocal::negotiate_with_setup(
+    let mut local = BrokerLocal::negotiate(
         UnixStreamLocalControlChannel::from_connected(local_control),
         |channel| {
             let shared_memory = channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, None)?;
