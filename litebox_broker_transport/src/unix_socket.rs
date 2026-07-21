@@ -13,7 +13,6 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Instant;
 
-#[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
 use crate::shared_memory::MemfdSharedMemory;
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
@@ -35,7 +34,6 @@ use litebox_broker_protocol::wire::{
 const MAX_FRAME_LEN: usize = 64 * 1024;
 
 /// Validates that a connected Unix socket belongs to `expected_process_id`.
-#[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
 pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> IoResult<()> {
     if peer_process_id(stream)? != expected_process_id {
         return Err(Error::new(
@@ -47,7 +45,6 @@ pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> I
 }
 
 /// Validates that two connected Unix sockets belong to the same process.
-#[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
 pub fn validate_same_peer_process(first: &UnixStream, second: &UnixStream) -> IoResult<()> {
     if peer_process_id(first)? != peer_process_id(second)? {
         return Err(Error::new(
@@ -58,7 +55,6 @@ pub fn validate_same_peer_process(first: &UnixStream, second: &UnixStream) -> Io
     Ok(())
 }
 
-#[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
 fn peer_process_id(stream: &UnixStream) -> IoResult<u32> {
     let credentials = rustix::net::sockopt::socket_peercred(stream)?;
     u32::try_from(credentials.pid.as_raw_pid())
@@ -113,7 +109,6 @@ impl UnixStreamLocalControlChannel {
     }
 
     /// Receives the memfd associated with this control channel.
-    #[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
     pub fn receive_memfd(
         &mut self,
         expected_len: usize,
@@ -177,7 +172,6 @@ impl UnixStreamHostControlChannel {
     }
 
     /// Sends the memfd associated with this control channel.
-    #[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
     pub fn send_memfd(
         &mut self,
         shared_memory: &MemfdSharedMemory,
@@ -398,7 +392,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
     #[test]
     fn linux_peer_validation_identifies_connected_process() {
         let (first, second) = UnixStream::pair().unwrap();
