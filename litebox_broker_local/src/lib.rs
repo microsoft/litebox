@@ -60,7 +60,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// shared memory with an invalid size.
     pub fn negotiate(
         mut channel: Channel,
-        establish_shared_memory: impl FnOnce(
+        receive_shared_memory: impl FnOnce(
             &mut Channel,
         ) -> core::result::Result<
             Arc<dyn SharedMemory>,
@@ -87,7 +87,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                     "broker returned unexpected negotiation response: {response:?}"
                 );
                 let shared_memory =
-                    establish_shared_memory(&mut channel).map_err(BrokerLocalError::Channel)?;
+                    receive_shared_memory(&mut channel).map_err(BrokerLocalError::Channel)?;
                 assert_eq!(
                     shared_memory.len(),
                     PIPE_TRANSFER_BUFFER_SIZE,
