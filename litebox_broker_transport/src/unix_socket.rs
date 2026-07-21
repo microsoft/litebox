@@ -11,10 +11,13 @@ use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
 use crate::shared_memory::MemfdSharedMemory;
+use crate::unix_io::{
+    refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
+};
 use litebox_broker_protocol::channel::{
     HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
     LocalNotificationChannel, PeerCredential,
@@ -308,40 +311,38 @@ fn read_frame_with_deadline(
     stream: &mut UnixStream,
     deadline: Option<Instant>,
 ) -> IoResult<Option<Vec<u8>>> {
-    with_read_deadline(stream, deadline, read_frame)
-}
-
-fn read_frame(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Option<Vec<u8>>> {
-    let mut len_buf = [0; 4];
-    let mut read = 0;
-    while read < len_buf.len() {
-        refresh_read_deadline(stream, deadline)?;
-        match stream.read(&mut len_buf[read..]) {
-            Ok(0) if read == 0 => return Ok(None),
-            Ok(0) => return Err(invalid_data("truncated broker frame length")),
-            Ok(len) => read += len,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+    with_read_deadline(stream, deadline, |stream, deadline| {
+        let mut len_buf = [0; 4];
+        let mut read = 0;
+        while read < len_buf.len() {
+            refresh_read_deadline(stream, deadline)?;
+            match stream.read(&mut len_buf[read..]) {
+                Ok(0) if read == 0 => return Ok(None),
+                Ok(0) => return Err(invalid_data("truncated broker frame length")),
+                Ok(len) => read += len,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
         }
-    }
 
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_FRAME_LEN {
-        return Err(invalid_data("invalid broker frame length"));
-    }
-
-    let mut frame = vec![0; len];
-    let mut read = 0;
-    while read < frame.len() {
-        refresh_read_deadline(stream, deadline)?;
-        match stream.read(&mut frame[read..]) {
-            Ok(0) => return Err(invalid_data("truncated broker frame")),
-            Ok(len) => read += len,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_FRAME_LEN {
+            return Err(invalid_data("invalid broker frame length"));
         }
-    }
-    Ok(Some(frame))
+
+        let mut frame = vec![0; len];
+        let mut read = 0;
+        while read < frame.len() {
+            refresh_read_deadline(stream, deadline)?;
+            match stream.read(&mut frame[read..]) {
+                Ok(0) => return Err(invalid_data("truncated broker frame")),
+                Ok(len) => read += len,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Some(frame))
+    })
 }
 
 fn write_frame_with_deadline(
@@ -350,17 +351,13 @@ fn write_frame_with_deadline(
     deadline: Option<Instant>,
 ) -> IoResult<()> {
     with_write_deadline(stream, deadline, |stream, deadline| {
-        write_frame(stream, frame, deadline)
+        if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
+            return Err(invalid_data("invalid broker frame length"));
+        }
+        let len = u32::try_from(frame.len()).map_err(|_| invalid_data("broker frame too large"))?;
+        write_all_with_deadline(stream, &len.to_le_bytes(), deadline)?;
+        write_all_with_deadline(stream, frame, deadline)
     })
-}
-
-fn write_frame(stream: &mut UnixStream, frame: &[u8], deadline: Option<Instant>) -> IoResult<()> {
-    if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
-        return Err(invalid_data("invalid broker frame length"));
-    }
-    let len = u32::try_from(frame.len()).map_err(|_| invalid_data("broker frame too large"))?;
-    write_all_with_deadline(stream, &len.to_le_bytes(), deadline)?;
-    write_all_with_deadline(stream, frame, deadline)
 }
 
 fn write_all_with_deadline(
@@ -385,69 +382,6 @@ fn write_all_with_deadline(
     Ok(())
 }
 
-fn with_read_deadline<Output>(
-    stream: &mut UnixStream,
-    deadline: Option<Instant>,
-    operation: impl FnOnce(&mut UnixStream, Option<Instant>) -> IoResult<Output>,
-) -> IoResult<Output> {
-    let Some(_) = deadline else {
-        return operation(stream, None);
-    };
-    let previous = stream.read_timeout()?;
-    let result = operation(stream, deadline);
-    combine_result_with_restore(result, stream.set_read_timeout(previous))
-}
-
-fn with_write_deadline<Output>(
-    stream: &mut UnixStream,
-    deadline: Option<Instant>,
-    operation: impl FnOnce(&mut UnixStream, Option<Instant>) -> IoResult<Output>,
-) -> IoResult<Output> {
-    let Some(_) = deadline else {
-        return operation(stream, None);
-    };
-    let previous = stream.write_timeout()?;
-    let result = operation(stream, deadline);
-    combine_result_with_restore(result, stream.set_write_timeout(previous))
-}
-
-fn refresh_read_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
-    if let Some(deadline) = deadline {
-        stream.set_read_timeout(Some(io_timeout_for_deadline(deadline)?))?;
-    }
-    Ok(())
-}
-
-fn refresh_write_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
-    if let Some(deadline) = deadline {
-        let timeout = io_timeout_for_deadline(deadline)?;
-        stream.set_write_timeout(Some(timeout))?;
-    }
-    Ok(())
-}
-
-fn combine_result_with_restore<Output>(
-    result: IoResult<Output>,
-    restore: IoResult<()>,
-) -> IoResult<Output> {
-    match (result, restore) {
-        (Ok(output), Ok(())) => Ok(output),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(operation), Err(restore)) => Err(Error::new(
-            operation.kind(),
-            format!("{operation}; additionally failed to restore socket timeout: {restore}"),
-        )),
-    }
-}
-
-fn io_timeout_for_deadline(deadline: Instant) -> IoResult<Duration> {
-    let timeout = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|timeout| !timeout.is_zero())
-        .ok_or_else(|| Error::new(ErrorKind::TimedOut, "broker I/O deadline expired"))?;
-    Ok(timeout)
-}
-
 fn invalid_data(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
@@ -462,6 +396,7 @@ fn wire_error(error: WireError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
     #[test]

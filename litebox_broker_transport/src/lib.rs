@@ -14,3 +14,9 @@ pub mod shared_memory;
 
 #[cfg(all(feature = "unix", unix))]
 pub mod unix_socket;
+
+#[cfg(any(
+    all(feature = "linux-shared-memory", target_os = "linux"),
+    all(feature = "unix", unix)
+))]
+mod unix_io;

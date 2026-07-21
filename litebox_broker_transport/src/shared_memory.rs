@@ -9,7 +9,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rustix::fs::{
     MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, fstat, ftruncate, memfd_create,
@@ -21,6 +21,10 @@ use rustix::net::{
 };
 
 use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
+
+use crate::unix_io::{
+    refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
+};
 
 const REQUIRED_MEMFD_SEALS: SealFlags = SealFlags::from_bits_retain(
     SealFlags::GROW.bits() | SealFlags::SHRINK.bits() | SealFlags::SEAL.bits(),
@@ -280,67 +284,6 @@ fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Ow
         .expect("exactly one received descriptor was validated"))
 }
 
-fn with_read_deadline<Output>(
-    stream: &mut UnixStream,
-    deadline: Option<Instant>,
-    operation: impl FnOnce(&mut UnixStream, Option<Instant>) -> IoResult<Output>,
-) -> IoResult<Output> {
-    let Some(_) = deadline else {
-        return operation(stream, None);
-    };
-    let previous = stream.read_timeout()?;
-    let result = operation(stream, deadline);
-    combine_result_with_restore(result, stream.set_read_timeout(previous))
-}
-
-fn with_write_deadline<Output>(
-    stream: &mut UnixStream,
-    deadline: Option<Instant>,
-    operation: impl FnOnce(&mut UnixStream, Option<Instant>) -> IoResult<Output>,
-) -> IoResult<Output> {
-    let Some(_) = deadline else {
-        return operation(stream, None);
-    };
-    let previous = stream.write_timeout()?;
-    let result = operation(stream, deadline);
-    combine_result_with_restore(result, stream.set_write_timeout(previous))
-}
-
-fn refresh_read_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
-    if let Some(deadline) = deadline {
-        stream.set_read_timeout(Some(io_timeout_for_deadline(deadline)?))?;
-    }
-    Ok(())
-}
-
-fn refresh_write_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
-    if let Some(deadline) = deadline {
-        stream.set_write_timeout(Some(io_timeout_for_deadline(deadline)?))?;
-    }
-    Ok(())
-}
-
-fn combine_result_with_restore<Output>(
-    result: IoResult<Output>,
-    restore: IoResult<()>,
-) -> IoResult<Output> {
-    match (result, restore) {
-        (Ok(output), Ok(())) => Ok(output),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(operation), Err(restore)) => Err(Error::new(
-            operation.kind(),
-            format!("{operation}; additionally failed to restore socket timeout: {restore}"),
-        )),
-    }
-}
-
-fn io_timeout_for_deadline(deadline: Instant) -> IoResult<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|timeout| !timeout.is_zero())
-        .ok_or_else(|| Error::new(ErrorKind::TimedOut, "shared-memory setup deadline expired"))
-}
-
 impl Drop for MappedRegion {
     fn drop(&mut self) {
         // SAFETY: `address` and `length` describe the mapping exclusively owned
@@ -359,6 +302,7 @@ mod tests {
     use super::*;
     use rustix::io::FdFlags;
     use std::io::Write;
+    use std::time::Duration;
 
     #[test]
     fn mappings_share_bytes_and_validate_ranges() {
