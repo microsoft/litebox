@@ -32,6 +32,8 @@ use zerocopy::{FromBytes, IntoBytes};
 pub struct UserPtr<T: Sized> {
     /// An exposed-provenance address of the pointer.
     addr: usize,
+    /// Note: This keeps user pointers `!Send + !Sync`; see
+    /// <https://github.com/microsoft/litebox/issues/431>.
     _phantom: core::marker::PhantomData<*const T>,
 }
 
@@ -115,6 +117,8 @@ impl UserPtr<core::ffi::c_char> {
 pub struct UserPtrMut<T: Sized> {
     /// An exposed-provenance address of the pointer.
     addr: usize,
+    /// Note: This keeps user pointers `!Send + !Sync`; see
+    /// <https://github.com/microsoft/litebox/issues/431>.
     _phantom: core::marker::PhantomData<*mut T>,
 }
 
