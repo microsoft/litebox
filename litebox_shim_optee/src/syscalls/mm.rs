@@ -4,7 +4,6 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
 use litebox::mm::linux::{MappingError, PAGE_SIZE};
-use litebox::platform::RawConstPointer;
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, user_pointers::UserPtrMut};
 
 use crate::{Platform, Task, UserMutPtr};
@@ -94,7 +93,11 @@ impl Task {
     /// Handle syscall `munmap`
     pub(crate) fn sys_munmap(&self, addr: UserMutPtr<u8>, len: usize) -> Result<(), Errno> {
         let pm = &self.global.pm;
-        litebox_common_linux::mm::sys_munmap(pm, UserPtrMut::from_usize(addr.as_usize()), len)
+        litebox_common_linux::mm::sys_munmap(
+            pm,
+            UserPtrMut::from_platform_ptr::<Platform>(addr),
+            len,
+        )
     }
 
     /// Handle syscall `mprotect`
@@ -108,7 +111,7 @@ impl Task {
         let pm = &self.global.pm;
         litebox_common_linux::mm::sys_mprotect(
             pm,
-            UserPtrMut::from_usize(addr.as_usize()),
+            UserPtrMut::from_platform_ptr::<Platform>(addr),
             len,
             prot,
         )

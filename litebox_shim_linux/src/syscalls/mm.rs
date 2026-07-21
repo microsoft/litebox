@@ -260,7 +260,7 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 }
                 .unwrap();
-                Some(Ok(UserPtrMut::from_usize(ptr.as_usize())))
+                Some(Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr)))
             }
             Err(_cow_not_supported) => None,
         }

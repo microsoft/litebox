@@ -80,6 +80,11 @@ impl<T> core::fmt::Debug for UserPtr<T> {
 }
 
 impl<T: FromBytes> UserPtr<T> {
+    /// Convert platform `P`'s const pointer type into an address-only pointer.
+    pub fn from_platform_ptr<P: RawPointerProvider>(ptr: P::RawConstPointer<T>) -> Self {
+        Self::from_usize(ptr.as_usize())
+    }
+
     /// Convert this address-only pointer into platform `P`'s const pointer type,
     /// through which memory can actually be accessed.
     pub fn to_platform_ptr<P: RawPointerProvider>(self) -> P::RawConstPointer<T> {
@@ -165,6 +170,11 @@ impl<T> core::fmt::Debug for UserPtrMut<T> {
 }
 
 impl<T: FromBytes + IntoBytes> UserPtrMut<T> {
+    /// Convert platform `P`'s mutable pointer type into an address-only pointer.
+    pub fn from_platform_ptr<P: RawPointerProvider>(ptr: P::RawMutPointer<T>) -> Self {
+        Self::from_usize(ptr.as_usize())
+    }
+
     /// Convert this address-only pointer into platform `P`'s mutable pointer type,
     /// through which memory can actually be accessed.
     pub fn to_platform_ptr<P: RawPointerProvider>(self) -> P::RawMutPointer<T> {

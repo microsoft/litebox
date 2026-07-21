@@ -7,7 +7,7 @@ use litebox::{
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
     },
-    platform::{RawConstPointer, page_mgmt::DeallocationError},
+    platform::page_mgmt::DeallocationError,
 };
 
 use crate::{MRemapFlags, MapFlags, ProtFlags, UserPtrMut, errno::Errno};
@@ -27,7 +27,7 @@ pub fn do_mmap<
     ensure_space_after: bool,
     op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, litebox::mm::linux::MappingError>,
 ) -> Result<UserPtrMut<u8>, litebox::mm::linux::MappingError> {
-    let op = |p: Platform::RawMutPointer<u8>| op(UserPtrMut::from_usize(p.as_usize()));
+    let op = |p: Platform::RawMutPointer<u8>| op(UserPtrMut::from_platform_ptr::<Platform>(p));
     let flags = {
         let mut create_flags = CreatePagesFlags::empty();
         // MAP_FIXED_NOREPLACE implies MAP_FIXED behavior (exact address, not a hint)
@@ -83,7 +83,7 @@ pub fn do_mmap<
             }
         }
     }
-    .map(|p| UserPtrMut::from_usize(p.as_usize()))
+    .map(UserPtrMut::from_platform_ptr::<Platform>)
 }
 
 /// Handle syscall `munmap`
@@ -216,7 +216,7 @@ pub fn sys_mremap<
             flags.contains(MRemapFlags::MREMAP_MAYMOVE),
         )
     }
-    .map(|p| UserPtrMut::from_usize(p.as_usize()))
+    .map(UserPtrMut::from_platform_ptr::<Platform>)
     .map_err(Errno::from)
 }
 

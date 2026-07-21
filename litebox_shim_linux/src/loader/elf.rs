@@ -7,10 +7,11 @@ use alloc::{ffi::CString, vec::Vec};
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    platform::{RawConstPointer as _, SystemInfoProvider as _},
+    platform::SystemInfoProvider as _,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
+use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
 use crate::{
@@ -295,7 +296,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
                 .map_err(ElfLoaderError::MappingError)?
         };
         let mut stack = UserStack::new(
-            UserPtrMut::from_usize(sp.as_usize()),
+            UserPtrMut::from_platform_ptr::<Platform>(sp),
             super::DEFAULT_STACK_SIZE,
         )
         .ok_or(ElfLoaderError::InvalidStackAddr)?;
