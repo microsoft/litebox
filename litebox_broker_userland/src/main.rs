@@ -16,8 +16,7 @@ use litebox_broker_host::{ConnectionTermination, serve_connection};
 use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixPeerCredentials, UnixStreamHostControlChannel, UnixStreamHostNotificationChannel,
-    peer_credentials,
+    UnixStreamHostControlChannel, UnixStreamHostNotificationChannel, validate_peer_process,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -85,22 +84,20 @@ fn serve_runner(
     runner_process_id: u32,
 ) -> Result<(), Box<dyn Error>> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let (control_stream, control_credentials) = accept_runner_stream(
+    let control_stream = accept_runner_stream(
         control_listener,
         runner,
         runner_process_id,
         setup_deadline,
         "control",
     )?;
-    let (notification_stream, notification_credentials) = accept_runner_stream(
+    let notification_stream = accept_runner_stream(
         notification_listener,
         runner,
         runner_process_id,
         setup_deadline,
         "notification",
     )?;
-    validate_channel_pair(control_credentials, notification_credentials)?;
-
     let shared_memory = MemfdSharedMemory::create(PIPE_TRANSFER_BUFFER_SIZE)?;
     let mut control_channel =
         UnixStreamHostControlChannel::from_host_guaranteed(control_stream, setup_deadline);
@@ -141,7 +138,7 @@ fn accept_runner_stream(
     runner_process_id: u32,
     deadline: Instant,
     channel_name: &'static str,
-) -> IoResult<(UnixStream, UnixPeerCredentials)> {
+) -> IoResult<UnixStream> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -159,58 +156,12 @@ fn accept_runner_stream(
 
         match listener.accept() {
             Ok((stream, _)) => {
-                let credentials = peer_credentials(&stream)?;
-                validate_runner_peer(credentials, runner_process_id)?;
-                return Ok((stream, credentials));
+                validate_peer_process(&stream, runner_process_id)?;
+                return Ok(stream);
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
         std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
-    }
-}
-
-fn validate_runner_peer(credentials: UnixPeerCredentials, runner_process_id: u32) -> IoResult<()> {
-    if credentials.process_id() != runner_process_id {
-        return Err(IoError::new(
-            ErrorKind::PermissionDenied,
-            "broker channel peer is not the spawned runner",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_channel_pair(
-    control: UnixPeerCredentials,
-    notification: UnixPeerCredentials,
-) -> IoResult<()> {
-    if control != notification {
-        return Err(IoError::new(
-            ErrorKind::PermissionDenied,
-            "broker control and notification channels have different peers",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runner_channel_validation_rejects_unexpected_or_mismatched_peers() {
-        let runner = UnixPeerCredentials::from_raw(7, 8, 9);
-        assert!(validate_runner_peer(runner, 7).is_ok());
-        assert_eq!(
-            validate_runner_peer(runner, 6).unwrap_err().kind(),
-            ErrorKind::PermissionDenied
-        );
-        assert!(validate_channel_pair(runner, runner).is_ok());
-        assert_eq!(
-            validate_channel_pair(runner, UnixPeerCredentials::from_raw(7, 10, 9))
-                .unwrap_err()
-                .kind(),
-            ErrorKind::PermissionDenied
-        );
     }
 }

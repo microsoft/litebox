@@ -348,16 +348,11 @@ fn spawn_test_broker(
                 let (notification_stream, _) = notification_listener
                     .accept()
                     .expect("failed to accept broker local notification connection");
-                let control_credentials =
-                    litebox_broker_transport::unix_socket::peer_credentials(&control_stream)
-                        .expect("failed to read broker control peer credentials");
-                let notification_credentials =
-                    litebox_broker_transport::unix_socket::peer_credentials(&notification_stream)
-                        .expect("failed to read broker notification peer credentials");
-                assert_eq!(
-                    control_credentials, notification_credentials,
-                    "broker channels must belong to the same runner process"
-                );
+                litebox_broker_transport::unix_socket::validate_same_peer_process(
+                    &control_stream,
+                    &notification_stream,
+                )
+                .expect("broker channels must belong to the same runner process");
                 control_stream
                     .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test read timeout");

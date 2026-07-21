@@ -31,49 +31,35 @@ use litebox_broker_protocol::wire::{
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
 
-/// Kernel-authenticated credentials for one Linux Unix-socket peer.
+/// Validates that a connected Unix socket belongs to `expected_process_id`.
 #[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnixPeerCredentials {
-    pid: u32,
-    uid: u32,
-    gid: u32,
+pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> IoResult<()> {
+    if peer_process_id(stream)? != expected_process_id {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket peer is not the expected process",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that two connected Unix sockets belong to the same process.
+#[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
+pub fn validate_same_peer_process(first: &UnixStream, second: &UnixStream) -> IoResult<()> {
+    if peer_process_id(first)? != peer_process_id(second)? {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix sockets belong to different peer processes",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
-impl UnixPeerCredentials {
-    /// Creates a credential value from raw Linux process, user, and group IDs.
-    pub const fn from_raw(pid: u32, uid: u32, gid: u32) -> Self {
-        Self { pid, uid, gid }
-    }
-
-    /// Returns the peer process ID.
-    pub const fn process_id(self) -> u32 {
-        self.pid
-    }
-
-    /// Returns the peer user ID.
-    pub const fn user_id(self) -> u32 {
-        self.uid
-    }
-
-    /// Returns the peer group ID.
-    pub const fn group_id(self) -> u32 {
-        self.gid
-    }
-}
-
-/// Returns Linux kernel-authenticated credentials for a connected Unix peer.
-#[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
-pub fn peer_credentials(stream: &UnixStream) -> IoResult<UnixPeerCredentials> {
+fn peer_process_id(stream: &UnixStream) -> IoResult<u32> {
     let credentials = rustix::net::sockopt::socket_peercred(stream)?;
-    let process_id = u32::try_from(credentials.pid.as_raw_pid())
-        .map_err(|_| invalid_data("Unix peer process ID is invalid"))?;
-    Ok(UnixPeerCredentials::from_raw(
-        process_id,
-        credentials.uid.as_raw(),
-        credentials.gid.as_raw(),
-    ))
+    u32::try_from(credentials.pid.as_raw_pid())
+        .map_err(|_| invalid_data("Unix peer process ID is invalid"))
 }
 
 /// Local-side Unix-domain-socket control channel for the hosted userland POC.
@@ -429,13 +415,18 @@ mod tests {
 
     #[cfg(all(feature = "linux-peer-credentials", target_os = "linux"))]
     #[test]
-    fn linux_peer_credentials_identify_connected_process() {
+    fn linux_peer_validation_identifies_connected_process() {
         let (first, second) = UnixStream::pair().unwrap();
 
-        let first_peer = peer_credentials(&first).unwrap();
-        let second_peer = peer_credentials(&second).unwrap();
-        assert_eq!(first_peer, second_peer);
-        assert_eq!(first_peer.process_id(), std::process::id());
+        validate_peer_process(&first, std::process::id()).unwrap();
+        validate_same_peer_process(&first, &second).unwrap();
+        let unexpected_process_id = std::process::id().checked_add(1).unwrap();
+        assert_eq!(
+            validate_peer_process(&first, unexpected_process_id)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
