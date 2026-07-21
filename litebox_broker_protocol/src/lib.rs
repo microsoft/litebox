@@ -32,4 +32,4 @@ pub struct ObjectHandle(pub u64);
 pub struct ProtocolVersion(pub u16);
 
 /// Current broker protocol version.
-pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);
+pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
