@@ -129,8 +129,8 @@ ranking below is authoritative (coupling-symbol scan of each merge's shared-crat
 diff + subject semantics + `origin/main` presence check). The raw size-ordered
 table is kept as a `<details>` reference at the end of this section.
 
-Verdict tally: **A-READY**=2, **A-DROP**=1, **A-CHECK**=1, **A-SLICE**=0, **A-FEAT**=1,
-**->review**=1, **->B**=24, **->C**=27, **->D**=3, **REJECT**=6.
+Verdict tally: **A-READY**=2, **A-DROP**=1, **A-CHECK**=0, **A-SLICE**=0, **A-FEAT**=1,
+**->review**=1, **->B**=24, **->C**=27, **->D**=3, **REJECT**=7.
 
 Legend: **A-READY** = verified clean + broker-independent + still-buggy on
 `main` + **upstream-quality** (a real fix, not a silent papering-over of an
@@ -152,27 +152,27 @@ principle and is **not** A-READY even though it compiles and is
 broker-independent. Scrutinize each candidate for whether it is a real fix or a
 papering-over before promoting it.
 
-**Exhaustion note (real-fix candidates content-reviewed):** after deep review of
-every A candidate that looked like a genuine implementation — sockopt (READY,
-PR #1054), SIG_DFL (A-DROP, papering-over), sendfile (REJECT, already on main +
-delayed-fork-coupled), WIFSIGNALED (->C, worker-host-coupled) — the **only**
-clean, upstream-quality, main-portable Bucket-A fix is the advisory-sockopt
-accept (**PR #1054**). The remaining unreviewed A rows are low-confidence:
-`fd51b53cb` (A-CHECK) is a signal-divergence bundle that likely shares SIG_DFL's
-papering-over pattern, and `netlink-getifaddrs` (A-FEAT) is a feature `main`
-rejects with EAFNOSUPPORT. **Implication: the amalgamation's durable upstream
-value is overwhelmingly Bucket B (the broker-held-resource model → ulitebox),
-not portable `main` bug-fixes.**
+**Conclusion (Bucket A fully content-reviewed):** every A candidate that could be
+a genuine fix has been read at diff level. The **only** clean, upstream-quality,
+main-portable Bucket-A *bug fix* is the advisory-sockopt accept (**PR #1054**).
+SIG_DFL (A-DROP) and its companion `fd51b53cb` (REJECT) are scenario-driven
+papering-over of unimplemented STOP; sendfile (REJECT) and WIFSIGNALED (->C) are
+already-on-main / worker-host-coupled. The one clean *feature* is netlink
+(**A-FEAT**) — but that means porting the whole `netlink.rs` module `main` rejects
+by design (`AF_NETLINK`→EAFNOSUPPORT), a maintainer-buy-in decision, not a quick
+win. **Implication: the amalgamation's durable upstream value is overwhelmingly
+Bucket B (the broker-held-resource model → ulitebox), not portable `main`
+bug-fixes.**
 
 | verdict | size | sha | work-stream — description | why |
 |:--|--:|:--|:--|:--|
 | A-READY | `7/1` | `fc2b3134d` | session-iptos-shim-fix — accept setsockopt(SOL_IP, IP_TOS) | **main PR #1054 (open)**; broker-indep |
 | A-READY | `11/4` | `30782b911` | session-rcvbuf-sndbuf-fix — accept SO_RCVBUF/SO_SNDBUF | **main PR #1054 (open)**; net.rs+unix.rs |
 | A-DROP | `140/5` | `27393b02a` | SIG_DFL Stop signals as no-op (SIGTTIN-cascade) | portable but a silent no-op that hides unimplemented STOP (removes the error log); dropped on quality review — `main` left terminating |
-| A-CHECK | `15/3` | `fd51b53cb` | TUI mode startup — 5 shim signal divergences | signal/mod.rs; sibling of dropped SIG_DFL — needs the same *quality* scrutiny, not just a main-diff |
+| REJECT | `15/3` | `fd51b53cb` | TUI mode startup — 5 shim signal divergences | companion to the dropped SIG_DFL change (extends the "is-ignored" predicate to `Stop`, valid only once SIG_DFL Stop is a no-op) **and** broker-coupled (`broker_pty_background_read_sigttin`) — papering-over + coupled |
 | REJECT | `141/46` | `13b12131b` | wave10 — SCM eventfd refs + **sendfile** | `main` already has a complete independent `sys_sendfile` (file.rs:564); amalgamation's also uses `park_if_deferred` (delayed-fork) — redundant + coupled |
 | ->C | `262/281` | `e7e59d2b6` | Phase 3 r5 — **WIFSIGNALED** encoding + pidfd delegation | the encoding lives entirely in the worker-host path (`worker_*`/`wait_worker_host`/`write_worker_result`/`host_pid` + coordinator/fork_matrix.rs) — fork-migration machinery main lacks; not a portable wait-status fix |
-| A-FEAT | `136/6` | `15f57bdda` | netlink-getifaddrs | main returns EAFNOSUPPORT — feature, product call |
+| A-FEAT | `136/6` | `15f57bdda` | netlink-getifaddrs (increment) | this merge only adds `set_nl_pid`; the real feature is the whole `netlink.rs` module (RTM_GETADDR/getifaddrs) main lacks (`AF_NETLINK`→EAFNOSUPPORT by design), assembled across many commits — a **feature needing maintainer buy-in**, not a cherry-pick |
 | ->review | `176/14` | `704336e24` | orphan-kpx | process-lifecycle — needs a manual look |
 | ->B (24 merges) | 6/3 … 6065/1329 | — | broker TCP/pipe/PTY/pidfd/scm/socketpair/cwfd/epoll-local, wave-*, broker-exit-status | broker-coupled — adapt into ulitebox 6-crate broker |
 | ->C (26 merges) | 6/4 … 4685/383 | — | fork-restore, vfork-quiesce, delayed-fork, CoW, seal-descriptor-table, wave-cleanup, invariants, clone-hang | fork-migration / refactor — neither target |
