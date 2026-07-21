@@ -659,44 +659,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(raw_fd) = handle.raw_fd() else {
             return Err(NtStatus::INVALID_HANDLE);
         };
-        {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<Subsystem>(raw_fd) {
-                Ok(typed) => Ok(typed),
-                Err(litebox::fd::ErrRawIntFd::NotFound) => Err(NtStatus::INVALID_HANDLE),
-                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                    Err(NtStatus::OBJECT_TYPE_MISMATCH)
-                }
-            }
+        let handles = self.process.handles.read();
+        match handles.fd_from_raw_integer::<Subsystem>(raw_fd) {
+            Ok(typed) => Ok(typed),
+            Err(litebox::fd::ErrRawIntFd::NotFound) => Err(NtStatus::INVALID_HANDLE),
+            Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
         }
     }
 
-    fn typed_handle_granted_access<Subsystem>(
+    fn typed_handle_metadata<Subsystem>(
         &self,
         typed: &litebox::fd::TypedFd<Subsystem>,
-    ) -> Result<u32, NtStatus>
+    ) -> Result<WindowsHandleMetadata, NtStatus>
     where
         Subsystem: WindowsHandleSubsystem,
     {
         self.global
             .litebox
             .descriptor_table()
-            .with_metadata::<Subsystem, WindowsHandleMetadata, _>(typed, |metadata| {
-                metadata.granted_access
-            })
+            .with_metadata::<Subsystem, WindowsHandleMetadata, _>(typed, |metadata| *metadata)
             .map_err(|_| NtStatus::INVALID_HANDLE)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn handle_granted_access<Subsystem>(
-        &self,
-        handle: syscalls::Handle,
-    ) -> Result<u32, NtStatus>
-    where
-        Subsystem: WindowsHandleSubsystem,
-    {
-        let typed = self.typed_handle::<Subsystem>(handle)?;
-        self.typed_handle_granted_access(&typed)
     }
 
     pub(crate) fn require_handle_access<Subsystem>(
@@ -719,7 +701,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     where
         Subsystem: WindowsHandleSubsystem,
     {
-        if self.typed_handle_granted_access(typed)? & required_access == required_access {
+        if self.typed_handle_metadata(typed)?.granted_access & required_access == required_access {
             Ok(())
         } else {
             Err(NtStatus::ACCESS_DENIED)
@@ -1717,69 +1699,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_nt_close(&self, handle: syscalls::Handle) -> NtStatus {
-        let Some(raw_fd) = handle.raw_fd() else {
-            return NtStatus::INVALID_HANDLE;
-        };
-        match self.raw_fd_handle_attributes(raw_fd) {
-            Ok(attributes) if attributes.contains(HandleAttributes::PROTECT_FROM_CLOSE) => {
-                return NtStatus::HANDLE_NOT_CLOSABLE;
-            }
-            Ok(_) => {}
-            Err(status) => return status,
-        }
-        self.close_raw_fd(raw_fd, CloseRawHandleVisitor { task: self })
-    }
-
-    fn raw_fd_handle_attributes(&self, raw_fd: usize) -> Result<HandleAttributes, NtStatus> {
-        macro_rules! try_attributes {
-            ($subsystem:ty) => {
-                if let Some(result) = self.try_raw_fd_handle_attributes::<$subsystem>(raw_fd) {
-                    return result;
-                }
-            };
-        }
-
-        try_attributes!(FileObjectSubsystem<FS>);
-        try_attributes!(RegistryKeySubsystem<Platform>);
-        try_attributes!(EventSubsystem<Platform>);
-        try_attributes!(DirectoryObjectSubsystem<Platform>);
-        try_attributes!(SymbolicLinkSubsystem<Platform>);
-        try_attributes!(IoCompletionSubsystem<Platform>);
-        try_attributes!(LpcPortSubsystem<Platform>);
-        try_attributes!(TimerSubsystem<Platform>);
-        try_attributes!(WaitCompletionPacketSubsystem<Platform>);
-        try_attributes!(WorkerFactorySubsystem<Platform>);
-        try_attributes!(SectionSubsystem<Platform>);
-
-        Err(NtStatus::INVALID_HANDLE)
-    }
-
-    fn try_raw_fd_handle_attributes<Subsystem>(
-        &self,
-        raw_fd: usize,
-    ) -> Option<Result<HandleAttributes, NtStatus>>
-    where
-        Subsystem: WindowsHandleSubsystem,
-    {
-        let typed = {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<Subsystem>(raw_fd) {
-                Ok(typed) => typed,
-                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => return None,
-                Err(litebox::fd::ErrRawIntFd::NotFound) => {
-                    return Some(Err(NtStatus::INVALID_HANDLE));
-                }
-            }
-        };
-        Some(
-            self.global
-                .litebox
-                .descriptor_table()
-                .with_metadata::<Subsystem, WindowsHandleMetadata, _>(&typed, |metadata| {
-                    metadata.attributes
-                })
-                .map_err(|_| NtStatus::INVALID_HANDLE),
-        )
+        self.close_handle(handle, CloseRawHandleVisitor { task: self })
     }
 
     #[expect(
@@ -1845,14 +1765,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // TODO(duplicate-object-cross-process): insert into the target process handle table.
             return NtStatus::INVALID_HANDLE;
         }
-        let Some(raw_fd) = source_handle.raw_fd() else {
-            return NtStatus::INVALID_HANDLE;
+        let duplicate = match self.duplicate_handle(
+            source_handle,
+            desired_access,
+            handle_attributes,
+            options,
+        ) {
+            Ok(handle) => handle,
+            Err(status) => return status,
         };
-        let duplicate =
-            match self.duplicate_raw_fd(raw_fd, desired_access, handle_attributes, options) {
-                Ok(handle) => handle,
-                Err(status) => return status,
-            };
         if let Some(target_handle) = target_handle
             && target_handle.write_at_offset(0, duplicate).is_none()
         {
@@ -1861,17 +1782,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
-    fn duplicate_raw_fd(
+    fn duplicate_handle(
         &self,
-        raw_fd: usize,
+        source_handle: syscalls::Handle,
         desired_access: u32,
         handle_attributes: u32,
         options: DuplicateOptions,
     ) -> Result<syscalls::Handle, NtStatus> {
         macro_rules! try_duplicate {
             ($subsystem:ty) => {
-                if let Some(result) = self.try_duplicate_raw_fd::<$subsystem>(
-                    raw_fd,
+                if let Some(result) = self.try_duplicate_handle::<$subsystem>(
+                    source_handle,
                     desired_access,
                     handle_attributes,
                     options,
@@ -1896,9 +1817,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Err(NtStatus::INVALID_HANDLE)
     }
 
-    fn try_duplicate_raw_fd<Subsystem>(
+    fn try_duplicate_handle<Subsystem>(
         &self,
-        raw_fd: usize,
+        source_handle: syscalls::Handle,
         desired_access: u32,
         handle_attributes: u32,
         options: DuplicateOptions,
@@ -1906,36 +1827,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     where
         Subsystem: WindowsHandleSubsystem,
     {
-        let typed = {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<Subsystem>(raw_fd) {
-                Ok(typed) => typed,
-                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => return None,
-                Err(litebox::fd::ErrRawIntFd::NotFound) => {
-                    return Some(Err(NtStatus::INVALID_HANDLE));
-                }
-            }
+        let typed = match self.typed_handle::<Subsystem>(source_handle) {
+            Ok(typed) => typed,
+            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
+            Err(status) => return Some(Err(status)),
         };
-        let source_metadata = {
-            let descriptors = self.global.litebox.descriptor_table();
-            match descriptors
-                .with_metadata::<Subsystem, WindowsHandleMetadata, _>(&typed, |metadata| *metadata)
-            {
-                Ok(metadata) => metadata,
-                Err(_) => return Some(Err(NtStatus::INVALID_HANDLE)),
-            }
+        let source_metadata = match self.typed_handle_metadata(&typed) {
+            Ok(metadata) => metadata,
+            Err(status) => return Some(Err(status)),
         };
 
+        let source_access = source_metadata.granted_access;
         let duplicate_access = if options.contains(DuplicateOptions::SAME_ACCESS) {
-            source_metadata.granted_access
+            source_access
         } else {
             let descriptors = self.global.litebox.descriptor_table();
             match descriptors.with_entry(&typed, |entry| {
-                Subsystem::resolve_duplicate_access(
-                    entry,
-                    source_metadata.granted_access,
-                    desired_access,
-                )
+                Subsystem::resolve_duplicate_access(entry, source_access, desired_access)
             }) {
                 Some(Ok(access)) => access,
                 Some(Err(status)) => return Some(Err(status)),
@@ -1971,20 +1879,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ))
     }
 
-    fn close_raw_fd(
+    fn close_handle(
         &self,
-        raw_fd: usize,
+        handle: syscalls::Handle,
         visitor: impl RawHandleVisitor<Platform, FS>,
     ) -> NtStatus {
         macro_rules! try_close {
             ($subsystem:ty, $visit:ident) => {
-                if remove_raw_handle_by_raw_fd::<Platform, $subsystem>(
-                    &self.global.litebox,
-                    &self.process.handles,
-                    raw_fd,
-                    |entry| visitor.$visit(entry),
-                ) {
-                    return NtStatus::SUCCESS;
+                if let Some(status) =
+                    self.try_close_handle::<$subsystem>(handle, |entry| visitor.$visit(entry))
+                {
+                    return status;
                 }
             };
         }
@@ -2005,6 +1910,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_close!(SectionSubsystem<Platform>, section);
 
         NtStatus::INVALID_HANDLE
+    }
+
+    fn try_close_handle<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+        cleanup_entry: impl FnOnce(Subsystem::Entry),
+    ) -> Option<NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let typed = match self.typed_handle::<Subsystem>(handle) {
+            Ok(typed) => typed,
+            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
+            Err(status) => return Some(status),
+        };
+        let metadata = match self.typed_handle_metadata(&typed) {
+            Ok(metadata) => metadata,
+            Err(status) => return Some(status),
+        };
+        if metadata
+            .attributes
+            .contains(HandleAttributes::PROTECT_FROM_CLOSE)
+        {
+            return Some(NtStatus::HANDLE_NOT_CLOSABLE);
+        }
+
+        remove_raw_handle::<Platform, Subsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            handle,
+            cleanup_entry,
+        );
+        Some(NtStatus::SUCCESS)
     }
 
     fn handle_interrupt_request(

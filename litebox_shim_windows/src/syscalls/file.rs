@@ -1402,7 +1402,11 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(
-            task.handle_granted_access::<FileObjectSubsystem<TestFS>>(maximum_duplicate),
+            task.typed_handle::<FileObjectSubsystem<TestFS>>(maximum_duplicate)
+                .and_then(|typed| {
+                    task.typed_handle_metadata(&typed)
+                        .map(|metadata| metadata.granted_access)
+                }),
             Ok(FileAccess::from_desired_access(FILE_GENERIC_READ).bits())
         );
         assert_eq!(task.sys_nt_close(source), NtStatus::SUCCESS);
