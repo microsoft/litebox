@@ -30,7 +30,11 @@ use litebox::{
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
-use litebox_common_linux::{SyscallRequest, UserPtr, UserPtrMut, errno::Errno};
+use litebox_common_linux::{
+    SyscallRequest,
+    errno::Errno,
+    user_pointers::{UserPtr, UserPtrMut},
+};
 use litebox_platform_multiplex::Platform;
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.

@@ -10,8 +10,8 @@ use litebox::{
     platform::{Instant as _, TimeProvider as _},
     utils::TruncateExt as _,
 };
-use litebox_common_linux::UserPtrMut;
 use litebox_common_linux::errno::Errno;
+use litebox_common_linux::user_pointers::UserPtrMut;
 use litebox_platform_multiplex::Platform;
 
 impl<FS: ShimFS> Task<FS> {
@@ -177,7 +177,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut buf = [0u8; 16];
-        let ptr = litebox_common_linux::UserPtrMut::from_ptr(buf.as_mut_ptr());
+        let ptr = litebox_common_linux::user_pointers::UserPtrMut::from_ptr(buf.as_mut_ptr());
         let count = task
             .sys_getrandom(ptr, buf.len() - 1, RngFlags::empty())
             .expect("getrandom failed");
@@ -194,7 +194,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut utsname = litebox_common_linux::Utsname::new_zeroed();
-        let ptr = litebox_common_linux::UserPtrMut::from_ptr(&raw mut utsname);
+        let ptr = litebox_common_linux::user_pointers::UserPtrMut::from_ptr(&raw mut utsname);
         task.sys_uname(ptr).expect("uname failed");
 
         assert_eq!(utsname.sysname, super::SYS_INFO.sysname);

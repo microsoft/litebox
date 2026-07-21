@@ -28,7 +28,7 @@ pub mod vmap;
 
 extern crate alloc;
 
-pub use user_pointers::{UserPtr, UserPtrMut};
+use user_pointers::{UserPtr, UserPtrMut};
 
 /// Number of AArch64 general-purpose registers saved by the Linux user ABI
 /// (`x0` through `x30`).
