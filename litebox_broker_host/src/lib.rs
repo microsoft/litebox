@@ -46,29 +46,9 @@ pub use error::{BrokerHostError, Result};
 /// response and do not also emit a duplicate notification.
 ///
 /// `shared_memory` belongs to this association and is reused at offset zero for
-/// serialized pipe transfers.
+/// serialized pipe transfers. `establish_association` runs after version
+/// negotiation and before active requests begin.
 pub fn serve_connection<ControlChannel, NotificationChannel, ChannelError>(
-    core: &BrokerCore,
-    control_channel: &mut ControlChannel,
-    notification_channel: &mut NotificationChannel,
-    shared_memory: &dyn SharedMemory,
-) -> Result<ConnectionTermination, ChannelError>
-where
-    ControlChannel: HostControlChannel<Error = ChannelError>,
-    NotificationChannel: HostNotificationChannel<Error = ChannelError>,
-{
-    serve_connection_with_setup(
-        core,
-        control_channel,
-        notification_channel,
-        shared_memory,
-        |_| Ok(()),
-    )
-}
-
-/// Negotiates and serves one broker association, establishing deployment
-/// resources after version negotiation and before active requests.
-pub fn serve_connection_with_setup<ControlChannel, NotificationChannel, ChannelError>(
     core: &BrokerCore,
     control_channel: &mut ControlChannel,
     _notification_channel: &mut NotificationChannel,
@@ -334,6 +314,7 @@ mod tests {
                 &mut channel,
                 &mut notifications,
                 &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                |_| Ok(()),
             )
             .unwrap(),
             ConnectionTermination::PeerClosed
@@ -371,6 +352,7 @@ mod tests {
                 &mut channel,
                 &mut notifications,
                 &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                |_| Ok(()),
             )
             .unwrap(),
             ConnectionTermination::PeerClosed
@@ -402,7 +384,7 @@ mod tests {
         let setup_called = Cell::new(false);
 
         assert_eq!(
-            serve_connection_with_setup(
+            serve_connection(
                 broker,
                 &mut channel,
                 &mut notifications,
@@ -437,6 +419,7 @@ mod tests {
                 &mut channel,
                 &mut notifications,
                 &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                |_| Ok(()),
             )
             .unwrap(),
             ConnectionTermination::ProtocolViolation
@@ -463,6 +446,7 @@ mod tests {
                 &mut channel,
                 &mut notifications,
                 &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                |_| Ok(()),
             )
             .unwrap(),
             ConnectionTermination::ProtocolViolation
@@ -494,6 +478,7 @@ mod tests {
             &mut channel,
             &mut notifications,
             &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+            |_| Ok(()),
         ) {
             Err(BrokerHostError::Channel(())) => {}
             result => panic!("unexpected serve result: {result:?}"),
@@ -519,6 +504,7 @@ mod tests {
                 &mut channel,
                 &mut notifications,
                 &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                |_| Ok(()),
             )
             .unwrap(),
             ConnectionTermination::PeerClosed

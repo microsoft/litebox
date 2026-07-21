@@ -366,7 +366,7 @@ fn spawn_test_broker(
                 };
                 let mut notification_channel =
                     litebox_broker_transport::unix_socket::UnixStreamHostNotificationChannel::from_accepted(notification_stream);
-                let termination = litebox_broker_host::serve_connection_with_setup(
+                let termination = litebox_broker_host::serve_connection(
                     &broker,
                     &mut channel,
                     &mut notification_channel,

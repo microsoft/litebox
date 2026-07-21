@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
-use litebox_broker_host::serve_connection_with_setup;
+use litebox_broker_host::serve_connection;
 use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     UnixStreamHostControlChannel::from_accepted(control_stream);
                 let mut notification_channel =
                     UnixStreamHostNotificationChannel::from_accepted(notification_stream);
-                if let Err(error) = serve_connection_with_setup(
+                if let Err(error) = serve_connection(
                     &broker,
                     &mut control_channel,
                     &mut notification_channel,

@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
-use litebox_broker_host::{ConnectionTermination, serve_connection_with_setup};
+use litebox_broker_host::{ConnectionTermination, serve_connection};
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -27,7 +27,7 @@ fn host_serves_control_requests_over_paired_userland_channels() {
     let host_thread = std::thread::spawn(move || {
         let mut control = UnixStreamHostControlChannel::from_accepted(host_control);
         let mut notification = UnixStreamHostNotificationChannel::from_accepted(host_notification);
-        serve_connection_with_setup(
+        serve_connection(
             &broker,
             &mut control,
             &mut notification,
