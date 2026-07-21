@@ -20,20 +20,28 @@ mod error;
 mod event;
 mod pipe;
 
+use alloc::sync::Arc;
+
 use litebox_broker_protocol::channel::{LocalControlChannel, LocalNotificationChannel};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
     BrokerResponse,
 };
+use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::shared_memory::SharedMemory;
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle};
 
 pub use error::{BrokerLocalError, Result};
 
 /// Typed broker-local control adapter for broker operations.
+///
+/// The shared memory belongs to the broker association and is reused for each
+/// serialized pipe transfer.
 pub struct BrokerLocal<Channel: LocalControlChannel> {
     channel: Channel,
+    shared_memory: Arc<dyn SharedMemory>,
 }
 
 /// Broker-local receive adapter for broker-initiated asynchronous notifications.
@@ -42,13 +50,37 @@ pub struct BrokerNotifications<Channel: LocalNotificationChannel> {
 }
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
-    /// Negotiates the broker protocol over an already-connected control channel.
+    /// Negotiates the broker protocol over an already-connected control channel
+    /// with its associated shared memory.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the negotiation request.
-    pub fn negotiate(mut channel: Channel) -> Result<Self, Channel::Error> {
+    pub fn negotiate(
+        channel: Channel,
+        shared_memory: Arc<dyn SharedMemory>,
+    ) -> Result<Self, Channel::Error> {
+        Self::negotiate_with_setup(channel, |_| Ok(shared_memory))
+    }
+
+    /// Negotiates the broker protocol, then establishes the association shared
+    /// memory before active requests begin.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error, returns a protocol
+    /// response that does not match the negotiation request, or setup returns
+    /// shared memory with an invalid size.
+    pub fn negotiate_with_setup(
+        mut channel: Channel,
+        establish_shared_memory: impl FnOnce(
+            &mut Channel,
+        ) -> core::result::Result<
+            Arc<dyn SharedMemory>,
+            Channel::Error,
+        >,
+    ) -> Result<Self, Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         let request = BrokerHandshakeRequest {
             protocol_version: requested,
@@ -68,7 +100,17 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                     requested, broker_protocol_version,
                     "broker returned unexpected negotiation response: {response:?}"
                 );
-                Ok(Self { channel })
+                let shared_memory =
+                    establish_shared_memory(&mut channel).map_err(BrokerLocalError::Channel)?;
+                assert_eq!(
+                    shared_memory.len(),
+                    PIPE_TRANSFER_BUFFER_SIZE,
+                    "broker association shared memory has an invalid size"
+                );
+                Ok(Self {
+                    channel,
+                    shared_memory,
+                })
             }
             BrokerHandshakeResponse::VersionMismatch { .. } => {
                 Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
@@ -92,7 +134,10 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match an active request.
-    pub fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, Channel::Error> {
+    pub(crate) fn request(
+        &mut self,
+        request: BrokerRequest,
+    ) -> Result<BrokerResponse, Channel::Error> {
         self.channel
             .send_request(&request)
             .map_err(BrokerLocalError::Channel)?;
@@ -179,6 +224,7 @@ impl<Channel: LocalNotificationChannel> BrokerNotifications<Channel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
     use core::convert::Infallible;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::ProtocolVersion;
@@ -195,7 +241,7 @@ mod tests {
             }),
             None,
         );
-        let local = BrokerLocal::negotiate(channel).unwrap();
+        let local = BrokerLocal::negotiate(channel, test_shared_memory()).unwrap();
 
         assert_eq!(
             local.channel.sent_handshake_request,
@@ -213,7 +259,10 @@ mod tests {
         }));
         let response = BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }));
         let channel = FakeControlChannel::new(None, Some(response.clone()));
-        let mut local = BrokerLocal { channel };
+        let mut local = BrokerLocal {
+            channel,
+            shared_memory: test_shared_memory(),
+        };
 
         assert_eq!(local.request(request.clone()).unwrap(), response);
         assert_eq!(local.channel.sent_request, Some(request));
@@ -225,7 +274,10 @@ mod tests {
         let request = BrokerRequest::CloseObject(handle);
         let response = BrokerResponse::ObjectClosed;
         let channel = FakeControlChannel::new(None, Some(response.clone()));
-        let mut local = BrokerLocal { channel };
+        let mut local = BrokerLocal {
+            channel,
+            shared_memory: test_shared_memory(),
+        };
 
         assert!(local.close_object(handle).is_ok());
         assert_eq!(local.channel.sent_request, Some(request));
@@ -238,7 +290,10 @@ mod tests {
         }));
         let channel =
             FakeControlChannel::new(None, Some(BrokerResponse::Error(ErrorCode::WouldBlock)));
-        let mut local = BrokerLocal { channel };
+        let mut local = BrokerLocal {
+            channel,
+            shared_memory: test_shared_memory(),
+        };
 
         assert!(matches!(
             local.request(request),
@@ -254,7 +309,28 @@ mod tests {
         }));
         let channel =
             FakeControlChannel::new(None, Some(BrokerResponse::Error(ErrorCode::Internal)));
-        let mut local = BrokerLocal { channel };
+        let mut local = BrokerLocal {
+            channel,
+            shared_memory: test_shared_memory(),
+        };
+
+        let _ = local.request(request);
+    }
+
+    #[test]
+    #[should_panic(expected = "broker returned unrecoverable error")]
+    fn active_request_panics_on_unsupported_operation() {
+        let request = BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
+            initial_count: 0,
+        }));
+        let channel = FakeControlChannel::new(
+            None,
+            Some(BrokerResponse::Error(ErrorCode::UnsupportedOperation)),
+        );
+        let mut local = BrokerLocal {
+            channel,
+            shared_memory: test_shared_memory(),
+        };
 
         let _ = local.request(request);
     }
@@ -270,7 +346,7 @@ mod tests {
             None,
         );
 
-        let _ = BrokerLocal::negotiate(channel);
+        let _ = BrokerLocal::negotiate(channel, test_shared_memory());
     }
 
     #[test]
@@ -297,10 +373,15 @@ mod tests {
             None,
         );
 
+        let setup_called = Cell::new(false);
         assert!(matches!(
-            BrokerLocal::negotiate(channel),
+            BrokerLocal::negotiate_with_setup(channel, |_| {
+                setup_called.set(true);
+                Ok(test_shared_memory())
+            }),
             Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
         ));
+        assert!(!setup_called.get());
     }
 
     #[test]
@@ -311,7 +392,7 @@ mod tests {
             None,
         );
 
-        let _ = BrokerLocal::negotiate(channel);
+        let _ = BrokerLocal::negotiate(channel, test_shared_memory());
     }
 
     struct FakeControlChannel {
@@ -319,6 +400,36 @@ mod tests {
         sent_request: Option<BrokerRequest>,
         handshake_response: Option<BrokerHandshakeResponse>,
         response: Option<BrokerResponse>,
+    }
+
+    struct TestSharedMemory;
+
+    impl SharedMemory for TestSharedMemory {
+        fn len(&self) -> usize {
+            PIPE_TRANSFER_BUFFER_SIZE
+        }
+
+        fn read(
+            &self,
+            _offset: usize,
+            _destination: &mut [u8],
+        ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
+        {
+            unreachable!("shared memory is not used by these tests")
+        }
+
+        fn write(
+            &self,
+            _offset: usize,
+            _source: &[u8],
+        ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
+        {
+            unreachable!("shared memory is not used by these tests")
+        }
+    }
+
+    fn test_shared_memory() -> Arc<dyn SharedMemory> {
+        Arc::new(TestSharedMemory)
     }
 
     impl FakeControlChannel {

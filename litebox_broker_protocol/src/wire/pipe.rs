@@ -33,7 +33,7 @@ pub(super) fn encode_pipe_request(encoder: &mut Encoder, request: PipeRequest) {
         PipeRequest::Write(request) => {
             encoder.u8(PIPE_REQUEST_TAG_WRITE);
             encoder.handle(request.handle);
-            encoder.bytes(&request.data);
+            encoder.u32(request.length);
         }
     }
 }
@@ -50,7 +50,7 @@ pub(super) fn decode_pipe_request(decoder: &mut Decoder<'_>) -> Result<PipeReque
         })),
         PIPE_REQUEST_TAG_WRITE => Ok(PipeRequest::Write(WritePipeRequest {
             handle: decoder.handle()?,
-            data: decoder.bytes()?,
+            length: decoder.u32()?,
         })),
         _ => Err(WireError::InvalidTag),
     }
@@ -65,7 +65,7 @@ pub(super) fn encode_pipe_response(encoder: &mut Encoder, response: PipeResponse
         }
         PipeResponse::Read(response) => {
             encoder.u8(PIPE_RESPONSE_TAG_READ);
-            encoder.bytes(&response.data);
+            encoder.u32(response.read);
         }
         PipeResponse::Write(response) => {
             encoder.u8(PIPE_RESPONSE_TAG_WRITTEN);
@@ -81,7 +81,7 @@ pub(super) fn decode_pipe_response(decoder: &mut Decoder<'_>) -> Result<PipeResp
             write_handle: decoder.handle()?,
         })),
         PIPE_RESPONSE_TAG_READ => Ok(PipeResponse::Read(ReadPipeResponse {
-            data: decoder.bytes()?,
+            read: decoder.u32()?,
         })),
         PIPE_RESPONSE_TAG_WRITTEN => Ok(PipeResponse::Write(WritePipeResponse {
             written: decoder.u32()?,

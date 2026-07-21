@@ -3,12 +3,15 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Error, ErrorKind, Result};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
@@ -81,7 +84,14 @@ fn run_fake_runner(args: &[OsString]) {
     let control_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
     let _notification_channel =
         connect_notification_with_retry(Path::new(notification_socket_path)).unwrap();
-    let mut local = BrokerLocal::negotiate(control_channel).unwrap();
+    let mut local = BrokerLocal::negotiate_with_setup(control_channel, |channel| {
+        let shared_memory = channel.receive_memfd(
+            PIPE_TRANSFER_BUFFER_SIZE,
+            Some(Instant::now() + Duration::from_secs(5)),
+        )?;
+        Ok(Arc::new(shared_memory))
+    })
+    .unwrap();
 
     let handle = local.create_event_with_count(0).unwrap();
     assert_eq!(
@@ -126,7 +136,9 @@ impl Drop for ChildGuard {
 fn connect_control_with_retry(socket_path: &Path) -> Result<UnixStreamLocalControlChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixStreamLocalControlChannel::connect_with_setup_deadline(socket_path, deadline) {
+        match UnixStream::connect(socket_path).map(|stream| {
+            UnixStreamLocalControlChannel::from_connected_with_setup_deadline(stream, deadline)
+        }) {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != ErrorKind::NotFound

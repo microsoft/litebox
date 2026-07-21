@@ -2,13 +2,16 @@
 // Licensed under the MIT license.
 
 use std::{
+    os::unix::net::UnixStream,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
+use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
     UnixStreamLocalNotificationChannel,
@@ -26,11 +29,11 @@ pub(crate) fn connect(
     UnixStreamLocalControlCancellation,
 )> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_channel = connect_with_retry(
+    let control_stream = connect_with_retry(
         control_socket_path,
         setup_deadline,
         "timed out connecting to broker",
-        |path, deadline| UnixStreamLocalControlChannel::connect_with_setup_deadline(path, deadline),
+        |path, _deadline| UnixStream::connect(path),
     )
     .with_context(|| {
         format!(
@@ -38,6 +41,10 @@ pub(crate) fn connect(
             control_socket_path.display()
         )
     })?;
+    let control_channel = UnixStreamLocalControlChannel::from_connected_with_setup_deadline(
+        control_stream,
+        setup_deadline,
+    );
     let notification_channel = connect_with_retry(
         notification_socket_path,
         setup_deadline,
@@ -53,7 +60,12 @@ pub(crate) fn connect(
     let control_cancellation = control_channel
         .cancellation_handle()
         .context("failed to create broker control cancellation handle")?;
-    let local = BrokerLocal::negotiate(control_channel).context("broker negotiation failed")?;
+    let local = BrokerLocal::negotiate_with_setup(control_channel, |channel| {
+        let shared_memory =
+            channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, Some(setup_deadline))?;
+        Ok(Arc::new(shared_memory))
+    })
+    .context("broker negotiation failed")?;
     Ok((
         local,
         BrokerNotifications::new(notification_channel),

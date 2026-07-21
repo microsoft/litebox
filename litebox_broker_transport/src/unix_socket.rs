@@ -13,6 +13,8 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
+use crate::shared_memory::MemfdSharedMemory;
 use litebox_broker_protocol::channel::{
     HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
     LocalNotificationChannel, PeerCredential,
@@ -49,6 +51,18 @@ impl UnixStreamLocalControlChannel {
         }
     }
 
+    /// Creates a local control channel from an already-connected Unix stream
+    /// with a deadline for handshake I/O.
+    pub const fn from_connected_with_setup_deadline(
+        stream: UnixStream,
+        setup_deadline: Instant,
+    ) -> Self {
+        Self {
+            stream,
+            setup_deadline: Some(setup_deadline),
+        }
+    }
+
     /// Connects to a userland broker Unix socket.
     pub fn connect(path: impl AsRef<Path>) -> IoResult<Self> {
         UnixStream::connect(path).map(Self::from_connected)
@@ -74,6 +88,16 @@ impl UnixStreamLocalControlChannel {
         self.stream
             .try_clone()
             .map(|stream| UnixStreamLocalControlCancellation { stream })
+    }
+
+    /// Receives the memfd associated with this control channel.
+    #[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
+    pub fn receive_memfd(
+        &mut self,
+        expected_len: usize,
+        deadline: Option<Instant>,
+    ) -> IoResult<MemfdSharedMemory> {
+        crate::shared_memory::receive_memfd(&mut self.stream, expected_len, deadline)
     }
 }
 
@@ -112,6 +136,16 @@ impl UnixStreamHostControlChannel {
     /// Creates a host control channel from an accepted Unix stream.
     pub const fn from_accepted(stream: UnixStream) -> Self {
         Self { stream }
+    }
+
+    /// Sends the memfd associated with this control channel.
+    #[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
+    pub fn send_memfd(
+        &mut self,
+        shared_memory: &MemfdSharedMemory,
+        deadline: Option<Instant>,
+    ) -> IoResult<()> {
+        crate::shared_memory::send_memfd(&mut self.stream, shared_memory, deadline)
     }
 }
 

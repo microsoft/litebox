@@ -1,15 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::vec::Vec;
-
 use crate::ObjectHandle;
 
-/// Maximum pipe payload carried by one control-path request or response.
+/// Maximum pipe transfer described by one control-path request or response.
 ///
 /// This leaves room for the broker envelope and operation metadata within the
 /// smallest currently supported transport frame.
 pub const MAX_PIPE_TRANSFER_SIZE: u32 = 32 * 1024;
+
+/// Association shared-memory size required for broker pipe transfers.
+pub const PIPE_TRANSFER_BUFFER_SIZE: usize = MAX_PIPE_TRANSFER_SIZE as usize;
 
 /// Request to create a broker-owned byte pipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,20 +39,20 @@ pub struct ReadPipeRequest {
     pub length: u32,
 }
 
-/// Response containing bytes read from a pipe.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Response describing bytes read into shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadPipeResponse {
-    /// Bytes removed from the pipe.
-    pub data: Vec<u8>,
+    /// Number of bytes placed in the read region.
+    pub read: u32,
 }
 
-/// Request to write bytes to a pipe endpoint.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Request to write bytes staged in shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WritePipeRequest {
     /// Write endpoint handle.
     pub handle: ObjectHandle,
-    /// Bytes to append to the pipe.
-    pub data: Vec<u8>,
+    /// Number of staged bytes to write.
+    pub length: u32,
 }
 
 /// Response describing a completed pipe write.

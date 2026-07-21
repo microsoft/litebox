@@ -6,13 +6,18 @@ use std::ffi::OsString;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
-use litebox_broker_host::serve_connection;
+use litebox_broker_host::serve_connection_with_setup;
+use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
+use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
     UnixStreamHostControlChannel, UnixStreamHostNotificationChannel,
 };
+
+const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 struct CliArgs {
@@ -54,6 +59,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         let (control_stream, _) = control_listener.accept()?;
+        let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+        let shared_memory = MemfdSharedMemory::create(PIPE_TRANSFER_BUFFER_SIZE)?;
         let (notification_stream, _) = notification_listener.accept()?;
         let broker = broker.clone();
         if let Err(error) = std::thread::Builder::new()
@@ -63,9 +70,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     UnixStreamHostControlChannel::from_accepted(control_stream);
                 let mut notification_channel =
                     UnixStreamHostNotificationChannel::from_accepted(notification_stream);
-                if let Err(error) =
-                    serve_connection(&broker, &mut control_channel, &mut notification_channel)
-                {
+                if let Err(error) = serve_connection_with_setup(
+                    &broker,
+                    &mut control_channel,
+                    &mut notification_channel,
+                    &shared_memory,
+                    |channel| channel.send_memfd(&shared_memory, Some(setup_deadline)),
+                ) {
                     eprintln!("failed to serve broker connection: {error}");
                 }
             })

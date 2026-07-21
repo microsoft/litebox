@@ -201,14 +201,17 @@ mod tests {
         let consume_attempts = Arc::new(AtomicUsize::new(0));
         let read_ready = Arc::new(AtomicBool::new(false));
         let request_count = Arc::new(AtomicUsize::new(0));
-        let local = BrokerLocal::negotiate(FakeLocalControlChannel {
-            next_handle: handle.0,
-            consume_attempts: consume_attempts.clone(),
-            read_ready: read_ready.clone(),
-            request_count,
-            fail_requests: Arc::new(AtomicBool::new(false)),
-            last_request: None,
-        })
+        let local = BrokerLocal::negotiate(
+            FakeLocalControlChannel {
+                next_handle: handle.0,
+                consume_attempts: consume_attempts.clone(),
+                read_ready: read_ready.clone(),
+                request_count,
+                fail_requests: Arc::new(AtomicBool::new(false)),
+                last_request: None,
+            },
+            Arc::new(TestSharedMemory),
+        )
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
         let counter = Arc::new(EventCounter::new(&litebox, 0).unwrap());
@@ -257,14 +260,17 @@ mod tests {
         let handle = ObjectHandle(7);
         let consume_attempts = Arc::new(AtomicUsize::new(0));
         let request_count = Arc::new(AtomicUsize::new(0));
-        let local = BrokerLocal::negotiate(FakeLocalControlChannel {
-            next_handle: handle.0,
-            consume_attempts: Arc::clone(&consume_attempts),
-            read_ready: Arc::new(AtomicBool::new(false)),
-            request_count: Arc::clone(&request_count),
-            fail_requests: Arc::new(AtomicBool::new(false)),
-            last_request: None,
-        })
+        let local = BrokerLocal::negotiate(
+            FakeLocalControlChannel {
+                next_handle: handle.0,
+                consume_attempts: Arc::clone(&consume_attempts),
+                read_ready: Arc::new(AtomicBool::new(false)),
+                request_count: Arc::clone(&request_count),
+                fail_requests: Arc::new(AtomicBool::new(false)),
+                last_request: None,
+            },
+            Arc::new(TestSharedMemory),
+        )
         .unwrap();
         let litebox = Arc::new(LiteBox::new_with_broker_local(platform, local));
         let counter = Arc::new(EventCounter::new(&litebox, 0).unwrap());
@@ -306,14 +312,17 @@ mod tests {
         let handle = ObjectHandle(7);
         let request_count = Arc::new(AtomicUsize::new(0));
         let fail_requests = Arc::new(AtomicBool::new(false));
-        let local = BrokerLocal::negotiate(FakeLocalControlChannel {
-            next_handle: handle.0,
-            consume_attempts: Arc::new(AtomicUsize::new(0)),
-            read_ready: Arc::new(AtomicBool::new(false)),
-            request_count: Arc::clone(&request_count),
-            fail_requests: Arc::clone(&fail_requests),
-            last_request: None,
-        })
+        let local = BrokerLocal::negotiate(
+            FakeLocalControlChannel {
+                next_handle: handle.0,
+                consume_attempts: Arc::new(AtomicUsize::new(0)),
+                read_ready: Arc::new(AtomicBool::new(false)),
+                request_count: Arc::clone(&request_count),
+                fail_requests: Arc::clone(&fail_requests),
+                last_request: None,
+            },
+            Arc::new(TestSharedMemory),
+        )
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
         let first = EventCounter::new(&litebox, 0).unwrap();
@@ -340,14 +349,17 @@ mod tests {
         let platform = MockPlatform::new();
         let handle = ObjectHandle(7);
         let request_count = Arc::new(AtomicUsize::new(0));
-        let local = BrokerLocal::negotiate(FakeLocalControlChannel {
-            next_handle: handle.0,
-            consume_attempts: Arc::new(AtomicUsize::new(0)),
-            read_ready: Arc::new(AtomicBool::new(false)),
-            request_count: Arc::clone(&request_count),
-            fail_requests: Arc::new(AtomicBool::new(false)),
-            last_request: None,
-        })
+        let local = BrokerLocal::negotiate(
+            FakeLocalControlChannel {
+                next_handle: handle.0,
+                consume_attempts: Arc::new(AtomicUsize::new(0)),
+                read_ready: Arc::new(AtomicBool::new(false)),
+                request_count: Arc::clone(&request_count),
+                fail_requests: Arc::new(AtomicBool::new(false)),
+                last_request: None,
+            },
+            Arc::new(TestSharedMemory),
+        )
         .unwrap();
         let litebox = LiteBox::new_with_broker_local(platform, local);
         let counter = EventCounter::new(&litebox, 0).unwrap();
@@ -398,6 +410,32 @@ mod tests {
         request_count: Arc<AtomicUsize>,
         fail_requests: Arc<AtomicBool>,
         last_request: Option<BrokerRequest>,
+    }
+
+    struct TestSharedMemory;
+
+    impl litebox_broker_protocol::shared_memory::SharedMemory for TestSharedMemory {
+        fn len(&self) -> usize {
+            litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE
+        }
+
+        fn read(
+            &self,
+            _offset: usize,
+            _destination: &mut [u8],
+        ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
+        {
+            unreachable!("event tests do not access shared memory")
+        }
+
+        fn write(
+            &self,
+            _offset: usize,
+            _source: &[u8],
+        ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
+        {
+            unreachable!("event tests do not access shared memory")
+        }
     }
 
     impl LocalControlChannel for FakeLocalControlChannel {

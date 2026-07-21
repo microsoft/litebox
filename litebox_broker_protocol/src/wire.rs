@@ -328,10 +328,7 @@ mod tests {
                 atomic_write_size: 512,
             })),
             BrokerRequest::Pipe(PipeRequest::Read(ReadPipeRequest { handle, length: 32 })),
-            BrokerRequest::Pipe(PipeRequest::Write(WritePipeRequest {
-                handle,
-                data: Vec::from([1, 2, 3]),
-            })),
+            BrokerRequest::Pipe(PipeRequest::Write(WritePipeRequest { handle, length: 3 })),
         ];
 
         for request in requests {
@@ -382,9 +379,7 @@ mod tests {
                 read_handle: handle,
                 write_handle: ObjectHandle(14),
             })),
-            BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse {
-                data: Vec::from([1, 2, 3]),
-            })),
+            BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 })),
             BrokerResponse::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
             BrokerResponse::Error(ErrorCode::WouldBlock),
