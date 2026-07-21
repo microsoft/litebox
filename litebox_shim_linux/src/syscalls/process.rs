@@ -1303,17 +1303,6 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-/// Bridge a local futex address pointer into the platform's mutable pointer type,
-/// which is what the platform-generic [`FutexManager`](litebox::sync::futex::FutexManager)
-/// expects.
-fn platform_futex_ptr(
-    addr: crate::UserPtrMut<u32>,
-) -> <litebox_platform_multiplex::Platform as litebox::platform::RawPointerProvider>::RawMutPointer<
-    u32,
-> {
-    litebox::platform::RawConstPointer::from_usize(addr.as_usize())
-}
-
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
@@ -1333,9 +1322,11 @@ impl<FS: ShimFS> Task<FS> {
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
-                self.global
-                    .futex_manager
-                    .wake(platform_futex_ptr(addr), count, None)? as usize
+                self.global.futex_manager.wake(
+                    litebox::platform::RawConstPointer::from_usize(addr.as_usize()),
+                    count,
+                    None,
+                )? as usize
             }
             FutexArgs::Wait {
                 addr,
@@ -1347,7 +1338,7 @@ impl<FS: ShimFS> Task<FS> {
                 let timeout = timeout.read::<Platform>()?;
                 self.global.futex_manager.wait(
                     &self.wait_cx().with_timeout(timeout),
-                    platform_futex_ptr(addr),
+                    litebox::platform::RawConstPointer::from_usize(addr.as_usize()),
                     val,
                     None,
                 )?;
@@ -1374,7 +1365,7 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 self.global.futex_manager.wait(
                     &self.wait_cx().with_deadline(deadline),
-                    platform_futex_ptr(addr),
+                    litebox::platform::RawConstPointer::from_usize(addr.as_usize()),
                     val,
                     core::num::NonZeroU32::new(bitmask),
                 )?;

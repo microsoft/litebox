@@ -9,17 +9,6 @@ use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, user_pointers::Use
 
 use crate::{Task, UserMutPtr};
 
-/// Bridge a platform mutable pointer to the address-only `UserPtrMut` used by
-/// the shared `litebox_common_linux::mm` helpers.
-fn to_local(ptr: UserMutPtr<u8>) -> UserPtrMut<u8> {
-    UserPtrMut::from_usize(ptr.as_usize())
-}
-
-/// Bridge an address-only `UserPtrMut` back to a platform mutable pointer.
-fn from_local(ptr: UserPtrMut<u8>) -> UserMutPtr<u8> {
-    <UserMutPtr<u8> as RawConstPointer<u8>>::from_usize(ptr.as_usize())
-}
-
 #[inline]
 fn align_up(addr: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two());
@@ -45,7 +34,7 @@ impl Task {
             false,
             op,
         )
-        .map(from_local)
+        .map(|ptr| <UserMutPtr<u8> as RawConstPointer<u8>>::from_usize(ptr.as_usize()))
     }
 
     /// Handle syscall `mmap`
@@ -105,7 +94,7 @@ impl Task {
     /// Handle syscall `munmap`
     pub(crate) fn sys_munmap(&self, addr: UserMutPtr<u8>, len: usize) -> Result<(), Errno> {
         let pm = &self.global.pm;
-        litebox_common_linux::mm::sys_munmap(pm, to_local(addr), len)
+        litebox_common_linux::mm::sys_munmap(pm, UserPtrMut::from_usize(addr.as_usize()), len)
     }
 
     /// Handle syscall `mprotect`
@@ -117,6 +106,11 @@ impl Task {
         prot: ProtFlags,
     ) -> Result<(), Errno> {
         let pm = &self.global.pm;
-        litebox_common_linux::mm::sys_mprotect(pm, to_local(addr), len, prot)
+        litebox_common_linux::mm::sys_mprotect(
+            pm,
+            UserPtrMut::from_usize(addr.as_usize()),
+            len,
+            prot,
+        )
     }
 }
