@@ -1675,6 +1675,7 @@ dependencies = [
  "litebox_shim_linux",
  "litebox_util_log",
  "log",
+ "once_cell",
 ]
 
 [[package]]

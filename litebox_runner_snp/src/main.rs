@@ -10,7 +10,7 @@ mod globals;
 
 extern crate alloc;
 
-use alloc::borrow::ToOwned;
+use alloc::{borrow::ToOwned, boxed::Box};
 use litebox::{
     fs::FileSystem as _,
     utils::{ReinterpretUnsignedExt as _, TruncateExt as _},
@@ -50,9 +50,10 @@ type DefaultFS = litebox::fs::layered::FileSystem<
     >,
 >;
 
-// FUTURE: replace this with some kind of OnceLock, or just eliminate this
-// entirely (ideal).
-static mut SHIM: Option<litebox_shim_linux::LinuxShim<Platform, DefaultFS>> = None;
+type Shim = litebox_shim_linux::LinuxShim<Platform, DefaultFS>;
+
+// FUTURE: eliminate this entirely (ideal).
+static SHIM: once_cell::race::OnceBox<Shim> = once_cell::race::OnceBox::new();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn floating_point_handler(_pt_regs: &mut litebox_common_linux::PtRegs) {
@@ -67,13 +68,10 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
     let addr: u64 = litebox_platform_linux_kernel::arch::instructions::cr2();
     let code = pt_regs.orig_rax;
 
-    let shim = &raw const SHIM;
+    let shim = SHIM.get().expect("initialized");
 
     match unsafe {
-        (*shim)
-            .as_ref()
-            .unwrap()
-            .page_manager()
+        shim.page_manager()
             .handle_page_fault(addr.trunc(), code as u64)
     } {
         Ok(()) => (),
@@ -98,10 +96,7 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
                 err:% = e;
                 "page fault failed"
             );
-            let platform = {
-                let shim = &raw const SHIM;
-                unsafe { (*shim).as_ref().unwrap().platform() }
-            };
+            let platform = shim.platform();
             platform.terminate(globals::SM_SEV_TERM_SET, globals::SM_TERM_EXCEPTION);
         }
     }
@@ -156,6 +151,10 @@ pub extern "C" fn sandbox_kernel_init(
 }
 
 /// Initializes the sandbox process.
+///
+/// # Panics
+///
+/// Panics if the shim has already been initialized.
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_process_init(
     pt_regs: &mut litebox_common_linux::PtRegs,
@@ -171,7 +170,8 @@ pub extern "C" fn sandbox_process_init(
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let shim = shim_builder.build();
-    unsafe { SHIM = Some(shim) };
+    let initialized = SHIM.set(Box::new(shim)).is_ok();
+    assert!(initialized, "shim initialized more than once");
 
     let parse_args =
         |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
@@ -210,9 +210,8 @@ pub extern "C" fn sandbox_process_init(
         );
     };
 
-    let shim = &raw const SHIM;
     #[allow(clippy::missing_panics_doc)]
-    let shim = unsafe { (*shim).as_ref().expect("initialized") };
+    let shim = SHIM.get().expect("initialized");
     let litebox = shim.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
@@ -303,10 +302,9 @@ pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) -> !
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sandbox_tun_read_write() {
-    let shim = &raw const SHIM;
     // wait until shim is initialized
     let shim = loop {
-        if let Some(shim) = unsafe { (*shim).as_ref() } {
+        if let Some(shim) = SHIM.get() {
             break shim;
         }
         core::hint::spin_loop();
