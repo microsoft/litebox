@@ -120,16 +120,16 @@ out of the dual-target set.
 
 ## Bucket A — dual-target substrate candidates (content-reviewed)
 
-**Only ~2–4 of the 66 A-by-path merges are genuinely clean, upstream-quality
-dual-target `main` fixes** — and as content review proceeds the pool keeps
-shrinking (candidates turn out broker-/fork-migration-coupled, already
-independently implemented on `main`, or scenario-driven papering-over). So far
-the sockopt accept (**PR #1054**) is the only confirmed one. The
+**In the end, exactly one of the 66 A-by-path merges is a clean, upstream-quality
+dual-target `main` fix: the advisory-sockopt accept (PR #1054).** Content review
+routed every other A candidate to broker-/fork-migration-coupled, already
+independently implemented on `main`, or scenario-driven papering-over (including
+the lone apparent "feature", netlink, which is a canned stub — see below). The
 ranking below is authoritative (coupling-symbol scan of each merge's shared-crate
 diff + subject semantics + `origin/main` presence check). The raw size-ordered
 table is kept as a `<details>` reference at the end of this section.
 
-Verdict tally: **A-READY**=2, **A-DROP**=1, **A-CHECK**=0, **A-SLICE**=0, **A-FEAT**=1,
+Verdict tally: **A-READY**=2, **A-DROP**=2, **A-CHECK**=0, **A-SLICE**=0, **A-FEAT**=0,
 **->review**=1, **->B**=24, **->C**=27, **->D**=3, **REJECT**=7.
 
 Legend: **A-READY** = verified clean + broker-independent + still-buggy on
@@ -157,10 +157,12 @@ a genuine fix has been read at diff level. The **only** clean, upstream-quality,
 main-portable Bucket-A *bug fix* is the advisory-sockopt accept (**PR #1054**).
 SIG_DFL (A-DROP) and its companion `fd51b53cb` (REJECT) are scenario-driven
 papering-over of unimplemented STOP; sendfile (REJECT) and WIFSIGNALED (->C) are
-already-on-main / worker-host-coupled. The one clean *feature* is netlink
-(**A-FEAT**) — but that means porting the whole `netlink.rs` module `main` rejects
-by design (`AF_NETLINK`→EAFNOSUPPORT), a maintainer-buy-in decision, not a quick
-win. **Implication: the amalgamation's durable upstream value is overwhelmingly
+already-on-main / worker-host-coupled. Even the lone apparent *feature*, netlink
+(**A-DROP**), is a 322-line **canned stub**: it returns a hardcoded RTM_GETLINK/
+GETADDR dump (loopback + a synthetic `10.0.0.2` eth0, a stale smoltcp-era
+address) so glibc `getifaddrs()` gets fabricated data instead of honestly failing
+on main's `AF_NETLINK`→EAFNOSUPPORT — the same papering-over pattern.
+**Implication: the amalgamation's durable upstream value is overwhelmingly
 Bucket B (the broker-held-resource model → ulitebox), not portable `main`
 bug-fixes.**
 
@@ -172,7 +174,7 @@ bug-fixes.**
 | REJECT | `15/3` | `fd51b53cb` | TUI mode startup — 5 shim signal divergences | companion to the dropped SIG_DFL change (extends the "is-ignored" predicate to `Stop`, valid only once SIG_DFL Stop is a no-op) **and** broker-coupled (`broker_pty_background_read_sigttin`) — papering-over + coupled |
 | REJECT | `141/46` | `13b12131b` | wave10 — SCM eventfd refs + **sendfile** | `main` already has a complete independent `sys_sendfile` (file.rs:564); amalgamation's also uses `park_if_deferred` (delayed-fork) — redundant + coupled |
 | ->C | `262/281` | `e7e59d2b6` | Phase 3 r5 — **WIFSIGNALED** encoding + pidfd delegation | the encoding lives entirely in the worker-host path (`worker_*`/`wait_worker_host`/`write_worker_result`/`host_pid` + coordinator/fork_matrix.rs) — fork-migration machinery main lacks; not a portable wait-status fix |
-| A-FEAT | `136/6` | `15f57bdda` | netlink-getifaddrs (increment) | this merge only adds `set_nl_pid`; the real feature is the whole `netlink.rs` module (RTM_GETADDR/getifaddrs) main lacks (`AF_NETLINK`→EAFNOSUPPORT by design), assembled across many commits — a **feature needing maintainer buy-in**, not a cherry-pick |
+| A-DROP | `136/6` | `15f57bdda` | netlink-getifaddrs | `netlink.rs` is a 322-line **canned stub** returning a hardcoded dump — loopback + a synthetic `10.0.0.2` eth0 (stale smoltcp-era address) — so glibc `getifaddrs()` gets fabricated data instead of failing. Papering-over of main's honest `AF_NETLINK`→EAFNOSUPPORT, not a real feature |
 | ->review | `176/14` | `704336e24` | orphan-kpx | process-lifecycle — needs a manual look |
 | ->B (24 merges) | 6/3 … 6065/1329 | — | broker TCP/pipe/PTY/pidfd/scm/socketpair/cwfd/epoll-local, wave-*, broker-exit-status | broker-coupled — adapt into ulitebox 6-crate broker |
 | ->C (26 merges) | 6/4 … 4685/383 | — | fork-restore, vfork-quiesce, delayed-fork, CoW, seal-descriptor-table, wave-cleanup, invariants, clone-hang | fork-migration / refactor — neither target |
