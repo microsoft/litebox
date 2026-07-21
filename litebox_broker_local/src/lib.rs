@@ -215,19 +215,26 @@ mod tests {
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::ProtocolVersion;
     use litebox_broker_protocol::channel::LocalNotificationChannel;
-    use litebox_broker_protocol::event::{CreateEventRequest, CreateEventResponse};
-    use litebox_broker_protocol::message::{EventRequest, EventResponse, ReadinessNotification};
+    use litebox_broker_protocol::message::ReadinessNotification;
     use litebox_broker_protocol::readiness::ReadinessFlags;
 
     #[test]
-    fn negotiate_returns_active_local_connection() {
+    fn negotiate_runs_setup_after_response_before_active_requests() {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }),
             None,
         );
-        let local = BrokerLocal::negotiate(channel, |_| Ok(noop_shared_memory())).unwrap();
+        let setup_calls = Cell::new(0);
+        let local = BrokerLocal::negotiate(channel, |channel| {
+            assert!(channel.sent_handshake_request.is_some());
+            assert!(channel.handshake_response.is_none());
+            assert!(channel.sent_request.is_none());
+            setup_calls.set(setup_calls.get() + 1);
+            Ok(noop_shared_memory())
+        })
+        .unwrap();
 
         assert_eq!(
             local.channel.sent_handshake_request,
@@ -235,23 +242,7 @@ mod tests {
                 protocol_version: BROKER_PROTOCOL_VERSION
             })
         );
-    }
-
-    #[test]
-    fn active_request_sends_event_request() {
-        let handle = ObjectHandle(7);
-        let request = BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-        }));
-        let response = BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }));
-        let channel = FakeControlChannel::new(None, Some(response.clone()));
-        let mut local = BrokerLocal {
-            channel,
-            shared_memory: noop_shared_memory(),
-        };
-
-        assert_eq!(local.request(request.clone()).unwrap(), response);
-        assert_eq!(local.channel.sent_request, Some(request));
+        assert_eq!(setup_calls.get(), 1);
     }
 
     #[test]
@@ -271,9 +262,6 @@ mod tests {
 
     #[test]
     fn active_request_returns_recoverable_broker_error() {
-        let request = BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-        }));
         let channel =
             FakeControlChannel::new(None, Some(BrokerResponse::Error(ErrorCode::WouldBlock)));
         let mut local = BrokerLocal {
@@ -282,7 +270,7 @@ mod tests {
         };
 
         assert!(matches!(
-            local.request(request),
+            local.create_event_with_count(0),
             Err(BrokerLocalError::Broker(ErrorCode::WouldBlock))
         ));
     }
@@ -290,9 +278,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "broker returned unrecoverable error")]
     fn active_request_panics_on_unrecoverable_broker_error() {
-        let request = BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-        }));
         let channel =
             FakeControlChannel::new(None, Some(BrokerResponse::Error(ErrorCode::Internal)));
         let mut local = BrokerLocal {
@@ -300,30 +285,11 @@ mod tests {
             shared_memory: noop_shared_memory(),
         };
 
-        let _ = local.request(request);
+        let _ = local.create_event_with_count(0);
     }
 
     #[test]
-    #[should_panic(expected = "broker returned unrecoverable error")]
-    fn active_request_panics_on_unsupported_operation() {
-        let request = BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-        }));
-        let channel = FakeControlChannel::new(
-            None,
-            Some(BrokerResponse::Error(ErrorCode::UnsupportedOperation)),
-        );
-        let mut local = BrokerLocal {
-            channel,
-            shared_memory: noop_shared_memory(),
-        };
-
-        let _ = local.request(request);
-    }
-
-    #[test]
-    #[should_panic(expected = "broker returned unexpected negotiation response")]
-    fn negotiate_rejects_broker_different_version_response() {
+    fn negotiate_rejects_broker_different_version_without_setup() {
         let broker_protocol_version = ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1);
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
@@ -331,8 +297,16 @@ mod tests {
             }),
             None,
         );
+        let setup_called = Cell::new(false);
 
-        let _ = BrokerLocal::negotiate(channel, |_| Ok(noop_shared_memory()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = BrokerLocal::negotiate(channel, |_| {
+                setup_called.set(true);
+                Ok(noop_shared_memory())
+            });
+        }));
+        assert_panic_contains(result, "broker returned unexpected negotiation response");
+        assert!(!setup_called.get());
     }
 
     #[test]
@@ -371,14 +345,70 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "broker returned unrecoverable error")]
-    fn negotiate_panics_on_unrecoverable_broker_error() {
+    fn negotiate_skips_setup_before_panicking_on_unrecoverable_broker_error() {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Error(ErrorCode::Internal)),
             None,
         );
+        let setup_called = Cell::new(false);
 
-        let _ = BrokerLocal::negotiate(channel, |_| Ok(noop_shared_memory()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = BrokerLocal::negotiate(channel, |_| {
+                setup_called.set(true);
+                Ok(noop_shared_memory())
+            });
+        }));
+        assert_panic_contains(result, "broker returned unrecoverable error");
+        assert!(!setup_called.get());
+    }
+
+    #[test]
+    fn negotiate_propagates_shared_memory_receive_error() {
+        let channel = FakeControlChannel::new(
+            Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            }),
+            None,
+        );
+
+        assert!(matches!(
+            BrokerLocal::negotiate(channel, |_| Err(FakeChannelError::SharedMemoryReceive)),
+            Err(BrokerLocalError::Channel(
+                FakeChannelError::SharedMemoryReceive
+            ))
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "broker association shared memory has an invalid size")]
+    fn negotiate_rejects_invalid_shared_memory_size() {
+        let channel = FakeControlChannel::new(
+            Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            }),
+            None,
+        );
+
+        let _ = BrokerLocal::negotiate(channel, |_| {
+            Ok(Arc::new(NoopSharedMemory {
+                length: PIPE_TRANSFER_BUFFER_SIZE - 1,
+            }) as Arc<dyn SharedMemory>)
+        });
+    }
+
+    fn assert_panic_contains(result: std::thread::Result<()>, expected: &str) {
+        let panic = result.expect_err("operation did not panic");
+        let message = if let Some(message) = panic.downcast_ref::<&str>() {
+            *message
+        } else if let Some(message) = panic.downcast_ref::<std::string::String>() {
+            message.as_str()
+        } else {
+            panic!("unexpected panic payload");
+        };
+        assert!(
+            message.contains(expected),
+            "panic message did not contain {expected:?}: {message}"
+        );
     }
 
     struct FakeControlChannel {
@@ -388,11 +418,18 @@ mod tests {
         response: Option<BrokerResponse>,
     }
 
-    struct NoopSharedMemory;
+    #[derive(Debug, PartialEq, Eq)]
+    enum FakeChannelError {
+        SharedMemoryReceive,
+    }
+
+    struct NoopSharedMemory {
+        length: usize,
+    }
 
     impl SharedMemory for NoopSharedMemory {
         fn len(&self) -> usize {
-            PIPE_TRANSFER_BUFFER_SIZE
+            self.length
         }
 
         fn read(
@@ -416,7 +453,9 @@ mod tests {
     }
 
     fn noop_shared_memory() -> Arc<dyn SharedMemory> {
-        Arc::new(NoopSharedMemory)
+        Arc::new(NoopSharedMemory {
+            length: PIPE_TRANSFER_BUFFER_SIZE,
+        })
     }
 
     impl FakeControlChannel {
@@ -434,7 +473,7 @@ mod tests {
     }
 
     impl LocalControlChannel for FakeControlChannel {
-        type Error = Infallible;
+        type Error = FakeChannelError;
 
         fn send_handshake_request(
             &mut self,
