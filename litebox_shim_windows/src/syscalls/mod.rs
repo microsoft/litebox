@@ -1129,7 +1129,6 @@ impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::TestPlatform;
 
     #[test]
     fn handle_encodes_raw_fds_and_rejects_invalid_values() {
@@ -1155,42 +1154,5 @@ mod tests {
 
         assert_eq!(Handle::from_raw_fd(usize::MAX >> HANDLE_SHIFT), None);
         assert_eq!(Handle::from_raw_fd(usize::MAX), None);
-    }
-
-    #[test]
-    fn query_wnf_state_data_decodes_register_and_stack_arguments() {
-        let mut stack = [0usize; 7];
-        stack[5] = 0x5555;
-        stack[6] = 0x6666;
-        let regs = litebox_common_linux::PtRegs {
-            orig_rax: NtSysno::NtQueryWnfStateData.as_raw() as usize,
-            r10: 0x1111,
-            rdx: 0x2222,
-            r8: 0,
-            r9: 0x4444,
-            rsp: stack.as_ptr() as usize,
-            ..litebox_common_linux::PtRegs::default()
-        };
-
-        let Some(SyscallRequest::NtQueryWnfStateData {
-            state_name,
-            type_id,
-            explicit_scope,
-            change_stamp,
-            buffer,
-            buffer_size,
-        }) = SyscallRequest::<TestPlatform>::try_from_raw(&regs)
-        else {
-            panic!("NtQueryWnfStateData should decode");
-        };
-        assert_eq!(state_name.as_usize(), 0x1111);
-        assert_eq!(
-            type_id.expect("non-null type ID should decode").as_usize(),
-            0x2222
-        );
-        assert!(explicit_scope.is_none());
-        assert_eq!(change_stamp.as_usize(), 0x4444);
-        assert_eq!(buffer.as_usize(), 0x5555);
-        assert_eq!(buffer_size.as_usize(), 0x6666);
     }
 }

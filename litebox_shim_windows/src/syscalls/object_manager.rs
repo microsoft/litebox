@@ -25,7 +25,9 @@ use crate::syscalls::event::EventObject;
 use crate::syscalls::section::{
     SectionObject, WINDOWS_SESSION_SHARED_SECTION_OBJECT, WINDOWS_SHARED_SECTION_OBJECT,
 };
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
+};
 
 const MAX_SYMLINK_REPARSE_DEPTH: usize = 64;
 pub(crate) const WINDOWS_API_PORT: &str = r"\Windows\ApiPort";
@@ -964,26 +966,6 @@ fn write_directory_records<Platform: RawPointerProvider>(
     Ok(())
 }
 
-fn probe_output_buffer<Platform: RawPointerProvider>(
-    buffer: MutPtr<Platform, u8>,
-    buffer_length: usize,
-) -> Result<(), NtStatus> {
-    if buffer_length == 0 {
-        return Ok(());
-    }
-    let value = buffer.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION)?;
-    buffer
-        .write_at_offset(0, value)
-        .ok_or(NtStatus::ACCESS_VIOLATION)?;
-    let last_offset = byte_offset(buffer_length - 1)?;
-    let value = buffer
-        .read_at_offset(last_offset)
-        .ok_or(NtStatus::ACCESS_VIOLATION)?;
-    buffer
-        .write_at_offset(last_offset, value)
-        .ok_or(NtStatus::ACCESS_VIOLATION)
-}
-
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn directory_entry(
         &self,
@@ -1233,7 +1215,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Err(status) => return status,
         };
         let buffer_length = params.buffer_length as usize;
-        if let Err(status) = probe_output_buffer::<Platform>(params.buffer, buffer_length) {
+        if let Err(status) = probe_guest_output_buffer::<Platform>(params.buffer, buffer_length) {
             return status;
         }
 

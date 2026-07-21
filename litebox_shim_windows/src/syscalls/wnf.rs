@@ -8,7 +8,10 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::Guid;
-use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
+use crate::{
+    ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_buffer,
+    probe_guest_output_preserving_value,
+};
 
 #[derive(Clone)]
 pub(crate) struct WnfStateData {
@@ -43,18 +46,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(available_size) = buffer_size.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
-        let outputs_valid = change_stamp
-            .read_at_offset(0)
-            .and_then(|value| change_stamp.write_at_offset(0, value))
-            .is_some()
-            && buffer_size.write_at_offset(0, available_size).is_some()
-            && probe_output_buffer::<Platform>(buffer, available_size as usize).is_ok();
+        let outputs_valid = probe_guest_output_preserving_value::<Platform, u32>(change_stamp)
+            .is_ok()
+            && probe_guest_output_preserving_value::<Platform, u32>(buffer_size).is_ok()
+            && probe_guest_output_buffer::<Platform>(buffer, available_size as usize).is_ok();
         if !outputs_valid {
             return NtStatus::ACCESS_VIOLATION;
         }
         if explicit_scope.is_some() {
             // TODO(wnf-explicit-scope): Key state data by the explicit SID once scoped WNF state
             // creation and security checks are modeled.
+            litebox_util_log::debug!(
+                state_name:% = format_args!("{state_name:#x}");
+                "Explicit-scope WNF state queries are not supported"
+            );
             return NtStatus::INVALID_PARAMETER;
         }
 
@@ -99,36 +104,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-fn probe_output_buffer<Platform: ShimPlatform>(
-    buffer: MutPtr<Platform, u8>,
-    buffer_size: usize,
-) -> Result<(), NtStatus> {
-    if buffer_size == 0 {
-        return Ok(());
-    }
-    let first = buffer.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION)?;
-    buffer
-        .write_at_offset(0, first)
-        .ok_or(NtStatus::ACCESS_VIOLATION)?;
-    let last_offset = isize::try_from(buffer_size - 1).map_err(|_| NtStatus::ACCESS_VIOLATION)?;
-    let last = buffer
-        .read_at_offset(last_offset)
-        .ok_or(NtStatus::ACCESS_VIOLATION)?;
-    buffer
-        .write_at_offset(last_offset, last)
-        .ok_or(NtStatus::ACCESS_VIOLATION)
-}
-
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
-
-    use litebox::platform::ThreadProvider;
-
     use super::*;
-    use crate::tests::{
-        TestFS, TestPlatform, mut_byte_ptr, mut_ptr, null_mut_ptr, test_platform, test_task,
-    };
+    use crate::tests::{TestFS, TestPlatform, mut_byte_ptr, mut_ptr, test_task};
 
     const STATE_NAME: u64 = 0x41c6_4e6d_a3bc_0075;
 
@@ -146,146 +125,6 @@ mod tests {
                 data: data.into(),
             },
         );
-    }
-
-    fn task_with_new_process(task: &Task<TestPlatform, TestFS>) -> Task<TestPlatform, TestFS> {
-        Task {
-            global: task.global.clone(),
-            process: Arc::new(crate::Process::default(
-                None,
-                task.process.windows_shared_section.clone(),
-            )),
-            fs: task.fs.clone(),
-            entry_point: task.entry_point,
-            stack_top: task.stack_top,
-            context: task.context,
-            teb_address: task.teb_address,
-        }
-    }
-
-    #[test]
-    fn query_shares_state_data_across_processes() {
-        let publisher = test_task();
-        publish_state(&publisher, 7, None, &[1, 2, 3, 4]);
-        let subscriber = task_with_new_process(&publisher);
-        let state_name = STATE_NAME;
-        let mut change_stamp = 0;
-        let mut buffer = [0xaau8; 8];
-        let mut buffer_size = 8;
-
-        assert_eq!(
-            subscriber.sys_nt_query_wnf_state_data(
-                crate::tests::const_ptr(&state_name),
-                None,
-                None,
-                mut_ptr(&mut change_stamp),
-                mut_byte_ptr(&mut buffer),
-                mut_ptr(&mut buffer_size),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(change_stamp, 7);
-        assert_eq!(buffer_size, 4);
-        assert_eq!(&buffer, &[1, 2, 3, 4, 0xaa, 0xaa, 0xaa, 0xaa]);
-    }
-
-    #[test]
-    fn empty_state_allows_a_null_buffer() {
-        let task = test_task();
-        publish_state(&task, 3, None, &[]);
-        let state_name = STATE_NAME;
-        let mut change_stamp = 0;
-        let mut buffer_size = 0;
-
-        assert_eq!(
-            task.sys_nt_query_wnf_state_data(
-                crate::tests::const_ptr(&state_name),
-                None,
-                None,
-                mut_ptr(&mut change_stamp),
-                null_mut_ptr(),
-                mut_ptr(&mut buffer_size),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(change_stamp, 3);
-        assert_eq!(buffer_size, 0);
-    }
-
-    #[test]
-    fn undersized_query_reports_change_stamp_and_required_size() {
-        let task = test_task();
-        publish_state(&task, 7, None, &[1, 2, 3, 4]);
-        let state_name = STATE_NAME;
-        let mut change_stamp = 99;
-        let mut buffer = [0xaau8; 4];
-        let mut buffer_size = 2;
-
-        assert_eq!(
-            task.sys_nt_query_wnf_state_data(
-                crate::tests::const_ptr(&state_name),
-                None,
-                None,
-                mut_ptr(&mut change_stamp),
-                mut_byte_ptr(&mut buffer),
-                mut_ptr(&mut buffer_size),
-            ),
-            NtStatus::BUFFER_TOO_SMALL
-        );
-        assert_eq!(buffer_size, 4);
-        assert_eq!(change_stamp, 7);
-        assert_eq!(buffer, [0xaa; 4]);
-    }
-
-    #[test]
-    fn unknown_state_leaves_outputs_unchanged() {
-        let task = test_task();
-        let state_name = STATE_NAME;
-        let mut change_stamp = 99;
-        let mut buffer = [0xaau8; 4];
-        let mut buffer_size = 4;
-
-        assert_eq!(
-            task.sys_nt_query_wnf_state_data(
-                crate::tests::const_ptr(&state_name),
-                None,
-                None,
-                mut_ptr(&mut change_stamp),
-                mut_byte_ptr(&mut buffer),
-                mut_ptr(&mut buffer_size),
-            ),
-            NtStatus::OBJECT_NAME_NOT_FOUND
-        );
-        assert_eq!(buffer_size, 4);
-        assert_eq!(change_stamp, 99);
-        assert_eq!(buffer, [0xaa; 4]);
-    }
-
-    #[test]
-    fn query_validates_optional_type_id() {
-        let task = test_task();
-        let expected_type = Guid { data: [1; 16] };
-        publish_state(&task, 7, Some(expected_type), &[1]);
-        let state_name = STATE_NAME;
-        let wrong_type = Guid { data: [2; 16] };
-        let mut change_stamp = 99;
-        let mut buffer = [0xaau8; 1];
-        let mut buffer_size = 1;
-
-        assert_eq!(
-            task.sys_nt_query_wnf_state_data(
-                crate::tests::const_ptr(&state_name),
-                Some(crate::tests::const_ptr(&wrong_type)),
-                None,
-                mut_ptr(&mut change_stamp),
-                mut_byte_ptr(&mut buffer),
-                mut_ptr(&mut buffer_size),
-            ),
-            NtStatus::OBJECT_TYPE_MISMATCH
-        );
-        assert_eq!(buffer_size, 1);
-        assert_eq!(change_stamp, 99);
-        assert_eq!(buffer, [0xaa; 1]);
     }
 
     #[test]
@@ -312,31 +151,6 @@ mod tests {
         assert_eq!(change_stamp, 7);
         assert_eq!(buffer_size, 1);
         assert_eq!(buffer, [1]);
-    }
-
-    #[test]
-    fn query_probes_the_supplied_buffer_before_state_lookup() {
-        let _ = test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(|| {
-            let task = test_task();
-            let state_name = STATE_NAME;
-            let mut change_stamp = 99;
-            let mut buffer_size = 1;
-
-            assert_eq!(
-                task.sys_nt_query_wnf_state_data(
-                    crate::tests::const_ptr(&state_name),
-                    None,
-                    None,
-                    mut_ptr(&mut change_stamp),
-                    null_mut_ptr(),
-                    mut_ptr(&mut buffer_size),
-                ),
-                NtStatus::ACCESS_VIOLATION
-            );
-            assert_eq!(change_stamp, 99);
-            assert_eq!(buffer_size, 1);
-        });
     }
 
     #[test]

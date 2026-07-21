@@ -247,6 +247,26 @@ where
         .ok_or(NtStatus::ACCESS_VIOLATION)
 }
 
+pub(crate) fn probe_guest_output_buffer<Platform>(
+    buffer: MutPtr<Platform, u8>,
+    buffer_length: usize,
+) -> Result<(), NtStatus>
+where
+    Platform: RawPointerProvider,
+{
+    if buffer_length == 0 {
+        return Ok(());
+    }
+    probe_guest_output_preserving_value::<Platform, u8>(buffer)?;
+    let last_offset = isize::try_from(buffer_length - 1).map_err(|_| NtStatus::ACCESS_VIOLATION)?;
+    let value = buffer
+        .read_at_offset(last_offset)
+        .ok_or(NtStatus::ACCESS_VIOLATION)?;
+    buffer
+        .write_at_offset(last_offset, value)
+        .ok_or(NtStatus::ACCESS_VIOLATION)
+}
+
 fn set_guest_teb<Platform>(platform: &Platform, teb_address: usize) -> bool
 where
     Platform: PunchthroughProvider + RawPointerProvider,
