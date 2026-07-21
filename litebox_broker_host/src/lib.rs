@@ -46,14 +46,14 @@ pub use error::{BrokerHostError, Result};
 /// response and do not also emit a duplicate notification.
 ///
 /// `shared_memory` belongs to this association and is reused at offset zero for
-/// serialized pipe transfers. `establish_association` runs after version
+/// serialized pipe transfers. `send_shared_memory` runs after version
 /// negotiation and before active requests begin.
 pub fn serve_connection<ControlChannel, NotificationChannel, ChannelError>(
     core: &BrokerCore,
     control_channel: &mut ControlChannel,
     _notification_channel: &mut NotificationChannel,
     shared_memory: &dyn SharedMemory,
-    establish_association: impl FnOnce(&mut ControlChannel) -> core::result::Result<(), ChannelError>,
+    send_shared_memory: impl FnOnce(&mut ControlChannel) -> core::result::Result<(), ChannelError>,
 ) -> Result<ConnectionTermination, ChannelError>
 where
     ControlChannel: HostControlChannel<Error = ChannelError>,
@@ -101,7 +101,7 @@ where
             .send_handshake_response(&response)
             .map_err(BrokerHostError::Channel)?;
         if negotiated {
-            establish_association(control_channel).map_err(BrokerHostError::Channel)?;
+            send_shared_memory(control_channel).map_err(BrokerHostError::Channel)?;
             break;
         }
     }
