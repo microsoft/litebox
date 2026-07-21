@@ -4,8 +4,7 @@
 //! A shim that provides a Linux-compatible ABI via LiteBox.
 //!
 //! This shim is generic over the choice of [LiteBox platform](../litebox/platform/index.html).
-//! The concrete platform is threaded in by the runner via [`LinuxShimBuilder::new`]; the shim
-//! never reaches for a global platform.
+//! The concrete platform is threaded in by the runner via [`LinuxShimBuilder::new`].
 
 #![no_std]
 #![expect(
