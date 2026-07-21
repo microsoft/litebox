@@ -121,8 +121,8 @@ where
             HostReceive::PeerClosed => break,
         };
 
-        let response =
-            handle_request(&session, request, shared_memory).map_err(BrokerHostError::Broker)?;
+        let response = complete_request(handle_request(&session, request, shared_memory))
+            .map_err(BrokerHostError::Broker)?;
         control_channel
             .send_response(&response)
             .map_err(BrokerHostError::Channel)?;
@@ -131,37 +131,46 @@ where
     Ok(ConnectionTermination::PeerClosed)
 }
 
+type RequestResult<T> = core::result::Result<T, RequestFailure>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestFailure {
+    /// Send an error response and continue serving the association.
+    Respond(ErrorCode),
+    /// Terminate the association without sending a response.
+    Abort(ErrorCode),
+}
+
+fn complete_request(
+    result: RequestResult<BrokerResponse>,
+) -> core::result::Result<BrokerResponse, ErrorCode> {
+    match result {
+        Ok(response) => Ok(response),
+        Err(RequestFailure::Respond(error)) => Ok(BrokerResponse::Error(error)),
+        Err(RequestFailure::Abort(error)) => Err(error),
+    }
+}
+
 fn handle_request(
     session: &BrokerSession,
     request: BrokerRequest,
     shared_memory: &dyn SharedMemory,
-) -> core::result::Result<BrokerResponse, ErrorCode> {
+) -> RequestResult<BrokerResponse> {
     match request {
-        BrokerRequest::CloseObject(handle) => match session.close_object_reference(handle) {
-            Ok(()) => Ok(BrokerResponse::ObjectClosed),
-            Err(error) => Ok(BrokerResponse::Error(error.into())),
-        },
-        BrokerRequest::CheckReadiness(handle) => Ok(match session.check_readiness(handle) {
-            Ok(readiness) => BrokerResponse::Readiness(readiness),
-            Err(error) => BrokerResponse::Error(error.into()),
-        }),
-        BrokerRequest::Event(request) => Ok(handle_event_request(session, request)),
-        BrokerRequest::Pipe(PipeRequest::Create(request)) => Ok(
-            match litebox_broker_core::pipe::create(
-                session,
-                request.capacity,
-                request.atomic_write_size,
-            ) {
-                Ok((read_handle, write_handle)) => {
-                    BrokerResponse::Pipe(PipeResponse::Create(CreatePipeResponse {
-                        read_handle,
-                        write_handle,
-                    }))
-                }
-                Err(error) => BrokerResponse::Error(error.into()),
-            },
-        ),
-        BrokerRequest::Pipe(request) => handle_pipe_request(session, request, shared_memory),
+        BrokerRequest::CloseObject(handle) => session
+            .close_object_reference(handle)
+            .map(|()| BrokerResponse::ObjectClosed)
+            .map_err(|error| RequestFailure::Respond(error.into())),
+        BrokerRequest::CheckReadiness(handle) => session
+            .check_readiness(handle)
+            .map(BrokerResponse::Readiness)
+            .map_err(|error| RequestFailure::Respond(error.into())),
+        BrokerRequest::Event(request) => {
+            handle_event_request(session, request).map(BrokerResponse::Event)
+        }
+        BrokerRequest::Pipe(request) => {
+            handle_pipe_request(session, request, shared_memory).map(BrokerResponse::Pipe)
+        }
     }
 }
 
@@ -169,82 +178,79 @@ fn handle_pipe_request(
     session: &BrokerSession,
     request: PipeRequest,
     shared_memory: &dyn SharedMemory,
-) -> core::result::Result<BrokerResponse, ErrorCode> {
-    let response: core::result::Result<PipeResponse, ErrorCode> = match request {
-        PipeRequest::Create(_) => unreachable!("pipe creation is handled separately"),
+) -> RequestResult<PipeResponse> {
+    match request {
+        PipeRequest::Create(request) => {
+            litebox_broker_core::pipe::create(session, request.capacity, request.atomic_write_size)
+                .map(|(read_handle, write_handle)| {
+                    PipeResponse::Create(CreatePipeResponse {
+                        read_handle,
+                        write_handle,
+                    })
+                })
+                .map_err(|error| RequestFailure::Respond(error.into()))
+        }
         PipeRequest::Read(request) => {
             if request.length as usize > PIPE_TRANSFER_BUFFER_SIZE {
-                return Ok(BrokerResponse::Error(ErrorCode::MalformedRequest));
+                return Err(RequestFailure::Respond(ErrorCode::MalformedRequest));
             }
-            let data =
-                match litebox_broker_core::pipe::read(session, request.handle, request.length) {
-                    Ok(data) => data,
-                    Err(error) => return Ok(BrokerResponse::Error(error.into())),
-                };
+            let data = litebox_broker_core::pipe::read(session, request.handle, request.length)
+                .map_err(|error| RequestFailure::Respond(error.into()))?;
             shared_memory
                 .write(0, &data)
-                .map_err(|_| ErrorCode::Internal)?;
+                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
             Ok(PipeResponse::Read(ReadPipeResponse {
                 read: data
                     .len()
                     .try_into()
-                    .map_err(|_| ErrorCode::ResourceExhausted)?,
+                    .map_err(|_| RequestFailure::Abort(ErrorCode::ResourceExhausted))?,
             }))
         }
         PipeRequest::Write(request) => {
             if request.length as usize > PIPE_TRANSFER_BUFFER_SIZE {
-                return Ok(BrokerResponse::Error(ErrorCode::MalformedRequest));
+                return Err(RequestFailure::Respond(ErrorCode::MalformedRequest));
             }
             let length = request.length as usize;
             let mut data = Vec::new();
             if data.try_reserve_exact(length).is_err() {
-                return Ok(BrokerResponse::Error(ErrorCode::OutOfMemory));
+                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
             }
             data.resize(length, 0);
             shared_memory
                 .read(0, &mut data)
-                .map_err(|_| ErrorCode::Internal)?;
+                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
             litebox_broker_core::pipe::write(session, request.handle, &data)
-                .map_err(ErrorCode::from)
+                .map_err(|error| RequestFailure::Respond(error.into()))
                 .and_then(|written| {
                     Ok(PipeResponse::Write(WritePipeResponse {
                         written: written
                             .try_into()
-                            .map_err(|_| ErrorCode::ResourceExhausted)?,
+                            .map_err(|_| RequestFailure::Abort(ErrorCode::ResourceExhausted))?,
                     }))
                 })
         }
-    };
-
-    Ok(match response {
-        Ok(response) => BrokerResponse::Pipe(response),
-        Err(error) => BrokerResponse::Error(error),
-    })
+    }
 }
 
-fn handle_event_request(session: &BrokerSession, request: EventRequest) -> BrokerResponse {
+fn handle_event_request(
+    session: &BrokerSession,
+    request: EventRequest,
+) -> RequestResult<EventResponse> {
     match request {
         EventRequest::Create(request) => {
-            match litebox_broker_core::event::create(session, request.initial_count) {
-                Ok(handle) => {
-                    BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }))
-                }
-                Err(error) => BrokerResponse::Error(error.into()),
-            }
+            litebox_broker_core::event::create(session, request.initial_count)
+                .map(|handle| EventResponse::Create(CreateEventResponse { handle }))
+                .map_err(|error| RequestFailure::Respond(error.into()))
         }
         EventRequest::Add(request) => {
-            match litebox_broker_core::event::add(session, request.handle, request.value) {
-                Ok(readiness) => {
-                    BrokerResponse::Event(EventResponse::Add(AddEventResponse { readiness }))
-                }
-                Err(error) => BrokerResponse::Error(error.into()),
-            }
+            litebox_broker_core::event::add(session, request.handle, request.value)
+                .map(|readiness| EventResponse::Add(AddEventResponse { readiness }))
+                .map_err(|error| RequestFailure::Respond(error.into()))
         }
         EventRequest::Consume(request) => {
-            match litebox_broker_core::event::consume(session, request.handle, request.mode) {
-                Ok(consumption) => BrokerResponse::Event(EventResponse::Consume(consumption)),
-                Err(error) => BrokerResponse::Error(error.into()),
-            }
+            litebox_broker_core::event::consume(session, request.handle, request.mode)
+                .map(EventResponse::Consume)
+                .map_err(|error| RequestFailure::Respond(error.into()))
         }
     }
 }
@@ -564,43 +570,40 @@ mod tests {
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let memory = TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE);
-        let created = handle_request(
+        let created = handle_test_request_with_memory(
             &session,
             BrokerRequest::Pipe(PipeRequest::Create(CreatePipeRequest {
                 capacity: 64,
                 atomic_write_size: 16,
             })),
             &memory,
-        )
-        .unwrap();
+        );
         let BrokerResponse::Pipe(PipeResponse::Create(response)) = created else {
             panic!("expected successful pipe creation");
         };
 
         memory.write(0, &[1, 2, 3]).unwrap();
-        let write = handle_request(
+        let write = handle_test_request_with_memory(
             &session,
             BrokerRequest::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle: response.write_handle,
                 length: 3,
             })),
             &memory,
-        )
-        .unwrap();
+        );
         assert_eq!(
             write,
             BrokerResponse::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 }))
         );
 
-        let read = handle_request(
+        let read = handle_test_request_with_memory(
             &session,
             BrokerRequest::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle: response.read_handle,
                 length: 3,
             })),
             &memory,
-        )
-        .unwrap();
+        );
         assert_eq!(
             read,
             BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 }))
@@ -609,28 +612,26 @@ mod tests {
         memory.read(0, &mut data).unwrap();
         assert_eq!(data, [1, 2, 3]);
 
-        let wrong_endpoint = handle_request(
+        let wrong_endpoint = handle_test_request_with_memory(
             &session,
             BrokerRequest::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle: response.write_handle,
                 length: 1,
             })),
             &memory,
-        )
-        .unwrap();
+        );
         assert_eq!(
             wrong_endpoint,
             BrokerResponse::Error(ErrorCode::InvalidRights)
         );
-        let invalid_range = handle_request(
+        let invalid_range = handle_test_request_with_memory(
             &session,
             BrokerRequest::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle: response.write_handle,
                 length: u32::try_from(PIPE_TRANSFER_BUFFER_SIZE).unwrap() + 1,
             })),
             &memory,
-        )
-        .unwrap();
+        );
         assert_eq!(
             invalid_range,
             BrokerResponse::Error(ErrorCode::MalformedRequest)
@@ -653,7 +654,7 @@ mod tests {
                 }),
                 &FailingSharedMemory,
             ),
-            Err(ErrorCode::Internal)
+            Err(RequestFailure::Abort(ErrorCode::Internal))
         );
     }
 
@@ -665,36 +666,49 @@ mod tests {
         let memory = TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE);
 
         assert_eq!(
-            handle_pipe_request(
-                &session,
-                PipeRequest::Read(ReadPipeRequest {
-                    handle: event_handle,
-                    length: 1,
-                }),
-                &memory,
+            complete_request(
+                handle_pipe_request(
+                    &session,
+                    PipeRequest::Read(ReadPipeRequest {
+                        handle: event_handle,
+                        length: 1,
+                    }),
+                    &memory,
+                )
+                .map(BrokerResponse::Pipe)
             ),
             Ok(BrokerResponse::Error(ErrorCode::InvalidRights))
         );
         assert_eq!(
-            handle_pipe_request(
-                &session,
-                PipeRequest::Read(ReadPipeRequest {
-                    handle: ObjectHandle(u64::MAX),
-                    length: 1,
-                }),
-                &memory,
+            complete_request(
+                handle_pipe_request(
+                    &session,
+                    PipeRequest::Read(ReadPipeRequest {
+                        handle: ObjectHandle(u64::MAX),
+                        length: 1,
+                    }),
+                    &memory,
+                )
+                .map(BrokerResponse::Pipe)
             ),
             Ok(BrokerResponse::Error(ErrorCode::UnknownObject))
         );
     }
 
     fn handle_test_request(session: &BrokerSession, request: BrokerRequest) -> BrokerResponse {
-        handle_request(
+        handle_test_request_with_memory(
             session,
             request,
             &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
         )
-        .unwrap()
+    }
+
+    fn handle_test_request_with_memory(
+        session: &BrokerSession,
+        request: BrokerRequest,
+        shared_memory: &dyn SharedMemory,
+    ) -> BrokerResponse {
+        complete_request(handle_request(session, request, shared_memory)).unwrap()
     }
 
     struct FakeHostControlChannel {
