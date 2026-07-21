@@ -7,7 +7,7 @@ use litebox::mm::linux::{MappingError, PAGE_SIZE};
 use litebox::platform::RawConstPointer;
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, user_pointers::UserPtrMut};
 
-use crate::{Task, UserMutPtr};
+use crate::{Platform, Task, UserMutPtr};
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> Option<usize> {
@@ -34,7 +34,7 @@ impl Task {
             false,
             op,
         )
-        .map(|ptr| <UserMutPtr<u8> as RawConstPointer<u8>>::from_usize(ptr.as_usize()))
+        .map(UserPtrMut::to_platform_ptr::<Platform>)
     }
 
     /// Handle syscall `mmap`

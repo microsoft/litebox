@@ -1316,11 +1316,9 @@ impl<FS: ShimFS> Task<FS> {
                 let Some(count) = core::num::NonZeroU32::new(count) else {
                     return Ok(0);
                 };
-                self.global.futex_manager.wake(
-                    litebox::platform::RawConstPointer::from_usize(addr.as_usize()),
-                    count,
-                    None,
-                )? as usize
+                self.global
+                    .futex_manager
+                    .wake(addr.to_platform_ptr::<Platform>(), count, None)? as usize
             }
             FutexArgs::Wait {
                 addr,
@@ -1332,7 +1330,7 @@ impl<FS: ShimFS> Task<FS> {
                 let timeout = timeout.read::<Platform>()?;
                 self.global.futex_manager.wait(
                     &self.wait_cx().with_timeout(timeout),
-                    litebox::platform::RawConstPointer::from_usize(addr.as_usize()),
+                    addr.to_platform_ptr::<Platform>(),
                     val,
                     None,
                 )?;
@@ -1359,7 +1357,7 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 self.global.futex_manager.wait(
                     &self.wait_cx().with_deadline(deadline),
-                    litebox::platform::RawConstPointer::from_usize(addr.as_usize()),
+                    addr.to_platform_ptr::<Platform>(),
                     val,
                     core::num::NonZeroU32::new(bitmask),
                 )?;
