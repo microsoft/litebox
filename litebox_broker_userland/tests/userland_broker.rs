@@ -105,6 +105,19 @@ fn run_fake_runner(args: &[OsString]) {
         local.check_readiness(handle).unwrap(),
         ReadinessFlags::READ | ReadinessFlags::WRITE
     );
+
+    let pipe = local.create_pipe(64, 16).unwrap();
+    let data = b"shared pipe data";
+    assert_eq!(
+        local.write_pipe(pipe.write_handle, data).unwrap(),
+        data.len()
+    );
+    assert_eq!(
+        local
+            .read_pipe(pipe.read_handle, data.len().try_into().unwrap())
+            .unwrap(),
+        data
+    );
     drop(local);
 
     // SAFETY: `getppid` takes no pointer arguments and has no Rust-side aliasing requirements.
