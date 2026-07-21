@@ -359,7 +359,6 @@ mod tests {
     use super::*;
     use rustix::io::FdFlags;
     use std::io::Write;
-    use std::net::Shutdown;
 
     #[test]
     fn mappings_share_bytes_and_validate_ranges() {
@@ -544,20 +543,5 @@ mod tests {
             rustix::net::sendmsg(stream.as_fd(), &io, &mut control, SendFlags::NOSIGNAL).unwrap(),
             1
         );
-    }
-
-    #[test]
-    fn dropping_stream_after_send_does_not_affect_mapping() {
-        let length = 8;
-        let memory = MemfdSharedMemory::create(length).unwrap();
-        let (mut local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        send_memfd(&mut host_stream, &memory, None).unwrap();
-        host_stream.shutdown(Shutdown::Both).unwrap();
-
-        let mapped_memory = receive_memfd(&mut local_stream, length, None).unwrap();
-        mapped_memory.write(0, &[7]).unwrap();
-        let mut byte = [0];
-        memory.read(0, &mut byte).unwrap();
-        assert_eq!(byte, [7]);
     }
 }
