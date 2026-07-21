@@ -2168,7 +2168,7 @@ impl<FS: ShimFS> Task<FS> {
             // TODO: This is not great from a provenance perspective. Consider
             // adding cast+add methods to UserPtr/UserPtrMut.
             let fd_addr = fds_base_addr + i * core::mem::size_of::<litebox_common_linux::Pollfd>();
-            let revents_ptr = crate::UserPtrMut::<i16>::from_usize(
+            let revents_ptr = UserPtrMut::<i16>::from_usize(
                 fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
             );
             let revents: u16 = revents.bits().trunc();
@@ -2544,11 +2544,11 @@ impl<FS: ShimFS> Task<FS> {
                         typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
                         __name: [0; 0],
                     };
-                    let hdr_ptr = crate::UserPtrMut::from_usize(dirp.as_usize() + nbytes);
+                    let hdr_ptr = UserPtrMut::from_usize(dirp.as_usize() + nbytes);
                     hdr_ptr
                         .write_at_offset::<Platform>(0, dirent64)
                         .ok_or(Errno::EFAULT)?;
-                    let name_ptr = crate::UserPtrMut::from_usize(
+                    let name_ptr = UserPtrMut::from_usize(
                         hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME,
                     );
                     name_ptr

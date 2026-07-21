@@ -165,7 +165,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         len: usize,
         prot: &litebox_common_linux::loader::Protection,
     ) -> Result<(), Self::Error> {
-        let addr = crate::UserPtrMut::<u8>::from_usize(address);
+        let addr = UserPtrMut::<u8>::from_usize(address);
         self.task.sys_mprotect(addr, len, prot.flags())
     }
 }

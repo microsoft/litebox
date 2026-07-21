@@ -379,7 +379,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `munmap`
     #[inline]
-    pub(crate) fn sys_munmap(&self, addr: crate::UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
+    pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
         let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
             self.clear_file_mappings_for_range(addr.as_usize(), len);
@@ -390,7 +390,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Raw munmap without clearing file_mappings — used internally by the
     /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
     #[inline]
-    fn sys_munmap_raw(&self, addr: crate::UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
+    fn sys_munmap_raw(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
         litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
     }
 
@@ -416,7 +416,7 @@ impl<FS: ShimFS> Task<FS> {
     #[inline]
     pub(crate) fn sys_mprotect(
         &self,
-        addr: crate::UserPtrMut<u8>,
+        addr: UserPtrMut<u8>,
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
@@ -435,7 +435,7 @@ impl<FS: ShimFS> Task<FS> {
     #[inline]
     fn sys_mprotect_raw(
         &self,
-        addr: crate::UserPtrMut<u8>,
+        addr: UserPtrMut<u8>,
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
@@ -445,12 +445,12 @@ impl<FS: ShimFS> Task<FS> {
     #[inline]
     pub(crate) fn sys_mremap(
         &self,
-        old_addr: crate::UserPtrMut<u8>,
+        old_addr: UserPtrMut<u8>,
         old_size: usize,
         new_size: usize,
         flags: MRemapFlags,
         new_addr: usize,
-    ) -> Result<crate::UserPtrMut<u8>, Errno> {
+    ) -> Result<UserPtrMut<u8>, Errno> {
         litebox_common_linux::mm::sys_mremap(
             &self.global.pm,
             old_addr,
@@ -483,12 +483,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Check all tracked file mappings for unpatched regions that overlap the
     /// mprotect range. If found, run the runtime rewriter before the region
     /// becomes executable.
-    fn maybe_patch_on_mprotect_exec(
-        &self,
-        addr: crate::UserPtrMut<u8>,
-        len: usize,
-        syscall_entry: usize,
-    ) {
+    fn maybe_patch_on_mprotect_exec(&self, addr: UserPtrMut<u8>, len: usize, syscall_entry: usize) {
         let mprotect_start = addr.as_usize();
         let mprotect_end = mprotect_start.saturating_add(len);
 
@@ -718,12 +713,7 @@ impl<FS: ShimFS> Task<FS> {
     /// and the initial mprotect RW is skipped.
     ///
     /// Panics on infrastructure failures (mprotect/read/write/disassembly).
-    fn apply_trap_fallback(
-        &self,
-        mapped_addr: crate::UserPtrMut<u8>,
-        len: usize,
-        already_rw: bool,
-    ) {
+    fn apply_trap_fallback(&self, mapped_addr: UserPtrMut<u8>, len: usize, already_rw: bool) {
         if !already_rw {
             self.sys_mprotect_raw(
                 mapped_addr,
@@ -1142,7 +1132,7 @@ mod tests {
     use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
     use litebox_platform_multiplex::Platform;
 
-    use crate::syscalls::tests::init_platform;
+    use crate::{UserPtrMut, syscalls::tests::init_platform};
 
     #[test]
     fn test_anonymous_mmap() {
@@ -1426,7 +1416,7 @@ mod tests {
         // grow the mapping without MREMAP_MAYMOVE should fail as the new region collides with the global allocator
         let err = task
             .sys_mremap(
-                crate::UserPtrMut::from_usize(addr - 0x1000),
+                UserPtrMut::from_usize(addr - 0x1000),
                 0x1000,
                 0x2000,
                 MRemapFlags::empty(),
@@ -1578,7 +1568,7 @@ mod tests {
     fn test_fallible_read() {
         let _ = init_platform(None);
 
-        let ptr = crate::UserPtrMut::<u8>::from_usize(0xdeadbeef);
+        let ptr = UserPtrMut::<u8>::from_usize(0xdeadbeef);
         let result = ptr.read_at_offset::<Platform>(0);
         assert!(result.is_none());
     }

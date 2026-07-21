@@ -39,6 +39,7 @@ macro_rules! common_functions_for_file_status {
     };
 }
 
+use crate::{UserPtr, UserPtrMut};
 pub(crate) use common_functions_for_file_status;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -46,7 +47,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 /// If the buffer size (i.e., provided `len`) is smaller than `size_of::<T>()`, only write up to `len` bytes.
 fn write_to_user<T: FromBytes + IntoBytes + Immutable>(
     val: T,
-    optval: crate::UserPtrMut<u8>,
+    optval: UserPtrMut<u8>,
     len: u32,
 ) -> Result<usize, litebox_common_linux::errno::Errno> {
     use litebox_platform_multiplex::Platform;
@@ -60,14 +61,14 @@ fn write_to_user<T: FromBytes + IntoBytes + Immutable>(
 /// Helper function to read a value of type T from user memory.
 /// If the buffer size (i.e., provided `optlen`) is smaller than `size_of::<T>()`, return EINVAL.
 fn read_from_user<T: FromBytes>(
-    optval: crate::UserPtr<u8>,
+    optval: UserPtr<u8>,
     optlen: usize,
 ) -> Result<T, litebox_common_linux::errno::Errno> {
     use litebox_platform_multiplex::Platform;
     if optlen < size_of::<T>() {
         return Err(litebox_common_linux::errno::Errno::EINVAL);
     }
-    let optval: crate::UserPtr<T> = crate::UserPtr::from_usize(optval.as_usize());
+    let optval: UserPtr<T> = UserPtr::from_usize(optval.as_usize());
     optval
         .read_at_offset::<Platform>(0)
         .ok_or(litebox_common_linux::errno::Errno::EFAULT)

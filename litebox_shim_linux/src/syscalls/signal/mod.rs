@@ -387,8 +387,8 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_rt_sigprocmask(
         &self,
         how: SigmaskHow,
-        set_ptr: Option<crate::UserPtr<SigSet>>,
-        oldset_ptr: Option<crate::UserPtrMut<SigSet>>,
+        set_ptr: Option<UserPtr<SigSet>>,
+        oldset_ptr: Option<UserPtrMut<SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigsetsize != core::mem::size_of::<SigSet>() {

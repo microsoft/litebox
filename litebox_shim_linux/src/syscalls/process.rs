@@ -430,11 +430,7 @@ const ROBUST_LIST_LIMIT: isize = 2048;
  * Process a futex-list entry, check whether it's owned by the
  * dying task, and do notification if so:
  */
-fn handle_futex_death(
-    futex_addr: crate::UserPtr<u32>,
-    _pi: bool,
-    _pending_op: bool,
-) -> Result<(), Errno> {
+fn handle_futex_death(futex_addr: UserPtr<u32>, _pi: bool, _pending_op: bool) -> Result<(), Errno> {
     if !futex_addr.as_usize().is_multiple_of(4) {
         return Err(Errno::EINVAL);
     }
@@ -443,29 +439,27 @@ fn handle_futex_death(
 }
 
 fn fetch_robust_entry(
-    head: crate::UserPtr<litebox_common_linux::RobustList>,
-) -> (crate::UserPtr<litebox_common_linux::RobustList>, bool) {
+    head: UserPtr<litebox_common_linux::RobustList>,
+) -> (UserPtr<litebox_common_linux::RobustList>, bool) {
     let next = head.as_usize();
-    (crate::UserPtr::from_usize(next & !1), next & 1 != 0)
+    (UserPtr::from_usize(next & !1), next & 1 != 0)
 }
 
-fn wake_robust_list(
-    head: crate::UserPtr<litebox_common_linux::RobustListHead>,
-) -> Result<(), Errno> {
+fn wake_robust_list(head: UserPtr<litebox_common_linux::RobustListHead>) -> Result<(), Errno> {
     let mut limit = ROBUST_LIST_LIMIT;
     let head_ptr = head.as_usize();
     let head = head.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-    let (mut entry, mut pi) = fetch_robust_entry(crate::UserPtr::from_usize(head.list.next));
-    let (pending, ppi) = fetch_robust_entry(crate::UserPtr::from_usize(head.list_op_pending));
+    let (mut entry, mut pi) = fetch_robust_entry(UserPtr::from_usize(head.list.next));
+    let (pending, ppi) = fetch_robust_entry(UserPtr::from_usize(head.list_op_pending));
     let futex_offset = head.futex_offset;
     let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
     while entry.as_usize() != entry_head && limit > 0 {
         let nxt = entry
             .read_at_offset::<Platform>(0)
-            .map(|e| fetch_robust_entry(crate::UserPtr::from_usize(e.next)));
+            .map(|e| fetch_robust_entry(UserPtr::from_usize(e.next)));
         if entry.as_usize() != pending.as_usize() {
             handle_futex_death(
-                crate::UserPtr::from_usize(entry.as_usize() + futex_offset),
+                UserPtr::from_usize(entry.as_usize() + futex_offset),
                 pi,
                 false,
             )?;
@@ -481,7 +475,7 @@ fn wake_robust_list(
 
     if pending.as_usize() != 0 {
         let _ = handle_futex_death(
-            crate::UserPtr::from_usize(pending.as_usize() + futex_offset),
+            UserPtr::from_usize(pending.as_usize() + futex_offset),
             ppi,
             true,
         );
@@ -499,7 +493,7 @@ impl<FS: ShimFS> Task<FS> {
             // TODO: if we are the last thread, we don't need to clear it
             let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
             // Cast from *i32 to *u32
-            let clear_child_tid = crate::UserPtrMut::from_usize(clear_child_tid.as_usize());
+            let clear_child_tid = UserPtrMut::from_usize(clear_child_tid.as_usize());
             let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
                 addr: clear_child_tid,
                 flags: litebox_common_linux::FutexFlags::PRIVATE,
@@ -744,7 +738,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `set_tid_address`.
-    pub(crate) fn sys_set_tid_address(&self, tidptr: crate::UserPtrMut<i32>) -> i32 {
+    pub(crate) fn sys_set_tid_address(&self, tidptr: UserPtrMut<i32>) -> i32 {
         self.thread.clear_child_tid.set(Some(tidptr));
         self.tid
     }
@@ -875,8 +869,8 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         pid: i32,
         resource: litebox_common_linux::RlimitResource,
-        new_rlim: Option<crate::UserPtr<litebox_common_linux::Rlimit64>>,
-        old_rlim: Option<crate::UserPtrMut<litebox_common_linux::Rlimit64>>,
+        new_rlim: Option<UserPtr<litebox_common_linux::Rlimit64>>,
+        old_rlim: Option<UserPtrMut<litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
         if pid != 0 {
             unimplemented!("prlimit for a specific PID is not supported yet");
@@ -902,7 +896,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_getrlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
-        rlim: crate::UserPtrMut<litebox_common_linux::Rlimit>,
+        rlim: UserPtrMut<litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
         let old_limit = self.do_prlimit(resource, None)?;
         rlim.write_at_offset::<Platform>(0, old_limit)
@@ -913,7 +907,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_setrlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
-        rlim: crate::UserPtr<litebox_common_linux::Rlimit>,
+        rlim: UserPtr<litebox_common_linux::Rlimit>,
     ) -> Result<(), Errno> {
         let new_limit = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         let _ = self.do_prlimit(resource, Some(new_limit))?;
@@ -922,7 +916,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `set_robust_list`.
     pub(crate) fn sys_set_robust_list(&self, head: usize) {
-        let head = crate::UserPtr::from_usize(head);
+        let head = UserPtr::from_usize(head);
         self.thread.robust_list.set(Some(head));
     }
 
@@ -930,7 +924,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_get_robust_list(
         &self,
         pid: Option<i32>,
-        head_ptr: crate::UserPtrMut<usize>,
+        head_ptr: UserPtrMut<usize>,
     ) -> Result<(), Errno> {
         if pid.is_some() {
             unimplemented!("Getting robust list for a specific PID is not supported yet");
@@ -1093,8 +1087,8 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `gettimeofday`.
     pub(crate) fn sys_gettimeofday(
         &self,
-        tv: Option<crate::UserPtrMut<litebox_common_linux::TimeVal>>,
-        tz: Option<crate::UserPtrMut<litebox_common_linux::TimeZone>>,
+        tv: Option<UserPtrMut<litebox_common_linux::TimeVal>>,
+        tz: Option<UserPtrMut<litebox_common_linux::TimeZone>>,
     ) -> Result<(), Errno> {
         if let Some(tz) = tz {
             // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
@@ -1114,7 +1108,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `time`.
     pub(crate) fn sys_time(
         &self,
-        tloc: Option<crate::UserPtrMut<litebox_common_linux::time_t>>,
+        tloc: Option<UserPtrMut<litebox_common_linux::time_t>>,
     ) -> Result<litebox_common_linux::time_t, Errno> {
         let time = self.real_time_as_duration_since_epoch();
         let seconds: u64 = time.as_secs();
@@ -1464,19 +1458,19 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
-        pathname: crate::UserPtr<i8>,
-        argv: crate::UserPtr<crate::UserPtr<i8>>,
-        envp: crate::UserPtr<crate::UserPtr<i8>>,
+        pathname: UserPtr<i8>,
+        argv: UserPtr<UserPtr<i8>>,
+        envp: UserPtr<UserPtr<i8>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         fn copy_vector(
-            mut base: crate::UserPtr<crate::UserPtr<i8>>,
+            mut base: UserPtr<UserPtr<i8>>,
             _which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
-                let p: crate::UserPtr<i8> = {
+                let p: UserPtr<i8> = {
                     // read pointer-sized entries
                     match base.read_at_offset::<Platform>(0) {
                         Some(ptr) => ptr,
@@ -1495,7 +1489,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 out.push(cs);
                 // advance to next pointer
-                base = crate::UserPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());
+                base = UserPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());
             }
             Ok(out)
         }
@@ -1654,12 +1648,14 @@ impl<FS: ShimFS> Task<FS> {
 
 #[cfg(test)]
 mod tests {
+    use crate::{UserPtr, UserPtrMut};
+
     extern crate std;
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_arch_prctl() {
-        use crate::{UserPtrMut, syscalls::tests::init_platform};
+        use crate::syscalls::tests::init_platform;
         use litebox_common_linux::ArchPrctlArg;
 
         let task = init_platform(None);
@@ -1684,7 +1680,7 @@ mod tests {
         assert_eq!(current_fs_base, new_fs_base.as_ptr() as usize);
 
         // Restore old FS base
-        let ptr: crate::UserPtrMut<u8> = crate::UserPtrMut::from_usize(old_fs_base);
+        let ptr: UserPtrMut<u8> = UserPtrMut::from_usize(old_fs_base);
         task.sys_arch_prctl(ArchPrctlArg::SetFs(ptr.as_usize()))
             .expect("Failed to restore FS base");
     }
@@ -1712,13 +1708,13 @@ mod tests {
         let name: &[u8] = b"litebox-test\0";
 
         // Call prctl(PR_SET_NAME, set_buf)
-        let set_ptr = crate::UserPtr::from_ptr(name.as_ptr());
+        let set_ptr = UserPtr::from_ptr(name.as_ptr());
         task.sys_prctl(litebox_common_linux::PrctlArg::SetName(set_ptr))
             .expect("sys_prctl SetName failed");
 
         // Prepare buffer for prctl(PR_GET_NAME, get_buf)
         let mut get_buf = [0u8; litebox_common_linux::TASK_COMM_LEN];
-        let get_ptr = crate::UserPtrMut::from_ptr(get_buf.as_mut_ptr());
+        let get_ptr = UserPtrMut::from_ptr(get_buf.as_mut_ptr());
 
         task.sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
             .expect("sys_prctl GetName failed");
@@ -1730,13 +1726,13 @@ mod tests {
 
         // Test too long name
         let long_name = [b'a'; litebox_common_linux::TASK_COMM_LEN + 10];
-        let long_name_ptr = crate::UserPtr::from_ptr(long_name.as_ptr());
+        let long_name_ptr = UserPtr::from_ptr(long_name.as_ptr());
         task.sys_prctl(litebox_common_linux::PrctlArg::SetName(long_name_ptr))
             .expect("sys_prctl SetName failed");
 
         // Get the name again
         let mut get_buf = [0u8; litebox_common_linux::TASK_COMM_LEN];
-        let get_ptr = crate::UserPtrMut::from_ptr(get_buf.as_mut_ptr());
+        let get_ptr = UserPtrMut::from_ptr(get_buf.as_mut_ptr());
         task.sys_prctl(litebox_common_linux::PrctlArg::GetName(get_ptr))
             .expect("sys_prctl GetName failed");
         assert_eq!(
@@ -1772,7 +1768,7 @@ mod tests {
                 restorer: 0,
                 mask: SigSet::empty(),
             };
-            let act_ptr = crate::UserPtr::from_ptr(&raw const act);
+            let act_ptr = UserPtr::from_ptr(&raw const act);
             task.sys_rt_sigaction(
                 Signal::SIGINT,
                 Some(act_ptr),
@@ -1799,7 +1795,7 @@ mod tests {
             let result = task.sys_clock_nanosleep(
                 ClockId::Monotonic,
                 TimerFlags::empty(),
-                litebox_common_linux::TimeParam::Timespec64(crate::UserPtrMut::from_ptr(
+                litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(
                     &raw mut request,
                 )),
                 litebox_common_linux::TimeParam::None,
@@ -1852,8 +1848,8 @@ mod tests {
             let result = task.sys_clock_nanosleep(
                 ClockId::Monotonic,
                 TimerFlags::empty(),
-                litebox_common_linux::TimeParam::Timespec64(crate::UserPtrMut::from_ptr(&raw mut request)),
-                litebox_common_linux::TimeParam::Timespec64(crate::UserPtrMut::from_ptr(&raw mut remain)),
+                litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut request)),
+                litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut remain)),
             );
 
             let elapsed = platform.now().duration_since(&start);
@@ -1906,7 +1902,7 @@ mod tests {
             let result = task.sys_clock_nanosleep(
                 ClockId::Monotonic,
                 TimerFlags::empty(),
-                litebox_common_linux::TimeParam::Timespec64(crate::UserPtrMut::from_ptr(&raw mut request)),
+                litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut request)),
                 litebox_common_linux::TimeParam::None,
             );
             assert_eq!(result, Ok(()), "nanosleep should not have been interrupted");
@@ -1931,7 +1927,7 @@ mod tests {
             let block_set = SigSet::empty().with(Signal::SIGUSR1);
             task.sys_rt_sigprocmask(
                 SigmaskHow::SIG_BLOCK,
-                Some(crate::UserPtr::from_ptr(&raw const block_set)),
+                Some(UserPtr::from_ptr(&raw const block_set)),
                 None,
                 core::mem::size_of::<SigSet>(),
             )
@@ -1948,7 +1944,7 @@ mod tests {
 
             task.sys_rt_sigprocmask(
                 SigmaskHow::SIG_UNBLOCK,
-                Some(crate::UserPtr::from_ptr(&raw const block_set)),
+                Some(UserPtr::from_ptr(&raw const block_set)),
                 None,
                 core::mem::size_of::<SigSet>(),
             )
@@ -1984,7 +1980,7 @@ mod tests {
                 restorer: 0,
                 mask: SigSet::empty(),
             };
-            let act_ptr = crate::UserPtr::from_ptr(&raw const act);
+            let act_ptr = UserPtr::from_ptr(&raw const act);
             task.sys_rt_sigaction(
                 Signal::SIGALRM,
                 Some(act_ptr),
@@ -2002,7 +1998,7 @@ mod tests {
             let result = task.sys_clock_nanosleep(
                 ClockId::Monotonic,
                 TimerFlags::empty(),
-                litebox_common_linux::TimeParam::Timespec64(crate::UserPtrMut::from_ptr(&raw mut request)),
+                litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut request)),
                 litebox_common_linux::TimeParam::None,
             );
 
@@ -2047,7 +2043,7 @@ mod tests {
             let result = task.sys_clock_nanosleep(
                 ClockId::Monotonic,
                 TimerFlags::empty(),
-                litebox_common_linux::TimeParam::Timespec64(crate::UserPtrMut::from_ptr(
+                litebox_common_linux::TimeParam::Timespec64(UserPtrMut::from_ptr(
                     &raw mut request,
                 )),
                 litebox_common_linux::TimeParam::None,

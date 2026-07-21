@@ -1114,8 +1114,8 @@ pub(crate) fn read_sockaddr_from_user(
 
 pub(crate) fn write_sockaddr_to_user(
     sock_addr: SocketAddress,
-    addr: crate::UserPtrMut<u8>,
-    addrlen: crate::UserPtrMut<u32>,
+    addr: UserPtrMut<u8>,
+    addrlen: UserPtrMut<u32>,
 ) -> Result<(), Errno> {
     let addrlen_val = addrlen.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
     if addrlen_val >= i32::MAX as u32 {
@@ -2119,7 +2119,7 @@ mod tests {
             data: u64::from(target_fd),
         };
         let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
-        let ev_const = crate::UserPtr::from_usize(ev_ptr as usize);
+        let ev_const = UserPtr::from_usize(ev_ptr as usize);
         task.sys_epoll_ctl(
             epfd,
             litebox_common_linux::EpollOp::EpollCtlAdd,
@@ -2134,7 +2134,7 @@ mod tests {
         epfd: i32,
         events: &mut [litebox_common_linux::EpollEvent],
     ) -> usize {
-        let events_ptr = crate::UserPtrMut::from_usize(events.as_mut_ptr() as usize);
+        let events_ptr = UserPtrMut::from_usize(events.as_mut_ptr() as usize);
         task.sys_epoll_pwait(epfd, events_ptr, events.len().trunc(), -1, None, 0)
             .expect("epoll_wait failed")
     }
