@@ -213,10 +213,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
         let frame = read_frame_with_deadline(&mut self.stream, self.setup_deadline)?;
-        if self.setup_deadline.take().is_some() {
-            self.stream.set_read_timeout(None)?;
-            self.stream.set_write_timeout(None)?;
-        }
+        self.setup_deadline = None;
         match frame {
             Some(frame) => decode_handshake_response(&frame)
                 .map(Some)
@@ -262,11 +259,8 @@ impl HostControlChannel for UnixStreamHostControlChannel {
             &encode_handshake_response(response.clone()),
             self.setup_deadline,
         )?;
-        if matches!(response, BrokerHandshakeResponse::Negotiated { .. })
-            && self.setup_deadline.take().is_some()
-        {
-            self.stream.set_read_timeout(None)?;
-            self.stream.set_write_timeout(None)?;
+        if matches!(response, BrokerHandshakeResponse::Negotiated { .. }) {
+            self.setup_deadline = None;
         }
         Ok(())
     }
@@ -314,10 +308,14 @@ fn read_frame_with_deadline(
     stream: &mut UnixStream,
     deadline: Option<Instant>,
 ) -> IoResult<Option<Vec<u8>>> {
+    with_read_deadline(stream, deadline, read_frame)
+}
+
+fn read_frame(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Option<Vec<u8>>> {
     let mut len_buf = [0; 4];
     let mut read = 0;
     while read < len_buf.len() {
-        refresh_stream_io_deadline(stream, deadline)?;
+        refresh_read_deadline(stream, deadline)?;
         match stream.read(&mut len_buf[read..]) {
             Ok(0) if read == 0 => return Ok(None),
             Ok(0) => return Err(invalid_data("truncated broker frame length")),
@@ -335,7 +333,7 @@ fn read_frame_with_deadline(
     let mut frame = vec![0; len];
     let mut read = 0;
     while read < frame.len() {
-        refresh_stream_io_deadline(stream, deadline)?;
+        refresh_read_deadline(stream, deadline)?;
         match stream.read(&mut frame[read..]) {
             Ok(0) => return Err(invalid_data("truncated broker frame")),
             Ok(len) => read += len,
@@ -351,6 +349,12 @@ fn write_frame_with_deadline(
     frame: &[u8],
     deadline: Option<Instant>,
 ) -> IoResult<()> {
+    with_write_deadline(stream, deadline, |stream, deadline| {
+        write_frame(stream, frame, deadline)
+    })
+}
+
+fn write_frame(stream: &mut UnixStream, frame: &[u8], deadline: Option<Instant>) -> IoResult<()> {
     if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
         return Err(invalid_data("invalid broker frame length"));
     }
@@ -365,7 +369,7 @@ fn write_all_with_deadline(
     deadline: Option<Instant>,
 ) -> IoResult<()> {
     while !buffer.is_empty() {
-        refresh_stream_io_deadline(stream, deadline)?;
+        refresh_write_deadline(stream, deadline)?;
         match stream.write(buffer) {
             Ok(0) => {
                 return Err(Error::new(
@@ -381,13 +385,59 @@ fn write_all_with_deadline(
     Ok(())
 }
 
-fn refresh_stream_io_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
+fn with_read_deadline<Output>(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+    operation: impl FnOnce(&mut UnixStream, Option<Instant>) -> IoResult<Output>,
+) -> IoResult<Output> {
+    let Some(_) = deadline else {
+        return operation(stream, None);
+    };
+    let previous = stream.read_timeout()?;
+    let result = operation(stream, deadline);
+    combine_result_with_restore(result, stream.set_read_timeout(previous))
+}
+
+fn with_write_deadline<Output>(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+    operation: impl FnOnce(&mut UnixStream, Option<Instant>) -> IoResult<Output>,
+) -> IoResult<Output> {
+    let Some(_) = deadline else {
+        return operation(stream, None);
+    };
+    let previous = stream.write_timeout()?;
+    let result = operation(stream, deadline);
+    combine_result_with_restore(result, stream.set_write_timeout(previous))
+}
+
+fn refresh_read_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
+    if let Some(deadline) = deadline {
+        stream.set_read_timeout(Some(io_timeout_for_deadline(deadline)?))?;
+    }
+    Ok(())
+}
+
+fn refresh_write_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
     if let Some(deadline) = deadline {
         let timeout = io_timeout_for_deadline(deadline)?;
-        stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
     }
     Ok(())
+}
+
+fn combine_result_with_restore<Output>(
+    result: IoResult<Output>,
+    restore: IoResult<()>,
+) -> IoResult<Output> {
+    match (result, restore) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(operation), Err(restore)) => Err(Error::new(
+            operation.kind(),
+            format!("{operation}; additionally failed to restore socket timeout: {restore}"),
+        )),
+    }
 }
 
 fn io_timeout_for_deadline(deadline: Instant) -> IoResult<Duration> {
@@ -547,13 +597,30 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_host_handshake_clears_setup_deadline() {
-        let (_local_stream, host_stream) = UnixStream::pair().unwrap();
+    fn negotiated_host_handshake_restores_active_timeouts() {
+        let (mut local_stream, host_stream) = UnixStream::pair().unwrap();
+        let active_read_timeout = Some(Duration::from_secs(2));
+        let active_write_timeout = Some(Duration::from_secs(3));
+        host_stream.set_read_timeout(active_read_timeout).unwrap();
+        host_stream.set_write_timeout(active_write_timeout).unwrap();
         let mut channel = UnixStreamHostControlChannel::from_host_guaranteed(
             host_stream,
             Instant::now() + Duration::from_secs(1),
         );
+        let request = BrokerHandshakeRequest {
+            protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+        };
 
+        write_frame_with_deadline(
+            &mut local_stream,
+            &encode_handshake_request(request.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            channel.recv_handshake_request().unwrap(),
+            HostReceive::Message(request)
+        );
         channel
             .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
@@ -561,8 +628,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(channel.setup_deadline, None);
-        assert_eq!(channel.stream.read_timeout().unwrap(), None);
-        assert_eq!(channel.stream.write_timeout().unwrap(), None);
+        assert_eq!(channel.stream.read_timeout().unwrap(), active_read_timeout);
+        assert_eq!(
+            channel.stream.write_timeout().unwrap(),
+            active_write_timeout
+        );
     }
 
     #[test]

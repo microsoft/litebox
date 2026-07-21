@@ -159,6 +159,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
 
+    let broker_connection = match (
+        cli_args.broker_control_socket.as_deref(),
+        cli_args.broker_notification_socket.as_deref(),
+    ) {
+        (Some(control_socket_path), Some(notification_socket_path)) => Some(broker::connect(
+            control_socket_path,
+            notification_socket_path,
+        )?),
+        (None, None) => None,
+        (Some(_), None) => {
+            anyhow::bail!("broker notification socket is required with broker control socket")
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("broker control socket is required with broker notification socket")
+        }
+    };
+
     let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
 
     // When --program-from-tar is set, the program binary is already in the tar file,
@@ -223,22 +240,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
-    let broker_connection = match (
-        cli_args.broker_control_socket.as_deref(),
-        cli_args.broker_notification_socket.as_deref(),
-    ) {
-        (Some(control_socket_path), Some(notification_socket_path)) => Some(broker::connect(
-            control_socket_path,
-            notification_socket_path,
-        )?),
-        (None, None) => None,
-        (Some(_), None) => {
-            anyhow::bail!("broker notification socket is required with broker control socket")
-        }
-        (None, Some(_)) => {
-            anyhow::bail!("broker control socket is required with broker notification socket")
-        }
-    };
 
     let shim_builder = if let Some(broker_connection) = broker_connection {
         let (broker_local, broker_notifications, broker_control_cancellation) = broker_connection;
