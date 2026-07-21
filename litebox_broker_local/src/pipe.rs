@@ -51,33 +51,6 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        self.read_pipe_shared(handle, length)
-    }
-
-    /// Writes bytes to a broker-owned pipe.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker reports an unrecoverable error or returns a
-    /// response that does not match the issued pipe request.
-    pub fn write_pipe(
-        &mut self,
-        handle: ObjectHandle,
-        data: &[u8],
-    ) -> Result<usize, Channel::Error> {
-        if data.len() > PIPE_TRANSFER_BUFFER_SIZE {
-            return Err(BrokerLocalError::Broker(
-                litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
-            ));
-        }
-        self.write_pipe_shared(handle, data)
-    }
-
-    fn read_pipe_shared(
-        &mut self,
-        handle: ObjectHandle,
-        length: u32,
-    ) -> Result<Vec<u8>, Channel::Error> {
         let mut data = Vec::new();
         data.try_reserve_exact(length as usize).map_err(|_| {
             BrokerLocalError::Broker(litebox_broker_protocol::error::ErrorCode::OutOfMemory)
@@ -99,11 +72,22 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         Ok(data)
     }
 
-    fn write_pipe_shared(
+    /// Writes bytes to a broker-owned pipe.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a
+    /// response that does not match the issued pipe request.
+    pub fn write_pipe(
         &mut self,
         handle: ObjectHandle,
         data: &[u8],
     ) -> Result<usize, Channel::Error> {
+        if data.len() > PIPE_TRANSFER_BUFFER_SIZE {
+            return Err(BrokerLocalError::Broker(
+                litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
+            ));
+        }
         self.shared_memory
             .write(0, data)
             .expect("validated shared pipe write range must be accessible");
