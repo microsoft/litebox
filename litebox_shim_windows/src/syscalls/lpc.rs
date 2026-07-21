@@ -33,8 +33,11 @@ impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for LpcPortSubsystem<
         desired_access
     }
 
-    fn maximum_allowed_access() -> u32 {
-        0
+    fn resolve_duplicate_access(
+        _entry: &Self::Entry,
+        desired_access: u32,
+    ) -> Result<u32, NtStatus> {
+        Ok(desired_access & !crate::nt_types::AccessMask::MAXIMUM_ALLOWED.bits())
     }
 }
 

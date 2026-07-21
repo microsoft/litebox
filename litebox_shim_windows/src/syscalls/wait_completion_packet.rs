@@ -66,10 +66,6 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
     fn normalize_desired_access(desired_access: u32) -> u32 {
         WaitCompletionPacketAccess::from_desired_access(desired_access).bits()
     }
-
-    fn maximum_allowed_access() -> u32 {
-        WaitCompletionPacketAccess::ALL_ACCESS.bits()
-    }
 }
 
 pub(crate) struct WaitCompletionPacketHandleObject<Platform: crate::ShimPlatform> {

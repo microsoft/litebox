@@ -82,10 +82,6 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for EventSubsy
     fn normalize_desired_access(desired_access: u32) -> u32 {
         EventAccess::from_desired_access(desired_access).bits()
     }
-
-    fn maximum_allowed_access() -> u32 {
-        EventAccess::ALL_ACCESS.bits()
-    }
 }
 
 pub(crate) struct EventHandleObject<Platform: crate::ShimPlatform> {

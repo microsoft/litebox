@@ -76,10 +76,6 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for TimerSubsy
     fn normalize_desired_access(desired_access: u32) -> u32 {
         TimerAccess::from_desired_access(desired_access).bits()
     }
-
-    fn maximum_allowed_access() -> u32 {
-        TimerAccess::ALL_ACCESS.bits()
-    }
 }
 
 pub(crate) struct TimerHandleObject<Platform: crate::ShimPlatform> {

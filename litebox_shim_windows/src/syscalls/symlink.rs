@@ -64,10 +64,6 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
     fn normalize_desired_access(desired_access: u32) -> u32 {
         SymbolicLinkAccess::from_desired_access(desired_access).bits()
     }
-
-    fn maximum_allowed_access() -> u32 {
-        SymbolicLinkAccess::ALL_ACCESS.bits()
-    }
 }
 
 pub(crate) struct SymbolicLinkHandleObject<Platform: crate::ShimPlatform> {

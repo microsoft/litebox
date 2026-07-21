@@ -65,10 +65,6 @@ impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for SectionSubsystem<
     fn normalize_desired_access(desired_access: u32) -> u32 {
         SectionAccess::from_desired_access(desired_access).bits()
     }
-
-    fn maximum_allowed_access() -> u32 {
-        SectionAccess::ALL_ACCESS.bits()
-    }
 }
 
 pub(crate) struct SectionHandleObject<Platform: ShimPlatform> {

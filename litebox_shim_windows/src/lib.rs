@@ -121,18 +121,15 @@ struct WindowsHandleMetadata {
 pub(crate) trait WindowsHandleSubsystem: litebox::fd::FdEnabledSubsystem {
     fn normalize_desired_access(desired_access: u32) -> u32;
 
-    fn maximum_allowed_access() -> u32;
-
     fn resolve_duplicate_access(
         _entry: &Self::Entry,
-        _source_access: u32,
         desired_access: u32,
     ) -> Result<u32, NtStatus> {
         let maximum_allowed = desired_access & nt_types::AccessMask::MAXIMUM_ALLOWED.bits() != 0;
         let explicit_access = desired_access & !nt_types::AccessMask::MAXIMUM_ALLOWED.bits();
         let normalized = Self::normalize_desired_access(explicit_access);
         Ok(if maximum_allowed {
-            normalized | Self::maximum_allowed_access()
+            normalized | Self::normalize_desired_access(nt_types::AccessMask::GENERIC_ALL.bits())
         } else {
             normalized
         })
@@ -1843,7 +1840,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             let descriptors = self.global.litebox.descriptor_table();
             match descriptors.with_entry(&typed, |entry| {
-                Subsystem::resolve_duplicate_access(entry, source_access, desired_access)
+                Subsystem::resolve_duplicate_access(entry, desired_access)
             }) {
                 Some(Ok(access)) => access,
                 Some(Err(status)) => return Some(Err(status)),

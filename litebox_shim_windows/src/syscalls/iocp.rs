@@ -57,10 +57,6 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
     fn normalize_desired_access(desired_access: u32) -> u32 {
         IoCompletionAccess::from_desired_access(desired_access).bits()
     }
-
-    fn maximum_allowed_access() -> u32 {
-        IoCompletionAccess::ALL_ACCESS.bits()
-    }
 }
 
 pub(crate) struct IoCompletionHandleObject<Platform: crate::ShimPlatform> {

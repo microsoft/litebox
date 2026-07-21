@@ -93,15 +93,7 @@ impl<FS: ShimFS> crate::WindowsHandleSubsystem for FileObjectSubsystem<FS> {
         FileAccess::from_desired_access(desired_access).bits()
     }
 
-    fn maximum_allowed_access() -> u32 {
-        FileAccess::ALL_ACCESS.bits()
-    }
-
-    fn resolve_duplicate_access(
-        entry: &Self::Entry,
-        _source_access: u32,
-        desired_access: u32,
-    ) -> Result<u32, NtStatus> {
+    fn resolve_duplicate_access(entry: &Self::Entry, desired_access: u32) -> Result<u32, NtStatus> {
         let maximum_allowed = desired_access & AccessMask::MAXIMUM_ALLOWED.bits() != 0;
         let explicit_access =
             FileAccess::from_desired_access(desired_access & !AccessMask::MAXIMUM_ALLOWED.bits());
