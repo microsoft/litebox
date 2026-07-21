@@ -101,6 +101,8 @@ impl<FS: ShimFS> crate::WindowsHandleSubsystem for FileObjectSubsystem<FS> {
             return Err(NtStatus::ACCESS_DENIED);
         }
         Ok(if maximum_allowed {
+            // TODO(dacl-access-check): Replace this original-open ceiling with a token and
+            // security-descriptor access check when the shim models DACLs.
             entry.create_time_access.bits()
         } else {
             explicit_access.bits()

@@ -129,6 +129,8 @@ pub(crate) trait WindowsHandleSubsystem: litebox::fd::FdEnabledSubsystem {
         let explicit_access = desired_access & !nt_types::AccessMask::MAXIMUM_ALLOWED.bits();
         let normalized = Self::normalize_desired_access(explicit_access);
         Ok(if maximum_allowed {
+            // TODO(dacl-access-check): Derive this grant from the caller's token and the
+            // object's security descriptor instead of assuming a single trust context.
             normalized | Self::normalize_desired_access(nt_types::AccessMask::GENERIC_ALL.bits())
         } else {
             normalized
