@@ -182,10 +182,9 @@ impl SharedBufferUsage {
         descriptor: SharedBufferDescriptor,
         layout: litebox_broker_protocol::shared_memory::SharedBufferLayout,
     ) -> core::result::Result<(), ErrorCode> {
-        if descriptor.length > MAX_PIPE_TRANSFER_SIZE
-            || layout
-                .range(descriptor.slot_index, descriptor.length as usize)
-                .is_err()
+        if layout
+            .range(descriptor.slot_index, descriptor.length as usize)
+            .is_err()
         {
             return Err(ErrorCode::MalformedRequest);
         }
@@ -275,6 +274,9 @@ fn handle_pipe_request<Memory: SharedMemory>(
                 .map_err(|error| RequestFailure::Respond(error.into()))
         }
         PipeRequest::Read(request) => {
+            if request.buffer.length > MAX_PIPE_TRANSFER_SIZE {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
             let data =
                 litebox_broker_core::pipe::read(session, request.handle, request.buffer.length)
                     .map_err(|error| RequestFailure::Respond(error.into()))?;
@@ -289,6 +291,9 @@ fn handle_pipe_request<Memory: SharedMemory>(
             }))
         }
         PipeRequest::Write(request) => {
+            if request.buffer.length > MAX_PIPE_TRANSFER_SIZE {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
             let length = request.buffer.length as usize;
             let mut data = Vec::new();
             if data.try_reserve_exact(length).is_err() {
@@ -356,8 +361,8 @@ mod tests {
     use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerNotification};
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
     use litebox_broker_protocol::shared_memory::{
-        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferPool,
-        SharedMemoryError,
+        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
+        SharedBufferDescriptor, SharedBufferPool, SharedMemoryError,
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use std::sync::{Arc, Mutex};
@@ -885,7 +890,7 @@ mod tests {
         assert_eq!(
             usage.begin(
                 RequestId(2),
-                descriptor(1, MAX_PIPE_TRANSFER_SIZE + 1),
+                descriptor(1, SHARED_BUFFER_SLOT_SIZE + 1),
                 SHARED_BUFFER_LAYOUT
             ),
             Err(ErrorCode::MalformedRequest)
