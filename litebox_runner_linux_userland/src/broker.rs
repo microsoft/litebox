@@ -28,7 +28,7 @@ pub(crate) fn connect(
 ) -> Result<(
     BrokerLocal<UnixStreamLocalControlChannel>,
     BrokerNotifications<UnixStreamLocalNotificationChannel>,
-    Arc<BrokerAssociationState>,
+    Arc<BrokerAssociationFailureCoordinator>,
 )> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let control_channel = connect_with_retry(
@@ -58,21 +58,22 @@ pub(crate) fn connect(
     let notification_cancellation_handle = notification_channel
         .cancellation_handle()
         .context("failed to create broker notification cancellation handle")?;
-    let association_state = Arc::new(BrokerAssociationState::new(
+    let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
         notification_cancellation_handle,
     ));
     let local = BrokerLocal::negotiate(control_channel, {
-        let association_state = Arc::clone(&association_state);
+        let association_coordinator = Arc::clone(&association_coordinator);
         move |channel| {
             let shared_memory =
                 channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, Some(setup_deadline))?;
-            let weak_association_state = Arc::downgrade(&association_state);
+            let weak_association_coordinator = Arc::downgrade(&association_coordinator);
             let control_cancellation_handle = channel.activate(move || {
-                if let Some(association_state) = weak_association_state.upgrade() {
-                    association_state.fail();
+                if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
+                    association_coordinator.fail();
                 }
             })?;
-            association_state.install_control_cancellation_handle(control_cancellation_handle)?;
+            association_coordinator
+                .install_control_cancellation_handle(control_cancellation_handle)?;
             Ok(Arc::new(shared_memory))
         }
     })
@@ -80,13 +81,13 @@ pub(crate) fn connect(
     Ok((
         local,
         BrokerNotifications::new(notification_channel),
-        association_state,
+        association_coordinator,
     ))
 }
 
 pub(crate) fn start_notification_receiver(
     mut notifications: BrokerNotifications<UnixStreamLocalNotificationChannel>,
-    association_state: Arc<BrokerAssociationState>,
+    association_coordinator: Arc<BrokerAssociationFailureCoordinator>,
     dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
 ) -> Result<()> {
     std::thread::Builder::new()
@@ -99,7 +100,7 @@ pub(crate) fn start_notification_receiver(
                     Err(error) => break Some(error),
                 }
             };
-            association_state.fail();
+            association_coordinator.fail();
             if let Some(error) = receive_error {
                 eprintln!("failed to receive broker notification: {error}");
             }
@@ -108,14 +109,14 @@ pub(crate) fn start_notification_receiver(
     Ok(())
 }
 
-pub(crate) struct BrokerAssociationState {
+pub(crate) struct BrokerAssociationFailureCoordinator {
     failed: AtomicBool,
     control_cancellation_handle: Mutex<Option<UnixStreamLocalControlCancellation>>,
     notification_cancellation_handle: UnixStreamLocalNotificationCancellation,
     dispatch_failure: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-impl BrokerAssociationState {
+impl BrokerAssociationFailureCoordinator {
     fn new(notification_cancellation_handle: UnixStreamLocalNotificationCancellation) -> Self {
         Self {
             failed: AtomicBool::new(false),
@@ -261,22 +262,22 @@ mod tests {
             .unwrap();
         let notification_channel =
             UnixStreamLocalNotificationChannel::from_connected(local_notification);
-        let association_state = Arc::new(BrokerAssociationState::new(
+        let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
             notification_channel.cancellation_handle().unwrap(),
         ));
-        let weak_association_state = Arc::downgrade(&association_state);
+        let weak_association_coordinator = Arc::downgrade(&association_coordinator);
         let control_cancellation_handle = active_channel
             .activate(move || {
-                if let Some(association_state) = weak_association_state.upgrade() {
-                    association_state.fail();
+                if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
+                    association_coordinator.fail();
                 }
             })
             .unwrap();
-        association_state
+        association_coordinator
             .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
         let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
-        association_state.install_dispatch(move || failure_sender.send(()).unwrap());
+        association_coordinator.install_dispatch(move || failure_sender.send(()).unwrap());
 
         drop(host_control);
 
@@ -297,25 +298,25 @@ mod tests {
         let (local_notification, host_notification) = UnixStream::pair().unwrap();
         let notification_channel =
             UnixStreamLocalNotificationChannel::from_connected(local_notification);
-        let association_state = Arc::new(BrokerAssociationState::new(
+        let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
             notification_channel.cancellation_handle().unwrap(),
         ));
-        let weak_association_state = Arc::downgrade(&association_state);
+        let weak_association_coordinator = Arc::downgrade(&association_coordinator);
         let control_cancellation_handle = active_channel
             .activate(move || {
-                if let Some(association_state) = weak_association_state.upgrade() {
-                    association_state.fail();
+                if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
+                    association_coordinator.fail();
                 }
             })
             .unwrap();
-        association_state
+        association_coordinator
             .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
         let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
-        association_state.install_dispatch(move || failure_sender.send(()).unwrap());
+        association_coordinator.install_dispatch(move || failure_sender.send(()).unwrap());
         start_notification_receiver(
             BrokerNotifications::new(notification_channel),
-            Arc::clone(&association_state),
+            Arc::clone(&association_coordinator),
             |_| {},
         )
         .unwrap();
