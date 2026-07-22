@@ -69,7 +69,7 @@ pub(crate) fn connect(
             let weak_association_coordinator = Arc::downgrade(&association_coordinator);
             let control_cancellation_handle = channel.activate(move || {
                 if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
-                    association_coordinator.fail();
+                    association_coordinator.report_failure();
                 }
             })?;
             association_coordinator
@@ -100,7 +100,7 @@ pub(crate) fn start_notification_receiver(
                     Err(error) => break Some(error),
                 }
             };
-            association_coordinator.fail();
+            association_coordinator.report_failure();
             if let Some(error) = receive_error {
                 eprintln!("failed to receive broker notification: {error}");
             }
@@ -166,7 +166,7 @@ impl BrokerAssociationFailureCoordinator {
         }
     }
 
-    fn fail(&self) {
+    fn report_failure(&self) {
         if self.failed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -269,7 +269,7 @@ mod tests {
         let control_cancellation_handle = active_channel
             .activate(move || {
                 if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
-                    association_coordinator.fail();
+                    association_coordinator.report_failure();
                 }
             })
             .unwrap();
@@ -305,7 +305,7 @@ mod tests {
         let control_cancellation_handle = active_channel
             .activate(move || {
                 if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
-                    association_coordinator.fail();
+                    association_coordinator.report_failure();
                 }
             })
             .unwrap();
