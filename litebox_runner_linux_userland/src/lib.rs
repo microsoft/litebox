@@ -242,15 +242,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_platform_multiplex::set_platform(platform);
 
     let shim_builder = if let Some(broker_connection) = broker_connection {
-        let (broker_local, broker_notifications, broker_association_failure) = broker_connection;
+        let (broker_local, broker_notifications, broker_association_state) = broker_connection;
         let litebox = litebox::LiteBox::new_with_broker_local(
             litebox_platform_multiplex::platform(),
             broker_local,
         );
-        broker_association_failure.install_dispatch(litebox.broker_failure_dispatcher());
+        broker_association_state.install_dispatch(litebox.broker_failure_dispatcher());
         broker::start_notification_receiver(
             broker_notifications,
-            broker_association_failure,
+            broker_association_state,
             litebox.broker_notification_dispatcher(),
         )?;
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(litebox)
