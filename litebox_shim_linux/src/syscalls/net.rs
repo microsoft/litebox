@@ -385,7 +385,15 @@ impl<FS: ShimFS> GlobalState<FS> {
 
         match optname {
             SocketOptionName::IP(ip) => match ip {
-                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                // IP_TOS is an advisory traffic-class hint. Accept it (we don't
+                // propagate the bit anywhere) instead of returning EOPNOTSUPP,
+                // which Node's Socket.setTypeOfService treats as fatal and
+                // cascades into tearing down the connection. Log at debug so the
+                // accepted-but-ignored option stays visible.
+                litebox_common_linux::IpOption::TOS => {
+                    litebox_util_log::debug!("accepting and ignoring setsockopt(IP_TOS)");
+                    return Ok(());
+                }
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -395,8 +403,17 @@ impl<FS: ShimFS> GlobalState<FS> {
                 | SocketOption::REUSEADDR
                 | SocketOption::BROADCAST
                 | SocketOption::KEEPALIVE => unreachable!(),
-                // We use fixed buffer size for now
-                SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
+                // SO_RCVBUF / SO_SNDBUF are advisory hints. Accept them and keep
+                // the fixed internal buffer size that getsockopt reports, instead
+                // of returning EOPNOTSUPP (which Node's TLS socket path treats as
+                // fatal). Log at debug so the accepted-but-ignored option stays
+                // visible.
+                SocketOption::RCVBUF | SocketOption::SNDBUF => {
+                    litebox_util_log::debug!(
+                        "accepting and ignoring setsockopt(SO_RCVBUF/SO_SNDBUF); using fixed buffer size"
+                    );
+                    return Ok(());
+                }
                 // Socket does not support these options
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     return Err(Errno::ENOPROTOOPT);
