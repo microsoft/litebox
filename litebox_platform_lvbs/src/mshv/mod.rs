@@ -3,7 +3,6 @@
 
 //! Hyper-V-specific code
 
-pub mod error;
 pub(crate) mod heki;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
@@ -80,8 +79,8 @@ type Vtl0PhysConstPtr<T, const ALIGN: usize> =
 type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, PrivilegedVmap>;
 
-use crate::arch::MAX_CORES;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
+use litebox_common_lvbs::MAX_CORES;
 use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -95,18 +94,6 @@ pub const HV_HYPERCALL_VARHEAD_OFFSET: u64 = 17;
 pub const HV_REGISTER_VP_INDEX: u32 = 0x_4000_0002;
 
 pub const HV_STATUS_SUCCESS: u32 = 0;
-pub const HV_STATUS_INVALID_HYPERCALL_CODE: u32 = 2;
-pub const HV_STATUS_INVALID_HYPERCALL_INPUT: u32 = 3;
-pub const HV_STATUS_INVALID_ALIGNMENT: u32 = 4;
-pub const HV_STATUS_INVALID_PARAMETER: u32 = 5;
-pub const HV_STATUS_ACCESS_DENIED: u32 = 6;
-pub const HV_STATUS_OPERATION_DENIED: u32 = 8;
-pub const HV_STATUS_INSUFFICIENT_MEMORY: u32 = 11;
-pub const HV_STATUS_INVALID_PORT_ID: u32 = 17;
-pub const HV_STATUS_INVALID_CONNECTION_ID: u32 = 18;
-pub const HV_STATUS_INSUFFICIENT_BUFFERS: u32 = 19;
-pub const HV_STATUS_TIME_OUT: u32 = 120;
-pub const HV_STATUS_VTL_ALREADY_ENABLED: u32 = 134;
 
 pub const HV_X64_MSR_GUEST_OS_ID: u32 = 0x_4000_0000;
 pub const HV_X64_MSR_HYPERCALL: u32 = 0x_4000_0001;
@@ -191,51 +178,6 @@ pub const HV_REGISTER_CR_INTERCEPT_CONTROL: u32 = 0x000e_0000;
 pub const HV_REGISTER_CR_INTERCEPT_CR0_MASK: u32 = 0x000e_0001;
 pub const HV_REGISTER_CR_INTERCEPT_CR4_MASK: u32 = 0x000e_0002;
 pub const HV_REGISTER_PENDING_EVENT0: u32 = 0x0001_0004;
-
-/// VTL call parameters (`param[0]`: function ID, `param[1..4]`: parameters)
-pub const NUM_VTLCALL_PARAMS: usize = 4;
-
-pub const VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL: u32 = 0x1_ffe0;
-pub const VSM_VTL_CALL_FUNC_ID_BOOT_APS: u32 = 0x1_ffe1;
-pub const VSM_VTL_CALL_FUNC_ID_LOCK_REGS: u32 = 0x1_ffe2;
-pub const VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT: u32 = 0x1_ffe3;
-pub const VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY: u32 = 0x1_ffe4;
-pub const VSM_VTL_CALL_FUNC_ID_LOAD_KDATA: u32 = 0x1_ffe5;
-pub const VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE: u32 = 0x1_ffe6;
-pub const VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT: u32 = 0x1_ffe7;
-pub const VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE: u32 = 0x1_ffe8;
-pub const VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY: u32 = 0x1_ffe9;
-pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
-pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
-pub const VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY: u32 = 0x1_ffec;
-
-// This VSM function ID for setting the platform root key is subject to change
-pub const VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY: u32 = 0x1_ffed;
-
-// This VSM function ID for OP-TEE messages is subject to change
-pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
-
-/// VSM Functions
-#[derive(Debug, PartialEq, TryFromPrimitive)]
-#[repr(u32)]
-pub enum VsmFunction {
-    // VSM/Heki functions
-    EnableAPsVtl = VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL,
-    BootAPs = VSM_VTL_CALL_FUNC_ID_BOOT_APS,
-    LockRegs = VSM_VTL_CALL_FUNC_ID_LOCK_REGS,
-    SignalEndOfBoot = VSM_VTL_CALL_FUNC_ID_SIGNAL_END_OF_BOOT,
-    ProtectMemory = VSM_VTL_CALL_FUNC_ID_PROTECT_MEMORY,
-    LoadKData = VSM_VTL_CALL_FUNC_ID_LOAD_KDATA,
-    ValidateModule = VSM_VTL_CALL_FUNC_ID_VALIDATE_MODULE,
-    FreeModuleInit = VSM_VTL_CALL_FUNC_ID_FREE_MODULE_INIT,
-    UnloadModule = VSM_VTL_CALL_FUNC_ID_UNLOAD_MODULE,
-    CopySecondaryKey = VSM_VTL_CALL_FUNC_ID_COPY_SECONDARY_KEY,
-    KexecValidate = VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE,
-    PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
-    OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
-    AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
-    SetPlatformRootKey = VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY,
-}
 
 pub const MSR_EFER: u32 = 0xc000_0080;
 pub const MSR_STAR: u32 = 0xc000_0081;

@@ -10,10 +10,7 @@ use crate::mshv::{PrivilegedVtl0PhysMutPtr, Vtl0PhysConstPtr};
 use crate::{
     debug_serial_println,
     host::{
-        PRK_LEN,
-        bootparam::get_vtl1_memory_info,
-        linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
-        per_cpu_variables::with_per_cpu_variables,
+        bootparam::get_vtl1_memory_info, linux::CpuMask, per_cpu_variables::with_per_cpu_variables,
         set_platform_root_key,
     },
     mshv::{
@@ -23,15 +20,9 @@ use crate::{
         HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER, HV_X64_REGISTER_LSTAR,
         HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR, HV_X64_REGISTER_SYSENTER_CS,
         HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP, HvCrInterceptControlFlags,
-        HvPageProtFlags, HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig, VsmFunction,
-        X86Cr0Flags, X86Cr4Flags,
-        error::VsmError,
-        heki::{
-            HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch,
-            HekiPatchInfo, HekiRange, MemAttr, ModMemType, mem_attr_to_hv_page_prot_flags,
-            mod_mem_type_to_mem_attr,
-        },
-        hvcall::HypervCallError,
+        HvPageProtFlags, HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig, X86Cr0Flags,
+        X86Cr4Flags,
+        heki::mem_attr_to_hv_page_prot_flags,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers, init_vtl_ap},
         mem_integrity::{
@@ -41,6 +32,11 @@ use crate::{
         vtl_switch::mshv_vsm_get_code_page_offsets,
         vtl1_mem_layout::{PAGE_SHIFT, PAGE_SIZE},
     },
+};
+use litebox_common_lvbs::{
+    HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch,
+    HekiPatchInfo, HekiRange, HypervCallError, KEXEC_SEGMENT_MAX, Kimage, MemAttr, ModMemType,
+    PRK_LEN, VsmError, VsmFunction, mod_mem_type_to_mem_attr,
 };
 
 use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};

@@ -43,10 +43,6 @@ pub fn enable_fsgsbase() {
     }
 }
 
-/// The maximum number of supported CPU cores. It depends on the number of VCPUs that
-/// Hyper-V supports. We set it to 128 for now.
-pub const MAX_CORES: usize = 128;
-
 /// Enable CPU extended states such as XMM and instructions to use and manage them
 /// such as SSE and XSAVE
 ///

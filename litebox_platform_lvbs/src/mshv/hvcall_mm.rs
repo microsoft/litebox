@@ -15,12 +15,11 @@ use crate::{
     host::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         HV_PARTITION_ID_SELF, HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMask,
-        HvInputVtl, HvPageProtFlags,
-        hvcall::{HypervCallError, hv_do_rep_hypercall},
-        vtl1_mem_layout::PAGE_SHIFT,
+        HvInputVtl, HvPageProtFlags, hvcall::hv_do_rep_hypercall, vtl1_mem_layout::PAGE_SHIFT,
     },
 };
 use litebox::utils::TruncateExt;
+use litebox_common_lvbs::HypervCallError;
 
 /// Hyper-V Hypercall to prevent lower VTLs (i.e., VTL0) from accessing a specified range of
 /// guest physical memory pages with a given protection flag.
