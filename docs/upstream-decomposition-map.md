@@ -78,11 +78,11 @@ validated. Commit messages use conventional-commit titles (`fix(scope): …`);
 the standard `Co-authored-by: Copilot` + `Copilot-Session:` trailers are fine in
 **commit messages** but must **not** appear in the PR description body.
 
-### PRs in flight
+### PRs landed
 
 | candidate | main PR | ulitebox PR |
 |:--|:--|:--|
-| advisory-sockopt accept (IP_TOS, SO_RCVBUF, SO_SNDBUF) | **#1054 merged** (squash `886f8278`) | **#1062 open** (cherry-pick of #1054) |
+| advisory-sockopt accept (IP_TOS, SO_RCVBUF, SO_SNDBUF) | **#1054 merged** (squash `886f8278`) | **#1062 merged** (squash `6b186e37`) |
 
 ## Methodology (reproducible)
 
@@ -168,8 +168,8 @@ bug-fixes.**
 
 | verdict | size | sha | work-stream — description | why |
 |:--|--:|:--|:--|:--|
-| A-READY | `7/1` | `fc2b3134d` | session-iptos-shim-fix — accept setsockopt(SOL_IP, IP_TOS) | **#1054 merged** → ulitebox **#1062**; broker-indep |
-| A-READY | `11/4` | `30782b911` | session-rcvbuf-sndbuf-fix — accept SO_RCVBUF/SO_SNDBUF | **#1054 merged** → ulitebox **#1062**; net.rs+unix.rs |
+| A-READY | `7/1` | `fc2b3134d` | session-iptos-shim-fix — accept setsockopt(SOL_IP, IP_TOS) | **#1054** + ulitebox **#1062** both merged; broker-indep |
+| A-READY | `11/4` | `30782b911` | session-rcvbuf-sndbuf-fix — accept SO_RCVBUF/SO_SNDBUF | **#1054** + ulitebox **#1062** both merged; net.rs+unix.rs |
 | A-DROP | `140/5` | `27393b02a` | SIG_DFL Stop signals as no-op (SIGTTIN-cascade) | portable but a silent no-op that hides unimplemented STOP (removes the error log); dropped on quality review — `main` left terminating |
 | REJECT | `15/3` | `fd51b53cb` | TUI mode startup — 5 shim signal divergences | companion to the dropped SIG_DFL change (extends the "is-ignored" predicate to `Stop`, valid only once SIG_DFL Stop is a no-op) **and** broker-coupled (`broker_pty_background_read_sigttin`) — papering-over + coupled |
 | REJECT | `141/46` | `13b12131b` | wave10 — SCM eventfd refs + **sendfile** | `main` already has a complete independent `sys_sendfile` (file.rs:564); amalgamation's also uses `park_if_deferred` (delayed-fork) — redundant + coupled |
