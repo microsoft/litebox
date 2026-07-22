@@ -173,15 +173,15 @@ where
         let (result, failed_connection) = {
             let mut local = self.local.lock();
             let Some(connection) = local.as_mut() else {
-                return Err(BrokerControlError::Transport);
+                return Err(BrokerControlError::AssociationFailed);
             };
             let result = request(connection).map_err(BrokerControlError::from);
-            let failed_connection = if matches!(result.as_ref(), Err(BrokerControlError::Transport))
-            {
-                local.take()
-            } else {
-                None
-            };
+            let failed_connection =
+                if matches!(result.as_ref(), Err(BrokerControlError::AssociationFailed)) {
+                    local.take()
+                } else {
+                    None
+                };
             (result, failed_connection)
         };
         if let Some(connection) = failed_connection {
