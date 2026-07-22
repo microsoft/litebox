@@ -20,9 +20,9 @@ use crate::platform::TimeProvider;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 pub(crate) mod error;
-mod shared_buffers;
+mod shared_buffer;
 use error::BrokerControlError;
-use shared_buffers::{SharedBufferLease, SharedBufferLeaseAllocator};
+use shared_buffer::{SharedBufferLease, SharedBufferLeaseAllocator};
 
 /// Local-core access to the negotiated broker control channel.
 ///
