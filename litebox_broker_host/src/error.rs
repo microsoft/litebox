@@ -13,6 +13,8 @@ pub enum BrokerHostError<E> {
     Channel(#[source] E),
     #[error("broker setup failed: {0}")]
     Broker(#[source] ErrorCode),
+    #[error("broker association shared-buffer layout does not match the protocol layout")]
+    SharedBufferLayoutMismatch,
 }
 
 impl<E> From<BrokerError> for BrokerHostError<E> {

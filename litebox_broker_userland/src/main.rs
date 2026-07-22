@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, serve_connection};
-use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
+use litebox_broker_protocol::shared_memory::{
+    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool,
+};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
     UnixStreamHostControlChannel, UnixStreamHostNotificationChannel, validate_peer_process,
@@ -98,7 +100,8 @@ fn serve_runner(
         setup_deadline,
         "notification",
     )?;
-    let shared_memory = MemfdSharedMemory::create(PIPE_TRANSFER_BUFFER_SIZE)?;
+    let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE)?;
+    let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)?;
     let mut control_channel =
         UnixStreamHostControlChannel::from_host_guaranteed(control_stream, setup_deadline);
     let mut notification_channel =
@@ -108,9 +111,9 @@ fn serve_runner(
         broker,
         &mut control_channel,
         &mut notification_channel,
-        &shared_memory,
+        &shared_buffers,
         |channel| {
-            channel.send_memfd(&shared_memory, Some(setup_deadline))?;
+            channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
             setup_completed.set(true);
             Ok(())
         },

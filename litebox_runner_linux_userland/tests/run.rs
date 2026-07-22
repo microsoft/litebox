@@ -342,9 +342,14 @@ fn spawn_test_broker(
                     .expect("failed to accept broker local control connection");
                 let shared_memory =
                     litebox_broker_transport::shared_memory::MemfdSharedMemory::create(
-                        litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE,
+                        litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE,
                     )
                     .expect("failed to create broker test shared memory");
+                let shared_buffers = litebox_broker_protocol::shared_memory::SharedBufferPool::new(
+                    shared_memory,
+                    litebox_broker_protocol::shared_memory::SHARED_BUFFER_LAYOUT,
+                )
+                .expect("failed to attach broker test shared-buffer layout");
                 let (notification_stream, _) = notification_listener
                     .accept()
                     .expect("failed to accept broker local notification connection");
@@ -378,8 +383,8 @@ fn spawn_test_broker(
                     &broker,
                     &mut channel,
                     &mut notification_channel,
-                    &shared_memory,
-                    |channel| channel.inner.send_memfd(&shared_memory, None),
+                    &shared_buffers,
+                    |channel| channel.inner.send_memfd(shared_buffers.memory(), None),
                 )
                 .expect("broker host failed");
                 assert_eq!(

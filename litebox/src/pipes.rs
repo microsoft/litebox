@@ -1119,7 +1119,7 @@ mod tests {
 
     impl litebox_broker_protocol::shared_memory::SharedMemory for NoopSharedMemory {
         fn len(&self) -> usize {
-            litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE
+            litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE
         }
 
         fn read(

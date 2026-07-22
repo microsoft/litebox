@@ -10,8 +10,11 @@ use litebox_broker_protocol::pipe::{
     CreatePipeRequest, CreatePipeResponse, PIPE_TRANSFER_BUFFER_SIZE, ReadPipeRequest,
     WritePipeRequest,
 };
+use litebox_broker_protocol::shared_memory::SharedBufferSlotIndex;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
+
+const SERIALIZED_PIPE_SLOT: SharedBufferSlotIndex = SharedBufferSlotIndex::new(0);
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned byte pipe.
@@ -72,8 +75,8 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         );
         let read = response.read as usize;
         data.truncate(read);
-        self.shared_memory
-            .read(0, &mut data)
+        self.shared_buffers
+            .read(SERIALIZED_PIPE_SLOT, &mut data)
             .expect("validated shared pipe read range must be accessible");
         Ok(data)
     }
@@ -100,8 +103,8 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        self.shared_memory
-            .write(0, data)
+        self.shared_buffers
+            .write(SERIALIZED_PIPE_SLOT, data)
             .expect("validated shared pipe write range must be accessible");
         let response = self.request_pipe(PipeRequest::Write(WritePipeRequest {
             handle,
@@ -149,13 +152,15 @@ mod tests {
         BrokerResponse, BrokerResult,
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
-    use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
+    use litebox_broker_protocol::shared_memory::{
+        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedMemory, SharedMemoryError,
+    };
 
     #[test]
-    fn pipe_uses_attached_shared_memory_for_data_operations() {
+    fn pipe_uses_slot_zero_for_serialized_data_operations() {
         let read_handle = ObjectHandle(1);
         let write_handle = ObjectHandle(2);
-        let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([
             BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
                 read_handle,
@@ -165,6 +170,9 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
         ]);
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory.clone())).unwrap();
+        memory
+            .write(SHARED_BUFFER_SLOT_SIZE as usize, &[9])
+            .unwrap();
 
         local.create_pipe(64, 16).unwrap();
         assert_eq!(local.write_pipe(write_handle, &[1, 2, 3]).unwrap(), 2);
@@ -174,6 +182,11 @@ mod tests {
 
         memory.write(0, &[4, 5, 6]).unwrap();
         assert_eq!(local.read_pipe(read_handle, 3).unwrap(), [4, 5]);
+        let mut second_slot = [0];
+        memory
+            .read(SHARED_BUFFER_SLOT_SIZE as usize, &mut second_slot)
+            .unwrap();
+        assert_eq!(second_slot, [9]);
         assert_eq!(
             local.channel.sent_operations.borrow().as_slice(),
             &[
@@ -195,7 +208,7 @@ mod tests {
 
     #[test]
     fn pipe_rejects_oversized_transfers_before_request() {
-        let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([]);
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
         let oversized_length = PIPE_TRANSFER_BUFFER_SIZE + 1;
@@ -222,7 +235,7 @@ mod tests {
             ScriptedChannel::new([BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
                 read: 2,
             }))]);
-        let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
 
         let _ = local.read_pipe(ObjectHandle(1), 1);
@@ -235,7 +248,7 @@ mod tests {
             ScriptedChannel::new([BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
                 written: 2,
             }))]);
-        let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
 
         let _ = local.write_pipe(ObjectHandle(1), &[0]);

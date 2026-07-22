@@ -30,7 +30,9 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, PIPE_TRANSFER_BUFFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
-use litebox_broker_protocol::shared_memory::SharedMemory;
+use litebox_broker_protocol::shared_memory::{
+    SHARED_BUFFER_LAYOUT, SharedBufferPool, SharedBufferSlotIndex, SharedMemory,
+};
 
 mod error;
 
@@ -45,23 +47,25 @@ pub use error::{BrokerHostError, Result};
 /// Event mutations caused by control requests return readiness in their control
 /// response and do not also emit a duplicate notification.
 ///
-/// `shared_memory` belongs to this association and is reused at offset zero for
-/// serialized pipe transfers. `send_shared_memory` runs after version
+/// `shared_buffers` belongs to this association. Pipe transfers currently reuse
+/// slot zero serially. `send_shared_memory` runs after version
 /// negotiation and before active requests begin.
-pub fn serve_connection<ControlChannel, NotificationChannel, ChannelError>(
+pub fn serve_connection<ControlChannel, NotificationChannel, Memory, ChannelError>(
     core: &BrokerCore,
     control_channel: &mut ControlChannel,
     _notification_channel: &mut NotificationChannel,
-    shared_memory: &dyn SharedMemory,
+    shared_buffers: &SharedBufferPool<Memory>,
     send_shared_memory: impl FnOnce(&mut ControlChannel) -> core::result::Result<(), ChannelError>,
 ) -> Result<ConnectionTermination, ChannelError>
 where
     ControlChannel: HostControlChannel<Error = ChannelError>,
     NotificationChannel: HostNotificationChannel<Error = ChannelError>,
+    Memory: SharedMemory,
 {
-    if shared_memory.len() != PIPE_TRANSFER_BUFFER_SIZE {
-        return Err(BrokerHostError::Broker(ErrorCode::Internal));
+    if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
+        return Err(BrokerHostError::SharedBufferLayoutMismatch);
     }
+
     let peer_credential = control_channel
         .peer_credential()
         .map_err(BrokerHostError::Channel)?;
@@ -123,7 +127,7 @@ where
             request_id,
             operation,
         } = request;
-        let result = complete_request(handle_request(&session, operation, shared_memory))
+        let result = complete_request(handle_request(&session, operation, shared_buffers))
             .map_err(BrokerHostError::Broker)?;
         control_channel
             .send_response(&BrokerResponse { request_id, result })
@@ -153,10 +157,10 @@ fn complete_request(
     }
 }
 
-fn handle_request(
+fn handle_request<Memory: SharedMemory>(
     session: &BrokerSession,
     operation: BrokerOperation,
-    shared_memory: &dyn SharedMemory,
+    shared_buffers: &SharedBufferPool<Memory>,
 ) -> RequestResult<BrokerResult> {
     match operation {
         BrokerOperation::CloseObject(handle) => session
@@ -171,16 +175,18 @@ fn handle_request(
             handle_event_request(session, request).map(BrokerResult::Event)
         }
         BrokerOperation::Pipe(request) => {
-            handle_pipe_request(session, request, shared_memory).map(BrokerResult::Pipe)
+            handle_pipe_request(session, request, shared_buffers).map(BrokerResult::Pipe)
         }
     }
 }
 
-fn handle_pipe_request(
+fn handle_pipe_request<Memory: SharedMemory>(
     session: &BrokerSession,
     request: PipeRequest,
-    shared_memory: &dyn SharedMemory,
+    shared_buffers: &SharedBufferPool<Memory>,
 ) -> RequestResult<PipeResponse> {
+    const SERIALIZED_PIPE_SLOT: SharedBufferSlotIndex = SharedBufferSlotIndex::new(0);
+
     match request {
         PipeRequest::Create(request) => {
             litebox_broker_core::pipe::create(session, request.capacity, request.atomic_write_size)
@@ -198,8 +204,8 @@ fn handle_pipe_request(
             }
             let data = litebox_broker_core::pipe::read(session, request.handle, request.length)
                 .map_err(|error| RequestFailure::Respond(error.into()))?;
-            shared_memory
-                .write(0, &data)
+            shared_buffers
+                .write(SERIALIZED_PIPE_SLOT, &data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
             Ok(PipeResponse::Read(ReadPipeResponse {
                 read: data
@@ -218,8 +224,8 @@ fn handle_pipe_request(
                 return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
             }
             data.resize(length, 0);
-            shared_memory
-                .read(0, &mut data)
+            shared_buffers
+                .read(SERIALIZED_PIPE_SLOT, &mut data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
             litebox_broker_core::pipe::write(session, request.handle, &data)
                 .map_err(|error| RequestFailure::Respond(error.into()))
@@ -278,7 +284,9 @@ mod tests {
     };
     use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerNotification};
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
-    use litebox_broker_protocol::shared_memory::SharedMemoryError;
+    use litebox_broker_protocol::shared_memory::{
+        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedMemoryError,
+    };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use std::sync::{Arc, Mutex};
 
@@ -298,8 +306,9 @@ mod tests {
         serve_connection_returns_event_readiness_in_control_responses(&broker);
         serve_connection_continues_after_recoverable_request_failure(&broker);
         serve_connection_aborts_without_response_on_shared_memory_failure(&broker);
+        serve_connection_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_closes_object_reference(&broker);
-        association_shared_memory_stages_pipe_data(&broker);
+        association_shared_buffer_slot_zero_stages_pipe_data(&broker);
     }
 
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
@@ -322,7 +331,7 @@ mod tests {
                 broker,
                 &mut channel,
                 &mut notifications,
-                &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                &test_shared_buffers(),
                 |_| Ok(()),
             )
             .unwrap(),
@@ -361,7 +370,7 @@ mod tests {
                 broker,
                 &mut channel,
                 &mut notifications,
-                &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                &test_shared_buffers(),
                 |_| Ok(()),
             )
             .unwrap(),
@@ -398,7 +407,7 @@ mod tests {
                 broker,
                 &mut channel,
                 &mut notifications,
-                &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                &test_shared_buffers(),
                 |_| {
                     setup_called.set(true);
                     Ok(())
@@ -428,7 +437,7 @@ mod tests {
                 broker,
                 &mut channel,
                 &mut notifications,
-                &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                &test_shared_buffers(),
                 |_| Ok(()),
             )
             .unwrap(),
@@ -455,7 +464,7 @@ mod tests {
                 broker,
                 &mut channel,
                 &mut notifications,
-                &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                &test_shared_buffers(),
                 |_| Ok(()),
             )
             .unwrap(),
@@ -484,7 +493,7 @@ mod tests {
             broker,
             &mut channel,
             &mut notifications,
-            &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+            &test_shared_buffers(),
             |_| Ok(()),
         ) {
             Err(BrokerHostError::Channel(())) => {}
@@ -510,7 +519,7 @@ mod tests {
                 broker,
                 &mut channel,
                 &mut notifications,
-                &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                &test_shared_buffers(),
                 |_| Ok(()),
             )
             .unwrap(),
@@ -559,7 +568,7 @@ mod tests {
                 broker,
                 &mut channel,
                 &mut notifications,
-                &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
+                &test_shared_buffers(),
                 |_| Ok(()),
             )
             .unwrap(),
@@ -596,7 +605,7 @@ mod tests {
                 broker,
                 &mut channel,
                 &mut notifications,
-                &FailingSharedMemory,
+                &SharedBufferPool::new(FailingSharedMemory, SHARED_BUFFER_LAYOUT).unwrap(),
                 |_| Ok(()),
             ),
             Err(BrokerHostError::Broker(ErrorCode::Internal))
@@ -606,6 +615,43 @@ mod tests {
             channel.results[0],
             BrokerResult::Pipe(PipeResponse::Create(_))
         ));
+    }
+
+    fn serve_connection_rejects_incompatible_shared_buffer_layout(broker: &BrokerCore) {
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            }))]),
+            std::vec::Vec::new(),
+        );
+        let mut notifications = FakeHostNotificationChannel::default();
+        let incompatible_layout = litebox_broker_protocol::shared_memory::SharedBufferLayout::new(
+            u32::try_from(SHARED_BUFFER_POOL_SIZE).unwrap(),
+            1,
+        )
+        .unwrap();
+        let shared_buffers = SharedBufferPool::new(
+            TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE),
+            incompatible_layout,
+        )
+        .unwrap();
+        let setup_called = Cell::new(false);
+
+        assert!(matches!(
+            serve_connection(
+                broker,
+                &mut channel,
+                &mut notifications,
+                &shared_buffers,
+                |_| {
+                    setup_called.set(true);
+                    Ok(())
+                },
+            ),
+            Err(BrokerHostError::SharedBufferLayoutMismatch)
+        ));
+        assert!(!setup_called.get());
+        assert!(channel.handshake_responses.is_empty());
     }
 
     fn active_request_closes_object_reference(broker: &BrokerCore) {
@@ -640,60 +686,73 @@ mod tests {
         );
     }
 
-    fn association_shared_memory_stages_pipe_data(broker: &BrokerCore) {
+    fn association_shared_buffer_slot_zero_stages_pipe_data(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let memory = TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE);
-        let created = handle_test_request_with_memory(
+        let memory = TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE);
+        let shared_buffers = SharedBufferPool::new(memory.clone(), SHARED_BUFFER_LAYOUT).unwrap();
+        shared_buffers
+            .write(SharedBufferSlotIndex::new(1), &[9])
+            .unwrap();
+        let created = handle_test_request_with_buffers(
             &session,
             BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
                 capacity: 64,
                 atomic_write_size: 16,
             })),
-            &memory,
+            &shared_buffers,
         );
         let BrokerResult::Pipe(PipeResponse::Create(response)) = created else {
             panic!("expected successful pipe creation");
         };
 
-        memory.write(0, &[1, 2, 3]).unwrap();
-        let write = handle_test_request_with_memory(
+        shared_buffers
+            .write(SharedBufferSlotIndex::new(0), &[1, 2, 3])
+            .unwrap();
+        let write = handle_test_request_with_buffers(
             &session,
             BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle: response.write_handle,
                 length: 3,
             })),
-            &memory,
+            &shared_buffers,
         );
         assert_eq!(
             write,
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 }))
         );
 
-        let read = handle_test_request_with_memory(
+        let read = handle_test_request_with_buffers(
             &session,
             BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle: response.read_handle,
                 length: 3,
             })),
-            &memory,
+            &shared_buffers,
         );
         assert_eq!(
             read,
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 }))
         );
         let mut data = [0; 3];
-        memory.read(0, &mut data).unwrap();
+        shared_buffers
+            .read(SharedBufferSlotIndex::new(0), &mut data)
+            .unwrap();
         assert_eq!(data, [1, 2, 3]);
+        let mut second_slot = [0];
+        shared_buffers
+            .read(SharedBufferSlotIndex::new(1), &mut second_slot)
+            .unwrap();
+        assert_eq!(second_slot, [9]);
 
-        let invalid_range = handle_test_request_with_memory(
+        let invalid_range = handle_test_request_with_buffers(
             &session,
             BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle: response.write_handle,
                 length: u32::try_from(PIPE_TRANSFER_BUFFER_SIZE).unwrap() + 1,
             })),
-            &memory,
+            &shared_buffers,
         );
         assert_eq!(
             invalid_range,
@@ -702,19 +761,23 @@ mod tests {
     }
 
     fn handle_test_request(session: &BrokerSession, operation: BrokerOperation) -> BrokerResult {
-        handle_test_request_with_memory(
-            session,
-            operation,
-            &TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE),
-        )
+        handle_test_request_with_buffers(session, operation, &test_shared_buffers())
     }
 
-    fn handle_test_request_with_memory(
+    fn handle_test_request_with_buffers<Memory: SharedMemory>(
         session: &BrokerSession,
         operation: BrokerOperation,
-        shared_memory: &dyn SharedMemory,
+        shared_buffers: &SharedBufferPool<Memory>,
     ) -> BrokerResult {
-        complete_request(handle_request(session, operation, shared_memory)).unwrap()
+        complete_request(handle_request(session, operation, shared_buffers)).unwrap()
+    }
+
+    fn test_shared_buffers() -> SharedBufferPool<TestSharedMemory> {
+        SharedBufferPool::new(
+            TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE),
+            SHARED_BUFFER_LAYOUT,
+        )
+        .unwrap()
     }
 
     struct FakeHostControlChannel {
@@ -897,7 +960,7 @@ mod tests {
 
     impl SharedMemory for FailingSharedMemory {
         fn len(&self) -> usize {
-            PIPE_TRANSFER_BUFFER_SIZE
+            SHARED_BUFFER_POOL_SIZE
         }
 
         fn read(

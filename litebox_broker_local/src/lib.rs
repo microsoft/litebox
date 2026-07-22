@@ -29,20 +29,21 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult,
 };
-use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::shared_memory::SharedMemory;
+use litebox_broker_protocol::shared_memory::{
+    SHARED_BUFFER_LAYOUT, SharedBufferPool, SharedMemory,
+};
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, RequestId};
 
 pub use error::{BrokerLocalError, Result};
 
 /// Typed broker-local control adapter for broker operations.
 ///
-/// The shared memory belongs to the broker association and is reused for each
-/// serialized pipe transfer.
+/// The shared-buffer pool belongs to the broker association. Pipe transfers
+/// currently reuse slot zero under the channel's serialization scope.
 pub struct BrokerLocal<Channel: LocalControlChannel> {
     channel: Channel,
-    shared_memory: Arc<dyn SharedMemory>,
+    shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
     next_request_id: AtomicU64,
 }
 
@@ -86,14 +87,11 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                     "broker returned unexpected negotiation response: {response:?}"
                 );
                 let shared_memory = activate(&mut channel).map_err(BrokerLocalError::Channel)?;
-                assert_eq!(
-                    shared_memory.len(),
-                    PIPE_TRANSFER_BUFFER_SIZE,
-                    "broker association shared memory has an invalid size"
-                );
+                let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
+                    .expect("broker association shared memory has an invalid size");
                 Ok(Self {
                     channel,
-                    shared_memory,
+                    shared_buffers,
                     next_request_id: AtomicU64::new(0),
                 })
             }
@@ -265,7 +263,7 @@ mod tests {
         let channel = FakeControlChannel::new(None, Some(response.clone()));
         let local = BrokerLocal {
             channel,
-            shared_memory: noop_shared_memory(),
+            shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
         };
 
@@ -285,7 +283,7 @@ mod tests {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let local = BrokerLocal {
             channel,
-            shared_memory: noop_shared_memory(),
+            shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
         };
 
@@ -321,7 +319,7 @@ mod tests {
             channel: ConcurrentCallChannel {
                 request_ids: Mutex::new(std::vec::Vec::new()),
             },
-            shared_memory: noop_shared_memory(),
+            shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
         });
         let callers = (0..16)
@@ -347,7 +345,7 @@ mod tests {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let local = BrokerLocal {
             channel,
-            shared_memory: noop_shared_memory(),
+            shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
         };
         local.channel.response_id.set(Some(RequestId(9)));
@@ -366,7 +364,7 @@ mod tests {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let local = BrokerLocal {
             channel,
-            shared_memory: noop_shared_memory(),
+            shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(u64::MAX),
         };
 
@@ -383,7 +381,7 @@ mod tests {
             FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::WouldBlock)));
         let local = BrokerLocal {
             channel,
-            shared_memory: noop_shared_memory(),
+            shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
         };
 
@@ -399,7 +397,7 @@ mod tests {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::Internal)));
         let local = BrokerLocal {
             channel,
-            shared_memory: noop_shared_memory(),
+            shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
         };
 
@@ -511,7 +509,7 @@ mod tests {
 
         let _ = BrokerLocal::negotiate(channel, |_| {
             Ok(Arc::new(NoopSharedMemory {
-                length: PIPE_TRANSFER_BUFFER_SIZE - 1,
+                length: litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE - 1,
             }) as Arc<dyn SharedMemory>)
         });
     }
@@ -575,8 +573,12 @@ mod tests {
 
     fn noop_shared_memory() -> Arc<dyn SharedMemory> {
         Arc::new(NoopSharedMemory {
-            length: PIPE_TRANSFER_BUFFER_SIZE,
+            length: litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE,
         })
+    }
+
+    fn noop_shared_buffers() -> SharedBufferPool<Arc<dyn SharedMemory>> {
+        SharedBufferPool::new(noop_shared_memory(), SHARED_BUFFER_LAYOUT).unwrap()
     }
 
     impl FakeControlChannel {

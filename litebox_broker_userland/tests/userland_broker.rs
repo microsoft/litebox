@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
 };
@@ -84,7 +84,7 @@ fn run_fake_runner(args: &[OsString]) {
         connect_notification_with_retry(Path::new(notification_socket_path)).unwrap();
     let local = BrokerLocal::negotiate(control_channel, |channel| {
         let shared_memory = channel.receive_memfd(
-            PIPE_TRANSFER_BUFFER_SIZE,
+            SHARED_BUFFER_POOL_SIZE,
             Some(Instant::now() + Duration::from_secs(5)),
         )?;
         let _cancellation = channel.activate(|| {})?;

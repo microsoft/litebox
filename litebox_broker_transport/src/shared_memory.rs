@@ -300,6 +300,9 @@ fn invalid_data(message: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_broker_protocol::shared_memory::{
+        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedBufferSlotIndex,
+    };
     use rustix::io::FdFlags;
     use std::io::Write;
     use std::time::Duration;
@@ -358,18 +361,30 @@ mod tests {
     }
 
     #[test]
-    fn transfers_exact_size_memory_with_close_on_exec() {
-        let length = 24;
-        let memory = MemfdSharedMemory::create(length).unwrap();
-        memory.write(16, &[1, 2, 3]).unwrap();
+    fn transfers_exact_pool_with_shared_visibility_and_close_on_exec() {
+        let memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
+        let pool = SharedBufferPool::new(memory, SHARED_BUFFER_LAYOUT).unwrap();
+        for index in 0..SHARED_BUFFER_LAYOUT.slot_count() {
+            pool.write(
+                SharedBufferSlotIndex::new(index),
+                &[u8::try_from(index).unwrap()],
+            )
+            .unwrap();
+        }
         let (mut local_stream, mut host_stream) = UnixStream::pair().unwrap();
 
-        send_memfd(&mut host_stream, &memory, None).unwrap();
-        let mapped_memory = receive_memfd(&mut local_stream, length, None).unwrap();
-        let mut bytes = [0; 3];
-        mapped_memory.read(16, &mut bytes).unwrap();
-        assert_eq!(bytes, [1, 2, 3]);
-        let flags = rustix::io::fcntl_getfd(mapped_memory.as_fd()).unwrap();
+        send_memfd(&mut host_stream, pool.memory(), None).unwrap();
+        let mapped_memory =
+            receive_memfd(&mut local_stream, SHARED_BUFFER_POOL_SIZE, None).unwrap();
+        let mapped_pool = SharedBufferPool::new(mapped_memory, SHARED_BUFFER_LAYOUT).unwrap();
+        for index in 0..SHARED_BUFFER_LAYOUT.slot_count() {
+            let mut byte = [0];
+            mapped_pool
+                .read(SharedBufferSlotIndex::new(index), &mut byte)
+                .unwrap();
+            assert_eq!(byte, [u8::try_from(index).unwrap()]);
+        }
+        let flags = rustix::io::fcntl_getfd(mapped_pool.memory().as_fd()).unwrap();
         assert!(flags.contains(FdFlags::CLOEXEC));
     }
 
@@ -412,9 +427,9 @@ mod tests {
 
     #[test]
     fn rejects_wrong_size_and_unsealed_memory() {
-        let length = 8;
+        let length = SHARED_BUFFER_POOL_SIZE;
 
-        let wrong_size = MemfdSharedMemory::create(7).unwrap();
+        let wrong_size = MemfdSharedMemory::create(length - 1).unwrap();
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
         send_memfd(&mut sender, &wrong_size, None).unwrap();
         assert_eq!(

@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
-use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
+use litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
     UnixStreamLocalNotificationCancellation, UnixStreamLocalNotificationChannel,
@@ -65,7 +65,7 @@ pub(crate) fn connect(
         let association_coordinator = Arc::clone(&association_coordinator);
         move |channel| {
             let shared_memory =
-                channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, Some(setup_deadline))?;
+                channel.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
             let weak_association_coordinator = Arc::downgrade(&association_coordinator);
             let control_cancellation_handle = channel.activate(move || {
                 if let Some(association_coordinator) = weak_association_coordinator.upgrade() {

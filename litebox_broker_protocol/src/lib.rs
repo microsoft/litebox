@@ -12,6 +12,9 @@
 
 extern crate alloc;
 
+#[cfg(test)]
+extern crate std;
+
 pub mod channel;
 pub mod error;
 pub mod event;
