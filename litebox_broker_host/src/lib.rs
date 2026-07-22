@@ -129,7 +129,14 @@ where
             request_id,
             operation,
         } = request;
-        let buffer_descriptor = shared_buffer_descriptor(&operation);
+        let buffer_descriptor = match &operation {
+            BrokerOperation::Pipe(PipeRequest::Read(request)) => Some(request.buffer),
+            BrokerOperation::Pipe(PipeRequest::Write(request)) => Some(request.buffer),
+            BrokerOperation::CloseObject(_)
+            | BrokerOperation::CheckReadiness(_)
+            | BrokerOperation::Event(_)
+            | BrokerOperation::Pipe(PipeRequest::Create(_)) => None,
+        };
         if let Some(descriptor) = buffer_descriptor {
             shared_buffer_usage
                 .begin(request_id, descriptor, shared_buffers.layout())
@@ -210,17 +217,6 @@ impl SharedBufferUsage {
             "shared-buffer slot state changed before response emission"
         );
         *slot = SharedBufferSlotState::Idle(request_id);
-    }
-}
-
-fn shared_buffer_descriptor(operation: &BrokerOperation) -> Option<SharedBufferDescriptor> {
-    match operation {
-        BrokerOperation::Pipe(PipeRequest::Read(request)) => Some(request.buffer),
-        BrokerOperation::Pipe(PipeRequest::Write(request)) => Some(request.buffer),
-        BrokerOperation::CloseObject(_)
-        | BrokerOperation::CheckReadiness(_)
-        | BrokerOperation::Event(_)
-        | BrokerOperation::Pipe(PipeRequest::Create(_)) => None,
     }
 }
 
