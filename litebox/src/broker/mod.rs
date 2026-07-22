@@ -22,7 +22,7 @@ use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 pub(crate) mod error;
 mod shared_buffer;
 use error::BrokerControlError;
-use shared_buffer::{SharedBufferLease, SlotAllocator};
+use shared_buffer::{SlotAllocator, SlotLease};
 
 /// Local-core access to the negotiated broker control channel.
 ///
@@ -190,7 +190,7 @@ where
     fn acquire_shared_buffer(
         &self,
         length: u32,
-    ) -> core::result::Result<SharedBufferLease<'_, Platform>, BrokerControlError> {
+    ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
         self.slot_allocator.acquire(length).map_err(|_| {
             self.fail_association();
             BrokerControlError::AssociationFailed

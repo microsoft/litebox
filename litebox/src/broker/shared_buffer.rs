@@ -28,7 +28,7 @@ struct LeaseState<Platform: RawSyncPrimitivesProvider> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct AcquireError;
 
-pub(super) struct SharedBufferLease<'a, Platform: RawSyncPrimitivesProvider> {
+pub(super) struct SlotLease<'a, Platform: RawSyncPrimitivesProvider> {
     allocator: &'a SlotAllocator<Platform>,
     descriptor: SharedBufferDescriptor,
 }
@@ -51,10 +51,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         }
     }
 
-    pub(super) fn acquire(
-        &self,
-        length: u32,
-    ) -> Result<SharedBufferLease<'_, Platform>, AcquireError> {
+    pub(super) fn acquire(&self, length: u32) -> Result<SlotLease<'_, Platform>, AcquireError> {
         {
             let mut state = self.state.lock();
             if state.failed {
@@ -63,7 +60,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
             if state.waiters.is_empty()
                 && let Some(descriptor) = allocate_descriptor(&mut state, length)
             {
-                return Ok(SharedBufferLease {
+                return Ok(SlotLease {
                     allocator: self,
                     descriptor,
                 });
@@ -79,7 +76,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
             if state.waiters.is_empty()
                 && let Some(descriptor) = allocate_descriptor(&mut state, length)
             {
-                return Ok(SharedBufferLease {
+                return Ok(SlotLease {
                     allocator: self,
                     descriptor,
                 });
@@ -88,7 +85,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         }
 
         let descriptor = waiter.wait()?;
-        Ok(SharedBufferLease {
+        Ok(SlotLease {
             allocator: self,
             descriptor,
         })
@@ -170,13 +167,13 @@ impl<Platform: RawSyncPrimitivesProvider> LeaseWaiter<Platform> {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> SharedBufferLease<'_, Platform> {
+impl<Platform: RawSyncPrimitivesProvider> SlotLease<'_, Platform> {
     pub(super) const fn descriptor(&self) -> SharedBufferDescriptor {
         self.descriptor
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Drop for SharedBufferLease<'_, Platform> {
+impl<Platform: RawSyncPrimitivesProvider> Drop for SlotLease<'_, Platform> {
     fn drop(&mut self) {
         self.allocator.release(self.descriptor.slot_index);
     }
