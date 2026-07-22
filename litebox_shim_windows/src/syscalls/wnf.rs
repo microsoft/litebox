@@ -347,20 +347,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(required_size) = u32::try_from(state.data.len()) else {
             return NtStatus::BUFFER_OVERFLOW;
         };
-        if available_size < required_size {
-            if change_stamp
-                .write_at_offset(0, state.change_stamp)
-                .is_none()
-                || buffer_size.write_at_offset(0, required_size).is_none()
-            {
+        let status = if available_size < required_size {
+            NtStatus::BUFFER_TOO_SMALL
+        } else {
+            if !state.data.is_empty() && buffer.write_slice_at_offset(0, &state.data).is_none() {
                 return NtStatus::ACCESS_VIOLATION;
             }
-            return NtStatus::BUFFER_TOO_SMALL;
-        }
-
-        if !state.data.is_empty() && buffer.write_slice_at_offset(0, &state.data).is_none() {
-            return NtStatus::ACCESS_VIOLATION;
-        }
+            NtStatus::SUCCESS
+        };
         if change_stamp
             .write_at_offset(0, state.change_stamp)
             .is_none()
@@ -368,7 +362,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return NtStatus::ACCESS_VIOLATION;
         }
-        NtStatus::SUCCESS
+        status
     }
 }
 
@@ -659,6 +653,17 @@ mod tests {
             task.sys_nt_query_wnf_state_data(
                 const_ptr(&state_name),
                 None,
+                None,
+                mut_ptr(&mut change_stamp),
+                mut_byte_ptr(&mut buffer),
+                mut_ptr(&mut buffer_size),
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(
+            task.sys_nt_query_wnf_state_data(
+                const_ptr(&state_name),
+                Some(const_ptr(&wrong_type)),
                 None,
                 mut_ptr(&mut change_stamp),
                 mut_byte_ptr(&mut buffer),
