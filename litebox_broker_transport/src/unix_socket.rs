@@ -364,6 +364,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
         };
         let request_id = request.request_id;
         let pending_call = active.pending_calls.register(request_id)?;
+        let request_frame = encode_request(request);
 
         let write_result = {
             let mut request_stream = active
@@ -372,9 +373,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
                 .expect("broker request writer mutex poisoned");
             match active.pending_calls.current_failure() {
                 Some(error) => Err(copy_io_error(&error)),
-                None => {
-                    write_frame_with_deadline(&mut request_stream, &encode_request(request), None)
-                }
+                None => write_frame_with_deadline(&mut request_stream, &request_frame, None),
             }
         };
         if let Err(error) = write_result {
@@ -540,6 +539,7 @@ impl PendingCalls {
     }
 
     fn register(&self, request_id: RequestId) -> IoResult<Arc<PendingCall>> {
+        let pending_call = Arc::new(PendingCall::new());
         let mut state = self.state.lock().expect("broker pending mutex poisoned");
         while state.calls.len() == MAX_PENDING_CALLS && state.failure.is_none() {
             state = self
@@ -550,7 +550,6 @@ impl PendingCalls {
         if let Some(error) = state.failure.as_ref() {
             return Err(copy_io_error(error));
         }
-        let pending_call = Arc::new(PendingCall::new());
         match state.calls.entry(request_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(Arc::clone(&pending_call));
@@ -585,15 +584,11 @@ impl PendingCalls {
                 return false;
             }
             state.failure = Some(Arc::clone(&error));
-            let pending_calls = state
-                .calls
-                .drain()
-                .map(|(_, call)| call)
-                .collect::<Vec<_>>();
+            let pending_calls = core::mem::take(&mut state.calls);
             self.capacity_available.notify_all();
             pending_calls
         };
-        for pending_call in pending_calls {
+        for pending_call in pending_calls.into_values() {
             pending_call.resolve(PendingCallResult::Failure(Arc::clone(&error)));
         }
         true
