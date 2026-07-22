@@ -1005,26 +1005,45 @@ mod tests {
         let (local_stream, _host_stream) = UnixStream::pair().unwrap();
         let (channel, _cancellation) = activate_test_channel(local_stream, || {});
         let channel = Arc::new(channel);
-        let active_transfers = Arc::new(AtomicUsize::new(0));
-        let callers = (0..2)
-            .map(|_| {
-                let channel = Arc::clone(&channel);
-                let active_transfers = Arc::clone(&active_transfers);
-                thread::spawn(move || {
-                    channel
-                        .with_serialized_payload(|| {
-                            assert_eq!(active_transfers.fetch_add(1, Ordering::SeqCst), 0);
-                            thread::sleep(Duration::from_millis(20));
-                            assert_eq!(active_transfers.fetch_sub(1, Ordering::SeqCst), 1);
-                        })
-                        .unwrap();
+        let (first_entered_sender, first_entered_receiver) = mpsc::sync_channel(1);
+        let (release_first_sender, release_first_receiver) = mpsc::sync_channel(1);
+        let first_channel = Arc::clone(&channel);
+        let first = thread::spawn(move || {
+            first_channel
+                .with_serialized_payload(|| {
+                    first_entered_sender.send(()).unwrap();
+                    release_first_receiver.recv().unwrap();
                 })
-            })
-            .collect::<Vec<_>>();
+                .unwrap();
+        });
+        first_entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
 
-        for caller in callers {
-            caller.join().unwrap();
+        let (second_started_sender, second_started_receiver) = mpsc::sync_channel(1);
+        let (second_entered_sender, second_entered_receiver) = mpsc::sync_channel(1);
+        let second = thread::spawn(move || {
+            second_started_sender.send(()).unwrap();
+            channel
+                .with_serialized_payload(|| second_entered_sender.send(()).unwrap())
+                .unwrap();
+        });
+        second_started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let entered_before_release = second_entered_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+
+        release_first_sender.send(()).unwrap();
+        if !entered_before_release {
+            second_entered_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
         }
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(!entered_before_release);
     }
 
     #[test]
