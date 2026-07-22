@@ -173,7 +173,7 @@ impl UnixStreamLocalControlChannel {
         thread::Builder::new()
             .name("litebox-broker-responses".to_owned())
             .spawn(move || {
-                response_pump(
+                dispatch_responses(
                     response_stream,
                     response_cancellation,
                     response_pending_calls,
@@ -571,7 +571,7 @@ impl PendingCalls {
     }
 }
 
-fn response_pump(
+fn dispatch_responses(
     mut response_stream: UnixStream,
     response_cancellation: UnixStream,
     pending_calls: Arc<PendingCalls>,
