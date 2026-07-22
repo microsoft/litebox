@@ -129,7 +129,7 @@ where
             request_id,
             operation,
         } = request;
-        let shared_buffer_claim = operation_shared_buffer(&operation)
+        let shared_buffer_claim = shared_buffer_descriptor_for_operation(&operation)
             .map(|descriptor| {
                 shared_buffer_claims.claim(request_id, descriptor, shared_buffers.layout())
             })
@@ -225,7 +225,9 @@ impl SharedBufferClaims {
     }
 }
 
-fn operation_shared_buffer(operation: &BrokerOperation) -> Option<SharedBufferDescriptor> {
+fn shared_buffer_descriptor_for_operation(
+    operation: &BrokerOperation,
+) -> Option<SharedBufferDescriptor> {
     match operation {
         BrokerOperation::Pipe(PipeRequest::Read(request)) => Some(request.buffer),
         BrokerOperation::Pipe(PipeRequest::Write(request)) => Some(request.buffer),
