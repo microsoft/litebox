@@ -326,20 +326,6 @@ mod tests {
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 
-    fn active_request(operation: BrokerOperation) -> BrokerRequest {
-        BrokerRequest {
-            request_id: TEST_REQUEST_ID,
-            operation,
-        }
-    }
-
-    fn active_response(result: BrokerResult) -> BrokerResponse {
-        BrokerResponse {
-            request_id: TEST_REQUEST_ID,
-            result,
-        }
-    }
-
     #[test]
     fn handshake_request_codec_round_trips_all_variants() {
         let requests = [BrokerHandshakeRequest {
@@ -357,7 +343,7 @@ mod tests {
     #[test]
     fn request_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
-        let requests = [
+        let operations = [
             BrokerOperation::CloseObject(handle),
             BrokerOperation::CheckReadiness(handle),
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
@@ -383,8 +369,11 @@ mod tests {
             BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest { handle, length: 3 })),
         ];
 
-        for request in requests {
-            let request = active_request(request);
+        for operation in operations {
+            let request = BrokerRequest {
+                request_id: TEST_REQUEST_ID,
+                operation,
+            };
             assert_eq!(
                 decode_request(&encode_request(request.clone())).unwrap(),
                 request
@@ -430,7 +419,7 @@ mod tests {
     #[test]
     fn response_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
-        let responses = [
+        let results = [
             BrokerResult::ObjectClosed,
             BrokerResult::Readiness(ReadinessFlags::READ),
             BrokerResult::Readiness(ReadinessFlags::WRITE),
@@ -455,8 +444,11 @@ mod tests {
             BrokerResult::Error(ErrorCode::Internal),
         ];
 
-        for response in responses {
-            let response = active_response(response);
+        for result in results {
+            let response = BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result,
+            };
             assert_eq!(
                 decode_response(&encode_response(response.clone())).unwrap(),
                 response
@@ -505,15 +497,19 @@ mod tests {
             Err(WireError::TruncatedFrame)
         );
         assert_eq!(
-            decode_handshake_request(&encode_request(active_request(BrokerOperation::Event(
-                EventRequest::Create(CreateEventRequest { initial_count: 0 }),
-            )))),
+            decode_handshake_request(&encode_request(BrokerRequest {
+                request_id: TEST_REQUEST_ID,
+                operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+                    initial_count: 0,
+                })),
+            })),
             Err(WireError::WrongMessagePhase)
         );
         assert_eq!(
-            decode_handshake_request(&encode_request(active_request(
-                BrokerOperation::CloseObject(ObjectHandle(13))
-            ))),
+            decode_handshake_request(&encode_request(BrokerRequest {
+                request_id: TEST_REQUEST_ID,
+                operation: BrokerOperation::CloseObject(ObjectHandle(13)),
+            })),
             Err(WireError::WrongMessagePhase)
         );
         let mut frame = encode_handshake_request(BrokerHandshakeRequest {
@@ -539,20 +535,24 @@ mod tests {
             decode_request(&[REQUEST_TAG_EVENT, 0, 0, 0, 0, 0, 0, 0]),
             Err(WireError::TruncatedFrame)
         );
-        let mut unknown_consume_mode = encode_request(active_request(BrokerOperation::Event(
-            EventRequest::Consume(ConsumeEventRequest {
+        let mut unknown_consume_mode = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
                 handle: ObjectHandle(13),
                 mode: EventConsumeMode::All,
-            }),
-        )));
+            })),
+        });
         *unknown_consume_mode.last_mut().unwrap() = 0xff;
         assert_eq!(
             decode_request(&unknown_consume_mode),
             Err(WireError::InvalidTag)
         );
-        let mut frame = encode_request(active_request(BrokerOperation::Event(
-            EventRequest::Create(CreateEventRequest { initial_count: 0 }),
-        )));
+        let mut frame = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+                initial_count: 0,
+            })),
+        });
         frame.push(0xff);
         assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
     }
@@ -572,23 +572,26 @@ mod tests {
             Err(WireError::InvalidTag)
         );
         assert_eq!(
-            decode_handshake_response(&encode_response(active_response(BrokerResult::Event(
-                EventResponse::Create(CreateEventResponse {
+            decode_handshake_response(&encode_response(BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::Event(EventResponse::Create(CreateEventResponse {
                     handle: ObjectHandle(13),
-                })
-            ),))),
+                })),
+            })),
             Err(WireError::WrongMessagePhase)
         );
         assert_eq!(
-            decode_handshake_response(&encode_response(active_response(
-                BrokerResult::ObjectClosed
-            ))),
+            decode_handshake_response(&encode_response(BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::ObjectClosed,
+            })),
             Err(WireError::WrongMessagePhase)
         );
         assert_eq!(
-            decode_handshake_response(&encode_response(active_response(BrokerResult::Error(
-                ErrorCode::WouldBlock
-            )))),
+            decode_handshake_response(&encode_response(BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::Error(ErrorCode::WouldBlock),
+            })),
             Err(WireError::WrongMessagePhase)
         );
 
@@ -634,11 +637,12 @@ mod tests {
         let truncated = [RESPONSE_TAG_EVENT, 2, 2, 0];
         assert_eq!(decode_response(&truncated), Err(WireError::TruncatedFrame));
 
-        let mut frame = encode_response(active_response(BrokerResult::Event(EventResponse::Add(
-            AddEventResponse {
+        let mut frame = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Event(EventResponse::Add(AddEventResponse {
                 readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
-            },
-        ))));
+            })),
+        });
         frame.push(0xff);
         assert_eq!(decode_response(&frame), Err(WireError::TrailingBytes));
     }
