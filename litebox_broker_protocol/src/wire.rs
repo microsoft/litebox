@@ -370,7 +370,6 @@ mod tests {
                 handle,
                 buffer: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(2),
-                    generation: 7,
                     length: 32,
                 },
             })),
@@ -378,7 +377,6 @@ mod tests {
                 handle,
                 buffer: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(15),
-                    generation: u64::MAX,
                     length: 3,
                 },
             })),

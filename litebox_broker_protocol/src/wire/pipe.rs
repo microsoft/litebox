@@ -59,7 +59,6 @@ pub(super) fn decode_pipe_request(decoder: &mut Decoder<'_>) -> Result<PipeReque
 
 fn encode_shared_buffer_descriptor(encoder: &mut Encoder, descriptor: SharedBufferDescriptor) {
     encoder.u32(descriptor.slot_index.0);
-    encoder.u64(descriptor.generation);
     encoder.u32(descriptor.length);
 }
 
@@ -68,7 +67,6 @@ fn decode_shared_buffer_descriptor(
 ) -> Result<SharedBufferDescriptor, WireError> {
     Ok(SharedBufferDescriptor {
         slot_index: SharedBufferSlotIndex(decoder.u32()?),
-        generation: decoder.u64()?,
         length: decoder.u32()?,
     })
 }

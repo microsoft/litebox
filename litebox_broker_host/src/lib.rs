@@ -160,7 +160,7 @@ enum RequestFailure {
 
 #[derive(Clone, Copy)]
 struct SharedBufferSlotState {
-    last_generation: u64,
+    last_request_id: Option<RequestId>,
     owner: Option<RequestId>,
 }
 
@@ -178,7 +178,7 @@ impl SharedBufferClaims {
     const fn new() -> Self {
         Self {
             slots: [SharedBufferSlotState {
-                last_generation: 0,
+                last_request_id: None,
                 owner: None,
             }; SHARED_BUFFER_SLOT_COUNT as usize],
         }
@@ -198,13 +198,16 @@ impl SharedBufferClaims {
             return Err(ErrorCode::MalformedRequest);
         }
         let slot = &mut self.slots[descriptor.slot_index.0 as usize];
-        let Some(expected_generation) = slot.last_generation.checked_add(1) else {
-            return Err(ErrorCode::MalformedRequest);
-        };
-        if slot.owner.is_some() || descriptor.generation != expected_generation {
+        // A local lease spans response consumption, so honest reuse of this slot
+        // always carries a newer, non-wrapping request ID.
+        if slot.owner.is_some()
+            || slot
+                .last_request_id
+                .is_some_and(|last_request_id| request_id <= last_request_id)
+        {
             return Err(ErrorCode::MalformedRequest);
         }
-        slot.last_generation = descriptor.generation;
+        slot.last_request_id = Some(request_id);
         slot.owner = Some(request_id);
         Ok(SharedBufferClaim {
             slot_index: descriptor.slot_index,
@@ -385,7 +388,7 @@ mod tests {
         serve_connection_returns_channel_error_when_response_send_fails(&broker);
         serve_connection_returns_event_readiness_in_control_responses(&broker);
         serve_connection_continues_after_recoverable_request_failure(&broker);
-        serve_connection_aborts_on_stale_shared_buffer_generation(&broker);
+        serve_connection_aborts_on_stale_shared_buffer_request(&broker);
         serve_connection_aborts_without_response_on_shared_memory_failure(&broker);
         serve_connection_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_closes_object_reference(&broker);
@@ -634,7 +637,7 @@ mod tests {
                 Ok(HostReceive::Message(BrokerOperation::Pipe(
                     PipeRequest::Read(ReadPipeRequest {
                         handle: ObjectHandle(u64::MAX),
-                        buffer: descriptor(0, 1, 1),
+                        buffer: descriptor(0, 1),
                     }),
                 ))),
                 Ok(HostReceive::Message(BrokerOperation::Event(
@@ -667,10 +670,10 @@ mod tests {
         assert_eq!(channel.response_ids, [RequestId(0), RequestId(1)]);
     }
 
-    fn serve_connection_aborts_on_stale_shared_buffer_generation(broker: &BrokerCore) {
+    fn serve_connection_aborts_on_stale_shared_buffer_request(broker: &BrokerCore) {
         let stale_request = BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
             handle: ObjectHandle(u64::MAX),
-            buffer: descriptor(0, 1, 1),
+            buffer: descriptor(0, 1),
         }));
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
@@ -681,6 +684,7 @@ mod tests {
                 Ok(HostReceive::Message(stale_request)),
             ]),
         );
+        channel.request_id_step = 0;
         let mut notifications = FakeHostNotificationChannel::default();
 
         assert!(matches!(
@@ -829,7 +833,7 @@ mod tests {
             &session,
             BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle: response.write_handle,
-                buffer: descriptor(2, 1, 3),
+                buffer: descriptor(2, 3),
             })),
             &shared_buffers,
         );
@@ -842,7 +846,7 @@ mod tests {
             &session,
             BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle: response.read_handle,
-                buffer: descriptor(4, 1, 3),
+                buffer: descriptor(4, 3),
             })),
             &shared_buffers,
         );
@@ -865,44 +869,43 @@ mod tests {
     fn shared_buffer_claims_reject_invalid_descriptors() {
         let mut claims = SharedBufferClaims::new();
         let first = claims
-            .claim(RequestId(1), descriptor(0, 1, 3), SHARED_BUFFER_LAYOUT)
+            .claim(RequestId(1), descriptor(0, 3), SHARED_BUFFER_LAYOUT)
             .unwrap();
         assert_eq!(
-            claims.claim(RequestId(2), descriptor(0, 2, 3), SHARED_BUFFER_LAYOUT),
+            claims.claim(RequestId(2), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         claims.release(first);
         assert_eq!(
-            claims.claim(RequestId(2), descriptor(0, 1, 3), SHARED_BUFFER_LAYOUT),
+            claims.claim(RequestId(1), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         assert_eq!(
-            claims.claim(RequestId(2), descriptor(0, 3, 3), SHARED_BUFFER_LAYOUT),
+            claims.claim(RequestId(0), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
+        assert!(
+            claims
+                .claim(RequestId(3), descriptor(0, 3), SHARED_BUFFER_LAYOUT)
+                .is_ok()
+        );
         assert_eq!(
-            claims.claim(RequestId(2), descriptor(16, 1, 3), SHARED_BUFFER_LAYOUT),
+            claims.claim(RequestId(2), descriptor(16, 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         assert_eq!(
             claims.claim(
                 RequestId(2),
-                descriptor(1, 1, MAX_PIPE_TRANSFER_SIZE + 1),
+                descriptor(1, MAX_PIPE_TRANSFER_SIZE + 1),
                 SHARED_BUFFER_LAYOUT
             ),
             Err(ErrorCode::MalformedRequest)
         );
-        claims.slots[1].last_generation = u64::MAX;
-        assert_eq!(
-            claims.claim(RequestId(2), descriptor(1, 1, 3), SHARED_BUFFER_LAYOUT),
-            Err(ErrorCode::MalformedRequest)
-        );
     }
 
-    const fn descriptor(slot: u32, generation: u64, length: u32) -> SharedBufferDescriptor {
+    const fn descriptor(slot: u32, length: u32) -> SharedBufferDescriptor {
         SharedBufferDescriptor {
             slot_index: SharedBufferSlotIndex(slot),
-            generation,
             length,
         }
     }
@@ -935,6 +938,7 @@ mod tests {
         results: std::vec::Vec<BrokerResult>,
         response_ids: std::vec::Vec<RequestId>,
         next_request_id: u64,
+        request_id_step: u64,
         enqueue_readiness_requests_after_create: bool,
         enqueue_write_request_after_pipe_create: bool,
         send_error: bool,
@@ -954,6 +958,7 @@ mod tests {
                 results: std::vec::Vec::new(),
                 response_ids: std::vec::Vec::new(),
                 next_request_id: 0,
+                request_id_step: 1,
                 enqueue_readiness_requests_after_create: false,
                 enqueue_write_request_after_pipe_create: false,
                 send_error: false,
@@ -1000,7 +1005,7 @@ mod tests {
             Ok(match received {
                 HostReceive::Message(request) => {
                     let request_id = RequestId(self.next_request_id);
-                    self.next_request_id += 1;
+                    self.next_request_id += self.request_id_step;
                     HostReceive::Message(BrokerRequest {
                         request_id,
                         operation: request,
@@ -1045,7 +1050,7 @@ mod tests {
                     .push(Ok(HostReceive::Message(BrokerOperation::Pipe(
                         PipeRequest::Write(WritePipeRequest {
                             handle: response.write_handle,
-                            buffer: descriptor(0, 1, 1),
+                            buffer: descriptor(0, 1),
                         }),
                     ))));
                 self.operations.push(Ok(HostReceive::PeerClosed));

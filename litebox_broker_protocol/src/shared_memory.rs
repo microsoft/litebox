@@ -177,8 +177,6 @@ pub struct SharedBufferSlotIndex(pub u32);
 pub struct SharedBufferDescriptor {
     /// Slot used by this operation.
     pub slot_index: SharedBufferSlotIndex,
-    /// Non-wrapping reuse generation for the slot.
-    pub generation: u64,
     /// Number of bytes used from the start of the slot.
     pub length: u32,
 }

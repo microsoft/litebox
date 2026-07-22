@@ -112,7 +112,6 @@ fn run_fake_runner(args: &[OsString]) {
     let data = b"shared pipe data";
     let write_buffer = SharedBufferDescriptor {
         slot_index: SharedBufferSlotIndex(0),
-        generation: 1,
         length: data.len().try_into().unwrap(),
     };
     assert_eq!(
@@ -127,7 +126,6 @@ fn run_fake_runner(args: &[OsString]) {
             pipe.read_handle,
             SharedBufferDescriptor {
                 slot_index: SharedBufferSlotIndex(1),
-                generation: 1,
                 length: received.len().try_into().unwrap(),
             },
             &mut received,

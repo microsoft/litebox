@@ -171,8 +171,8 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
         ]);
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory.clone())).unwrap();
-        let write_buffer = descriptor(2, 1, 3);
-        let read_buffer = descriptor(4, 1, 3);
+        let write_buffer = descriptor(2, 3);
+        let read_buffer = descriptor(4, 3);
 
         local.create_pipe(64, 16).unwrap();
         assert_eq!(
@@ -220,7 +220,7 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([]);
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
-        let oversized = descriptor(0, 1, MAX_PIPE_TRANSFER_SIZE + 1);
+        let oversized = descriptor(0, MAX_PIPE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
             local.read_pipe(ObjectHandle(1), oversized, &mut []),
@@ -248,7 +248,7 @@ mod tests {
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
         let mut destination = [0];
 
-        let _ = local.read_pipe(ObjectHandle(1), descriptor(0, 1, 1), &mut destination);
+        let _ = local.read_pipe(ObjectHandle(1), descriptor(0, 1), &mut destination);
     }
 
     #[test]
@@ -261,13 +261,12 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
 
-        let _ = local.write_pipe(ObjectHandle(1), descriptor(0, 1, 1), &[0]);
+        let _ = local.write_pipe(ObjectHandle(1), descriptor(0, 1), &[0]);
     }
 
-    const fn descriptor(slot: u32, generation: u64, length: u32) -> SharedBufferDescriptor {
+    const fn descriptor(slot: u32, length: u32) -> SharedBufferDescriptor {
         SharedBufferDescriptor {
             slot_index: SharedBufferSlotIndex(slot),
-            generation,
             length,
         }
     }
