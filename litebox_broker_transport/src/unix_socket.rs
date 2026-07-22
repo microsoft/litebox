@@ -360,7 +360,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
                 .request_stream
                 .lock()
                 .expect("broker request writer mutex poisoned");
-            match active.pending_calls.failure() {
+            match active.pending_calls.current_failure() {
                 Some(error) => Err(copy_io_error(&error)),
                 None => {
                     write_frame_with_deadline(&mut request_stream, &encode_request(request), None)
@@ -551,7 +551,7 @@ impl PendingCalls {
         }
     }
 
-    fn fail(&self, error: Arc<Error>) -> bool {
+    fn record_failure(&self, error: Arc<Error>) -> bool {
         let mut state = self.state.lock().expect("broker pending mutex poisoned");
         if state.failure.is_some() {
             return false;
@@ -561,7 +561,7 @@ impl PendingCalls {
         true
     }
 
-    fn failure(&self) -> Option<Arc<Error>> {
+    fn current_failure(&self) -> Option<Arc<Error>> {
         self.state
             .lock()
             .expect("broker pending mutex poisoned")
@@ -632,7 +632,7 @@ fn fail_active_channel(
     association_failure: &(dyn Fn() + Send + Sync),
     error: Error,
 ) -> IoResult<()> {
-    let first_failure = pending_calls.fail(Arc::new(error));
+    let first_failure = pending_calls.record_failure(Arc::new(error));
     let shutdown_result = shutdown(shutdown_stream);
     if first_failure {
         association_failure();
@@ -1077,7 +1077,7 @@ mod tests {
                 result: BrokerResult::ObjectClosed,
             })
             .unwrap();
-        pending.fail(Arc::new(Error::new(
+        pending.record_failure(Arc::new(Error::new(
             ErrorKind::ConnectionAborted,
             "test failure",
         )));
@@ -1109,7 +1109,7 @@ mod tests {
         let pending = PendingCalls::new();
         let request_id = RequestId(1);
         pending.register(request_id).unwrap();
-        pending.fail(Arc::new(Error::new(
+        pending.record_failure(Arc::new(Error::new(
             ErrorKind::ConnectionAborted,
             "test failure",
         )));
