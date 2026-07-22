@@ -751,6 +751,7 @@ mod tests {
     };
     use litebox_broker_protocol::{ObjectHandle, RequestId};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     fn activate_test_channel(
@@ -769,6 +770,24 @@ mod tests {
         };
         let cancellation = channel.activate(association_failure).unwrap();
         (channel, cancellation)
+    }
+
+    fn activate_counting_failure_channel(
+        stream: UnixStream,
+    ) -> (
+        UnixStreamLocalControlChannel,
+        UnixStreamLocalControlCancellation,
+        Arc<AtomicUsize>,
+        mpsc::Receiver<()>,
+    ) {
+        let failure_count = Arc::new(AtomicUsize::new(0));
+        let response_failure_count = Arc::clone(&failure_count);
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        let (channel, cancellation) = activate_test_channel(stream, move || {
+            response_failure_count.fetch_add(1, Ordering::SeqCst);
+            failure_sender.send(()).unwrap();
+        });
+        (channel, cancellation, failure_count, failure_receiver)
     }
 
     #[test]
@@ -1005,11 +1024,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        let mut published_request_ids = Vec::with_capacity(MAX_PENDING_CALLS);
         for _ in 0..MAX_PENDING_CALLS {
             let frame = read_frame_with_deadline(&mut host_stream, None)
                 .unwrap()
                 .unwrap();
-            decode_request(&frame).unwrap();
+            published_request_ids.push(decode_request(&frame).unwrap().request_id);
         }
         host_stream
             .set_read_timeout(Some(Duration::from_millis(50)))
@@ -1020,20 +1040,44 @@ mod tests {
             ErrorKind::WouldBlock | ErrorKind::TimedOut
         ));
 
+        write_frame_with_deadline(
+            &mut host_stream,
+            &encode_response(BrokerResponse {
+                request_id: published_request_ids[0],
+                result: BrokerResult::ObjectClosed,
+            }),
+            None,
+        )
+        .unwrap();
+        host_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let released_request = decode_request(
+            &read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!published_request_ids.contains(&released_request.request_id));
+
         cancellation.cancel().unwrap();
+        let mut completed = 0;
+        let mut failed = 0;
         for caller in callers {
-            assert!(caller.join().unwrap().is_err());
+            match caller.join().unwrap() {
+                Ok(_) => completed += 1,
+                Err(_) => failed += 1,
+            }
         }
+        assert_eq!(completed, 1);
+        assert_eq!(failed, MAX_PENDING_CALLS);
     }
 
     #[test]
     fn unknown_response_identifier_fails_all_pending_calls() {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let failure_count = Arc::new(AtomicUsize::new(0));
-        let response_failure_count = Arc::clone(&failure_count);
-        let (channel, _cancellation) = activate_test_channel(local_stream, move || {
-            response_failure_count.fetch_add(1, Ordering::SeqCst);
-        });
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
         let channel = Arc::new(channel);
         let callers = [1, 2].map(|request_id| {
             let channel = Arc::clone(&channel);
@@ -1067,17 +1111,17 @@ mod tests {
                 ErrorKind::InvalidData
             );
         }
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn malformed_response_fails_all_pending_calls() {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let failure_count = Arc::new(AtomicUsize::new(0));
-        let response_failure_count = Arc::clone(&failure_count);
-        let (channel, _cancellation) = activate_test_channel(local_stream, move || {
-            response_failure_count.fetch_add(1, Ordering::SeqCst);
-        });
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
         let channel = Arc::new(channel);
         let callers = [1, 2].map(|request_id| {
             let channel = Arc::clone(&channel);
@@ -1103,17 +1147,17 @@ mod tests {
                 ErrorKind::InvalidData
             );
         }
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn response_eof_fails_all_pending_calls() {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let failure_count = Arc::new(AtomicUsize::new(0));
-        let response_failure_count = Arc::clone(&failure_count);
-        let (channel, _cancellation) = activate_test_channel(local_stream, move || {
-            response_failure_count.fetch_add(1, Ordering::SeqCst);
-        });
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
         let channel = Arc::new(channel);
         let callers = [1, 2].map(|request_id| {
             let channel = Arc::clone(&channel);
@@ -1139,17 +1183,17 @@ mod tests {
                 ErrorKind::UnexpectedEof
             );
         }
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn request_write_failure_fails_existing_pending_calls() {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let failure_count = Arc::new(AtomicUsize::new(0));
-        let response_failure_count = Arc::clone(&failure_count);
-        let (channel, _cancellation) = activate_test_channel(local_stream, move || {
-            response_failure_count.fetch_add(1, Ordering::SeqCst);
-        });
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
         let channel = Arc::new(channel);
         let pending_callers = [1, 2].map(|request_id| {
             let channel = Arc::clone(&channel);
@@ -1180,17 +1224,17 @@ mod tests {
         for caller in pending_callers {
             assert!(caller.join().unwrap().is_err());
         }
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn duplicate_response_identifier_fails_other_pending_calls() {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let failure_count = Arc::new(AtomicUsize::new(0));
-        let response_failure_count = Arc::clone(&failure_count);
-        let (channel, _cancellation) = activate_test_channel(local_stream, move || {
-            response_failure_count.fetch_add(1, Ordering::SeqCst);
-        });
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
         let channel = Arc::new(channel);
         let first_channel = Arc::clone(&channel);
         let first = thread::spawn(move || {
@@ -1225,6 +1269,9 @@ mod tests {
             second.join().unwrap().unwrap_err().kind(),
             ErrorKind::InvalidData
         );
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
     }
 

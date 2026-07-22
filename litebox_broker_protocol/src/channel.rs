@@ -55,6 +55,11 @@ pub trait LocalControlChannel {
     fn recv_handshake_response(&mut self) -> Result<Option<BrokerHandshakeResponse>, Self::Error>;
 
     /// Publishes one request and waits for its correlated response.
+    ///
+    /// Calls may execute concurrently, and each pending request must have a
+    /// distinct identifier. If a valid active call returns a channel error, the
+    /// association is considered failed: every concurrent or future call must
+    /// return an error rather than remain blocked.
     fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error>;
 
     /// Serializes one complete shared-memory payload transfer.
