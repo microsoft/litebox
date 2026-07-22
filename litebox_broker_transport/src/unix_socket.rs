@@ -386,7 +386,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
             );
         }
 
-        active.pending_calls.wait(pending_call)
+        pending_call.wait()
     }
 
     fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> IoResult<T> {
@@ -476,19 +476,56 @@ struct PendingCalls {
 }
 
 struct PendingCallState {
-    calls: HashMap<RequestId, PendingCall>,
+    calls: HashMap<RequestId, Arc<PendingCall>>,
     failure: Option<Arc<Error>>,
 }
 
 struct PendingCall {
-    response: Option<BrokerResponse>,
-    response_ready: Arc<Condvar>,
+    result: Mutex<Option<PendingCallResult>>,
+    result_ready: Condvar,
 }
 
-#[derive(Debug)]
-struct PendingCallWaiter {
-    request_id: RequestId,
-    response_ready: Arc<Condvar>,
+enum PendingCallResult {
+    Response(BrokerResponse),
+    Failure(Arc<Error>),
+}
+
+impl PendingCall {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            result_ready: Condvar::new(),
+        }
+    }
+
+    fn resolve(&self, result: PendingCallResult) {
+        let mut stored = self
+            .result
+            .lock()
+            .expect("broker pending-call result mutex poisoned");
+        assert!(stored.is_none(), "broker pending call already resolved");
+        *stored = Some(result);
+        self.result_ready.notify_one();
+    }
+
+    fn wait(&self) -> IoResult<BrokerResponse> {
+        let mut result = self
+            .result
+            .lock()
+            .expect("broker pending-call result mutex poisoned");
+        loop {
+            if let Some(result) = result.take() {
+                return match result {
+                    PendingCallResult::Response(response) => Ok(response),
+                    PendingCallResult::Failure(error) => Err(copy_io_error(&error)),
+                };
+            }
+            result = self
+                .result_ready
+                .wait(result)
+                .expect("broker pending-call result mutex poisoned");
+        }
+    }
 }
 
 impl PendingCalls {
@@ -502,7 +539,7 @@ impl PendingCalls {
         }
     }
 
-    fn register(&self, request_id: RequestId) -> IoResult<PendingCallWaiter> {
+    fn register(&self, request_id: RequestId) -> IoResult<Arc<PendingCall>> {
         let mut state = self.state.lock().expect("broker pending mutex poisoned");
         while state.calls.len() == MAX_PENDING_CALLS && state.failure.is_none() {
             state = self
@@ -513,73 +550,52 @@ impl PendingCalls {
         if let Some(error) = state.failure.as_ref() {
             return Err(copy_io_error(error));
         }
-        let response_ready = Arc::new(Condvar::new());
+        let pending_call = Arc::new(PendingCall::new());
         match state.calls.entry(request_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(PendingCall {
-                    response: None,
-                    response_ready: Arc::clone(&response_ready),
-                });
+                entry.insert(Arc::clone(&pending_call));
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(invalid_data("duplicate broker request ID"));
             }
         }
-        Ok(PendingCallWaiter {
-            request_id,
-            response_ready,
-        })
+        Ok(pending_call)
     }
 
     fn complete(&self, response: BrokerResponse) -> IoResult<()> {
-        let mut state = self.state.lock().expect("broker pending mutex poisoned");
-        if let Some(error) = state.failure.as_ref() {
-            return Err(copy_io_error(error));
-        }
-        let Some(call) = state.calls.get_mut(&response.request_id) else {
-            return Err(invalid_data("broker returned an unknown response ID"));
+        let pending_call = {
+            let mut state = self.state.lock().expect("broker pending mutex poisoned");
+            if let Some(error) = state.failure.as_ref() {
+                return Err(copy_io_error(error));
+            }
+            let Some(pending_call) = state.calls.remove(&response.request_id) else {
+                return Err(invalid_data("broker returned an unknown response ID"));
+            };
+            self.capacity_available.notify_one();
+            pending_call
         };
-        if call.response.is_some() {
-            return Err(invalid_data("broker returned a duplicate response ID"));
-        }
-        call.response = Some(response);
-        call.response_ready.notify_one();
+        pending_call.resolve(PendingCallResult::Response(response));
         Ok(())
     }
 
-    fn wait(&self, pending_call: PendingCallWaiter) -> IoResult<BrokerResponse> {
-        let mut state = self.state.lock().expect("broker pending mutex poisoned");
-        loop {
-            let Some(call) = state.calls.get_mut(&pending_call.request_id) else {
-                unreachable!("pending broker call disappeared");
-            };
-            if let Some(response) = call.response.take() {
-                state.calls.remove(&pending_call.request_id);
-                self.capacity_available.notify_one();
-                return Ok(response);
-            }
-            if let Some(error) = state.failure.as_ref().map(Arc::clone) {
-                state.calls.remove(&pending_call.request_id);
-                self.capacity_available.notify_one();
-                return Err(copy_io_error(&error));
-            }
-            state = pending_call
-                .response_ready
-                .wait(state)
-                .expect("broker pending mutex poisoned");
-        }
-    }
-
     fn record_failure(&self, error: Arc<Error>) -> bool {
-        let mut state = self.state.lock().expect("broker pending mutex poisoned");
-        if state.failure.is_some() {
-            return false;
+        let pending_calls = {
+            let mut state = self.state.lock().expect("broker pending mutex poisoned");
+            if state.failure.is_some() {
+                return false;
+            }
+            state.failure = Some(Arc::clone(&error));
+            let pending_calls = state
+                .calls
+                .drain()
+                .map(|(_, call)| call)
+                .collect::<Vec<_>>();
+            self.capacity_available.notify_all();
+            pending_calls
+        };
+        for pending_call in pending_calls {
+            pending_call.resolve(PendingCallResult::Failure(Arc::clone(&error)));
         }
-        state.failure = Some(error);
-        for call in state.calls.values() {
-            call.response_ready.notify_one();
-        }
-        self.capacity_available.notify_all();
         true
     }
 
@@ -1303,14 +1319,18 @@ mod tests {
             "test failure",
         )));
 
-        assert_eq!(pending.wait(pending_call).unwrap().request_id, request_id);
+        assert_eq!(pending_call.wait().unwrap().request_id, request_id);
     }
 
     #[test]
-    fn duplicate_registration_preserves_the_original_call() {
+    fn duplicate_pending_registration_preserves_the_original_call() {
         let pending = PendingCalls::new();
         let request_id = RequestId(1);
         let pending_call = pending.register(request_id).unwrap();
+        assert_eq!(
+            pending.register(request_id).err().unwrap().kind(),
+            ErrorKind::InvalidData
+        );
         pending
             .complete(BrokerResponse {
                 request_id,
@@ -1318,11 +1338,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(
-            pending.register(request_id).unwrap_err().kind(),
-            ErrorKind::InvalidData
-        );
-        assert_eq!(pending.wait(pending_call).unwrap().request_id, request_id);
+        assert_eq!(pending_call.wait().unwrap().request_id, request_id);
     }
 
     #[test]
@@ -1344,7 +1360,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            pending.wait(pending_call).unwrap_err().kind(),
+            pending_call.wait().unwrap_err().kind(),
             ErrorKind::ConnectionAborted
         );
     }
