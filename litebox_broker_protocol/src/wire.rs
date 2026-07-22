@@ -39,7 +39,7 @@ const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
-const HANDSHAKE_RESPONSE_TAG_ERROR: u8 = 2;
+const RESPONSE_TAG_HANDSHAKE_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
 const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
 const RESPONSE_TAG_PIPE: u8 = 5;
@@ -177,7 +177,7 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
             encoder.protocol_version(broker_protocol_version);
         }
         BrokerHandshakeResponse::Error(error) => {
-            encoder.u8(HANDSHAKE_RESPONSE_TAG_ERROR);
+            encoder.u8(RESPONSE_TAG_HANDSHAKE_ERROR);
             encoder.u16(error.as_raw());
         }
     }
@@ -202,7 +202,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version: decoder.protocol_version()?,
         },
-        HANDSHAKE_RESPONSE_TAG_ERROR => {
+        RESPONSE_TAG_HANDSHAKE_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerHandshakeResponse::Error(error)
         }
@@ -253,7 +253,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     match tag {
-        RESPONSE_TAG_NEGOTIATED | HANDSHAKE_RESPONSE_TAG_ERROR | RESPONSE_TAG_VERSION_MISMATCH => {
+        RESPONSE_TAG_NEGOTIATED | RESPONSE_TAG_HANDSHAKE_ERROR | RESPONSE_TAG_VERSION_MISMATCH => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_EVENT
