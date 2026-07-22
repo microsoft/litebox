@@ -363,7 +363,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
             return Err(invalid_data("broker control channel is not active"));
         };
         let request_id = request.request_id;
-        active.pending_calls.register(request_id)?;
+        let pending_call = active.pending_calls.register(request_id)?;
 
         let write_result = {
             let mut request_stream = active
@@ -386,7 +386,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
             );
         }
 
-        active.pending_calls.wait(request_id)
+        active.pending_calls.wait(pending_call)
     }
 
     fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> IoResult<T> {
@@ -472,7 +472,7 @@ impl HostNotificationChannel for UnixStreamHostNotificationChannel {
 
 struct PendingCalls {
     state: Mutex<PendingCallState>,
-    changed: Condvar,
+    capacity_available: Condvar,
 }
 
 struct PendingCallState {
@@ -480,9 +480,15 @@ struct PendingCallState {
     failure: Option<Arc<Error>>,
 }
 
-enum PendingCall {
-    Submitted,
-    Completed(BrokerResponse),
+struct PendingCall {
+    response: Option<BrokerResponse>,
+    response_ready: Arc<Condvar>,
+}
+
+#[derive(Debug)]
+struct PendingCallWaiter {
+    request_id: RequestId,
+    response_ready: Arc<Condvar>,
 }
 
 impl PendingCalls {
@@ -492,30 +498,37 @@ impl PendingCalls {
                 calls: HashMap::new(),
                 failure: None,
             }),
-            changed: Condvar::new(),
+            capacity_available: Condvar::new(),
         }
     }
 
-    fn register(&self, request_id: RequestId) -> IoResult<()> {
+    fn register(&self, request_id: RequestId) -> IoResult<PendingCallWaiter> {
         let mut state = self.state.lock().expect("broker pending mutex poisoned");
         while state.calls.len() == MAX_PENDING_CALLS && state.failure.is_none() {
             state = self
-                .changed
+                .capacity_available
                 .wait(state)
                 .expect("broker pending mutex poisoned");
         }
         if let Some(error) = state.failure.as_ref() {
             return Err(copy_io_error(error));
         }
+        let response_ready = Arc::new(Condvar::new());
         match state.calls.entry(request_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(PendingCall::Submitted);
+                entry.insert(PendingCall {
+                    response: None,
+                    response_ready: Arc::clone(&response_ready),
+                });
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(invalid_data("duplicate broker request ID"));
             }
         }
-        Ok(())
+        Ok(PendingCallWaiter {
+            request_id,
+            response_ready,
+        })
     }
 
     fn complete(&self, response: BrokerResponse) -> IoResult<()> {
@@ -526,36 +539,32 @@ impl PendingCalls {
         let Some(call) = state.calls.get_mut(&response.request_id) else {
             return Err(invalid_data("broker returned an unknown response ID"));
         };
-        match call {
-            PendingCall::Submitted => *call = PendingCall::Completed(response),
-            PendingCall::Completed(_) => {
-                return Err(invalid_data("broker returned a duplicate response ID"));
-            }
+        if call.response.is_some() {
+            return Err(invalid_data("broker returned a duplicate response ID"));
         }
-        self.changed.notify_all();
+        call.response = Some(response);
+        call.response_ready.notify_one();
         Ok(())
     }
 
-    fn wait(&self, request_id: RequestId) -> IoResult<BrokerResponse> {
+    fn wait(&self, pending_call: PendingCallWaiter) -> IoResult<BrokerResponse> {
         let mut state = self.state.lock().expect("broker pending mutex poisoned");
         loop {
-            if matches!(
-                state.calls.get(&request_id),
-                Some(PendingCall::Completed(_))
-            ) {
-                let Some(PendingCall::Completed(response)) = state.calls.remove(&request_id) else {
-                    unreachable!("completed broker call disappeared");
-                };
-                self.changed.notify_all();
+            let Some(call) = state.calls.get_mut(&pending_call.request_id) else {
+                unreachable!("pending broker call disappeared");
+            };
+            if let Some(response) = call.response.take() {
+                state.calls.remove(&pending_call.request_id);
+                self.capacity_available.notify_one();
                 return Ok(response);
             }
             if let Some(error) = state.failure.as_ref().map(Arc::clone) {
-                state.calls.remove(&request_id);
-                self.changed.notify_all();
+                state.calls.remove(&pending_call.request_id);
+                self.capacity_available.notify_one();
                 return Err(copy_io_error(&error));
             }
-            state = self
-                .changed
+            state = pending_call
+                .response_ready
                 .wait(state)
                 .expect("broker pending mutex poisoned");
         }
@@ -567,7 +576,10 @@ impl PendingCalls {
             return false;
         }
         state.failure = Some(error);
-        self.changed.notify_all();
+        for call in state.calls.values() {
+            call.response_ready.notify_one();
+        }
+        self.capacity_available.notify_all();
         true
     }
 
@@ -1279,7 +1291,7 @@ mod tests {
     fn completed_call_wins_over_later_association_failure() {
         let pending = PendingCalls::new();
         let request_id = RequestId(1);
-        pending.register(request_id).unwrap();
+        let pending_call = pending.register(request_id).unwrap();
         pending
             .complete(BrokerResponse {
                 request_id,
@@ -1291,14 +1303,14 @@ mod tests {
             "test failure",
         )));
 
-        assert_eq!(pending.wait(request_id).unwrap().request_id, request_id);
+        assert_eq!(pending.wait(pending_call).unwrap().request_id, request_id);
     }
 
     #[test]
     fn duplicate_registration_preserves_the_original_call() {
         let pending = PendingCalls::new();
         let request_id = RequestId(1);
-        pending.register(request_id).unwrap();
+        let pending_call = pending.register(request_id).unwrap();
         pending
             .complete(BrokerResponse {
                 request_id,
@@ -1310,14 +1322,14 @@ mod tests {
             pending.register(request_id).unwrap_err().kind(),
             ErrorKind::InvalidData
         );
-        assert_eq!(pending.wait(request_id).unwrap().request_id, request_id);
+        assert_eq!(pending.wait(pending_call).unwrap().request_id, request_id);
     }
 
     #[test]
     fn association_failure_wins_before_completion() {
         let pending = PendingCalls::new();
         let request_id = RequestId(1);
-        pending.register(request_id).unwrap();
+        let pending_call = pending.register(request_id).unwrap();
         pending.record_failure(Arc::new(Error::new(
             ErrorKind::ConnectionAborted,
             "test failure",
@@ -1332,7 +1344,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            pending.wait(request_id).unwrap_err().kind(),
+            pending.wait(pending_call).unwrap_err().kind(),
             ErrorKind::ConnectionAborted
         );
     }
