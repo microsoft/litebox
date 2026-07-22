@@ -219,9 +219,38 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
 
+    fn negotiate_control_pair(
+        local_stream: UnixStream,
+        host_stream: UnixStream,
+    ) -> (UnixStreamLocalControlChannel, UnixStreamHostControlChannel) {
+        let mut local = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let mut host = UnixStreamHostControlChannel::from_accepted(host_stream);
+        let request = litebox_broker_protocol::message::BrokerHandshakeRequest {
+            protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+        };
+        local.send_handshake_request(&request).unwrap();
+        assert_eq!(
+            host.recv_handshake_request().unwrap(),
+            HostReceive::Message(request)
+        );
+        host.send_handshake_response(
+            &litebox_broker_protocol::message::BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            local.recv_handshake_response().unwrap(),
+            Some(litebox_broker_protocol::message::BrokerHandshakeResponse::Negotiated { .. })
+        ));
+        (local, host)
+    }
+
     #[test]
     fn control_failure_cancels_notifications() {
         let (local_control, host_control) = UnixStream::pair().unwrap();
+        let (mut active_channel, host_control) =
+            negotiate_control_pair(local_control, host_control);
         let (local_notification, mut host_notification) = UnixStream::pair().unwrap();
         host_notification
             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -232,7 +261,6 @@ mod tests {
             notification_channel.cancellation_handle().unwrap(),
         ));
         let response_failure = Arc::downgrade(&association_failure);
-        let mut active_channel = UnixStreamLocalControlChannel::from_connected(local_control);
         let control_cancellation = active_channel
             .activate(move || {
                 if let Some(response_failure) = response_failure.upgrade() {
@@ -260,15 +288,15 @@ mod tests {
     #[test]
     fn notification_failure_cancels_control() {
         let (local_control, host_control) = UnixStream::pair().unwrap();
+        let (mut active_channel, mut host_control) =
+            negotiate_control_pair(local_control, host_control);
         let (local_notification, host_notification) = UnixStream::pair().unwrap();
-        let mut host_control = UnixStreamHostControlChannel::from_accepted(host_control);
         let notification_channel =
             UnixStreamLocalNotificationChannel::from_connected(local_notification);
         let association_failure = Arc::new(BrokerAssociationFailure::new(
             notification_channel.cancellation_handle().unwrap(),
         ));
         let response_failure = Arc::downgrade(&association_failure);
-        let mut active_channel = UnixStreamLocalControlChannel::from_connected(local_control);
         let control_cancellation = active_channel
             .activate(move || {
                 if let Some(response_failure) = response_failure.upgrade() {
