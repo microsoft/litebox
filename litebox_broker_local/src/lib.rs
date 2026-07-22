@@ -42,7 +42,7 @@ pub use error::{BrokerLocalError, Result};
 pub struct BrokerLocal<Channel: LocalControlChannel> {
     channel: Channel,
     shared_memory: Arc<dyn SharedMemory>,
-    next_request_id: Option<RequestId>,
+    next_request_id: u64,
 }
 
 /// Broker-local receive adapter for broker-initiated asynchronous notifications.
@@ -97,7 +97,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 Ok(Self {
                     channel,
                     shared_memory,
-                    next_request_id: Some(RequestId(0)),
+                    next_request_id: 0,
                 })
             }
             BrokerHandshakeResponse::VersionMismatch { .. } => {
@@ -126,11 +126,11 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         &mut self,
         operation: BrokerOperation,
     ) -> Result<BrokerResult, Channel::Error> {
-        let request_id = self
+        let request_id = RequestId(self.next_request_id);
+        self.next_request_id = self
             .next_request_id
-            .take()
+            .checked_add(1)
             .ok_or(BrokerLocalError::RequestIdExhausted)?;
-        self.next_request_id = request_id.0.checked_add(1).map(RequestId);
         self.channel
             .send_request(&BrokerRequest {
                 request_id,
@@ -273,7 +273,7 @@ mod tests {
         let mut local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: Some(RequestId(0)),
+            next_request_id: 0,
         };
 
         assert!(local.close_object(handle).is_ok());
@@ -293,7 +293,7 @@ mod tests {
         let mut local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: Some(RequestId(0)),
+            next_request_id: 0,
         };
 
         local.close_object(handle).unwrap();
@@ -312,11 +312,11 @@ mod tests {
 
     #[test]
     fn active_request_rejects_mismatched_response_identifier() {
-        let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::Internal)));
+        let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let mut local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: Some(RequestId(0)),
+            next_request_id: 0,
         };
         local.channel.response_id = Some(RequestId(9));
 
@@ -330,20 +330,14 @@ mod tests {
     }
 
     #[test]
-    fn active_request_identifier_exhaustion_allows_maximum_identifier_once() {
+    fn active_request_identifier_exhaustion_does_not_wrap() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let mut local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: Some(RequestId(u64::MAX)),
+            next_request_id: u64::MAX,
         };
 
-        local.close_object(ObjectHandle(7)).unwrap();
-        assert_eq!(
-            local.channel.sent_request.as_ref().unwrap().request_id,
-            RequestId(u64::MAX)
-        );
-        local.channel.sent_request = None;
         assert!(matches!(
             local.close_object(ObjectHandle(7)),
             Err(BrokerLocalError::RequestIdExhausted)
@@ -358,7 +352,7 @@ mod tests {
         let mut local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: Some(RequestId(0)),
+            next_request_id: 0,
         };
 
         assert!(matches!(
@@ -374,7 +368,7 @@ mod tests {
         let mut local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: Some(RequestId(0)),
+            next_request_id: 0,
         };
 
         let _ = local.create_event_with_count(0);
