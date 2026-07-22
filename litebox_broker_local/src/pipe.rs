@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
-use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse, PipeRequest, PipeResponse};
+use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, PipeRequest, PipeResponse};
 use litebox_broker_protocol::pipe::{
     CreatePipeRequest, CreatePipeResponse, PIPE_TRANSFER_BUFFER_SIZE, ReadPipeRequest,
     WritePipeRequest,
@@ -110,12 +110,12 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     }
 
     fn request_pipe(&mut self, request: PipeRequest) -> Result<PipeResponse, Channel::Error> {
-        match self.request(BrokerRequest::Pipe(request))? {
-            BrokerResponse::Pipe(response) => Ok(response),
-            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response @ (BrokerResponse::ObjectClosed
-            | BrokerResponse::Readiness(_)
-            | BrokerResponse::Event(_)) => {
+        match self.request(BrokerOperation::Pipe(request))? {
+            BrokerResult::Pipe(response) => Ok(response),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response @ (BrokerResult::ObjectClosed
+            | BrokerResult::Readiness(_)
+            | BrokerResult::Event(_)) => {
                 panic!("broker returned unexpected pipe response: {response:?}");
             }
         }
@@ -132,8 +132,8 @@ mod tests {
 
     use litebox_broker_protocol::channel::LocalControlChannel;
     use litebox_broker_protocol::message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequestEnvelope,
-        BrokerResponseEnvelope,
+        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
+        BrokerResponse, BrokerResult,
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
     use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
@@ -145,12 +145,12 @@ mod tests {
         let write_handle = ObjectHandle(2);
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
         let channel = ScriptedChannel::new([
-            BrokerResponse::Pipe(PipeResponse::Create(CreatePipeResponse {
+            BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
                 read_handle,
                 write_handle,
             })),
-            BrokerResponse::Pipe(PipeResponse::Write(WritePipeResponse { written: 2 })),
-            BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
+            BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 2 })),
+            BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
         ]);
         let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory.clone())).unwrap();
 
@@ -163,17 +163,17 @@ mod tests {
         memory.write(0, &[4, 5, 6]).unwrap();
         assert_eq!(local.read_pipe(read_handle, 3).unwrap(), [4, 5]);
         assert_eq!(
-            local.channel.sent_requests,
+            local.channel.sent_operations,
             [
-                BrokerRequest::Pipe(PipeRequest::Create(CreatePipeRequest {
+                BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
                     capacity: 64,
                     atomic_write_size: 16,
                 })),
-                BrokerRequest::Pipe(PipeRequest::Write(WritePipeRequest {
+                BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                     handle: write_handle,
                     length: 3,
                 })),
-                BrokerRequest::Pipe(PipeRequest::Read(ReadPipeRequest {
+                BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                     handle: read_handle,
                     length: 3,
                 })),
@@ -200,14 +200,14 @@ mod tests {
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted
             ))
         ));
-        assert!(local.channel.sent_requests.is_empty());
+        assert!(local.channel.sent_operations.is_empty());
     }
 
     #[test]
     #[should_panic(expected = "broker returned oversized pipe read")]
     fn read_pipe_rejects_oversized_response() {
         let channel =
-            ScriptedChannel::new([BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse {
+            ScriptedChannel::new([BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
                 read: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
@@ -219,9 +219,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "broker returned oversized shared pipe write")]
     fn write_pipe_rejects_oversized_response() {
-        let channel = ScriptedChannel::new([BrokerResponse::Pipe(PipeResponse::Write(
-            WritePipeResponse { written: 2 },
-        ))]);
+        let channel =
+            ScriptedChannel::new([BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
+                written: 2,
+            }))]);
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
         let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
 
@@ -276,16 +277,16 @@ mod tests {
     }
 
     struct ScriptedChannel {
-        responses: VecDeque<BrokerResponse>,
-        sent_requests: Vec<BrokerRequest>,
+        results: VecDeque<BrokerResult>,
+        sent_operations: Vec<BrokerOperation>,
         last_request_id: Option<RequestId>,
     }
 
     impl ScriptedChannel {
-        fn new(responses: impl IntoIterator<Item = BrokerResponse>) -> Self {
+        fn new(results: impl IntoIterator<Item = BrokerResult>) -> Self {
             Self {
-                responses: responses.into_iter().collect(),
-                sent_requests: Vec::new(),
+                results: results.into_iter().collect(),
+                sent_operations: Vec::new(),
                 last_request_id: None,
             }
         }
@@ -312,25 +313,20 @@ mod tests {
 
         fn send_request(
             &mut self,
-            request: &BrokerRequestEnvelope,
+            request: &BrokerRequest,
         ) -> core::result::Result<(), Self::Error> {
-            self.sent_requests.push(request.request.clone());
+            self.sent_operations.push(request.operation.clone());
             self.last_request_id = Some(request.request_id);
             Ok(())
         }
 
-        fn recv_response(
-            &mut self,
-        ) -> core::result::Result<Option<BrokerResponseEnvelope>, Self::Error> {
-            Ok(self
-                .responses
-                .pop_front()
-                .map(|response| BrokerResponseEnvelope {
-                    request_id: self
-                        .last_request_id
-                        .expect("response requires a sent request"),
-                    response,
-                }))
+        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
+            Ok(self.results.pop_front().map(|result| BrokerResponse {
+                request_id: self
+                    .last_request_id
+                    .expect("response requires a sent request"),
+                result,
+            }))
         }
     }
 }

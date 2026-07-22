@@ -20,9 +20,9 @@ pub struct BrokerHandshakeRequest {
     pub protocol_version: ProtocolVersion,
 }
 
-/// Broker request sent over an active control channel.
+/// Operation requested over an active broker control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrokerRequest {
+pub enum BrokerOperation {
     /// Close one broker object reference.
     CloseObject(ObjectHandle),
     /// Check the current readiness of a broker-owned object.
@@ -33,13 +33,13 @@ pub enum BrokerRequest {
     Pipe(PipeRequest),
 }
 
-/// Broker request and its association-scoped correlation identifier.
+/// Request sent over an active broker control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrokerRequestEnvelope {
+pub struct BrokerRequest {
     /// Correlation identifier allocated by the local endpoint.
     pub request_id: RequestId,
     /// Requested broker operation.
-    pub request: BrokerRequest,
+    pub operation: BrokerOperation,
 }
 
 /// Broker handshake response sent before the control channel is active.
@@ -88,9 +88,9 @@ pub enum PipeRequest {
     Write(WritePipeRequest),
 }
 
-/// Broker response sent over an active control channel.
+/// Result returned for an active broker operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrokerResponse {
+pub enum BrokerResult {
     /// Object close operation completed.
     ObjectClosed,
     /// Current readiness of a broker-owned object.
@@ -103,13 +103,13 @@ pub enum BrokerResponse {
     Error(ErrorCode),
 }
 
-/// Broker response and the identifier of its corresponding request.
+/// Response sent over an active broker control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrokerResponseEnvelope {
+pub struct BrokerResponse {
     /// Correlation identifier copied from the request.
     pub request_id: RequestId,
-    /// Broker operation result.
-    pub response: BrokerResponse,
+    /// Result of the requested broker operation.
+    pub result: BrokerResult,
 }
 
 /// Broker-owned event object response.

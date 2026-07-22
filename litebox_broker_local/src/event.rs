@@ -8,7 +8,7 @@ use litebox_broker_protocol::event::{
     EventConsumeMode,
 };
 use litebox_broker_protocol::message::{
-    BrokerRequest, BrokerResponse, EventRequest, EventResponse,
+    BrokerOperation, BrokerResult, EventRequest, EventResponse,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
@@ -71,12 +71,12 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     }
 
     fn request_event(&mut self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
-        match self.request(BrokerRequest::Event(request))? {
-            BrokerResponse::Event(response) => Ok(response),
-            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response @ (BrokerResponse::ObjectClosed
-            | BrokerResponse::Readiness(_)
-            | BrokerResponse::Pipe(_)) => {
+        match self.request(BrokerOperation::Event(request))? {
+            BrokerResult::Event(response) => Ok(response),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response @ (BrokerResult::ObjectClosed
+            | BrokerResult::Readiness(_)
+            | BrokerResult::Pipe(_)) => {
                 panic!("broker returned unexpected event response: {response:?}");
             }
         }

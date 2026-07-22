@@ -451,7 +451,7 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
         &mut self,
     ) -> Result<
         litebox_broker_protocol::channel::HostReceive<
-            litebox_broker_protocol::message::BrokerRequestEnvelope,
+            litebox_broker_protocol::message::BrokerRequest,
         >,
         Self::Error,
     > {
@@ -459,8 +459,8 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
         if matches!(
             &request,
             litebox_broker_protocol::channel::HostReceive::Message(
-                litebox_broker_protocol::message::BrokerRequestEnvelope {
-                    request: litebox_broker_protocol::message::BrokerRequest::CloseObject(_),
+                litebox_broker_protocol::message::BrokerRequest {
+                    operation: litebox_broker_protocol::message::BrokerOperation::CloseObject(_),
                     ..
                 }
             )
@@ -472,7 +472,7 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
 
     fn send_response(
         &mut self,
-        response: &litebox_broker_protocol::message::BrokerResponseEnvelope,
+        response: &litebox_broker_protocol::message::BrokerResponse,
     ) -> Result<(), Self::Error> {
         self.inner.send_response(response)
     }
