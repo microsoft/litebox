@@ -150,7 +150,7 @@ pub(crate) struct BrokerLocalControl<
 > {
     local: Mutex<Platform, Option<Arc<BrokerLocal<Channel>>>>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
-    shared_buffer_leases: SlotAllocator<Platform>,
+    slot_allocator: SlotAllocator<Platform>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
@@ -165,7 +165,7 @@ where
         Self {
             local: Mutex::new(Some(Arc::new(local))),
             pollable_registry,
-            shared_buffer_leases: SlotAllocator::new(),
+            slot_allocator: SlotAllocator::new(),
         }
     }
 
@@ -191,14 +191,14 @@ where
         &self,
         length: u32,
     ) -> core::result::Result<SharedBufferLease<'_, Platform>, BrokerControlError> {
-        self.shared_buffer_leases.acquire(length).map_err(|_| {
+        self.slot_allocator.acquire(length).map_err(|_| {
             self.fail_association();
             BrokerControlError::AssociationFailed
         })
     }
 
     fn fail_association(&self) {
-        self.shared_buffer_leases.fail();
+        self.slot_allocator.fail();
         if self.local.lock().take().is_some() {
             self.pollable_registry.notify_all(Events::ERR);
         }
