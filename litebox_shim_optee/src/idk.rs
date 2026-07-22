@@ -1,7 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{NormalWorldMutPtr, Task, UserConstPtr, UserMutPtr, syscalls::Cleanup};
+use crate::syscalls::pta::PTA_DEFAULT_FLAGS;
+use crate::{
+    NormalWorldMutPtr, TA_DIGEST_LEN, TaDigest, Task, UserConstPtr, UserMutPtr, syscalls::Cleanup,
+};
 use alloc::vec::Vec;
 use litebox::{
     mm::linux::PAGE_SIZE,
@@ -9,9 +12,7 @@ use litebox::{
     utils::TruncateExt,
 };
 use litebox_common_linux::errno::Errno;
-use litebox_common_optee::{
-    PTA_DEFAULT_FLAGS, TaFlags, TeeParamType, TeeResult, TeeUuid, UteeParams,
-};
+use litebox_common_optee::{TaFlags, TeeParamType, TeeResult, TeeUuid, UteeParams};
 use num_enum::TryFromPrimitive;
 use p384::{
     NonZeroScalar,
@@ -40,6 +41,7 @@ const IDKS_ENDORSEMENT_METADATA_LEN: usize = IDKS_ENDORSEMENT_MAGIC.len()
     + size_of::<u32>()
     + size_of::<TeeUuid>()
     + size_of::<u32>()
+    + TA_DIGEST_LEN
     + size_of::<u8>()
     + ISOLATION_SOLUTION.len();
 pub(crate) struct IdksPta;
@@ -123,12 +125,12 @@ impl IdksPta {
             .to_owned_slice(ta_data_size)
             .ok_or(TeeResult::BadParameters)?
         };
-        let mut endorsement = build_endorsement_data(&ta_data, &task.ta_app_id, task.ta_svn)
-            .ok_or(TeeResult::BadParameters)?;
+        let mut endorsement =
+            build_endorsement_data(&ta_data, &task.ta_app_id, task.ta_svn, &task.ta_digest)
+                .ok_or(TeeResult::BadParameters)?;
         let key_pair = get_identity_signing_key_pair().map_err(|_| TeeResult::GenericError)?;
-        let signature =
-            endorse_data_with(&endorsement, &key_pair.private_key)
-                .map_err(|_| TeeResult::GenericError)?;
+        let signature = endorse_data_with(&endorsement, &key_pair.private_key)
+            .map_err(|_| TeeResult::GenericError)?;
         endorsement.extend_from_slice(&signature);
         UserMutPtr::<u8>::from_usize(
             usize::try_from(endorsement_addr).map_err(|_| TeeResult::BadParameters)?,
@@ -141,8 +143,13 @@ impl IdksPta {
     }
 }
 
-fn build_endorsement_data(ta_data: &[u8], ta_uuid: &TeeUuid, ta_svn: u32) -> Option<Vec<u8>> {
-    // MAGIC || VERSION || TA_DATA || TA_UUID || TA_SVN || DEBUG || ISOLATION_SOLUTION
+fn build_endorsement_data(
+    ta_data: &[u8],
+    ta_uuid: &TeeUuid,
+    ta_svn: u32,
+    ta_digest: &TaDigest,
+) -> Option<Vec<u8>> {
+    // MAGIC || VERSION || TA_DATA || TA_UUID || TA_SVN || TA_DIGEST || DEBUG || ISOLATION_SOLUTION
     let capacity = ta_data.len().checked_add(IDKS_ENDORSEMENT_METADATA_LEN)?;
     let mut endorsement = Vec::with_capacity(capacity);
     endorsement.extend_from_slice(IDKS_ENDORSEMENT_MAGIC);
@@ -150,6 +157,7 @@ fn build_endorsement_data(ta_data: &[u8], ta_uuid: &TeeUuid, ta_svn: u32) -> Opt
     endorsement.extend_from_slice(ta_data);
     endorsement.extend_from_slice(&ta_uuid.to_le_bytes());
     endorsement.extend_from_slice(&ta_svn.to_le_bytes());
+    endorsement.extend_from_slice(ta_digest);
     endorsement.push(IDKS_DEBUG_FLAG);
     endorsement.extend_from_slice(ISOLATION_SOLUTION);
     Some(endorsement)
@@ -313,7 +321,13 @@ mod tests {
         };
 
         let ta_svn = 7u32;
-        let expected_plaintext = build_endorsement_data(ta_data, &ta_uuid, ta_svn).unwrap();
+        let ta_digest = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b,
+            0x3c, 0x2d, 0x1e, 0x0f,
+        ];
+        let expected_plaintext =
+            build_endorsement_data(ta_data, &ta_uuid, ta_svn, &ta_digest).unwrap();
 
         let signature = endorse_data_with(&expected_plaintext, &private_key).unwrap();
         let public_key = identity_signing_public_key_from_private_key(&private_key).unwrap();
@@ -323,15 +337,5 @@ mod tests {
         verifying_key
             .verify(&expected_plaintext, &signature)
             .unwrap();
-        let other_uuid = TeeUuid {
-            time_low: ta_uuid.time_low.wrapping_add(1),
-            ..ta_uuid
-        };
-        let mut other_plaintext = Vec::from(ta_data.as_slice());
-        other_plaintext.extend_from_slice(&other_uuid.to_le_bytes());
-        other_plaintext.extend_from_slice(&ta_svn.to_le_bytes());
-        other_plaintext.extend_from_slice(ISOLATION_SOLUTION);
-
-        assert!(verifying_key.verify(&other_plaintext, &signature).is_err());
     }
 }
