@@ -3,7 +3,10 @@
 
 use std::{
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -12,8 +15,8 @@ use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_transport::unix_socket::{
-    UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
-    UnixStreamLocalNotificationChannel,
+    UnixStreamLocalCallChannel, UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
+    UnixStreamLocalNotificationCancellation, UnixStreamLocalNotificationChannel,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -23,9 +26,9 @@ pub(crate) fn connect(
     control_socket_path: &Path,
     notification_socket_path: &Path,
 ) -> Result<(
-    BrokerLocal<UnixStreamLocalControlChannel>,
+    BrokerLocal<UnixStreamLocalCallChannel>,
     BrokerNotifications<UnixStreamLocalNotificationChannel>,
-    UnixStreamLocalControlCancellation,
+    Arc<BrokerAssociationFailure>,
 )> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let control_channel = connect_with_retry(
@@ -52,27 +55,35 @@ pub(crate) fn connect(
             notification_socket_path.display()
         )
     })?;
-    let control_cancellation = control_channel
+    let notification_cancellation = notification_channel
         .cancellation_handle()
-        .context("failed to create broker control cancellation handle")?;
-    let local = BrokerLocal::negotiate(control_channel, |channel| {
+        .context("failed to create broker notification cancellation handle")?;
+    let association_failure = Arc::new(BrokerAssociationFailure::new(notification_cancellation));
+    let activation_failure = Arc::clone(&association_failure);
+    let local = BrokerLocal::negotiate(control_channel, move |mut channel| {
         let shared_memory =
             channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, Some(setup_deadline))?;
-        Ok(Arc::new(shared_memory))
+        let response_failure = Arc::downgrade(&activation_failure);
+        let (channel, control_cancellation) = channel.activate(move || {
+            if let Some(response_failure) = response_failure.upgrade() {
+                response_failure.fail();
+            }
+        })?;
+        activation_failure.install_control(control_cancellation)?;
+        Ok((Arc::new(shared_memory), channel))
     })
     .context("broker negotiation failed")?;
     Ok((
         local,
         BrokerNotifications::new(notification_channel),
-        control_cancellation,
+        association_failure,
     ))
 }
 
 pub(crate) fn start_notification_receiver(
     mut notifications: BrokerNotifications<UnixStreamLocalNotificationChannel>,
-    control_cancellation: UnixStreamLocalControlCancellation,
+    association_failure: Arc<BrokerAssociationFailure>,
     dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
-    dispatch_failure: impl Fn() + Send + 'static,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("litebox-broker-notifications".to_owned())
@@ -84,17 +95,97 @@ pub(crate) fn start_notification_receiver(
                     Err(error) => break Some(error),
                 }
             };
-            let cancellation_error = control_cancellation.cancel().err();
-            dispatch_failure();
+            association_failure.fail();
             if let Some(error) = receive_error {
                 eprintln!("failed to receive broker notification: {error}");
-            }
-            if let Some(error) = cancellation_error {
-                eprintln!("failed to cancel broker control channel: {error}");
             }
         })
         .context("failed to start broker notification receiver")?;
     Ok(())
+}
+
+pub(crate) struct BrokerAssociationFailure {
+    failed: AtomicBool,
+    control_cancellation: Mutex<Option<UnixStreamLocalControlCancellation>>,
+    notification_cancellation: UnixStreamLocalNotificationCancellation,
+    dispatch_failure: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl BrokerAssociationFailure {
+    fn new(notification_cancellation: UnixStreamLocalNotificationCancellation) -> Self {
+        Self {
+            failed: AtomicBool::new(false),
+            control_cancellation: Mutex::new(None),
+            notification_cancellation,
+            dispatch_failure: Mutex::new(None),
+        }
+    }
+
+    fn install_control(
+        &self,
+        control_cancellation: UnixStreamLocalControlCancellation,
+    ) -> std::io::Result<()> {
+        let mut installed = self
+            .control_cancellation
+            .lock()
+            .expect("broker control cancellation mutex poisoned");
+        assert!(
+            installed.is_none(),
+            "broker control cancellation already installed"
+        );
+        if self.failed.load(Ordering::Acquire) {
+            control_cancellation.cancel()?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "broker association failed during activation",
+            ));
+        }
+        *installed = Some(control_cancellation);
+        Ok(())
+    }
+
+    pub(crate) fn install_dispatch(&self, dispatch_failure: impl FnOnce() + Send + 'static) {
+        let mut installed = self
+            .dispatch_failure
+            .lock()
+            .expect("broker failure dispatch mutex poisoned");
+        assert!(
+            installed.is_none(),
+            "broker failure dispatch already installed"
+        );
+        if self.failed.load(Ordering::Acquire) {
+            drop(installed);
+            dispatch_failure();
+        } else {
+            *installed = Some(Box::new(dispatch_failure));
+        }
+    }
+
+    fn fail(&self) {
+        if self.failed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(cancellation) = self
+            .control_cancellation
+            .lock()
+            .expect("broker control cancellation mutex poisoned")
+            .as_ref()
+            && let Err(error) = cancellation.cancel()
+        {
+            eprintln!("failed to cancel broker control channel: {error}");
+        }
+        if let Err(error) = self.notification_cancellation.cancel() {
+            eprintln!("failed to cancel broker notification channel: {error}");
+        }
+        let dispatch_failure = self
+            .dispatch_failure
+            .lock()
+            .expect("broker failure dispatch mutex poisoned")
+            .take();
+        if let Some(dispatch_failure) = dispatch_failure {
+            dispatch_failure();
+        }
+    }
 }
 
 fn connect_with_retry<Channel>(
@@ -114,5 +205,110 @@ fn connect_with_retry<Channel>(
         }
         let remaining = setup_deadline.saturating_duration_since(Instant::now());
         std::thread::sleep(RETRY_DELAY.min(remaining));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox_broker_protocol::channel::{HostControlChannel, HostReceive, LocalCallChannel};
+    use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
+    use litebox_broker_protocol::{ObjectHandle, RequestId};
+    use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+
+    #[test]
+    fn control_failure_cancels_notifications() {
+        let (local_control, host_control) = UnixStream::pair().unwrap();
+        let (local_notification, mut host_notification) = UnixStream::pair().unwrap();
+        host_notification
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let notification_channel =
+            UnixStreamLocalNotificationChannel::from_connected(local_notification);
+        let association_failure = Arc::new(BrokerAssociationFailure::new(
+            notification_channel.cancellation_handle().unwrap(),
+        ));
+        let response_failure = Arc::downgrade(&association_failure);
+        let (active_channel, control_cancellation) =
+            UnixStreamLocalControlChannel::from_connected(local_control)
+                .activate(move || {
+                    if let Some(response_failure) = response_failure.upgrade() {
+                        response_failure.fail();
+                    }
+                })
+                .unwrap();
+        association_failure
+            .install_control(control_cancellation)
+            .unwrap();
+        let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
+        association_failure.install_dispatch(move || failure_sender.send(()).unwrap());
+
+        drop(host_control);
+
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(host_notification.read(&mut byte).unwrap(), 0);
+        drop(active_channel);
+        drop(notification_channel);
+    }
+
+    #[test]
+    fn notification_failure_cancels_control() {
+        let (local_control, host_control) = UnixStream::pair().unwrap();
+        let (local_notification, host_notification) = UnixStream::pair().unwrap();
+        let mut host_control = UnixStreamHostControlChannel::from_accepted(host_control);
+        let notification_channel =
+            UnixStreamLocalNotificationChannel::from_connected(local_notification);
+        let association_failure = Arc::new(BrokerAssociationFailure::new(
+            notification_channel.cancellation_handle().unwrap(),
+        ));
+        let response_failure = Arc::downgrade(&association_failure);
+        let (active_channel, control_cancellation) =
+            UnixStreamLocalControlChannel::from_connected(local_control)
+                .activate(move || {
+                    if let Some(response_failure) = response_failure.upgrade() {
+                        response_failure.fail();
+                    }
+                })
+                .unwrap();
+        association_failure
+            .install_control(control_cancellation)
+            .unwrap();
+        let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
+        association_failure.install_dispatch(move || failure_sender.send(()).unwrap());
+        start_notification_receiver(
+            BrokerNotifications::new(notification_channel),
+            Arc::clone(&association_failure),
+            |_| {},
+        )
+        .unwrap();
+        let active_channel = Arc::new(active_channel);
+        let pending_channel = Arc::clone(&active_channel);
+        let pending_call = std::thread::spawn(move || {
+            pending_channel.call(BrokerRequest {
+                request_id: RequestId(1),
+                operation: BrokerOperation::CloseObject(ObjectHandle(1)),
+            })
+        });
+        assert!(matches!(
+            host_control.recv_request().unwrap(),
+            HostReceive::Message(_)
+        ));
+
+        drop(host_notification);
+
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(pending_call.join().unwrap().is_err());
+        assert_eq!(
+            host_control.recv_request().unwrap(),
+            HostReceive::PeerClosed
+        );
     }
 }

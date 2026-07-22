@@ -9,7 +9,7 @@ use alloc::{
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::pipe::CreatePipeResponse;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -143,49 +143,42 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
 
 pub(crate) struct BrokerLocalControl<
     Platform: RawSyncPrimitivesProvider,
-    Channel: LocalControlChannel + Send,
+    Channel: LocalCallChannel + Send + Sync,
 > {
-    local: Mutex<Platform, Option<BrokerLocal<Channel>>>,
+    local: Mutex<Platform, Option<Arc<BrokerLocal<Channel>>>>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
-    Channel: LocalControlChannel + Send,
+    Channel: LocalCallChannel + Send + Sync,
 {
     pub(crate) fn new(
         local: BrokerLocal<Channel>,
         pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     ) -> Self {
         Self {
-            local: Mutex::new(Some(local)),
+            local: Mutex::new(Some(Arc::new(local))),
             pollable_registry,
         }
     }
 
     fn request<T>(
         &self,
-        request: impl FnOnce(
-            &mut BrokerLocal<Channel>,
-        ) -> litebox_broker_local::Result<T, Channel::Error>,
+        request: impl FnOnce(&BrokerLocal<Channel>) -> litebox_broker_local::Result<T, Channel::Error>,
     ) -> core::result::Result<T, BrokerControlError> {
-        let (result, failed_connection) = {
-            let mut local = self.local.lock();
-            let Some(connection) = local.as_mut() else {
+        let connection = {
+            let local = self.local.lock();
+            let Some(connection) = local.as_ref() else {
                 return Err(BrokerControlError::AssociationFailed);
             };
-            let result = request(connection).map_err(BrokerControlError::from);
-            let failed_connection =
-                if matches!(result.as_ref(), Err(BrokerControlError::AssociationFailed)) {
-                    local.take()
-                } else {
-                    None
-                };
-            (result, failed_connection)
+            Arc::clone(connection)
         };
-        if let Some(connection) = failed_connection {
-            drop(connection);
+        let result = request(&connection).map_err(BrokerControlError::from);
+        if matches!(result.as_ref(), Err(BrokerControlError::AssociationFailed))
+            && self.local.lock().take().is_some()
+        {
             self.pollable_registry.notify_all(Events::ERR);
         }
         result
@@ -195,7 +188,7 @@ where
 impl<Platform, Channel> BrokerControl for BrokerLocalControl<Platform, Channel>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
-    Channel: LocalControlChannel + Send,
+    Channel: LocalCallChannel + Send + Sync,
 {
     fn create_event_with_count(
         &self,
@@ -257,8 +250,7 @@ where
 
     fn fail_connection(&self) {
         let connection = self.local.lock().take();
-        if let Some(connection) = connection {
-            drop(connection);
+        if connection.is_some() {
             self.pollable_registry.notify_all(Events::ERR);
         }
     }

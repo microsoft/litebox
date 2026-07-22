@@ -37,8 +37,8 @@ pub enum HostReceive<T> {
     PeerClosed,
 }
 
-/// Local-side control channel for broker authority calls.
-pub trait LocalControlChannel {
+/// Local-side sequential channel for broker association setup.
+pub trait LocalSetupChannel {
     /// Channel-specific error type.
     type Error;
 
@@ -53,15 +53,21 @@ pub trait LocalControlChannel {
     /// Returns `Ok(None)` when the broker closed the channel cleanly before
     /// starting another response frame.
     fn recv_handshake_response(&mut self) -> Result<Option<BrokerHandshakeResponse>, Self::Error>;
+}
 
-    /// Sends one active broker request.
-    fn send_request(&mut self, request: &BrokerRequest) -> Result<(), Self::Error>;
+/// Local-side shared channel for active broker calls.
+pub trait LocalCallChannel {
+    /// Channel-specific error type.
+    type Error;
 
-    /// Receives one active broker response.
+    /// Publishes one request and waits for its correlated response.
+    fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error>;
+
+    /// Serializes one complete shared-memory payload transfer.
     ///
-    /// Returns `Ok(None)` when the broker closed the channel cleanly before
-    /// starting another response frame.
-    fn recv_response(&mut self) -> Result<Option<BrokerResponse>, Self::Error>;
+    /// The closure must run exactly once while no other payload transfer using
+    /// the same association shared memory is active.
+    fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> T;
 }
 
 /// Host-side control channel for broker authority calls.

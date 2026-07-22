@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
     EventConsumeMode,
@@ -14,7 +14,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
-impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
+impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned event object with initial readiness credits.
     ///
     /// # Panics
@@ -22,7 +22,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued event request.
     pub fn create_event_with_count(
-        &mut self,
+        &self,
         initial_count: u64,
     ) -> Result<ObjectHandle, Channel::Error> {
         let response =
@@ -40,7 +40,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued event request.
     pub fn add_event(
-        &mut self,
+        &self,
         handle: ObjectHandle,
         value: u64,
     ) -> Result<ReadinessFlags, Channel::Error> {
@@ -58,7 +58,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued event request.
     pub fn consume_event(
-        &mut self,
+        &self,
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> Result<ConsumeEventResponse, Channel::Error> {
@@ -70,7 +70,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         }
     }
 
-    fn request_event(&mut self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
+    fn request_event(&self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
         match self.request(BrokerOperation::Event(request))? {
             BrokerResult::Event(response) => Ok(response),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),

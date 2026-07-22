@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, PipeRequest, PipeResponse};
 use litebox_broker_protocol::pipe::{
     CreatePipeRequest, CreatePipeResponse, PIPE_TRANSFER_BUFFER_SIZE, ReadPipeRequest,
@@ -13,7 +13,7 @@ use litebox_broker_protocol::pipe::{
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
-impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
+impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned byte pipe.
     ///
     /// # Panics
@@ -21,7 +21,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error or returns a
     /// response that does not match the issued pipe request.
     pub fn create_pipe(
-        &mut self,
+        &self,
         capacity: u64,
         atomic_write_size: u64,
     ) -> Result<CreatePipeResponse, Channel::Error> {
@@ -41,8 +41,13 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
     /// response that does not match the issued pipe request.
-    pub fn read_pipe(
-        &mut self,
+    pub fn read_pipe(&self, handle: ObjectHandle, length: u32) -> Result<Vec<u8>, Channel::Error> {
+        self.channel
+            .with_serialized_payload(|| self.read_pipe_serialized(handle, length))
+    }
+
+    fn read_pipe_serialized(
+        &self,
         handle: ObjectHandle,
         length: u32,
     ) -> Result<Vec<u8>, Channel::Error> {
@@ -78,8 +83,13 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
     /// response that does not match the issued pipe request.
-    pub fn write_pipe(
-        &mut self,
+    pub fn write_pipe(&self, handle: ObjectHandle, data: &[u8]) -> Result<usize, Channel::Error> {
+        self.channel
+            .with_serialized_payload(|| self.write_pipe_serialized(handle, data))
+    }
+
+    fn write_pipe_serialized(
+        &self,
         handle: ObjectHandle,
         data: &[u8],
     ) -> Result<usize, Channel::Error> {
@@ -109,7 +119,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         Ok(written)
     }
 
-    fn request_pipe(&mut self, request: PipeRequest) -> Result<PipeResponse, Channel::Error> {
+    fn request_pipe(&self, request: PipeRequest) -> Result<PipeResponse, Channel::Error> {
         match self.request(BrokerOperation::Pipe(request))? {
             BrokerResult::Pipe(response) => Ok(response),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
@@ -126,18 +136,18 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
 mod tests {
     use super::*;
     use alloc::sync::Arc;
-    use core::convert::Infallible;
+    use core::{cell::RefCell, convert::Infallible};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
+    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
         BrokerResponse, BrokerResult,
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
     use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
-    use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 
     #[test]
     fn pipe_uses_attached_shared_memory_for_data_operations() {
@@ -152,7 +162,8 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 2 })),
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
         ]);
-        let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory.clone())).unwrap();
+        let local =
+            BrokerLocal::negotiate(channel, |channel| Ok((memory.clone(), channel))).unwrap();
 
         local.create_pipe(64, 16).unwrap();
         assert_eq!(local.write_pipe(write_handle, &[1, 2, 3]).unwrap(), 2);
@@ -163,8 +174,8 @@ mod tests {
         memory.write(0, &[4, 5, 6]).unwrap();
         assert_eq!(local.read_pipe(read_handle, 3).unwrap(), [4, 5]);
         assert_eq!(
-            local.channel.sent_operations,
-            [
+            local.channel.sent_operations.borrow().as_slice(),
+            &[
                 BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
                     capacity: 64,
                     atomic_write_size: 16,
@@ -185,7 +196,7 @@ mod tests {
     fn pipe_rejects_oversized_transfers_before_request() {
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
         let channel = ScriptedChannel::new([]);
-        let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
+        let local = BrokerLocal::negotiate(channel, |channel| Ok((memory, channel))).unwrap();
         let oversized_length = PIPE_TRANSFER_BUFFER_SIZE + 1;
 
         assert!(matches!(
@@ -200,7 +211,7 @@ mod tests {
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted
             ))
         ));
-        assert!(local.channel.sent_operations.is_empty());
+        assert!(local.channel.sent_operations.borrow().is_empty());
     }
 
     #[test]
@@ -211,7 +222,7 @@ mod tests {
                 read: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
-        let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
+        let local = BrokerLocal::negotiate(channel, |channel| Ok((memory, channel))).unwrap();
 
         let _ = local.read_pipe(ObjectHandle(1), 1);
     }
@@ -224,7 +235,7 @@ mod tests {
                 written: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(PIPE_TRANSFER_BUFFER_SIZE));
-        let mut local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
+        let local = BrokerLocal::negotiate(channel, |channel| Ok((memory, channel))).unwrap();
 
         let _ = local.write_pipe(ObjectHandle(1), &[0]);
     }
@@ -277,22 +288,20 @@ mod tests {
     }
 
     struct ScriptedChannel {
-        results: VecDeque<BrokerResult>,
-        sent_operations: Vec<BrokerOperation>,
-        last_request_id: Option<RequestId>,
+        results: RefCell<VecDeque<BrokerResult>>,
+        sent_operations: RefCell<Vec<BrokerOperation>>,
     }
 
     impl ScriptedChannel {
         fn new(results: impl IntoIterator<Item = BrokerResult>) -> Self {
             Self {
-                results: results.into_iter().collect(),
-                sent_operations: Vec::new(),
-                last_request_id: None,
+                results: RefCell::new(results.into_iter().collect()),
+                sent_operations: RefCell::new(Vec::new()),
             }
         }
     }
 
-    impl LocalControlChannel for ScriptedChannel {
+    impl LocalSetupChannel for ScriptedChannel {
         type Error = Infallible;
 
         fn send_handshake_request(
@@ -310,23 +319,28 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }))
         }
+    }
 
-        fn send_request(
-            &mut self,
-            request: &BrokerRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            self.sent_operations.push(request.operation.clone());
-            self.last_request_id = Some(request.request_id);
-            Ok(())
+    impl LocalCallChannel for ScriptedChannel {
+        type Error = Infallible;
+
+        fn call(
+            &self,
+            request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, Self::Error> {
+            self.sent_operations.borrow_mut().push(request.operation);
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result: self
+                    .results
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("response requires a scripted result"),
+            })
         }
 
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
-            Ok(self.results.pop_front().map(|result| BrokerResponse {
-                request_id: self
-                    .last_request_id
-                    .expect("response requires a sent request"),
-                result,
-            }))
+        fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> T {
+            transfer()
         }
     }
 }

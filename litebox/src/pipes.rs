@@ -928,7 +928,7 @@ mod tests {
 
     use alloc::sync::Arc;
     use litebox_broker_local::BrokerLocal;
-    use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
@@ -952,12 +952,11 @@ mod tests {
         let force_transport = Arc::new(AtomicBool::new(false));
         let local = BrokerLocal::negotiate(
             FailingPipeChannel {
-                last_request: None,
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::Transport,
                 force_transport,
             },
-            |_| Ok(Arc::new(NoopSharedMemory)),
+            |channel| Ok((Arc::new(NoopSharedMemory), channel)),
         )
         .unwrap();
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
@@ -999,12 +998,11 @@ mod tests {
         let force_transport = Arc::new(AtomicBool::new(false));
         let local = BrokerLocal::negotiate(
             FailingPipeChannel {
-                last_request: None,
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
             },
-            |_| Ok(Arc::new(NoopSharedMemory)),
+            |channel| Ok((Arc::new(NoopSharedMemory), channel)),
         )
         .unwrap();
         let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));
@@ -1111,7 +1109,6 @@ mod tests {
 
     #[derive(Debug)]
     struct FailingPipeChannel {
-        last_request: Option<BrokerRequest>,
         request_count: Arc<AtomicUsize>,
         read_failure: ReadFailure,
         force_transport: Arc<AtomicBool>,
@@ -1151,7 +1148,7 @@ mod tests {
         WouldBlock,
     }
 
-    impl LocalControlChannel for FailingPipeChannel {
+    impl LocalSetupChannel for FailingPipeChannel {
         type Error = ();
 
         fn send_handshake_request(
@@ -1168,18 +1165,16 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }))
         }
+    }
 
-        fn send_request(
-            &mut self,
-            request: &BrokerRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            self.last_request = Some(request.clone());
+    impl LocalCallChannel for FailingPipeChannel {
+        type Error = ();
+
+        fn call(
+            &self,
+            request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, Self::Error> {
             self.request_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
-            let request = self.last_request.take().unwrap();
             let result = match request.operation {
                 BrokerOperation::Pipe(PipeRequest::Create(_)) => BrokerResult::Pipe(
                     litebox_broker_protocol::message::PipeResponse::Create(CreatePipeResponse {
@@ -1204,10 +1199,14 @@ mod tests {
                     panic!("unexpected broker request: {request:?}")
                 }
             };
-            Ok(Some(BrokerResponse {
+            Ok(BrokerResponse {
                 request_id: request.request_id,
                 result,
-            }))
+            })
+        }
+
+        fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> T {
+            transfer()
         }
     }
 

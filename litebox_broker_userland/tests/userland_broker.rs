@@ -82,12 +82,13 @@ fn run_fake_runner(args: &[OsString]) {
     let control_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
     let _notification_channel =
         connect_notification_with_retry(Path::new(notification_socket_path)).unwrap();
-    let mut local = BrokerLocal::negotiate(control_channel, |channel| {
+    let local = BrokerLocal::negotiate(control_channel, |mut channel| {
         let shared_memory = channel.receive_memfd(
             PIPE_TRANSFER_BUFFER_SIZE,
             Some(Instant::now() + Duration::from_secs(5)),
         )?;
-        Ok(Arc::new(shared_memory))
+        let (channel, _cancellation) = channel.activate(|| {})?;
+        Ok((Arc::new(shared_memory), channel))
     })
     .unwrap();
 
