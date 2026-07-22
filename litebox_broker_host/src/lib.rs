@@ -112,7 +112,7 @@ where
         }
     }
 
-    let mut shared_buffer_claims = SharedBufferClaims::new();
+    let mut shared_buffer_usage = SharedBufferUsage::new();
     loop {
         let request = match control_channel
             .recv_request()
@@ -129,19 +129,19 @@ where
             request_id,
             operation,
         } = request;
-        let shared_buffer_claim = shared_buffer_descriptor(&operation)
-            .map(|descriptor| {
-                shared_buffer_claims.claim(request_id, descriptor, shared_buffers.layout())
-            })
-            .transpose()
-            .map_err(BrokerHostError::Broker)?;
+        let buffer_descriptor = shared_buffer_descriptor(&operation);
+        if let Some(descriptor) = buffer_descriptor {
+            shared_buffer_usage
+                .begin(request_id, descriptor, shared_buffers.layout())
+                .map_err(BrokerHostError::Broker)?;
+        }
         let result = complete_request(handle_request(&session, operation, shared_buffers))
             .map_err(BrokerHostError::Broker)?;
         control_channel
             .send_response(&BrokerResponse { request_id, result })
             .map_err(BrokerHostError::Channel)?;
-        if let Some(claim) = shared_buffer_claim {
-            shared_buffer_claims.release(claim);
+        if let Some(descriptor) = buffer_descriptor {
+            shared_buffer_usage.end(request_id, descriptor.slot_index);
         }
     }
 
@@ -158,38 +158,30 @@ enum RequestFailure {
     Abort(ErrorCode),
 }
 
-#[derive(Clone, Copy)]
-struct SharedBufferSlotState {
-    last_request_id: Option<RequestId>,
-    owner: Option<RequestId>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedBufferSlotState {
+    Unused,
+    Idle(RequestId),
+    Active(RequestId),
 }
 
-struct SharedBufferClaims {
+struct SharedBufferUsage {
     slots: [SharedBufferSlotState; SHARED_BUFFER_SLOT_COUNT as usize],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SharedBufferClaim {
-    slot_index: SharedBufferSlotIndex,
-    request_id: RequestId,
-}
-
-impl SharedBufferClaims {
+impl SharedBufferUsage {
     const fn new() -> Self {
         Self {
-            slots: [SharedBufferSlotState {
-                last_request_id: None,
-                owner: None,
-            }; SHARED_BUFFER_SLOT_COUNT as usize],
+            slots: [SharedBufferSlotState::Unused; SHARED_BUFFER_SLOT_COUNT as usize],
         }
     }
 
-    fn claim(
+    fn begin(
         &mut self,
         request_id: RequestId,
         descriptor: SharedBufferDescriptor,
         layout: litebox_broker_protocol::shared_memory::SharedBufferLayout,
-    ) -> core::result::Result<SharedBufferClaim, ErrorCode> {
+    ) -> core::result::Result<(), ErrorCode> {
         if descriptor.length > MAX_PIPE_TRANSFER_SIZE
             || layout
                 .range(descriptor.slot_index, descriptor.length as usize)
@@ -200,28 +192,25 @@ impl SharedBufferClaims {
         let slot = &mut self.slots[descriptor.slot_index.0 as usize];
         // A local lease spans response consumption, so honest reuse of this slot
         // always carries a newer, non-wrapping request ID.
-        if slot.owner.is_some()
-            || slot
-                .last_request_id
-                .is_some_and(|last_request_id| request_id <= last_request_id)
-        {
-            return Err(ErrorCode::MalformedRequest);
+        match *slot {
+            SharedBufferSlotState::Unused => {}
+            SharedBufferSlotState::Idle(last_request_id) if request_id > last_request_id => {}
+            SharedBufferSlotState::Idle(_) | SharedBufferSlotState::Active(_) => {
+                return Err(ErrorCode::MalformedRequest);
+            }
         }
-        slot.last_request_id = Some(request_id);
-        slot.owner = Some(request_id);
-        Ok(SharedBufferClaim {
-            slot_index: descriptor.slot_index,
-            request_id,
-        })
+        *slot = SharedBufferSlotState::Active(request_id);
+        Ok(())
     }
 
-    fn release(&mut self, claim: SharedBufferClaim) {
-        let slot = &mut self.slots[claim.slot_index.0 as usize];
+    fn end(&mut self, request_id: RequestId, slot_index: SharedBufferSlotIndex) {
+        let slot = &mut self.slots[slot_index.0 as usize];
         assert_eq!(
-            slot.owner.take(),
-            Some(claim.request_id),
-            "shared-buffer claim owner changed before response emission"
+            *slot,
+            SharedBufferSlotState::Active(request_id),
+            "shared-buffer slot state changed before response emission"
         );
+        *slot = SharedBufferSlotState::Idle(request_id);
     }
 }
 
@@ -393,7 +382,7 @@ mod tests {
         serve_connection_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_closes_object_reference(&broker);
         association_shared_buffer_descriptors_stage_pipe_data(&broker);
-        shared_buffer_claims_reject_invalid_descriptors();
+        shared_buffer_usage_rejects_invalid_descriptors();
     }
 
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
@@ -866,35 +855,35 @@ mod tests {
         assert_eq!(second_slot, [9]);
     }
 
-    fn shared_buffer_claims_reject_invalid_descriptors() {
-        let mut claims = SharedBufferClaims::new();
-        let first = claims
-            .claim(RequestId(1), descriptor(0, 3), SHARED_BUFFER_LAYOUT)
+    fn shared_buffer_usage_rejects_invalid_descriptors() {
+        let mut usage = SharedBufferUsage::new();
+        usage
+            .begin(RequestId(1), descriptor(0, 3), SHARED_BUFFER_LAYOUT)
             .unwrap();
         assert_eq!(
-            claims.claim(RequestId(2), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(2), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
-        claims.release(first);
+        usage.end(RequestId(1), SharedBufferSlotIndex(0));
         assert_eq!(
-            claims.claim(RequestId(1), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(1), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         assert_eq!(
-            claims.claim(RequestId(0), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(0), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         assert!(
-            claims
-                .claim(RequestId(3), descriptor(0, 3), SHARED_BUFFER_LAYOUT)
+            usage
+                .begin(RequestId(3), descriptor(0, 3), SHARED_BUFFER_LAYOUT)
                 .is_ok()
         );
         assert_eq!(
-            claims.claim(RequestId(2), descriptor(16, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(2), descriptor(16, 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         assert_eq!(
-            claims.claim(
+            usage.begin(
                 RequestId(2),
                 descriptor(1, MAX_PIPE_TRANSFER_SIZE + 1),
                 SHARED_BUFFER_LAYOUT
