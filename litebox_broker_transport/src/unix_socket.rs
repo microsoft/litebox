@@ -779,7 +779,7 @@ mod tests {
     };
     use litebox_broker_protocol::{ObjectHandle, RequestId};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
+    use std::sync::{Barrier, mpsc};
     use std::time::Duration;
 
     fn activate_test_channel(
@@ -1040,10 +1040,13 @@ mod tests {
             .unwrap();
         let (channel, cancellation) = activate_test_channel(local_stream, || {});
         let channel = Arc::new(channel);
+        let call_start = Arc::new(Barrier::new(MAX_PENDING_CALLS + 2));
         let callers = (0..=MAX_PENDING_CALLS)
             .map(|request_id| {
                 let channel = Arc::clone(&channel);
+                let call_start = Arc::clone(&call_start);
                 thread::spawn(move || {
+                    call_start.wait();
                     channel.call(BrokerRequest {
                         request_id: RequestId(request_id as u64),
                         operation: BrokerOperation::CloseObject(ObjectHandle(request_id as u64)),
@@ -1052,6 +1055,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        call_start.wait();
         let mut published_request_ids = Vec::with_capacity(MAX_PENDING_CALLS);
         for _ in 0..MAX_PENDING_CALLS {
             let frame = read_frame_with_deadline(&mut host_stream, None)
@@ -1060,7 +1064,7 @@ mod tests {
             published_request_ids.push(decode_request(&frame).unwrap().request_id);
         }
         host_stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
+            .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let error = read_frame_with_deadline(&mut host_stream, None).unwrap_err();
         assert!(matches!(
@@ -1500,15 +1504,14 @@ mod tests {
     }
 
     #[test]
-    fn local_control_cancellation_unblocks_response_read() {
-        let (local_stream, _host_stream) = UnixStream::pair().unwrap();
+    fn local_control_cancellation_unblocks_pending_call() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        host_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         let (channel, cancellation) = activate_test_channel(local_stream, || {});
-        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
-        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
-        let reader_completed = completed.clone();
-        let reader = std::thread::spawn(move || {
-            started_sender.send(()).unwrap();
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let caller = std::thread::spawn(move || {
             result_sender
                 .send(channel.call(BrokerRequest {
                     request_id: RequestId(0),
@@ -1517,18 +1520,27 @@ mod tests {
                     )),
                 }))
                 .unwrap();
-            reader_completed.store(true, std::sync::atomic::Ordering::Release);
         });
 
-        started_receiver
-            .recv_timeout(Duration::from_secs(1))
+        let frame = read_frame_with_deadline(&mut host_stream, None)
+            .unwrap()
             .unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
+        decode_request(&frame).unwrap();
+        assert!(matches!(
+            result_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         cancellation.cancel().unwrap();
 
-        assert!(result_receiver.recv_timeout(Duration::from_secs(1)).is_ok());
-        reader.join().unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ConnectionAborted
+        );
+        caller.join().unwrap();
     }
 
     #[test]
