@@ -14,7 +14,7 @@ use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 const ALLOCATED_SLOT_MASK: u64 = (1 << SHARED_BUFFER_SLOT_COUNT) - 1;
 
-pub(super) struct SharedBufferLeaseAllocator<Platform: RawSyncPrimitivesProvider> {
+pub(super) struct SlotAllocator<Platform: RawSyncPrimitivesProvider> {
     state: Mutex<Platform, LeaseState<Platform>>,
 }
 
@@ -29,7 +29,7 @@ struct LeaseState<Platform: RawSyncPrimitivesProvider> {
 pub(super) struct AcquireError;
 
 pub(super) struct SharedBufferLease<'a, Platform: RawSyncPrimitivesProvider> {
-    allocator: &'a SharedBufferLeaseAllocator<Platform>,
+    allocator: &'a SlotAllocator<Platform>,
     descriptor: SharedBufferDescriptor,
 }
 
@@ -39,7 +39,7 @@ struct LeaseWaiter<Platform: RawSyncPrimitivesProvider> {
     result_ready: Platform::RawMutex,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> SharedBufferLeaseAllocator<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
     pub(super) fn new() -> Self {
         Self {
             state: Mutex::new(LeaseState {
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn leases_use_distinct_slots_and_reuse_released_slots() {
-        let allocator = SharedBufferLeaseAllocator::<MockPlatform>::new();
+        let allocator = SlotAllocator::<MockPlatform>::new();
         let mut leases = (0..SHARED_BUFFER_SLOT_COUNT)
             .map(|_| allocator.acquire(7).unwrap())
             .collect::<Vec<_>>();
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn exhausted_allocator_wakes_one_waiter_on_release() {
-        let allocator = Arc::new(SharedBufferLeaseAllocator::<MockPlatform>::new());
+        let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
         let mut leases = (0..SHARED_BUFFER_SLOT_COUNT)
             .map(|_| allocator.acquire(1).unwrap())
             .collect::<Vec<_>>();
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn exhausted_allocator_serves_waiters_in_arrival_order() {
-        let allocator = Arc::new(SharedBufferLeaseAllocator::<MockPlatform>::new());
+        let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
         let mut leases = (0..SHARED_BUFFER_SLOT_COUNT)
             .map(|_| allocator.acquire(1).unwrap())
             .collect::<Vec<_>>();
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn association_failure_wakes_waiters_and_prevents_new_leases() {
-        let allocator = Arc::new(SharedBufferLeaseAllocator::<MockPlatform>::new());
+        let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
         let _leases = (0..SHARED_BUFFER_SLOT_COUNT)
             .map(|_| allocator.acquire(1).unwrap())
             .collect::<Vec<_>>();

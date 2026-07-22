@@ -22,7 +22,7 @@ use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 pub(crate) mod error;
 mod shared_buffer;
 use error::BrokerControlError;
-use shared_buffer::{SharedBufferLease, SharedBufferLeaseAllocator};
+use shared_buffer::{SharedBufferLease, SlotAllocator};
 
 /// Local-core access to the negotiated broker control channel.
 ///
@@ -150,7 +150,7 @@ pub(crate) struct BrokerLocalControl<
 > {
     local: Mutex<Platform, Option<Arc<BrokerLocal<Channel>>>>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
-    shared_buffer_leases: SharedBufferLeaseAllocator<Platform>,
+    shared_buffer_leases: SlotAllocator<Platform>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
@@ -165,7 +165,7 @@ where
         Self {
             local: Mutex::new(Some(Arc::new(local))),
             pollable_registry,
-            shared_buffer_leases: SharedBufferLeaseAllocator::new(),
+            shared_buffer_leases: SlotAllocator::new(),
         }
     }
 
