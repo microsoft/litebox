@@ -220,7 +220,7 @@ mod tests {
     use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
     use litebox_broker_protocol::{ObjectHandle, RequestId};
     use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
-    use std::io::Read;
+    use std::io::{ErrorKind, Read};
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
 
@@ -251,6 +251,20 @@ mod tests {
         (local, host)
     }
 
+    fn activate_control_channel(
+        channel: &mut UnixStreamLocalControlChannel,
+        association_coordinator: &Arc<BrokerAssociationFailureCoordinator>,
+    ) -> UnixStreamLocalControlCancellation {
+        let weak_association_coordinator = Arc::downgrade(association_coordinator);
+        channel
+            .activate(move || {
+                if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
+                    association_coordinator.report_failure();
+                }
+            })
+            .unwrap()
+    }
+
     #[test]
     fn control_failure_cancels_notifications() {
         let (local_control, host_control) = UnixStream::pair().unwrap();
@@ -265,14 +279,8 @@ mod tests {
         let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
             notification_channel.cancellation_handle().unwrap(),
         ));
-        let weak_association_coordinator = Arc::downgrade(&association_coordinator);
-        let control_cancellation_handle = active_channel
-            .activate(move || {
-                if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
-                    association_coordinator.report_failure();
-                }
-            })
-            .unwrap();
+        let control_cancellation_handle =
+            activate_control_channel(&mut active_channel, &association_coordinator);
         association_coordinator
             .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
@@ -291,6 +299,48 @@ mod tests {
     }
 
     #[test]
+    fn failure_before_installation_cancels_control_and_dispatches_failure() {
+        let (local_control, host_control) = UnixStream::pair().unwrap();
+        host_control
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (mut active_channel, mut host_control) =
+            negotiate_control_pair(local_control, host_control);
+        let (local_notification, mut host_notification) = UnixStream::pair().unwrap();
+        host_notification
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let notification_channel =
+            UnixStreamLocalNotificationChannel::from_connected(local_notification);
+        let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
+            notification_channel.cancellation_handle().unwrap(),
+        ));
+        let control_cancellation_handle =
+            activate_control_channel(&mut active_channel, &association_coordinator);
+
+        association_coordinator.report_failure();
+
+        assert_eq!(
+            association_coordinator
+                .install_control_cancellation_handle(control_cancellation_handle)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ConnectionAborted
+        );
+        let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
+        association_coordinator.install_dispatch(move || failure_sender.send(()).unwrap());
+        failure_receiver.try_recv().unwrap();
+        assert_eq!(
+            host_control.recv_request().unwrap(),
+            HostReceive::PeerClosed
+        );
+        let mut byte = [0];
+        assert_eq!(host_notification.read(&mut byte).unwrap(), 0);
+        drop(active_channel);
+        drop(notification_channel);
+    }
+
+    #[test]
     fn notification_failure_cancels_control() {
         let (local_control, host_control) = UnixStream::pair().unwrap();
         let (mut active_channel, mut host_control) =
@@ -301,14 +351,8 @@ mod tests {
         let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
             notification_channel.cancellation_handle().unwrap(),
         ));
-        let weak_association_coordinator = Arc::downgrade(&association_coordinator);
-        let control_cancellation_handle = active_channel
-            .activate(move || {
-                if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
-                    association_coordinator.report_failure();
-                }
-            })
-            .unwrap();
+        let control_cancellation_handle =
+            activate_control_channel(&mut active_channel, &association_coordinator);
         association_coordinator
             .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
