@@ -55,22 +55,24 @@ pub(crate) fn connect(
             notification_socket_path.display()
         )
     })?;
-    let notification_cancellation = notification_channel
+    let notification_cancellation_handle = notification_channel
         .cancellation_handle()
         .context("failed to create broker notification cancellation handle")?;
-    let association_state = Arc::new(BrokerAssociationState::new(notification_cancellation));
+    let association_state = Arc::new(BrokerAssociationState::new(
+        notification_cancellation_handle,
+    ));
     let local = BrokerLocal::negotiate(control_channel, {
         let association_state = Arc::clone(&association_state);
         move |channel| {
             let shared_memory =
                 channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, Some(setup_deadline))?;
             let weak_association_state = Arc::downgrade(&association_state);
-            let control_cancellation = channel.activate(move || {
+            let control_cancellation_handle = channel.activate(move || {
                 if let Some(association_state) = weak_association_state.upgrade() {
                     association_state.fail();
                 }
             })?;
-            association_state.install_control(control_cancellation)?;
+            association_state.install_control_cancellation_handle(control_cancellation_handle)?;
             Ok(Arc::new(shared_memory))
         }
     })
@@ -108,27 +110,27 @@ pub(crate) fn start_notification_receiver(
 
 pub(crate) struct BrokerAssociationState {
     failed: AtomicBool,
-    control_cancellation: Mutex<Option<UnixStreamLocalControlCancellation>>,
-    notification_cancellation: UnixStreamLocalNotificationCancellation,
+    control_cancellation_handle: Mutex<Option<UnixStreamLocalControlCancellation>>,
+    notification_cancellation_handle: UnixStreamLocalNotificationCancellation,
     dispatch_failure: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl BrokerAssociationState {
-    fn new(notification_cancellation: UnixStreamLocalNotificationCancellation) -> Self {
+    fn new(notification_cancellation_handle: UnixStreamLocalNotificationCancellation) -> Self {
         Self {
             failed: AtomicBool::new(false),
-            control_cancellation: Mutex::new(None),
-            notification_cancellation,
+            control_cancellation_handle: Mutex::new(None),
+            notification_cancellation_handle,
             dispatch_failure: Mutex::new(None),
         }
     }
 
-    fn install_control(
+    fn install_control_cancellation_handle(
         &self,
-        control_cancellation: UnixStreamLocalControlCancellation,
+        control_cancellation_handle: UnixStreamLocalControlCancellation,
     ) -> std::io::Result<()> {
         let mut installed = self
-            .control_cancellation
+            .control_cancellation_handle
             .lock()
             .expect("broker control cancellation mutex poisoned");
         assert!(
@@ -136,13 +138,13 @@ impl BrokerAssociationState {
             "broker control cancellation already installed"
         );
         if self.failed.load(Ordering::Acquire) {
-            control_cancellation.cancel()?;
+            control_cancellation_handle.cancel()?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "broker association failed during activation",
             ));
         }
-        *installed = Some(control_cancellation);
+        *installed = Some(control_cancellation_handle);
         Ok(())
     }
 
@@ -167,16 +169,16 @@ impl BrokerAssociationState {
         if self.failed.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(cancellation) = self
-            .control_cancellation
+        if let Some(cancellation_handle) = self
+            .control_cancellation_handle
             .lock()
             .expect("broker control cancellation mutex poisoned")
             .as_ref()
-            && let Err(error) = cancellation.cancel()
+            && let Err(error) = cancellation_handle.cancel()
         {
             eprintln!("failed to cancel broker control channel: {error}");
         }
-        if let Err(error) = self.notification_cancellation.cancel() {
+        if let Err(error) = self.notification_cancellation_handle.cancel() {
             eprintln!("failed to cancel broker notification channel: {error}");
         }
         let dispatch_failure = self
@@ -263,7 +265,7 @@ mod tests {
             notification_channel.cancellation_handle().unwrap(),
         ));
         let weak_association_state = Arc::downgrade(&association_state);
-        let control_cancellation = active_channel
+        let control_cancellation_handle = active_channel
             .activate(move || {
                 if let Some(association_state) = weak_association_state.upgrade() {
                     association_state.fail();
@@ -271,7 +273,7 @@ mod tests {
             })
             .unwrap();
         association_state
-            .install_control(control_cancellation)
+            .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
         let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
         association_state.install_dispatch(move || failure_sender.send(()).unwrap());
@@ -299,7 +301,7 @@ mod tests {
             notification_channel.cancellation_handle().unwrap(),
         ));
         let weak_association_state = Arc::downgrade(&association_state);
-        let control_cancellation = active_channel
+        let control_cancellation_handle = active_channel
             .activate(move || {
                 if let Some(association_state) = weak_association_state.upgrade() {
                     association_state.fail();
@@ -307,7 +309,7 @@ mod tests {
             })
             .unwrap();
         association_state
-            .install_control(control_cancellation)
+            .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
         let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
         association_state.install_dispatch(move || failure_sender.send(()).unwrap());
