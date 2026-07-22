@@ -540,12 +540,9 @@ pub struct Process<Platform: ShimPlatform> {
     object_manager: WindowsObjectManager<Platform>,
     section_views: WindowsSectionViews<Platform>,
     // TODO: move this into `GlobalState` once we have a proper shared mapping implementation.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "keeps alive the section registered weakly in the object namespace"
-        )
+    #[expect(
+        dead_code,
+        reason = "keeps alive the section registered weakly in the object namespace"
     )]
     windows_shared_section: Arc<SectionObject<Platform>>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
