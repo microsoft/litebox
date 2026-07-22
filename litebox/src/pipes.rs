@@ -928,7 +928,7 @@ mod tests {
 
     use alloc::sync::Arc;
     use litebox_broker_local::BrokerLocal;
-    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_protocol::channel::LocalControlChannel;
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
@@ -956,7 +956,7 @@ mod tests {
                 read_failure: ReadFailure::Transport,
                 force_transport,
             },
-            |channel| Ok((Arc::new(NoopSharedMemory), channel)),
+            |_| Ok(Arc::new(NoopSharedMemory)),
         )
         .unwrap();
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
@@ -1002,7 +1002,7 @@ mod tests {
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
             },
-            |channel| Ok((Arc::new(NoopSharedMemory), channel)),
+            |_| Ok(Arc::new(NoopSharedMemory)),
         )
         .unwrap();
         let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));
@@ -1148,7 +1148,7 @@ mod tests {
         WouldBlock,
     }
 
-    impl LocalSetupChannel for FailingPipeChannel {
+    impl LocalControlChannel for FailingPipeChannel {
         type Error = ();
 
         fn send_handshake_request(
@@ -1165,11 +1165,6 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }))
         }
-    }
-
-    impl LocalCallChannel for FailingPipeChannel {
-        type Error = ();
-
         fn call(
             &self,
             request: BrokerRequest,
@@ -1205,8 +1200,11 @@ mod tests {
             })
         }
 
-        fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> T {
-            transfer()
+        fn with_serialized_payload<T>(
+            &self,
+            transfer: impl FnOnce() -> T,
+        ) -> core::result::Result<T, Self::Error> {
+            Ok(transfer())
         }
     }
 

@@ -15,7 +15,7 @@ use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_transport::unix_socket::{
-    UnixStreamLocalCallChannel, UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
+    UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
     UnixStreamLocalNotificationCancellation, UnixStreamLocalNotificationChannel,
 };
 
@@ -26,7 +26,7 @@ pub(crate) fn connect(
     control_socket_path: &Path,
     notification_socket_path: &Path,
 ) -> Result<(
-    BrokerLocal<UnixStreamLocalCallChannel>,
+    BrokerLocal<UnixStreamLocalControlChannel>,
     BrokerNotifications<UnixStreamLocalNotificationChannel>,
     Arc<BrokerAssociationFailure>,
 )> {
@@ -60,17 +60,17 @@ pub(crate) fn connect(
         .context("failed to create broker notification cancellation handle")?;
     let association_failure = Arc::new(BrokerAssociationFailure::new(notification_cancellation));
     let activation_failure = Arc::clone(&association_failure);
-    let local = BrokerLocal::negotiate(control_channel, move |mut channel| {
+    let local = BrokerLocal::negotiate(control_channel, move |channel| {
         let shared_memory =
             channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, Some(setup_deadline))?;
         let response_failure = Arc::downgrade(&activation_failure);
-        let (channel, control_cancellation) = channel.activate(move || {
+        let control_cancellation = channel.activate(move || {
             if let Some(response_failure) = response_failure.upgrade() {
                 response_failure.fail();
             }
         })?;
         activation_failure.install_control(control_cancellation)?;
-        Ok((Arc::new(shared_memory), channel))
+        Ok(Arc::new(shared_memory))
     })
     .context("broker negotiation failed")?;
     Ok((
@@ -211,7 +211,7 @@ fn connect_with_retry<Channel>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_protocol::channel::{HostControlChannel, HostReceive, LocalCallChannel};
+    use litebox_broker_protocol::channel::{HostControlChannel, HostReceive, LocalControlChannel};
     use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
     use litebox_broker_protocol::{ObjectHandle, RequestId};
     use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
@@ -232,14 +232,14 @@ mod tests {
             notification_channel.cancellation_handle().unwrap(),
         ));
         let response_failure = Arc::downgrade(&association_failure);
-        let (active_channel, control_cancellation) =
-            UnixStreamLocalControlChannel::from_connected(local_control)
-                .activate(move || {
-                    if let Some(response_failure) = response_failure.upgrade() {
-                        response_failure.fail();
-                    }
-                })
-                .unwrap();
+        let mut active_channel = UnixStreamLocalControlChannel::from_connected(local_control);
+        let control_cancellation = active_channel
+            .activate(move || {
+                if let Some(response_failure) = response_failure.upgrade() {
+                    response_failure.fail();
+                }
+            })
+            .unwrap();
         association_failure
             .install_control(control_cancellation)
             .unwrap();
@@ -268,14 +268,14 @@ mod tests {
             notification_channel.cancellation_handle().unwrap(),
         ));
         let response_failure = Arc::downgrade(&association_failure);
-        let (active_channel, control_cancellation) =
-            UnixStreamLocalControlChannel::from_connected(local_control)
-                .activate(move || {
-                    if let Some(response_failure) = response_failure.upgrade() {
-                        response_failure.fail();
-                    }
-                })
-                .unwrap();
+        let mut active_channel = UnixStreamLocalControlChannel::from_connected(local_control);
+        let control_cancellation = active_channel
+            .activate(move || {
+                if let Some(response_failure) = response_failure.upgrade() {
+                    response_failure.fail();
+                }
+            })
+            .unwrap();
         association_failure
             .install_control(control_cancellation)
             .unwrap();

@@ -9,7 +9,7 @@ use alloc::{
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalCallChannel;
+use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::pipe::CreatePipeResponse;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -143,7 +143,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
 
 pub(crate) struct BrokerLocalControl<
     Platform: RawSyncPrimitivesProvider,
-    Channel: LocalCallChannel + Send + Sync,
+    Channel: LocalControlChannel + Send + Sync,
 > {
     local: Mutex<Platform, Option<Arc<BrokerLocal<Channel>>>>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
@@ -152,7 +152,7 @@ pub(crate) struct BrokerLocalControl<
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
-    Channel: LocalCallChannel + Send + Sync,
+    Channel: LocalControlChannel + Send + Sync,
 {
     pub(crate) fn new(
         local: BrokerLocal<Channel>,
@@ -188,7 +188,7 @@ where
 impl<Platform, Channel> BrokerControl for BrokerLocalControl<Platform, Channel>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
-    Channel: LocalCallChannel + Send + Sync,
+    Channel: LocalControlChannel + Send + Sync,
 {
     fn create_event_with_count(
         &self,

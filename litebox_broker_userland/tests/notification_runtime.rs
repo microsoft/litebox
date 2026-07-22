@@ -38,10 +38,10 @@ fn host_serves_control_requests_over_paired_userland_channels() {
 
     let local = BrokerLocal::negotiate(
         UnixStreamLocalControlChannel::from_connected(local_control),
-        |mut channel| {
+        |channel| {
             let shared_memory = channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, None)?;
-            let (channel, _cancellation) = channel.activate(|| {})?;
-            Ok((Arc::new(shared_memory), channel))
+            let _cancellation = channel.activate(|| {})?;
+            Ok(Arc::new(shared_memory))
         },
     )
     .unwrap();

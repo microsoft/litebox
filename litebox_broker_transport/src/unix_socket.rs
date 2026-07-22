@@ -21,8 +21,8 @@ use crate::unix_io::{
 };
 use litebox_broker_protocol::RequestId;
 use litebox_broker_protocol::channel::{
-    HostControlChannel, HostNotificationChannel, HostReceive, LocalCallChannel,
-    LocalNotificationChannel, LocalSetupChannel, PeerCredential,
+    HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
+    LocalNotificationChannel, PeerCredential,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
@@ -68,6 +68,16 @@ fn peer_process_id(stream: &UnixStream) -> IoResult<u32> {
 
 /// Local-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamLocalControlChannel {
+    state: UnixStreamLocalControlState,
+}
+
+enum UnixStreamLocalControlState {
+    Setup(UnixStreamLocalSetup),
+    Active(UnixStreamLocalActive),
+    Failed,
+}
+
+struct UnixStreamLocalSetup {
     stream: UnixStream,
     setup_deadline: Option<Instant>,
 }
@@ -79,8 +89,7 @@ pub struct UnixStreamLocalControlCancellation {
     association_failure: Arc<dyn Fn() + Send + Sync>,
 }
 
-/// Shared active-call channel backed by one Unix stream.
-pub struct UnixStreamLocalCallChannel {
+struct UnixStreamLocalActive {
     request_stream: Mutex<UnixStream>,
     shutdown_stream: UnixStream,
     pending_calls: Arc<PendingCalls>,
@@ -92,8 +101,10 @@ impl UnixStreamLocalControlChannel {
     /// Creates a local control channel from an already-connected Unix stream.
     pub const fn from_connected(stream: UnixStream) -> Self {
         Self {
-            stream,
-            setup_deadline: None,
+            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+                stream,
+                setup_deadline: None,
+            }),
         }
     }
 
@@ -112,8 +123,10 @@ impl UnixStreamLocalControlChannel {
         deadline: Instant,
     ) -> IoResult<Self> {
         UnixStream::connect(path).map(|stream| Self {
-            stream,
-            setup_deadline: Some(deadline),
+            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+                stream,
+                setup_deadline: Some(deadline),
+            }),
         })
     }
 
@@ -123,24 +136,32 @@ impl UnixStreamLocalControlChannel {
         expected_len: usize,
         deadline: Option<Instant>,
     ) -> IoResult<MemfdSharedMemory> {
-        crate::shared_memory::receive_memfd(&mut self.stream, expected_len, deadline)
+        let UnixStreamLocalControlState::Setup(setup) = &mut self.state else {
+            return Err(invalid_data("broker control setup already completed"));
+        };
+        crate::shared_memory::receive_memfd(&mut setup.stream, expected_len, deadline)
     }
 
-    /// Consumes the setup channel and starts the active response pump.
+    /// Completes setup and starts the active response pump.
     pub fn activate(
-        self,
+        &mut self,
         association_failure: impl Fn() + Send + Sync + 'static,
-    ) -> IoResult<(
-        UnixStreamLocalCallChannel,
-        UnixStreamLocalControlCancellation,
-    )> {
-        if self.setup_deadline.is_some() {
+    ) -> IoResult<UnixStreamLocalControlCancellation> {
+        if !matches!(&self.state, UnixStreamLocalControlState::Setup(_)) {
+            return Err(invalid_data("broker control channel already active"));
+        }
+        let UnixStreamLocalControlState::Setup(setup) =
+            core::mem::replace(&mut self.state, UnixStreamLocalControlState::Failed)
+        else {
+            unreachable!("broker control setup state disappeared");
+        };
+        if setup.setup_deadline.is_some() {
             return Err(invalid_data(
                 "broker control channel activated before setup completed",
             ));
         }
 
-        let response_stream = self.stream;
+        let response_stream = setup.stream;
         let request_stream = response_stream.try_clone()?;
         let shutdown_stream = response_stream.try_clone()?;
         let cancellation_stream = response_stream.try_clone()?;
@@ -160,20 +181,18 @@ impl UnixStreamLocalControlChannel {
                 );
             })?;
 
-        Ok((
-            UnixStreamLocalCallChannel {
-                request_stream: Mutex::new(request_stream),
-                shutdown_stream,
-                pending_calls: Arc::clone(&pending_calls),
-                payload_transfer: Mutex::new(()),
-                association_failure: Arc::clone(&association_failure),
-            },
-            UnixStreamLocalControlCancellation {
-                stream: cancellation_stream,
-                pending_calls,
-                association_failure: Arc::clone(&association_failure),
-            },
-        ))
+        self.state = UnixStreamLocalControlState::Active(UnixStreamLocalActive {
+            request_stream: Mutex::new(request_stream),
+            shutdown_stream,
+            pending_calls: Arc::clone(&pending_calls),
+            payload_transfer: Mutex::new(()),
+            association_failure: Arc::clone(&association_failure),
+        });
+        Ok(UnixStreamLocalControlCancellation {
+            stream: cancellation_stream,
+            pending_calls,
+            association_failure,
+        })
     }
 }
 
@@ -189,12 +208,15 @@ impl UnixStreamLocalControlCancellation {
     }
 }
 
-impl Drop for UnixStreamLocalCallChannel {
+impl Drop for UnixStreamLocalControlChannel {
     fn drop(&mut self) {
+        let UnixStreamLocalControlState::Active(active) = &self.state else {
+            return;
+        };
         let _ = fail_active_channel(
-            &self.pending_calls,
-            &self.shutdown_stream,
-            self.association_failure.as_ref(),
+            &active.pending_calls,
+            &active.shutdown_stream,
+            active.association_failure.as_ref(),
             Error::new(
                 ErrorKind::ConnectionAborted,
                 "broker active channel dropped",
@@ -301,17 +323,23 @@ impl UnixStreamHostNotificationChannel {
     }
 }
 
-impl LocalSetupChannel for UnixStreamLocalControlChannel {
+impl LocalControlChannel for UnixStreamLocalControlChannel {
     type Error = Error;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
+        let UnixStreamLocalControlState::Setup(setup) = &mut self.state else {
+            return Err(invalid_data("broker control channel is already active"));
+        };
         let frame = encode_handshake_request(request.clone());
-        write_frame_with_deadline(&mut self.stream, &frame, self.setup_deadline)
+        write_frame_with_deadline(&mut setup.stream, &frame, setup.setup_deadline)
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
-        let frame = read_frame_with_deadline(&mut self.stream, self.setup_deadline)?;
-        self.setup_deadline = None;
+        let UnixStreamLocalControlState::Setup(setup) = &mut self.state else {
+            return Err(invalid_data("broker control channel is already active"));
+        };
+        let frame = read_frame_with_deadline(&mut setup.stream, setup.setup_deadline)?;
+        setup.setup_deadline = None;
         match frame {
             Some(frame) => decode_handshake_response(&frame)
                 .map(Some)
@@ -319,21 +347,20 @@ impl LocalSetupChannel for UnixStreamLocalControlChannel {
             None => Ok(None),
         }
     }
-}
-
-impl LocalCallChannel for UnixStreamLocalCallChannel {
-    type Error = Error;
 
     fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
+        let UnixStreamLocalControlState::Active(active) = &self.state else {
+            return Err(invalid_data("broker control channel is not active"));
+        };
         let request_id = request.request_id;
-        self.pending_calls.register(request_id)?;
+        active.pending_calls.register(request_id)?;
 
         let write_result = {
-            let mut request_stream = self
+            let mut request_stream = active
                 .request_stream
                 .lock()
                 .expect("broker request writer mutex poisoned");
-            match self.pending_calls.failure() {
+            match active.pending_calls.failure() {
                 Some(error) => Err(copy_io_error(&error)),
                 None => {
                     write_frame_with_deadline(&mut request_stream, &encode_request(request), None)
@@ -342,22 +369,25 @@ impl LocalCallChannel for UnixStreamLocalCallChannel {
         };
         if let Err(error) = write_result {
             let _ = fail_active_channel(
-                &self.pending_calls,
-                &self.shutdown_stream,
-                self.association_failure.as_ref(),
+                &active.pending_calls,
+                &active.shutdown_stream,
+                active.association_failure.as_ref(),
                 error,
             );
         }
 
-        self.pending_calls.wait(request_id)
+        active.pending_calls.wait(request_id)
     }
 
-    fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> T {
-        let _transfer = self
+    fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> IoResult<T> {
+        let UnixStreamLocalControlState::Active(active) = &self.state else {
+            return Err(invalid_data("broker control channel is not active"));
+        };
+        let _transfer = active
             .payload_transfer
             .lock()
             .expect("broker payload-transfer mutex poisoned");
-        transfer()
+        Ok(transfer())
     }
 }
 
@@ -754,11 +784,67 @@ mod tests {
     }
 
     #[test]
+    fn local_control_channel_enforces_setup_and_active_phases() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        assert_eq!(
+            channel
+                .call(BrokerRequest {
+                    request_id: RequestId(0),
+                    operation: BrokerOperation::CloseObject(ObjectHandle(1)),
+                })
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let _cancellation = channel.activate(|| {}).unwrap();
+
+        assert_eq!(
+            channel.activate(|| {}).err().unwrap().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            channel
+                .send_handshake_request(&BrokerHandshakeRequest {
+                    protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+                })
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let channel = Arc::new(channel);
+        let call_channel = Arc::clone(&channel);
+        let call = thread::spawn(move || {
+            call_channel.call(BrokerRequest {
+                request_id: RequestId(1),
+                operation: BrokerOperation::CloseObject(ObjectHandle(1)),
+            })
+        });
+        let request = decode_request(
+            &read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        write_frame_with_deadline(
+            &mut host_stream,
+            &encode_response(BrokerResponse {
+                request_id: request.request_id,
+                result: BrokerResult::ObjectClosed,
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(call.join().unwrap().unwrap().request_id, RequestId(1));
+    }
+
+    #[test]
     fn active_channel_matches_out_of_order_responses() {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let (channel, _cancellation) = UnixStreamLocalControlChannel::from_connected(local_stream)
-            .activate(|| {})
-            .unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let _cancellation = channel.activate(|| {}).unwrap();
         let channel = Arc::new(channel);
 
         let first_channel = Arc::clone(&channel);
@@ -818,9 +904,8 @@ mod tests {
     #[test]
     fn active_channel_serializes_shared_payload_transfers() {
         let (local_stream, _host_stream) = UnixStream::pair().unwrap();
-        let (channel, _cancellation) = UnixStreamLocalControlChannel::from_connected(local_stream)
-            .activate(|| {})
-            .unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let _cancellation = channel.activate(|| {}).unwrap();
         let channel = Arc::new(channel);
         let active_transfers = Arc::new(AtomicUsize::new(0));
         let callers = (0..2)
@@ -828,11 +913,13 @@ mod tests {
                 let channel = Arc::clone(&channel);
                 let active_transfers = Arc::clone(&active_transfers);
                 thread::spawn(move || {
-                    channel.with_serialized_payload(|| {
-                        assert_eq!(active_transfers.fetch_add(1, Ordering::SeqCst), 0);
-                        thread::sleep(Duration::from_millis(20));
-                        assert_eq!(active_transfers.fetch_sub(1, Ordering::SeqCst), 1);
-                    });
+                    channel
+                        .with_serialized_payload(|| {
+                            assert_eq!(active_transfers.fetch_add(1, Ordering::SeqCst), 0);
+                            thread::sleep(Duration::from_millis(20));
+                            assert_eq!(active_transfers.fetch_sub(1, Ordering::SeqCst), 1);
+                        })
+                        .unwrap();
                 })
             })
             .collect::<Vec<_>>();
@@ -848,9 +935,8 @@ mod tests {
         host_stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let (channel, cancellation) = UnixStreamLocalControlChannel::from_connected(local_stream)
-            .activate(|| {})
-            .unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let cancellation = channel.activate(|| {}).unwrap();
         let channel = Arc::new(channel);
         let callers = (0..=MAX_PENDING_CALLS)
             .map(|request_id| {
@@ -890,7 +976,8 @@ mod tests {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
         let failure_count = Arc::new(AtomicUsize::new(0));
         let response_failure_count = Arc::clone(&failure_count);
-        let (channel, _cancellation) = UnixStreamLocalControlChannel::from_connected(local_stream)
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let _cancellation = channel
             .activate(move || {
                 response_failure_count.fetch_add(1, Ordering::SeqCst);
             })
@@ -936,7 +1023,8 @@ mod tests {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
         let failure_count = Arc::new(AtomicUsize::new(0));
         let response_failure_count = Arc::clone(&failure_count);
-        let (channel, _cancellation) = UnixStreamLocalControlChannel::from_connected(local_stream)
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let _cancellation = channel
             .activate(move || {
                 response_failure_count.fetch_add(1, Ordering::SeqCst);
             })
@@ -1088,8 +1176,10 @@ mod tests {
     fn local_handshake_response_read_setup_deadline_is_wall_clock() {
         let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
         let mut channel = UnixStreamLocalControlChannel {
-            stream: local_stream,
-            setup_deadline: Some(Instant::now() + Duration::from_millis(50)),
+            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+                stream: local_stream,
+                setup_deadline: Some(Instant::now() + Duration::from_millis(50)),
+            }),
         };
 
         let reader = std::thread::spawn(move || channel.recv_handshake_response().unwrap_err());
@@ -1174,9 +1264,8 @@ mod tests {
     #[test]
     fn local_control_cancellation_unblocks_response_read() {
         let (local_stream, _host_stream) = UnixStream::pair().unwrap();
-        let (channel, cancellation) = UnixStreamLocalControlChannel::from_connected(local_stream)
-            .activate(|| {})
-            .unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let cancellation = channel.activate(|| {}).unwrap();
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
@@ -1208,9 +1297,8 @@ mod tests {
     #[test]
     fn dropping_local_control_closes_connection_with_cancellation_clone() {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let (channel, _cancellation) = UnixStreamLocalControlChannel::from_connected(local_stream)
-            .activate(|| {})
-            .unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let _cancellation = channel.activate(|| {}).unwrap();
         host_stream
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
