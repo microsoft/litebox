@@ -185,7 +185,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
     request: PipeRequest,
     shared_buffers: &SharedBufferPool<Memory>,
 ) -> RequestResult<PipeResponse> {
-    const SERIALIZED_PIPE_SLOT: SharedBufferSlotIndex = SharedBufferSlotIndex::new(0);
+    const SERIALIZED_PIPE_SLOT: SharedBufferSlotIndex = SharedBufferSlotIndex(0);
 
     match request {
         PipeRequest::Create(request) => {
@@ -693,7 +693,7 @@ mod tests {
         let memory = TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE);
         let shared_buffers = SharedBufferPool::new(memory.clone(), SHARED_BUFFER_LAYOUT).unwrap();
         shared_buffers
-            .write(SharedBufferSlotIndex::new(1), &[9])
+            .write(SharedBufferSlotIndex(1), &[9])
             .unwrap();
         let created = handle_test_request_with_buffers(
             &session,
@@ -708,7 +708,7 @@ mod tests {
         };
 
         shared_buffers
-            .write(SharedBufferSlotIndex::new(0), &[1, 2, 3])
+            .write(SharedBufferSlotIndex(0), &[1, 2, 3])
             .unwrap();
         let write = handle_test_request_with_buffers(
             &session,
@@ -737,12 +737,12 @@ mod tests {
         );
         let mut data = [0; 3];
         shared_buffers
-            .read(SharedBufferSlotIndex::new(0), &mut data)
+            .read(SharedBufferSlotIndex(0), &mut data)
             .unwrap();
         assert_eq!(data, [1, 2, 3]);
         let mut second_slot = [0];
         shared_buffers
-            .read(SharedBufferSlotIndex::new(1), &mut second_slot)
+            .read(SharedBufferSlotIndex(1), &mut second_slot)
             .unwrap();
         assert_eq!(second_slot, [9]);
 

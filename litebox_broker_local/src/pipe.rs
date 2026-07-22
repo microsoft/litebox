@@ -14,7 +14,7 @@ use litebox_broker_protocol::shared_memory::SharedBufferSlotIndex;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
-const SERIALIZED_PIPE_SLOT: SharedBufferSlotIndex = SharedBufferSlotIndex::new(0);
+const SERIALIZED_PIPE_SLOT: SharedBufferSlotIndex = SharedBufferSlotIndex(0);
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned byte pipe.

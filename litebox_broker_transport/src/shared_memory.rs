@@ -366,7 +366,7 @@ mod tests {
         let pool = SharedBufferPool::new(memory, SHARED_BUFFER_LAYOUT).unwrap();
         for index in 0..SHARED_BUFFER_LAYOUT.slot_count() {
             pool.write(
-                SharedBufferSlotIndex::new(index),
+                SharedBufferSlotIndex(index),
                 &[u8::try_from(index).unwrap()],
             )
             .unwrap();
@@ -380,7 +380,7 @@ mod tests {
         for index in 0..SHARED_BUFFER_LAYOUT.slot_count() {
             let mut byte = [0];
             mapped_pool
-                .read(SharedBufferSlotIndex::new(index), &mut byte)
+                .read(SharedBufferSlotIndex(index), &mut byte)
                 .unwrap();
             assert_eq!(byte, [u8::try_from(index).unwrap()]);
         }

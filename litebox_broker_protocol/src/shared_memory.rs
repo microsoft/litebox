@@ -148,13 +148,13 @@ impl SharedBufferLayout {
         slot: SharedBufferSlotIndex,
         length: usize,
     ) -> Result<Range<usize>, SharedBufferError> {
-        if slot.index() >= self.slot_count {
+        if slot.0 >= self.slot_count {
             return Err(SharedBufferError::InvalidSlot);
         }
         if length > self.slot_size as usize {
             return Err(SharedBufferError::RangeExceedsSlot);
         }
-        let offset = (slot.index() as usize)
+        let offset = (slot.0 as usize)
             .checked_mul(self.slot_size as usize)
             .ok_or(SharedBufferError::InvalidLayout)?;
         let end = offset
@@ -167,19 +167,7 @@ impl SharedBufferLayout {
 /// Index of one fixed shared-buffer slot.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SharedBufferSlotIndex(u32);
-
-impl SharedBufferSlotIndex {
-    /// Creates a slot index.
-    pub const fn new(index: u32) -> Self {
-        Self(index)
-    }
-
-    /// Returns the numeric slot index.
-    pub const fn index(self) -> u32 {
-        self.0
-    }
-}
+pub struct SharedBufferSlotIndex(pub u32);
 
 /// A shared-memory resource viewed as a checked fixed-slot buffer pool.
 ///
@@ -267,15 +255,15 @@ mod tests {
     fn layout_derives_disjoint_slot_ranges() {
         let layout = SharedBufferLayout::new(8, 3).unwrap();
 
-        assert_eq!(layout.range(SharedBufferSlotIndex::new(0), 8), Ok(0..8));
-        assert_eq!(layout.range(SharedBufferSlotIndex::new(1), 8), Ok(8..16));
-        assert_eq!(layout.range(SharedBufferSlotIndex::new(2), 8), Ok(16..24));
+        assert_eq!(layout.range(SharedBufferSlotIndex(0), 8), Ok(0..8));
+        assert_eq!(layout.range(SharedBufferSlotIndex(1), 8), Ok(8..16));
+        assert_eq!(layout.range(SharedBufferSlotIndex(2), 8), Ok(16..24));
         assert_eq!(
-            layout.range(SharedBufferSlotIndex::new(3), 0),
+            layout.range(SharedBufferSlotIndex(3), 0),
             Err(SharedBufferError::InvalidSlot)
         );
         assert_eq!(
-            layout.range(SharedBufferSlotIndex::new(0), 9),
+            layout.range(SharedBufferSlotIndex(0), 9),
             Err(SharedBufferError::RangeExceedsSlot)
         );
     }
@@ -290,16 +278,14 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
         let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
 
-        pool.write(SharedBufferSlotIndex::new(0), &[1, 2, 3])
-            .unwrap();
-        pool.write(SharedBufferSlotIndex::new(2), &[4, 5]).unwrap();
+        pool.write(SharedBufferSlotIndex(0), &[1, 2, 3]).unwrap();
+        pool.write(SharedBufferSlotIndex(2), &[4, 5]).unwrap();
         let mut first = [0; 3];
-        pool.read(SharedBufferSlotIndex::new(0), &mut first)
-            .unwrap();
+        pool.read(SharedBufferSlotIndex(0), &mut first).unwrap();
         assert_eq!(first, [1, 2, 3]);
         assert_eq!(&memory.bytes()[8..16], &[0; 8]);
         assert_eq!(
-            pool.write(SharedBufferSlotIndex::new(2), &[0; 9]),
+            pool.write(SharedBufferSlotIndex(2), &[0; 9]),
             Err(SharedBufferError::RangeExceedsSlot)
         );
     }
