@@ -28,7 +28,7 @@ use litebox_broker_protocol::message::{
     EventRequest, EventResponse, PipeRequest, PipeResponse,
 };
 use litebox_broker_protocol::pipe::{
-    CreatePipeResponse, PIPE_TRANSFER_BUFFER_SIZE, ReadPipeResponse, WritePipeResponse,
+    CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::shared_memory::{
     SHARED_BUFFER_LAYOUT, SharedBufferPool, SharedBufferSlotIndex, SharedMemory,
@@ -199,7 +199,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
                 .map_err(|error| RequestFailure::Respond(error.into()))
         }
         PipeRequest::Read(request) => {
-            if request.length as usize > PIPE_TRANSFER_BUFFER_SIZE {
+            if request.length > MAX_PIPE_TRANSFER_SIZE {
                 return Err(RequestFailure::Respond(ErrorCode::MalformedRequest));
             }
             let data = litebox_broker_core::pipe::read(session, request.handle, request.length)
@@ -215,7 +215,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
             }))
         }
         PipeRequest::Write(request) => {
-            if request.length as usize > PIPE_TRANSFER_BUFFER_SIZE {
+            if request.length > MAX_PIPE_TRANSFER_SIZE {
                 return Err(RequestFailure::Respond(ErrorCode::MalformedRequest));
             }
             let length = request.length as usize;
@@ -750,7 +750,7 @@ mod tests {
             &session,
             BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle: response.write_handle,
-                length: u32::try_from(PIPE_TRANSFER_BUFFER_SIZE).unwrap() + 1,
+                length: MAX_PIPE_TRANSFER_SIZE + 1,
             })),
             &shared_buffers,
         );

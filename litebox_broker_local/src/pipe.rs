@@ -7,7 +7,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, PipeRequest, PipeResponse};
 use litebox_broker_protocol::pipe::{
-    CreatePipeRequest, CreatePipeResponse, PIPE_TRANSFER_BUFFER_SIZE, ReadPipeRequest,
+    CreatePipeRequest, CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeRequest,
     WritePipeRequest,
 };
 use litebox_broker_protocol::shared_memory::SharedBufferSlotIndex;
@@ -55,7 +55,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         length: u32,
     ) -> Result<Vec<u8>, Channel::Error> {
-        if length as usize > PIPE_TRANSFER_BUFFER_SIZE {
+        if length > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
@@ -98,7 +98,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         data: &[u8],
     ) -> Result<usize, Channel::Error> {
-        if data.len() > PIPE_TRANSFER_BUFFER_SIZE {
+        if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
@@ -211,7 +211,7 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([]);
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
-        let oversized_length = PIPE_TRANSFER_BUFFER_SIZE + 1;
+        let oversized_length = MAX_PIPE_TRANSFER_SIZE as usize + 1;
 
         assert!(matches!(
             local.read_pipe(ObjectHandle(1), u32::try_from(oversized_length).unwrap()),

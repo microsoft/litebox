@@ -9,9 +9,6 @@ use crate::ObjectHandle;
 /// smallest currently supported transport frame.
 pub const MAX_PIPE_TRANSFER_SIZE: u32 = 32 * 1024;
 
-/// Size of one association shared-buffer slot used for broker pipe transfers.
-pub const PIPE_TRANSFER_BUFFER_SIZE: usize = MAX_PIPE_TRANSFER_SIZE as usize;
-
 /// Request to create a broker-owned byte pipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreatePipeRequest {
