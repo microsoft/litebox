@@ -6,6 +6,11 @@
 //! This module deliberately uses `std` because Unix-domain sockets and `std::io`
 //! framing are hosted userland concerns. Portable broker interfaces live in the
 //! no_std protocol, local, core, and host crates.
+//!
+//! After setup, each caller thread registers its request and writes its complete
+//! frame while holding the shared writer mutex; there is no local request worker.
+//! One response-dispatcher thread exclusively reads responses, correlates them by
+//! request ID, and wakes the matching callers.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
 use std::net::Shutdown;

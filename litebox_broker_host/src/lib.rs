@@ -48,6 +48,10 @@ pub use error::{BrokerHostError, Result};
 /// `shared_memory` belongs to this association and is reused at offset zero for
 /// serialized pipe transfers. `send_shared_memory` runs after version
 /// negotiation and before active requests begin.
+///
+/// Active requests are intentionally executed serially: this function receives,
+/// executes, and responds to one request before reading the next. It does not
+/// create a request queue or dispatch work to worker threads.
 pub fn serve_connection<ControlChannel, NotificationChannel, ChannelError>(
     core: &BrokerCore,
     control_channel: &mut ControlChannel,
