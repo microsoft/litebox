@@ -423,6 +423,38 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         buffer: Platform::RawMutPointer<u8>,
         buffer_size: Platform::RawMutPointer<u32>,
     },
+    NtCreateWnfStateName {
+        state_name: Platform::RawMutPointer<u64>,
+        name_lifetime: u32,
+        data_scope: u32,
+        persist_data: u8,
+        type_id: Option<Platform::RawConstPointer<nt_types::Guid>>,
+        maximum_state_size: u32,
+        security_descriptor: Platform::RawConstPointer<u8>,
+    },
+    NtUpdateWnfStateData {
+        state_name: Platform::RawConstPointer<u64>,
+        buffer: Option<Platform::RawConstPointer<u8>>,
+        buffer_size: u32,
+        type_id: Option<Platform::RawConstPointer<nt_types::Guid>>,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        matching_change_stamp: u32,
+        check_stamp: i32,
+    },
+    NtDeleteWnfStateData {
+        state_name: Platform::RawConstPointer<u64>,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+    },
+    NtDeleteWnfStateName {
+        state_name: Platform::RawConstPointer<u64>,
+    },
+    NtQueryWnfStateNameInformation {
+        state_name: Platform::RawConstPointer<u64>,
+        name_information_class: u32,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        buffer: Platform::RawMutPointer<u32>,
+        buffer_size: u32,
+    },
     NtQuerySection {
         section_handle: Handle,
         section_information_class: u32,
@@ -875,6 +907,40 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 buffer:*,
                 buffer_size:*,
             })),
+            NtSysno::NtCreateWnfStateName => Some(sys_req!(NtCreateWnfStateName {
+                state_name:*,
+                name_lifetime,
+                data_scope,
+                persist_data,
+                type_id:*,
+                maximum_state_size,
+                security_descriptor:*,
+            })),
+            NtSysno::NtUpdateWnfStateData => Some(sys_req!(NtUpdateWnfStateData {
+                state_name:*,
+                buffer:*,
+                buffer_size,
+                type_id:*,
+                explicit_scope:*,
+                matching_change_stamp,
+                check_stamp,
+            })),
+            NtSysno::NtDeleteWnfStateData => Some(sys_req!(NtDeleteWnfStateData {
+                state_name:*,
+                explicit_scope:*,
+            })),
+            NtSysno::NtDeleteWnfStateName => Some(sys_req!(NtDeleteWnfStateName {
+                state_name:*,
+            })),
+            NtSysno::NtQueryWnfStateNameInformation => {
+                Some(sys_req!(NtQueryWnfStateNameInformation {
+                    state_name:*,
+                    name_information_class,
+                    explicit_scope:*,
+                    buffer:*,
+                    buffer_size,
+                }))
+            }
             NtSysno::NtQuerySection => Some(sys_req!(NtQuerySection {
                 section_handle: { Handle::from_raw },
                 section_information_class,

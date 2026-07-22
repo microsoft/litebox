@@ -3,7 +3,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-
+use int_enum::IntEnum;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_windows::nt_status::NtStatus;
 
@@ -13,17 +13,287 @@ use crate::{
     probe_guest_output_preserving_value,
 };
 
+const MAXIMUM_STATE_SIZE: u32 = 0x1000;
+const STATE_NAME_XOR_KEY: u64 = 0x41c6_4e6d_a3bc_0074;
+const MAXIMUM_UNIQUE_ID: u32 = 0x001f_ffff;
+const STATE_NAME_INFORMATION_SIZE: u32 = 4;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum WnfStateNameLifetime {
+    WellKnown = 0,
+    Permanent = 1,
+    Persistent = 2,
+    Temporary = 3,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum WnfDataScope {
+    System = 0,
+    Session = 1,
+    User = 2,
+    Process = 3,
+    Machine = 4,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum WnfStateNameInformation {
+    Exists = 0,
+    SubscribersPresent = 1,
+    IsQuiescent = 2,
+}
+
 #[derive(Clone)]
 pub(crate) struct WnfStateData {
     change_stamp: u32,
     type_id: Option<Guid>,
     data: Vec<u8>,
+    maximum_state_size: u32,
+    lifetime: WnfStateNameLifetime,
 }
 
-pub(crate) type WnfStateStore<Platform> =
-    litebox::sync::RwLock<Platform, BTreeMap<u64, WnfStateData>>;
+#[derive(Default)]
+pub(crate) struct WnfStateStoreData {
+    next_unique_id: u32,
+    states: BTreeMap<u64, WnfStateData>,
+}
+
+pub(crate) type WnfStateStore<Platform> = litebox::sync::RwLock<Platform, WnfStateStoreData>;
+
+pub(crate) struct WnfCreateStateNameParameters<Platform: litebox::platform::RawPointerProvider> {
+    pub(crate) state_name: MutPtr<Platform, u64>,
+    pub(crate) name_lifetime: u32,
+    pub(crate) data_scope: u32,
+    pub(crate) persist_data: u8,
+    pub(crate) type_id: Option<ConstPtr<Platform, Guid>>,
+    pub(crate) maximum_state_size: u32,
+    pub(crate) security_descriptor: ConstPtr<Platform, u8>,
+}
+
+pub(crate) struct WnfUpdateStateDataParameters<Platform: litebox::platform::RawPointerProvider> {
+    pub(crate) state_name: ConstPtr<Platform, u64>,
+    pub(crate) buffer: Option<ConstPtr<Platform, u8>>,
+    pub(crate) buffer_size: u32,
+    pub(crate) type_id: Option<ConstPtr<Platform, Guid>>,
+    pub(crate) explicit_scope: Option<ConstPtr<Platform, u8>>,
+    pub(crate) matching_change_stamp: u32,
+    pub(crate) check_stamp: i32,
+}
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn sys_nt_create_wnf_state_name(
+        &self,
+        params: WnfCreateStateNameParameters<Platform>,
+    ) -> NtStatus {
+        if probe_guest_output_preserving_value::<Platform, u64>(params.state_name).is_err() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let type_id = match read_type_id::<Platform>(params.type_id) {
+            Ok(type_id) => type_id,
+            Err(status) => return status,
+        };
+        if params.security_descriptor.read_at_offset(0).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let Ok(lifetime) = WnfStateNameLifetime::try_from(params.name_lifetime) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let Ok(data_scope) = WnfDataScope::try_from(params.data_scope) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if params.maximum_state_size > MAXIMUM_STATE_SIZE {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        match lifetime {
+            WnfStateNameLifetime::WellKnown => return NtStatus::INVALID_PARAMETER,
+            WnfStateNameLifetime::Permanent | WnfStateNameLifetime::Persistent => {
+                // TODO(wnf-create-privilege): Allow privileged lifetimes once guest token
+                // privileges are modeled.
+                return NtStatus::PRIVILEGE_NOT_HELD;
+            }
+            WnfStateNameLifetime::Temporary => {}
+        }
+        if data_scope == WnfDataScope::Process || params.persist_data != 0 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        // TODO(wnf-security-descriptor): Enforce the supplied DACL once guest tokens and WNF
+        // access checks are modeled.
+        let (state_name, state) = {
+            let mut store = self.global.wnf_states.write();
+            let Some(unique_id) = store.next_unique_id.checked_add(1) else {
+                return NtStatus::NO_MEMORY;
+            };
+            if unique_id > MAXIMUM_UNIQUE_ID {
+                return NtStatus::NO_MEMORY;
+            }
+            store.next_unique_id = unique_id;
+            let state_name = encode_state_name(lifetime, data_scope, false, unique_id);
+            let state = WnfStateData {
+                change_stamp: 0,
+                type_id,
+                data: Vec::new(),
+                maximum_state_size: params.maximum_state_size,
+                lifetime,
+            };
+            // TODO(wnf-temporary-lifetime): Remove temporary names when their creating guest
+            // process exits once process lifecycle is modeled.
+            store.states.insert(state_name, state.clone());
+            (state_name, state)
+        };
+        if params.state_name.write_at_offset(0, state_name).is_none() {
+            let mut store = self.global.wnf_states.write();
+            if store
+                .states
+                .get(&state_name)
+                .is_some_and(|current| current.change_stamp == state.change_stamp)
+            {
+                store.states.remove(&state_name);
+            }
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_update_wnf_state_data(
+        &self,
+        params: WnfUpdateStateDataParameters<Platform>,
+    ) -> NtStatus {
+        let Some(state_name) = params.state_name.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let type_id = match read_type_id::<Platform>(params.type_id) {
+            Ok(type_id) => type_id,
+            Err(status) => return status,
+        };
+        if params.explicit_scope.is_some() {
+            // TODO(wnf-explicit-scope): Key state data by the explicit SID once scoped WNF
+            // state access is modeled.
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let data = if params.buffer_size == 0 {
+            Vec::new()
+        } else {
+            let Some(buffer) = params.buffer else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            let Some(data) = buffer.to_owned_slice(params.buffer_size as usize) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            Vec::from(data)
+        };
+
+        let mut store = self.global.wnf_states.write();
+        let Some(state) = store.states.get_mut(&state_name) else {
+            return NtStatus::OBJECT_NAME_NOT_FOUND;
+        };
+        if !type_id_matches(state.type_id, type_id) || params.buffer_size > state.maximum_state_size
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if params.check_stamp != 0 && params.matching_change_stamp != state.change_stamp {
+            return NtStatus::UNSUCCESSFUL;
+        }
+        state.change_stamp = state.change_stamp.wrapping_add(1);
+        state.data = data;
+        // TODO(wnf-notify): Deliver successful updates to subscribers when WNF subscriptions are
+        // modeled.
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_delete_wnf_state_data(
+        &self,
+        state_name: ConstPtr<Platform, u64>,
+        explicit_scope: Option<ConstPtr<Platform, u8>>,
+    ) -> NtStatus {
+        let Some(state_name) = state_name.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if explicit_scope.is_some() {
+            // TODO(wnf-explicit-scope): Delete only the selected SID-scoped data instance once
+            // scoped WNF state access is modeled.
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let mut store = self.global.wnf_states.write();
+        let Some(state) = store.states.get_mut(&state_name) else {
+            return NtStatus::OBJECT_NAME_NOT_FOUND;
+        };
+        state.change_stamp = 0;
+        state.data.clear();
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_delete_wnf_state_name(
+        &self,
+        state_name: ConstPtr<Platform, u64>,
+    ) -> NtStatus {
+        let Some(state_name) = state_name.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let mut store = self.global.wnf_states.write();
+        let Some(state) = store.states.get(&state_name) else {
+            return NtStatus::OBJECT_NAME_NOT_FOUND;
+        };
+        if state.lifetime == WnfStateNameLifetime::WellKnown {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        store.states.remove(&state_name);
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_query_wnf_state_name_information(
+        &self,
+        state_name: ConstPtr<Platform, u64>,
+        name_information_class: u32,
+        explicit_scope: Option<ConstPtr<Platform, u8>>,
+        buffer: MutPtr<Platform, u32>,
+        buffer_size: u32,
+    ) -> NtStatus {
+        let Some(state_name) = state_name.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Ok(information_class) = WnfStateNameInformation::try_from(name_information_class)
+        else {
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+        if buffer_size != STATE_NAME_INFORMATION_SIZE {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if explicit_scope.is_some() {
+            // TODO(wnf-explicit-scope): Resolve the selected SID-scoped state instance once scoped
+            // WNF state access is modeled.
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if probe_guest_output_preserving_value::<Platform, u32>(buffer).is_err() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        let store = self.global.wnf_states.read();
+        let exists = store.states.contains_key(&state_name);
+        let value = match information_class {
+            WnfStateNameInformation::Exists => u32::from(exists),
+            WnfStateNameInformation::SubscribersPresent => {
+                if !exists {
+                    return NtStatus::OBJECT_NAME_NOT_FOUND;
+                }
+                // TODO(wnf-notify): Report registered subscribers once WNF subscriptions are
+                // modeled.
+                0
+            }
+            WnfStateNameInformation::IsQuiescent => {
+                if !exists {
+                    return NtStatus::OBJECT_NAME_NOT_FOUND;
+                }
+                1
+            }
+        };
+        buffer
+            .write_at_offset(0, value)
+            .map_or(NtStatus::ACCESS_VIOLATION, |()| NtStatus::SUCCESS)
+    }
+
     pub(crate) fn sys_nt_query_wnf_state_data(
         &self,
         state_name: ConstPtr<Platform, u64>,
@@ -64,16 +334,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let state = {
-            let states = self.global.wnf_states.read();
-            states.get(&state_name).cloned()
+            let store = self.global.wnf_states.read();
+            store.states.get(&state_name).cloned()
         };
         let Some(state) = state else {
             return NtStatus::OBJECT_NAME_NOT_FOUND;
         };
-        if let (Some(type_id), Some(expected_type_id)) = (type_id, state.type_id)
-            && type_id.data != expected_type_id.data
-        {
-            return NtStatus::OBJECT_TYPE_MISMATCH;
+        if !type_id_matches(state.type_id, type_id) {
+            return NtStatus::INVALID_PARAMETER;
         }
 
         let Ok(required_size) = u32::try_from(state.data.len()) else {
@@ -104,43 +372,137 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
+fn read_type_id<Platform: ShimPlatform>(
+    type_id: Option<ConstPtr<Platform, Guid>>,
+) -> Result<Option<Guid>, NtStatus> {
+    type_id
+        .map(|type_id| type_id.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION))
+        .transpose()
+}
+
+fn type_id_matches(expected: Option<Guid>, supplied: Option<Guid>) -> bool {
+    expected.is_none()
+        || matches!((expected, supplied), (Some(expected), Some(supplied)) if expected.data == supplied.data)
+}
+
+fn encode_state_name(
+    lifetime: WnfStateNameLifetime,
+    data_scope: WnfDataScope,
+    persist_data: bool,
+    unique_id: u32,
+) -> u64 {
+    let clear = 1
+        | ((lifetime as u64) << 4)
+        | ((data_scope as u64) << 6)
+        | (u64::from(persist_data) << 10)
+        | (u64::from(unique_id) << 11);
+    clear ^ STATE_NAME_XOR_KEY
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+
     use super::*;
-    use crate::tests::{TestFS, TestPlatform, mut_byte_ptr, mut_ptr, test_task};
+    use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
 
-    const STATE_NAME: u64 = 0x41c6_4e6d_a3bc_0075;
+    const SECURITY_DESCRIPTOR_REVISION: u8 = 1;
 
-    fn publish_state(
+    fn create_state(
         task: &Task<TestPlatform, TestFS>,
-        change_stamp: u32,
         type_id: Option<Guid>,
-        data: &[u8],
-    ) {
-        task.global.wnf_states.write().insert(
-            STATE_NAME,
-            WnfStateData {
-                change_stamp,
-                type_id,
-                data: data.into(),
-            },
+        maximum_state_size: u32,
+    ) -> u64 {
+        let mut state_name = 0;
+        assert_eq!(
+            task.sys_nt_create_wnf_state_name(WnfCreateStateNameParameters {
+                state_name: mut_ptr(&mut state_name),
+                name_lifetime: WnfStateNameLifetime::Temporary as u32,
+                data_scope: WnfDataScope::Machine as u32,
+                persist_data: 0,
+                type_id: type_id.as_ref().map(const_ptr),
+                maximum_state_size,
+                security_descriptor: const_ptr(&SECURITY_DESCRIPTOR_REVISION),
+            }),
+            NtStatus::SUCCESS
         );
+        state_name
+    }
+
+    fn update_state(
+        task: &Task<TestPlatform, TestFS>,
+        state_name: u64,
+        data: &[u8],
+        type_id: Option<&Guid>,
+        matching_change_stamp: u32,
+        check_stamp: i32,
+    ) -> NtStatus {
+        task.sys_nt_update_wnf_state_data(WnfUpdateStateDataParameters {
+            state_name: const_ptr(&state_name),
+            buffer: data.first().map(const_ptr),
+            buffer_size: u32::try_from(data.len()).expect("test payload length fits in u32"),
+            type_id: type_id.map(const_ptr),
+            explicit_scope: None,
+            matching_change_stamp,
+            check_stamp,
+        })
+    }
+
+    fn task_with_new_process(task: &Task<TestPlatform, TestFS>) -> Task<TestPlatform, TestFS> {
+        Task {
+            global: task.global.clone(),
+            process: Arc::new(crate::Process::default(
+                None,
+                task.process.windows_shared_section.clone(),
+            )),
+            fs: task.fs.clone(),
+            entry_point: 0,
+            stack_top: 0,
+            context: 0,
+            teb_address: 0,
+        }
     }
 
     #[test]
-    fn untyped_state_accepts_an_optional_type_id() {
-        let task = test_task();
-        publish_state(&task, 7, None, &[1]);
-        let state_name = STATE_NAME;
-        let type_id = Guid { data: [2; 16] };
-        let mut change_stamp = 0;
-        let mut buffer = [0u8; 1];
-        let mut buffer_size = 1;
-
+    fn lifecycle_updates_are_visible_across_processes() {
+        let publisher = test_task();
+        let state_name = create_state(&publisher, None, 4);
         assert_eq!(
-            task.sys_nt_query_wnf_state_data(
+            update_state(&publisher, state_name, &[1, 2], None, 0, 0),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            update_state(&publisher, state_name, &[9], None, 99, 1),
+            NtStatus::UNSUCCESSFUL
+        );
+        assert_eq!(
+            update_state(&publisher, state_name, &[3], None, 1, 1),
+            NtStatus::SUCCESS
+        );
+
+        let subscriber = task_with_new_process(&publisher);
+        let mut change_stamp = 0;
+        let mut buffer = [0xaau8; 4];
+        let mut buffer_size = 0;
+        assert_eq!(
+            subscriber.sys_nt_query_wnf_state_data(
                 crate::tests::const_ptr(&state_name),
-                Some(crate::tests::const_ptr(&type_id)),
+                None,
+                None,
+                mut_ptr(&mut change_stamp),
+                mut_byte_ptr(&mut buffer),
+                mut_ptr(&mut buffer_size),
+            ),
+            NtStatus::BUFFER_TOO_SMALL
+        );
+        assert_eq!(change_stamp, 2);
+        assert_eq!(buffer_size, 1);
+
+        buffer_size = 4;
+        assert_eq!(
+            subscriber.sys_nt_query_wnf_state_data(
+                crate::tests::const_ptr(&state_name),
+                None,
                 None,
                 mut_ptr(&mut change_stamp),
                 mut_byte_ptr(&mut buffer),
@@ -148,33 +510,234 @@ mod tests {
             ),
             NtStatus::SUCCESS
         );
-        assert_eq!(change_stamp, 7);
+        assert_eq!(change_stamp, 2);
         assert_eq!(buffer_size, 1);
-        assert_eq!(buffer, [1]);
+        assert_eq!(buffer, [3, 0xaa, 0xaa, 0xaa]);
     }
 
     #[test]
-    fn explicit_scope_is_rejected_until_scoped_states_are_modeled() {
+    fn delete_data_resets_state_and_delete_name_removes_it() {
         let task = test_task();
-        let state_name = STATE_NAME;
-        let explicit_scope = 0u8;
-        let mut change_stamp = 99;
-        let mut buffer = [0xaau8; 1];
-        let mut buffer_size = 1;
+        let state_name = create_state(&task, None, 4);
+        assert_eq!(
+            update_state(&task, state_name, &[1, 2], None, 0, 0),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_delete_wnf_state_data(const_ptr(&state_name), None),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_delete_wnf_state_data(const_ptr(&state_name), None),
+            NtStatus::SUCCESS
+        );
 
+        let mut change_stamp = 99;
+        let mut buffer = [0xaau8; 2];
+        let mut buffer_size = 2;
         assert_eq!(
             task.sys_nt_query_wnf_state_data(
-                crate::tests::const_ptr(&state_name),
+                const_ptr(&state_name),
                 None,
-                Some(crate::tests::const_ptr(&explicit_scope)),
+                None,
+                mut_ptr(&mut change_stamp),
+                mut_byte_ptr(&mut buffer),
+                mut_ptr(&mut buffer_size),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(change_stamp, 0);
+        assert_eq!(buffer_size, 0);
+        assert_eq!(buffer, [0xaa; 2]);
+
+        assert_eq!(
+            task.sys_nt_delete_wnf_state_name(const_ptr(&state_name)),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_delete_wnf_state_name(const_ptr(&state_name)),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(
+            task.sys_nt_query_wnf_state_data(
+                const_ptr(&state_name),
+                None,
+                None,
+                mut_ptr(&mut change_stamp),
+                mut_byte_ptr(&mut buffer),
+                mut_ptr(&mut buffer_size),
+            ),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn state_name_information_reports_native_boolean_contract() {
+        let task = test_task();
+        let state_name = create_state(&task, None, 4);
+        for (class, expected) in [
+            (WnfStateNameInformation::Exists, 1),
+            (WnfStateNameInformation::SubscribersPresent, 0),
+            (WnfStateNameInformation::IsQuiescent, 1),
+        ] {
+            let mut value = u32::MAX;
+            assert_eq!(
+                task.sys_nt_query_wnf_state_name_information(
+                    const_ptr(&state_name),
+                    class as u32,
+                    None,
+                    mut_ptr(&mut value),
+                    STATE_NAME_INFORMATION_SIZE,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(value, expected);
+        }
+
+        assert_eq!(
+            task.sys_nt_delete_wnf_state_name(const_ptr(&state_name)),
+            NtStatus::SUCCESS
+        );
+        let mut value = u32::MAX;
+        assert_eq!(
+            task.sys_nt_query_wnf_state_name_information(
+                const_ptr(&state_name),
+                WnfStateNameInformation::Exists as u32,
+                None,
+                mut_ptr(&mut value),
+                STATE_NAME_INFORMATION_SIZE,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(value, 0);
+        assert_eq!(
+            task.sys_nt_query_wnf_state_name_information(
+                const_ptr(&state_name),
+                WnfStateNameInformation::SubscribersPresent as u32,
+                None,
+                mut_ptr(&mut value),
+                STATE_NAME_INFORMATION_SIZE,
+            ),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(
+            task.sys_nt_query_wnf_state_name_information(
+                const_ptr(&state_name),
+                3,
+                None,
+                mut_ptr(&mut value),
+                STATE_NAME_INFORMATION_SIZE,
+            ),
+            NtStatus::INVALID_INFO_CLASS
+        );
+    }
+
+    #[test]
+    fn typed_states_require_the_created_type_id() {
+        let task = test_task();
+        let expected_type = Guid { data: [1; 16] };
+        let wrong_type = Guid { data: [2; 16] };
+        let state_name = create_state(&task, Some(expected_type), 4);
+
+        assert_eq!(
+            update_state(&task, state_name, &[1], None, 0, 0),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(
+            update_state(&task, state_name, &[1], Some(&wrong_type), 0, 0),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(
+            update_state(&task, state_name, &[1], Some(&expected_type), 0, 0),
+            NtStatus::SUCCESS
+        );
+
+        let mut change_stamp = 0;
+        let mut buffer = [0u8; 1];
+        let mut buffer_size = 1;
+        assert_eq!(
+            task.sys_nt_query_wnf_state_data(
+                const_ptr(&state_name),
+                None,
+                None,
                 mut_ptr(&mut change_stamp),
                 mut_byte_ptr(&mut buffer),
                 mut_ptr(&mut buffer_size),
             ),
             NtStatus::INVALID_PARAMETER
         );
-        assert_eq!(change_stamp, 99);
-        assert_eq!(buffer_size, 1);
-        assert_eq!(buffer, [0xaa; 1]);
+        assert_eq!(
+            task.sys_nt_query_wnf_state_data(
+                const_ptr(&state_name),
+                Some(const_ptr(&expected_type)),
+                None,
+                mut_ptr(&mut change_stamp),
+                mut_byte_ptr(&mut buffer),
+                mut_ptr(&mut buffer_size),
+            ),
+            NtStatus::SUCCESS
+        );
+    }
+
+    #[test]
+    fn create_and_update_enforce_native_parameter_limits() {
+        let task = test_task();
+        let mut state_name = 0;
+        for (lifetime, scope, persist_data, maximum_state_size, expected) in [
+            (
+                WnfStateNameLifetime::WellKnown as u32,
+                WnfDataScope::Machine as u32,
+                0,
+                4,
+                NtStatus::INVALID_PARAMETER,
+            ),
+            (
+                WnfStateNameLifetime::Permanent as u32,
+                WnfDataScope::Machine as u32,
+                0,
+                4,
+                NtStatus::PRIVILEGE_NOT_HELD,
+            ),
+            (
+                WnfStateNameLifetime::Temporary as u32,
+                WnfDataScope::Process as u32,
+                0,
+                4,
+                NtStatus::INVALID_PARAMETER,
+            ),
+            (
+                WnfStateNameLifetime::Temporary as u32,
+                WnfDataScope::Machine as u32,
+                1,
+                4,
+                NtStatus::INVALID_PARAMETER,
+            ),
+            (
+                WnfStateNameLifetime::Temporary as u32,
+                WnfDataScope::Machine as u32,
+                0,
+                MAXIMUM_STATE_SIZE + 1,
+                NtStatus::INVALID_PARAMETER,
+            ),
+        ] {
+            assert_eq!(
+                task.sys_nt_create_wnf_state_name(WnfCreateStateNameParameters {
+                    state_name: mut_ptr(&mut state_name),
+                    name_lifetime: lifetime,
+                    data_scope: scope,
+                    persist_data,
+                    type_id: None,
+                    maximum_state_size,
+                    security_descriptor: const_ptr(&SECURITY_DESCRIPTOR_REVISION),
+                }),
+                expected
+            );
+        }
+
+        let state_name = create_state(&task, None, 1);
+        assert_eq!(
+            update_state(&task, state_name, &[1, 2], None, 0, 0),
+            NtStatus::INVALID_PARAMETER
+        );
     }
 }
