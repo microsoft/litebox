@@ -12,8 +12,8 @@ use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::{DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{
-    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, PTA_DEFAULT_FLAGS, TaFlags, TeeParamType,
-    TeeResult, TeeUuid, UteeParams,
+    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, TaFlags, TeeParamType, TeeResult, TeeUuid,
+    UteeParams,
 };
 use num_enum::TryFromPrimitive;
 use sha2::Sha256;
@@ -77,6 +77,10 @@ impl PseudoTa {
         }
     }
 }
+
+pub(crate) const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
+    .union(TaFlags::MULTI_SESSION)
+    .union(TaFlags::INSTANCE_KEEP_ALIVE);
 
 const MAX_PTA_SESSIONS_PER_TASK: usize = 100;
 
