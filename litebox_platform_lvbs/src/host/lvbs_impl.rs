@@ -8,6 +8,7 @@ use crate::{
     host::per_cpu_variables::with_per_cpu_variables,
 };
 use digest::Digest;
+use litebox_common_lvbs::PRK_LEN;
 use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
@@ -173,9 +174,6 @@ impl LvbsCrng {
         self.bytes_until_reseed = CRNG_RESEED_INTERVAL_BYTES;
     }
 }
-
-/// Length of the Platform Root Key in bytes.
-pub(crate) const PRK_LEN: usize = 32;
 
 static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 

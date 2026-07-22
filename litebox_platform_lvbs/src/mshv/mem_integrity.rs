@@ -3,13 +3,7 @@
 
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
-use crate::{
-    host::linux::ModuleSignature,
-    mshv::{
-        heki::{HekiPatch, POKE_MAX_OPCODE_SIZE},
-        vsm::ModuleMemory,
-    },
-};
+use crate::mshv::vsm::ModuleMemory;
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
@@ -25,7 +19,7 @@ use elf::{
     string_table::StringTable,
     symbol::Symbol,
 };
-use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::{HekiPatch, ModuleSignature, POKE_MAX_OPCODE_SIZE, VerificationError};
 use object::read::pe::PeFile64;
 use rangemap::set::RangeSet;
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
@@ -765,34 +759,4 @@ pub enum KernelElfError {
     #[cfg_attr(debug_assertions, allow(dead_code))]
     #[error("unsupported relocation type")]
     UnsupportedRelocation,
-}
-
-/// Errors for module signature verification.
-#[derive(Debug, Error, PartialEq)]
-#[non_exhaustive]
-pub enum VerificationError {
-    #[error("signature not found in module")]
-    SignatureNotFound,
-    #[error("invalid signature format")]
-    InvalidSignature,
-    #[error("invalid certificate")]
-    InvalidCertificate,
-    #[error("signature authentication failed")]
-    AuthenticationFailed,
-    #[error("failed to parse signature data")]
-    ParseFailed,
-    #[error("unsupported signature algorithm")]
-    Unsupported,
-}
-
-impl From<VerificationError> for Errno {
-    fn from(e: VerificationError) -> Self {
-        match e {
-            VerificationError::AuthenticationFailed => Errno::EKEYREJECTED,
-            VerificationError::SignatureNotFound => Errno::ENODATA,
-            VerificationError::Unsupported => Errno::ENOPKG,
-            VerificationError::InvalidCertificate => Errno::ENOKEY,
-            VerificationError::InvalidSignature | VerificationError::ParseFailed => Errno::ELIBBAD,
-        }
-    }
 }

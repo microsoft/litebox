@@ -12,10 +12,10 @@ use crate::{
         HV_X64_REGISTER_TR, HvInterceptMessage, HvInterceptMessageHeader, HvMessageType,
         HvMsrInterceptMessage, HvPendingExceptionEvent, MSR_CSTAR, MSR_EFER, MSR_IA32_APICBASE,
         MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP, MSR_IA32_SYSENTER_ESP, MSR_LSTAR, MSR_STAR,
-        MSR_SYSCALL_MASK, X86Cr0Flags, X86Cr4Flags, hvcall::HypervCallError,
-        hvcall_vp::hvcall_set_vp_vtl0_registers,
+        MSR_SYSCALL_MASK, X86Cr0Flags, X86Cr4Flags, hvcall_vp::hvcall_set_vp_vtl0_registers,
     },
 };
+use litebox_common_lvbs::HypervCallError;
 use num_enum::TryFromPrimitive;
 
 /// A list of MSR indexes that VSM prevents VTL0 from writing to.

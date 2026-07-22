@@ -4,7 +4,7 @@
 //! Per-CPU VTL1 kernel variables
 
 use crate::{
-    arch::{MAX_CORES, gdt, instrs::rdmsr},
+    arch::{gdt, instrs::rdmsr},
     mshv::{
         HV_REGISTER_VP_INDEX, HvMessage, HvMessagePage, HvVpAssistPage, vsm::ControlRegMap,
         vtl_switch::VtlState, vtl1_mem_layout::PAGE_SIZE,
@@ -16,6 +16,7 @@ use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::{rdgsbase, wrgsbase};
+use litebox_common_lvbs::MAX_CORES;
 use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;

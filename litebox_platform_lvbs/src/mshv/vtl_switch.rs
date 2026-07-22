@@ -9,12 +9,12 @@ use crate::host::{
 };
 use crate::mshv::{
     HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
-    NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
-    VTL_ENTRY_REASON_RESERVED, error::VsmError, hvcall_vp::hvcall_get_vp_registers,
-    vsm_intercept::vsm_handle_intercept,
+    VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
+    hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
+use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError};
 use num_enum::TryFromPrimitive;
 
 /// Bitmask of VPs currently executing VTL1 code.
