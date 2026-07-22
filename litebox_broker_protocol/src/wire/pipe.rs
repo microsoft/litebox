@@ -6,6 +6,7 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
+use crate::shared_memory::{SharedBufferDescriptor, SharedBufferSlotIndex};
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
@@ -28,12 +29,12 @@ pub(super) fn encode_pipe_request(encoder: &mut Encoder, request: PipeRequest) {
         PipeRequest::Read(request) => {
             encoder.u8(PIPE_REQUEST_TAG_READ);
             encoder.handle(request.handle);
-            encoder.u32(request.length);
+            encode_shared_buffer_descriptor(encoder, request.buffer);
         }
         PipeRequest::Write(request) => {
             encoder.u8(PIPE_REQUEST_TAG_WRITE);
             encoder.handle(request.handle);
-            encoder.u32(request.length);
+            encode_shared_buffer_descriptor(encoder, request.buffer);
         }
     }
 }
@@ -46,14 +47,30 @@ pub(super) fn decode_pipe_request(decoder: &mut Decoder<'_>) -> Result<PipeReque
         })),
         PIPE_REQUEST_TAG_READ => Ok(PipeRequest::Read(ReadPipeRequest {
             handle: decoder.handle()?,
-            length: decoder.u32()?,
+            buffer: decode_shared_buffer_descriptor(decoder)?,
         })),
         PIPE_REQUEST_TAG_WRITE => Ok(PipeRequest::Write(WritePipeRequest {
             handle: decoder.handle()?,
-            length: decoder.u32()?,
+            buffer: decode_shared_buffer_descriptor(decoder)?,
         })),
         _ => Err(WireError::InvalidTag),
     }
+}
+
+fn encode_shared_buffer_descriptor(encoder: &mut Encoder, descriptor: SharedBufferDescriptor) {
+    encoder.u32(descriptor.slot_index.0);
+    encoder.u64(descriptor.generation);
+    encoder.u32(descriptor.length);
+}
+
+fn decode_shared_buffer_descriptor(
+    decoder: &mut Decoder<'_>,
+) -> Result<SharedBufferDescriptor, WireError> {
+    Ok(SharedBufferDescriptor {
+        slot_index: SharedBufferSlotIndex(decoder.u32()?),
+        generation: decoder.u64()?,
+        length: decoder.u32()?,
+    })
 }
 
 pub(super) fn encode_pipe_response(encoder: &mut Encoder, response: PipeResponse) {

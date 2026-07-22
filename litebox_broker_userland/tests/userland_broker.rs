@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE;
+use litebox_broker_protocol::shared_memory::{
+    SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
+};
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
 };
@@ -108,16 +110,30 @@ fn run_fake_runner(args: &[OsString]) {
 
     let pipe = local.create_pipe(64, 16).unwrap();
     let data = b"shared pipe data";
-    assert_eq!(
-        local.write_pipe(pipe.write_handle, data).unwrap(),
-        data.len()
-    );
+    let write_buffer = SharedBufferDescriptor {
+        slot_index: SharedBufferSlotIndex(0),
+        generation: 1,
+        length: data.len().try_into().unwrap(),
+    };
     assert_eq!(
         local
-            .read_pipe(pipe.read_handle, data.len().try_into().unwrap())
+            .write_pipe(pipe.write_handle, write_buffer, data)
             .unwrap(),
-        data
+        data.len()
     );
+    let mut received = [0; 16];
+    let read = local
+        .read_pipe(
+            pipe.read_handle,
+            SharedBufferDescriptor {
+                slot_index: SharedBufferSlotIndex(1),
+                generation: 1,
+                length: received.len().try_into().unwrap(),
+            },
+            &mut received,
+        )
+        .unwrap();
+    assert_eq!(&received[..read], data);
     drop(local);
 }
 

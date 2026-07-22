@@ -10,8 +10,9 @@ use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
-use litebox_broker_protocol::pipe::CreatePipeResponse;
+use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::event::{Events, polling::Pollee};
@@ -19,7 +20,9 @@ use crate::platform::TimeProvider;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 pub(crate) mod error;
+mod shared_buffers;
 use error::BrokerControlError;
+use shared_buffers::{SharedBufferLease, SharedBufferLeaseAllocator};
 
 /// Local-core access to the negotiated broker control channel.
 ///
@@ -147,6 +150,7 @@ pub(crate) struct BrokerLocalControl<
 > {
     local: Mutex<Platform, Option<Arc<BrokerLocal<Channel>>>>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
+    shared_buffer_leases: SharedBufferLeaseAllocator<Platform>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
@@ -161,6 +165,7 @@ where
         Self {
             local: Mutex::new(Some(Arc::new(local))),
             pollable_registry,
+            shared_buffer_leases: SharedBufferLeaseAllocator::new(),
         }
     }
 
@@ -176,12 +181,27 @@ where
             Arc::clone(connection)
         };
         let result = request(&connection).map_err(BrokerControlError::from);
-        if matches!(result.as_ref(), Err(BrokerControlError::AssociationFailed))
-            && self.local.lock().take().is_some()
-        {
-            self.pollable_registry.notify_all(Events::ERR);
+        if matches!(result.as_ref(), Err(BrokerControlError::AssociationFailed)) {
+            self.fail_association();
         }
         result
+    }
+
+    fn acquire_shared_buffer(
+        &self,
+        length: u32,
+    ) -> core::result::Result<SharedBufferLease<'_, Platform>, BrokerControlError> {
+        self.shared_buffer_leases.acquire(length).map_err(|_| {
+            self.fail_association();
+            BrokerControlError::AssociationFailed
+        })
+    }
+
+    fn fail_association(&self) {
+        self.shared_buffer_leases.fail();
+        if self.local.lock().take().is_some() {
+            self.pollable_registry.notify_all(Events::ERR);
+        }
     }
 }
 
@@ -233,7 +253,17 @@ where
         handle: ObjectHandle,
         length: u32,
     ) -> core::result::Result<Vec<u8>, BrokerControlError> {
-        self.request(|local| local.read_pipe(handle, length))
+        if length > MAX_PIPE_TRANSFER_SIZE {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(length as usize)
+            .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
+        data.resize(length as usize, 0);
+        let lease = self.acquire_shared_buffer(length)?;
+        let read = self.request(|local| local.read_pipe(handle, lease.descriptor(), &mut data))?;
+        data.truncate(read);
+        Ok(data)
     }
 
     fn write_pipe(
@@ -241,7 +271,13 @@ where
         handle: ObjectHandle,
         data: &[u8],
     ) -> core::result::Result<usize, BrokerControlError> {
-        self.request(|local| local.write_pipe(handle, data))
+        if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length = u32::try_from(data.len())
+            .expect("validated shared pipe transfer length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.write_pipe(handle, lease.descriptor(), data))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {
@@ -249,10 +285,7 @@ where
     }
 
     fn fail_connection(&self) {
-        let connection = self.local.lock().take();
-        if connection.is_some() {
-            self.pollable_registry.notify_all(Events::ERR);
-        }
+        self.fail_association();
     }
 }
 
@@ -263,4 +296,274 @@ pub(crate) fn readiness_events(readiness: ReadinessFlags) -> Events {
     events.set(Events::HUP, readiness.0 & ReadinessFlags::HANGUP.0 != 0);
     events.set(Events::ERR, readiness.0 & ReadinessFlags::ERROR.0 != 0);
     events
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use core::convert::Infallible;
+    use std::sync::{Arc as StdArc, Condvar as StdCondvar, Mutex as StdMutex, mpsc};
+    use std::time::Duration;
+
+    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
+    use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::message::{
+        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
+        BrokerResponse, BrokerResult, PipeRequest, PipeResponse,
+    };
+    use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
+    use litebox_broker_protocol::shared_memory::{
+        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor, SharedMemory,
+        SharedMemoryError,
+    };
+
+    use crate::platform::mock::MockPlatform;
+
+    #[test]
+    fn concurrent_pipe_writes_use_distinct_shared_buffer_leases() {
+        let memory = TestSharedMemory::new();
+        let (observed_sender, observed_receiver) = mpsc::sync_channel(2);
+        let release = StdArc::new((StdMutex::new(false), StdCondvar::new()));
+        let channel = ConcurrentPipeChannel {
+            memory: memory.clone(),
+            observed_sender,
+            release: StdArc::clone(&release),
+        };
+        let local =
+            BrokerLocal::negotiate(channel, |_| Ok(Arc::new(memory) as Arc<dyn SharedMemory>))
+                .unwrap();
+        let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
+            local,
+            Arc::new(BrokerPollableRegistry::new()),
+        ));
+        let first_control = Arc::clone(&control);
+        let first = std::thread::spawn(move || first_control.write_pipe(ObjectHandle(1), b"first"));
+        let second_control = Arc::clone(&control);
+        let second =
+            std::thread::spawn(move || second_control.write_pipe(ObjectHandle(2), b"second"));
+
+        let first_observed = observed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let second_observed = observed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(
+            first_observed.0.slot_index, second_observed.0.slot_index,
+            "simultaneous payload calls reused one slot"
+        );
+        let mut payloads = [first_observed.1, second_observed.1];
+        payloads.sort();
+        assert_eq!(payloads, [b"first".to_vec(), b"second".to_vec()]);
+
+        let (released, available) = &*release;
+        *released.lock().unwrap() = true;
+        available.notify_all();
+        assert_eq!(first.join().unwrap().unwrap(), 5);
+        assert_eq!(second.join().unwrap().unwrap(), 6);
+    }
+
+    #[test]
+    fn concurrent_pipe_reads_retain_distinct_shared_buffer_data() {
+        let memory = TestSharedMemory::new();
+        let (observed_sender, observed_receiver) = mpsc::sync_channel(2);
+        let release = StdArc::new((StdMutex::new(false), StdCondvar::new()));
+        let channel = ConcurrentPipeReadChannel {
+            memory: memory.clone(),
+            observed_sender,
+            release: StdArc::clone(&release),
+        };
+        let local =
+            BrokerLocal::negotiate(channel, |_| Ok(Arc::new(memory) as Arc<dyn SharedMemory>))
+                .unwrap();
+        let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
+            local,
+            Arc::new(BrokerPollableRegistry::new()),
+        ));
+        let first_control = Arc::clone(&control);
+        let first = std::thread::spawn(move || first_control.read_pipe(ObjectHandle(1), 3));
+        let second_control = Arc::clone(&control);
+        let second = std::thread::spawn(move || second_control.read_pipe(ObjectHandle(2), 3));
+
+        let first_buffer = observed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let second_buffer = observed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(
+            first_buffer.slot_index, second_buffer.slot_index,
+            "simultaneous payload calls reused one slot"
+        );
+
+        let (released, available) = &*release;
+        *released.lock().unwrap() = true;
+        available.notify_all();
+        assert_eq!(first.join().unwrap().unwrap(), [1; 3]);
+        assert_eq!(second.join().unwrap().unwrap(), [2; 3]);
+    }
+
+    #[derive(Clone)]
+    struct TestSharedMemory(StdArc<StdMutex<std::vec::Vec<u8>>>);
+
+    impl TestSharedMemory {
+        fn new() -> Self {
+            Self(StdArc::new(StdMutex::new(std::vec![
+                0;
+                SHARED_BUFFER_POOL_SIZE
+            ])))
+        }
+    }
+
+    impl SharedMemory for TestSharedMemory {
+        fn len(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+
+        fn read(
+            &self,
+            offset: usize,
+            destination: &mut [u8],
+        ) -> core::result::Result<(), SharedMemoryError> {
+            let memory = self.0.lock().unwrap();
+            let end = offset
+                .checked_add(destination.len())
+                .ok_or(SharedMemoryError::InvalidRange)?;
+            destination.copy_from_slice(
+                memory
+                    .get(offset..end)
+                    .ok_or(SharedMemoryError::InvalidRange)?,
+            );
+            Ok(())
+        }
+
+        fn write(
+            &self,
+            offset: usize,
+            source: &[u8],
+        ) -> core::result::Result<(), SharedMemoryError> {
+            let mut memory = self.0.lock().unwrap();
+            let end = offset
+                .checked_add(source.len())
+                .ok_or(SharedMemoryError::InvalidRange)?;
+            memory
+                .get_mut(offset..end)
+                .ok_or(SharedMemoryError::InvalidRange)?
+                .copy_from_slice(source);
+            Ok(())
+        }
+    }
+
+    struct ConcurrentPipeChannel {
+        memory: TestSharedMemory,
+        observed_sender: mpsc::SyncSender<(SharedBufferDescriptor, std::vec::Vec<u8>)>,
+        release: StdArc<(StdMutex<bool>, StdCondvar)>,
+    }
+
+    struct ConcurrentPipeReadChannel {
+        memory: TestSharedMemory,
+        observed_sender: mpsc::SyncSender<SharedBufferDescriptor>,
+        release: StdArc<(StdMutex<bool>, StdCondvar)>,
+    }
+
+    impl LocalControlChannel for ConcurrentPipeChannel {
+        type Error = Infallible;
+
+        fn send_handshake_request(
+            &mut self,
+            request: &BrokerHandshakeRequest,
+        ) -> core::result::Result<(), Self::Error> {
+            assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
+            Ok(())
+        }
+
+        fn recv_handshake_response(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
+            Ok(Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            }))
+        }
+
+        fn call(
+            &self,
+            request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, Self::Error> {
+            let BrokerOperation::Pipe(PipeRequest::Write(write)) = request.operation else {
+                panic!("unexpected broker request");
+            };
+            let mut payload = std::vec![0; write.buffer.length as usize];
+            self.memory
+                .read(
+                    write.buffer.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
+                    &mut payload,
+                )
+                .unwrap();
+            self.observed_sender.send((write.buffer, payload)).unwrap();
+            let (released, available) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = available.wait(released).unwrap();
+            }
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result: BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
+                    written: write.buffer.length,
+                })),
+            })
+        }
+    }
+
+    impl LocalControlChannel for ConcurrentPipeReadChannel {
+        type Error = Infallible;
+
+        fn send_handshake_request(
+            &mut self,
+            request: &BrokerHandshakeRequest,
+        ) -> core::result::Result<(), Self::Error> {
+            assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
+            Ok(())
+        }
+
+        fn recv_handshake_response(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
+            Ok(Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            }))
+        }
+
+        fn call(
+            &self,
+            request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, Self::Error> {
+            let BrokerOperation::Pipe(PipeRequest::Read(read)) = request.operation else {
+                panic!("unexpected broker request");
+            };
+            let payload = std::vec![
+                u8::try_from(read.handle.0).unwrap();
+                read.buffer.length as usize
+            ];
+            self.memory
+                .write(
+                    read.buffer.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
+                    &payload,
+                )
+                .unwrap();
+            self.observed_sender.send(read.buffer).unwrap();
+            let (released, available) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = available.wait(released).unwrap();
+            }
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result: BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
+                    read: read.buffer.length,
+                })),
+            })
+        }
+    }
 }

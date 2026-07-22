@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::vec::Vec;
-
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, PipeRequest, PipeResponse};
@@ -10,11 +8,9 @@ use litebox_broker_protocol::pipe::{
     CreatePipeRequest, CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeRequest,
     WritePipeRequest,
 };
-use litebox_broker_protocol::shared_memory::SharedBufferSlotIndex;
+use litebox_broker_protocol::shared_memory::SharedBufferDescriptor;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
-
-const SERIALIZED_PIPE_SLOT: SharedBufferSlotIndex = SharedBufferSlotIndex(0);
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned byte pipe.
@@ -22,7 +18,8 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
-    /// response that does not match the issued pipe request.
+    /// response that does not match the issued pipe request, or if `buffer` is
+    /// not a valid lease whose length matches `destination`.
     pub fn create_pipe(
         &self,
         capacity: u64,
@@ -38,81 +35,83 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         Ok(response)
     }
 
-    /// Reads bytes from a broker-owned pipe.
+    /// Reads bytes from a broker-owned pipe into an operation-scoped shared
+    /// buffer lease.
+    ///
+    /// The caller must retain exclusive ownership of the descriptor's slot
+    /// until this method returns.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
-    /// response that does not match the issued pipe request.
-    pub fn read_pipe(&self, handle: ObjectHandle, length: u32) -> Result<Vec<u8>, Channel::Error> {
-        self.channel
-            .with_serialized_payload(|| self.read_pipe_serialized(handle, length))
-            .map_err(BrokerLocalError::Channel)?
-    }
-
-    fn read_pipe_serialized(
+    /// response that does not match the issued pipe request, or if `buffer` is
+    /// not a valid lease whose length matches `data`.
+    pub fn read_pipe(
         &self,
         handle: ObjectHandle,
-        length: u32,
-    ) -> Result<Vec<u8>, Channel::Error> {
-        if length > MAX_PIPE_TRANSFER_SIZE {
+        buffer: SharedBufferDescriptor,
+        destination: &mut [u8],
+    ) -> Result<usize, Channel::Error> {
+        if buffer.length > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        let mut data = Vec::new();
-        data.try_reserve_exact(length as usize).map_err(|_| {
-            BrokerLocalError::Broker(litebox_broker_protocol::error::ErrorCode::OutOfMemory)
-        })?;
-        data.resize(length as usize, 0);
-        let response = self.request_pipe(PipeRequest::Read(ReadPipeRequest { handle, length }))?;
+        assert_eq!(
+            destination.len(),
+            buffer.length as usize,
+            "shared pipe read destination must match its descriptor"
+        );
+        self.shared_buffers
+            .layout()
+            .range(buffer.slot_index, destination.len())
+            .expect("shared pipe read descriptor must identify a valid slot range");
+        let response = self.request_pipe(PipeRequest::Read(ReadPipeRequest { handle, buffer }))?;
         let PipeResponse::Read(response) = response else {
             panic!("broker returned unexpected pipe read response: {response:?}");
         };
         assert!(
-            response.read <= length,
+            response.read <= buffer.length,
             "broker returned oversized pipe read"
         );
         let read = response.read as usize;
-        data.truncate(read);
         self.shared_buffers
-            .read(SERIALIZED_PIPE_SLOT, &mut data)
+            .read(buffer.slot_index, &mut destination[..read])
             .expect("validated shared pipe read range must be accessible");
-        Ok(data)
+        Ok(read)
     }
 
-    /// Writes bytes to a broker-owned pipe.
+    /// Writes bytes to a broker-owned pipe from an operation-scoped shared
+    /// buffer lease.
+    ///
+    /// The caller must retain exclusive ownership of the descriptor's slot
+    /// until this method returns.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
     /// response that does not match the issued pipe request.
-    pub fn write_pipe(&self, handle: ObjectHandle, data: &[u8]) -> Result<usize, Channel::Error> {
-        self.channel
-            .with_serialized_payload(|| self.write_pipe_serialized(handle, data))
-            .map_err(BrokerLocalError::Channel)?
-    }
-
-    fn write_pipe_serialized(
+    pub fn write_pipe(
         &self,
         handle: ObjectHandle,
+        buffer: SharedBufferDescriptor,
         data: &[u8],
     ) -> Result<usize, Channel::Error> {
-        if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
+        if buffer.length > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
+        assert_eq!(
+            data.len(),
+            buffer.length as usize,
+            "shared pipe write data must match its descriptor"
+        );
         self.shared_buffers
-            .write(SERIALIZED_PIPE_SLOT, data)
+            .write(buffer.slot_index, data)
             .expect("validated shared pipe write range must be accessible");
-        let response = self.request_pipe(PipeRequest::Write(WritePipeRequest {
-            handle,
-            length: data
-                .len()
-                .try_into()
-                .expect("shared pipe transfer length must fit in u32"),
-        }))?;
+        let response =
+            self.request_pipe(PipeRequest::Write(WritePipeRequest { handle, buffer }))?;
         let PipeResponse::Write(response) = response else {
             panic!("broker returned unexpected pipe write response: {response:?}");
         };
@@ -141,6 +140,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
 mod tests {
     use super::*;
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
     use core::{cell::RefCell, convert::Infallible};
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -153,11 +153,12 @@ mod tests {
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
     use litebox_broker_protocol::shared_memory::{
-        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedMemory, SharedMemoryError,
+        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex, SharedMemory,
+        SharedMemoryError,
     };
 
     #[test]
-    fn pipe_uses_slot_zero_for_serialized_data_operations() {
+    fn pipe_uses_the_descriptor_slot_for_data_operations() {
         let read_handle = ObjectHandle(1);
         let write_handle = ObjectHandle(2);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
@@ -170,23 +171,31 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
         ]);
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory.clone())).unwrap();
-        memory
-            .write(SHARED_BUFFER_SLOT_SIZE as usize, &[9])
-            .unwrap();
+        let write_buffer = descriptor(2, 1, 3);
+        let read_buffer = descriptor(4, 1, 3);
 
         local.create_pipe(64, 16).unwrap();
-        assert_eq!(local.write_pipe(write_handle, &[1, 2, 3]).unwrap(), 2);
+        assert_eq!(
+            local
+                .write_pipe(write_handle, write_buffer, &[1, 2, 3])
+                .unwrap(),
+            2
+        );
         let mut staged = [0; 3];
-        memory.read(0, &mut staged).unwrap();
+        memory
+            .read(2 * SHARED_BUFFER_SLOT_SIZE as usize, &mut staged)
+            .unwrap();
         assert_eq!(staged, [1, 2, 3]);
 
-        memory.write(0, &[4, 5, 6]).unwrap();
-        assert_eq!(local.read_pipe(read_handle, 3).unwrap(), [4, 5]);
-        let mut second_slot = [0];
         memory
-            .read(SHARED_BUFFER_SLOT_SIZE as usize, &mut second_slot)
+            .write(4 * SHARED_BUFFER_SLOT_SIZE as usize, &[4, 5, 6])
             .unwrap();
-        assert_eq!(second_slot, [9]);
+        let mut read_data = [0; 3];
+        let read = local
+            .read_pipe(read_handle, read_buffer, &mut read_data)
+            .unwrap();
+        assert_eq!(read, 2);
+        assert_eq!(&read_data[..read], &[4, 5]);
         assert_eq!(
             local.channel.sent_operations.borrow().as_slice(),
             &[
@@ -196,11 +205,11 @@ mod tests {
                 })),
                 BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                     handle: write_handle,
-                    length: 3,
+                    buffer: write_buffer,
                 })),
                 BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                     handle: read_handle,
-                    length: 3,
+                    buffer: read_buffer,
                 })),
             ]
         );
@@ -211,16 +220,16 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([]);
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
-        let oversized_length = MAX_PIPE_TRANSFER_SIZE as usize + 1;
+        let oversized = descriptor(0, 1, MAX_PIPE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
-            local.read_pipe(ObjectHandle(1), u32::try_from(oversized_length).unwrap()),
+            local.read_pipe(ObjectHandle(1), oversized, &mut []),
             Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted
             ))
         ));
         assert!(matches!(
-            local.write_pipe(ObjectHandle(2), &std::vec![0; oversized_length]),
+            local.write_pipe(ObjectHandle(2), oversized, &[]),
             Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted
             ))
@@ -237,8 +246,9 @@ mod tests {
             }))]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
+        let mut destination = [0];
 
-        let _ = local.read_pipe(ObjectHandle(1), 1);
+        let _ = local.read_pipe(ObjectHandle(1), descriptor(0, 1, 1), &mut destination);
     }
 
     #[test]
@@ -251,7 +261,15 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
 
-        let _ = local.write_pipe(ObjectHandle(1), &[0]);
+        let _ = local.write_pipe(ObjectHandle(1), descriptor(0, 1, 1), &[0]);
+    }
+
+    const fn descriptor(slot: u32, generation: u64, length: u32) -> SharedBufferDescriptor {
+        SharedBufferDescriptor {
+            slot_index: SharedBufferSlotIndex(slot),
+            generation,
+            length,
+        }
     }
 
     #[derive(Clone)]
@@ -346,13 +364,6 @@ mod tests {
                     .pop_front()
                     .expect("response requires a scripted result"),
             })
-        }
-
-        fn with_serialized_payload<T>(
-            &self,
-            transfer: impl FnOnce() -> T,
-        ) -> core::result::Result<T, Self::Error> {
-            Ok(transfer())
         }
     }
 }

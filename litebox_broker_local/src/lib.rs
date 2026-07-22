@@ -39,8 +39,8 @@ pub use error::{BrokerLocalError, Result};
 
 /// Typed broker-local control adapter for broker operations.
 ///
-/// The shared-buffer pool belongs to the broker association. Pipe transfers
-/// currently reuse slot zero under the channel's serialization scope.
+/// The shared-buffer pool belongs to the broker association. Payload request
+/// descriptors identify operation-scoped slots managed by the caller.
 pub struct BrokerLocal<Channel: LocalControlChannel> {
     channel: Channel,
     shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
@@ -633,13 +633,6 @@ mod tests {
                 result,
             })
         }
-
-        fn with_serialized_payload<T>(
-            &self,
-            transfer: impl FnOnce() -> T,
-        ) -> core::result::Result<T, Self::Error> {
-            Ok(transfer())
-        }
     }
 
     struct FakeNotificationChannel {
@@ -677,13 +670,6 @@ mod tests {
                 request_id: request.request_id,
                 result: BrokerResult::ObjectClosed,
             })
-        }
-
-        fn with_serialized_payload<T>(
-            &self,
-            transfer: impl FnOnce() -> T,
-        ) -> core::result::Result<T, Self::Error> {
-            Ok(transfer())
         }
     }
 

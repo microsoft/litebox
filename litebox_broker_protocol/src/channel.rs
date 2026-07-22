@@ -61,12 +61,6 @@ pub trait LocalControlChannel {
     /// association is considered failed: every concurrent or future call must
     /// return an error rather than remain blocked.
     fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error>;
-
-    /// Serializes one complete shared-memory payload transfer.
-    ///
-    /// The closure must run exactly once while no other payload transfer using
-    /// the same association shared memory is active.
-    fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> Result<T, Self::Error>;
 }
 
 /// Host-side control channel for broker authority calls.

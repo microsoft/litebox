@@ -169,6 +169,20 @@ impl SharedBufferLayout {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SharedBufferSlotIndex(pub u32);
 
+/// Identifies one operation-scoped region in the association shared-buffer pool.
+///
+/// The slot offset is derived from the trusted association layout and is never
+/// supplied by the peer. The request variant determines the transfer direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedBufferDescriptor {
+    /// Slot used by this operation.
+    pub slot_index: SharedBufferSlotIndex,
+    /// Non-wrapping reuse generation for the slot.
+    pub generation: u64,
+    /// Number of bytes used from the start of the slot.
+    pub length: u32,
+}
+
 /// A shared-memory resource viewed as a checked fixed-slot buffer pool.
 ///
 /// Slot ownership and reuse remain responsibilities of the protocol using the

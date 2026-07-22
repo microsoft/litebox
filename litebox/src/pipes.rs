@@ -1199,13 +1199,6 @@ mod tests {
                 result,
             })
         }
-
-        fn with_serialized_payload<T>(
-            &self,
-            transfer: impl FnOnce() -> T,
-        ) -> core::result::Result<T, Self::Error> {
-            Ok(transfer())
-        }
     }
 
     #[test]

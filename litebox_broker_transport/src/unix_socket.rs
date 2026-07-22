@@ -99,7 +99,6 @@ struct UnixStreamLocalActive {
     request_stream: Mutex<UnixStream>,
     shutdown_stream: UnixStream,
     pending_calls: Arc<PendingCalls>,
-    payload_transfer: Mutex<()>,
     association_failure: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -193,7 +192,6 @@ impl UnixStreamLocalControlChannel {
             request_stream: Mutex::new(request_stream),
             shutdown_stream,
             pending_calls: Arc::clone(&pending_calls),
-            payload_transfer: Mutex::new(()),
             association_failure: Arc::clone(&association_failure),
         });
         Ok(UnixStreamLocalControlCancellation {
@@ -386,17 +384,6 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
         }
 
         pending_call.wait()
-    }
-
-    fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> IoResult<T> {
-        let UnixStreamLocalControlState::Active(active) = &self.state else {
-            return Err(invalid_data("broker control channel is not active"));
-        };
-        let _transfer = active
-            .payload_transfer
-            .lock()
-            .expect("broker payload-transfer mutex poisoned");
-        Ok(transfer())
     }
 }
 
@@ -998,52 +985,6 @@ mod tests {
 
         assert_eq!(first.join().unwrap().unwrap().request_id, RequestId(3));
         assert_eq!(second.join().unwrap().unwrap().request_id, RequestId(7));
-    }
-
-    #[test]
-    fn active_channel_serializes_shared_payload_transfers() {
-        let (local_stream, _host_stream) = UnixStream::pair().unwrap();
-        let (channel, _cancellation) = activate_test_channel(local_stream, || {});
-        let channel = Arc::new(channel);
-        let (first_entered_sender, first_entered_receiver) = mpsc::sync_channel(1);
-        let (release_first_sender, release_first_receiver) = mpsc::sync_channel(1);
-        let first_channel = Arc::clone(&channel);
-        let first = thread::spawn(move || {
-            first_channel
-                .with_serialized_payload(|| {
-                    first_entered_sender.send(()).unwrap();
-                    release_first_receiver.recv().unwrap();
-                })
-                .unwrap();
-        });
-        first_entered_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-
-        let (second_started_sender, second_started_receiver) = mpsc::sync_channel(1);
-        let (second_entered_sender, second_entered_receiver) = mpsc::sync_channel(1);
-        let second = thread::spawn(move || {
-            second_started_sender.send(()).unwrap();
-            channel
-                .with_serialized_payload(|| second_entered_sender.send(()).unwrap())
-                .unwrap();
-        });
-        second_started_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        let entered_before_release = second_entered_receiver
-            .recv_timeout(Duration::from_millis(100))
-            .is_ok();
-
-        release_first_sender.send(()).unwrap();
-        if !entered_before_release {
-            second_entered_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap();
-        }
-        first.join().unwrap();
-        second.join().unwrap();
-        assert!(!entered_before_release);
     }
 
     #[test]

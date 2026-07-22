@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::ObjectHandle;
+use crate::shared_memory::SharedBufferDescriptor;
 
 /// Maximum pipe transfer described by one control-path request or response.
 ///
@@ -32,8 +33,8 @@ pub struct CreatePipeResponse {
 pub struct ReadPipeRequest {
     /// Read endpoint handle.
     pub handle: ObjectHandle,
-    /// Maximum number of bytes to return.
-    pub length: u32,
+    /// Leased shared-buffer region to receive the bytes.
+    pub buffer: SharedBufferDescriptor,
 }
 
 /// Response describing bytes read into shared memory.
@@ -48,8 +49,8 @@ pub struct ReadPipeResponse {
 pub struct WritePipeRequest {
     /// Write endpoint handle.
     pub handle: ObjectHandle,
-    /// Number of staged bytes to write.
-    pub length: u32,
+    /// Leased shared-buffer region containing the staged bytes.
+    pub buffer: SharedBufferDescriptor,
 }
 
 /// Response describing a completed pipe write.

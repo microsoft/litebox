@@ -1,0 +1,379 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use core::sync::atomic::Ordering::{Acquire, Release};
+
+use litebox_broker_protocol::shared_memory::{
+    SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
+};
+
+use crate::platform::RawMutex as _;
+use crate::sync::{Mutex, RawSyncPrimitivesProvider};
+
+const SLOT_COUNT: usize = SHARED_BUFFER_SLOT_COUNT as usize;
+const ALLOCATED_SLOT_MASK: u64 = (1 << SHARED_BUFFER_SLOT_COUNT) - 1;
+
+pub(super) struct SharedBufferLeaseAllocator<Platform: RawSyncPrimitivesProvider> {
+    state: Mutex<Platform, LeaseState<Platform>>,
+}
+
+struct LeaseState<Platform: RawSyncPrimitivesProvider> {
+    allocated_slots: u64,
+    generations: [u64; SLOT_COUNT],
+    next_slot: u32,
+    failed: bool,
+    waiters: VecDeque<Arc<LeaseWaiter<Platform>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AcquireError;
+
+pub(super) struct SharedBufferLease<'a, Platform: RawSyncPrimitivesProvider> {
+    allocator: &'a SharedBufferLeaseAllocator<Platform>,
+    descriptor: SharedBufferDescriptor,
+}
+
+struct LeaseWaiter<Platform: RawSyncPrimitivesProvider> {
+    length: u32,
+    result: Mutex<Platform, Option<Result<SharedBufferDescriptor, AcquireError>>>,
+    result_ready: Platform::RawMutex,
+}
+
+impl<Platform: RawSyncPrimitivesProvider> SharedBufferLeaseAllocator<Platform> {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(LeaseState {
+                allocated_slots: 0,
+                generations: [0; SLOT_COUNT],
+                next_slot: 0,
+                failed: false,
+                waiters: VecDeque::new(),
+            }),
+        }
+    }
+
+    pub(super) fn acquire(
+        &self,
+        length: u32,
+    ) -> Result<SharedBufferLease<'_, Platform>, AcquireError> {
+        {
+            let mut state = self.state.lock();
+            if state.waiters.is_empty()
+                && let Some(descriptor) = allocate_descriptor(&mut state, length)?
+            {
+                return Ok(SharedBufferLease {
+                    allocator: self,
+                    descriptor,
+                });
+            }
+            if state.failed {
+                return Err(AcquireError);
+            }
+        }
+
+        let waiter = Arc::new(LeaseWaiter::new(length));
+        {
+            let mut state = self.state.lock();
+            if state.waiters.is_empty()
+                && let Some(descriptor) = allocate_descriptor(&mut state, length)?
+            {
+                return Ok(SharedBufferLease {
+                    allocator: self,
+                    descriptor,
+                });
+            }
+            if state.failed {
+                return Err(AcquireError);
+            }
+            state.waiters.push_back(Arc::clone(&waiter));
+        }
+
+        let descriptor = waiter.wait()?;
+        Ok(SharedBufferLease {
+            allocator: self,
+            descriptor,
+        })
+    }
+
+    pub(super) fn fail(&self) -> bool {
+        let waiters = {
+            let mut state = self.state.lock();
+            if state.failed {
+                return false;
+            }
+            state.failed = true;
+            core::mem::take(&mut state.waiters)
+        };
+        for waiter in waiters {
+            waiter.resolve(Err(AcquireError));
+        }
+        true
+    }
+
+    fn release(&self, slot_index: SharedBufferSlotIndex) {
+        let mut waiter_result = None;
+        let mut failed_waiters = VecDeque::new();
+        {
+            let mut state = self.state.lock();
+            let slot_mask = 1 << slot_index.0;
+            assert_ne!(
+                state.allocated_slots & slot_mask,
+                0,
+                "shared-buffer slot released without an active lease"
+            );
+            state.allocated_slots &= !slot_mask;
+            if !state.failed
+                && let Some(waiter) = state.waiters.pop_front()
+            {
+                match allocate_descriptor(&mut state, waiter.length) {
+                    Ok(Some(descriptor)) => waiter_result = Some((waiter, descriptor)),
+                    Ok(None) => unreachable!("released slot was not available"),
+                    Err(AcquireError) => {
+                        failed_waiters.push_back(waiter);
+                        failed_waiters.append(&mut state.waiters);
+                    }
+                }
+            }
+        }
+        if let Some((waiter, descriptor)) = waiter_result {
+            waiter.resolve(Ok(descriptor));
+        }
+        for waiter in failed_waiters {
+            waiter.resolve(Err(AcquireError));
+        }
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.state.lock().waiters.len()
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> LeaseWaiter<Platform> {
+    fn new(length: u32) -> Self {
+        Self {
+            length,
+            result: Mutex::new(None),
+            result_ready: Platform::RawMutex::INIT,
+        }
+    }
+
+    fn resolve(&self, result: Result<SharedBufferDescriptor, AcquireError>) {
+        let mut stored = self.result.lock();
+        assert!(stored.is_none(), "shared-buffer waiter already resolved");
+        *stored = Some(result);
+        drop(stored);
+        self.result_ready.underlying_atomic().fetch_add(1, Release);
+        self.result_ready.wake_one();
+    }
+
+    fn wait(&self) -> Result<SharedBufferDescriptor, AcquireError> {
+        loop {
+            let mut result = self.result.lock();
+            if let Some(result) = result.take() {
+                return result;
+            }
+            let observed = self.result_ready.underlying_atomic().load(Acquire);
+            drop(result);
+            let _ = self.result_ready.block(observed);
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> SharedBufferLease<'_, Platform> {
+    pub(super) const fn descriptor(&self) -> SharedBufferDescriptor {
+        self.descriptor
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Drop for SharedBufferLease<'_, Platform> {
+    fn drop(&mut self) {
+        self.allocator.release(self.descriptor.slot_index);
+    }
+}
+
+fn allocate_descriptor<Platform: RawSyncPrimitivesProvider>(
+    state: &mut LeaseState<Platform>,
+    length: u32,
+) -> Result<Option<SharedBufferDescriptor>, AcquireError> {
+    if state.failed {
+        return Err(AcquireError);
+    }
+    let Some(slot_index) = next_free_slot(state) else {
+        return Ok(None);
+    };
+    let slot = slot_index as usize;
+    let Some(generation) = state.generations[slot].checked_add(1) else {
+        state.failed = true;
+        return Err(AcquireError);
+    };
+    state.allocated_slots |= 1 << slot_index;
+    state.generations[slot] = generation;
+    state.next_slot = (slot_index + 1) % SHARED_BUFFER_SLOT_COUNT;
+    Ok(Some(SharedBufferDescriptor {
+        slot_index: SharedBufferSlotIndex(slot_index),
+        generation,
+        length,
+    }))
+}
+
+fn next_free_slot<Platform: RawSyncPrimitivesProvider>(
+    state: &LeaseState<Platform>,
+) -> Option<u32> {
+    if state.allocated_slots & ALLOCATED_SLOT_MASK == ALLOCATED_SLOT_MASK {
+        return None;
+    }
+    (0..SHARED_BUFFER_SLOT_COUNT)
+        .map(|offset| (state.next_slot + offset) % SHARED_BUFFER_SLOT_COUNT)
+        .find(|slot| state.allocated_slots & (1 << slot) == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use crate::platform::mock::MockPlatform;
+
+    #[test]
+    fn leases_use_distinct_slots_and_increment_generations() {
+        let allocator = SharedBufferLeaseAllocator::<MockPlatform>::new();
+        let mut leases = (0..SHARED_BUFFER_SLOT_COUNT)
+            .map(|_| allocator.acquire(7).unwrap())
+            .collect::<Vec<_>>();
+
+        for (index, lease) in leases.iter().enumerate() {
+            assert_eq!(lease.descriptor().slot_index.0 as usize, index);
+            assert_eq!(lease.descriptor().generation, 1);
+            assert_eq!(lease.descriptor().length, 7);
+        }
+
+        drop(leases.remove(0));
+        let reused = allocator.acquire(9).unwrap();
+        assert_eq!(reused.descriptor().slot_index, SharedBufferSlotIndex(0));
+        assert_eq!(reused.descriptor().generation, 2);
+    }
+
+    #[test]
+    fn exhausted_allocator_wakes_one_waiter_on_release() {
+        let allocator = Arc::new(SharedBufferLeaseAllocator::<MockPlatform>::new());
+        let mut leases = (0..SHARED_BUFFER_SLOT_COUNT)
+            .map(|_| allocator.acquire(1).unwrap())
+            .collect::<Vec<_>>();
+        let waiter_allocator = Arc::clone(&allocator);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let lease = waiter_allocator.acquire(1).unwrap();
+            sender.send(lease.descriptor()).unwrap();
+        });
+        while allocator.waiter_count() == 0 {
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(leases.remove(0));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SharedBufferDescriptor {
+                slot_index: SharedBufferSlotIndex(0),
+                generation: 2,
+                length: 1,
+            }
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn exhausted_allocator_serves_waiters_in_arrival_order() {
+        let allocator = Arc::new(SharedBufferLeaseAllocator::<MockPlatform>::new());
+        let mut leases = (0..SHARED_BUFFER_SLOT_COUNT)
+            .map(|_| allocator.acquire(1).unwrap())
+            .collect::<Vec<_>>();
+
+        let first_allocator = Arc::clone(&allocator);
+        let (first_acquired_sender, first_acquired_receiver) = mpsc::sync_channel(1);
+        let (release_first_sender, release_first_receiver) = mpsc::sync_channel(1);
+        let first = std::thread::spawn(move || {
+            let lease = first_allocator.acquire(1).unwrap();
+            first_acquired_sender.send(lease.descriptor()).unwrap();
+            release_first_receiver.recv().unwrap();
+        });
+        while allocator.waiter_count() != 1 {
+            std::thread::yield_now();
+        }
+
+        let second_allocator = Arc::clone(&allocator);
+        let (second_acquired_sender, second_acquired_receiver) = mpsc::sync_channel(1);
+        let second = std::thread::spawn(move || {
+            let lease = second_allocator.acquire(1).unwrap();
+            second_acquired_sender.send(lease.descriptor()).unwrap();
+        });
+        while allocator.waiter_count() != 2 {
+            std::thread::yield_now();
+        }
+
+        drop(leases.remove(0));
+        assert_eq!(
+            first_acquired_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .generation,
+            2
+        );
+        assert!(matches!(
+            second_acquired_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_first_sender.send(()).unwrap();
+        assert_eq!(
+            second_acquired_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .generation,
+            3
+        );
+        first.join().unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn association_failure_wakes_waiters_and_prevents_new_leases() {
+        let allocator = Arc::new(SharedBufferLeaseAllocator::<MockPlatform>::new());
+        let _leases = (0..SHARED_BUFFER_SLOT_COUNT)
+            .map(|_| allocator.acquire(1).unwrap())
+            .collect::<Vec<_>>();
+        let waiter_allocator = Arc::clone(&allocator);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            sender.send(waiter_allocator.acquire(1).is_err()).unwrap();
+        });
+        while allocator.waiter_count() == 0 {
+            std::thread::yield_now();
+        }
+
+        assert!(allocator.fail());
+        assert!(receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(allocator.acquire(1).is_err());
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn generation_exhaustion_fails_the_allocator() {
+        let allocator = SharedBufferLeaseAllocator::<MockPlatform>::new();
+        allocator.state.lock().generations[0] = u64::MAX;
+
+        assert!(allocator.acquire(1).is_err());
+        assert!(!allocator.fail());
+    }
+}

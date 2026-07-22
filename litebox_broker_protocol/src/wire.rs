@@ -322,6 +322,7 @@ mod tests {
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
     };
+    use crate::shared_memory::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
@@ -365,8 +366,22 @@ mod tests {
                 capacity: 4096,
                 atomic_write_size: 512,
             })),
-            BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest { handle, length: 32 })),
-            BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest { handle, length: 3 })),
+            BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(2),
+                    generation: 7,
+                    length: 32,
+                },
+            })),
+            BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(15),
+                    generation: u64::MAX,
+                    length: 3,
+                },
+            })),
         ];
 
         for operation in operations {
