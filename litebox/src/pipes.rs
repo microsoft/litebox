@@ -932,7 +932,8 @@ mod tests {
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-        BrokerResponse, PipeRequest, ReadinessNotification,
+        BrokerRequestEnvelope, BrokerResponse, BrokerResponseEnvelope, PipeRequest,
+        ReadinessNotification,
     };
     use litebox_broker_protocol::pipe::CreatePipeResponse;
     use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -1111,7 +1112,7 @@ mod tests {
 
     #[derive(Debug)]
     struct FailingPipeChannel {
-        last_request: Option<BrokerRequest>,
+        last_request: Option<BrokerRequestEnvelope>,
         request_count: Arc<AtomicUsize>,
         read_failure: ReadFailure,
         force_transport: Arc<AtomicBool>,
@@ -1171,40 +1172,45 @@ mod tests {
 
         fn send_request(
             &mut self,
-            request: &BrokerRequest,
+            request: &BrokerRequestEnvelope,
         ) -> core::result::Result<(), Self::Error> {
             self.last_request = Some(request.clone());
             self.request_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
-            match self.last_request.take().unwrap() {
-                BrokerRequest::Pipe(PipeRequest::Create(_)) => Ok(Some(BrokerResponse::Pipe(
+        fn recv_response(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerResponseEnvelope>, Self::Error> {
+            let request = self.last_request.take().unwrap();
+            let response = match request.request {
+                BrokerRequest::Pipe(PipeRequest::Create(_)) => BrokerResponse::Pipe(
                     litebox_broker_protocol::message::PipeResponse::Create(CreatePipeResponse {
                         read_handle: ObjectHandle(1),
                         write_handle: ObjectHandle(2),
                     }),
-                ))),
+                ),
                 BrokerRequest::Pipe(PipeRequest::Read(_))
                     if self.force_transport.load(Ordering::SeqCst) =>
                 {
-                    Err(())
+                    return Err(());
                 }
                 BrokerRequest::Pipe(PipeRequest::Read(_)) => match self.read_failure {
-                    ReadFailure::Transport => Err(()),
-                    ReadFailure::WouldBlock => {
-                        Ok(Some(BrokerResponse::Error(ErrorCode::WouldBlock)))
-                    }
+                    ReadFailure::Transport => return Err(()),
+                    ReadFailure::WouldBlock => BrokerResponse::Error(ErrorCode::WouldBlock),
                 },
-                BrokerRequest::CloseObject(_) => Ok(Some(BrokerResponse::ObjectClosed)),
+                BrokerRequest::CloseObject(_) => BrokerResponse::ObjectClosed,
                 BrokerRequest::CheckReadiness(_) => {
-                    Ok(Some(BrokerResponse::Readiness(ReadinessFlags::default())))
+                    BrokerResponse::Readiness(ReadinessFlags::default())
                 }
                 request @ (BrokerRequest::Pipe(_) | BrokerRequest::Event(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
-            }
+            };
+            Ok(Some(BrokerResponseEnvelope {
+                request_id: request.request_id,
+                response,
+            }))
         }
     }
 

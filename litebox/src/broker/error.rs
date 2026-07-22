@@ -69,7 +69,10 @@ impl From<ErrorCode> for BrokerObjectError {
 impl<E> From<BrokerLocalError<E>> for BrokerControlError {
     fn from(error: BrokerLocalError<E>) -> Self {
         match error {
-            BrokerLocalError::Channel(_) | BrokerLocalError::ChannelClosed => Self::Transport,
+            BrokerLocalError::Channel(_)
+            | BrokerLocalError::ChannelClosed
+            | BrokerLocalError::RequestIdExhausted
+            | BrokerLocalError::UnexpectedResponseId { .. } => Self::Transport,
             BrokerLocalError::Broker(error) => Self::Broker(error),
         }
     }

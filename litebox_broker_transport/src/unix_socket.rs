@@ -22,8 +22,8 @@ use litebox_broker_protocol::channel::{
     LocalNotificationChannel, PeerCredential,
 };
 use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-    BrokerResponse,
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequestEnvelope,
+    BrokerResponseEnvelope,
 };
 use litebox_broker_protocol::wire::{
     WireError, decode_handshake_request, decode_handshake_response, decode_notification,
@@ -219,12 +219,12 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
         }
     }
 
-    fn send_request(&mut self, request: &BrokerRequest) -> IoResult<()> {
+    fn send_request(&mut self, request: &BrokerRequestEnvelope) -> IoResult<()> {
         let frame = encode_request(request.clone());
         write_frame_with_deadline(&mut self.stream, &frame, None)
     }
 
-    fn recv_response(&mut self) -> IoResult<Option<BrokerResponse>> {
+    fn recv_response(&mut self) -> IoResult<Option<BrokerResponseEnvelope>> {
         match read_frame_with_deadline(&mut self.stream, None)? {
             Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
             None => Ok(None),
@@ -262,7 +262,7 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         Ok(())
     }
 
-    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequestEnvelope>> {
         let Some(frame) = read_frame_with_deadline(&mut self.stream, None)? else {
             return Ok(HostReceive::PeerClosed);
         };
@@ -273,7 +273,7 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         }
     }
 
-    fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
+    fn send_response(&mut self, response: &BrokerResponseEnvelope) -> IoResult<()> {
         write_frame_with_deadline(&mut self.stream, &encode_response(response.clone()), None)
     }
 }
@@ -390,6 +390,8 @@ fn wire_error(error: WireError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_broker_protocol::RequestId;
+    use litebox_broker_protocol::message::BrokerRequest;
     use std::time::Duration;
 
     #[test]
@@ -610,11 +612,14 @@ mod tests {
         let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
         write_frame_with_deadline(
             &mut peer_stream,
-            &encode_request(BrokerRequest::Event(
-                litebox_broker_protocol::message::EventRequest::Create(
-                    litebox_broker_protocol::event::CreateEventRequest { initial_count: 0 },
+            &encode_request(BrokerRequestEnvelope {
+                request_id: RequestId(0),
+                request: BrokerRequest::Event(
+                    litebox_broker_protocol::message::EventRequest::Create(
+                        litebox_broker_protocol::event::CreateEventRequest { initial_count: 0 },
+                    ),
                 ),
-            )),
+            }),
             None,
         )
         .unwrap();

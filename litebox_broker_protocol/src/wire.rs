@@ -21,7 +21,7 @@ use thiserror::Error;
 use crate::error::ErrorCode;
 use crate::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-    BrokerResponse, ReadinessNotification,
+    BrokerRequestEnvelope, BrokerResponse, BrokerResponseEnvelope, ReadinessNotification,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -39,11 +39,12 @@ const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
-const RESPONSE_TAG_ERROR: u8 = 2;
+const HANDSHAKE_RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
 const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
 const RESPONSE_TAG_PIPE: u8 = 5;
 const RESPONSE_TAG_READINESS: u8 = 6;
+const RESPONSE_TAG_ERROR: u8 = 7;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
@@ -98,23 +99,31 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
 ///
 /// Successful encodings are always non-empty because the first byte is the
 /// message tag.
-pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
+pub fn encode_request(envelope: BrokerRequestEnvelope) -> Vec<u8> {
     let mut encoder = Encoder::default();
+    let BrokerRequestEnvelope {
+        request_id,
+        request,
+    } = envelope;
     match request {
         BrokerRequest::CloseObject(handle) => {
             encoder.u8(REQUEST_TAG_CLOSE_OBJECT);
+            encoder.request_id(request_id);
             encoder.handle(handle);
         }
         BrokerRequest::CheckReadiness(handle) => {
             encoder.u8(REQUEST_TAG_CHECK_READINESS);
+            encoder.request_id(request_id);
             encoder.handle(handle);
         }
         BrokerRequest::Event(request) => {
             encoder.u8(REQUEST_TAG_EVENT);
+            encoder.request_id(request_id);
             event::encode_event_request(&mut encoder, request);
         }
         BrokerRequest::Pipe(request) => {
             encoder.u8(REQUEST_TAG_PIPE);
+            encoder.request_id(request_id);
             pipe::encode_pipe_request(&mut encoder, request);
         }
     }
@@ -122,19 +131,30 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
 }
 
 /// Decodes a broker request body.
-pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
+pub fn decode_request(frame: &[u8]) -> Result<BrokerRequestEnvelope, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
-    let request = match tag {
+    match tag {
         REQUEST_TAG_NEGOTIATE => return Err(WireError::WrongMessagePhase),
+        REQUEST_TAG_CLOSE_OBJECT
+        | REQUEST_TAG_CHECK_READINESS
+        | REQUEST_TAG_EVENT
+        | REQUEST_TAG_PIPE => {}
+        _ => return Err(WireError::InvalidTag),
+    }
+    let request_id = decoder.request_id()?;
+    let request = match tag {
         REQUEST_TAG_CLOSE_OBJECT => BrokerRequest::CloseObject(decoder.handle()?),
         REQUEST_TAG_CHECK_READINESS => BrokerRequest::CheckReadiness(decoder.handle()?),
         REQUEST_TAG_EVENT => BrokerRequest::Event(event::decode_event_request(&mut decoder)?),
         REQUEST_TAG_PIPE => BrokerRequest::Pipe(pipe::decode_pipe_request(&mut decoder)?),
-        _ => return Err(WireError::InvalidTag),
+        _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
-    Ok(request)
+    Ok(BrokerRequestEnvelope {
+        request_id,
+        request,
+    })
 }
 
 /// Encodes a broker handshake response body.
@@ -157,7 +177,7 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
             encoder.protocol_version(broker_protocol_version);
         }
         BrokerHandshakeResponse::Error(error) => {
-            encoder.u8(RESPONSE_TAG_ERROR);
+            encoder.u8(HANDSHAKE_RESPONSE_TAG_ERROR);
             encoder.u16(error.as_raw());
         }
     }
@@ -175,13 +195,14 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         RESPONSE_TAG_EVENT
         | RESPONSE_TAG_OBJECT_CLOSED
         | RESPONSE_TAG_PIPE
-        | RESPONSE_TAG_READINESS => {
+        | RESPONSE_TAG_READINESS
+        | RESPONSE_TAG_ERROR => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version: decoder.protocol_version()?,
         },
-        RESPONSE_TAG_ERROR => {
+        HANDSHAKE_RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerHandshakeResponse::Error(error)
         }
@@ -195,26 +216,35 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
 ///
 /// Successful encodings are always non-empty because the first byte is the
 /// message tag.
-pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
+pub fn encode_response(envelope: BrokerResponseEnvelope) -> Vec<u8> {
     let mut encoder = Encoder::default();
+    let BrokerResponseEnvelope {
+        request_id,
+        response,
+    } = envelope;
     match response {
         BrokerResponse::ObjectClosed => {
             encoder.u8(RESPONSE_TAG_OBJECT_CLOSED);
+            encoder.request_id(request_id);
         }
         BrokerResponse::Readiness(readiness) => {
             encoder.u8(RESPONSE_TAG_READINESS);
+            encoder.request_id(request_id);
             encoder.u32(readiness.0);
         }
         BrokerResponse::Event(response) => {
             encoder.u8(RESPONSE_TAG_EVENT);
+            encoder.request_id(request_id);
             event::encode_event_response(&mut encoder, response);
         }
         BrokerResponse::Pipe(response) => {
             encoder.u8(RESPONSE_TAG_PIPE);
+            encoder.request_id(request_id);
             pipe::encode_pipe_response(&mut encoder, response);
         }
         BrokerResponse::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
+            encoder.request_id(request_id);
             encoder.u16(error.as_raw());
         }
     }
@@ -222,13 +252,22 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
 }
 
 /// Decodes a broker response body.
-pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
+pub fn decode_response(frame: &[u8]) -> Result<BrokerResponseEnvelope, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
-    let response = match tag {
-        RESPONSE_TAG_NEGOTIATED | RESPONSE_TAG_VERSION_MISMATCH => {
+    match tag {
+        RESPONSE_TAG_NEGOTIATED | HANDSHAKE_RESPONSE_TAG_ERROR | RESPONSE_TAG_VERSION_MISMATCH => {
             return Err(WireError::WrongMessagePhase);
         }
+        RESPONSE_TAG_EVENT
+        | RESPONSE_TAG_OBJECT_CLOSED
+        | RESPONSE_TAG_PIPE
+        | RESPONSE_TAG_READINESS
+        | RESPONSE_TAG_ERROR => {}
+        _ => return Err(WireError::InvalidTag),
+    }
+    let request_id = decoder.request_id()?;
+    let response = match tag {
         RESPONSE_TAG_EVENT => BrokerResponse::Event(event::decode_event_response(&mut decoder)?),
         RESPONSE_TAG_PIPE => BrokerResponse::Pipe(pipe::decode_pipe_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => {
@@ -237,10 +276,13 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         }
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResponse::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResponse::Readiness(ReadinessFlags(decoder.u32()?)),
-        _ => return Err(WireError::InvalidTag),
+        _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
-    Ok(response)
+    Ok(BrokerResponseEnvelope {
+        request_id,
+        response,
+    })
 }
 
 /// Encodes a broker notification body.
@@ -286,7 +328,23 @@ mod tests {
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
     };
-    use crate::{ObjectHandle, ProtocolVersion};
+    use crate::{ObjectHandle, ProtocolVersion, RequestId};
+
+    const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
+
+    fn request_envelope(request: BrokerRequest) -> BrokerRequestEnvelope {
+        BrokerRequestEnvelope {
+            request_id: TEST_REQUEST_ID,
+            request,
+        }
+    }
+
+    fn response_envelope(response: BrokerResponse) -> BrokerResponseEnvelope {
+        BrokerResponseEnvelope {
+            request_id: TEST_REQUEST_ID,
+            response,
+        }
+    }
 
     #[test]
     fn handshake_request_codec_round_trips_all_variants() {
@@ -332,9 +390,24 @@ mod tests {
         ];
 
         for request in requests {
+            let envelope = request_envelope(request);
             assert_eq!(
-                decode_request(&encode_request(request.clone())).unwrap(),
-                request
+                decode_request(&encode_request(envelope.clone())).unwrap(),
+                envelope
+            );
+        }
+    }
+
+    #[test]
+    fn request_codec_round_trips_identifier_bounds() {
+        for request_id in [RequestId(0), RequestId(u64::MAX)] {
+            let envelope = BrokerRequestEnvelope {
+                request_id,
+                request: BrokerRequest::CloseObject(ObjectHandle(13)),
+            };
+            assert_eq!(
+                decode_request(&encode_request(envelope.clone())).unwrap(),
+                envelope
             );
         }
     }
@@ -389,9 +462,24 @@ mod tests {
         ];
 
         for response in responses {
+            let envelope = response_envelope(response);
             assert_eq!(
-                decode_response(&encode_response(response.clone())).unwrap(),
-                response
+                decode_response(&encode_response(envelope.clone())).unwrap(),
+                envelope
+            );
+        }
+    }
+
+    #[test]
+    fn response_codec_round_trips_identifier_bounds() {
+        for request_id in [RequestId(0), RequestId(u64::MAX)] {
+            let envelope = BrokerResponseEnvelope {
+                request_id,
+                response: BrokerResponse::ObjectClosed,
+            };
+            assert_eq!(
+                decode_response(&encode_response(envelope.clone())).unwrap(),
+                envelope
             );
         }
     }
@@ -423,15 +511,15 @@ mod tests {
             Err(WireError::TruncatedFrame)
         );
         assert_eq!(
-            decode_handshake_request(&encode_request(BrokerRequest::Event(EventRequest::Create(
-                CreateEventRequest { initial_count: 0 },
+            decode_handshake_request(&encode_request(request_envelope(BrokerRequest::Event(
+                EventRequest::Create(CreateEventRequest { initial_count: 0 }),
             )))),
             Err(WireError::WrongMessagePhase)
         );
         assert_eq!(
-            decode_handshake_request(&encode_request(BrokerRequest::CloseObject(ObjectHandle(
-                13
-            )))),
+            decode_handshake_request(&encode_request(request_envelope(
+                BrokerRequest::CloseObject(ObjectHandle(13))
+            ))),
             Err(WireError::WrongMessagePhase)
         );
         let mut frame = encode_handshake_request(BrokerHandshakeRequest {
@@ -453,19 +541,23 @@ mod tests {
             })),
             Err(WireError::WrongMessagePhase)
         );
-        let mut unknown_consume_mode = encode_request(BrokerRequest::Event(EventRequest::Consume(
-            ConsumeEventRequest {
+        assert_eq!(
+            decode_request(&[REQUEST_TAG_EVENT, 0, 0, 0, 0, 0, 0, 0]),
+            Err(WireError::TruncatedFrame)
+        );
+        let mut unknown_consume_mode = encode_request(request_envelope(BrokerRequest::Event(
+            EventRequest::Consume(ConsumeEventRequest {
                 handle: ObjectHandle(13),
                 mode: EventConsumeMode::All,
-            },
+            }),
         )));
         *unknown_consume_mode.last_mut().unwrap() = 0xff;
         assert_eq!(
             decode_request(&unknown_consume_mode),
             Err(WireError::InvalidTag)
         );
-        let mut frame = encode_request(BrokerRequest::Event(EventRequest::Create(
-            CreateEventRequest { initial_count: 0 },
+        let mut frame = encode_request(request_envelope(BrokerRequest::Event(
+            EventRequest::Create(CreateEventRequest { initial_count: 0 }),
         )));
         frame.push(0xff);
         assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
@@ -486,15 +578,23 @@ mod tests {
             Err(WireError::InvalidTag)
         );
         assert_eq!(
-            decode_handshake_response(&encode_response(BrokerResponse::Event(
+            decode_handshake_response(&encode_response(response_envelope(BrokerResponse::Event(
                 EventResponse::Create(CreateEventResponse {
                     handle: ObjectHandle(13),
-                }),
+                })
+            ),))),
+            Err(WireError::WrongMessagePhase)
+        );
+        assert_eq!(
+            decode_handshake_response(&encode_response(response_envelope(
+                BrokerResponse::ObjectClosed
             ))),
             Err(WireError::WrongMessagePhase)
         );
         assert_eq!(
-            decode_handshake_response(&encode_response(BrokerResponse::ObjectClosed)),
+            decode_handshake_response(&encode_response(response_envelope(BrokerResponse::Error(
+                ErrorCode::WouldBlock
+            )))),
             Err(WireError::WrongMessagePhase)
         );
 
@@ -514,30 +614,36 @@ mod tests {
             decode_response(&[0xff, 1, 2, 3]),
             Err(WireError::InvalidTag)
         );
-        assert_eq!(
-            decode_response(&encode_handshake_response(
-                BrokerHandshakeResponse::Negotiated {
-                    broker_protocol_version: ProtocolVersion(1),
-                },
-            )),
-            Err(WireError::WrongMessagePhase)
-        );
+        for response in [
+            BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: ProtocolVersion(1),
+            },
+            BrokerHandshakeResponse::VersionMismatch {
+                broker_protocol_version: ProtocolVersion(1),
+            },
+            BrokerHandshakeResponse::Error(ErrorCode::PolicyDenied),
+        ] {
+            assert_eq!(
+                decode_response(&encode_handshake_response(response)),
+                Err(WireError::WrongMessagePhase)
+            );
+        }
         assert_eq!(
             decode_response(&[RESPONSE_TAG_READINESS, 0xff]),
             Err(WireError::TruncatedFrame)
         );
-        assert_eq!(
-            decode_response(&[2, 0xff, 0xff]),
-            Err(WireError::InvalidTag)
-        );
+        let mut invalid_error = Vec::from([RESPONSE_TAG_ERROR]);
+        invalid_error.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
+        invalid_error.extend_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(decode_response(&invalid_error), Err(WireError::InvalidTag));
 
-        let truncated = [1, 2, 2, 0];
+        let truncated = [RESPONSE_TAG_EVENT, 2, 2, 0];
         assert_eq!(decode_response(&truncated), Err(WireError::TruncatedFrame));
 
-        let mut frame = encode_response(BrokerResponse::Event(EventResponse::Add(
-            AddEventResponse {
+        let mut frame = encode_response(response_envelope(BrokerResponse::Event(
+            EventResponse::Add(AddEventResponse {
                 readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
-            },
+            }),
         )));
         frame.push(0xff);
         assert_eq!(decode_response(&frame), Err(WireError::TrailingBytes));
@@ -578,14 +684,28 @@ mod tests {
     }
 
     #[test]
+    fn event_create_request_wire_shape_is_pinned() {
+        assert_eq!(
+            encode_request(BrokerRequestEnvelope {
+                request_id: RequestId(13),
+                request: BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
+                    initial_count: 7,
+                })),
+            }),
+            [1, 13, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
     fn event_add_response_wire_shape_is_pinned() {
         assert_eq!(
-            encode_response(BrokerResponse::Event(EventResponse::Add(
-                AddEventResponse {
+            encode_response(BrokerResponseEnvelope {
+                request_id: RequestId(13),
+                response: BrokerResponse::Event(EventResponse::Add(AddEventResponse {
                     readiness: ReadinessFlags::READ,
-                }
-            ))),
-            [1, 1, 1, 0, 0, 0]
+                })),
+            }),
+            [1, 13, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0]
         );
     }
 

@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 use crate::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-    BrokerResponse,
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequestEnvelope,
+    BrokerResponseEnvelope,
 };
 
 /// Peer identity information supplied by the channel or host layer.
@@ -55,13 +55,13 @@ pub trait LocalControlChannel {
     fn recv_handshake_response(&mut self) -> Result<Option<BrokerHandshakeResponse>, Self::Error>;
 
     /// Sends one active broker request.
-    fn send_request(&mut self, request: &BrokerRequest) -> Result<(), Self::Error>;
+    fn send_request(&mut self, request: &BrokerRequestEnvelope) -> Result<(), Self::Error>;
 
     /// Receives one active broker response.
     ///
     /// Returns `Ok(None)` when the broker closed the channel cleanly before
     /// starting another response frame.
-    fn recv_response(&mut self) -> Result<Option<BrokerResponse>, Self::Error>;
+    fn recv_response(&mut self) -> Result<Option<BrokerResponseEnvelope>, Self::Error>;
 }
 
 /// Host-side control channel for broker authority calls.
@@ -84,10 +84,10 @@ pub trait HostControlChannel {
     ) -> Result<(), Self::Error>;
 
     /// Receives one active broker request.
-    fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
+    fn recv_request(&mut self) -> Result<HostReceive<BrokerRequestEnvelope>, Self::Error>;
 
     /// Sends one active broker response.
-    fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;
+    fn send_response(&mut self, response: &BrokerResponseEnvelope) -> Result<(), Self::Error>;
 }
 
 /// Local-side receive channel for broker-initiated asynchronous notifications.

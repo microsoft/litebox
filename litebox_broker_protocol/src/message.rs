@@ -11,7 +11,7 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::readiness::ReadinessFlags;
-use crate::{ObjectHandle, ProtocolVersion};
+use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
 /// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +31,15 @@ pub enum BrokerRequest {
     Event(EventRequest),
     /// Pipe object request family.
     Pipe(PipeRequest),
+}
+
+/// Broker request and its association-scoped correlation identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrokerRequestEnvelope {
+    /// Correlation identifier allocated by the local endpoint.
+    pub request_id: RequestId,
+    /// Requested broker operation.
+    pub request: BrokerRequest,
 }
 
 /// Broker handshake response sent before the control channel is active.
@@ -92,6 +101,15 @@ pub enum BrokerResponse {
     Pipe(PipeResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
+}
+
+/// Broker response and the identifier of its corresponding request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrokerResponseEnvelope {
+    /// Correlation identifier copied from the request.
+    pub request_id: RequestId,
+    /// Broker operation result.
+    pub response: BrokerResponse,
 }
 
 /// Broker-owned event object response.

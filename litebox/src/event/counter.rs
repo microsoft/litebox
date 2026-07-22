@@ -183,7 +183,8 @@ mod tests {
     use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-        BrokerResponse, EventRequest, EventResponse, ReadinessNotification,
+        BrokerRequestEnvelope, BrokerResponse, BrokerResponseEnvelope, EventRequest, EventResponse,
+        ReadinessNotification,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
 
@@ -409,7 +410,7 @@ mod tests {
         read_ready: Arc<AtomicBool>,
         request_count: Arc<AtomicUsize>,
         fail_requests: Arc<AtomicBool>,
-        last_request: Option<BrokerRequest>,
+        last_request: Option<BrokerRequestEnvelope>,
     }
 
     struct NoopSharedMemory;
@@ -459,19 +460,22 @@ mod tests {
 
         fn send_request(
             &mut self,
-            request: &BrokerRequest,
+            request: &BrokerRequestEnvelope,
         ) -> core::result::Result<(), Self::Error> {
             self.last_request = Some(request.clone());
             self.request_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
+        fn recv_response(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerResponseEnvelope>, Self::Error> {
             if self.fail_requests.load(Ordering::SeqCst) {
                 self.last_request.take();
                 return Err(());
             }
-            let response = match self.last_request.take().unwrap() {
+            let request = self.last_request.take().unwrap();
+            let response = match request.request {
                 BrokerRequest::Event(EventRequest::Create(_)) => {
                     let handle = ObjectHandle(self.next_handle);
                     self.next_handle += 1;
@@ -496,7 +500,10 @@ mod tests {
                     panic!("unexpected broker request: {request:?}")
                 }
             };
-            Ok(Some(response))
+            Ok(Some(BrokerResponseEnvelope {
+                request_id: request.request_id,
+                response,
+            }))
         }
     }
 }

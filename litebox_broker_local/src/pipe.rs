@@ -130,11 +130,14 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::channel::LocalControlChannel;
-    use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
+    use litebox_broker_protocol::message::{
+        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequestEnvelope,
+        BrokerResponseEnvelope,
+    };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
     use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
+    use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 
     #[test]
     fn pipe_uses_attached_shared_memory_for_data_operations() {
@@ -275,6 +278,7 @@ mod tests {
     struct ScriptedChannel {
         responses: VecDeque<BrokerResponse>,
         sent_requests: Vec<BrokerRequest>,
+        last_request_id: Option<RequestId>,
     }
 
     impl ScriptedChannel {
@@ -282,6 +286,7 @@ mod tests {
             Self {
                 responses: responses.into_iter().collect(),
                 sent_requests: Vec::new(),
+                last_request_id: None,
             }
         }
     }
@@ -307,14 +312,25 @@ mod tests {
 
         fn send_request(
             &mut self,
-            request: &BrokerRequest,
+            request: &BrokerRequestEnvelope,
         ) -> core::result::Result<(), Self::Error> {
-            self.sent_requests.push(request.clone());
+            self.sent_requests.push(request.request.clone());
+            self.last_request_id = Some(request.request_id);
             Ok(())
         }
 
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
-            Ok(self.responses.pop_front())
+        fn recv_response(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerResponseEnvelope>, Self::Error> {
+            Ok(self
+                .responses
+                .pop_front()
+                .map(|response| BrokerResponseEnvelope {
+                    request_id: self
+                        .last_request_id
+                        .expect("response requires a sent request"),
+                    response,
+                }))
         }
     }
 }

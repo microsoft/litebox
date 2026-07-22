@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use litebox_broker_protocol::RequestId;
 use litebox_broker_protocol::error::ErrorCode;
 use thiserror::Error;
 
@@ -11,6 +12,15 @@ pub enum BrokerLocalError<E> {
     Channel(#[source] E),
     #[error("broker closed the channel")]
     ChannelClosed,
+    #[error("broker request identifiers are exhausted")]
+    RequestIdExhausted,
+    #[error("broker returned response ID {actual:?} for request {expected:?}")]
+    UnexpectedResponseId {
+        /// Request identifier sent by the local endpoint.
+        expected: RequestId,
+        /// Request identifier returned by the broker.
+        actual: RequestId,
+    },
     #[error("broker rejected request: {0}")]
     Broker(#[source] ErrorCode),
 }

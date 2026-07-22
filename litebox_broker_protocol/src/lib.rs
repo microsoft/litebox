@@ -26,6 +26,11 @@ pub mod wire;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectHandle(pub u64);
 
+/// Association-scoped broker request identifier.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestId(pub u64);
+
 /// Broker protocol version.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

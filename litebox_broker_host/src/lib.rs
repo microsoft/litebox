@@ -24,8 +24,8 @@ use litebox_broker_protocol::channel::{
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::message::{
-    BrokerHandshakeResponse, BrokerRequest, BrokerResponse, EventRequest, EventResponse,
-    PipeRequest, PipeResponse,
+    BrokerHandshakeResponse, BrokerRequest, BrokerRequestEnvelope, BrokerResponse,
+    BrokerResponseEnvelope, EventRequest, EventResponse, PipeRequest, PipeResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, PIPE_TRANSFER_BUFFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -114,18 +114,22 @@ where
         {
             HostReceive::Message(request) => request,
             HostReceive::ProtocolViolation => {
-                control_channel
-                    .send_response(&BrokerResponse::Error(ErrorCode::ProtocolState))
-                    .map_err(BrokerHostError::Channel)?;
                 return Ok(ConnectionTermination::ProtocolViolation);
             }
             HostReceive::PeerClosed => break,
         };
 
+        let BrokerRequestEnvelope {
+            request_id,
+            request,
+        } = request;
         let response = complete_request(handle_request(&session, request, shared_memory))
             .map_err(BrokerHostError::Broker)?;
         control_channel
-            .send_response(&response)
+            .send_response(&BrokerResponseEnvelope {
+                request_id,
+                response,
+            })
             .map_err(BrokerHostError::Channel)?;
     }
 
@@ -262,7 +266,7 @@ fn handle_event_request(
 pub enum ConnectionTermination {
     /// The peer cleanly closed the channel.
     PeerClosed,
-    /// The broker sent a protocol-state error before closing the channel.
+    /// The peer violated the protocol.
     ProtocolViolation,
 }
 
@@ -278,7 +282,7 @@ mod tests {
     use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerNotification};
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
     use litebox_broker_protocol::shared_memory::SharedMemoryError;
-    use litebox_broker_protocol::{ObjectHandle, ProtocolVersion};
+    use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -313,6 +317,7 @@ mod tests {
                 Ok(HostReceive::PeerClosed),
             ]),
         );
+        channel.next_request_id = 41;
         let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
@@ -337,6 +342,7 @@ mod tests {
             response => panic!("unexpected response: {response:?}"),
         };
         assert_ne!(handle.0, 0);
+        assert_eq!(channel.response_ids, [RequestId(41)]);
     }
 
     fn serve_connection_retries_after_version_mismatch(broker: &BrokerCore) {
@@ -464,10 +470,7 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION
             }]
         );
-        assert_eq!(
-            channel.responses,
-            [BrokerResponse::Error(ErrorCode::ProtocolState)]
-        );
+        assert!(channel.responses.is_empty());
     }
 
     fn serve_connection_returns_channel_error_when_response_send_fails(broker: &BrokerCore) {
@@ -573,6 +576,7 @@ mod tests {
             channel.responses[1],
             BrokerResponse::Event(EventResponse::Create(_))
         ));
+        assert_eq!(channel.response_ids, [RequestId(0), RequestId(1)]);
     }
 
     fn serve_connection_aborts_without_response_on_shared_memory_failure(broker: &BrokerCore) {
@@ -722,6 +726,8 @@ mod tests {
         requests: std::vec::Vec<core::result::Result<HostReceive<BrokerRequest>, ()>>,
         handshake_responses: std::vec::Vec<BrokerHandshakeResponse>,
         responses: std::vec::Vec<BrokerResponse>,
+        response_ids: std::vec::Vec<RequestId>,
+        next_request_id: u64,
         enqueue_readiness_requests_after_create: bool,
         enqueue_write_request_after_pipe_create: bool,
         send_error: bool,
@@ -739,6 +745,8 @@ mod tests {
                 requests,
                 handshake_responses: std::vec::Vec::new(),
                 responses: std::vec::Vec::new(),
+                response_ids: std::vec::Vec::new(),
+                next_request_id: 0,
                 enqueue_readiness_requests_after_create: false,
                 enqueue_write_request_after_pipe_create: false,
                 send_error: false,
@@ -776,21 +784,34 @@ mod tests {
 
         fn recv_request(
             &mut self,
-        ) -> core::result::Result<HostReceive<BrokerRequest>, Self::Error> {
-            if self.requests.is_empty() {
-                Ok(HostReceive::PeerClosed)
+        ) -> core::result::Result<HostReceive<BrokerRequestEnvelope>, Self::Error> {
+            let received = if self.requests.is_empty() {
+                HostReceive::PeerClosed
             } else {
-                self.requests.remove(0)
-            }
+                self.requests.remove(0)?
+            };
+            Ok(match received {
+                HostReceive::Message(request) => {
+                    let request_id = RequestId(self.next_request_id);
+                    self.next_request_id += 1;
+                    HostReceive::Message(BrokerRequestEnvelope {
+                        request_id,
+                        request,
+                    })
+                }
+                HostReceive::ProtocolViolation => HostReceive::ProtocolViolation,
+                HostReceive::PeerClosed => HostReceive::PeerClosed,
+            })
         }
 
         fn send_response(
             &mut self,
-            response: &BrokerResponse,
+            envelope: &BrokerResponseEnvelope,
         ) -> core::result::Result<(), Self::Error> {
             if self.send_error {
                 return Err(());
             }
+            let response = &envelope.response;
             if self.enqueue_readiness_requests_after_create
                 && let BrokerResponse::Event(EventResponse::Create(response)) = response
             {
@@ -823,6 +844,7 @@ mod tests {
                 self.requests.push(Ok(HostReceive::PeerClosed));
             }
             self.responses.push(response.clone());
+            self.response_ids.push(envelope.request_id);
             Ok(())
         }
     }
