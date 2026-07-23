@@ -6,9 +6,7 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
-use crate::{
-    host::per_cpu_variables::PerCpuVariablesAsm, mshv::heki_service::state::Vtl0KernelInfo,
-};
+use crate::host::per_cpu_variables::PerCpuVariablesAsm;
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
@@ -391,7 +389,6 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    vtl0_kernel_info: Vtl0KernelInfo,
 }
 
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
@@ -624,7 +621,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table_manager: PageTableManager::new(base_pt),
             vtl1_phys_frame_range: vtl1_range,
-            vtl0_kernel_info: Vtl0KernelInfo::new(),
         }))
     }
 
@@ -1284,16 +1280,16 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             range_set.insert(start..end);
         }
 
-        let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
+        let page_prot = if perms.contains(PhysPageMapPermissions::WRITE) {
             // VTL1 needs writable access, so deny VTL0 all access.
-            litebox_common_lvbs::MemAttr::empty()
+            crate::mshv::HvPageProtFlags::HV_PAGE_ACCESS_NONE
         } else if perms.contains(PhysPageMapPermissions::READ) {
             // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-            litebox_common_lvbs::MemAttr::MEM_ATTR_READ
-                | litebox_common_lvbs::MemAttr::MEM_ATTR_EXEC
+            crate::mshv::HvPageProtFlags::HV_PAGE_READABLE
+                | crate::mshv::HvPageProtFlags::HV_PAGE_EXECUTABLE
         } else {
             // VTL1 no longer protects the pages.
-            litebox_common_lvbs::MemAttr::all()
+            crate::mshv::HvPageProtFlags::HV_PAGE_FULL_ACCESS
         };
 
         for range in range_set.iter() {
@@ -1301,7 +1297,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
             );
-            crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
+            crate::mshv::vsm::protect_physical_memory_range(frame_range, page_prot)
                 .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
         }
 

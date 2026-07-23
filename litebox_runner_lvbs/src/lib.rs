@@ -13,7 +13,7 @@ use litebox::{
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
-use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmFunction};
+use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction, VsmMediation};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
@@ -25,7 +25,6 @@ use litebox_platform_lvbs::{
     mm::MemoryProvider,
     mshv::{
         hvcall,
-        vsm::vsm_dispatch,
         vsm_intercept::raise_vtl0_gp_fault,
         vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
@@ -262,6 +261,67 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
             litebox_shim_optee::idk::generate_identity_signing_key(public_key_pa, key_alg)
         }
         _ => vsm_dispatch(func_id, &params[1..]),
+    }
+}
+
+/// Returns the process-wide [`litebox_platform_lvbs::mshv::heki_service::HekiState`], the single
+/// long-lived HEKI/VSM service state owned by the runner (the VSM composition
+/// root), initializing it on first access.
+fn heki_state() -> &'static litebox_platform_lvbs::mshv::heki_service::HekiState {
+    static HEKI_STATE: spin::Once<litebox_platform_lvbs::mshv::heki_service::HekiState> =
+        spin::Once::new();
+    HEKI_STATE.call_once(litebox_platform_lvbs::mshv::heki_service::HekiState::new)
+}
+
+/// Dispatch a VSM function to its handler and return the result.
+///
+/// HEKI/VSM policy is delegated to the service (`Vsm`) over the VTL0-mediation
+/// capability ([`Vtl0Mediation`], via `LvbsVsmMediation`). The VTL1 self-lifecycle
+/// operations (AP bring-up, root-key provisioning) are invoked by the runner
+/// itself as the VSM composition root, over the full [`VsmMediation`]; each
+/// reads its own VTL0 arguments internally. The runner owns the `HekiState`
+/// that gates end-of-boot-sensitive operations.
+fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
+    use litebox_platform_lvbs::mshv::vsm_mediation::LvbsVsmMediation;
+
+    let state = heki_state();
+    let mediation = LvbsVsmMediation::mint();
+    let vsm = litebox_platform_lvbs::mshv::heki_service::Vsm::new(&mediation, state);
+    let result: Result<i64, VsmError> = match func_id {
+        // AP enablement is a no-op in this implementation.
+        VsmFunction::EnableAPsVtl => Ok(0),
+        VsmFunction::BootAPs => mediation.boot_aps(params[0]).map(|()| 0),
+        VsmFunction::LockRegs => vsm.lock_regs(),
+        VsmFunction::SignalEndOfBoot => Ok(vsm.end_of_boot()),
+        VsmFunction::ProtectMemory => vsm.protect_memory(params[0], params[1]),
+        VsmFunction::LoadKData => vsm.load_kdata(params[0], params[1]),
+        VsmFunction::ValidateModule => vsm.validate_guest_module(params[0], params[1], params[2]),
+        VsmFunction::FreeModuleInit => {
+            vsm.free_guest_module_init(params[0].reinterpret_as_signed())
+        }
+        VsmFunction::UnloadModule => vsm.unload_guest_module(params[0].reinterpret_as_signed()),
+        VsmFunction::CopySecondaryKey => vsm.copy_secondary_key(params[0], params[1]),
+        VsmFunction::KexecValidate => vsm.kexec_validate(params[0], params[1], params[2]),
+        VsmFunction::PatchText => vsm.patch_text(params[0], params[1]),
+        VsmFunction::AllocateRingbufferMemory => {
+            let size: usize = params[1].trunc();
+            vsm.allocate_ringbuffer_memory(params[0], size)
+        }
+        VsmFunction::SetPlatformRootKey => {
+            if state.check_end_of_boot() {
+                Err(VsmError::OperationAfterEndOfBoot("set platform root key"))
+            } else {
+                mediation.set_platform_root_key(params[0]).map(|()| 0)
+            }
+        }
+        VsmFunction::GenerateIdentitySigningKey => {
+            Err(VsmError::OperationNotSupported("Identity key generation"))
+        }
+        VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
+    };
+    match result {
+        Ok(value) => value,
+        Err(e) => Errno::from(e).as_neg().into(),
     }
 }
 

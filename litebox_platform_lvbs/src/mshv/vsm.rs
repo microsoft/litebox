@@ -1,14 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! VSM functions
+//! Platform-side VSM bring-up and control-register locking.
 
-use crate::mshv::heki_service::vsm::{
-    mshv_vsm_allocate_ringbuffer_memory, mshv_vsm_boot_aps, mshv_vsm_copy_secondary_key,
-    mshv_vsm_enable_aps, mshv_vsm_end_of_boot, mshv_vsm_free_guest_module_init,
-    mshv_vsm_kexec_validate, mshv_vsm_load_kdata, mshv_vsm_patch_text, mshv_vsm_protect_memory,
-    mshv_vsm_set_platform_root_key, mshv_vsm_unload_guest_module, mshv_vsm_validate_guest_module,
-};
 use crate::{
     debug_serial_println,
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables::with_per_cpu_variables},
@@ -21,24 +15,20 @@ use crate::{
         HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP, HvCrInterceptControlFlags,
         HvPageProtFlags, HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig, X86Cr0Flags,
         X86Cr4Flags,
-        heki::mem_attr_to_hv_page_prot_flags,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers},
         vtl_switch::mshv_vsm_get_code_page_offsets,
     },
 };
-use litebox_common_lvbs::{HypervCallError, MemAttr, VsmError, VsmFunction};
-
-use alloc::vec::Vec;
-use core::ops::Range;
-use litebox::utils::TruncateExt;
-use litebox_common_linux::errno::Errno;
-use rangemap::RangeSet;
-use spin::{Once, rwlock::RwLock as SpinRwLock};
 use x86_64::{
     PhysAddr,
     structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
+
+use alloc::vec::Vec;
+use core::ops::Range;
+use rangemap::RangeSet;
+use spin::{Once, rwlock::RwLock as SpinRwLock};
 
 pub(crate) fn init(is_bsp: bool) {
     assert!(
@@ -83,7 +73,7 @@ pub(crate) fn init(is_bsp: bool) {
 }
 
 /// VSM function for enforcing certain security features of VTL0
-pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
+pub(crate) fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Secure VTL0 configuration");
 
     let mut config = HvRegisterVsmVpSecureVtlConfig::new();
@@ -97,7 +87,7 @@ pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
 }
 
 /// VSM function to configure a VSM partition for VTL1
-pub fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
+pub(crate) fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Configure partition");
 
     let mut config = HvRegisterVsmPartitionConfig::new();
@@ -111,14 +101,14 @@ pub fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
 }
 
 /// VSM function for locking VTL0's control registers.
-pub fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
+///
+/// The end-of-boot guard is enforced by the runner-side dispatcher (which owns
+/// the `HekiState`) before this is called.
+///
+/// Returns the common wire error type so the runner can uniformly combine this
+/// platform-owned operation with the `litebox_service_heki` handlers.
+pub(crate) fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Lock control registers");
-
-    if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
-        return Err(VsmError::OperationAfterEndOfBoot(
-            "control register locking",
-        ));
-    }
 
     let flag = HvCrInterceptControlFlags::CR0_WRITE.bits()
         | HvCrInterceptControlFlags::CR4_WRITE.bits()
@@ -154,41 +144,6 @@ pub fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
     .map_err(VsmError::HypercallFailed)?;
 
     Ok(0)
-}
-
-/// VSM function dispatcher
-pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
-    let result: Result<i64, VsmError> = match func_id {
-        VsmFunction::EnableAPsVtl => mshv_vsm_enable_aps(params[0]),
-        VsmFunction::BootAPs => mshv_vsm_boot_aps(params[0]),
-        VsmFunction::LockRegs => mshv_vsm_lock_regs(),
-        VsmFunction::SignalEndOfBoot => Ok(mshv_vsm_end_of_boot()),
-        VsmFunction::ProtectMemory => mshv_vsm_protect_memory(params[0], params[1]),
-        VsmFunction::LoadKData => mshv_vsm_load_kdata(params[0], params[1]),
-        VsmFunction::ValidateModule => {
-            mshv_vsm_validate_guest_module(params[0], params[1], params[2])
-        }
-        #[allow(clippy::cast_possible_wrap)]
-        VsmFunction::FreeModuleInit => mshv_vsm_free_guest_module_init(params[0] as i64),
-        #[allow(clippy::cast_possible_wrap)]
-        VsmFunction::UnloadModule => mshv_vsm_unload_guest_module(params[0] as i64),
-        VsmFunction::CopySecondaryKey => mshv_vsm_copy_secondary_key(params[0], params[1]),
-        VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[0], params[1], params[2]),
-        VsmFunction::PatchText => mshv_vsm_patch_text(params[0], params[1]),
-        VsmFunction::AllocateRingbufferMemory => {
-            let size: usize = params[1].trunc();
-            mshv_vsm_allocate_ringbuffer_memory(params[0], size)
-        }
-        VsmFunction::SetPlatformRootKey => mshv_vsm_set_platform_root_key(params[0]),
-        VsmFunction::GenerateIdentitySigningKey => {
-            Err(VsmError::OperationNotSupported("Identity key generation"))
-        }
-        VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
-    };
-    match result {
-        Ok(value) => value,
-        Err(e) => Errno::from(e).as_neg().into(),
-    }
 }
 
 pub const NUM_CONTROL_REGS: usize = 11;
@@ -271,6 +226,38 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     Ok(0)
 }
 
+/// This function protects a VTL1 physical memory range, securing VTL1's own pages.
+/// VTL0 should never access VTL1 memory, so the memory attribute is always empty (no read, write, or execute).
+///
+/// Note. This function doesn't check whether `phys_frame_range` belongs to VTL1 because it is called by BSP
+/// before the kernel platform data structure is initialized. To this end, one might call this function with
+/// a VTL0 physical memory range which only restricts access to the range.
+#[inline]
+pub(crate) fn protect_vtl1_physical_memory_range(
+    phys_frame_range: PhysFrameRange<Size4KiB>,
+) -> Result<(), VsmError> {
+    let pa = phys_frame_range.start.start_address().as_u64();
+    let num_pages = phys_frame_range.count() as u64;
+    if num_pages > 0 {
+        hv_modify_vtl_protection_mask(pa, num_pages, HvPageProtFlags::HV_PAGE_ACCESS_NONE)
+            .map_err(VsmError::HypercallFailed)?;
+    }
+    Ok(())
+}
+
+// --- Protected-frame registry -----------------------------------------------
+//
+// VTL0 protected-frame registry (mutual-exclusion guard). This is the platform's
+// authority over which VTL0 frames are non-writable or reserved by in-flight
+// module/kexec validation. Ordinary writable foreign mappings acquire a shared
+// access guard (see `LvbsPhysPageMapInfo` and `vmap`) so a concurrent VTL
+// protection change cannot alias a writable VTL0 mapping.
+//
+// The registry is driven by the VSM/HEKI service through the `Vtl0Mediation` trait,
+// so its public surface speaks the common wire error type `VsmError`.
+
+use litebox_common_lvbs::{HypervCallError, ReservationStatus, VsmError};
+
 /// RAII reservation over VTL0 physical frames, shared by module load and kexec validation.
 /// On drop without `commit`, every newly reserved range is restored to VTL0 read/write,
 /// non-executable access.
@@ -280,10 +267,10 @@ pub(crate) struct FrameReservation {
     committed: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ReservationStatus {
-    New,
-    AlreadyOwned,
+impl Default for FrameReservation {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FrameReservation {
@@ -495,12 +482,12 @@ pub(crate) fn protected_frame_registry() -> &'static ProtectedFrameRegistry {
 ///
 /// `phys_frame_range` specifies the range whose VTL0 permissions are updated; VTL1 working-memory
 /// portions are ignored.
-/// `mem_attr` specifies the memory attributes (VTL0's allowed access) to be applied.
+/// `page_prot` specifies the hypervisor page-protection flags (VTL0's allowed access) to apply.
 pub(crate) fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
-    mem_attr: MemAttr,
+    page_prot: HvPageProtFlags,
 ) -> Result<(), VsmError> {
-    let protect = !mem_attr.contains(MemAttr::MEM_ATTR_WRITE);
+    let protect = !page_prot.contains(HvPageProtFlags::HV_PAGE_WRITABLE);
     let vtl1_range = crate::platform_low().vtl1_phys_frame_range();
 
     // Range fully within VTL1 — nothing to protect for VTL0.
@@ -516,7 +503,7 @@ pub(crate) fn protect_physical_memory_range(
         if !overlaps_vtl1 {
             let pa = phys_frame_range.start.start_address().as_u64();
             let num_pages = phys_frame_range.count() as u64;
-            hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
+            hv_modify_vtl_protection_mask(pa, num_pages, page_prot)
                 .map_err(VsmError::HypercallFailed)?;
             protected.record_protection(phys_frame_range, protect);
             return Ok(());
@@ -541,7 +528,7 @@ pub(crate) fn protect_physical_memory_range(
             }
             let pa = sub_range.start.start_address().as_u64();
             let num_pages = sub_range.count() as u64;
-            hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
+            hv_modify_vtl_protection_mask(pa, num_pages, page_prot)
                 .map_err(VsmError::HypercallFailed)?;
             protected.record_protection(sub_range, protect);
         }
@@ -555,30 +542,8 @@ pub(crate) fn unprotect_physical_memory_range(
 ) -> Result<(), VsmError> {
     protect_physical_memory_range(
         phys_frame_range,
-        MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE,
+        HvPageProtFlags::HV_PAGE_READABLE
+            | HvPageProtFlags::HV_PAGE_USER_EXECUTABLE
+            | HvPageProtFlags::HV_PAGE_WRITABLE,
     )
-}
-
-/// This function is a variant of [`protect_physical_memory_range`] to protect a VTL1 physical memory range.
-/// Unlike [`protect_physical_memory_range`], this is intended exclusively for securing VTL1's own pages.
-/// VTL0 should never access VTL1 memory, so the memory attribute is always empty (no read, write, or execute).
-///
-/// Note. This function doesn't check whether `phys_frame_range` belongs to VTL1 because it is called by BSP
-/// before the kernel platform data structure is initialized. To this end, one might call this function with
-/// a VTL0 physical memory range which only restricts access to the range.
-#[inline]
-fn protect_vtl1_physical_memory_range(
-    phys_frame_range: PhysFrameRange<Size4KiB>,
-) -> Result<(), VsmError> {
-    let pa = phys_frame_range.start.start_address().as_u64();
-    let num_pages = phys_frame_range.count() as u64;
-    if num_pages > 0 {
-        hv_modify_vtl_protection_mask(
-            pa,
-            num_pages,
-            mem_attr_to_hv_page_prot_flags(MemAttr::empty()),
-        )
-        .map_err(VsmError::HypercallFailed)?;
-    }
-    Ok(())
 }

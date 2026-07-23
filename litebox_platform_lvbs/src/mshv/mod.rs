@@ -3,14 +3,14 @@
 
 //! Hyper-V-specific code
 
-pub(crate) mod heki;
-pub(crate) mod heki_service;
+pub mod heki_service;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;
 pub(crate) mod ringbuffer;
 pub mod vsm;
 pub mod vsm_intercept;
+pub mod vsm_mediation;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
@@ -192,7 +192,7 @@ pub const MSR_IA32_SYSENTER_EIP: u32 = 0x0000_0176;
 pub const DEFAULT_REG_PIN_MASK: u64 = u64::MAX;
 
 bitflags::bitflags! {
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Clone, Copy)]
     pub struct HvPageProtFlags: u8 {
         const HV_PAGE_ACCESS_NONE = 0x0;
         const HV_PAGE_READABLE = 0x1;

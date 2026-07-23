@@ -1635,6 +1635,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_common_lvbs",
  "litebox_util_log",
+ "log",
  "modular-bitfield",
  "num_enum",
  "object",

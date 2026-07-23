@@ -185,11 +185,7 @@ static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 ///
 /// This should be called once during platform initialization with a key derived
 /// from hardware or a boot nonce.
-///
-/// # Panics
-/// Panics if `key` length does not match `PRK_LEN`.
-pub(crate) fn set_platform_root_key(key: &[u8]) {
-    assert_eq!(key.len(), PRK_LEN, "Platform Root Key length mismatch");
+pub(crate) fn set_platform_root_key(key: &[u8; PRK_LEN]) {
     PRK_ONCE.call_once(|| {
         let mut prk = Zeroizing::new([0u8; PRK_LEN]);
         prk.copy_from_slice(key);
