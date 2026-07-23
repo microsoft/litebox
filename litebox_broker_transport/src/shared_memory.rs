@@ -23,12 +23,7 @@ use rustix::net::{
 
 use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemory, SharedMemoryError};
 
-#[cfg(target_has_atomic = "32")]
-use std::sync::atomic::AtomicU32;
-#[cfg(target_has_atomic = "64")]
-use std::sync::atomic::AtomicU64;
-#[cfg(any(target_has_atomic = "32", target_has_atomic = "64"))]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
@@ -53,7 +48,6 @@ struct MappedRegion {
 // serialized by the enclosing `Mutex`.
 unsafe impl Send for MappedRegion {}
 
-#[cfg(target_has_atomic = "64")]
 fn atomic_u64_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU64, SharedMemoryError> {
     let byte_address = shared_address(mapping, offset, size_of::<u64>(), align_of::<AtomicU64>())?;
     // The runtime check above establishes the stronger alignment.
@@ -64,7 +58,6 @@ fn atomic_u64_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU64, Sh
     Ok(unsafe { AtomicU64::from_ptr(address) })
 }
 
-#[cfg(target_has_atomic = "32")]
 fn atomic_u32_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU32, SharedMemoryError> {
     let address = shared_u32_address(mapping, offset)?;
     // SAFETY: The pointer is valid and aligned for a `u32`. Control-ring epoch
@@ -73,7 +66,6 @@ fn atomic_u32_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU32, Sh
     Ok(unsafe { AtomicU32::from_ptr(address) })
 }
 
-#[cfg(target_has_atomic = "32")]
 fn shared_u32_address(
     mapping: &MappedRegion,
     offset: usize,
@@ -181,7 +173,6 @@ impl MemfdSharedMemory {
     ///
     /// A value change or signal interruption is reported as a successful,
     /// possibly spurious wakeup. The caller must recheck its wait condition.
-    #[cfg(target_has_atomic = "32")]
     pub fn futex_wait_u32(&self, offset: usize, expected: u32) -> IoResult<()> {
         let address = {
             let mapping = self
@@ -214,7 +205,6 @@ impl MemfdSharedMemory {
     }
 
     /// Wakes one waiter blocked on a shared atomic `u32`.
-    #[cfg(target_has_atomic = "32")]
     pub fn futex_wake_u32(&self, offset: usize) -> IoResult<()> {
         let address = {
             let mapping = self
@@ -303,7 +293,6 @@ impl SharedMemory for MemfdSharedMemory {
     }
 }
 
-#[cfg(target_has_atomic = "64")]
 impl AtomicSharedMemory for MemfdSharedMemory {
     fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
         let mapping = self
@@ -502,7 +491,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_has_atomic = "64")]
     #[test]
     fn mappings_share_ordered_atomic_values_and_validate_alignment() {
         let first = MemfdSharedMemory::create(64).unwrap();
