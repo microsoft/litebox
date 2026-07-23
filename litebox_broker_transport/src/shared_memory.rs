@@ -208,7 +208,8 @@ impl MemfdSharedMemory {
     /// A value change or signal interruption is reported as a successful,
     /// possibly spurious wakeup. The caller must recheck its wait condition.
     fn futex_wait_u32(&self, offset: usize, expected: u32) -> IoResult<()> {
-        let word = atomic_u32_at(self, offset).map_err(shared_memory_error)?;
+        let word = atomic_u32_at(self, offset)
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
         match futex::wait(word, futex::Flags::empty(), expected, None) {
             Ok(()) | Err(Errno::AGAIN | Errno::INTR) => Ok(()),
             Err(error) => Err(error.into()),
@@ -217,7 +218,8 @@ impl MemfdSharedMemory {
 
     /// Wakes one waiter blocked on a shared atomic `u32`.
     fn futex_wake_u32(&self, offset: usize) -> IoResult<()> {
-        let word = atomic_u32_at(self, offset).map_err(shared_memory_error)?;
+        let word = atomic_u32_at(self, offset)
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
         futex::wake(word, futex::Flags::empty(), 1)?;
         Ok(())
     }
@@ -465,10 +467,6 @@ impl Drop for MappedRegion {
 
 fn invalid_data(message: &'static str) -> Error {
     Error::new(std::io::ErrorKind::InvalidData, message)
-}
-
-fn shared_memory_error(error: SharedMemoryError) -> Error {
-    Error::new(ErrorKind::InvalidInput, error)
 }
 
 #[cfg(test)]
