@@ -18,6 +18,7 @@ pub(crate) mod symlink;
 pub(crate) mod sysinfo;
 pub(crate) mod thread;
 pub(crate) mod timer;
+pub(crate) mod token;
 pub(crate) mod wait_completion_packet;
 pub(crate) mod wnf;
 pub(crate) mod worker_factory;
@@ -493,6 +494,24 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         open_as_self: u32,
         handle_attributes: u32,
         token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenProcessToken {
+        process_handle: ProcessHandle,
+        desired_access: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenProcessTokenEx {
+        process_handle: ProcessHandle,
+        desired_access: u32,
+        handle_attributes: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtQueryInformationToken {
+        token_handle: Handle,
+        token_information_class: u32,
+        token_information: Platform::RawMutPointer<u8>,
+        token_information_length: u32,
+        return_length: Platform::RawMutPointer<u32>,
     },
     NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
         flag: u32,
@@ -979,6 +998,24 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 open_as_self,
                 handle_attributes,
                 token_handle:*,
+            })),
+            NtSysno::NtOpenProcessToken => Some(sys_req!(NtOpenProcessToken {
+                process_handle: { ProcessHandle::from_raw },
+                desired_access,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenProcessTokenEx => Some(sys_req!(NtOpenProcessTokenEx {
+                process_handle: { ProcessHandle::from_raw },
+                desired_access,
+                handle_attributes,
+                token_handle:*,
+            })),
+            NtSysno::NtQueryInformationToken => Some(sys_req!(NtQueryInformationToken {
+                token_handle: { Handle::from_raw },
+                token_information_class,
+                token_information:*,
+                token_information_length,
+                return_length:*,
             })),
             NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(
                 sys_req!(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {

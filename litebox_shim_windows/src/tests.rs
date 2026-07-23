@@ -282,6 +282,53 @@ fn nt_duplicate_object_closes_source_even_when_duplication_fails() {
     assert!(duplicate.is_null());
 }
 
+#[test]
+fn nt_duplicate_object_validates_and_filters_handle_attributes() {
+    let task = test_task();
+    let source = create_event(&task, EVENT_MODIFY_STATE);
+    let sentinel = Handle::from_raw(0x7777);
+    let mut duplicate = sentinel;
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut duplicate)),
+            0,
+            0x20,
+            DUPLICATE_SAME_ACCESS,
+        ),
+        litebox_common_windows::nt_status::NtStatus::INVALID_PARAMETER
+    );
+    assert!(duplicate.is_null());
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            source,
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut duplicate)),
+            0,
+            0x100,
+            DUPLICATE_SAME_ACCESS,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_set_event(duplicate, None),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(duplicate),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(source),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+}
+
 #[cfg(target_os = "windows")]
 #[test]
 fn host_nt_duplicate_object_failure_and_access_matrix() {

@@ -43,6 +43,7 @@ use crate::syscalls::section::{
 };
 use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
+use crate::syscalls::token::{TokenHandleObject, TokenObject, TokenSubsystem};
 use crate::syscalls::wait_completion_packet::{
     WaitCompletionPacketAssociateParameters, WaitCompletionPacketHandleObject,
     WaitCompletionPacketSubsystem,
@@ -107,8 +108,40 @@ bitflags::bitflags! {
         const PROTECT_FROM_CLOSE = 0x0000_0001;
         const INHERIT = 0x0000_0002;
         const AUDIT_OBJECT_CLOSE = 0x0000_0004;
+        const HANDLE_BEHAVIOR_ATTRIBUTES = Self::PROTECT_FROM_CLOSE.bits()
+            | Self::INHERIT.bits()
+            | Self::AUDIT_OBJECT_CLOSE.bits();
 
         const _ = !0;
+    }
+}
+
+impl HandleAttributes {
+    fn from_token_open_attributes(attributes: u32) -> Option<Self> {
+        const OBJ_EXCLUSIVE: u32 = 0x20;
+        const OBJ_OPENLINK: u32 = 0x100;
+
+        // NtOpenProcessTokenEx accepts and ignores unrelated object attributes, but native
+        // Windows rejects the two attributes that cannot apply to opening an existing token.
+        if attributes & (OBJ_EXCLUSIVE | OBJ_OPENLINK) != 0 {
+            return None;
+        }
+        Some(Self::from_bits_retain(
+            attributes & Self::HANDLE_BEHAVIOR_ATTRIBUTES.bits(),
+        ))
+    }
+
+    fn from_duplicate_attributes(attributes: u32) -> Option<Self> {
+        const OBJ_EXCLUSIVE: u32 = 0x20;
+
+        // Native NtDuplicateObject accepts and ignores unrelated object attributes, but an
+        // exclusive duplicate is invalid because the object already has an open handle.
+        if attributes & OBJ_EXCLUSIVE != 0 {
+            return None;
+        }
+        Some(Self::from_bits_retain(
+            attributes & Self::HANDLE_BEHAVIOR_ATTRIBUTES.bits(),
+        ))
     }
 }
 
@@ -536,6 +569,7 @@ pub struct Process<Platform: ShimPlatform> {
     ntdll_mapping: Option<MappingInfo>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
+    token: Arc<TokenObject>,
     condrv_console: syscalls::condrv::CondrvConsole<Platform>,
     object_manager: WindowsObjectManager<Platform>,
     section_views: WindowsSectionViews<Platform>,
@@ -583,6 +617,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             ntdll_mapping: None,
             peb_address: 0,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
+            token: Arc::new(TokenObject::primary()),
             // TODO(condrv-shared-console): move console ownership to shared state or a broker when
             // LiteBox supports AttachConsole/IOCTL_CONDRV_BIND_PID across guest processes.
             condrv_console: syscalls::condrv::CondrvConsole::new(),
@@ -743,6 +778,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     where
         Subsystem: WindowsHandleSubsystem,
     {
+        self.insert_typed_handle_with_attributes::<Subsystem>(
+            entry,
+            granted_access,
+            HandleAttributes::empty(),
+            cleanup_entry,
+        )
+    }
+
+    fn insert_typed_handle_with_attributes<Subsystem>(
+        &self,
+        entry: Subsystem::Entry,
+        granted_access: u32,
+        attributes: HandleAttributes,
+        cleanup_entry: impl FnOnce(Subsystem::Entry),
+    ) -> Result<syscalls::Handle, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
         let typed = {
             let mut descriptors = self.global.litebox.descriptor_table_mut();
             let typed = descriptors.insert::<Subsystem>(entry);
@@ -750,7 +803,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 &typed,
                 WindowsHandleMetadata {
                     granted_access,
-                    attributes: HandleAttributes::empty(),
+                    attributes,
                 },
             );
             debug_assert!(old.is_none());
@@ -1614,6 +1667,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenProcessToken {
+                process_handle,
+                desired_access,
+                token_handle,
+            } => {
+                let status =
+                    self.sys_nt_open_process_token(process_handle, desired_access, token_handle);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenProcessTokenEx {
+                process_handle,
+                desired_access,
+                handle_attributes,
+                token_handle,
+            } => {
+                let status = self.sys_nt_open_process_token_ex(
+                    process_handle,
+                    desired_access,
+                    handle_attributes,
+                    token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryInformationToken {
+                token_handle,
+                token_information_class,
+                token_information,
+                token_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_information_token(
+                    token_handle,
+                    token_information_class,
+                    token_information,
+                    token_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
                 flag,
                 source,
@@ -1892,6 +1984,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(target_handle) = target_handle
             && target_handle.write_at_offset(0, duplicate).is_none()
         {
+            let _ = self.remove_handle(duplicate, CloseRawHandleVisitor { task: self }, false);
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
@@ -1928,6 +2021,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_duplicate!(WaitCompletionPacketSubsystem<Platform>);
         try_duplicate!(WorkerFactorySubsystem<Platform>);
         try_duplicate!(SectionSubsystem<Platform>);
+        try_duplicate!(TokenSubsystem);
 
         Err(NtStatus::INVALID_HANDLE)
     }
@@ -1968,7 +2062,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let duplicate_attributes = if options.contains(DuplicateOptions::SAME_ATTRIBUTES) {
             source_metadata.attributes
         } else {
-            HandleAttributes::from_bits_retain(handle_attributes)
+            let Some(attributes) = HandleAttributes::from_duplicate_attributes(handle_attributes)
+            else {
+                return Some(Err(NtStatus::INVALID_PARAMETER));
+            };
+            attributes
         };
 
         let duplicate = {
@@ -1999,11 +2097,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         handle: syscalls::Handle,
         visitor: impl RawHandleVisitor<Platform, FS>,
     ) -> NtStatus {
+        self.remove_handle(handle, visitor, true)
+    }
+
+    fn remove_handle(
+        &self,
+        handle: syscalls::Handle,
+        visitor: impl RawHandleVisitor<Platform, FS>,
+        enforce_protect_from_close: bool,
+    ) -> NtStatus {
         macro_rules! try_close {
             ($subsystem:ty, $visit:ident) => {
-                if let Some(status) =
-                    self.try_close_handle::<$subsystem>(handle, |entry| visitor.$visit(entry))
-                {
+                if let Some(status) = self.try_remove_handle::<$subsystem>(
+                    handle,
+                    enforce_protect_from_close,
+                    |entry| visitor.$visit(entry),
+                ) {
                     return status;
                 }
             };
@@ -2023,13 +2132,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         try_close!(WorkerFactorySubsystem<Platform>, worker_factory);
         try_close!(SectionSubsystem<Platform>, section);
+        try_close!(TokenSubsystem, token);
 
         NtStatus::INVALID_HANDLE
     }
 
-    fn try_close_handle<Subsystem>(
+    fn try_remove_handle<Subsystem>(
         &self,
         handle: syscalls::Handle,
+        enforce_protect_from_close: bool,
         cleanup_entry: impl FnOnce(Subsystem::Entry),
     ) -> Option<NtStatus>
     where
@@ -2044,9 +2155,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(metadata) => metadata,
             Err(status) => return Some(status),
         };
-        if metadata
-            .attributes
-            .contains(HandleAttributes::PROTECT_FROM_CLOSE)
+        if enforce_protect_from_close
+            && metadata
+                .attributes
+                .contains(HandleAttributes::PROTECT_FROM_CLOSE)
         {
             return Some(NtStatus::HANDLE_NOT_CLOSABLE);
         }
@@ -2097,6 +2209,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
 
     fn section(&self, section: SectionHandleObject<Platform>);
+
+    fn token(&self, token: TokenHandleObject);
 }
 
 struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
@@ -2151,6 +2265,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn section(&self, section: SectionHandleObject<Platform>) {
         Task::<Platform, FS>::close_section(section);
+    }
+
+    fn token(&self, token: TokenHandleObject) {
+        Task::<Platform, FS>::close_token(token);
     }
 }
 
