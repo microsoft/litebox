@@ -161,14 +161,27 @@ fn dispatch_requests<Memory: SharedMemory>(
 
     std::thread::scope(|scope| {
         let mut workers = Vec::with_capacity(WORKER_COUNT);
-        for _ in 0..WORKER_COUNT {
+        for worker_id in 0..WORKER_COUNT {
             let association = Arc::clone(&association);
             let request_receiver = Arc::clone(&request_receiver);
             let response_sink = response_sink.clone();
-            let failure = Arc::clone(&failure);
-            workers.push(scope.spawn(move || {
-                run_worker(&association, &request_receiver, &response_sink, &failure);
-            }));
+            let worker_failure = Arc::clone(&failure);
+            match std::thread::Builder::new()
+                .name(format!("litebox-broker-worker-{worker_id}"))
+                .spawn_scoped(scope, move || {
+                    run_worker(
+                        &association,
+                        &request_receiver,
+                        &response_sink,
+                        &worker_failure,
+                    );
+                }) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    failure.report(error);
+                    break;
+                }
+            }
         }
 
         read_requests(&mut request_source, request_sender, &failure);
