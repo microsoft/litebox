@@ -44,15 +44,17 @@ fn loads_minimal_pe_without_imports() {
         .expect("failed to run litebox_runner_windows_userland");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let reached_unsupported_syscall = stdout.contains("Unsupported Windows syscall")
-        || stderr.contains("Unsupported Windows syscall");
 
     assert!(
-        output.status.success() || reached_unsupported_syscall,
-        "runner failed to load no-import PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.success(),
+        "runner failed to run no-import PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         stdout,
         stderr
+    );
+    assert!(
+        stdout.contains("hello world\n"),
+        "guest output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
@@ -60,11 +62,11 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
     let source_path = test_dir.join("no_import.rs");
     let raw_exe_path = test_dir.join("no_import.raw.exe");
     let exe_path = test_dir.join("no_import.exe");
-    let syscall_number = litebox_common_windows::NtSysno::NtTerminateProcess.as_raw();
-    println!("Using LiteBox NtTerminateProcess sysno `{syscall_number:#x}`");
+    let terminate_syscall_number = litebox_common_windows::NtSysno::NtTerminateProcess.as_raw();
+    let write_syscall_number = litebox_common_windows::NtSysno::NtWriteFile.as_raw();
     std::fs::write(
         &source_path,
-        minimal_pe_with_nt_terminate_process_syscall_source(syscall_number),
+        minimal_pe_source(write_syscall_number, terminate_syscall_number),
     )
     .unwrap();
 
@@ -75,6 +77,8 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
             source_path.to_str().unwrap(),
             "-C",
             "panic=abort",
+            "-C",
+            "opt-level=1",
             "-C",
             "link-arg=/ENTRY:mainCRTStartup",
             "-C",
@@ -101,21 +105,90 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
     exe_path
 }
 
-fn minimal_pe_with_nt_terminate_process_syscall_source(syscall_number: u32) -> String {
+fn minimal_pe_source(write_syscall_number: u32, terminate_syscall_number: u32) -> String {
     format!(
         r#"
 #![no_std]
 #![no_main]
 
+#[repr(C)]
+struct ProcessEnvironmentBlock {{
+    reserved: [u8; 0x20],
+    process_parameters: *const RtlUserProcessParameters,
+}}
+
+#[repr(C)]
+struct RtlUserProcessParameters {{
+    maximum_length: u32,
+    length: u32,
+    flags: u32,
+    debug_flags: u32,
+    console_handle: usize,
+    console_flags: u32,
+    padding: u32,
+    standard_input: usize,
+    standard_output: usize,
+    standard_error: usize,
+}}
+
+#[repr(C)]
+struct IoStatusBlock {{
+    status: i32,
+    padding: u32,
+    information: usize,
+}}
+
+#[unsafe(naked)]
+unsafe extern "system" fn nt_write_file(
+    _file_handle: usize,
+    _event: usize,
+    _apc_routine: usize,
+    _apc_context: usize,
+    _io_status_block: *mut IoStatusBlock,
+    _buffer: *const u8,
+    _length: u32,
+    _byte_offset: usize,
+    _key: usize,
+) -> i32 {{
+    core::arch::naked_asm!(
+        "mov r10, rcx",
+        "mov eax, {write_syscall_number:#x}",
+        "syscall",
+        "ret",
+    );
+}}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn mainCRTStartup() -> ! {{
     unsafe {{
+        static MESSAGE: &[u8] = b"hello world\n";
+        let peb: *const ProcessEnvironmentBlock;
+        core::arch::asm!("mov {{}}, gs:[0x60]", out(reg) peb);
+        let stdout = (*(*peb).process_parameters).standard_output;
+        let mut io_status = IoStatusBlock {{
+            status: -1,
+            padding: 0,
+            information: 0,
+        }};
+        let status = nt_write_file(
+            stdout,
+            0,
+            0,
+            0,
+            &raw mut io_status,
+            MESSAGE.as_ptr(),
+            MESSAGE.len() as u32,
+            0,
+            0,
+        );
+        let exit_status =
+            i32::from(status != 0 || io_status.status != 0 || io_status.information != MESSAGE.len());
         core::arch::asm!(
             "mov rcx, -1",
-            "xor edx, edx",
             "mov r10, rcx",
-            "mov eax, {syscall_number:#x}",
+            "mov eax, {terminate_syscall_number:#x}",
             "syscall",
+            in("edx") exit_status,
             options(noreturn),
         );
     }}

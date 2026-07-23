@@ -1297,6 +1297,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtWriteFile {
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                buffer,
+                length,
+                byte_offset,
+                key,
+            } => {
+                let status = self.sys_nt_write_file(
+                    file_handle,
+                    event,
+                    apc_routine,
+                    apc_context,
+                    io_status_block,
+                    buffer,
+                    length,
+                    byte_offset,
+                    key,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQueryVolumeInformationFile {
                 file_handle,
                 io_status_block,
