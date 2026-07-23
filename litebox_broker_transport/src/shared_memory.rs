@@ -26,6 +26,7 @@ use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemory, S
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::control_ring::{ControlRingConsumer, ControlRingProducer};
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
 };
@@ -112,6 +113,22 @@ fn shared_address(
     Ok(byte_address)
 }
 
+fn validate_nonoverlapping_atomic_ranges(
+    store_offset: usize,
+    add_offset: usize,
+) -> Result<(), SharedMemoryError> {
+    let store_end = store_offset
+        .checked_add(size_of::<u64>())
+        .ok_or(SharedMemoryError::InvalidRange)?;
+    let add_end = add_offset
+        .checked_add(size_of::<u32>())
+        .ok_or(SharedMemoryError::InvalidRange)?;
+    if store_offset < add_end && add_offset < store_end {
+        return Err(SharedMemoryError::InvalidRange);
+    }
+    Ok(())
+}
+
 impl MemfdSharedMemory {
     /// Creates and maps a sealed memfd with `length` bytes.
     pub fn create(length: usize) -> IoResult<Self> {
@@ -190,7 +207,7 @@ impl MemfdSharedMemory {
     ///
     /// A value change or signal interruption is reported as a successful,
     /// possibly spurious wakeup. The caller must recheck its wait condition.
-    pub fn futex_wait_u32(&self, offset: usize, expected: u32) -> IoResult<()> {
+    fn futex_wait_u32(&self, offset: usize, expected: u32) -> IoResult<()> {
         let word = atomic_u32_at(self, offset).map_err(shared_memory_error)?;
         match futex::wait(word, futex::Flags::empty(), expected, None) {
             Ok(()) | Err(Errno::AGAIN | Errno::INTR) => Ok(()),
@@ -199,10 +216,42 @@ impl MemfdSharedMemory {
     }
 
     /// Wakes one waiter blocked on a shared atomic `u32`.
-    pub fn futex_wake_u32(&self, offset: usize) -> IoResult<()> {
+    fn futex_wake_u32(&self, offset: usize) -> IoResult<()> {
         let word = atomic_u32_at(self, offset).map_err(shared_memory_error)?;
         futex::wake(word, futex::Flags::empty(), 1)?;
         Ok(())
+    }
+}
+
+impl ControlRingProducer<MemfdSharedMemory> {
+    /// Waits for consumer progress after [`ControlRingWriteStatus::Full`].
+    ///
+    /// The caller must retry the write after this possibly spurious wakeup.
+    pub fn wait_for_capacity(&self, wait_epoch: u32) -> IoResult<()> {
+        self.memory()
+            .futex_wait_u32(self.direction().consumer_epoch_offset(), wait_epoch)
+    }
+
+    /// Wakes the consumer after publishing one or more messages.
+    pub fn wake_consumer(&self) -> IoResult<()> {
+        self.memory()
+            .futex_wake_u32(self.direction().producer_epoch_offset())
+    }
+}
+
+impl ControlRingConsumer<MemfdSharedMemory> {
+    /// Waits for producer progress after [`ControlRingReadStatus::Empty`].
+    ///
+    /// The caller must retry the read after this possibly spurious wakeup.
+    pub fn wait_for_message(&self, wait_epoch: u32) -> IoResult<()> {
+        self.memory()
+            .futex_wait_u32(self.direction().producer_epoch_offset(), wait_epoch)
+    }
+
+    /// Wakes the producer after publishing newly consumed slots.
+    pub fn wake_producer(&self) -> IoResult<()> {
+        self.memory()
+            .futex_wake_u32(self.direction().consumer_epoch_offset())
     }
 }
 
@@ -281,6 +330,20 @@ impl AtomicSharedMemory for MemfdSharedMemory {
     fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
         atomic_u64_at(self, offset)?.store(value, Ordering::Release);
         Ok(())
+    }
+
+    fn store_u64_and_fetch_add_u32_release(
+        &self,
+        store_offset: usize,
+        value: u64,
+        add_offset: usize,
+        add_value: u32,
+    ) -> Result<u32, SharedMemoryError> {
+        validate_nonoverlapping_atomic_ranges(store_offset, add_offset)?;
+        let stored = atomic_u64_at(self, store_offset)?;
+        let added = atomic_u32_at(self, add_offset)?;
+        stored.store(value, Ordering::Release);
+        Ok(added.fetch_add(add_value, Ordering::Release))
     }
 }
 
@@ -410,8 +473,8 @@ fn shared_memory_error(error: SharedMemoryError) -> Error {
 mod tests {
     use super::*;
     use crate::control_ring::{
-        CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRing, ControlRingDirection,
-        ControlRingReadStatus, ControlRingWriteStatus,
+        CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRing, ControlRingReadStatus,
+        ControlRingWriteStatus,
     };
     use litebox_broker_protocol::shared_memory::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedBufferSlotIndex,
@@ -455,6 +518,21 @@ mod tests {
         assert_eq!(second.load_u64_acquire(8), Ok(0x0102_0304_0506_0708));
         assert_eq!(first.fetch_add_u32_release(4, 3), Ok(0));
         assert_eq!(second.load_u32_acquire(4), Ok(3));
+        assert_eq!(
+            first.store_u64_and_fetch_add_u32_release(8, 0x1112_1314_1516_1718, 4, 2),
+            Ok(3)
+        );
+        assert_eq!(second.load_u64_acquire(8), Ok(0x1112_1314_1516_1718));
+        assert_eq!(second.load_u32_acquire(4), Ok(5));
+        assert_eq!(
+            first.store_u64_and_fetch_add_u32_release(8, 0, 64, 1),
+            Err(SharedMemoryError::InvalidRange)
+        );
+        assert_eq!(
+            first.store_u64_and_fetch_add_u32_release(8, 0, 12, 1),
+            Err(SharedMemoryError::InvalidRange)
+        );
+        assert_eq!(second.load_u64_acquire(8), Ok(0x1112_1314_1516_1718));
         second.futex_wait_u32(4, 0).unwrap();
         assert_eq!(
             second.load_u64_acquire(1),
@@ -589,13 +667,7 @@ mod tests {
                 panic!("request ring should initially be empty");
             };
             broker_empty_checked.wait();
-            consumer
-                .memory()
-                .futex_wait_u32(
-                    ControlRingDirection::Requests.producer_epoch_offset(),
-                    producer_epoch,
-                )
-                .unwrap();
+            consumer.wait_for_message(producer_epoch).unwrap();
             for expected in 0..CONTROL_RING_SLOT_COUNT {
                 let expected = u8::try_from(expected).unwrap();
                 assert_eq!(
@@ -605,22 +677,13 @@ mod tests {
             }
 
             consumer.publish_head().unwrap();
-            consumer
-                .memory()
-                .futex_wake_u32(ControlRingDirection::Requests.consumer_epoch_offset())
-                .unwrap();
+            consumer.wake_producer().unwrap();
             match consumer
                 .try_read(|payload| Ok::<_, ()>(payload[0]))
                 .unwrap()
             {
                 ControlRingReadStatus::Empty { wait_epoch } => {
-                    consumer
-                        .memory()
-                        .futex_wait_u32(
-                            ControlRingDirection::Requests.producer_epoch_offset(),
-                            wait_epoch,
-                        )
-                        .unwrap();
+                    consumer.wait_for_message(wait_epoch).unwrap();
                     assert_eq!(
                         consumer.try_read(|payload| Ok::<_, ()>(payload[0])),
                         Ok(ControlRingReadStatus::Message(0xff))
@@ -644,26 +707,14 @@ mod tests {
         else {
             panic!("request ring should be full");
         };
-        producer
-            .memory()
-            .futex_wake_u32(ControlRingDirection::Requests.producer_epoch_offset())
-            .unwrap();
+        producer.wake_consumer().unwrap();
 
-        producer
-            .memory()
-            .futex_wait_u32(
-                ControlRingDirection::Requests.consumer_epoch_offset(),
-                consumer_epoch,
-            )
-            .unwrap();
+        producer.wait_for_capacity(consumer_epoch).unwrap();
         assert_eq!(
             producer.try_write(&[0xff]),
             Ok(ControlRingWriteStatus::Written)
         );
-        producer
-            .memory()
-            .futex_wake_u32(ControlRingDirection::Requests.producer_epoch_offset())
-            .unwrap();
+        producer.wake_consumer().unwrap();
 
         broker.join().unwrap();
     }

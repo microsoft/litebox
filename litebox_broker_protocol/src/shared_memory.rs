@@ -92,6 +92,20 @@ pub trait AtomicSharedMemory: SharedMemory {
     ///
     /// On error, the value must not have been stored.
     fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError>;
+
+    /// Atomically release-stores a native-endian `u64`, then release-adds to a
+    /// native-endian `u32`, returning the previous `u32`.
+    ///
+    /// Both values must be naturally aligned and occupy non-overlapping ranges.
+    /// Implementations must validate both accesses before storing either value.
+    /// On error, neither value may have been modified.
+    fn store_u64_and_fetch_add_u32_release(
+        &self,
+        store_offset: usize,
+        value: u64,
+        add_offset: usize,
+        add_value: u32,
+    ) -> Result<u32, SharedMemoryError>;
 }
 
 impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
