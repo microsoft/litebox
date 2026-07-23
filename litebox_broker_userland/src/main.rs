@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
-use litebox_broker_protocol::channel::{HostReceive, HostRequestSource, HostResponseSink};
+use litebox_broker_protocol::channel::HostReceive;
 use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_memory::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedMemory,

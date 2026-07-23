@@ -26,8 +26,8 @@ use crate::unix_io::{
 };
 use litebox_broker_protocol::RequestId;
 use litebox_broker_protocol::channel::{
-    HostControlChannel, HostNotificationChannel, HostReceive, HostRequestSource, HostResponseSink,
-    LocalControlChannel, LocalNotificationChannel, PeerCredential,
+    HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
+    LocalNotificationChannel, PeerCredential,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
@@ -490,10 +490,9 @@ impl HostControlChannel for UnixStreamHostControlChannel {
     }
 }
 
-impl HostRequestSource for UnixStreamHostRequestSource {
-    type Error = Error;
-
-    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+impl UnixStreamHostRequestSource {
+    /// Receives one active broker request.
+    pub fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
         let Some(frame) = read_frame_with_deadline(&mut self.stream, None)? else {
             return Ok(HostReceive::PeerClosed);
         };
@@ -505,14 +504,13 @@ impl HostRequestSource for UnixStreamHostRequestSource {
     }
 }
 
-impl HostResponseSink for UnixStreamHostResponseSink {
-    type Error = Error;
-
-    fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
+impl UnixStreamHostResponseSink {
+    /// Serializes and sends one complete active broker response.
+    pub fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
         let mut stream = self
             .stream
             .lock()
-            .expect("broker response writer mutex poisoned");
+            .map_err(|_| Error::other("broker response writer mutex poisoned"))?;
         write_frame_with_deadline(&mut stream, &encode_response(response.clone()), None)
     }
 }
