@@ -36,7 +36,7 @@ pub(super) struct SlotLease<'a, Platform: RawSyncPrimitivesProvider> {
 struct SlotWaiter<Platform: RawSyncPrimitivesProvider> {
     length: u32,
     result: Mutex<Platform, Option<Result<SharedBufferDescriptor, AcquireError>>>,
-    result_ready: Platform::RawMutex,
+    completion: Platform::RawMutex,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
@@ -139,7 +139,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotWaiter<Platform> {
         Self {
             length,
             result: Mutex::new(None),
-            result_ready: Platform::RawMutex::INIT,
+            completion: Platform::RawMutex::INIT,
         }
     }
 
@@ -148,8 +148,8 @@ impl<Platform: RawSyncPrimitivesProvider> SlotWaiter<Platform> {
         assert!(stored.is_none(), "shared-buffer waiter already resolved");
         *stored = Some(result);
         drop(stored);
-        self.result_ready.underlying_atomic().fetch_add(1, Release);
-        self.result_ready.wake_one();
+        self.completion.underlying_atomic().fetch_add(1, Release);
+        self.completion.wake_one();
     }
 
     fn wait(&self) -> Result<SharedBufferDescriptor, AcquireError> {
@@ -158,9 +158,9 @@ impl<Platform: RawSyncPrimitivesProvider> SlotWaiter<Platform> {
             if let Some(result) = result.take() {
                 return result;
             }
-            let observed = self.result_ready.underlying_atomic().load(Acquire);
+            let observed = self.completion.underlying_atomic().load(Acquire);
             drop(result);
-            let _ = self.result_ready.block(observed);
+            let _ = self.completion.block(observed);
         }
     }
 }
