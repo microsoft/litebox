@@ -4,10 +4,10 @@
 //! Hyper-V-specific code
 
 pub(crate) mod heki;
+pub(crate) mod heki_service;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;
-mod mem_integrity;
 pub(crate) mod ringbuffer;
 pub mod vsm;
 pub mod vsm_intercept;

@@ -6,7 +6,9 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
-use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
+use crate::{
+    host::per_cpu_variables::PerCpuVariablesAsm, mshv::heki_service::state::Vtl0KernelInfo,
+};
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{

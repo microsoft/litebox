@@ -3,7 +3,7 @@
 
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
-use crate::mshv::vsm::ModuleMemory;
+use crate::mshv::heki_service::state::ModuleMemory;
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
