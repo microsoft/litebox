@@ -434,8 +434,8 @@ mod tests {
         WireError, decode_request, encode_handshake_request, encode_request,
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::vec;
     use std::vec::Vec;
 
@@ -524,8 +524,7 @@ mod tests {
 
     #[test]
     fn producer_writes_payload_metadata_then_sequence_without_full_slot_staging() {
-        let memory = Arc::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE));
-        let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
+        let ring = test_ring();
         let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
 
         assert_eq!(
@@ -533,7 +532,7 @@ mod tests {
             Ok(ControlRingWriteStatus::Written)
         );
         assert_eq!(
-            memory.write_log(),
+            ring.memory().write_log(),
             vec![
                 (CONTROL_RING_SLOT_HEADER_SIZE, 3),
                 (
@@ -548,12 +547,11 @@ mod tests {
     #[test]
     fn failed_payload_metadata_or_sequence_write_does_not_publish_progress() {
         for failed_write in [1, 2, 3] {
-            let memory = Arc::new(FailingWriteMemory::new());
-            let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
+            let ring = ControlRing::new(FailingWriteMemory::new()).unwrap();
             let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
             let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
             producer.try_write(&ring, &[7]).unwrap();
-            memory.fail_after(failed_write);
+            ring.memory().fail_after(failed_write);
             assert_eq!(
                 producer.try_write(&ring, &[1, 2, 3]),
                 Err(ControlRingError::SharedMemory(
@@ -583,8 +581,7 @@ mod tests {
 
     #[test]
     fn shorter_reused_payload_does_not_expose_stale_trailing_bytes() {
-        let memory = Arc::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE));
-        let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
+        let ring = test_ring();
         let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
         let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
 
@@ -603,7 +600,8 @@ mod tests {
 
         producer.try_write(&ring, &[9]).unwrap();
         assert_eq!(
-            &memory.bytes()[CONTROL_RING_SLOT_HEADER_SIZE + 1..CONTROL_RING_SLOT_HEADER_SIZE + 100],
+            &ring.memory().bytes()
+                [CONTROL_RING_SLOT_HEADER_SIZE + 1..CONTROL_RING_SLOT_HEADER_SIZE + 100],
             &[7; 99]
         );
         assert_eq!(
@@ -829,11 +827,11 @@ mod tests {
 
     #[test]
     fn decoder_observes_only_the_owned_slot_snapshot() {
-        let memory = Arc::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE));
-        let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
+        let ring = test_ring();
         let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
         producer.try_write(&ring, &[1, 2, 3]).unwrap();
         let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
+        let memory = ring.memory();
 
         assert_eq!(
             consumer.try_read(&ring, |payload| {
@@ -869,8 +867,7 @@ mod tests {
 
     #[test]
     fn terminal_sequence_is_used_once_without_wrapping() {
-        let memory = Arc::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE));
-        let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
+        let ring = test_ring();
         let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
         producer.tail = u64::MAX - 1;
         producer.acknowledged_head = u64::MAX - 1;
@@ -879,12 +876,12 @@ mod tests {
             producer.try_write(&ring, &[7]),
             Ok(ControlRingWriteStatus::Written)
         );
-        let writes = memory.write_count.load(Ordering::Relaxed);
+        let writes = ring.memory().write_count.load(Ordering::Relaxed);
         assert_eq!(
             producer.try_write(&ring, &[8]),
             Err(ControlRingError::CounterExhausted)
         );
-        assert_eq!(memory.write_count.load(Ordering::Relaxed), writes);
+        assert_eq!(ring.memory().write_count.load(Ordering::Relaxed), writes);
 
         let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
         consumer.head = u64::MAX - 1;

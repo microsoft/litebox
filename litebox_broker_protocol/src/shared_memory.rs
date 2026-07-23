@@ -108,24 +108,6 @@ impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
     }
 }
 
-impl<Memory: AtomicSharedMemory + ?Sized> AtomicSharedMemory for Arc<Memory> {
-    fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
-        (**self).load_u32_acquire(offset)
-    }
-
-    fn fetch_add_u32_release(&self, offset: usize, value: u32) -> Result<u32, SharedMemoryError> {
-        (**self).fetch_add_u32_release(offset, value)
-    }
-
-    fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
-        (**self).load_u64_acquire(offset)
-    }
-
-    fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
-        (**self).store_u64_release(offset, value)
-    }
-}
-
 /// Error validating or accessing a fixed-slot shared-buffer pool.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
