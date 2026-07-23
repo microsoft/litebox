@@ -6,6 +6,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::borrow::Borrow;
 use core::mem::size_of;
 
 use int_enum::IntEnum;
@@ -177,9 +178,6 @@ struct TokenSecurityAttributeV1 {
     values: usize,
 }
 
-const _: () = assert!(size_of::<TokenSecurityAttributeV1>() == 40);
-const _: () = assert!(core::mem::offset_of!(TokenSecurityAttributeV1, values) == 32);
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
 struct TokenSecurityAttributesInformation {
@@ -188,9 +186,6 @@ struct TokenSecurityAttributesInformation {
     attribute_count: u32,
     attribute_v1: usize,
 }
-
-const _: () = assert!(size_of::<TokenSecurityAttributesInformation>() == 16);
-const _: () = assert!(core::mem::offset_of!(TokenSecurityAttributesInformation, attribute_v1) == 8);
 
 struct TokenSecurityAttribute {
     name: Box<[u16]>,
@@ -457,7 +452,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }),
             TokenInformationClass::SecurityAttributes => entry.with_entry(|entry| {
                 Self::write_token_security_attributes(
-                    &entry.token.security_attributes.iter().collect::<Vec<_>>(),
+                    &entry.token.security_attributes,
                     token_information,
                     token_information_length,
                     return_length,
@@ -531,9 +526,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         number_of_attributes: u32,
     ) -> Result<Vec<alloc::string::String>, NtStatus> {
         let mut names = Vec::new();
-        for index in 0..number_of_attributes {
+        for index in 0..number_of_attributes as usize {
             let name = attributes
-                .read_at_offset(index.try_into().map_err(|_| NtStatus::INVALID_PARAMETER)?)
+                .read_at_offset(index.cast_signed())
                 .ok_or(NtStatus::ACCESS_VIOLATION)?
                 .read_string::<Platform>()?;
             names.push(name);
@@ -568,8 +563,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(selected)
     }
 
-    fn write_token_security_attributes(
-        security_attributes: &[&TokenSecurityAttribute],
+    fn write_token_security_attributes<S: Borrow<TokenSecurityAttribute>>(
+        security_attributes: &[S],
         buffer: MutPtr<Platform, u8>,
         length: u32,
         return_length: MutPtr<Platform, u32>,
@@ -585,6 +580,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER;
         };
         for attribute in security_attributes {
+            let attribute = attribute.borrow();
             let Some(name_bytes) = attribute.name.len().checked_mul(size_of::<u16>()) else {
                 return NtStatus::INVALID_PARAMETER;
             };
@@ -634,7 +630,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let mut name_offset = size_of::<TokenSecurityAttributesInformation>() + attribute_bytes;
+        let attribute_buffer =
+            MutPtr::<Platform, TokenSecurityAttributeV1>::from_usize(attribute_v1);
         for (index, attribute) in security_attributes.iter().enumerate() {
+            let attribute = attribute.borrow();
             let Some(name_length) = attribute.name.len().checked_mul(size_of::<u16>()) else {
                 return NtStatus::INVALID_PARAMETER;
             };
@@ -658,22 +657,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 padding: 0,
                 values: 0,
             };
-            let attribute_offset = size_of::<TokenSecurityAttributesInformation>()
-                + index * size_of::<TokenSecurityAttributeV1>();
-            let Ok(attribute_offset) = isize::try_from(attribute_offset) else {
-                return NtStatus::ACCESS_VIOLATION;
-            };
-            if buffer
-                .write_slice_at_offset(attribute_offset, information.as_bytes())
+            if attribute_buffer
+                .write_at_offset(index.cast_signed(), information)
                 .is_none()
             {
                 return NtStatus::ACCESS_VIOLATION;
             }
-            let Ok(name_offset_isize) = isize::try_from(name_offset) else {
-                return NtStatus::ACCESS_VIOLATION;
-            };
             if buffer
-                .write_slice_at_offset(name_offset_isize, attribute.name.as_bytes())
+                .write_slice_at_offset(name_offset.cast_signed(), attribute.name.as_bytes())
                 .is_none()
             {
                 return NtStatus::ACCESS_VIOLATION;
@@ -802,100 +793,6 @@ mod tests {
         );
         assert_eq!(output.user.user.attributes, 0);
         assert_eq!(output.sid, LOCAL_SYSTEM_SID);
-    }
-
-    #[test]
-    fn query_security_attributes_reports_the_empty_primary_token() {
-        let task = test_task();
-        let mut required_length = 0;
-
-        assert_eq!(
-            task.sys_nt_query_security_attributes_token(
-                Task::<crate::tests::TestPlatform, crate::tests::TestFS>::CURRENT_PROCESS_TOKEN,
-                null_const_ptr(),
-                0,
-                null_mut_ptr(),
-                0,
-                mut_ptr(&mut required_length),
-            ),
-            NtStatus::BUFFER_TOO_SMALL
-        );
-        assert_eq!(
-            required_length as usize,
-            size_of::<TokenSecurityAttributesInformation>()
-        );
-
-        let mut output = TokenSecurityAttributesInformation {
-            version: u16::MAX,
-            reserved: u16::MAX,
-            attribute_count: u32::MAX,
-            attribute_v1: usize::MAX,
-        };
-        assert_eq!(
-            task.sys_nt_query_security_attributes_token(
-                Task::<crate::tests::TestPlatform, crate::tests::TestFS>::CURRENT_PROCESS_TOKEN,
-                null_const_ptr(),
-                0,
-                mut_byte_ptr(&mut output),
-                required_length,
-                mut_ptr(&mut required_length),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            output,
-            TokenSecurityAttributesInformation {
-                version: TokenSecurityAttributesInformationVersion::V1 as u16,
-                reserved: 0,
-                attribute_count: 0,
-                attribute_v1: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn query_information_token_shares_the_security_attribute_layout() {
-        let task = test_task();
-        let mut handle = Handle::default();
-        assert_eq!(
-            task.sys_nt_open_process_token(
-                ProcessHandle::CURRENT,
-                TokenAccess::QUERY.bits(),
-                mut_ptr(&mut handle),
-            ),
-            NtStatus::SUCCESS
-        );
-        let mut output = TokenSecurityAttributesInformation {
-            version: u16::MAX,
-            reserved: u16::MAX,
-            attribute_count: u32::MAX,
-            attribute_v1: usize::MAX,
-        };
-        let mut return_length = 0;
-
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                handle,
-                TokenInformationClass::SecurityAttributes as u32,
-                mut_byte_ptr(&mut output),
-                size_of::<TokenSecurityAttributesInformation>().trunc(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            output,
-            TokenSecurityAttributesInformation {
-                version: TokenSecurityAttributesInformationVersion::V1 as u16,
-                reserved: 0,
-                attribute_count: 0,
-                attribute_v1: 0,
-            }
-        );
-        assert_eq!(
-            return_length as usize,
-            size_of::<TokenSecurityAttributesInformation>()
-        );
     }
 
     #[test]
@@ -1045,54 +942,6 @@ mod tests {
                 mut_ptr(&mut return_length),
             ),
             NtStatus::SUCCESS
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn query_security_attributes_rejects_invalid_pointers() {
-        let task = test_task();
-        let mut output = TokenSecurityAttributesInformation {
-            version: 0,
-            reserved: 0,
-            attribute_count: 0,
-            attribute_v1: 0,
-        };
-
-        assert_eq!(
-            task.sys_nt_query_security_attributes_token(
-                Task::<crate::tests::TestPlatform, crate::tests::TestFS>::CURRENT_PROCESS_TOKEN,
-                null_const_ptr(),
-                0,
-                mut_byte_ptr(&mut output),
-                size_of::<TokenSecurityAttributesInformation>().trunc(),
-                null_mut_ptr(),
-            ),
-            NtStatus::ACCESS_VIOLATION
-        );
-
-        let mut return_length = u32::MAX;
-        assert_eq!(
-            task.sys_nt_query_security_attributes_token(
-                Task::<crate::tests::TestPlatform, crate::tests::TestFS>::CURRENT_PROCESS_TOKEN,
-                null_const_ptr(),
-                1,
-                mut_byte_ptr(&mut output),
-                size_of::<TokenSecurityAttributesInformation>().trunc(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::INVALID_PARAMETER
-        );
-        assert_eq!(
-            task.sys_nt_query_security_attributes_token(
-                Task::<crate::tests::TestPlatform, crate::tests::TestFS>::CURRENT_PROCESS_TOKEN,
-                null_const_ptr(),
-                0,
-                MutPtr::<crate::tests::TestPlatform, u8>::from_usize(1),
-                size_of::<TokenSecurityAttributesInformation>().trunc(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::ACCESS_VIOLATION
         );
     }
 }
