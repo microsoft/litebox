@@ -301,14 +301,8 @@ pub fn encode_local_doorbell(doorbell: LocalDoorbell) -> Vec<u8> {
 /// Decodes local control-ring progress.
 pub fn decode_local_doorbell(frame: &[u8]) -> Result<LocalDoorbell, WireError> {
     let mut decoder = Decoder::new(frame);
-    match decoder.u8()? {
-        REQUEST_TAG_LOCAL_DOORBELL => {}
-        REQUEST_TAG_NEGOTIATE
-        | REQUEST_TAG_EVENT
-        | REQUEST_TAG_CLOSE_OBJECT
-        | REQUEST_TAG_PIPE
-        | REQUEST_TAG_CHECK_READINESS => return Err(WireError::WrongMessagePhase),
-        _ => return Err(WireError::InvalidTag),
+    if decoder.u8()? != REQUEST_TAG_LOCAL_DOORBELL {
+        return Err(WireError::InvalidTag);
     }
     let doorbell = LocalDoorbell {
         request_tail: decoder.u64()?,
@@ -330,17 +324,8 @@ pub fn encode_broker_doorbell(doorbell: BrokerDoorbell) -> Vec<u8> {
 /// Decodes broker control-ring progress.
 pub fn decode_broker_doorbell(frame: &[u8]) -> Result<BrokerDoorbell, WireError> {
     let mut decoder = Decoder::new(frame);
-    match decoder.u8()? {
-        RESPONSE_TAG_BROKER_DOORBELL => {}
-        RESPONSE_TAG_NEGOTIATED
-        | RESPONSE_TAG_EVENT
-        | RESPONSE_TAG_HANDSHAKE_ERROR
-        | RESPONSE_TAG_VERSION_MISMATCH
-        | RESPONSE_TAG_OBJECT_CLOSED
-        | RESPONSE_TAG_PIPE
-        | RESPONSE_TAG_READINESS
-        | RESPONSE_TAG_ERROR => return Err(WireError::WrongMessagePhase),
-        _ => return Err(WireError::InvalidTag),
+    if decoder.u8()? != RESPONSE_TAG_BROKER_DOORBELL {
+        return Err(WireError::InvalidTag);
     }
     let doorbell = BrokerDoorbell {
         request_head: decoder.u64()?,
@@ -813,14 +798,14 @@ mod tests {
             decode_local_doorbell(&encode_handshake_request(BrokerHandshakeRequest {
                 protocol_version: ProtocolVersion(1),
             })),
-            Err(WireError::WrongMessagePhase)
+            Err(WireError::InvalidTag)
         );
         assert_eq!(
             decode_local_doorbell(&encode_request(BrokerRequest {
                 request_id: TEST_REQUEST_ID,
                 operation: BrokerOperation::CloseObject(ObjectHandle(13)),
             })),
-            Err(WireError::WrongMessagePhase)
+            Err(WireError::InvalidTag)
         );
         assert_eq!(
             decode_handshake_request(&encode_local_doorbell(LocalDoorbell::default())),
@@ -857,14 +842,14 @@ mod tests {
                     broker_protocol_version: ProtocolVersion(1),
                 },
             )),
-            Err(WireError::WrongMessagePhase)
+            Err(WireError::InvalidTag)
         );
         assert_eq!(
             decode_broker_doorbell(&encode_response(BrokerResponse {
                 request_id: TEST_REQUEST_ID,
                 result: BrokerResult::ObjectClosed,
             })),
-            Err(WireError::WrongMessagePhase)
+            Err(WireError::InvalidTag)
         );
         assert_eq!(
             decode_handshake_response(&encode_broker_doorbell(BrokerDoorbell::default())),
