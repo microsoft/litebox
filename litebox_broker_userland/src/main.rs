@@ -22,6 +22,7 @@ use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_memory::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedMemory,
 };
+use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
     UnixStreamHostControlChannel, UnixStreamHostControlShutdown, UnixStreamHostNotificationChannel,
@@ -111,6 +112,9 @@ fn serve_runner(
     )?;
     let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE)?;
     let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)?;
+    let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE)?;
+    let control_ring = ControlRing::new(control_memory)
+        .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let mut control_channel =
         UnixStreamHostControlChannel::from_host_guaranteed(control_stream, setup_deadline);
     let _notification_channel =
@@ -118,6 +122,7 @@ fn serve_runner(
     let association =
         match setup_connection(broker, &mut control_channel, &shared_buffers, |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
+            channel.send_memfd(control_ring.memory(), Some(setup_deadline))?;
             Ok(())
         })? {
             Ok(association) => association,
@@ -143,7 +148,7 @@ fn serve_runner(
                 .into());
             }
         };
-    let (request_source, response_sink, shutdown) = control_channel.into_active()?;
+    let (request_source, response_sink, shutdown) = control_channel.into_active(control_ring)?;
     dispatch_requests(association, request_source, response_sink, shutdown)?;
     Ok(())
 }
@@ -336,19 +341,37 @@ fn accept_runner_stream(
 mod tests {
     use super::*;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::channel::HostControlChannel;
+    use litebox_broker_protocol::channel::{HostSetupChannel, LocalControlChannel};
     use litebox_broker_protocol::message::BrokerHandshakeResponse;
+    use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
+    use std::os::fd::AsFd;
 
     #[test]
     fn first_failure_is_preserved_and_unblocks_request_reading() {
         let (peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut local_channel = UnixStreamLocalControlChannel::from_connected(peer_stream);
         let mut control_channel = UnixStreamHostControlChannel::from_accepted(host_stream);
         control_channel
             .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             })
             .unwrap();
-        let (mut request_source, _response_sink, shutdown) = control_channel.into_active().unwrap();
+        local_channel.recv_handshake_response().unwrap().unwrap();
+        let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let host_memory = MemfdSharedMemory::from_received_fd(
+            local_memory.as_fd().try_clone_to_owned().unwrap(),
+            CONTROL_RING_MEMORY_SIZE,
+        )
+        .unwrap();
+        let local_ring = ControlRing::new(local_memory).unwrap();
+        let host_ring = ControlRing::new(host_memory).unwrap();
+        let local_activation = std::thread::spawn(move || {
+            let cancellation = local_channel.activate(local_ring, || {}).unwrap();
+            (local_channel, cancellation)
+        });
+        let (mut request_source, _response_sink, shutdown) =
+            control_channel.into_active(host_ring).unwrap();
+        let (_local_channel, _cancellation) = local_activation.join().unwrap();
         let failure = HostAssociationFailure::new(shutdown);
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
         let reader = std::thread::spawn(move || {
@@ -358,7 +381,6 @@ mod tests {
         failure.report(IoError::new(ErrorKind::TimedOut, "first failure"));
         failure.report(IoError::other("second failure"));
         let receive_result = result_receiver.recv_timeout(Duration::from_secs(1));
-        drop(peer_stream);
         reader.join().unwrap();
 
         assert!(matches!(

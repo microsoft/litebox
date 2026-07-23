@@ -13,6 +13,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_memory::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
+use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
 };
@@ -90,7 +91,17 @@ fn run_fake_runner(args: &[OsString]) {
                 SHARED_BUFFER_POOL_SIZE,
                 Some(Instant::now() + Duration::from_secs(5)),
             )?;
-            let _cancellation = channel.activate(|| {})?;
+            let control_memory = channel.receive_memfd(
+                CONTROL_RING_MEMORY_SIZE,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )?;
+            let control_ring = ControlRing::new(control_memory).map_err(|error| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid test control ring: {error:?}"),
+                )
+            })?;
+            let _cancellation = channel.activate(control_ring, || {})?;
             Ok(Arc::new(shared_memory))
         })
         .unwrap(),

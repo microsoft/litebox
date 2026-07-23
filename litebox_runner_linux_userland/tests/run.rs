@@ -388,6 +388,14 @@ fn spawn_test_broker(
                     litebox_broker_protocol::shared_memory::SHARED_BUFFER_LAYOUT,
                 )
                 .expect("failed to attach broker test shared-buffer layout");
+                let control_memory =
+                    litebox_broker_transport::shared_memory::MemfdSharedMemory::create(
+                        litebox_broker_transport::control_ring::CONTROL_RING_MEMORY_SIZE,
+                    )
+                    .expect("failed to create broker test control ring");
+                let control_ring =
+                    litebox_broker_transport::control_ring::ControlRing::new(control_memory)
+                        .expect("failed to attach broker test control ring");
                 let (notification_stream, _) = notification_listener
                     .accept()
                     .expect("failed to accept broker local notification connection");
@@ -408,29 +416,60 @@ fn spawn_test_broker(
                 notification_stream
                     .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker notification test write timeout");
-                let mut channel = CountingHostControlChannel {
-                    inner: litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_host_guaranteed(
+                let mut channel =
+                    litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_host_guaranteed(
                         control_stream,
                         std::time::Instant::now() + BROKER_HELPER_TIMEOUT,
-                    ),
-                    close_object_count: 0,
-                };
-                let mut notification_channel =
+                    );
+                let _notification_channel =
                     litebox_broker_transport::unix_socket::UnixStreamHostNotificationChannel::from_accepted(notification_stream);
-                let termination = litebox_broker_host::serve_connection(
+                let association = litebox_broker_host::setup_connection(
                     &broker,
                     &mut channel,
-                    &mut notification_channel,
                     &shared_buffers,
-                    |channel| channel.inner.send_memfd(shared_buffers.memory(), None),
+                    |channel| {
+                        channel.send_memfd(shared_buffers.memory(), None)?;
+                        channel.send_memfd(control_ring.memory(), None)
+                    },
                 )
-                .expect("broker host failed");
+                .expect("broker host setup failed")
+                .expect("broker setup terminated before activation");
+                let (mut request_source, response_sink, _shutdown) = channel
+                    .into_active(control_ring)
+                    .expect("failed to activate broker test control ring");
+                let mut close_object_count = 0;
+                let termination = loop {
+                    match request_source
+                        .recv_request()
+                        .expect("failed to receive broker test request")
+                    {
+                        litebox_broker_protocol::channel::HostReceive::Message(request) => {
+                            if matches!(
+                                &request.operation,
+                                litebox_broker_protocol::message::BrokerOperation::CloseObject(_)
+                            ) {
+                                close_object_count += 1;
+                            }
+                            association
+                                .execute_request(request, |response| {
+                                    response_sink.send_response(response)
+                                })
+                                .expect("failed to execute broker test request");
+                        }
+                        litebox_broker_protocol::channel::HostReceive::PeerClosed => {
+                            break litebox_broker_host::ConnectionTermination::PeerClosed;
+                        }
+                        litebox_broker_protocol::channel::HostReceive::ProtocolViolation => {
+                            break litebox_broker_host::ConnectionTermination::ProtocolViolation;
+                        }
+                    }
+                };
                 assert_eq!(
                     termination,
                     litebox_broker_host::ConnectionTermination::PeerClosed
                 );
                 close_object_count_tx
-                    .send(channel.close_object_count)
+                    .send(close_object_count)
                     .expect("failed to report broker close-object count");
             }
         }));
@@ -451,73 +490,6 @@ fn spawn_test_broker(
         close_object_count_rx,
         control_socket_path: cleanup_control_socket_path,
         notification_socket_path: cleanup_notification_socket_path,
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-struct CountingHostControlChannel<Channel: litebox_broker_protocol::channel::HostControlChannel> {
-    inner: Channel,
-    close_object_count: usize,
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
-    litebox_broker_protocol::channel::HostControlChannel for CountingHostControlChannel<Channel>
-{
-    type Error = Channel::Error;
-
-    fn peer_credential(
-        &self,
-    ) -> Result<litebox_broker_protocol::channel::PeerCredential, Self::Error> {
-        self.inner.peer_credential()
-    }
-
-    fn recv_handshake_request(
-        &mut self,
-    ) -> Result<
-        litebox_broker_protocol::channel::HostReceive<
-            litebox_broker_protocol::message::BrokerHandshakeRequest,
-        >,
-        Self::Error,
-    > {
-        self.inner.recv_handshake_request()
-    }
-
-    fn send_handshake_response(
-        &mut self,
-        response: &litebox_broker_protocol::message::BrokerHandshakeResponse,
-    ) -> Result<(), Self::Error> {
-        self.inner.send_handshake_response(response)
-    }
-
-    fn recv_request(
-        &mut self,
-    ) -> Result<
-        litebox_broker_protocol::channel::HostReceive<
-            litebox_broker_protocol::message::BrokerRequest,
-        >,
-        Self::Error,
-    > {
-        let request = self.inner.recv_request()?;
-        if matches!(
-            &request,
-            litebox_broker_protocol::channel::HostReceive::Message(
-                litebox_broker_protocol::message::BrokerRequest {
-                    operation: litebox_broker_protocol::message::BrokerOperation::CloseObject(_),
-                    ..
-                }
-            )
-        ) {
-            self.close_object_count += 1;
-        }
-        Ok(request)
-    }
-
-    fn send_response(
-        &mut self,
-        response: &litebox_broker_protocol::message::BrokerResponse,
-    ) -> Result<(), Self::Error> {
-        self.inner.send_response(response)
     }
 }
 

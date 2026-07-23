@@ -313,6 +313,38 @@ pub struct ControlRingProducer<Memory: AtomicSharedMemory> {
     acknowledged_head: u64,
 }
 
+/// Cloneable, narrow handle for interrupting a wait on one ring endpoint.
+///
+/// This handle intentionally exposes neither the backing memory nor endpoint
+/// state. Hosted transports use it to make liveness and cancellation events
+/// visible to a thread blocked in an OS-specific wait.
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+pub(crate) struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
+    ring: Arc<ControlRing<Memory>>,
+    wait_epoch_offset: usize,
+}
+
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+impl<Memory: AtomicSharedMemory> Clone for ControlRingWakeHandle<Memory> {
+    fn clone(&self) -> Self {
+        Self {
+            ring: Arc::clone(&self.ring),
+            wait_epoch_offset: self.wait_epoch_offset,
+        }
+    }
+}
+
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+impl<Memory: AtomicSharedMemory> ControlRingWakeHandle<Memory> {
+    pub(crate) const fn wait_epoch_offset(&self) -> usize {
+        self.wait_epoch_offset
+    }
+
+    pub(crate) fn memory(&self) -> &Memory {
+        self.ring.memory()
+    }
+}
+
 impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
     fn new(ring: Arc<ControlRing<Memory>>, direction: ControlRingDirection) -> Self {
         Self {
@@ -326,6 +358,14 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
     /// Returns the ring direction written by this producer.
     pub const fn direction(&self) -> ControlRingDirection {
         self.direction
+    }
+
+    #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+    pub(crate) fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
+        ControlRingWakeHandle {
+            ring: Arc::clone(&self.ring),
+            wait_epoch_offset: self.direction.consumer_epoch_offset(),
+        }
     }
 
     #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
@@ -410,6 +450,14 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
     /// Returns the ring direction read by this consumer.
     pub const fn direction(&self) -> ControlRingDirection {
         self.direction
+    }
+
+    #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+    pub(crate) fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
+        ControlRingWakeHandle {
+            ring: Arc::clone(&self.ring),
+            wait_epoch_offset: self.direction.producer_epoch_offset(),
+        }
     }
 
     #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]

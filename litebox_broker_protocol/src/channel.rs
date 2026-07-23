@@ -20,7 +20,7 @@ pub enum PeerCredential {
     /// Explicit deployment mode for the initial unauthenticated userland POC.
     ///
     /// Channels that are expected to authenticate peers must return an error
-    /// from [`HostControlChannel::peer_credential`] when authentication is
+    /// from [`HostSetupChannel::peer_credential`] when authentication is
     /// unavailable or fails; this variant is only for deployments that
     /// deliberately choose unauthenticated operation.
     Unauthenticated,
@@ -63,8 +63,8 @@ pub trait LocalControlChannel {
     fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error>;
 }
 
-/// Host-side control channel for broker authority calls.
-pub trait HostControlChannel {
+/// Host-side channel for broker association setup.
+pub trait HostSetupChannel {
     /// Channel-specific error type.
     type Error;
 
@@ -81,7 +81,10 @@ pub trait HostControlChannel {
         &mut self,
         response: &BrokerHandshakeResponse,
     ) -> Result<(), Self::Error>;
+}
 
+/// Host-side control channel that carries both setup and active broker calls.
+pub trait HostControlChannel: HostSetupChannel {
     /// Receives one active broker request.
     fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
 

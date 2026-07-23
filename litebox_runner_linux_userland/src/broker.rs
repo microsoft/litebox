@@ -14,6 +14,7 @@ use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE;
+use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
     UnixStreamLocalNotificationCancellation, UnixStreamLocalNotificationChannel,
@@ -66,8 +67,16 @@ pub(crate) fn connect(
         move |channel| {
             let shared_memory =
                 channel.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
+            let control_memory =
+                channel.receive_memfd(CONTROL_RING_MEMORY_SIZE, Some(setup_deadline))?;
+            let control_ring = ControlRing::new(control_memory).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid broker control ring: {error:?}"),
+                )
+            })?;
             let weak_association_coordinator = Arc::downgrade(&association_coordinator);
-            let control_cancellation_handle = channel.activate(move || {
+            let control_cancellation_handle = channel.activate(control_ring, move || {
                 if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
                     association_coordinator.report_failure();
                 }
@@ -216,11 +225,16 @@ fn connect_with_retry<Channel>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_protocol::channel::{HostControlChannel, HostReceive, LocalControlChannel};
+    use litebox_broker_protocol::channel::{HostReceive, HostSetupChannel, LocalControlChannel};
     use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
     use litebox_broker_protocol::{ObjectHandle, RequestId};
-    use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
+    use litebox_broker_transport::shared_memory::MemfdSharedMemory;
+    use litebox_broker_transport::unix_socket::{
+        UnixStreamHostControlChannel, UnixStreamHostControlShutdown, UnixStreamHostRequestSource,
+        UnixStreamHostResponseSink,
+    };
     use std::io::{ErrorKind, Read};
+    use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
 
@@ -253,16 +267,34 @@ mod tests {
 
     fn activate_control_channel(
         channel: &mut UnixStreamLocalControlChannel,
+        host_channel: UnixStreamHostControlChannel,
         association_coordinator: &Arc<BrokerAssociationFailureCoordinator>,
-    ) -> UnixStreamLocalControlCancellation {
+    ) -> (
+        UnixStreamLocalControlCancellation,
+        UnixStreamHostRequestSource,
+        UnixStreamHostResponseSink,
+        UnixStreamHostControlShutdown,
+    ) {
+        let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let host_memory = MemfdSharedMemory::from_received_fd(
+            local_memory.as_fd().try_clone_to_owned().unwrap(),
+            CONTROL_RING_MEMORY_SIZE,
+        )
+        .unwrap();
+        let local_ring = ControlRing::new(local_memory).unwrap();
+        let host_ring = ControlRing::new(host_memory).unwrap();
+        let host_activation =
+            std::thread::spawn(move || host_channel.into_active(host_ring).unwrap());
         let weak_association_coordinator = Arc::downgrade(association_coordinator);
-        channel
-            .activate(move || {
+        let cancellation = channel
+            .activate(local_ring, move || {
                 if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
                     association_coordinator.report_failure();
                 }
             })
-            .unwrap()
+            .unwrap();
+        let (request_source, response_sink, shutdown) = host_activation.join().unwrap();
+        (cancellation, request_source, response_sink, shutdown)
     }
 
     #[test]
@@ -279,15 +311,17 @@ mod tests {
         let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
             notification_channel.cancellation_handle().unwrap(),
         ));
-        let control_cancellation_handle =
-            activate_control_channel(&mut active_channel, &association_coordinator);
+        let (control_cancellation_handle, host_request_source, host_response_sink, host_shutdown) =
+            activate_control_channel(&mut active_channel, host_control, &association_coordinator);
         association_coordinator
             .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
         let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
         association_coordinator.install_dispatch(move || failure_sender.send(()).unwrap());
 
-        drop(host_control);
+        host_shutdown.shutdown().unwrap();
+        drop(host_request_source);
+        drop(host_response_sink);
 
         failure_receiver
             .recv_timeout(Duration::from_secs(1))
@@ -304,7 +338,7 @@ mod tests {
         host_control
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let (mut active_channel, mut host_control) =
+        let (mut active_channel, host_control) =
             negotiate_control_pair(local_control, host_control);
         let (local_notification, mut host_notification) = UnixStream::pair().unwrap();
         host_notification
@@ -315,8 +349,12 @@ mod tests {
         let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
             notification_channel.cancellation_handle().unwrap(),
         ));
-        let control_cancellation_handle =
-            activate_control_channel(&mut active_channel, &association_coordinator);
+        let (
+            control_cancellation_handle,
+            mut host_request_source,
+            _host_response_sink,
+            _host_shutdown,
+        ) = activate_control_channel(&mut active_channel, host_control, &association_coordinator);
 
         association_coordinator.report_failure();
 
@@ -331,7 +369,7 @@ mod tests {
         association_coordinator.install_dispatch(move || failure_sender.send(()).unwrap());
         failure_receiver.try_recv().unwrap();
         assert_eq!(
-            host_control.recv_request().unwrap(),
+            host_request_source.recv_request().unwrap(),
             HostReceive::PeerClosed
         );
         let mut byte = [0];
@@ -343,7 +381,7 @@ mod tests {
     #[test]
     fn notification_failure_cancels_control() {
         let (local_control, host_control) = UnixStream::pair().unwrap();
-        let (mut active_channel, mut host_control) =
+        let (mut active_channel, host_control) =
             negotiate_control_pair(local_control, host_control);
         let (local_notification, host_notification) = UnixStream::pair().unwrap();
         let notification_channel =
@@ -351,8 +389,12 @@ mod tests {
         let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
             notification_channel.cancellation_handle().unwrap(),
         ));
-        let control_cancellation_handle =
-            activate_control_channel(&mut active_channel, &association_coordinator);
+        let (
+            control_cancellation_handle,
+            mut host_request_source,
+            _host_response_sink,
+            _host_shutdown,
+        ) = activate_control_channel(&mut active_channel, host_control, &association_coordinator);
         association_coordinator
             .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
@@ -373,7 +415,7 @@ mod tests {
             })
         });
         assert!(matches!(
-            host_control.recv_request().unwrap(),
+            host_request_source.recv_request().unwrap(),
             HostReceive::Message(_)
         ));
 
@@ -384,7 +426,7 @@ mod tests {
             .unwrap();
         assert!(pending_call.join().unwrap().is_err());
         assert_eq!(
-            host_control.recv_request().unwrap(),
+            host_request_source.recv_request().unwrap(),
             HostReceive::PeerClosed
         );
     }

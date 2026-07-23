@@ -26,7 +26,7 @@ use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemory, S
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::control_ring::{ControlRingConsumer, ControlRingProducer};
+use crate::control_ring::{ControlRingConsumer, ControlRingProducer, ControlRingWakeHandle};
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
 };
@@ -256,6 +256,19 @@ impl ControlRingConsumer<MemfdSharedMemory> {
     pub fn wake_producer(&self) -> IoResult<()> {
         self.memory()
             .futex_wake_u32(self.direction().consumer_epoch_offset())
+    }
+}
+
+impl ControlRingWakeHandle<MemfdSharedMemory> {
+    /// Changes and wakes the epoch observed by this endpoint's wait operation.
+    ///
+    /// Incrementing before waking closes the race where cancellation happens
+    /// after a ring operation samples its epoch but before it enters futex wait.
+    pub(crate) fn interrupt_wait(&self) -> IoResult<()> {
+        self.memory()
+            .fetch_add_u32_release(self.wait_epoch_offset(), 1)
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        self.memory().futex_wake_u32(self.wait_epoch_offset())
     }
 }
 

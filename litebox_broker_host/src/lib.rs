@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::channel::{
-    HostControlChannel, HostNotificationChannel, HostReceive, PeerCredential,
+    HostControlChannel, HostNotificationChannel, HostReceive, HostSetupChannel, PeerCredential,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
@@ -137,7 +137,7 @@ pub fn setup_connection<'a, ControlChannel, Memory, ChannelError>(
     send_shared_memory: impl FnOnce(&mut ControlChannel) -> core::result::Result<(), ChannelError>,
 ) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
 where
-    ControlChannel: HostControlChannel<Error = ChannelError>,
+    ControlChannel: HostSetupChannel<Error = ChannelError>,
     Memory: SharedMemory,
 {
     if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
@@ -1228,7 +1228,7 @@ mod tests {
         }
     }
 
-    impl HostControlChannel for FakeHostControlChannel {
+    impl HostSetupChannel for FakeHostControlChannel {
         type Error = ();
 
         fn peer_credential(&self) -> core::result::Result<PeerCredential, Self::Error> {
@@ -1252,7 +1252,9 @@ mod tests {
             self.handshake_responses.push(response.clone());
             Ok(())
         }
+    }
 
+    impl HostControlChannel for FakeHostControlChannel {
         fn recv_request(
             &mut self,
         ) -> core::result::Result<HostReceive<BrokerRequest>, Self::Error> {
