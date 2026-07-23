@@ -81,7 +81,7 @@ impl From<SharedMemoryError> for ControlRingError {
 /// Result of a nonblocking control-ring write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlRingWriteStatus {
-    /// A complete slot image was copied into shared memory.
+    /// The payload and its header were copied into shared memory.
     Written,
     /// The producer cannot reuse a slot until the peer acknowledges progress.
     Full,
@@ -132,13 +132,16 @@ impl<Memory: SharedMemory> ControlRing<Memory> {
         &self,
         direction: ControlRingDirection,
         position: u64,
-        image: &[u8; CONTROL_RING_SLOT_SIZE],
+        header: &[u8; CONTROL_RING_SLOT_HEADER_SIZE],
+        payload: &[u8],
     ) -> Result<(), ControlRingError> {
         let slot = position % CONTROL_RING_SLOT_COUNT;
         let range = CONTROL_RING_LAYOUT
             .slot_range(direction, slot)
             .expect("modulo-derived control-ring slot is valid");
-        self.memory.write(range.start, image)?;
+        self.memory
+            .write(range.start + CONTROL_RING_SLOT_HEADER_SIZE, payload)?;
+        self.memory.write(range.start, header)?;
         Ok(())
     }
 
@@ -207,7 +210,7 @@ impl ControlRingProducer {
         Ok(())
     }
 
-    /// Copies one complete encoded envelope into the next available slot.
+    /// Copies an encoded envelope and its header into the next available slot.
     pub fn try_write<Memory: SharedMemory>(
         &mut self,
         ring: &ControlRing<Memory>,
@@ -233,12 +236,10 @@ impl ControlRingProducer {
             u32::try_from(payload.len()).map_err(|_| ControlRingError::PayloadTooLarge {
                 length: payload.len(),
             })?;
-        let mut image = [0; CONTROL_RING_SLOT_SIZE];
-        image[SEQUENCE_RANGE].copy_from_slice(&sequence.to_le_bytes());
-        image[LENGTH_RANGE].copy_from_slice(&length.to_le_bytes());
-        image[CONTROL_RING_SLOT_HEADER_SIZE..CONTROL_RING_SLOT_HEADER_SIZE + payload.len()]
-            .copy_from_slice(payload);
-        ring.write_slot(self.direction, self.tail, &image)?;
+        let mut header = [0; CONTROL_RING_SLOT_HEADER_SIZE];
+        header[SEQUENCE_RANGE].copy_from_slice(&sequence.to_le_bytes());
+        header[LENGTH_RANGE].copy_from_slice(&length.to_le_bytes());
+        ring.write_slot(self.direction, self.tail, &header, payload)?;
         self.tail = sequence;
         Ok(ControlRingWriteStatus::Written)
     }
@@ -459,6 +460,97 @@ mod tests {
             Ok(ControlRingReadStatus::Message(
                 CONTROL_RING_PAYLOAD_CAPACITY
             ))
+        );
+    }
+
+    #[test]
+    fn producer_writes_payload_then_header_without_staging_a_full_slot() {
+        let memory = Arc::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE));
+        let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
+        let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
+
+        assert_eq!(
+            producer.try_write(&ring, &[1, 2, 3]),
+            Ok(ControlRingWriteStatus::Written)
+        );
+        assert_eq!(
+            memory.write_log(),
+            vec![
+                (CONTROL_RING_SLOT_HEADER_SIZE, 3),
+                (0, CONTROL_RING_SLOT_HEADER_SIZE),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_payload_or_header_write_does_not_publish_progress() {
+        for failed_write in [1, 2] {
+            let memory = Arc::new(FailingWriteMemory::new());
+            let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
+            let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
+            let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
+
+            producer.try_write(&ring, &[7]).unwrap();
+            consumer.observe_tail(producer.published_tail()).unwrap();
+            memory.fail_after(failed_write);
+            assert_eq!(
+                producer.try_write(&ring, &[1, 2, 3]),
+                Err(ControlRingError::SharedMemory(
+                    SharedMemoryError::InvalidRange
+                ))
+            );
+            assert_eq!(producer.published_tail(), 1);
+            assert_eq!(
+                consumer.try_read(&ring, owned_bytes),
+                Ok(ControlRingReadStatus::Message(vec![7]))
+            );
+            assert_eq!(
+                consumer.try_read(&ring, owned_bytes),
+                Ok(ControlRingReadStatus::Empty)
+            );
+
+            assert_eq!(
+                producer.try_write(&ring, &[1, 2, 3]),
+                Ok(ControlRingWriteStatus::Written)
+            );
+            consumer.observe_tail(producer.published_tail()).unwrap();
+            assert_eq!(
+                consumer.try_read(&ring, owned_bytes),
+                Ok(ControlRingReadStatus::Message(vec![1, 2, 3]))
+            );
+        }
+    }
+
+    #[test]
+    fn shorter_reused_payload_does_not_expose_stale_trailing_bytes() {
+        let memory = Arc::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE));
+        let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
+        let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
+        let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
+
+        producer.try_write(&ring, &[7; 100]).unwrap();
+        for _ in 1..CONTROL_RING_SLOT_COUNT {
+            producer.try_write(&ring, &[8]).unwrap();
+        }
+        consumer.observe_tail(producer.published_tail()).unwrap();
+        assert_eq!(
+            consumer.try_read(&ring, |payload| Ok::<_, ()>(payload.len())),
+            Ok(ControlRingReadStatus::Message(100))
+        );
+        for _ in 1..CONTROL_RING_SLOT_COUNT {
+            consumer.try_read(&ring, owned_bytes).unwrap();
+        }
+        producer.observe_head(consumer.published_head()).unwrap();
+
+        producer.try_write(&ring, &[9]).unwrap();
+        assert_eq!(
+            &memory.bytes()[CONTROL_RING_SLOT_HEADER_SIZE + 1..CONTROL_RING_SLOT_HEADER_SIZE + 100],
+            &[7; 99]
+        );
+        consumer.observe_tail(producer.published_tail()).unwrap();
+        assert_eq!(
+            consumer.try_read(&ring, owned_bytes),
+            Ok(ControlRingReadStatus::Message(vec![9]))
         );
     }
 
@@ -760,6 +852,7 @@ mod tests {
 
     struct TestMemory {
         bytes: Mutex<Vec<u8>>,
+        write_log: Mutex<Vec<(usize, usize)>>,
         write_count: AtomicUsize,
     }
 
@@ -767,12 +860,17 @@ mod tests {
         fn new(length: usize) -> Self {
             Self {
                 bytes: Mutex::new(vec![0; length]),
+                write_log: Mutex::new(Vec::new()),
                 write_count: AtomicUsize::new(0),
             }
         }
 
         fn bytes(&self) -> Vec<u8> {
             self.bytes.lock().unwrap().clone()
+        }
+
+        fn write_log(&self) -> Vec<(usize, usize)> {
+            self.write_log.lock().unwrap().clone()
         }
     }
 
@@ -803,7 +901,67 @@ mod tests {
                 .get_mut(offset..end)
                 .ok_or(SharedMemoryError::InvalidRange)?
                 .copy_from_slice(source);
+            self.write_log.lock().unwrap().push((offset, source.len()));
             self.write_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct FailingWriteMemory {
+        bytes: Mutex<Vec<u8>>,
+        write_count: AtomicUsize,
+        fail_on_write: AtomicUsize,
+    }
+
+    impl FailingWriteMemory {
+        fn new() -> Self {
+            Self {
+                bytes: Mutex::new(vec![0; CONTROL_RING_MEMORY_SIZE]),
+                write_count: AtomicUsize::new(0),
+                fail_on_write: AtomicUsize::new(usize::MAX),
+            }
+        }
+
+        fn fail_after(&self, writes: usize) {
+            let current = self.write_count.load(Ordering::Relaxed);
+            self.fail_on_write
+                .store(current + writes, Ordering::Relaxed);
+        }
+    }
+
+    impl SharedMemory for FailingWriteMemory {
+        fn len(&self) -> usize {
+            self.bytes.lock().unwrap().len()
+        }
+
+        fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
+            let bytes = self.bytes.lock().unwrap();
+            let end = offset
+                .checked_add(destination.len())
+                .ok_or(SharedMemoryError::InvalidRange)?;
+            destination.copy_from_slice(
+                bytes
+                    .get(offset..end)
+                    .ok_or(SharedMemoryError::InvalidRange)?,
+            );
+            Ok(())
+        }
+
+        fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
+            let call = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let mut bytes = self.bytes.lock().unwrap();
+            let end = offset
+                .checked_add(source.len())
+                .ok_or(SharedMemoryError::InvalidRange)?;
+            let destination = bytes
+                .get_mut(offset..end)
+                .ok_or(SharedMemoryError::InvalidRange)?;
+            if call == self.fail_on_write.load(Ordering::Relaxed) {
+                let partial = source.len().div_ceil(2);
+                destination[..partial].copy_from_slice(&source[..partial]);
+                return Err(SharedMemoryError::InvalidRange);
+            }
+            destination.copy_from_slice(source);
             Ok(())
         }
     }
