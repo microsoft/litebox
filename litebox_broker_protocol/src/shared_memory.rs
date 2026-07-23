@@ -33,6 +33,9 @@ pub enum SharedMemoryError {
     /// The requested byte range is outside the shared-memory resource.
     #[error("shared-memory range is out of bounds")]
     InvalidRange,
+    /// An atomic access is not naturally aligned.
+    #[error("shared-memory atomic access is not naturally aligned")]
+    UnalignedAtomic,
 }
 
 /// Byte-copy access to a shared-memory resource.
@@ -65,6 +68,24 @@ pub trait SharedMemory: Send + Sync + 'static {
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError>;
 }
 
+/// Ordered atomic access to shared-memory `u64` values.
+///
+/// Implementations must provide naturally aligned, indivisible, system-visible
+/// operations over coherent shared memory. Atomic values must not also be
+/// accessed through [`SharedMemory::read`] or [`SharedMemory::write`] by a
+/// conforming endpoint.
+pub trait AtomicSharedMemory: SharedMemory {
+    /// Atomically loads a naturally aligned native-endian `u64` with acquire
+    /// ordering.
+    fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError>;
+
+    /// Atomically stores a naturally aligned native-endian `u64` with release
+    /// ordering.
+    ///
+    /// On error, the value must not have been stored.
+    fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError>;
+}
+
 impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
     fn len(&self) -> usize {
         (**self).len()
@@ -76,6 +97,16 @@ impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
 
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
         (**self).write(offset, source)
+    }
+}
+
+impl<Memory: AtomicSharedMemory + ?Sized> AtomicSharedMemory for Arc<Memory> {
+    fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
+        (**self).load_u64_acquire(offset)
+    }
+
+    fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
+        (**self).store_u64_release(offset, value)
     }
 }
 

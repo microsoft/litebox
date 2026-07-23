@@ -3,15 +3,18 @@
 
 //! Hostile-peer-safe shared control-ring state machines.
 
+use core::mem::size_of;
 use core::sync::atomic::{Ordering, fence};
 
 use litebox_broker_protocol::control_ring::{
     CONTROL_RING_MEMORY_SIZE, CONTROL_RING_PAYLOAD_CAPACITY, CONTROL_RING_SLOT_COUNT,
     CONTROL_RING_SLOT_HEADER_SIZE, CONTROL_RING_SLOT_SIZE, ControlRingDirection,
 };
-use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
+use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemory, SharedMemoryError};
 
+#[cfg(test)]
 const SEQUENCE_RANGE: core::ops::Range<usize> = 0..8;
+#[cfg(test)]
 const LENGTH_RANGE: core::ops::Range<usize> = 8..12;
 #[cfg(test)]
 const RESERVED_RANGE: core::ops::Range<usize> = 12..16;
@@ -80,7 +83,7 @@ impl From<SharedMemoryError> for ControlRingError {
 /// Result of a nonblocking control-ring write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlRingWriteStatus {
-    /// The payload and its header were copied into shared memory.
+    /// The payload and metadata were copied and the sequence was published.
     Written,
     /// The producer cannot reuse a slot until the peer acknowledges progress.
     Full,
@@ -91,7 +94,7 @@ pub enum ControlRingWriteStatus {
 pub enum ControlRingReadStatus<Message> {
     /// One complete slot was copied, validated, and decoded.
     Message(Message),
-    /// No peer-published slot is available.
+    /// The next slot still carries its previous sequence.
     Empty,
 }
 
@@ -131,30 +134,52 @@ impl<Memory: SharedMemory> ControlRing<Memory> {
         &self,
         direction: ControlRingDirection,
         position: u64,
-        header: &[u8; CONTROL_RING_SLOT_HEADER_SIZE],
+        metadata: [u8; CONTROL_RING_SLOT_HEADER_SIZE - size_of::<u64>()],
         payload: &[u8],
-    ) -> Result<(), ControlRingError> {
+        sequence: u64,
+    ) -> Result<(), ControlRingError>
+    where
+        Memory: AtomicSharedMemory,
+    {
         let slot = position % CONTROL_RING_SLOT_COUNT;
         let range = direction
             .slot_range(slot)
             .expect("modulo-derived control-ring slot is valid");
         self.memory
             .write(range.start + CONTROL_RING_SLOT_HEADER_SIZE, payload)?;
-        self.memory.write(range.start, header)?;
+        self.memory
+            .write(range.start + size_of::<u64>(), &metadata)?;
+        self.memory
+            .store_u64_release(range.start, sequence.to_le())?;
         Ok(())
     }
 
-    fn read_slot(
+    fn load_sequence(
         &self,
         direction: ControlRingDirection,
         position: u64,
-        image: &mut [u8; CONTROL_RING_SLOT_SIZE],
+    ) -> Result<u64, ControlRingError>
+    where
+        Memory: AtomicSharedMemory,
+    {
+        let slot = position % CONTROL_RING_SLOT_COUNT;
+        let range = direction
+            .slot_range(slot)
+            .expect("modulo-derived control-ring slot is valid");
+        Ok(u64::from_le(self.memory.load_u64_acquire(range.start)?))
+    }
+
+    fn read_slot_body(
+        &self,
+        direction: ControlRingDirection,
+        position: u64,
+        body: &mut [u8],
     ) -> Result<(), ControlRingError> {
         let slot = position % CONTROL_RING_SLOT_COUNT;
         let range = direction
             .slot_range(slot)
             .expect("modulo-derived control-ring slot is valid");
-        self.memory.read(range.start, image)?;
+        self.memory.read(range.start + size_of::<u64>(), body)?;
         Ok(())
     }
 }
@@ -183,8 +208,8 @@ impl ControlRingProducer {
 
     /// Returns the tail to publish in a socket doorbell.
     ///
-    /// The release fence orders all preceding slot copies before the peer can
-    /// observe the returned progress.
+    /// The release fence orders preceding sequence publications before a
+    /// socket wakeup carrying the returned progress.
     pub fn published_tail(&self) -> u64 {
         fence(Ordering::Release);
         self.tail
@@ -210,7 +235,7 @@ impl ControlRingProducer {
     }
 
     /// Copies an encoded envelope and its header into the next available slot.
-    pub fn try_write<Memory: SharedMemory>(
+    pub fn try_write<Memory: AtomicSharedMemory>(
         &mut self,
         ring: &ControlRing<Memory>,
         payload: &[u8],
@@ -235,10 +260,9 @@ impl ControlRingProducer {
             u32::try_from(payload.len()).map_err(|_| ControlRingError::PayloadTooLarge {
                 length: payload.len(),
             })?;
-        let mut header = [0; CONTROL_RING_SLOT_HEADER_SIZE];
-        header[SEQUENCE_RANGE].copy_from_slice(&sequence.to_le_bytes());
-        header[LENGTH_RANGE].copy_from_slice(&length.to_le_bytes());
-        ring.write_slot(self.direction, self.tail, &header, payload)?;
+        let mut metadata = [0; CONTROL_RING_SLOT_HEADER_SIZE - size_of::<u64>()];
+        metadata[..size_of::<u32>()].copy_from_slice(&length.to_le_bytes());
+        ring.write_slot(self.direction, self.tail, metadata, payload, sequence)?;
         self.tail = sequence;
         Ok(ControlRingWriteStatus::Written)
     }
@@ -248,7 +272,7 @@ impl ControlRingProducer {
 pub struct ControlRingConsumer {
     direction: ControlRingDirection,
     head: u64,
-    observed_tail: u64,
+    notified_tail: u64,
 }
 
 impl ControlRingConsumer {
@@ -257,7 +281,7 @@ impl ControlRingConsumer {
         Self {
             direction,
             head: 0,
-            observed_tail: 0,
+            notified_tail: 0,
         }
     }
 
@@ -275,32 +299,28 @@ impl ControlRingConsumer {
         self.head
     }
 
-    /// Accepts peer-published progress from a socket doorbell.
+    /// Validates peer progress carried by a socket wakeup.
+    ///
+    /// This progress does not gate reads; the next slot's atomic sequence is
+    /// the publication authority.
     pub fn observe_tail(&mut self, tail: u64) -> Result<(), ControlRingError> {
-        if tail < self.observed_tail {
+        if tail < self.notified_tail {
             return Err(ControlRingError::CounterRegressed {
-                previous: self.observed_tail,
+                previous: self.notified_tail,
                 received: tail,
             });
         }
-        let Some(available) = tail.checked_sub(self.head) else {
-            return Err(ControlRingError::CounterOutOfRange {
-                local: self.head,
-                received: tail,
-            });
-        };
-        if available > CONTROL_RING_SLOT_COUNT {
+        if tail > self.head && tail - self.head > CONTROL_RING_SLOT_COUNT {
             return Err(ControlRingError::CounterOutOfRange {
                 local: self.head,
                 received: tail,
             });
         }
-        self.observed_tail = tail;
-        fence(Ordering::Acquire);
+        self.notified_tail = tail;
         Ok(())
     }
 
-    /// Copies, validates, and decodes one peer-published slot.
+    /// Polls, copies, validates, and decodes one peer-published slot.
     ///
     /// The decoder receives only an owned snapshot of the exact encoded
     /// envelope. It must reject malformed message tags, phases, and trailing
@@ -311,26 +331,38 @@ impl ControlRingConsumer {
         decode: impl FnOnce(&[u8]) -> Result<Message, DecodeError>,
     ) -> Result<ControlRingReadStatus<Message>, ControlRingReadError<DecodeError>>
     where
-        Memory: SharedMemory,
+        Memory: AtomicSharedMemory,
     {
-        if self.head == self.observed_tail {
-            return Ok(ControlRingReadStatus::Empty);
-        }
         let expected_sequence = self.head.checked_add(1).ok_or(ControlRingReadError::Ring(
             ControlRingError::CounterExhausted,
         ))?;
-        let mut image = [0; CONTROL_RING_SLOT_SIZE];
-        ring.read_slot(self.direction, self.head, &mut image)
+        let actual_sequence = ring
+            .load_sequence(self.direction, self.head)
             .map_err(ControlRingReadError::Ring)?;
-
-        let actual_sequence = u64::from_le_bytes([
-            image[0], image[1], image[2], image[3], image[4], image[5], image[6], image[7],
-        ]);
+        let stale_sequence = expected_sequence.saturating_sub(CONTROL_RING_SLOT_COUNT);
+        if actual_sequence == stale_sequence {
+            return Ok(ControlRingReadStatus::Empty);
+        }
         if actual_sequence != expected_sequence {
             return Err(ControlRingReadError::Ring(
                 ControlRingError::UnexpectedSequence {
                     expected: expected_sequence,
                     actual: actual_sequence,
+                },
+            ));
+        }
+        let mut image = [0; CONTROL_RING_SLOT_SIZE];
+        image[..size_of::<u64>()].copy_from_slice(&actual_sequence.to_le_bytes());
+        ring.read_slot_body(self.direction, self.head, &mut image[size_of::<u64>()..])
+            .map_err(ControlRingReadError::Ring)?;
+        let verified_sequence = ring
+            .load_sequence(self.direction, self.head)
+            .map_err(ControlRingReadError::Ring)?;
+        if verified_sequence != expected_sequence {
+            return Err(ControlRingReadError::Ring(
+                ControlRingError::UnexpectedSequence {
+                    expected: expected_sequence,
+                    actual: verified_sequence,
                 },
             ));
         }
@@ -358,6 +390,7 @@ impl ControlRingConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::mem::align_of;
     use litebox_broker_protocol::RequestId;
     use litebox_broker_protocol::control_ring::CONTROL_RING_MEMORY_SIZE;
     use litebox_broker_protocol::message::{
@@ -392,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn request_and_response_rings_are_independent() {
+    fn request_and_response_sequences_publish_without_doorbells() {
         let ring = test_ring();
         let mut request_producer = ControlRingProducer::new(ControlRingDirection::Requests);
         let mut request_consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
@@ -407,12 +440,6 @@ mod tests {
             response_producer.try_write(&ring, &[4, 5]),
             Ok(ControlRingWriteStatus::Written)
         );
-        request_consumer
-            .observe_tail(request_producer.published_tail())
-            .unwrap();
-        response_consumer
-            .observe_tail(response_producer.published_tail())
-            .unwrap();
 
         assert_eq!(
             request_consumer.try_read(&ring, owned_bytes),
@@ -463,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn producer_writes_payload_then_header_without_staging_a_full_slot() {
+    fn producer_writes_payload_metadata_then_sequence_without_full_slot_staging() {
         let memory = Arc::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE));
         let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
         let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
@@ -476,14 +503,18 @@ mod tests {
             memory.write_log(),
             vec![
                 (CONTROL_RING_SLOT_HEADER_SIZE, 3),
-                (0, CONTROL_RING_SLOT_HEADER_SIZE),
+                (
+                    size_of::<u64>(),
+                    CONTROL_RING_SLOT_HEADER_SIZE - size_of::<u64>()
+                ),
+                (0, size_of::<u64>()),
             ]
         );
     }
 
     #[test]
-    fn failed_payload_or_header_write_does_not_publish_progress() {
-        for failed_write in [1, 2] {
+    fn failed_payload_metadata_or_sequence_write_does_not_publish_progress() {
+        for failed_write in [1, 2, 3] {
             let memory = Arc::new(FailingWriteMemory::new());
             let ring = ControlRing::new(Arc::clone(&memory)).unwrap();
             let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
@@ -554,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn one_doorbell_publishes_and_acknowledges_a_full_batch() {
+    fn one_wakeup_notifies_and_acknowledges_a_full_batch() {
         let ring = test_ring();
         let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
         let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
@@ -647,8 +678,12 @@ mod tests {
                 received: CONTROL_RING_SLOT_COUNT + 1
             })
         );
+        consumer.head = CONTROL_RING_SLOT_COUNT;
+        assert_eq!(consumer.observe_tail(1), Ok(()));
+
+        let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
         consumer.head = 1;
-        consumer.observed_tail = 1;
+        consumer.notified_tail = 1;
         assert_eq!(
             consumer.observe_tail(0),
             Err(ControlRingError::CounterRegressed {
@@ -662,9 +697,8 @@ mod tests {
     fn consumer_rejects_hostile_slot_metadata() {
         fn assert_rejected(image: &[u8; CONTROL_RING_SLOT_SIZE], expected: ControlRingError) {
             let ring = test_ring();
-            ring.memory().write(0, image).unwrap();
+            install_slot(&ring, image);
             let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
-            consumer.observe_tail(1).unwrap();
             assert_eq!(
                 consumer.try_read(&ring, owned_bytes),
                 Err(ControlRingReadError::Ring(expected))
@@ -673,10 +707,10 @@ mod tests {
         }
 
         assert_rejected(
-            &raw_slot(0, 1, 0, &[1]),
+            &raw_slot(2, 1, 0, &[1]),
             ControlRingError::UnexpectedSequence {
                 expected: 1,
-                actual: 0,
+                actual: 2,
             },
         );
         assert_rejected(
@@ -691,6 +725,23 @@ mod tests {
         assert_rejected(
             &raw_slot(1, oversized, 0, &[]),
             ControlRingError::InvalidPayloadLength { length: oversized },
+        );
+    }
+
+    #[test]
+    fn consumer_treats_the_previous_slot_sequence_as_empty() {
+        let ring = test_ring();
+        let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
+
+        assert_eq!(
+            consumer.try_read(&ring, owned_bytes),
+            Ok(ControlRingReadStatus::Empty)
+        );
+        install_slot(&ring, &raw_slot(1, 1, 0, &[7]));
+        consumer.head = CONTROL_RING_SLOT_COUNT;
+        assert_eq!(
+            consumer.try_read(&ring, owned_bytes),
+            Ok(ControlRingReadStatus::Empty)
         );
     }
 
@@ -809,7 +860,7 @@ mod tests {
 
         let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
         consumer.head = u64::MAX - 1;
-        consumer.observed_tail = u64::MAX - 1;
+        consumer.notified_tail = u64::MAX - 1;
         consumer.observe_tail(u64::MAX).unwrap();
         assert_eq!(
             consumer.try_read(&ring, owned_bytes),
@@ -818,7 +869,9 @@ mod tests {
         assert_eq!(consumer.published_head(), u64::MAX);
         assert_eq!(
             consumer.try_read(&ring, owned_bytes),
-            Ok(ControlRingReadStatus::Empty)
+            Err(ControlRingReadError::Ring(
+                ControlRingError::CounterExhausted
+            ))
         );
     }
 
@@ -847,6 +900,16 @@ mod tests {
         image[CONTROL_RING_SLOT_HEADER_SIZE..CONTROL_RING_SLOT_HEADER_SIZE + payload.len()]
             .copy_from_slice(payload);
         image
+    }
+
+    fn install_slot(ring: &ControlRing<TestMemory>, image: &[u8; CONTROL_RING_SLOT_SIZE]) {
+        ring.memory()
+            .write(size_of::<u64>(), &image[size_of::<u64>()..])
+            .unwrap();
+        let sequence = u64::from_le_bytes(image[..size_of::<u64>()].try_into().unwrap());
+        ring.memory()
+            .store_u64_release(0, sequence.to_le())
+            .unwrap();
     }
 
     struct TestMemory {
@@ -901,6 +964,22 @@ mod tests {
                 .ok_or(SharedMemoryError::InvalidRange)?
                 .copy_from_slice(source);
             self.write_log.lock().unwrap().push((offset, source.len()));
+            self.write_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    impl AtomicSharedMemory for TestMemory {
+        fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
+            test_load_u64_acquire(&self.bytes, offset)
+        }
+
+        fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
+            test_store_u64_release(&self.bytes, offset, value)?;
+            self.write_log
+                .lock()
+                .unwrap()
+                .push((offset, size_of::<u64>()));
             self.write_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
@@ -965,6 +1044,23 @@ mod tests {
         }
     }
 
+    impl AtomicSharedMemory for FailingWriteMemory {
+        fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
+            test_load_u64_acquire(&self.bytes, offset)
+        }
+
+        fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
+            if !offset.is_multiple_of(align_of::<u64>()) {
+                return Err(SharedMemoryError::UnalignedAtomic);
+            }
+            let call = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if call == self.fail_on_write.load(Ordering::Relaxed) {
+                return Err(SharedMemoryError::InvalidRange);
+            }
+            test_store_u64_release(&self.bytes, offset, value)
+        }
+    }
+
     struct TearingMemory(Mutex<Vec<u8>>);
 
     impl TearingMemory {
@@ -989,9 +1085,9 @@ mod tests {
                 .get(offset..end)
                 .ok_or(SharedMemoryError::InvalidRange)?;
 
-            destination[..10].copy_from_slice(&bytes[offset..offset + 10]);
-            bytes[offset + 10..offset + 12].fill(0xff);
-            destination[10..].copy_from_slice(&bytes[offset + 10..end]);
+            destination[..2].copy_from_slice(&bytes[offset..offset + 2]);
+            bytes[offset + 2..offset + 4].fill(0xff);
+            destination[2..].copy_from_slice(&bytes[offset + 2..end]);
             Ok(())
         }
 
@@ -1006,5 +1102,57 @@ mod tests {
                 .copy_from_slice(source);
             Ok(())
         }
+    }
+
+    impl AtomicSharedMemory for TearingMemory {
+        fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
+            test_load_u64_acquire(&self.0, offset)
+        }
+
+        fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
+            test_store_u64_release(&self.0, offset, value)
+        }
+    }
+
+    fn test_load_u64_acquire(
+        bytes: &Mutex<Vec<u8>>,
+        offset: usize,
+    ) -> Result<u64, SharedMemoryError> {
+        if !offset.is_multiple_of(align_of::<u64>()) {
+            return Err(SharedMemoryError::UnalignedAtomic);
+        }
+        let bytes = bytes.lock().unwrap();
+        let end = offset
+            .checked_add(size_of::<u64>())
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        let value = u64::from_ne_bytes(
+            bytes
+                .get(offset..end)
+                .ok_or(SharedMemoryError::InvalidRange)?
+                .try_into()
+                .unwrap(),
+        );
+        fence(Ordering::Acquire);
+        Ok(value)
+    }
+
+    fn test_store_u64_release(
+        bytes: &Mutex<Vec<u8>>,
+        offset: usize,
+        value: u64,
+    ) -> Result<(), SharedMemoryError> {
+        if !offset.is_multiple_of(align_of::<u64>()) {
+            return Err(SharedMemoryError::UnalignedAtomic);
+        }
+        fence(Ordering::Release);
+        let mut bytes = bytes.lock().unwrap();
+        let end = offset
+            .checked_add(size_of::<u64>())
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        bytes
+            .get_mut(offset..end)
+            .ok_or(SharedMemoryError::InvalidRange)?
+            .copy_from_slice(&value.to_ne_bytes());
+        Ok(())
     }
 }

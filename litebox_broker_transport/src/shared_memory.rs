@@ -5,6 +5,7 @@
 
 use std::io::{Error, Result as IoResult};
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
+use std::mem::{align_of, size_of};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
@@ -20,7 +21,10 @@ use rustix::net::{
     SendAncillaryMessage, SendFlags,
 };
 
-use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
+use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemory, SharedMemoryError};
+
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
@@ -44,6 +48,25 @@ struct MappedRegion {
 // SAFETY: `MappedRegion` exclusively owns its mapping, and all byte access is
 // serialized by the enclosing `Mutex`.
 unsafe impl Send for MappedRegion {}
+
+#[cfg(target_has_atomic = "64")]
+fn atomic_u64_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU64, SharedMemoryError> {
+    offset
+        .checked_add(size_of::<u64>())
+        .filter(|end| *end <= mapping.length)
+        .ok_or(SharedMemoryError::InvalidRange)?;
+    // SAFETY: The checked offset is inside the live mapping.
+    let byte_address = unsafe { mapping.address.as_ptr().add(offset) };
+    if !byte_address.addr().is_multiple_of(align_of::<AtomicU64>()) {
+        return Err(SharedMemoryError::UnalignedAtomic);
+    }
+    // The runtime check above establishes the stronger alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    let address = byte_address.cast::<u64>();
+    // SAFETY: The pointer is valid and aligned for a `u64`. Control-ring
+    // sequence words are accessed atomically by conforming endpoints.
+    Ok(unsafe { AtomicU64::from_ptr(address) })
+}
 
 impl MemfdSharedMemory {
     /// Creates and maps a sealed memfd with `length` bytes.
@@ -175,6 +198,26 @@ impl SharedMemory for MemfdSharedMemory {
                 source.len(),
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(target_has_atomic = "64")]
+impl AtomicSharedMemory for MemfdSharedMemory {
+    fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
+        let mapping = self
+            .mapping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(atomic_u64_at(&mapping, offset)?.load(Ordering::Acquire))
+    }
+
+    fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
+        let mapping = self
+            .mapping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        atomic_u64_at(&mapping, offset)?.store(value, Ordering::Release);
         Ok(())
     }
 }
@@ -317,6 +360,7 @@ mod tests {
     };
     use rustix::io::FdFlags;
     use std::io::{Read, Write};
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
 
@@ -338,6 +382,30 @@ mod tests {
         );
         assert_eq!(
             second.read(usize::MAX, &mut data),
+            Err(SharedMemoryError::InvalidRange)
+        );
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn mappings_share_ordered_atomic_values_and_validate_alignment() {
+        let first = MemfdSharedMemory::create(64).unwrap();
+        let second =
+            MemfdSharedMemory::from_received_fd(first.as_fd().try_clone_to_owned().unwrap(), 64)
+                .unwrap();
+
+        first.store_u64_release(8, 0x0102_0304_0506_0708).unwrap();
+        assert_eq!(second.load_u64_acquire(8), Ok(0x0102_0304_0506_0708));
+        assert_eq!(
+            second.load_u64_acquire(1),
+            Err(SharedMemoryError::UnalignedAtomic)
+        );
+        assert_eq!(
+            second.store_u64_release(1, 0),
+            Err(SharedMemoryError::UnalignedAtomic)
+        );
+        assert_eq!(
+            second.load_u64_acquire(64),
             Err(SharedMemoryError::InvalidRange)
         );
     }
@@ -423,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_progress_orders_cross_mapping_slot_reuse() {
+    fn buffered_socket_wakeup_prevents_missed_cross_mapping_work() {
         const DOORBELL_LEN: usize = 17;
 
         let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
@@ -435,9 +503,16 @@ mod tests {
         let local_ring = ControlRing::new(local_memory).unwrap();
         let broker_ring = ControlRing::new(broker_memory).unwrap();
         let (mut local_socket, mut broker_socket) = UnixStream::pair().unwrap();
+        let empty_checked = Arc::new(Barrier::new(2));
+        let broker_empty_checked = Arc::clone(&empty_checked);
 
         let broker = thread::spawn(move || {
             let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
+            assert_eq!(
+                consumer.try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0])),
+                Ok(ControlRingReadStatus::Empty)
+            );
+            broker_empty_checked.wait();
             let mut frame = [0; DOORBELL_LEN];
             broker_socket.read_exact(&mut frame).unwrap();
             let doorbell = decode_local_doorbell(&frame).unwrap();
@@ -466,6 +541,7 @@ mod tests {
         });
 
         let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
+        empty_checked.wait();
         for value in 0..CONTROL_RING_SLOT_COUNT {
             let value = u8::try_from(value).unwrap();
             assert_eq!(

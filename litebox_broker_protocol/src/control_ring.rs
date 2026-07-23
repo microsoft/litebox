@@ -65,7 +65,9 @@ pub enum ControlRingLayoutError {
 /// Local endpoint progress sent to the broker over the control socket.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LocalDoorbell {
-    /// Number of request slots published by the local endpoint.
+    /// Latest request tail accompanying this socket wakeup.
+    ///
+    /// Slot sequences, not this value, determine whether requests are ready.
     pub request_tail: u64,
     /// Number of response slots consumed by the local endpoint.
     pub response_head: u64,
@@ -76,7 +78,9 @@ pub struct LocalDoorbell {
 pub struct BrokerDoorbell {
     /// Number of request slots consumed by the broker.
     pub request_head: u64,
-    /// Number of response slots published by the broker.
+    /// Latest response tail accompanying this socket wakeup.
+    ///
+    /// Slot sequences, not this value, determine whether responses are ready.
     pub response_tail: u64,
 }
 
