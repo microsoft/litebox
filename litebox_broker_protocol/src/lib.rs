@@ -16,7 +16,6 @@ extern crate alloc;
 extern crate std;
 
 pub mod channel;
-pub mod control_ring;
 pub mod error;
 pub mod event;
 pub mod message;

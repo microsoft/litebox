@@ -4,14 +4,85 @@
 //! Hostile-peer-safe shared control-ring state machines.
 
 use core::mem::size_of;
+use core::ops::Range;
 #[cfg(test)]
 use core::sync::atomic::fence;
 
-use litebox_broker_protocol::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, CONTROL_RING_PAYLOAD_CAPACITY, CONTROL_RING_SLOT_COUNT,
-    CONTROL_RING_SLOT_HEADER_SIZE, CONTROL_RING_SLOT_SIZE, ControlRingDirection,
-};
 use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemory, SharedMemoryError};
+
+/// Size of one shared control-ring slot.
+pub const CONTROL_RING_SLOT_SIZE: usize = 4096;
+
+/// Size of the fixed metadata at the start of a control-ring slot.
+pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;
+
+/// Maximum encoded request or response size in one control-ring slot.
+pub const CONTROL_RING_PAYLOAD_CAPACITY: usize =
+    CONTROL_RING_SLOT_SIZE - CONTROL_RING_SLOT_HEADER_SIZE;
+
+/// Number of slots in each direction of the shared control ring.
+pub const CONTROL_RING_SLOT_COUNT: u64 = 64;
+
+/// Exact shared-memory size required for both control-ring directions.
+pub const CONTROL_RING_MEMORY_SIZE: usize =
+    CONTROL_RING_DATA_SIZE + CONTROL_RING_SYNC_DIRECTION_SIZE * 2;
+
+// The fixed count is representable by `usize` on every supported target.
+#[allow(clippy::cast_possible_truncation)]
+const CONTROL_RING_DIRECTION_SIZE: usize =
+    CONTROL_RING_SLOT_SIZE * CONTROL_RING_SLOT_COUNT as usize;
+const CONTROL_RING_DATA_SIZE: usize = CONTROL_RING_DIRECTION_SIZE * 2;
+const CONTROL_RING_SYNC_DIRECTION_SIZE: usize = 16;
+const PRODUCER_EPOCH_OFFSET: usize = 0;
+const CONSUMER_EPOCH_OFFSET: usize = 4;
+const CONSUMER_HEAD_OFFSET: usize = 8;
+
+/// One direction in the shared control-ring mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlRingDirection {
+    /// Local-to-broker request ring.
+    Requests,
+    /// Broker-to-local response ring.
+    Responses,
+}
+
+impl ControlRingDirection {
+    fn slot_range(self, slot: u64) -> Range<usize> {
+        debug_assert!(slot < CONTROL_RING_SLOT_COUNT);
+        let slot = usize::try_from(slot).expect("control-ring slot index is bounded");
+        let direction_offset = match self {
+            Self::Requests => 0,
+            Self::Responses => CONTROL_RING_DIRECTION_SIZE,
+        };
+        let start = direction_offset + slot * CONTROL_RING_SLOT_SIZE;
+        start..start + CONTROL_RING_SLOT_SIZE
+    }
+
+    /// Returns the atomic `u32` epoch incremented when the producer publishes
+    /// work for this direction.
+    pub const fn producer_epoch_offset(self) -> usize {
+        self.sync_offset() + PRODUCER_EPOCH_OFFSET
+    }
+
+    /// Returns the atomic `u32` epoch incremented when the consumer publishes
+    /// progress for this direction.
+    pub const fn consumer_epoch_offset(self) -> usize {
+        self.sync_offset() + CONSUMER_EPOCH_OFFSET
+    }
+
+    /// Returns the atomic `u64` consumer-head offset for this direction.
+    pub const fn consumer_head_offset(self) -> usize {
+        self.sync_offset() + CONSUMER_HEAD_OFFSET
+    }
+
+    const fn sync_offset(self) -> usize {
+        CONTROL_RING_DATA_SIZE
+            + match self {
+                Self::Requests => 0,
+                Self::Responses => CONTROL_RING_SYNC_DIRECTION_SIZE,
+            }
+    }
+}
 
 #[cfg(test)]
 const SEQUENCE_RANGE: core::ops::Range<usize> = 0..8;
@@ -143,9 +214,7 @@ impl<Memory: SharedMemory> ControlRing<Memory> {
         Memory: AtomicSharedMemory,
     {
         let slot = position % CONTROL_RING_SLOT_COUNT;
-        let range = direction
-            .slot_range(slot)
-            .expect("modulo-derived control-ring slot is valid");
+        let range = direction.slot_range(slot);
         self.memory
             .write(range.start + CONTROL_RING_SLOT_HEADER_SIZE, payload)?;
         self.memory
@@ -164,9 +233,7 @@ impl<Memory: SharedMemory> ControlRing<Memory> {
         Memory: AtomicSharedMemory,
     {
         let slot = position % CONTROL_RING_SLOT_COUNT;
-        let range = direction
-            .slot_range(slot)
-            .expect("modulo-derived control-ring slot is valid");
+        let range = direction.slot_range(slot);
         Ok(u64::from_le(self.memory.load_u64_acquire(range.start)?))
     }
 
@@ -177,9 +244,7 @@ impl<Memory: SharedMemory> ControlRing<Memory> {
         body: &mut [u8],
     ) -> Result<(), ControlRingError> {
         let slot = position % CONTROL_RING_SLOT_COUNT;
-        let range = direction
-            .slot_range(slot)
-            .expect("modulo-derived control-ring slot is valid");
+        let range = direction.slot_range(slot);
         self.memory.read(range.start + size_of::<u64>(), body)?;
         Ok(())
     }
@@ -426,7 +491,6 @@ mod tests {
     use super::*;
     use core::mem::align_of;
     use litebox_broker_protocol::RequestId;
-    use litebox_broker_protocol::control_ring::CONTROL_RING_MEMORY_SIZE;
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerOperation, BrokerRequest,
     };

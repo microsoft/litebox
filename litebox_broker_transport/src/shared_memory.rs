@@ -410,11 +410,8 @@ fn shared_memory_error(error: SharedMemoryError) -> Error {
 mod tests {
     use super::*;
     use crate::control_ring::{
-        ControlRing, ControlRingConsumer, ControlRingProducer, ControlRingReadStatus,
-        ControlRingWriteStatus,
-    };
-    use litebox_broker_protocol::control_ring::{
-        CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRingDirection,
+        CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRing, ControlRingConsumer,
+        ControlRingDirection, ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus,
     };
     use litebox_broker_protocol::shared_memory::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedBufferSlotIndex,
