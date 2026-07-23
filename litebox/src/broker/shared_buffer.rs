@@ -107,28 +107,25 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
     }
 
     fn release(&self, slot_index: SharedBufferSlotIndex) {
-        let mut waiter_result = None;
-        {
-            let mut state = self.state.lock();
-            let slot_mask = 1 << slot_index.0;
-            assert_ne!(
-                state.allocated_slots & slot_mask,
-                0,
-                "shared-buffer slot released without an active lease"
-            );
-            state.allocated_slots &= !slot_mask;
-            if !state.failed
-                && let Some(waiter) = state.waiters.pop_front()
-            {
-                let descriptor = state
-                    .allocate(waiter.length)
-                    .expect("released slot was not available");
-                waiter_result = Some((waiter, descriptor));
-            }
+        let mut state = self.state.lock();
+        let slot_mask = 1 << slot_index.0;
+        assert_ne!(
+            state.allocated_slots & slot_mask,
+            0,
+            "shared-buffer slot released without an active lease"
+        );
+        state.allocated_slots &= !slot_mask;
+        if state.failed {
+            return;
         }
-        if let Some((waiter, descriptor)) = waiter_result {
-            waiter.resolve(Ok(descriptor));
-        }
+        let Some(waiter) = state.waiters.pop_front() else {
+            return;
+        };
+        let descriptor = state
+            .allocate(waiter.length)
+            .expect("released slot was not available");
+        drop(state);
+        waiter.resolve(Ok(descriptor));
     }
 
     #[cfg(test)]
