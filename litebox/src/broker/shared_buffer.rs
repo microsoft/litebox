@@ -189,12 +189,16 @@ impl<Platform: RawSyncPrimitivesProvider> AllocatorState<Platform> {
     }
 
     fn next_free_slot(&self) -> Option<u32> {
-        if self.allocated_slots & ALLOCATED_SLOT_MASK == ALLOCATED_SLOT_MASK {
+        let available_slots = !self.allocated_slots & ALLOCATED_SLOT_MASK;
+        if available_slots == 0 {
             return None;
         }
-        (0..SHARED_BUFFER_SLOT_COUNT)
-            .map(|offset| (self.next_slot + offset) % SHARED_BUFFER_SLOT_COUNT)
-            .find(|slot| self.allocated_slots & (1 << slot) == 0)
+        let available_slots_after_next = available_slots & (u64::MAX << self.next_slot);
+        Some(if available_slots_after_next == 0 {
+            available_slots.trailing_zeros()
+        } else {
+            available_slots_after_next.trailing_zeros()
+        })
     }
 }
 
