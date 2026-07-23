@@ -27,8 +27,8 @@ use thiserror::Error;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use crate::nt_types::{
-    ClientId, PebBitField, ProcessEnvironmentBlock, RtlUserProcFlags, RtlUserProcessParameters,
-    ThreadEnvironmentBlock, UnicodeString, X64Context,
+    ClientId, Luid, PebBitField, ProcessEnvironmentBlock, RtlUserProcFlags,
+    RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString, X64Context,
 };
 use crate::syscalls::mm::{MemoryType, PageProtection};
 use crate::syscalls::process::{INITIAL_PROCESS_ID, INITIAL_THREAD_ID};
@@ -753,13 +753,6 @@ struct NlsUserInfo {
     user_locale_id: u32,
     interactive_user_luid: Luid,
     ul_cache_update_count: u32,
-}
-
-#[repr(C)]
-#[derive(FromBytes, IntoBytes)]
-struct Luid {
-    low_part: u32,
-    high_part: i32,
 }
 
 #[repr(C)]

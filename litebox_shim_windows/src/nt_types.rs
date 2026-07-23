@@ -20,6 +20,13 @@ const USER_MODE_STACK_SELECTOR: u16 = 0x2b;
 const INITIAL_CONTEXT_EFLAGS: u32 = 0x200;
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
+pub(crate) struct Luid {
+    pub(crate) low_part: u32,
+    pub(crate) high_part: i32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
 pub struct X64Context {
     pub p1_home: u64,

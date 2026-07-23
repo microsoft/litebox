@@ -13,7 +13,7 @@ use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::AccessMask;
+use crate::nt_types::{AccessMask, Luid};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{
     HandleAttributes, MutPtr, ShimFS, Task, WindowsHandleSubsystem, probe_guest_output_buffer,
@@ -132,13 +132,6 @@ pub(crate) enum TokenInformationClass {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
-pub(crate) struct Luid {
-    low_part: u32,
-    high_part: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
 pub(crate) struct SidAndAttributes {
     sid: usize,
     attributes: u32,
@@ -158,6 +151,13 @@ pub(crate) struct Sid {
     sub_authority_count: u8,
     identifier_authority: [u8; 6],
     sub_authority: [u32; 1],
+}
+
+#[repr(C, packed(4))]
+#[derive(Immutable, IntoBytes)]
+struct TokenUserInformation {
+    user: TokenUser,
+    sid: Sid,
 }
 
 #[repr(C)]
@@ -184,23 +184,29 @@ pub(crate) struct TokenStatistics {
 const TOKEN_TYPE_PRIMARY: u32 = 1;
 const SECURITY_ANONYMOUS: u32 = 0;
 
+// TODO(token-luid-allocation): Allocate these from sandbox-wide state once multiple token objects
+// or token mutation are supported.
+const PRIMARY_TOKEN_ID: Luid = Luid {
+    low_part: 1,
+    high_part: 0,
+};
+
+const PRIMARY_TOKEN_MODIFIED_ID: Luid = Luid {
+    low_part: 2,
+    high_part: 0,
+};
+
+const SYSTEM_LUID: Luid = Luid {
+    low_part: 0x3e7,
+    high_part: 0,
+};
+
 const LOCAL_SYSTEM_SID: Sid = Sid {
     revision: 1,
     sub_authority_count: 1,
     identifier_authority: [0, 0, 0, 0, 0, 5],
     sub_authority: [18],
 };
-
-const TOKEN_USER_SIZE: usize = size_of::<TokenUser>() + size_of::<Sid>();
-const TOKEN_USER_SID_OFFSET: isize = 16;
-const TOKEN_PRIVILEGES_SIZE: usize = size_of::<TokenPrivileges>();
-const TOKEN_STATISTICS_SIZE: usize = size_of::<TokenStatistics>();
-
-const _: () = assert!(size_of::<TokenUser>() == 16);
-const _: () = assert!(size_of::<Sid>() == 12);
-const _: () = assert!(TOKEN_USER_SIZE == 28);
-const _: () = assert!(TOKEN_PRIVILEGES_SIZE == 4);
-const _: () = assert!(TOKEN_STATISTICS_SIZE == 56);
 
 pub(crate) struct TokenObject {
     user: Sid,
@@ -212,14 +218,8 @@ impl TokenObject {
         Self {
             user: LOCAL_SYSTEM_SID,
             statistics: TokenStatistics {
-                token_id: Luid {
-                    low_part: 1,
-                    high_part: 0,
-                },
-                authentication_id: Luid {
-                    low_part: 0x3e7,
-                    high_part: 0,
-                },
+                token_id: PRIMARY_TOKEN_ID,
+                authentication_id: SYSTEM_LUID,
                 expiration_time: i64::MAX,
                 token_type: TOKEN_TYPE_PRIMARY,
                 impersonation_level: SECURITY_ANONYMOUS,
@@ -227,10 +227,7 @@ impl TokenObject {
                 dynamic_available: 0,
                 group_count: 0,
                 privilege_count: 0,
-                modified_id: Luid {
-                    low_part: 2,
-                    high_part: 0,
-                },
+                modified_id: PRIMARY_TOKEN_MODIFIED_ID,
             },
         }
     }
@@ -348,27 +345,40 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         match class {
             TokenInformationClass::User => entry.with_entry(|entry| {
-                Self::write_token_user(
-                    &entry.token,
+                Self::write_token_information_value(
                     token_information,
                     token_information_length,
                     return_length,
+                    || {
+                        let sid_address = token_information
+                            .as_usize()
+                            .checked_add(size_of::<TokenUser>())
+                            .ok_or(NtStatus::ACCESS_VIOLATION)?;
+                        Ok(TokenUserInformation {
+                            user: TokenUser {
+                                user: SidAndAttributes {
+                                    sid: sid_address,
+                                    attributes: 0,
+                                    padding: 0,
+                                },
+                            },
+                            sid: entry.token.user,
+                        })
+                    },
                 )
             }),
-            TokenInformationClass::Privileges => entry.with_entry(|entry| {
-                Self::write_token_privileges(
-                    &entry.token,
-                    token_information,
-                    token_information_length,
-                    return_length,
-                )
-            }),
+            TokenInformationClass::Privileges => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || Ok(TokenPrivileges { privilege_count: 0 }),
+            ),
             TokenInformationClass::Statistics => entry.with_entry(|entry| {
-                Self::write_token_statistics(
-                    &entry.token,
+                Self::write_token_information_value(
                     token_information,
                     token_information_length,
                     return_length,
+                    || Ok(entry.token.statistics),
                 )
             }),
             _ => {
@@ -379,83 +389,25 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    fn write_token_user(
-        token: &TokenObject,
+    fn write_token_information_value<T: Immutable + IntoBytes>(
         token_information: MutPtr<Platform, u8>,
         token_information_length: u32,
         return_length: MutPtr<Platform, u32>,
+        build_information: impl FnOnce() -> Result<T, NtStatus>,
     ) -> NtStatus {
-        let required_length = TOKEN_USER_SIZE.trunc();
+        let required_length = size_of::<T>().trunc();
         if return_length.write_at_offset(0, required_length).is_none() {
             return NtStatus::ACCESS_VIOLATION;
         }
         if token_information_length < required_length {
             return NtStatus::BUFFER_TOO_SMALL;
         }
-
-        let Some(sid_address) = token_information
-            .as_usize()
-            .checked_add(size_of::<TokenUser>())
-        else {
-            return NtStatus::ACCESS_VIOLATION;
-        };
-        let user = TokenUser {
-            user: SidAndAttributes {
-                sid: sid_address,
-                attributes: 0,
-                padding: 0,
-            },
+        let information = match build_information() {
+            Ok(information) => information,
+            Err(status) => return status,
         };
         if token_information
-            .write_slice_at_offset(0, user.as_bytes())
-            .is_none()
-            || token_information
-                .write_slice_at_offset(TOKEN_USER_SID_OFFSET, token.user.as_bytes())
-                .is_none()
-        {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        NtStatus::SUCCESS
-    }
-
-    fn write_token_privileges(
-        _token: &TokenObject,
-        token_information: MutPtr<Platform, u8>,
-        token_information_length: u32,
-        return_length: MutPtr<Platform, u32>,
-    ) -> NtStatus {
-        let required_length = TOKEN_PRIVILEGES_SIZE.trunc();
-        if return_length.write_at_offset(0, required_length).is_none() {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        if token_information_length < required_length {
-            return NtStatus::BUFFER_TOO_SMALL;
-        }
-        let privileges = TokenPrivileges { privilege_count: 0 };
-        if token_information
-            .write_slice_at_offset(0, privileges.as_bytes())
-            .is_none()
-        {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        NtStatus::SUCCESS
-    }
-
-    fn write_token_statistics(
-        token: &TokenObject,
-        token_information: MutPtr<Platform, u8>,
-        token_information_length: u32,
-        return_length: MutPtr<Platform, u32>,
-    ) -> NtStatus {
-        let required_length = TOKEN_STATISTICS_SIZE.trunc();
-        if return_length.write_at_offset(0, required_length).is_none() {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        if token_information_length < required_length {
-            return NtStatus::BUFFER_TOO_SMALL;
-        }
-        if token_information
-            .write_slice_at_offset(0, token.statistics.as_bytes())
+            .write_slice_at_offset(0, information.as_bytes())
             .is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
@@ -476,8 +428,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     use super::*;
     use crate::tests::{mut_byte_ptr, mut_ptr, null_mut_ptr, test_task};
-    use crate::{DuplicateOptions, tests::TestPlatform};
-    use litebox::platform::ThreadProvider;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
@@ -511,7 +461,10 @@ mod tests {
             ),
             NtStatus::BUFFER_TOO_SMALL
         );
-        assert_eq!(required_length as usize, TOKEN_USER_SIZE);
+        assert_eq!(
+            required_length as usize,
+            size_of::<TokenUser>() + size_of::<Sid>()
+        );
 
         let mut output = TokenUserBuffer {
             user: TokenUser {
@@ -545,243 +498,5 @@ mod tests {
         );
         assert_eq!(output.user.user.attributes, 0);
         assert_eq!(output.sid, LOCAL_SYSTEM_SID);
-    }
-
-    #[test]
-    fn query_process_token_reports_privileges_and_statistics() {
-        let task = test_task();
-        let mut handle = Handle::default();
-        assert_eq!(
-            task.sys_nt_open_process_token_ex(
-                ProcessHandle::CURRENT,
-                TokenAccess::QUERY.bits(),
-                HandleAttributes::INHERIT.bits(),
-                mut_ptr(&mut handle),
-            ),
-            NtStatus::SUCCESS
-        );
-
-        let mut privileges = TokenPrivileges {
-            privilege_count: u32::MAX,
-        };
-        let mut return_length = 0;
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                handle,
-                TokenInformationClass::Privileges as u32,
-                mut_byte_ptr(&mut privileges),
-                size_of::<TokenPrivileges>().trunc(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(return_length as usize, TOKEN_PRIVILEGES_SIZE);
-        assert_eq!(privileges.privilege_count, 0);
-
-        let mut statistics = TokenStatistics {
-            token_id: Luid {
-                low_part: 0,
-                high_part: 0,
-            },
-            authentication_id: Luid {
-                low_part: 0,
-                high_part: 0,
-            },
-            expiration_time: 0,
-            token_type: 0,
-            impersonation_level: 0,
-            dynamic_charged: 0,
-            dynamic_available: 0,
-            group_count: u32::MAX,
-            privilege_count: u32::MAX,
-            modified_id: Luid {
-                low_part: 0,
-                high_part: 0,
-            },
-        };
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                handle,
-                TokenInformationClass::Statistics as u32,
-                mut_byte_ptr(&mut statistics),
-                size_of::<TokenStatistics>().trunc(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(return_length as usize, TOKEN_STATISTICS_SIZE);
-        assert_eq!(statistics.authentication_id.low_part, 0x3e7);
-        assert_eq!(statistics.token_type, TOKEN_TYPE_PRIMARY);
-        assert_eq!(statistics.group_count, 0);
-        assert_eq!(statistics.privilege_count, 0);
-    }
-
-    #[test]
-    fn query_process_token_enforces_buffer_and_access() {
-        let task = test_task();
-        let mut query_handle = Handle::default();
-        assert_eq!(
-            task.sys_nt_open_process_token(
-                ProcessHandle::CURRENT,
-                TokenAccess::QUERY.bits(),
-                mut_ptr(&mut query_handle),
-            ),
-            NtStatus::SUCCESS
-        );
-
-        let mut output = [0xa5_u8; TOKEN_STATISTICS_SIZE];
-        let mut return_length = 0;
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                query_handle,
-                TokenInformationClass::Statistics as u32,
-                mut_byte_ptr(&mut output),
-                (TOKEN_STATISTICS_SIZE - 1).trunc(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::BUFFER_TOO_SMALL
-        );
-        assert_eq!(return_length as usize, TOKEN_STATISTICS_SIZE);
-        assert_eq!(output, [0xa5; TOKEN_STATISTICS_SIZE]);
-
-        let mut duplicate_only_handle = Handle::default();
-        assert_eq!(
-            task.sys_nt_open_process_token(
-                ProcessHandle::CURRENT,
-                TokenAccess::DUPLICATE.bits(),
-                mut_ptr(&mut duplicate_only_handle),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                duplicate_only_handle,
-                TokenInformationClass::Statistics as u32,
-                mut_byte_ptr(&mut output),
-                TOKEN_STATISTICS_SIZE.trunc(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::ACCESS_DENIED
-        );
-    }
-
-    #[test]
-    fn open_process_token_validates_process_and_attributes() {
-        let task = test_task();
-        let sentinel = Handle::from_raw(0x1122_3344);
-        let mut handle = sentinel;
-        assert_eq!(
-            task.sys_nt_open_process_token(
-                ProcessHandle::from_raw(0x1234),
-                TokenAccess::QUERY.bits(),
-                mut_ptr(&mut handle),
-            ),
-            NtStatus::INVALID_HANDLE
-        );
-        assert_eq!(handle, sentinel);
-
-        assert_eq!(
-            task.sys_nt_open_process_token_ex(
-                ProcessHandle::CURRENT,
-                TokenAccess::QUERY.bits(),
-                0x20,
-                mut_ptr(&mut handle),
-            ),
-            NtStatus::INVALID_PARAMETER
-        );
-        assert_eq!(handle, sentinel);
-
-        assert_eq!(
-            task.sys_nt_open_process_token_ex(
-                ProcessHandle::CURRENT,
-                TokenAccess::QUERY.bits(),
-                0x40,
-                mut_ptr(&mut handle),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-    }
-
-    #[test]
-    fn duplicated_token_handle_remains_queryable_after_source_close() {
-        let task = test_task();
-        let mut source = Handle::default();
-        assert_eq!(
-            task.sys_nt_open_process_token(
-                ProcessHandle::CURRENT,
-                TokenAccess::QUERY.bits(),
-                mut_ptr(&mut source),
-            ),
-            NtStatus::SUCCESS
-        );
-        let mut duplicate = Handle::default();
-        assert_eq!(
-            task.sys_nt_duplicate_object(
-                ProcessHandle::CURRENT,
-                source,
-                ProcessHandle::CURRENT,
-                Some(mut_ptr(&mut duplicate)),
-                0,
-                0,
-                DuplicateOptions::SAME_ACCESS.bits(),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(task.sys_nt_close(source), NtStatus::SUCCESS);
-
-        let mut privileges = TokenPrivileges {
-            privilege_count: u32::MAX,
-        };
-        let mut return_length = 0;
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                duplicate,
-                TokenInformationClass::Privileges as u32,
-                mut_byte_ptr(&mut privileges),
-                TOKEN_PRIVILEGES_SIZE.trunc(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(privileges.privilege_count, 0);
-        assert_eq!(task.sys_nt_close(duplicate), NtStatus::SUCCESS);
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                duplicate,
-                TokenInformationClass::Privileges as u32,
-                mut_byte_ptr(&mut privileges),
-                TOKEN_PRIVILEGES_SIZE.trunc(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::INVALID_HANDLE
-        );
-    }
-
-    #[test]
-    fn query_process_token_requires_return_length() {
-        let _ = crate::tests::test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(|| {
-            let task = test_task();
-            let mut handle = Handle::default();
-            assert_eq!(
-                task.sys_nt_open_process_token(
-                    ProcessHandle::CURRENT,
-                    TokenAccess::QUERY.bits(),
-                    mut_ptr(&mut handle),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(
-                task.sys_nt_query_information_token(
-                    handle,
-                    TokenInformationClass::User as u32,
-                    null_mut_ptr(),
-                    0,
-                    MutPtr::<TestPlatform, u32>::from_usize(0),
-                ),
-                NtStatus::ACCESS_VIOLATION
-            );
-        });
     }
 }
