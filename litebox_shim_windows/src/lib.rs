@@ -1706,6 +1706,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQuerySecurityAttributesToken {
+                token_handle,
+                attributes,
+                number_of_attributes,
+                buffer,
+                length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_security_attributes_token(
+                    token_handle,
+                    attributes,
+                    number_of_attributes,
+                    buffer,
+                    length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
                 flag,
                 source,

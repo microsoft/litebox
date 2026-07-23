@@ -513,6 +513,14 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         token_information_length: u32,
         return_length: Platform::RawMutPointer<u32>,
     },
+    NtQuerySecurityAttributesToken {
+        token_handle: Handle,
+        attributes: Platform::RawConstPointer<nt_types::UnicodeString>,
+        number_of_attributes: u32,
+        buffer: Platform::RawMutPointer<u8>,
+        length: u32,
+        return_length: Platform::RawMutPointer<u32>,
+    },
     NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
         flag: u32,
         source: Platform::RawConstPointer<u64>,
@@ -1017,6 +1025,16 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 token_information_length,
                 return_length:*,
             })),
+            NtSysno::NtQuerySecurityAttributesToken => {
+                Some(sys_req!(NtQuerySecurityAttributesToken {
+                    token_handle: { Handle::from_raw },
+                    attributes:*,
+                    number_of_attributes,
+                    buffer:*,
+                    length,
+                    return_length:*,
+                }))
+            }
             NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(
                 sys_req!(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
                     flag,
