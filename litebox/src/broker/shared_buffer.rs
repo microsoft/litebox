@@ -22,7 +22,7 @@ struct LeaseState<Platform: RawSyncPrimitivesProvider> {
     allocated_slots: u64,
     next_slot: u32,
     failed: bool,
-    waiters: VecDeque<Arc<LeaseWaiter<Platform>>>,
+    waiters: VecDeque<Arc<SlotWaiter<Platform>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +33,7 @@ pub(super) struct SlotLease<'a, Platform: RawSyncPrimitivesProvider> {
     descriptor: SharedBufferDescriptor,
 }
 
-struct LeaseWaiter<Platform: RawSyncPrimitivesProvider> {
+struct SlotWaiter<Platform: RawSyncPrimitivesProvider> {
     length: u32,
     result: Mutex<Platform, Option<Result<SharedBufferDescriptor, AcquireError>>>,
     result_ready: Platform::RawMutex,
@@ -67,7 +67,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
             }
         }
 
-        let waiter = Arc::new(LeaseWaiter::new(length));
+        let waiter = Arc::new(SlotWaiter::new(length));
         {
             let mut state = self.state.lock();
             if state.failed {
@@ -136,7 +136,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> LeaseWaiter<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> SlotWaiter<Platform> {
     fn new(length: u32) -> Self {
         Self {
             length,
