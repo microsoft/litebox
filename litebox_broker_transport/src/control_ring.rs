@@ -547,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn request_and_response_sequences_publish_without_doorbells() {
+    fn request_and_response_rings_publish_independently() {
         let ring = Arc::new(test_ring());
         let mut request_producer =
             ControlRingProducer::new(Arc::clone(&ring), ControlRingDirection::Requests);
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn producer_writes_payload_metadata_then_sequence_without_full_slot_staging() {
+    fn producer_publishes_sequence_after_payload_and_metadata() {
         let (mut producer, _) = test_endpoints();
 
         assert_eq!(
