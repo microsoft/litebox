@@ -17,12 +17,17 @@ fn objdump(objdump_cmd: &str, binary: &[u8]) -> String {
         .output()
         .unwrap();
 
-    String::from_utf8_lossy(&output.stdout)
+    let mut lines = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.contains("/tmp/"))
         .map(|line| normalize_objdump_line(line, trampoline_range.as_ref()))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Vec<_>>();
+    let first_content = lines
+        .iter()
+        .position(|line| !line.is_empty())
+        .unwrap_or(lines.len());
+    lines.drain(..first_content);
+    lines.join("\n")
 }
 
 /// Return the first objdump-like command that exists on the host from
@@ -57,9 +62,6 @@ fn trampoline_range(binary: &[u8]) -> Option<std::ops::Range<u64>> {
 }
 
 fn normalize_objdump_line(line: &str, trampoline_range: Option<&std::ops::Range<u64>>) -> String {
-    let Some(trampoline_range) = trampoline_range else {
-        return line.trim_end().to_owned();
-    };
     let Some((address, rest)) = line.split_once(':') else {
         return line.trim_end().to_owned();
     };
@@ -71,19 +73,54 @@ fn normalize_objdump_line(line: &str, trampoline_range: Option<&std::ops::Range<
     // trampoline base so the snapshot is independent of the trampoline's exact
     // address. Other branches (and same-mnemonic branches that stay in the
     // original code) are left untouched.
-    for (i, token) in tokens.iter().enumerate() {
-        if !matches!(*token, "jmp" | "b" | "bl") {
-            continue;
-        }
-        if let Some(target) = tokens
-            .get(i + 1)
-            .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
-            && trampoline_range.contains(&target)
-        {
-            let offset = target - trampoline_range.start;
-            return format!("{address}:\t<trampoline-{token}+0x{offset:x}>");
+    if let Some(trampoline_range) = trampoline_range {
+        for (i, token) in tokens.iter().enumerate() {
+            if !matches!(*token, "jmp" | "b" | "bl") {
+                continue;
+            }
+            if let Some(target) = tokens
+                .get(i + 1)
+                .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+                && trampoline_range.contains(&target)
+            {
+                let offset = target - trampoline_range.start;
+                return format!("{address}:\t<trampoline-{token}+0x{offset:x}>");
+            }
         }
     }
+
+    // GNU and LLVM objdump differ in whitespace, capitalization, comments,
+    // and some numeric formatting. Keep snapshots focused on instructions
+    // rather than the disassembler that happened to be available.
+    let code_len = tokens
+        .iter()
+        .take_while(|token| {
+            matches!(token.len(), 2 | 8) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .count();
+    if code_len != 0 && code_len < tokens.len() {
+        let machine_code = tokens[..code_len].join(" ").to_ascii_lowercase();
+        let instruction = tokens[code_len..]
+            .iter()
+            .take_while(|token| !matches!(**token, "//" | "#"))
+            .map(|token| {
+                let token = token.to_ascii_lowercase();
+                if token == "#0" {
+                    "#0x0".to_owned()
+                } else if let Some(value) = token.strip_prefix("0x")
+                    && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    value.to_owned()
+                } else {
+                    token
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(", ", ",");
+        return format!("{address}:\t{machine_code}\t{instruction}");
+    }
+
     line.trim_end().to_owned()
 }
 
