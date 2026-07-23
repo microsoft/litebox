@@ -604,7 +604,6 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         process_handle: ProcessHandle,
         exit_status: i32,
     },
-    /// Tests for queued user APCs; an empty queue completes successfully.
     NtTestAlert,
     /// TODO: not supported yet
     NtManageHotPatch,
