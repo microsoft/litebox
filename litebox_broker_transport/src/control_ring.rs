@@ -6,9 +6,8 @@
 use core::sync::atomic::{Ordering, fence};
 
 use litebox_broker_protocol::control_ring::{
-    CONTROL_RING_LAYOUT, CONTROL_RING_MEMORY_SIZE, CONTROL_RING_PAYLOAD_CAPACITY,
-    CONTROL_RING_SLOT_COUNT, CONTROL_RING_SLOT_HEADER_SIZE, CONTROL_RING_SLOT_SIZE,
-    ControlRingDirection,
+    CONTROL_RING_MEMORY_SIZE, CONTROL_RING_PAYLOAD_CAPACITY, CONTROL_RING_SLOT_COUNT,
+    CONTROL_RING_SLOT_HEADER_SIZE, CONTROL_RING_SLOT_SIZE, ControlRingDirection,
 };
 use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
 
@@ -136,8 +135,8 @@ impl<Memory: SharedMemory> ControlRing<Memory> {
         payload: &[u8],
     ) -> Result<(), ControlRingError> {
         let slot = position % CONTROL_RING_SLOT_COUNT;
-        let range = CONTROL_RING_LAYOUT
-            .slot_range(direction, slot)
+        let range = direction
+            .slot_range(slot)
             .expect("modulo-derived control-ring slot is valid");
         self.memory
             .write(range.start + CONTROL_RING_SLOT_HEADER_SIZE, payload)?;
@@ -152,8 +151,8 @@ impl<Memory: SharedMemory> ControlRing<Memory> {
         image: &mut [u8; CONTROL_RING_SLOT_SIZE],
     ) -> Result<(), ControlRingError> {
         let slot = position % CONTROL_RING_SLOT_COUNT;
-        let range = CONTROL_RING_LAYOUT
-            .slot_range(direction, slot)
+        let range = direction
+            .slot_range(slot)
             .expect("modulo-derived control-ring slot is valid");
         self.memory.read(range.start, image)?;
         Ok(())
