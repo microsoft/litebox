@@ -224,7 +224,8 @@ impl MemfdSharedMemory {
 }
 
 impl ControlRingProducer<MemfdSharedMemory> {
-    /// Waits for consumer progress after [`ControlRingWriteStatus::Full`].
+    /// Waits for consumer progress after
+    /// [`Full`](crate::control_ring::ControlRingWriteStatus::Full).
     ///
     /// The caller must retry the write after this possibly spurious wakeup.
     pub fn wait_for_capacity(&self, wait_epoch: u32) -> IoResult<()> {
@@ -240,7 +241,8 @@ impl ControlRingProducer<MemfdSharedMemory> {
 }
 
 impl ControlRingConsumer<MemfdSharedMemory> {
-    /// Waits for producer progress after [`ControlRingReadStatus::Empty`].
+    /// Waits for producer progress after
+    /// [`Empty`](crate::control_ring::ControlRingReadStatus::Empty).
     ///
     /// The caller must retry the read after this possibly spurious wakeup.
     pub fn wait_for_message(&self, wait_epoch: u32) -> IoResult<()> {
