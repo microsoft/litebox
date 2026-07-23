@@ -9,7 +9,9 @@ use core::mem::size_of;
 use litebox::LiteBox;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
+use litebox::shim::ContinueOperation;
 use litebox::utils::TruncateExt as _;
+use litebox_common_windows::NtSysno;
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
@@ -103,6 +105,27 @@ fn map_csr_server_shared_memory(
 
 pub(crate) fn test_task() -> Task<TestPlatform, TestFS> {
     test_task_with_nls_files(&[])
+}
+
+#[test]
+fn nt_test_alert_resumes_with_an_empty_apc_queue() {
+    let task = test_task();
+    let mut context = litebox_common_linux::PtRegs {
+        orig_rax: NtSysno::NtTestAlert.as_raw() as usize,
+        rax: usize::MAX,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        task.handle_syscall_request(&mut context),
+        ContinueOperation::Resume
+    );
+    assert_eq!(
+        context.rax,
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+            .as_raw()
+            .cast_unsigned() as usize
+    );
 }
 
 pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform, TestFS> {

@@ -1900,6 +1900,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
             }
+            SyscallRequest::NtTestAlert => {
+                // TODO(apc-model): Deliver queued user-mode APCs once thread alert and APC state
+                // are modeled.
+                (NtStatus::SUCCESS, ContinueOperation::Resume)
+            }
             SyscallRequest::NtManageHotPatch => {
                 (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
             }
