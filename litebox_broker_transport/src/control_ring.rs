@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn torn_length_snapshot_is_rejected_before_payload_slicing() {
-        let memory = TearingMemory::new(&raw_slot(1, 1, 0, &[7]));
+        let memory = TearingMemory::with_torn_length(&raw_slot(1, 1, 0, &[7]));
         let ring = ControlRing::new(memory).unwrap();
         let (_, mut consumer) = ring.into_endpoints(
             ControlRingDirection::Responses,
@@ -967,6 +967,27 @@ mod tests {
             Err(ControlRingReadError::Ring(
                 ControlRingError::InvalidPayloadLength {
                     length: 0xffff_0001
+                }
+            ))
+        );
+        assert_eq!(consumer.head, 0);
+    }
+
+    #[test]
+    fn sequence_change_during_body_copy_is_rejected() {
+        let memory = TearingMemory::with_changed_sequence(&raw_slot(1, 1, 0, &[7]));
+        let ring = ControlRing::new(memory).unwrap();
+        let (_, mut consumer) = ring.into_endpoints(
+            ControlRingDirection::Responses,
+            ControlRingDirection::Requests,
+        );
+
+        assert_eq!(
+            consumer.try_read(owned_bytes),
+            Err(ControlRingReadError::Ring(
+                ControlRingError::UnexpectedSequence {
+                    expected: 1,
+                    actual: 2,
                 }
             ))
         );
@@ -1282,23 +1303,42 @@ mod tests {
         }
     }
 
-    struct TearingMemory(Mutex<Vec<u8>>);
+    enum Tear {
+        Length,
+        Sequence,
+    }
+
+    struct TearingMemory {
+        bytes: Mutex<Vec<u8>>,
+        tear: Tear,
+    }
 
     impl TearingMemory {
-        fn new(first_slot: &[u8; CONTROL_RING_SLOT_SIZE]) -> Self {
+        fn with_torn_length(first_slot: &[u8; CONTROL_RING_SLOT_SIZE]) -> Self {
+            Self::new(first_slot, Tear::Length)
+        }
+
+        fn with_changed_sequence(first_slot: &[u8; CONTROL_RING_SLOT_SIZE]) -> Self {
+            Self::new(first_slot, Tear::Sequence)
+        }
+
+        fn new(first_slot: &[u8; CONTROL_RING_SLOT_SIZE], tear: Tear) -> Self {
             let mut bytes = vec![0; CONTROL_RING_MEMORY_SIZE];
             bytes[..CONTROL_RING_SLOT_SIZE].copy_from_slice(first_slot);
-            Self(Mutex::new(bytes))
+            Self {
+                bytes: Mutex::new(bytes),
+                tear,
+            }
         }
     }
 
     impl SharedMemory for TearingMemory {
         fn len(&self) -> usize {
-            self.0.lock().unwrap().len()
+            self.bytes.lock().unwrap().len()
         }
 
         fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-            let mut bytes = self.0.lock().unwrap();
+            let mut bytes = self.bytes.lock().unwrap();
             let end = offset
                 .checked_add(destination.len())
                 .ok_or(SharedMemoryError::InvalidRange)?;
@@ -1306,14 +1346,22 @@ mod tests {
                 .get(offset..end)
                 .ok_or(SharedMemoryError::InvalidRange)?;
 
-            destination[..2].copy_from_slice(&bytes[offset..offset + 2]);
-            bytes[offset + 2..offset + 4].fill(0xff);
-            destination[2..].copy_from_slice(&bytes[offset + 2..end]);
+            match self.tear {
+                Tear::Length => {
+                    destination[..2].copy_from_slice(&bytes[offset..offset + 2]);
+                    bytes[offset + 2..offset + 4].fill(0xff);
+                    destination[2..].copy_from_slice(&bytes[offset + 2..end]);
+                }
+                Tear::Sequence => {
+                    destination.copy_from_slice(&bytes[offset..end]);
+                    bytes[..size_of::<u64>()].copy_from_slice(&2_u64.to_le_bytes());
+                }
+            }
             Ok(())
         }
 
         fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-            let mut bytes = self.0.lock().unwrap();
+            let mut bytes = self.bytes.lock().unwrap();
             let end = offset
                 .checked_add(source.len())
                 .ok_or(SharedMemoryError::InvalidRange)?;
@@ -1327,7 +1375,7 @@ mod tests {
 
     impl AtomicSharedMemory for TearingMemory {
         fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
-            test_load_u32_acquire(&self.0, offset)
+            test_load_u32_acquire(&self.bytes, offset)
         }
 
         fn fetch_add_u32_release(
@@ -1335,15 +1383,15 @@ mod tests {
             offset: usize,
             value: u32,
         ) -> Result<u32, SharedMemoryError> {
-            test_fetch_add_u32_release(&self.0, offset, value)
+            test_fetch_add_u32_release(&self.bytes, offset, value)
         }
 
         fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
-            test_load_u64_acquire(&self.0, offset)
+            test_load_u64_acquire(&self.bytes, offset)
         }
 
         fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
-            test_store_u64_release(&self.0, offset, value)
+            test_store_u64_release(&self.bytes, offset, value)
         }
 
         fn store_u64_and_fetch_add_u32_release(
@@ -1354,7 +1402,7 @@ mod tests {
             add_value: u32,
         ) -> Result<u32, SharedMemoryError> {
             test_store_u64_and_fetch_add_u32_release(
-                &self.0,
+                &self.bytes,
                 store_offset,
                 value,
                 add_offset,
