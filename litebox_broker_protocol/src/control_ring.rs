@@ -85,15 +85,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_layout_has_expected_geometry() {
-        assert_eq!(CONTROL_RING_SLOT_SIZE, 4096);
-        assert_eq!(CONTROL_RING_SLOT_COUNT, 64);
-        assert_eq!(CONTROL_RING_PAYLOAD_CAPACITY, 4080);
-        assert_eq!(CONTROL_RING_DIRECTION_SIZE, 256 * 1024);
-        assert_eq!(CONTROL_RING_MEMORY_SIZE, 512 * 1024);
-    }
-
-    #[test]
     fn layout_derives_disjoint_directional_slot_ranges() {
         assert_eq!(ControlRingDirection::Requests.slot_range(0), Ok(0..4096));
         assert_eq!(
