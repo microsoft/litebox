@@ -1493,6 +1493,7 @@ version = "0.1.0"
 dependencies = [
  "litebox_broker_core",
  "litebox_broker_protocol",
+ "spin 0.9.8",
  "thiserror",
 ]
 

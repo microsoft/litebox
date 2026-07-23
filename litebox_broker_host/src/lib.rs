@@ -34,33 +34,110 @@ use litebox_broker_protocol::shared_memory::{
     SharedBufferSlotIndex, SharedMemory,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
+use spin::mutex::SpinMutex;
 
 mod error;
 
 pub use error::{BrokerHostError, Result};
 
-/// Authenticates, negotiates, and serves one broker association over paired
-/// control and notification channels.
+/// Negotiated active association, or a terminal outcome reached during setup.
+pub type ConnectionSetup<'a, Memory> =
+    core::result::Result<BrokerHostAssociation<'a, Memory>, ConnectionTermination>;
+
+/// Active portable broker association.
 ///
-/// The deployment must bind both channels to the same authenticated peer
-/// association. Active requests and responses remain on the control channel;
-/// broker-initiated readiness wakeups are sent on the notification channel.
-/// Event mutations caused by control requests return readiness in their control
-/// response and do not also emit a duplicate notification.
+/// Deployments may share this value across bounded workers. Each request is
+/// executed independently, while shared-buffer usage is synchronized and
+/// released immediately before publishing the response.
+pub struct BrokerHostAssociation<'a, Memory: SharedMemory> {
+    session: BrokerSession,
+    shared_buffers: &'a SharedBufferPool<Memory>,
+    state: SpinMutex<AssociationState>,
+}
+
+struct AssociationState {
+    failed: bool,
+    shared_buffer_usage: SharedBufferUsage,
+}
+
+impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
+    /// Executes one active request and emits its response.
+    ///
+    /// Any fatal broker or response-channel error permanently fails this
+    /// association. Recoverable broker operation errors are emitted normally in
+    /// the correlated response.
+    pub fn execute_request<ChannelError>(
+        &self,
+        request: BrokerRequest,
+        send_response: impl FnOnce(&BrokerResponse) -> core::result::Result<(), ChannelError>,
+    ) -> Result<(), ChannelError> {
+        let BrokerRequest {
+            request_id,
+            operation,
+        } = request;
+        let buffer_descriptor = match &operation {
+            BrokerOperation::Pipe(PipeRequest::Read(request)) => Some(request.buffer),
+            BrokerOperation::Pipe(PipeRequest::Write(request)) => Some(request.buffer),
+            BrokerOperation::CloseObject(_)
+            | BrokerOperation::CheckReadiness(_)
+            | BrokerOperation::Event(_)
+            | BrokerOperation::Pipe(PipeRequest::Create(_)) => None,
+        };
+
+        {
+            let mut state = self.state.lock();
+            if state.failed {
+                return Err(BrokerHostError::Broker(ErrorCode::Internal));
+            }
+            if let Some(descriptor) = buffer_descriptor
+                && let Err(error) = state.shared_buffer_usage.begin(
+                    request_id,
+                    descriptor,
+                    self.shared_buffers.layout(),
+                )
+            {
+                state.failed = true;
+                return Err(BrokerHostError::Broker(error));
+            }
+        }
+
+        let result = match complete_request(handle_request(
+            &self.session,
+            operation,
+            self.shared_buffers,
+        )) {
+            Ok(result) => result,
+            Err(error) => {
+                self.state.lock().failed = true;
+                return Err(BrokerHostError::Broker(error));
+            }
+        };
+        if let Some(descriptor) = buffer_descriptor {
+            self.state
+                .lock()
+                .shared_buffer_usage
+                .end(request_id, descriptor.slot_index);
+        }
+        if let Err(error) = send_response(&BrokerResponse { request_id, result }) {
+            self.state.lock().failed = true;
+            return Err(BrokerHostError::Channel(error));
+        }
+        Ok(())
+    }
+}
+
+/// Authenticates and negotiates one broker control connection.
 ///
-/// `shared_buffers` belongs to this association. Payload descriptors are
-/// validated against trusted per-slot claim state. `send_shared_memory` runs
-/// after version negotiation and before active requests begin.
-pub fn serve_connection<ControlChannel, NotificationChannel, Memory, ChannelError>(
+/// `send_shared_memory` runs after version negotiation and before the active
+/// association is returned.
+pub fn setup_connection<'a, ControlChannel, Memory, ChannelError>(
     core: &BrokerCore,
     control_channel: &mut ControlChannel,
-    _notification_channel: &mut NotificationChannel,
-    shared_buffers: &SharedBufferPool<Memory>,
+    shared_buffers: &'a SharedBufferPool<Memory>,
     send_shared_memory: impl FnOnce(&mut ControlChannel) -> core::result::Result<(), ChannelError>,
-) -> Result<ConnectionTermination, ChannelError>
+) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
 where
     ControlChannel: HostControlChannel<Error = ChannelError>,
-    NotificationChannel: HostNotificationChannel<Error = ChannelError>,
     Memory: SharedMemory,
 {
     if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
@@ -88,9 +165,11 @@ where
                         ErrorCode::ProtocolState,
                     ))
                     .map_err(BrokerHostError::Channel)?;
-                return Ok(ConnectionTermination::ProtocolViolation);
+                return Ok(Err(ConnectionTermination::ProtocolViolation));
             }
-            HostReceive::PeerClosed => return Ok(ConnectionTermination::PeerClosed),
+            HostReceive::PeerClosed => {
+                return Ok(Err(ConnectionTermination::PeerClosed));
+            }
         };
 
         let negotiated = request.protocol_version == BROKER_PROTOCOL_VERSION;
@@ -108,11 +187,47 @@ where
             .map_err(BrokerHostError::Channel)?;
         if negotiated {
             send_shared_memory(control_channel).map_err(BrokerHostError::Channel)?;
-            break;
+            return Ok(Ok(BrokerHostAssociation {
+                session,
+                shared_buffers,
+                state: SpinMutex::new(AssociationState {
+                    failed: false,
+                    shared_buffer_usage: SharedBufferUsage::new(),
+                }),
+            }));
         }
     }
+}
 
-    let mut shared_buffer_usage = SharedBufferUsage::new();
+/// Authenticates, negotiates, and serves one broker association over paired
+/// control and notification channels.
+///
+/// The deployment must bind both channels to the same authenticated peer
+/// association. Active requests and responses remain on the control channel;
+/// broker-initiated readiness wakeups are sent on the notification channel.
+/// Event mutations caused by control requests return readiness in their control
+/// response and do not also emit a duplicate notification.
+///
+/// `shared_buffers` belongs to this association. Payload descriptors are
+/// validated against trusted per-slot claim state. `send_shared_memory` runs
+/// after version negotiation and before active requests begin.
+pub fn serve_connection<ControlChannel, NotificationChannel, Memory, ChannelError>(
+    core: &BrokerCore,
+    control_channel: &mut ControlChannel,
+    _notification_channel: &mut NotificationChannel,
+    shared_buffers: &SharedBufferPool<Memory>,
+    send_shared_memory: impl FnOnce(&mut ControlChannel) -> core::result::Result<(), ChannelError>,
+) -> Result<ConnectionTermination, ChannelError>
+where
+    ControlChannel: HostControlChannel<Error = ChannelError>,
+    NotificationChannel: HostNotificationChannel<Error = ChannelError>,
+    Memory: SharedMemory,
+{
+    let association =
+        match setup_connection(core, control_channel, shared_buffers, send_shared_memory)? {
+            Ok(association) => association,
+            Err(termination) => return Ok(termination),
+        };
     loop {
         let request = match control_channel
             .recv_request()
@@ -124,32 +239,7 @@ where
             }
             HostReceive::PeerClosed => break,
         };
-
-        let BrokerRequest {
-            request_id,
-            operation,
-        } = request;
-        let buffer_descriptor = match &operation {
-            BrokerOperation::Pipe(PipeRequest::Read(request)) => Some(request.buffer),
-            BrokerOperation::Pipe(PipeRequest::Write(request)) => Some(request.buffer),
-            BrokerOperation::CloseObject(_)
-            | BrokerOperation::CheckReadiness(_)
-            | BrokerOperation::Event(_)
-            | BrokerOperation::Pipe(PipeRequest::Create(_)) => None,
-        };
-        if let Some(descriptor) = buffer_descriptor {
-            shared_buffer_usage
-                .begin(request_id, descriptor, shared_buffers.layout())
-                .map_err(BrokerHostError::Broker)?;
-        }
-        let result = complete_request(handle_request(&session, operation, shared_buffers))
-            .map_err(BrokerHostError::Broker)?;
-        control_channel
-            .send_response(&BrokerResponse { request_id, result })
-            .map_err(BrokerHostError::Channel)?;
-        if let Some(descriptor) = buffer_descriptor {
-            shared_buffer_usage.end(request_id, descriptor.slot_index);
-        }
+        association.execute_request(request, |response| control_channel.send_response(response))?;
     }
 
     Ok(ConnectionTermination::PeerClosed)
@@ -361,7 +451,8 @@ mod tests {
         SharedBufferDescriptor, SharedBufferPool, SharedMemoryError,
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::time::Duration;
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
@@ -384,6 +475,9 @@ mod tests {
         active_request_closes_object_reference(&broker);
         association_shared_buffer_descriptors_stage_pipe_data(&broker);
         shared_buffer_usage_rejects_invalid_descriptors();
+        association_executes_distinct_slots_concurrently(&broker);
+        association_allows_slot_reuse_during_response_emission(&broker);
+        association_allows_out_of_order_responses(&broker);
     }
 
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
@@ -559,9 +653,11 @@ mod tests {
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }))]),
-            std::vec::Vec::new(),
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerOperation::Event(
+                EventRequest::Create(CreateEventRequest { initial_count: 0 }),
+            )))]),
         );
-        channel.send_error = true;
+        channel.response_send_error = true;
         let mut notifications = FakeHostNotificationChannel::default();
 
         match serve_connection(
@@ -574,7 +670,8 @@ mod tests {
             Err(BrokerHostError::Channel(())) => {}
             result => panic!("unexpected serve result: {result:?}"),
         }
-        assert!(channel.handshake_responses.is_empty());
+        assert_eq!(channel.handshake_responses.len(), 1);
+        assert!(channel.results.is_empty());
     }
 
     fn serve_connection_returns_event_readiness_in_control_responses(broker: &BrokerCore) {
@@ -893,6 +990,174 @@ mod tests {
         );
     }
 
+    fn association_executes_distinct_slots_concurrently(broker: &BrokerCore) {
+        let shared_buffers = test_shared_buffers();
+        let association = test_association(broker, &shared_buffers);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_sender, started_receiver) = mpsc::sync_channel(2);
+
+        std::thread::scope(|scope| {
+            let first_release = Arc::clone(&release);
+            let first_sender = started_sender.clone();
+            let first_association = &association;
+            let first = scope.spawn(move || {
+                first_association.execute_request(read_request(1, 0), |response| {
+                    first_sender.send(response.request_id).unwrap();
+                    wait_for_release(&first_release);
+                    Ok::<_, ()>(())
+                })
+            });
+            let second_release = Arc::clone(&release);
+            let second_association = &association;
+            let second = scope.spawn(move || {
+                second_association.execute_request(read_request(2, 1), |response| {
+                    started_sender.send(response.request_id).unwrap();
+                    wait_for_release(&second_release);
+                    Ok::<_, ()>(())
+                })
+            });
+
+            let mut started = [
+                started_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap(),
+                started_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap(),
+            ];
+            started.sort();
+            assert_eq!(started, [RequestId(1), RequestId(2)]);
+            let (released, available) = &*release;
+            *released.lock().unwrap() = true;
+            available.notify_all();
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+    }
+
+    fn association_allows_slot_reuse_during_response_emission(broker: &BrokerCore) {
+        let shared_buffers = test_shared_buffers();
+        let association = test_association(broker, &shared_buffers);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+
+        std::thread::scope(|scope| {
+            let worker_release = Arc::clone(&release);
+            let first_association = &association;
+            let first = scope.spawn(move || {
+                first_association.execute_request(read_request(1, 0), |_| {
+                    started_sender.send(()).unwrap();
+                    wait_for_release(&worker_release);
+                    Ok::<_, ()>(())
+                })
+            });
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+
+            association
+                .execute_request(read_request(2, 0), |_| Ok::<_, ()>(()))
+                .unwrap();
+            let (released, available) = &*release;
+            *released.lock().unwrap() = true;
+            available.notify_all();
+            first.join().unwrap().unwrap();
+        });
+    }
+
+    fn association_allows_out_of_order_responses(broker: &BrokerCore) {
+        let shared_buffers = test_shared_buffers();
+        let association = test_association(broker, &shared_buffers);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (first_started_sender, first_started_receiver) = mpsc::sync_channel(1);
+        let (response_sender, response_receiver) = mpsc::sync_channel(2);
+
+        std::thread::scope(|scope| {
+            let first_association = &association;
+            let first_release = Arc::clone(&release);
+            let first_response_sender = response_sender.clone();
+            let first = scope.spawn(move || {
+                first_association.execute_request(event_create_request(1), |response| {
+                    first_started_sender.send(()).unwrap();
+                    wait_for_release(&first_release);
+                    first_response_sender.send(response.request_id).unwrap();
+                    Ok::<_, ()>(())
+                })
+            });
+            first_started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+
+            let second_association = &association;
+            let second = scope.spawn(move || {
+                second_association.execute_request(event_create_request(2), |response| {
+                    response_sender.send(response.request_id).unwrap();
+                    Ok::<_, ()>(())
+                })
+            });
+            assert_eq!(
+                response_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap(),
+                RequestId(2)
+            );
+            let (released, available) = &*release;
+            *released.lock().unwrap() = true;
+            available.notify_all();
+            assert_eq!(
+                response_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap(),
+                RequestId(1)
+            );
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+    }
+
+    fn test_association<'a>(
+        broker: &BrokerCore,
+        shared_buffers: &'a SharedBufferPool<TestSharedMemory>,
+    ) -> BrokerHostAssociation<'a, TestSharedMemory> {
+        BrokerHostAssociation {
+            session: broker
+                .create_session(CallerCredential::Unauthenticated)
+                .unwrap(),
+            shared_buffers,
+            state: SpinMutex::new(AssociationState {
+                failed: false,
+                shared_buffer_usage: SharedBufferUsage::new(),
+            }),
+        }
+    }
+
+    fn read_request(request_id: u64, slot_index: u32) -> BrokerRequest {
+        BrokerRequest {
+            request_id: RequestId(request_id),
+            operation: BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
+                handle: ObjectHandle(u64::MAX),
+                buffer: descriptor(slot_index, 1),
+            })),
+        }
+    }
+
+    fn event_create_request(request_id: u64) -> BrokerRequest {
+        BrokerRequest {
+            request_id: RequestId(request_id),
+            operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+                initial_count: 0,
+            })),
+        }
+    }
+
+    fn wait_for_release(release: &(Mutex<bool>, Condvar)) {
+        let (released, available) = release;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = available.wait(released).unwrap();
+        }
+    }
+
     const fn descriptor(slot: u32, length: u32) -> SharedBufferDescriptor {
         SharedBufferDescriptor {
             slot_index: SharedBufferSlotIndex(slot),
@@ -931,7 +1196,7 @@ mod tests {
         request_id_step: u64,
         enqueue_readiness_requests_after_create: bool,
         enqueue_write_request_after_pipe_create: bool,
-        send_error: bool,
+        response_send_error: bool,
     }
 
     impl FakeHostControlChannel {
@@ -951,7 +1216,7 @@ mod tests {
                 request_id_step: 1,
                 enqueue_readiness_requests_after_create: false,
                 enqueue_write_request_after_pipe_create: false,
-                send_error: false,
+                response_send_error: false,
             }
         }
     }
@@ -977,9 +1242,6 @@ mod tests {
             &mut self,
             response: &BrokerHandshakeResponse,
         ) -> core::result::Result<(), Self::Error> {
-            if self.send_error {
-                return Err(());
-            }
             self.handshake_responses.push(response.clone());
             Ok(())
         }
@@ -1010,7 +1272,7 @@ mod tests {
             &mut self,
             response: &BrokerResponse,
         ) -> core::result::Result<(), Self::Error> {
-            if self.send_error {
+            if self.response_send_error {
                 return Err(());
             }
             let result = &response.result;

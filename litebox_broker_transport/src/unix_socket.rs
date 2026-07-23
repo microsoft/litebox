@@ -26,8 +26,8 @@ use crate::unix_io::{
 };
 use litebox_broker_protocol::RequestId;
 use litebox_broker_protocol::channel::{
-    HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
-    LocalNotificationChannel, PeerCredential,
+    HostControlChannel, HostNotificationChannel, HostReceive, HostRequestSource, HostResponseSink,
+    LocalControlChannel, LocalNotificationChannel, PeerCredential,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
@@ -243,6 +243,23 @@ pub struct UnixStreamHostControlChannel {
     stream: UnixStream,
     peer_credential: PeerCredential,
     setup_deadline: Option<Instant>,
+    negotiated: bool,
+}
+
+/// Request-reading half of an active host control channel.
+pub struct UnixStreamHostRequestSource {
+    stream: UnixStream,
+}
+
+/// Shared response-writing half of an active host control channel.
+#[derive(Clone)]
+pub struct UnixStreamHostResponseSink {
+    stream: Arc<Mutex<UnixStream>>,
+}
+
+/// Handle that interrupts all active host control-channel I/O.
+pub struct UnixStreamHostControlShutdown {
+    stream: UnixStream,
 }
 
 /// Local-side Unix-domain-socket notification channel for the hosted userland POC.
@@ -267,6 +284,7 @@ impl UnixStreamHostControlChannel {
             stream,
             peer_credential: PeerCredential::Unauthenticated,
             setup_deadline: None,
+            negotiated: false,
         }
     }
 
@@ -277,6 +295,7 @@ impl UnixStreamHostControlChannel {
             stream,
             peer_credential: PeerCredential::HostGuaranteed,
             setup_deadline: Some(setup_deadline),
+            negotiated: false,
         }
     }
 
@@ -287,6 +306,43 @@ impl UnixStreamHostControlChannel {
         deadline: Option<Instant>,
     ) -> IoResult<()> {
         crate::shared_memory::send_memfd(&mut self.stream, shared_memory, deadline)
+    }
+
+    /// Consumes a negotiated setup channel into independently usable active
+    /// request, response, and shutdown handles.
+    pub fn into_active(
+        self,
+    ) -> IoResult<(
+        UnixStreamHostRequestSource,
+        UnixStreamHostResponseSink,
+        UnixStreamHostControlShutdown,
+    )> {
+        if !self.negotiated {
+            return Err(invalid_data(
+                "broker host control channel activated before negotiation completed",
+            ));
+        }
+        let response_stream = self.stream.try_clone()?;
+        let shutdown_stream = self.stream.try_clone()?;
+        Ok((
+            UnixStreamHostRequestSource {
+                stream: self.stream,
+            },
+            UnixStreamHostResponseSink {
+                stream: Arc::new(Mutex::new(response_stream)),
+            },
+            UnixStreamHostControlShutdown {
+                stream: shutdown_stream,
+            },
+        ))
+    }
+}
+
+impl UnixStreamHostControlShutdown {
+    /// Shuts down the active control socket without waiting for the response
+    /// writer mutex.
+    pub fn shutdown(&self) -> IoResult<()> {
+        shutdown(&self.stream)
     }
 }
 
@@ -411,7 +467,8 @@ impl HostControlChannel for UnixStreamHostControlChannel {
             &encode_handshake_response(response.clone()),
             self.setup_deadline,
         )?;
-        if matches!(response, BrokerHandshakeResponse::Negotiated { .. }) {
+        self.negotiated = matches!(response, BrokerHandshakeResponse::Negotiated { .. });
+        if self.negotiated {
             self.setup_deadline = None;
         }
         Ok(())
@@ -430,6 +487,33 @@ impl HostControlChannel for UnixStreamHostControlChannel {
 
     fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
         write_frame_with_deadline(&mut self.stream, &encode_response(response.clone()), None)
+    }
+}
+
+impl HostRequestSource for UnixStreamHostRequestSource {
+    type Error = Error;
+
+    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+        let Some(frame) = read_frame_with_deadline(&mut self.stream, None)? else {
+            return Ok(HostReceive::PeerClosed);
+        };
+        match decode_request(&frame) {
+            Ok(request) => Ok(HostReceive::Message(request)),
+            Err(WireError::WrongMessagePhase) => Ok(HostReceive::ProtocolViolation),
+            Err(error) => Err(wire_error(error)),
+        }
+    }
+}
+
+impl HostResponseSink for UnixStreamHostResponseSink {
+    type Error = Error;
+
+    fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
+        let mut stream = self
+            .stream
+            .lock()
+            .expect("broker response writer mutex poisoned");
+        write_frame_with_deadline(&mut stream, &encode_response(response.clone()), None)
     }
 }
 
@@ -1456,6 +1540,62 @@ mod tests {
             channel.stream.write_timeout().unwrap(),
             active_write_timeout
         );
+    }
+
+    #[test]
+    fn host_control_requires_negotiation_before_active_split() {
+        let (_peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+
+        assert!(channel.into_active().is_err());
+    }
+
+    #[test]
+    fn concurrent_host_response_sinks_write_complete_frames() {
+        let (mut peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        channel
+            .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+            })
+            .unwrap();
+        let handshake = read_frame_with_deadline(&mut peer_stream, None)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            decode_handshake_response(&handshake).unwrap(),
+            BrokerHandshakeResponse::Negotiated { .. }
+        ));
+        let (_request_source, response_sink, _shutdown) = channel.into_active().unwrap();
+        let first_sink = response_sink.clone();
+        let first = std::thread::spawn(move || {
+            first_sink
+                .send_response(&BrokerResponse {
+                    request_id: RequestId(1),
+                    result: BrokerResult::ObjectClosed,
+                })
+                .unwrap();
+        });
+        let second = std::thread::spawn(move || {
+            response_sink
+                .send_response(&BrokerResponse {
+                    request_id: RequestId(2),
+                    result: BrokerResult::ObjectClosed,
+                })
+                .unwrap();
+        });
+
+        let mut response_ids = [RequestId(0); 2];
+        for response_id in &mut response_ids {
+            let frame = read_frame_with_deadline(&mut peer_stream, None)
+                .unwrap()
+                .unwrap();
+            *response_id = decode_response(&frame).unwrap().request_id;
+        }
+        response_ids.sort();
+        assert_eq!(response_ids, [RequestId(1), RequestId(2)]);
+        first.join().unwrap();
+        second.join().unwrap();
     }
 
     #[test]

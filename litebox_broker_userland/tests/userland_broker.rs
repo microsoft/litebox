@@ -84,15 +84,37 @@ fn run_fake_runner(args: &[OsString]) {
     let control_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
     let _notification_channel =
         connect_notification_with_retry(Path::new(notification_socket_path)).unwrap();
-    let local = BrokerLocal::negotiate(control_channel, |channel| {
-        let shared_memory = channel.receive_memfd(
-            SHARED_BUFFER_POOL_SIZE,
-            Some(Instant::now() + Duration::from_secs(5)),
-        )?;
-        let _cancellation = channel.activate(|| {})?;
-        Ok(Arc::new(shared_memory))
-    })
-    .unwrap();
+    let local = Arc::new(
+        BrokerLocal::negotiate(control_channel, |channel| {
+            let shared_memory = channel.receive_memfd(
+                SHARED_BUFFER_POOL_SIZE,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )?;
+            let _cancellation = channel.activate(|| {})?;
+            Ok(Arc::new(shared_memory))
+        })
+        .unwrap(),
+    );
+
+    let start = Arc::new(std::sync::Barrier::new(17));
+    let callers = (0..16)
+        .map(|initial_count| {
+            let local = Arc::clone(&local);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                local.create_event_with_count(initial_count).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    start.wait();
+    let mut concurrent_handles = callers
+        .into_iter()
+        .map(|caller| caller.join().unwrap())
+        .collect::<Vec<_>>();
+    concurrent_handles.sort();
+    concurrent_handles.dedup();
+    assert_eq!(concurrent_handles.len(), 16);
 
     let handle = local.create_event_with_count(0).unwrap();
     assert_eq!(

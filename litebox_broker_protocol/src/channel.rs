@@ -89,6 +89,27 @@ pub trait HostControlChannel {
     fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;
 }
 
+/// Host-side source of active broker requests.
+pub trait HostRequestSource {
+    /// Channel-specific error type.
+    type Error;
+
+    /// Receives one active broker request.
+    fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
+}
+
+/// Host-side sink for complete active broker responses.
+pub trait HostResponseSink {
+    /// Channel-specific error type.
+    type Error;
+
+    /// Sends one complete broker response.
+    ///
+    /// Implementations must serialize concurrent calls so response frames never
+    /// interleave.
+    fn send_response(&self, response: &BrokerResponse) -> Result<(), Self::Error>;
+}
+
 /// Local-side receive channel for broker-initiated asynchronous notifications.
 ///
 /// A notification channel is separate from the control channel so active broker
