@@ -9,6 +9,8 @@
 //! protocol messages, local-side adapters, host-side request handling, and core
 //! authority state live in separate crates.
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 

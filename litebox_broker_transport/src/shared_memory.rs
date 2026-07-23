@@ -410,8 +410,8 @@ fn shared_memory_error(error: SharedMemoryError) -> Error {
 mod tests {
     use super::*;
     use crate::control_ring::{
-        CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRing, ControlRingConsumer,
-        ControlRingDirection, ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus,
+        CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRing, ControlRingDirection,
+        ControlRingReadStatus, ControlRingWriteStatus,
     };
     use litebox_broker_protocol::shared_memory::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedBufferSlotIndex,
@@ -574,20 +574,22 @@ mod tests {
             CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
-        let local_ring = ControlRing::new(local_memory).unwrap();
-        let broker_ring = ControlRing::new(broker_memory).unwrap();
+        let (mut producer, _) = ControlRing::new(local_memory).unwrap().into_local();
+        let (_, mut consumer) = ControlRing::new(broker_memory).unwrap().into_broker();
         let empty_checked = Arc::new(Barrier::new(2));
         let broker_empty_checked = Arc::clone(&empty_checked);
 
         let broker = thread::spawn(move || {
-            let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
-            assert_eq!(
-                consumer.try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0])),
-                Ok(ControlRingReadStatus::Empty)
-            );
-            let producer_epoch = consumer.wait_epoch(&broker_ring).unwrap();
+            let ControlRingReadStatus::Empty {
+                wait_epoch: producer_epoch,
+            } = consumer
+                .try_read(|payload| Ok::<_, ()>(payload[0]))
+                .unwrap()
+            else {
+                panic!("request ring should initially be empty");
+            };
             broker_empty_checked.wait();
-            broker_ring
+            consumer
                 .memory()
                 .futex_wait_u32(
                     ControlRingDirection::Requests.producer_epoch_offset(),
@@ -597,31 +599,30 @@ mod tests {
             for expected in 0..CONTROL_RING_SLOT_COUNT {
                 let expected = u8::try_from(expected).unwrap();
                 assert_eq!(
-                    consumer.try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0])),
+                    consumer.try_read(|payload| Ok::<_, ()>(payload[0])),
                     Ok(ControlRingReadStatus::Message(expected))
                 );
             }
 
-            consumer.publish_head(&broker_ring).unwrap();
-            broker_ring
+            consumer.publish_head().unwrap();
+            consumer
                 .memory()
                 .futex_wake_u32(ControlRingDirection::Requests.consumer_epoch_offset())
                 .unwrap();
-            let producer_epoch = consumer.wait_epoch(&broker_ring).unwrap();
             match consumer
-                .try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0]))
+                .try_read(|payload| Ok::<_, ()>(payload[0]))
                 .unwrap()
             {
-                ControlRingReadStatus::Empty => {
-                    broker_ring
+                ControlRingReadStatus::Empty { wait_epoch } => {
+                    consumer
                         .memory()
                         .futex_wait_u32(
                             ControlRingDirection::Requests.producer_epoch_offset(),
-                            producer_epoch,
+                            wait_epoch,
                         )
                         .unwrap();
                     assert_eq!(
-                        consumer.try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0])),
+                        consumer.try_read(|payload| Ok::<_, ()>(payload[0])),
                         Ok(ControlRingReadStatus::Message(0xff))
                     );
                 }
@@ -629,27 +630,26 @@ mod tests {
             }
         });
 
-        let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
         empty_checked.wait();
         for value in 0..CONTROL_RING_SLOT_COUNT {
             let value = u8::try_from(value).unwrap();
             assert_eq!(
-                producer.try_write(&local_ring, &[value]),
+                producer.try_write(&[value]),
                 Ok(ControlRingWriteStatus::Written)
             );
         }
-        assert_eq!(
-            producer.try_write(&local_ring, &[0xff]),
-            Ok(ControlRingWriteStatus::Full)
-        );
-        let consumer_epoch = producer.wait_epoch(&local_ring).unwrap();
-        producer.notify_consumer(&local_ring).unwrap();
-        local_ring
+        let ControlRingWriteStatus::Full {
+            wait_epoch: consumer_epoch,
+        } = producer.try_write(&[0xff]).unwrap()
+        else {
+            panic!("request ring should be full");
+        };
+        producer
             .memory()
             .futex_wake_u32(ControlRingDirection::Requests.producer_epoch_offset())
             .unwrap();
 
-        local_ring
+        producer
             .memory()
             .futex_wait_u32(
                 ControlRingDirection::Requests.consumer_epoch_offset(),
@@ -657,11 +657,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            producer.try_write(&local_ring, &[0xff]),
+            producer.try_write(&[0xff]),
             Ok(ControlRingWriteStatus::Written)
         );
-        producer.notify_consumer(&local_ring).unwrap();
-        local_ring
+        producer
             .memory()
             .futex_wake_u32(ControlRingDirection::Requests.producer_epoch_offset())
             .unwrap();
