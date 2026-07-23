@@ -21,10 +21,12 @@ pub const CONTROL_RING_PAYLOAD_CAPACITY: usize =
 pub const CONTROL_RING_SLOT_COUNT: u64 = 64;
 
 /// Exact shared-memory size required for both control-ring directions.
-pub const CONTROL_RING_MEMORY_SIZE: usize =
-    CONTROL_RING_SLOT_SIZE * CONTROL_RING_SLOT_COUNT_USIZE * 2;
+pub const CONTROL_RING_MEMORY_SIZE: usize = CONTROL_RING_DIRECTION_SIZE * 2;
 
-const CONTROL_RING_SLOT_COUNT_USIZE: usize = 64;
+// The fixed count is representable by `usize` on every supported target.
+#[allow(clippy::cast_possible_truncation)]
+const CONTROL_RING_DIRECTION_SIZE: usize =
+    CONTROL_RING_SLOT_SIZE * CONTROL_RING_SLOT_COUNT as usize;
 
 /// Fixed layout of the association shared control rings.
 pub const CONTROL_RING_LAYOUT: ControlRingLayout = ControlRingLayout::new();
@@ -74,7 +76,7 @@ impl ControlRingLayout {
 
     /// Returns the size of one directional ring.
     pub const fn direction_len(self) -> usize {
-        CONTROL_RING_SLOT_SIZE * CONTROL_RING_SLOT_COUNT_USIZE
+        CONTROL_RING_DIRECTION_SIZE
     }
 
     /// Returns the exact backing-memory length required for both rings.
