@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Reusable byte codec for broker control-channel messages.
+//! Reusable byte codec for broker request/response control-channel messages.
 //!
 //! The wire codec mirrors the protocol DTO hierarchy:
 //! - this module owns public encode/decode entry points and top-level broker
@@ -18,7 +18,6 @@
 use alloc::vec::Vec;
 use thiserror::Error;
 
-use crate::control_ring::{BrokerDoorbell, LocalDoorbell};
 use crate::error::ErrorCode;
 use crate::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
@@ -37,7 +36,6 @@ const REQUEST_TAG_EVENT: u8 = 1;
 const REQUEST_TAG_CLOSE_OBJECT: u8 = 2;
 const REQUEST_TAG_PIPE: u8 = 3;
 const REQUEST_TAG_CHECK_READINESS: u8 = 4;
-const REQUEST_TAG_LOCAL_DOORBELL: u8 = 5;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
@@ -47,7 +45,6 @@ const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
 const RESPONSE_TAG_PIPE: u8 = 5;
 const RESPONSE_TAG_READINESS: u8 = 6;
 const RESPONSE_TAG_ERROR: u8 = 7;
-const RESPONSE_TAG_BROKER_DOORBELL: u8 = 8;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
@@ -89,8 +86,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         REQUEST_TAG_EVENT
         | REQUEST_TAG_CLOSE_OBJECT
         | REQUEST_TAG_PIPE
-        | REQUEST_TAG_CHECK_READINESS
-        | REQUEST_TAG_LOCAL_DOORBELL => {
+        | REQUEST_TAG_CHECK_READINESS => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -139,9 +135,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     match tag {
-        REQUEST_TAG_NEGOTIATE | REQUEST_TAG_LOCAL_DOORBELL => {
-            return Err(WireError::WrongMessagePhase);
-        }
+        REQUEST_TAG_NEGOTIATE => return Err(WireError::WrongMessagePhase),
         REQUEST_TAG_CLOSE_OBJECT
         | REQUEST_TAG_CHECK_READINESS
         | REQUEST_TAG_EVENT
@@ -202,8 +196,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_OBJECT_CLOSED
         | RESPONSE_TAG_PIPE
         | RESPONSE_TAG_READINESS
-        | RESPONSE_TAG_ERROR
-        | RESPONSE_TAG_BROKER_DOORBELL => {
+        | RESPONSE_TAG_ERROR => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -260,10 +253,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     match tag {
-        RESPONSE_TAG_NEGOTIATED
-        | RESPONSE_TAG_HANDSHAKE_ERROR
-        | RESPONSE_TAG_VERSION_MISMATCH
-        | RESPONSE_TAG_BROKER_DOORBELL => {
+        RESPONSE_TAG_NEGOTIATED | RESPONSE_TAG_HANDSHAKE_ERROR | RESPONSE_TAG_VERSION_MISMATCH => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_EVENT
@@ -287,52 +277,6 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
     };
     decoder.finish()?;
     Ok(BrokerResponse { request_id, result })
-}
-
-/// Encodes local control-ring progress.
-pub fn encode_local_doorbell(doorbell: LocalDoorbell) -> Vec<u8> {
-    let mut encoder = Encoder::default();
-    encoder.u8(REQUEST_TAG_LOCAL_DOORBELL);
-    encoder.u64(doorbell.request_tail);
-    encoder.u64(doorbell.response_head);
-    encoder.finish()
-}
-
-/// Decodes local control-ring progress.
-pub fn decode_local_doorbell(frame: &[u8]) -> Result<LocalDoorbell, WireError> {
-    let mut decoder = Decoder::new(frame);
-    if decoder.u8()? != REQUEST_TAG_LOCAL_DOORBELL {
-        return Err(WireError::InvalidTag);
-    }
-    let doorbell = LocalDoorbell {
-        request_tail: decoder.u64()?,
-        response_head: decoder.u64()?,
-    };
-    decoder.finish()?;
-    Ok(doorbell)
-}
-
-/// Encodes broker control-ring progress.
-pub fn encode_broker_doorbell(doorbell: BrokerDoorbell) -> Vec<u8> {
-    let mut encoder = Encoder::default();
-    encoder.u8(RESPONSE_TAG_BROKER_DOORBELL);
-    encoder.u64(doorbell.request_head);
-    encoder.u64(doorbell.response_tail);
-    encoder.finish()
-}
-
-/// Decodes broker control-ring progress.
-pub fn decode_broker_doorbell(frame: &[u8]) -> Result<BrokerDoorbell, WireError> {
-    let mut decoder = Decoder::new(frame);
-    if decoder.u8()? != RESPONSE_TAG_BROKER_DOORBELL {
-        return Err(WireError::InvalidTag);
-    }
-    let doorbell = BrokerDoorbell {
-        request_head: decoder.u64()?,
-        response_tail: decoder.u64()?,
-    };
-    decoder.finish()?;
-    Ok(doorbell)
 }
 
 /// Encodes a broker notification body.
@@ -556,27 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn doorbell_codecs_round_trip() {
-        let local = LocalDoorbell {
-            request_tail: 13,
-            response_head: 17,
-        };
-        assert_eq!(
-            decode_local_doorbell(&encode_local_doorbell(local)).unwrap(),
-            local
-        );
-
-        let broker = BrokerDoorbell {
-            request_head: 19,
-            response_tail: 23,
-        };
-        assert_eq!(
-            decode_broker_doorbell(&encode_broker_doorbell(broker)).unwrap(),
-            broker
-        );
-    }
-
-    #[test]
     fn decode_rejects_malformed_handshake_request_frames() {
         assert_eq!(
             decode_handshake_request(&[0xff, 1, 2, 3]),
@@ -772,60 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_malformed_or_wrong_phase_local_doorbells() {
-        assert_eq!(decode_local_doorbell(&[0xff]), Err(WireError::InvalidTag));
-        let encoded = encode_local_doorbell(LocalDoorbell {
-            request_tail: 13,
-            response_head: 17,
-        });
-        assert_eq!(
-            decode_local_doorbell(&encoded[..encoded.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-        let mut trailing = encoded;
-        trailing.push(0xff);
-        assert_eq!(
-            decode_local_doorbell(&trailing),
-            Err(WireError::TrailingBytes)
-        );
-        assert_eq!(
-            decode_handshake_request(&encode_local_doorbell(LocalDoorbell::default())),
-            Err(WireError::WrongMessagePhase)
-        );
-        assert_eq!(
-            decode_request(&encode_local_doorbell(LocalDoorbell::default())),
-            Err(WireError::WrongMessagePhase)
-        );
-    }
-
-    #[test]
-    fn decode_rejects_malformed_or_wrong_phase_broker_doorbells() {
-        assert_eq!(decode_broker_doorbell(&[0xff]), Err(WireError::InvalidTag));
-        let encoded = encode_broker_doorbell(BrokerDoorbell {
-            request_head: 19,
-            response_tail: 23,
-        });
-        assert_eq!(
-            decode_broker_doorbell(&encoded[..encoded.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-        let mut trailing = encoded;
-        trailing.push(0xff);
-        assert_eq!(
-            decode_broker_doorbell(&trailing),
-            Err(WireError::TrailingBytes)
-        );
-        assert_eq!(
-            decode_handshake_response(&encode_broker_doorbell(BrokerDoorbell::default())),
-            Err(WireError::WrongMessagePhase)
-        );
-        assert_eq!(
-            decode_response(&encode_broker_doorbell(BrokerDoorbell::default())),
-            Err(WireError::WrongMessagePhase)
-        );
-    }
-
-    #[test]
     fn event_create_request_wire_shape_is_pinned() {
         assert_eq!(
             encode_request(BrokerRequest {
@@ -859,24 +728,6 @@ mod tests {
                 readiness: ReadinessFlags::READ | ReadinessFlags::HANGUP,
             })),
             [0, 13, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]
-        );
-    }
-
-    #[test]
-    fn doorbell_wire_shapes_are_pinned() {
-        assert_eq!(
-            encode_local_doorbell(LocalDoorbell {
-                request_tail: 13,
-                response_head: 17,
-            }),
-            [5, 13, 0, 0, 0, 0, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            encode_broker_doorbell(BrokerDoorbell {
-                request_head: 19,
-                response_tail: 23,
-            }),
-            [8, 19, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0]
         );
     }
 }

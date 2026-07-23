@@ -23,8 +23,12 @@ use rustix::net::{
 
 use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemory, SharedMemoryError};
 
+#[cfg(target_has_atomic = "32")]
+use std::sync::atomic::AtomicU32;
 #[cfg(target_has_atomic = "64")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(any(target_has_atomic = "32", target_has_atomic = "64"))]
+use std::sync::atomic::Ordering;
 
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
@@ -51,21 +55,52 @@ unsafe impl Send for MappedRegion {}
 
 #[cfg(target_has_atomic = "64")]
 fn atomic_u64_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU64, SharedMemoryError> {
-    offset
-        .checked_add(size_of::<u64>())
-        .filter(|end| *end <= mapping.length)
-        .ok_or(SharedMemoryError::InvalidRange)?;
-    // SAFETY: The checked offset is inside the live mapping.
-    let byte_address = unsafe { mapping.address.as_ptr().add(offset) };
-    if !byte_address.addr().is_multiple_of(align_of::<AtomicU64>()) {
-        return Err(SharedMemoryError::UnalignedAtomic);
-    }
+    let byte_address = shared_address(mapping, offset, size_of::<u64>(), align_of::<AtomicU64>())?;
     // The runtime check above establishes the stronger alignment.
     #[allow(clippy::cast_ptr_alignment)]
     let address = byte_address.cast::<u64>();
     // SAFETY: The pointer is valid and aligned for a `u64`. Control-ring
     // sequence words are accessed atomically by conforming endpoints.
     Ok(unsafe { AtomicU64::from_ptr(address) })
+}
+
+#[cfg(target_has_atomic = "32")]
+fn atomic_u32_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU32, SharedMemoryError> {
+    let address = shared_u32_address(mapping, offset)?;
+    // SAFETY: The pointer is valid and aligned for a `u32`. Control-ring epoch
+    // words are accessed atomically by conforming endpoints and the futex
+    // syscall.
+    Ok(unsafe { AtomicU32::from_ptr(address) })
+}
+
+#[cfg(target_has_atomic = "32")]
+fn shared_u32_address(
+    mapping: &MappedRegion,
+    offset: usize,
+) -> Result<*mut u32, SharedMemoryError> {
+    let byte_address = shared_address(mapping, offset, size_of::<u32>(), align_of::<AtomicU32>())?;
+    // The runtime check above establishes the stronger alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    let address = byte_address.cast();
+    Ok(address)
+}
+
+fn shared_address(
+    mapping: &MappedRegion,
+    offset: usize,
+    size: usize,
+    alignment: usize,
+) -> Result<*mut u8, SharedMemoryError> {
+    offset
+        .checked_add(size)
+        .filter(|end| *end <= mapping.length)
+        .ok_or(SharedMemoryError::InvalidRange)?;
+    // SAFETY: The checked offset is inside the live mapping.
+    let byte_address = unsafe { mapping.address.as_ptr().add(offset) };
+    if !byte_address.addr().is_multiple_of(alignment) {
+        return Err(SharedMemoryError::UnalignedAtomic);
+    }
+    Ok(byte_address)
 }
 
 impl MemfdSharedMemory {
@@ -141,6 +176,72 @@ impl MemfdSharedMemory {
             mapping: Mutex::new(MappedRegion { address, length }),
         })
     }
+
+    /// Waits while a shared atomic `u32` still equals `expected`.
+    ///
+    /// A value change or signal interruption is reported as a successful,
+    /// possibly spurious wakeup. The caller must recheck its wait condition.
+    #[cfg(target_has_atomic = "32")]
+    pub fn futex_wait_u32(&self, offset: usize, expected: u32) -> IoResult<()> {
+        let address = {
+            let mapping = self
+                .mapping
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            shared_u32_address(&mapping, offset).map_err(shared_memory_error)?
+        };
+        // SAFETY: `address` points to a live, aligned shared `u32`. `self`
+        // remains borrowed for the syscall, so the mapping cannot be dropped.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                address,
+                libc::FUTEX_WAIT,
+                expected,
+                std::ptr::null::<libc::timespec>(),
+                std::ptr::null::<u32>(),
+                0_u32,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EAGAIN | libc::EINTR) => Ok(()),
+            _ => Err(error),
+        }
+    }
+
+    /// Wakes one waiter blocked on a shared atomic `u32`.
+    #[cfg(target_has_atomic = "32")]
+    pub fn futex_wake_u32(&self, offset: usize) -> IoResult<()> {
+        let address = {
+            let mapping = self
+                .mapping
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            shared_u32_address(&mapping, offset).map_err(shared_memory_error)?
+        };
+        // SAFETY: `address` points to a live, aligned shared `u32`. `self`
+        // remains borrowed for the syscall, so the mapping cannot be dropped.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                address,
+                libc::FUTEX_WAKE,
+                1_u32,
+                std::ptr::null::<libc::timespec>(),
+                std::ptr::null::<u32>(),
+                0_u32,
+            )
+        };
+        if result < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl AsFd for MemfdSharedMemory {
@@ -204,6 +305,22 @@ impl SharedMemory for MemfdSharedMemory {
 
 #[cfg(target_has_atomic = "64")]
 impl AtomicSharedMemory for MemfdSharedMemory {
+    fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
+        let mapping = self
+            .mapping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(atomic_u32_at(&mapping, offset)?.load(Ordering::Acquire))
+    }
+
+    fn fetch_add_u32_release(&self, offset: usize, value: u32) -> Result<u32, SharedMemoryError> {
+        let mapping = self
+            .mapping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(atomic_u32_at(&mapping, offset)?.fetch_add(value, Ordering::Release))
+    }
+
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
         let mapping = self
             .mapping
@@ -340,6 +457,10 @@ fn invalid_data(message: &'static str) -> Error {
     Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
+fn shared_memory_error(error: SharedMemoryError) -> Error {
+    Error::new(ErrorKind::InvalidInput, error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,18 +469,13 @@ mod tests {
         ControlRingWriteStatus,
     };
     use litebox_broker_protocol::control_ring::{
-        BrokerDoorbell, CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRingDirection,
-        LocalDoorbell,
+        CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRingDirection,
     };
     use litebox_broker_protocol::shared_memory::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedBufferSlotIndex,
     };
-    use litebox_broker_protocol::wire::{
-        decode_broker_doorbell, decode_local_doorbell, encode_broker_doorbell,
-        encode_local_doorbell,
-    };
     use rustix::io::FdFlags;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
@@ -396,6 +512,9 @@ mod tests {
 
         first.store_u64_release(8, 0x0102_0304_0506_0708).unwrap();
         assert_eq!(second.load_u64_acquire(8), Ok(0x0102_0304_0506_0708));
+        assert_eq!(first.fetch_add_u32_release(4, 3), Ok(0));
+        assert_eq!(second.load_u32_acquire(4), Ok(3));
+        second.futex_wait_u32(4, 0).unwrap();
         assert_eq!(
             second.load_u64_acquire(1),
             Err(SharedMemoryError::UnalignedAtomic)
@@ -407,6 +526,22 @@ mod tests {
         assert_eq!(
             second.load_u64_acquire(64),
             Err(SharedMemoryError::InvalidRange)
+        );
+        assert_eq!(
+            second.load_u32_acquire(1),
+            Err(SharedMemoryError::UnalignedAtomic)
+        );
+        assert_eq!(
+            second.fetch_add_u32_release(64, 1),
+            Err(SharedMemoryError::InvalidRange)
+        );
+        assert_eq!(
+            second.futex_wait_u32(64, 0).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            second.futex_wake_u32(1).unwrap_err().kind(),
+            ErrorKind::InvalidInput
         );
     }
 
@@ -491,9 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_socket_wakeup_prevents_missed_cross_mapping_work() {
-        const DOORBELL_LEN: usize = 17;
-
+    fn shared_futex_wakeup_prevents_missed_cross_mapping_work() {
         let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
         let broker_memory = MemfdSharedMemory::from_received_fd(
             local_memory.as_fd().try_clone_to_owned().unwrap(),
@@ -502,7 +635,6 @@ mod tests {
         .unwrap();
         let local_ring = ControlRing::new(local_memory).unwrap();
         let broker_ring = ControlRing::new(broker_memory).unwrap();
-        let (mut local_socket, mut broker_socket) = UnixStream::pair().unwrap();
         let empty_checked = Arc::new(Barrier::new(2));
         let broker_empty_checked = Arc::clone(&empty_checked);
 
@@ -512,11 +644,15 @@ mod tests {
                 consumer.try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0])),
                 Ok(ControlRingReadStatus::Empty)
             );
+            let producer_epoch = consumer.wait_epoch(&broker_ring).unwrap();
             broker_empty_checked.wait();
-            let mut frame = [0; DOORBELL_LEN];
-            broker_socket.read_exact(&mut frame).unwrap();
-            let doorbell = decode_local_doorbell(&frame).unwrap();
-            consumer.observe_tail(doorbell.request_tail).unwrap();
+            broker_ring
+                .memory()
+                .futex_wait_u32(
+                    ControlRingDirection::Requests.producer_epoch_offset(),
+                    producer_epoch,
+                )
+                .unwrap();
             for expected in 0..CONTROL_RING_SLOT_COUNT {
                 let expected = u8::try_from(expected).unwrap();
                 assert_eq!(
@@ -525,19 +661,31 @@ mod tests {
                 );
             }
 
-            let encoded = encode_broker_doorbell(BrokerDoorbell {
-                request_head: consumer.published_head(),
-                response_tail: 0,
-            });
-            broker_socket.write_all(&encoded).unwrap();
-
-            broker_socket.read_exact(&mut frame).unwrap();
-            let doorbell = decode_local_doorbell(&frame).unwrap();
-            consumer.observe_tail(doorbell.request_tail).unwrap();
-            assert_eq!(
-                consumer.try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0])),
-                Ok(ControlRingReadStatus::Message(0xff))
-            );
+            consumer.publish_head(&broker_ring).unwrap();
+            broker_ring
+                .memory()
+                .futex_wake_u32(ControlRingDirection::Requests.consumer_epoch_offset())
+                .unwrap();
+            let producer_epoch = consumer.wait_epoch(&broker_ring).unwrap();
+            match consumer
+                .try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0]))
+                .unwrap()
+            {
+                ControlRingReadStatus::Empty => {
+                    broker_ring
+                        .memory()
+                        .futex_wait_u32(
+                            ControlRingDirection::Requests.producer_epoch_offset(),
+                            producer_epoch,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        consumer.try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0])),
+                        Ok(ControlRingReadStatus::Message(0xff))
+                    );
+                }
+                ControlRingReadStatus::Message(value) => assert_eq!(value, 0xff),
+            }
         });
 
         let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
@@ -553,25 +701,29 @@ mod tests {
             producer.try_write(&local_ring, &[0xff]),
             Ok(ControlRingWriteStatus::Full)
         );
-        let frame = encode_local_doorbell(LocalDoorbell {
-            request_tail: producer.published_tail(),
-            response_head: 0,
-        });
-        local_socket.write_all(&frame).unwrap();
+        let consumer_epoch = producer.wait_epoch(&local_ring).unwrap();
+        producer.notify_consumer(&local_ring).unwrap();
+        local_ring
+            .memory()
+            .futex_wake_u32(ControlRingDirection::Requests.producer_epoch_offset())
+            .unwrap();
 
-        let mut frame = [0; DOORBELL_LEN];
-        local_socket.read_exact(&mut frame).unwrap();
-        let doorbell = decode_broker_doorbell(&frame).unwrap();
-        producer.observe_head(doorbell.request_head).unwrap();
+        local_ring
+            .memory()
+            .futex_wait_u32(
+                ControlRingDirection::Requests.consumer_epoch_offset(),
+                consumer_epoch,
+            )
+            .unwrap();
         assert_eq!(
             producer.try_write(&local_ring, &[0xff]),
             Ok(ControlRingWriteStatus::Written)
         );
-        let frame = encode_local_doorbell(LocalDoorbell {
-            request_tail: producer.published_tail(),
-            response_head: 0,
-        });
-        local_socket.write_all(&frame).unwrap();
+        producer.notify_consumer(&local_ring).unwrap();
+        local_ring
+            .memory()
+            .futex_wake_u32(ControlRingDirection::Requests.producer_epoch_offset())
+            .unwrap();
 
         broker.join().unwrap();
     }

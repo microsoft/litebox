@@ -21,12 +21,18 @@ pub const CONTROL_RING_PAYLOAD_CAPACITY: usize =
 pub const CONTROL_RING_SLOT_COUNT: u64 = 64;
 
 /// Exact shared-memory size required for both control-ring directions.
-pub const CONTROL_RING_MEMORY_SIZE: usize = CONTROL_RING_DIRECTION_SIZE * 2;
+pub const CONTROL_RING_MEMORY_SIZE: usize =
+    CONTROL_RING_DATA_SIZE + CONTROL_RING_SYNC_DIRECTION_SIZE * 2;
 
 // The fixed count is representable by `usize` on every supported target.
 #[allow(clippy::cast_possible_truncation)]
 const CONTROL_RING_DIRECTION_SIZE: usize =
     CONTROL_RING_SLOT_SIZE * CONTROL_RING_SLOT_COUNT as usize;
+const CONTROL_RING_DATA_SIZE: usize = CONTROL_RING_DIRECTION_SIZE * 2;
+const CONTROL_RING_SYNC_DIRECTION_SIZE: usize = 16;
+const PRODUCER_EPOCH_OFFSET: usize = 0;
+const CONSUMER_EPOCH_OFFSET: usize = 4;
+const CONSUMER_HEAD_OFFSET: usize = 8;
 
 /// One direction in the shared control-ring mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +57,31 @@ impl ControlRingDirection {
         let start = direction_offset + slot * CONTROL_RING_SLOT_SIZE;
         Ok(start..start + CONTROL_RING_SLOT_SIZE)
     }
+
+    /// Returns the atomic `u32` epoch incremented when the producer publishes
+    /// work for this direction.
+    pub const fn producer_epoch_offset(self) -> usize {
+        self.sync_offset() + PRODUCER_EPOCH_OFFSET
+    }
+
+    /// Returns the atomic `u32` epoch incremented when the consumer publishes
+    /// progress for this direction.
+    pub const fn consumer_epoch_offset(self) -> usize {
+        self.sync_offset() + CONSUMER_EPOCH_OFFSET
+    }
+
+    /// Returns the atomic `u64` consumer-head offset for this direction.
+    pub const fn consumer_head_offset(self) -> usize {
+        self.sync_offset() + CONSUMER_HEAD_OFFSET
+    }
+
+    const fn sync_offset(self) -> usize {
+        CONTROL_RING_DATA_SIZE
+            + match self {
+                Self::Requests => 0,
+                Self::Responses => CONTROL_RING_SYNC_DIRECTION_SIZE,
+            }
+    }
 }
 
 /// Error deriving a range in the fixed control-ring layout.
@@ -60,28 +91,6 @@ pub enum ControlRingLayoutError {
     /// The requested slot does not exist.
     #[error("control-ring slot is out of bounds")]
     InvalidSlot,
-}
-
-/// Local endpoint progress sent to the broker over the control socket.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LocalDoorbell {
-    /// Latest request tail accompanying this socket wakeup.
-    ///
-    /// Slot sequences, not this value, determine whether requests are ready.
-    pub request_tail: u64,
-    /// Number of response slots consumed by the local endpoint.
-    pub response_head: u64,
-}
-
-/// Broker endpoint progress sent to the local endpoint over the control socket.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BrokerDoorbell {
-    /// Number of request slots consumed by the broker.
-    pub request_head: u64,
-    /// Latest response tail accompanying this socket wakeup.
-    ///
-    /// Slot sequences, not this value, determine whether responses are ready.
-    pub response_tail: u64,
 }
 
 #[cfg(test)]

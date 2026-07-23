@@ -68,13 +68,21 @@ pub trait SharedMemory: Send + Sync + 'static {
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError>;
 }
 
-/// Ordered atomic access to shared-memory `u64` values.
+/// Ordered atomic access to shared-memory synchronization values.
 ///
 /// Implementations must provide naturally aligned, indivisible, system-visible
 /// operations over coherent shared memory. Atomic values must not also be
 /// accessed through [`SharedMemory::read`] or [`SharedMemory::write`] by a
 /// conforming endpoint.
 pub trait AtomicSharedMemory: SharedMemory {
+    /// Atomically loads a naturally aligned native-endian `u32` with acquire
+    /// ordering.
+    fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError>;
+
+    /// Atomically increments a naturally aligned native-endian `u32` with
+    /// release ordering and returns its previous value.
+    fn fetch_add_u32_release(&self, offset: usize, value: u32) -> Result<u32, SharedMemoryError>;
+
     /// Atomically loads a naturally aligned native-endian `u64` with acquire
     /// ordering.
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError>;
@@ -101,6 +109,14 @@ impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
 }
 
 impl<Memory: AtomicSharedMemory + ?Sized> AtomicSharedMemory for Arc<Memory> {
+    fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
+        (**self).load_u32_acquire(offset)
+    }
+
+    fn fetch_add_u32_release(&self, offset: usize, value: u32) -> Result<u32, SharedMemoryError> {
+        (**self).fetch_add_u32_release(offset, value)
+    }
+
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
         (**self).load_u64_acquire(offset)
     }
