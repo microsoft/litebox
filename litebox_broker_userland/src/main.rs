@@ -331,3 +331,42 @@ fn accept_runner_stream(
         std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
+    use litebox_broker_protocol::channel::HostControlChannel;
+    use litebox_broker_protocol::message::BrokerHandshakeResponse;
+
+    #[test]
+    fn first_failure_is_preserved_and_unblocks_request_reading() {
+        let (peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut control_channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        control_channel
+            .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            })
+            .unwrap();
+        let (mut request_source, _response_sink, shutdown) = control_channel.into_active().unwrap();
+        let failure = HostAssociationFailure::new(shutdown);
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            result_sender.send(request_source.recv_request()).unwrap();
+        });
+
+        failure.report(IoError::new(ErrorKind::TimedOut, "first failure"));
+        failure.report(IoError::other("second failure"));
+        let receive_result = result_receiver.recv_timeout(Duration::from_secs(1));
+        drop(peer_stream);
+        reader.join().unwrap();
+
+        assert!(matches!(
+            receive_result.unwrap(),
+            Ok(HostReceive::PeerClosed) | Err(_)
+        ));
+        let error = failure.take_error().unwrap();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "first failure");
+    }
+}

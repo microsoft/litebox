@@ -991,47 +991,44 @@ mod tests {
     }
 
     fn association_executes_distinct_slots_concurrently(broker: &BrokerCore) {
-        let shared_buffers = test_shared_buffers();
-        let association = test_association(broker, &shared_buffers);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
-        let (started_sender, started_receiver) = mpsc::sync_channel(2);
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(2);
+        let memory = BlockingReadSharedMemory {
+            memory: TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE),
+            entered_sender,
+            release: Arc::clone(&release),
+        };
+        let shared_buffers = SharedBufferPool::new(memory, SHARED_BUFFER_LAYOUT).unwrap();
+        let association = test_association(broker, &shared_buffers);
+        let (_, first_write_handle) =
+            litebox_broker_core::pipe::create(&association.session, 64, 16).unwrap();
+        let (_, second_write_handle) =
+            litebox_broker_core::pipe::create(&association.session, 64, 16).unwrap();
 
         std::thread::scope(|scope| {
-            let first_release = Arc::clone(&release);
-            let first_sender = started_sender.clone();
             let first_association = &association;
             let first = scope.spawn(move || {
-                first_association.execute_request(read_request(1, 0), |response| {
-                    first_sender.send(response.request_id).unwrap();
-                    wait_for_release(&first_release);
-                    Ok::<_, ()>(())
-                })
+                first_association
+                    .execute_request(write_request(1, 0, first_write_handle), |_| Ok::<_, ()>(()))
             });
-            let second_release = Arc::clone(&release);
             let second_association = &association;
             let second = scope.spawn(move || {
-                second_association.execute_request(read_request(2, 1), |response| {
-                    started_sender.send(response.request_id).unwrap();
-                    wait_for_release(&second_release);
+                second_association.execute_request(write_request(2, 1, second_write_handle), |_| {
                     Ok::<_, ()>(())
                 })
             });
 
-            let mut started = [
-                started_receiver
-                    .recv_timeout(Duration::from_secs(1))
-                    .unwrap(),
-                started_receiver
-                    .recv_timeout(Duration::from_secs(1))
-                    .unwrap(),
+            let entered = [
+                entered_receiver.recv_timeout(Duration::from_secs(1)),
+                entered_receiver.recv_timeout(Duration::from_secs(1)),
             ];
-            started.sort();
-            assert_eq!(started, [RequestId(1), RequestId(2)]);
             let (released, available) = &*release;
             *released.lock().unwrap() = true;
             available.notify_all();
             first.join().unwrap().unwrap();
             second.join().unwrap().unwrap();
+            let [first_offset, second_offset] = entered.map(|result| result.unwrap());
+            assert_ne!(first_offset, second_offset);
         });
     }
 
@@ -1115,10 +1112,10 @@ mod tests {
         });
     }
 
-    fn test_association<'a>(
+    fn test_association<'a, Memory: SharedMemory>(
         broker: &BrokerCore,
-        shared_buffers: &'a SharedBufferPool<TestSharedMemory>,
-    ) -> BrokerHostAssociation<'a, TestSharedMemory> {
+        shared_buffers: &'a SharedBufferPool<Memory>,
+    ) -> BrokerHostAssociation<'a, Memory> {
         BrokerHostAssociation {
             session: broker
                 .create_session(CallerCredential::Unauthenticated)
@@ -1136,6 +1133,16 @@ mod tests {
             request_id: RequestId(request_id),
             operation: BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle: ObjectHandle(u64::MAX),
+                buffer: descriptor(slot_index, 1),
+            })),
+        }
+    }
+
+    fn write_request(request_id: u64, slot_index: u32, handle: ObjectHandle) -> BrokerRequest {
+        BrokerRequest {
+            request_id: RequestId(request_id),
+            operation: BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
+                handle,
                 buffer: descriptor(slot_index, 1),
             })),
         }
@@ -1357,6 +1364,36 @@ mod tests {
                 .ok_or(SharedMemoryError::InvalidRange)?;
             destination.copy_from_slice(source);
             Ok(())
+        }
+    }
+
+    struct BlockingReadSharedMemory {
+        memory: TestSharedMemory,
+        entered_sender: mpsc::SyncSender<usize>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl SharedMemory for BlockingReadSharedMemory {
+        fn len(&self) -> usize {
+            self.memory.len()
+        }
+
+        fn read(
+            &self,
+            offset: usize,
+            destination: &mut [u8],
+        ) -> core::result::Result<(), SharedMemoryError> {
+            self.entered_sender.send(offset).unwrap();
+            wait_for_release(&self.release);
+            self.memory.read(offset, destination)
+        }
+
+        fn write(
+            &self,
+            offset: usize,
+            source: &[u8],
+        ) -> core::result::Result<(), SharedMemoryError> {
+            self.memory.write(offset, source)
         }
     }
 
