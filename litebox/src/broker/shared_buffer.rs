@@ -15,10 +15,10 @@ use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 const ALLOCATED_SLOT_MASK: u64 = (1 << SHARED_BUFFER_SLOT_COUNT) - 1;
 
 pub(super) struct SlotAllocator<Platform: RawSyncPrimitivesProvider> {
-    state: Mutex<Platform, LeaseState<Platform>>,
+    state: Mutex<Platform, AllocatorState<Platform>>,
 }
 
-struct LeaseState<Platform: RawSyncPrimitivesProvider> {
+struct AllocatorState<Platform: RawSyncPrimitivesProvider> {
     allocated_slots: u64,
     next_slot: u32,
     failed: bool,
@@ -42,7 +42,7 @@ struct SlotWaiter<Platform: RawSyncPrimitivesProvider> {
 impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
     pub(super) fn new() -> Self {
         Self {
-            state: Mutex::new(LeaseState {
+            state: Mutex::new(AllocatorState {
                 allocated_slots: 0,
                 next_slot: 0,
                 failed: false,
@@ -58,7 +58,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
                 return Err(AcquireError);
             }
             if state.waiters.is_empty()
-                && let Some(descriptor) = allocate_descriptor(&mut state, length)
+                && let Some(descriptor) = state.allocate(length)
             {
                 return Ok(SlotLease {
                     allocator: self,
@@ -74,7 +74,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
                 return Err(AcquireError);
             }
             if state.waiters.is_empty()
-                && let Some(descriptor) = allocate_descriptor(&mut state, length)
+                && let Some(descriptor) = state.allocate(length)
             {
                 return Ok(SlotLease {
                     allocator: self,
@@ -120,7 +120,8 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
             if !state.failed
                 && let Some(waiter) = state.waiters.pop_front()
             {
-                let descriptor = allocate_descriptor(&mut state, waiter.length)
+                let descriptor = state
+                    .allocate(waiter.length)
                     .expect("released slot was not available");
                 waiter_result = Some((waiter, descriptor));
             }
@@ -179,28 +180,25 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for SlotLease<'_, Platform> {
     }
 }
 
-fn allocate_descriptor<Platform: RawSyncPrimitivesProvider>(
-    state: &mut LeaseState<Platform>,
-    length: u32,
-) -> Option<SharedBufferDescriptor> {
-    let slot_index = next_free_slot(state)?;
-    state.allocated_slots |= 1 << slot_index;
-    state.next_slot = (slot_index + 1) % SHARED_BUFFER_SLOT_COUNT;
-    Some(SharedBufferDescriptor {
-        slot_index: SharedBufferSlotIndex(slot_index),
-        length,
-    })
-}
-
-fn next_free_slot<Platform: RawSyncPrimitivesProvider>(
-    state: &LeaseState<Platform>,
-) -> Option<u32> {
-    if state.allocated_slots & ALLOCATED_SLOT_MASK == ALLOCATED_SLOT_MASK {
-        return None;
+impl<Platform: RawSyncPrimitivesProvider> AllocatorState<Platform> {
+    fn allocate(&mut self, length: u32) -> Option<SharedBufferDescriptor> {
+        let slot_index = self.next_free_slot()?;
+        self.allocated_slots |= 1 << slot_index;
+        self.next_slot = (slot_index + 1) % SHARED_BUFFER_SLOT_COUNT;
+        Some(SharedBufferDescriptor {
+            slot_index: SharedBufferSlotIndex(slot_index),
+            length,
+        })
     }
-    (0..SHARED_BUFFER_SLOT_COUNT)
-        .map(|offset| (state.next_slot + offset) % SHARED_BUFFER_SLOT_COUNT)
-        .find(|slot| state.allocated_slots & (1 << slot) == 0)
+
+    fn next_free_slot(&self) -> Option<u32> {
+        if self.allocated_slots & ALLOCATED_SLOT_MASK == ALLOCATED_SLOT_MASK {
+            return None;
+        }
+        (0..SHARED_BUFFER_SLOT_COUNT)
+            .map(|offset| (self.next_slot + offset) % SHARED_BUFFER_SLOT_COUNT)
+            .find(|slot| self.allocated_slots & (1 << slot) == 0)
+    }
 }
 
 #[cfg(test)]
