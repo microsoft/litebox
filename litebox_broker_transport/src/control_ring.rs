@@ -87,13 +87,6 @@ impl ControlRingDirection {
     }
 }
 
-#[cfg(test)]
-const SEQUENCE_RANGE: core::ops::Range<usize> = 0..8;
-#[cfg(test)]
-const LENGTH_RANGE: core::ops::Range<usize> = 8..12;
-#[cfg(test)]
-const RESERVED_RANGE: core::ops::Range<usize> = 12..16;
-
 /// Error validating or accessing shared control-ring state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -286,8 +279,22 @@ impl<Memory: AtomicSharedMemory> ControlRing<Memory> {
         Ok(())
     }
 
-    fn load_epoch(&self, offset: usize) -> Result<u32, ControlRingError> {
-        Ok(self.memory.load_u32_acquire(offset)?)
+    fn load_producer_epoch(
+        &self,
+        direction: ControlRingDirection,
+    ) -> Result<u32, ControlRingError> {
+        Ok(self
+            .memory
+            .load_u32_acquire(direction.producer_epoch_offset())?)
+    }
+
+    fn load_consumer_epoch(
+        &self,
+        direction: ControlRingDirection,
+    ) -> Result<u32, ControlRingError> {
+        Ok(self
+            .memory
+            .load_u32_acquire(direction.consumer_epoch_offset())?)
     }
 
     fn load_consumer_head(&self, direction: ControlRingDirection) -> Result<u64, ControlRingError> {
@@ -361,9 +368,7 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
             return Err(ControlRingError::CounterExhausted);
         }
         if self.tail - self.acknowledged_head == CONTROL_RING_SLOT_COUNT {
-            let wait_epoch = self
-                .ring
-                .load_epoch(self.direction.consumer_epoch_offset())?;
+            let wait_epoch = self.ring.load_consumer_epoch(self.direction)?;
             self.refresh_head()?;
             if self.tail - self.acknowledged_head == CONTROL_RING_SLOT_COUNT {
                 return Ok(ControlRingWriteStatus::Full { wait_epoch });
@@ -441,7 +446,7 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
         ))?;
         let wait_epoch = self
             .ring
-            .load_epoch(self.direction.producer_epoch_offset())
+            .load_producer_epoch(self.direction)
             .map_err(ControlRingReadError::Ring)?;
         let actual_sequence = self
             .ring
@@ -513,6 +518,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::vec;
     use std::vec::Vec;
+
+    const SEQUENCE_RANGE: core::ops::Range<usize> = 0..8;
+    const LENGTH_RANGE: core::ops::Range<usize> = 8..12;
+    const RESERVED_RANGE: core::ops::Range<usize> = 12..16;
 
     #[test]
     fn mapping_requires_the_exact_control_ring_size() {
