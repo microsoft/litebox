@@ -20,6 +20,7 @@ use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags,
 };
+use rustix::thread::futex;
 
 use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemory, SharedMemoryError};
 
@@ -48,33 +49,49 @@ struct MappedRegion {
 // serialized by the enclosing `Mutex`.
 unsafe impl Send for MappedRegion {}
 
-fn atomic_u64_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU64, SharedMemoryError> {
-    let byte_address = shared_address(mapping, offset, size_of::<u64>(), align_of::<AtomicU64>())?;
-    // The runtime check above establishes the stronger alignment.
-    #[allow(clippy::cast_ptr_alignment)]
-    let address = byte_address.cast::<u64>();
+fn atomic_u64_at(
+    memory: &MemfdSharedMemory,
+    offset: usize,
+) -> Result<&AtomicU64, SharedMemoryError> {
+    let address = {
+        let mapping = memory
+            .mapping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let byte_address =
+            shared_address(&mapping, offset, size_of::<u64>(), align_of::<AtomicU64>())?;
+        // The runtime check above establishes the stronger alignment.
+        #[allow(clippy::cast_ptr_alignment)]
+        let address = byte_address.cast::<u64>();
+        address
+    };
     // SAFETY: The pointer is valid and aligned for a `u64`. Control-ring
-    // sequence words are accessed atomically by conforming endpoints.
+    // sequence words are accessed atomically by conforming endpoints, and
+    // `memory` keeps the immutable mapping alive for the returned reference.
     Ok(unsafe { AtomicU64::from_ptr(address) })
 }
 
-fn atomic_u32_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU32, SharedMemoryError> {
-    let address = shared_u32_address(mapping, offset)?;
+fn atomic_u32_at(
+    memory: &MemfdSharedMemory,
+    offset: usize,
+) -> Result<&AtomicU32, SharedMemoryError> {
+    let address = {
+        let mapping = memory
+            .mapping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let byte_address =
+            shared_address(&mapping, offset, size_of::<u32>(), align_of::<AtomicU32>())?;
+        // The runtime check above establishes the stronger alignment.
+        #[allow(clippy::cast_ptr_alignment)]
+        let address = byte_address.cast::<u32>();
+        address
+    };
     // SAFETY: The pointer is valid and aligned for a `u32`. Control-ring epoch
     // words are accessed atomically by conforming endpoints and the futex
-    // syscall.
+    // syscall, and `memory` keeps the immutable mapping alive for the returned
+    // reference.
     Ok(unsafe { AtomicU32::from_ptr(address) })
-}
-
-fn shared_u32_address(
-    mapping: &MappedRegion,
-    offset: usize,
-) -> Result<*mut u32, SharedMemoryError> {
-    let byte_address = shared_address(mapping, offset, size_of::<u32>(), align_of::<AtomicU32>())?;
-    // The runtime check above establishes the stronger alignment.
-    #[allow(clippy::cast_ptr_alignment)]
-    let address = byte_address.cast();
-    Ok(address)
 }
 
 fn shared_address(
@@ -174,63 +191,18 @@ impl MemfdSharedMemory {
     /// A value change or signal interruption is reported as a successful,
     /// possibly spurious wakeup. The caller must recheck its wait condition.
     pub fn futex_wait_u32(&self, offset: usize, expected: u32) -> IoResult<()> {
-        let address = {
-            let mapping = self
-                .mapping
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            shared_u32_address(&mapping, offset).map_err(shared_memory_error)?
-        };
-        // SAFETY: `address` points to a live, aligned shared `u32`. `self`
-        // remains borrowed for the syscall, so the mapping cannot be dropped.
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                address,
-                libc::FUTEX_WAIT,
-                expected,
-                std::ptr::null::<libc::timespec>(),
-                std::ptr::null::<u32>(),
-                0_u32,
-            )
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EAGAIN | libc::EINTR) => Ok(()),
-            _ => Err(error),
+        let word = atomic_u32_at(self, offset).map_err(shared_memory_error)?;
+        match futex::wait(word, futex::Flags::empty(), expected, None) {
+            Ok(()) | Err(Errno::AGAIN | Errno::INTR) => Ok(()),
+            Err(error) => Err(error.into()),
         }
     }
 
     /// Wakes one waiter blocked on a shared atomic `u32`.
     pub fn futex_wake_u32(&self, offset: usize) -> IoResult<()> {
-        let address = {
-            let mapping = self
-                .mapping
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            shared_u32_address(&mapping, offset).map_err(shared_memory_error)?
-        };
-        // SAFETY: `address` points to a live, aligned shared `u32`. `self`
-        // remains borrowed for the syscall, so the mapping cannot be dropped.
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                address,
-                libc::FUTEX_WAKE,
-                1_u32,
-                std::ptr::null::<libc::timespec>(),
-                std::ptr::null::<u32>(),
-                0_u32,
-            )
-        };
-        if result < 0 {
-            Err(Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        let word = atomic_u32_at(self, offset).map_err(shared_memory_error)?;
+        futex::wake(word, futex::Flags::empty(), 1)?;
+        Ok(())
     }
 }
 
@@ -295,35 +267,19 @@ impl SharedMemory for MemfdSharedMemory {
 
 impl AtomicSharedMemory for MemfdSharedMemory {
     fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
-        let mapping = self
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(atomic_u32_at(&mapping, offset)?.load(Ordering::Acquire))
+        Ok(atomic_u32_at(self, offset)?.load(Ordering::Acquire))
     }
 
     fn fetch_add_u32_release(&self, offset: usize, value: u32) -> Result<u32, SharedMemoryError> {
-        let mapping = self
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(atomic_u32_at(&mapping, offset)?.fetch_add(value, Ordering::Release))
+        Ok(atomic_u32_at(self, offset)?.fetch_add(value, Ordering::Release))
     }
 
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
-        let mapping = self
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(atomic_u64_at(&mapping, offset)?.load(Ordering::Acquire))
+        Ok(atomic_u64_at(self, offset)?.load(Ordering::Acquire))
     }
 
     fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
-        let mapping = self
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        atomic_u64_at(&mapping, offset)?.store(value, Ordering::Release);
+        atomic_u64_at(self, offset)?.store(value, Ordering::Release);
         Ok(())
     }
 }

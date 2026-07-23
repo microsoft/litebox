@@ -5,7 +5,14 @@ edition = "2024"
 
 [features]
 std = []
-linux-userland = ["std", "dep:libc", "dep:rustix", "rustix/fs", "rustix/net"]
+linux-userland = [
+    "std",
+    "dep:libc",
+    "dep:rustix",
+    "rustix/fs",
+    "rustix/net",
+    "rustix/thread",
+]
 
 [dependencies]
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
