@@ -9,6 +9,11 @@
 //! protocol messages, local-side adapters, host-side request handling, and core
 //! authority state live in separate crates.
 
+#[cfg(test)]
+extern crate std;
+
+pub mod control_ring;
+
 #[cfg(all(feature = "linux-userland", target_os = "linux"))]
 pub mod shared_memory;
 

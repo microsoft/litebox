@@ -300,11 +300,24 @@ fn invalid_data(message: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_ring::{
+        ControlRing, ControlRingConsumer, ControlRingProducer, ControlRingReadStatus,
+        ControlRingWriteStatus,
+    };
+    use litebox_broker_protocol::control_ring::{
+        BrokerDoorbell, CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRingDirection,
+        LocalDoorbell,
+    };
     use litebox_broker_protocol::shared_memory::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedBufferSlotIndex,
     };
+    use litebox_broker_protocol::wire::{
+        decode_broker_doorbell, decode_local_doorbell, encode_broker_doorbell,
+        encode_local_doorbell,
+    };
     use rustix::io::FdFlags;
-    use std::io::Write;
+    use std::io::{Read, Write};
+    use std::thread;
     use std::time::Duration;
 
     #[test]
@@ -386,6 +399,105 @@ mod tests {
         }
         let flags = rustix::io::fcntl_getfd(mapped_pool.memory().as_fd()).unwrap();
         assert!(flags.contains(FdFlags::CLOEXEC));
+    }
+
+    #[test]
+    fn transfers_exact_sealed_control_ring_mapping() {
+        let memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let ring = ControlRing::new(memory).unwrap();
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+
+        send_memfd(&mut sender, ring.memory(), None).unwrap();
+        let mapped = receive_memfd(&mut receiver, CONTROL_RING_MEMORY_SIZE, None).unwrap();
+        let mapped_ring = ControlRing::new(mapped).unwrap();
+        ring.memory().write(13, &[1, 2, 3]).unwrap();
+        let mut bytes = [0; 3];
+        mapped_ring.memory().read(13, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3]);
+
+        let flags = rustix::io::fcntl_getfd(mapped_ring.memory().as_fd()).unwrap();
+        assert!(flags.contains(FdFlags::CLOEXEC));
+        let seals = fcntl_get_seals(mapped_ring.memory().as_fd()).unwrap();
+        assert!(seals.contains(REQUIRED_MEMFD_SEALS));
+        assert!(!seals.contains(SealFlags::WRITE));
+    }
+
+    #[test]
+    fn socket_progress_orders_cross_mapping_slot_reuse() {
+        const DOORBELL_LEN: usize = 17;
+
+        let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let broker_memory = MemfdSharedMemory::from_received_fd(
+            local_memory.as_fd().try_clone_to_owned().unwrap(),
+            CONTROL_RING_MEMORY_SIZE,
+        )
+        .unwrap();
+        let local_ring = ControlRing::new(local_memory).unwrap();
+        let broker_ring = ControlRing::new(broker_memory).unwrap();
+        let (mut local_socket, mut broker_socket) = UnixStream::pair().unwrap();
+
+        let broker = thread::spawn(move || {
+            let mut consumer = ControlRingConsumer::new(ControlRingDirection::Requests);
+            let mut frame = [0; DOORBELL_LEN];
+            broker_socket.read_exact(&mut frame).unwrap();
+            let doorbell = decode_local_doorbell(&frame).unwrap();
+            consumer.observe_tail(doorbell.request_tail).unwrap();
+            for expected in 0..CONTROL_RING_SLOT_COUNT {
+                let expected = u8::try_from(expected).unwrap();
+                assert_eq!(
+                    consumer.try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0])),
+                    Ok(ControlRingReadStatus::Message(expected))
+                );
+            }
+
+            let encoded = encode_broker_doorbell(BrokerDoorbell {
+                request_head: consumer.published_head(),
+                response_tail: 0,
+            });
+            broker_socket.write_all(&encoded).unwrap();
+
+            broker_socket.read_exact(&mut frame).unwrap();
+            let doorbell = decode_local_doorbell(&frame).unwrap();
+            consumer.observe_tail(doorbell.request_tail).unwrap();
+            assert_eq!(
+                consumer.try_read(&broker_ring, |payload| Ok::<_, ()>(payload[0])),
+                Ok(ControlRingReadStatus::Message(0xff))
+            );
+        });
+
+        let mut producer = ControlRingProducer::new(ControlRingDirection::Requests);
+        for value in 0..CONTROL_RING_SLOT_COUNT {
+            let value = u8::try_from(value).unwrap();
+            assert_eq!(
+                producer.try_write(&local_ring, &[value]),
+                Ok(ControlRingWriteStatus::Written)
+            );
+        }
+        assert_eq!(
+            producer.try_write(&local_ring, &[0xff]),
+            Ok(ControlRingWriteStatus::Full)
+        );
+        let frame = encode_local_doorbell(LocalDoorbell {
+            request_tail: producer.published_tail(),
+            response_head: 0,
+        });
+        local_socket.write_all(&frame).unwrap();
+
+        let mut frame = [0; DOORBELL_LEN];
+        local_socket.read_exact(&mut frame).unwrap();
+        let doorbell = decode_broker_doorbell(&frame).unwrap();
+        producer.observe_head(doorbell.request_head).unwrap();
+        assert_eq!(
+            producer.try_write(&local_ring, &[0xff]),
+            Ok(ControlRingWriteStatus::Written)
+        );
+        let frame = encode_local_doorbell(LocalDoorbell {
+            request_tail: producer.published_tail(),
+            response_head: 0,
+        });
+        local_socket.write_all(&frame).unwrap();
+
+        broker.join().unwrap();
     }
 
     #[test]
