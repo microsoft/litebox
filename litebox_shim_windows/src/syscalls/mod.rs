@@ -600,6 +600,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         base_address: usize,
         flags: u32,
     },
+    /// Restores the selected portions of a thread context and resumes execution.
+    NtContinue {
+        context: Platform::RawConstPointer<nt_types::X64Context>,
+        test_alert: bool,
+    },
     NtTerminateProcess {
         process_handle: ProcessHandle,
         exit_status: i32,
@@ -1116,6 +1121,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 process_handle: { ProcessHandle::from_raw },
                 base_address,
                 flags,
+            })),
+            NtSysno::NtContinue => Some(sys_req!(NtContinue {
+                context:*,
+                test_alert: { |value: u8| value != 0 },
             })),
             NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
                 process_handle: { ProcessHandle::from_raw },

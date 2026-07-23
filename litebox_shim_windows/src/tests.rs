@@ -11,7 +11,9 @@ use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
 
-use crate::nt_types::{ObjectAttributes, UnicodeString};
+use crate::nt_types::{
+    ObjectAttributes, UnicodeString, X64_CONTEXT_CONTROL, X64_CONTEXT_INTEGER, X64Context,
+};
 use crate::syscalls::Handle;
 use crate::{ConstPtr, DefaultFS, MutPtr, Process, Task, WindowsShim};
 
@@ -103,6 +105,175 @@ fn map_csr_server_shared_memory(
 
 pub(crate) fn test_task() -> Task<TestPlatform, TestFS> {
     test_task_with_nls_files(&[])
+}
+
+#[test]
+fn nt_continue_restores_the_requested_context() {
+    let task = test_task();
+    let restored = X64Context {
+        context_flags: X64_CONTEXT_CONTROL | X64_CONTEXT_INTEGER,
+        seg_cs: 0x33,
+        seg_ss: 0x2b,
+        e_flags: 0x246,
+        rax: 0x01,
+        rcx: 0x02,
+        rdx: 0x03,
+        rbx: 0x04,
+        rsp: 0x05,
+        rbp: 0x06,
+        rsi: 0x07,
+        rdi: 0x08,
+        r8: 0x09,
+        r9: 0x0a,
+        r10: 0x0b,
+        r11: 0x0c,
+        r12: 0x0d,
+        r13: 0x0e,
+        r14: 0x0f,
+        r15: 0x10,
+        rip: 0x11,
+        ..Default::default()
+    };
+    let mut context = litebox_common_linux::PtRegs {
+        orig_rax: NtSysno::NtContinue.as_raw() as usize,
+        r10: const_ptr(&restored).as_usize(),
+        rdx: 1,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        task.handle_syscall_request(&mut context),
+        ContinueOperation::Resume
+    );
+    assert_eq!(context.rip, restored.rip.trunc());
+    assert_eq!(context.rsp, restored.rsp.trunc());
+    assert_eq!(context.eflags, restored.e_flags as usize);
+    assert_eq!(context.cs, restored.seg_cs as usize);
+    assert_eq!(context.ss, restored.seg_ss as usize);
+    assert_eq!(context.rax, restored.rax.trunc());
+    assert_eq!(context.rbx, restored.rbx.trunc());
+    assert_eq!(context.rcx, restored.rcx.trunc());
+    assert_eq!(context.rdx, restored.rdx.trunc());
+    assert_eq!(context.rsi, restored.rsi.trunc());
+    assert_eq!(context.rdi, restored.rdi.trunc());
+    assert_eq!(context.rbp, restored.rbp.trunc());
+    assert_eq!(context.r8, restored.r8.trunc());
+    assert_eq!(context.r9, restored.r9.trunc());
+    assert_eq!(context.r10, restored.r10.trunc());
+    assert_eq!(context.r11, restored.r11.trunc());
+    assert_eq!(context.r12, restored.r12.trunc());
+    assert_eq!(context.r13, restored.r13.trunc());
+    assert_eq!(context.r14, restored.r14.trunc());
+    assert_eq!(context.r15, restored.r15.trunc());
+}
+
+#[test]
+fn nt_continue_only_restores_selected_context_groups() {
+    let task = test_task();
+
+    // CONTROL-only: control registers restore, integer group stays put.
+    let control_only = X64Context {
+        context_flags: X64_CONTEXT_CONTROL,
+        rax: 0x11,
+        rip: 0x22,
+        ..Default::default()
+    };
+    let mut context = litebox_common_linux::PtRegs {
+        orig_rax: NtSysno::NtContinue.as_raw() as usize,
+        r10: const_ptr(&control_only).as_usize(),
+        rax: 0x33,
+        rip: 0x44,
+        ..Default::default()
+    };
+    assert_eq!(
+        task.handle_syscall_request(&mut context),
+        ContinueOperation::Resume
+    );
+    assert_eq!(context.rip, control_only.rip.trunc());
+    assert_eq!(context.rax, 0x33);
+
+    // INTEGER-only: full GP set restores, control registers stay put. Poison the
+    // control fields in the source context to catch an implementation that leaks
+    // the CONTROL restore when only the INTEGER flag is set.
+    let integer_only = X64Context {
+        context_flags: X64_CONTEXT_INTEGER,
+        rax: 0x11,
+        rbx: 0x12,
+        rcx: 0x13,
+        rdx: 0x14,
+        rsi: 0x15,
+        rdi: 0x16,
+        rbp: 0x17,
+        r8: 0x18,
+        r9: 0x19,
+        r10: 0x1a,
+        r11: 0x1b,
+        r12: 0x1c,
+        r13: 0x1d,
+        r14: 0x1e,
+        r15: 0x1f,
+        rip: 0xdead,
+        rsp: 0xbeef,
+        e_flags: 0xcafe,
+        seg_cs: 0x99,
+        seg_ss: 0x88,
+        ..Default::default()
+    };
+    let mut context = litebox_common_linux::PtRegs {
+        orig_rax: NtSysno::NtContinue.as_raw() as usize,
+        r10: const_ptr(&integer_only).as_usize(),
+        rip: 0x44,
+        rsp: 0x55,
+        eflags: 0x66,
+        cs: 0x77,
+        ss: 0x11,
+        ..Default::default()
+    };
+    assert_eq!(
+        task.handle_syscall_request(&mut context),
+        ContinueOperation::Resume
+    );
+    assert_eq!(context.rax, integer_only.rax.trunc());
+    assert_eq!(context.rbx, integer_only.rbx.trunc());
+    assert_eq!(context.rcx, integer_only.rcx.trunc());
+    assert_eq!(context.rdx, integer_only.rdx.trunc());
+    assert_eq!(context.rsi, integer_only.rsi.trunc());
+    assert_eq!(context.rdi, integer_only.rdi.trunc());
+    assert_eq!(context.rbp, integer_only.rbp.trunc());
+    assert_eq!(context.r8, integer_only.r8.trunc());
+    assert_eq!(context.r9, integer_only.r9.trunc());
+    assert_eq!(context.r10, integer_only.r10.trunc());
+    assert_eq!(context.r11, integer_only.r11.trunc());
+    assert_eq!(context.r12, integer_only.r12.trunc());
+    assert_eq!(context.r13, integer_only.r13.trunc());
+    assert_eq!(context.r14, integer_only.r14.trunc());
+    assert_eq!(context.r15, integer_only.r15.trunc());
+    assert_eq!(context.rip, 0x44);
+    assert_eq!(context.rsp, 0x55);
+    assert_eq!(context.eflags, 0x66);
+    assert_eq!(context.cs, 0x77);
+    assert_eq!(context.ss, 0x11);
+}
+
+#[test]
+fn nt_continue_rejects_an_invalid_context_pointer() {
+    let task = test_task();
+    let mut context = litebox_common_linux::PtRegs {
+        orig_rax: NtSysno::NtContinue.as_raw() as usize,
+        r10: 0,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        task.handle_syscall_request(&mut context),
+        ContinueOperation::Resume
+    );
+    assert_eq!(
+        context.rax,
+        litebox_common_windows::nt_status::NtStatus::ACCESS_VIOLATION
+            .as_raw()
+            .cast_unsigned() as usize
+    );
 }
 
 pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform, TestFS> {
