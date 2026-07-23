@@ -14,6 +14,7 @@ const IDENTITY_SIGNING_PUBLIC_KEY_LEN: usize = 97;
 const KEY_ALGORITHM_MASK: u64 = 0xff00;
 const KEY_VARIANT_MASK: u64 = 0xff;
 const KEY_ALGORITHM_VALUE_MASK: u64 = KEY_ALGORITHM_MASK | KEY_VARIANT_MASK;
+const MAX_KEYGEN_ATTEMPT: usize = 256;
 
 static IDENTITY_SIGNING_KEY_PAIR: Once<IdentitySigningKeyPair> = Once::new();
 
@@ -69,7 +70,7 @@ fn generate_identity_signing_key_inner(public_key_pa: u64, key_alg: u64) -> Resu
         )
         .map_err(|_| Errno::EINVAL)?;
 
-    let key_pair = get_identity_signing_key_pair();
+    let key_pair = get_identity_signing_key_pair()?;
     pubkey_ptr
         .write_at_offset(0, key_pair.public_key)
         .map_err(|_| Errno::EFAULT)?;
@@ -99,33 +100,36 @@ fn validate_key_algorithm(key_alg: u64) -> Result<(), Errno> {
     }
 }
 
-fn get_identity_signing_key_pair() -> &'static IdentitySigningKeyPair {
-    IDENTITY_SIGNING_KEY_PAIR.call_once(|| {
-        let private_key = generate_identity_signing_private_key();
-        let public_key = identity_signing_public_key_from_private_key(&private_key)
-            .expect("generated IDK_S private key must be valid");
-        IdentitySigningKeyPair {
+fn get_identity_signing_key_pair() -> Result<&'static IdentitySigningKeyPair, Errno> {
+    IDENTITY_SIGNING_KEY_PAIR.try_call_once(|| {
+        let private_key = generate_identity_signing_private_key()?;
+        let public_key = identity_signing_public_key_from_private_key(&private_key)?;
+        Ok(IdentitySigningKeyPair {
             private_key,
             public_key,
-        }
+        })
     })
 }
 
-fn generate_identity_signing_private_key() -> Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]> {
+fn generate_identity_signing_private_key()
+-> Result<Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]>, Errno> {
     let mut private_key_bytes = Zeroizing::new([0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]);
 
-    loop {
+    for _ in 0..MAX_KEYGEN_ATTEMPT {
         litebox_platform_multiplex::platform().fill_bytes_crng(&mut *private_key_bytes);
         if is_valid_identity_signing_private_key(&private_key_bytes) {
-            return private_key_bytes;
+            return Ok(private_key_bytes);
         }
     }
+
+    Err(Errno::EIO)
 }
 
 #[inline]
 fn is_valid_identity_signing_private_key(
     private_key: &[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN],
 ) -> bool {
+    // P-384 private keys must be valid non-zero scalars smaller than the curve order.
     NonZeroScalar::try_from(&private_key[..]).is_ok()
 }
 
@@ -156,7 +160,7 @@ mod tests {
         let message = b"IDK_S signing test message";
 
         let _task = init_platform();
-        let private_key = generate_identity_signing_private_key();
+        let private_key = generate_identity_signing_private_key().unwrap();
         assert!(is_valid_identity_signing_private_key(&private_key));
         let signing_key = SigningKey::from_slice(&private_key[..]).unwrap();
         let public_key = identity_signing_public_key_from_private_key(&private_key).unwrap();
