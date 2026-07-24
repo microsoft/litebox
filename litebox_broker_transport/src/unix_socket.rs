@@ -626,7 +626,7 @@ impl UnixStreamHostResponseSink {
             .lock()
             .map_err(|_| Error::other("broker response writer mutex poisoned"))?;
         loop {
-            self.active.response_live()?;
+            self.active.ensure_response_path_live()?;
             match producer.try_write(&frame).map_err(control_ring_error) {
                 Ok(ControlRingWriteStatus::Written) => {
                     if let Err(error) = producer.wake_consumer() {
@@ -866,7 +866,7 @@ impl HostActiveState {
         }
     }
 
-    fn response_live(&self) -> IoResult<()> {
+    fn ensure_response_path_live(&self) -> IoResult<()> {
         match &*self
             .status
             .lock()
