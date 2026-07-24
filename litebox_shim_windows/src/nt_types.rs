@@ -9,10 +9,20 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{ConstPtr, syscalls::Handle};
 
-pub const X64_CONTEXT_CONTROL: u32 = 0x0010_0001;
-pub const X64_CONTEXT_INTEGER: u32 = 0x0010_0002;
-pub const X64_CONTEXT_FLOATING_POINT: u32 = 0x0010_0008;
-pub const X64_CONTEXT_DEBUG_REGISTERS: u32 = 0x0010_0010;
+bitflags::bitflags! {
+    /// Flags carried in `CONTEXT.ContextFlags`, selecting which register groups
+    /// a `CONTEXT` structure describes.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct ContextFlags: u32 {
+        const CONTROL = 0x0010_0001;
+        const INTEGER = 0x0010_0002;
+        const FLOATING_POINT = 0x0010_0008;
+        const DEBUG_REGISTERS = 0x0010_0010;
+        const XSTATE = 0x0010_0040;
+
+        const _ = !0;
+    }
+}
 
 const INITIAL_CONTEXT_MXCSR: u32 = 0x1f80;
 const USER_MODE_CODE_SELECTOR: u16 = 0x33;
@@ -124,10 +134,11 @@ impl X64Context {
         peb: usize,
     ) -> X64Context {
         X64Context {
-            context_flags: X64_CONTEXT_CONTROL
-                | X64_CONTEXT_INTEGER
-                | X64_CONTEXT_FLOATING_POINT
-                | X64_CONTEXT_DEBUG_REGISTERS,
+            context_flags: ContextFlags::CONTROL
+                .union(ContextFlags::INTEGER)
+                .union(ContextFlags::FLOATING_POINT)
+                .union(ContextFlags::DEBUG_REGISTERS)
+                .bits(),
             mx_csr: INITIAL_CONTEXT_MXCSR,
             seg_cs: USER_MODE_CODE_SELECTOR,
             seg_ss: USER_MODE_STACK_SELECTOR,

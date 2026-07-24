@@ -1909,11 +1909,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
             SyscallRequest::NtTestAlert => {
-                // TODO(apc-model): Deliver queued user-mode APCs once thread alert and APC state
-                // are modeled.
-                litebox_util_log::debug!(
-                    "NtTestAlert is a no-op; user-mode APC delivery is not yet modeled"
-                );
+                Self::test_alert();
                 (NtStatus::SUCCESS, ContinueOperation::Resume)
             }
             SyscallRequest::NtManageHotPatch => {
@@ -1941,7 +1937,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Self::test_alert();
         }
 
-        if context.context_flags & nt_types::X64_CONTEXT_CONTROL == nt_types::X64_CONTEXT_CONTROL {
+        let context_flags = nt_types::ContextFlags::from_bits_retain(context.context_flags);
+
+        if context_flags.contains(nt_types::ContextFlags::CONTROL) {
             ctx.rip = context.rip.trunc();
             ctx.rsp = context.rsp.trunc();
             ctx.eflags = context.e_flags as usize;
@@ -1949,7 +1947,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ctx.ss = context.seg_ss as usize;
         }
 
-        if context.context_flags & nt_types::X64_CONTEXT_INTEGER == nt_types::X64_CONTEXT_INTEGER {
+        if context_flags.contains(nt_types::ContextFlags::INTEGER) {
             ctx.rax = context.rax.trunc();
             ctx.rbx = context.rbx.trunc();
             ctx.rcx = context.rcx.trunc();
@@ -1968,11 +1966,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         // TODO(context-model): Restore floating-point, extended, and debug-register state.
+        if context_flags.contains(nt_types::ContextFlags::FLOATING_POINT) {
+            litebox_util_log::warn!(
+                "NtContinue requested floating-point state, which is not yet restored"
+            );
+        }
+        if context_flags.contains(nt_types::ContextFlags::XSTATE) {
+            litebox_util_log::warn!(
+                "NtContinue requested extended state, which is not yet restored"
+            );
+        }
+        if context_flags.contains(nt_types::ContextFlags::DEBUG_REGISTERS) {
+            litebox_util_log::warn!(
+                "NtContinue requested debug-register state, which is not yet restored"
+            );
+        }
+
         Ok(())
     }
 
     fn test_alert() {
-        // TODO(apc-model): Deliver queued user-mode APCs once thread alert and APC state are modeled.
+        // TODO(apc-model): Deliver queued user-mode APCs once thread alert and APC state
+        // are modeled.
+        litebox_util_log::debug!(
+            "NtTestAlert is a no-op; user-mode APC delivery is not yet modeled"
+        );
     }
 
     pub(crate) fn sys_nt_close(&self, handle: syscalls::Handle) -> NtStatus {
