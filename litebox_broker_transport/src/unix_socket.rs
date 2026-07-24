@@ -510,10 +510,11 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
                 .lock()
                 .expect("broker request writer mutex poisoned");
             loop {
-                if let Some(error) = active.failure_coordinator.pending_calls.current_failure() {
-                    break Err(copy_io_error(&error));
-                }
-                match producer.try_write(&request_frame).map_err(Error::from) {
+                let write_status = active
+                    .failure_coordinator
+                    .pending_calls
+                    .run_if_live(|| producer.try_write(&request_frame).map_err(Error::from));
+                match write_status {
                     Ok(ControlRingWriteStatus::Written) => {
                         if let Err(error) = producer.wake_consumer() {
                             break Err(error);
@@ -575,19 +576,7 @@ impl UnixStreamHostRequestSource {
             }
             match self.consumer.try_read(decode_request) {
                 Ok(ControlRingReadStatus::Message(request)) => {
-                    if let Some(error) = self.active.request_failure() {
-                        return Err(error);
-                    }
-                    if let Err(error) = self
-                        .consumer
-                        .publish_head()
-                        .map_err(Error::from)
-                        .and_then(|()| self.consumer.wake_producer())
-                    {
-                        let result = Err(copy_io_error(&error));
-                        let _ = self.active.fail(error);
-                        return result;
-                    }
+                    self.active.acknowledge_request(&mut self.consumer)?;
                     return Ok(HostReceive::Message(request));
                 }
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
@@ -812,6 +801,15 @@ impl PendingCalls {
             .as_ref()
             .map(Arc::clone)
     }
+
+    /// Runs a nonblocking publication while excluding failure recording.
+    fn run_if_live<T>(&self, operation: impl FnOnce() -> IoResult<T>) -> IoResult<T> {
+        let state = self.state.lock().expect("broker pending mutex poisoned");
+        if let Some(error) = state.failure.as_ref() {
+            return Err(copy_io_error(error));
+        }
+        operation()
+    }
 }
 
 impl LocalActiveFailureCoordinator {
@@ -828,6 +826,31 @@ impl LocalActiveFailureCoordinator {
 }
 
 impl HostActiveState {
+    fn acknowledge_request(
+        &self,
+        consumer: &mut ControlRingConsumer<MemfdSharedMemory>,
+    ) -> IoResult<()> {
+        let result = {
+            let status = self
+                .status
+                .lock()
+                .expect("broker host active-state mutex poisoned");
+            if let HostActiveStatus::Failed(error) = &*status {
+                return Err(copy_io_error(error));
+            }
+            consumer
+                .publish_head()
+                .map_err(Error::from)
+                .and_then(|()| consumer.wake_producer())
+        };
+        if let Err(error) = result {
+            let result = Err(copy_io_error(&error));
+            let _ = self.fail(error);
+            return result;
+        }
+        Ok(())
+    }
+
     fn fail(&self, error: Error) -> IoResult<()> {
         {
             let mut status = self
@@ -1576,7 +1599,7 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn host_failure_preempts_queued_request_but_peer_close_drains_it() {
+    fn host_failure_preempts_queued_and_decoded_requests_but_peer_close_drains() {
         let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
         write_payload(&mut requests, &encode_request(request(1)));
         source
@@ -1590,11 +1613,30 @@ mod control_ring_tests {
 
         let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
         write_payload(&mut requests, &encode_request(request(2)));
+        assert!(matches!(
+            source.consumer.try_read(decode_request).unwrap(),
+            ControlRingReadStatus::Message(_)
+        ));
+        source
+            .active
+            .fail(Error::new(ErrorKind::TimedOut, "test failure"))
+            .unwrap();
+        assert_eq!(
+            source
+                .active
+                .acknowledge_request(&mut source.consumer)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::TimedOut
+        );
+
+        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
+        write_payload(&mut requests, &encode_request(request(3)));
         source.active.peer_closed();
         assert!(matches!(
             source.recv_request().unwrap(),
             HostReceive::Message(BrokerRequest {
-                request_id: RequestId(2),
+                request_id: RequestId(3),
                 ..
             })
         ));
@@ -1779,6 +1821,59 @@ mod control_ring_tests {
         assert!(pending.complete(response(RequestId(2))).is_err());
         assert_eq!(
             failed.wait().unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+    }
+
+    #[test]
+    fn failure_recording_waits_for_in_progress_publication() {
+        let pending = Arc::new(PendingCalls::new());
+        let pending_call = pending.register(RequestId(1)).unwrap();
+        let publication_state = Arc::new(AtomicUsize::new(0));
+        let (publication_started, wait_for_publication) = std::sync::mpsc::sync_channel(0);
+        let (release_publication, publication_released) = std::sync::mpsc::sync_channel(0);
+        let publisher_pending = Arc::clone(&pending);
+        let publisher_state = Arc::clone(&publication_state);
+        let publisher = thread::spawn(move || {
+            publisher_pending
+                .run_if_live(|| {
+                    publisher_state.store(1, Ordering::Release);
+                    publication_started.send(()).unwrap();
+                    publication_released.recv().unwrap();
+                    publisher_state.store(2, Ordering::Release);
+                    Ok(())
+                })
+                .unwrap();
+        });
+        wait_for_publication.recv().unwrap();
+
+        let (failure_started, wait_for_failure) = std::sync::mpsc::sync_channel(0);
+        let (failure_recorded, wait_for_recording) = std::sync::mpsc::sync_channel(0);
+        let failure_pending = Arc::clone(&pending);
+        let failure_state = Arc::clone(&publication_state);
+        let failure = thread::spawn(move || {
+            failure_started.send(()).unwrap();
+            failure_pending.record_failure(Arc::new(Error::new(
+                ErrorKind::ConnectionAborted,
+                "test failure",
+            )));
+            assert_eq!(failure_state.load(Ordering::Acquire), 2);
+            failure_recorded.send(()).unwrap();
+        });
+        wait_for_failure.recv().unwrap();
+        assert!(matches!(
+            wait_for_recording.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_publication.send(()).unwrap();
+        publisher.join().unwrap();
+        wait_for_recording
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        failure.join().unwrap();
+        assert_eq!(
+            pending_call.wait().unwrap_err().kind(),
             ErrorKind::ConnectionAborted
         );
     }
