@@ -6,7 +6,16 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
-use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
+use crate::{
+    host::per_cpu_variables::{PER_CPU_ALIGN, PerCpuVariablesAsm},
+    mshv::vsm::Vtl0KernelInfo,
+};
+
+/// Negated [`PER_CPU_ALIGN`] for `and reg, imm32` per-CPU base derivation in
+/// inline asm (sign-extended imm32).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::cast_possible_wrap)]
+const PER_CPU_ALIGN_NEG: i64 = -(PER_CPU_ALIGN as i64);
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
@@ -26,12 +35,9 @@ use litebox_common_linux::vmap::{
     GlobalVmapManager, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions,
     PhysPointerError, VmapManager,
 };
-use x86_64::{
-    VirtAddr,
-    structures::paging::{
-        PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
-        mapper::MapToError,
-    },
+use x86_64::structures::paging::{
+    PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
+    mapper::MapToError,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -595,7 +601,15 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         if base_pt
             .map_phys_frame_range(
                 vtl1_range,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                // ACCESSED/DIRTY are pre-set on these kernel leaf mappings
+                // (mirroring the Linux kernel's `_PAGE_KERNEL`) so the CPU
+                // walker never takes an atomic RMW to set them; the W^X logic
+                // in `map_phys_frame_range` strips WRITABLE and DIRTY for
+                // exec ranges.
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::ACCESSED
+                    | PageTableFlags::DIRTY,
                 Some(&exec_ranges),
             )
             .is_err()
@@ -1158,9 +1172,13 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         }
 
         // VTL0 memory must never be executable from VTL1 (DEP).
-        let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+        // ACCESSED is pre-set on every vmap leaf (avoids the walker's atomic
+        // RMW on first access); DIRTY only together with WRITABLE below,
+        // because WRITABLE=0 + DIRTY=1 is the CET shadow-stack PTE shape.
+        let mut flags =
+            PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE | PageTableFlags::ACCESSED;
         if perms.contains(PhysPageMapPermissions::WRITE) {
-            flags |= PageTableFlags::WRITABLE;
+            flags |= PageTableFlags::WRITABLE | PageTableFlags::DIRTY;
         }
 
         // Always allocate a fresh, private virtual address window for the mapping. This lets
@@ -1316,11 +1334,11 @@ pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
-    // kernel and user GS base values during kernel-user mode transitions.
-    // This `swapgs` usage can pontetially leak a kernel address to the user, so
-    // we clear the `KernelGsBase` MSR before running the user thread.
-    crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+    // The kernel never touches GS, so a TA's GSBASE survives kernel entries
+    // within one dispatch by construction. Reset it to 0 for each fresh
+    // dispatch from VTL0 so one TA's GSBASE cannot leak to the next TA
+    // scheduled on this core (same TA-visible semantics as before).
+    unsafe { litebox_common_linux::wrgsbase(0) };
     run_thread_inner(&shim, ctx, false);
 }
 
@@ -1335,7 +1353,8 @@ pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+    // Reset user GSBASE for a fresh dispatch (see `run_thread`).
+    unsafe { litebox_common_linux::wrgsbase(0) };
     run_thread_inner(shim, ctx, false);
 }
 
@@ -1350,7 +1369,8 @@ pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::Pt
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
+    // Reset user GSBASE for a fresh dispatch (see `run_thread`).
+    unsafe { litebox_common_linux::wrgsbase(0) };
     run_thread_inner(shim, ctx, true);
 }
 
@@ -1433,21 +1453,31 @@ macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
 
 /// Assembly macro to save VTL1 extended states (XSAVE/XSAVEOPT).
 /// Uses xsaveopt only after XRSTOR has established tracking (xsaved == 2).
+/// `$base` is a register holding the `PerCpuVariables` pointer; it must not
+/// be rax/rcx/rdx (clobbered by this macro).
 /// Clobbers: rax, rcx, rdx
 #[cfg(target_arch = "x86_64")]
 macro_rules! XSAVE_VTL1_ASM {
-    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
+    ($base:tt, $xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
         concat!(
-            "mov rcx, gs:[",
+            "mov rcx, [",
+            stringify!($base),
+            " + ",
             stringify!($xsave_area_off),
             "]\n",
-            "mov eax, gs:[",
+            "mov eax, [",
+            stringify!($base),
+            " + ",
             stringify!($mask_lo_off),
             "]\n",
-            "mov edx, gs:[",
+            "mov edx, [",
+            stringify!($base),
+            " + ",
             stringify!($mask_hi_off),
             "]\n",
-            "cmp byte ptr gs:[",
+            "cmp byte ptr [",
+            stringify!($base),
+            " + ",
             stringify!($xsaved_off),
             "], 2\n",
             "jne 2f\n",
@@ -1456,11 +1486,15 @@ macro_rules! XSAVE_VTL1_ASM {
             "2:\n",
             "xsave [rcx]\n",
             // Set to 1 if it was 0 (first save). If already 1, keep it as 1.
-            "cmp byte ptr gs:[",
+            "cmp byte ptr [",
+            stringify!($base),
+            " + ",
             stringify!($xsaved_off),
             "], 0\n",
             "jne 3f\n",
-            "mov byte ptr gs:[",
+            "mov byte ptr [",
+            stringify!($base),
+            " + ",
             stringify!($xsaved_off),
             "], 1\n",
             "3:\n",
@@ -1471,27 +1505,39 @@ macro_rules! XSAVE_VTL1_ASM {
 /// Assembly macro to restore VTL1 extended states (XRSTOR).
 /// Skips restore if state was never saved (xsaved == 0).
 /// Sets xsaved to 2 after restore to enable XSAVEOPT optimization.
+/// `$base` is a register holding the `PerCpuVariables` pointer; it must not
+/// be rax/rcx/rdx (clobbered by this macro).
 /// Clobbers: rax, rcx, rdx
 #[cfg(target_arch = "x86_64")]
 macro_rules! XRSTOR_VTL1_ASM {
-    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
+    ($base:tt, $xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
         concat!(
-            "cmp byte ptr gs:[",
+            "cmp byte ptr [",
+            stringify!($base),
+            " + ",
             stringify!($xsaved_off),
             "], 0\n",
             "je 4f\n",
-            "mov rcx, gs:[",
+            "mov rcx, [",
+            stringify!($base),
+            " + ",
             stringify!($xsave_area_off),
             "]\n",
-            "mov eax, gs:[",
+            "mov eax, [",
+            stringify!($base),
+            " + ",
             stringify!($mask_lo_off),
             "]\n",
-            "mov edx, gs:[",
+            "mov edx, [",
+            stringify!($base),
+            " + ",
             stringify!($mask_hi_off),
             "]\n",
             "xrstor [rcx]\n",
             // After XRSTOR, tracking is established - XSAVEOPT is now safe
-            "mov byte ptr gs:[",
+            "mov byte ptr [",
+            stringify!($base),
+            " + ",
             stringify!($xsaved_off),
             "], 2\n",
             "4:\n",
@@ -1507,8 +1553,11 @@ macro_rules! XRSTOR_VTL1_ASM {
 /// (i.e., from high addresses down to low ones).
 ///
 /// Prerequisite:
+/// - `rax` holds the `PerCpuVariables` pointer (loaded by this core's
+///   syscall entry stub).
 /// - Store user `rsp` in `r11` before calling this macro.
-/// - Store user `rflags` in `gs:[user_rflags]` before calling this macro.
+/// - Store user `rflags` in `[rax + user_rflags]` before calling this macro.
+/// - Store user `rax` in `[rax + scratch]` before calling this macro.
 /// - Store the userspace return address in `rcx` (`syscall` does this automatically).
 #[cfg(target_arch = "x86_64")]
 macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
@@ -1516,10 +1565,10 @@ macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
         "
         push 0x2b       // pt_regs->ss = __USER_DS
         push r11        // pt_regs->rsp
-        push qword ptr gs:[{user_rflags_off}] // pt_regs->eflags
+        push qword ptr [rax + {user_rflags_off}] // pt_regs->eflags
         push 0x33       // pt_regs->cs = __USER_CS
         push rcx        // pt_regs->rip
-        push rax        // pt_regs->orig_rax
+        push qword ptr [rax + {scratch_off}] // pt_regs->orig_rax (user rax)
         push rdi        // pt_regs->rdi
         push rsi        // pt_regs->rsi
         push rdx        // pt_regs->rdx
@@ -1547,35 +1596,34 @@ macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
 ///
 /// Prerequisites:
 /// - `rsp` points to the top of the user context area (push target)
-/// - `rax` points to the ISR stack: `[rax]`=vector, `[rax+8]`=error_code,
-///   `[rax+16]`=RIP, `[rax+24]`=CS, `[rax+32]`=RFLAGS, `[rax+40]`=RSP,
-///   `[rax+48]`=SS
-/// - All GPRs except `rax` contain user-mode values
-/// - User `rax` has been saved to per-CPU scratch
-/// - `swapgs` has already been executed (GS = kernel)
+/// - `rbx` points to the ISR stack: `[rbx]`=vector, `[rbx+8]`=error_code,
+///   `[rbx+16]`=RIP, `[rbx+24]`=CS, `[rbx+32]`=RFLAGS, `[rbx+40]`=RSP,
+///   `[rbx+48]`=SS
+/// - User `rax` was pushed at `[rbx-8]`, user `rbx` at `[rbx-16]` by
+///   `exception_callback` before it derived the per-CPU base
+/// - All other GPRs contain user-mode values
 ///
-/// Clobbers: rax
+/// Clobbers: none
 #[cfg(target_arch = "x86_64")]
 macro_rules! SAVE_PF_USER_CONTEXT_ASM {
     () => {
         "
-        push [rax + 48]   // pt_regs->ss
-        push [rax + 40]   // pt_regs->rsp
-        push [rax + 32]   // pt_regs->eflags
-        push [rax + 24]   // pt_regs->cs
-        push [rax + 16]   // pt_regs->rip
-        push [rax + 8]    // pt_regs->orig_rax (error code)
+        push [rbx + 48]   // pt_regs->ss
+        push [rbx + 40]   // pt_regs->rsp
+        push [rbx + 32]   // pt_regs->eflags
+        push [rbx + 24]   // pt_regs->cs
+        push [rbx + 16]   // pt_regs->rip
+        push [rbx + 8]    // pt_regs->orig_rax (error code)
         push rdi          // pt_regs->rdi
         push rsi          // pt_regs->rsi
         push rdx          // pt_regs->rdx
         push rcx          // pt_regs->rcx
-        mov rax, gs:[{scratch_off}]
-        push rax          // pt_regs->rax
+        push [rbx - 8]    // pt_regs->rax (user rax)
         push r8           // pt_regs->r8
         push r9           // pt_regs->r9
         push r10          // pt_regs->r10
         push r11          // pt_regs->r11
-        push rbx          // pt_regs->rbx
+        push [rbx - 16]   // pt_regs->rbx (user rbx)
         push rbp          // pt_regs->rbp
         push r12          // pt_regs->r12
         push r13          // pt_regs->r13
@@ -1647,18 +1695,22 @@ unsafe extern "C" fn run_thread_arch(
         SAVE_CALLEE_SAVED_REGISTERS_ASM!(),
         // Save reenter flag (in dl) before XSAVE clobbers edx
         "mov r9b, dl",
+        // Derive the per-CPU base from RSP (the kernel stack lives inside the
+        // 256 KiB-aligned PerCpuVariables; see its doc comment).
+        "mov r10, rsp",
+        "and r10, {neg_pcv_align}",
         // Extended states are callee-saved. Save all extended states for now because
         // we don't know whether the caller touched any of them.
-        XSAVE_VTL1_ASM!({vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
+        XSAVE_VTL1_ASM!(r10, {vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
         "push rdi", // save `thread_ctx`
         // Save kernel rsp and rbp and user context top in PerCpuVariablesAsm.
-        "mov gs:[{cur_kernel_sp_off}], rsp",
-        "mov gs:[{cur_kernel_bp_off}], rbp",
+        "mov [r10 + {cur_kernel_sp_off}], rsp",
+        "mov [r10 + {cur_kernel_bp_off}], rbp",
         "lea r8, [rsi + {USER_CONTEXT_SIZE}]",
-        "mov gs:[{user_context_top_off}], r8",
+        "mov [r10 + {user_context_top_off}], r8",
         // Mark that we are inside a user/TA context so that
         // kernel_exception_callback knows a valid ThreadContext exists.
-        "mov byte ptr gs:[{is_in_user_off}], 1",
+        "mov byte ptr [r10 + {is_in_user_off}], 1",
         // Call init_handler or reenter_handler based on reenter flag (in dl)
         "test r9b, r9b",
         "jnz 1f",
@@ -1667,16 +1719,26 @@ unsafe extern "C" fn run_thread_arch(
         "1:",
         "call {reenter_handler}",
         "jmp done",
+        // Syscall callback: entered from this core's per-core LSTAR stub
+        // (see `syscall_entry`). At this point:
+        // - rax = this core's PerCpuVariables pointer (loaded by the stub)
+        // - user rax is parked in this core's SyscallSlot rax_spill
+        // - rsp = UNTRUSTED user rsp (unchanged by the stub)
+        // - rcx = user return RIP, r11 = user RFLAGS (hardware)
+        // - Interrupts are masked (SFMASK clears IF)
         ".globl syscall_callback",
         "syscall_callback:",
-        "swapgs",
-        "mov gs:[{user_rflags_off}], r11", // store user `rflags`.
+        "mov [rax + {user_rflags_off}], r11", // store user `rflags`.
+        "mov r11, [rax + {syscall_slot_ptr_off}]",
+        "mov r11, [r11]", // user `rax` from the stub's spill slot
+        "mov [rax + {scratch_off}], r11", // park user `rax` in pcv scratch
         "mov r11, rsp", // store user `rsp` in `r11`
-        "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
+        "mov rsp, [rax + {user_context_top_off}]", // `rsp` points to the top address of user context area
         SAVE_SYSCALL_USER_CONTEXT_ASM!(),
-        XSAVE_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
-        "mov rbp, gs:[{cur_kernel_bp_off}]",
-        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        "mov rbx, rax", // XSAVE clobbers rax/rcx/rdx; keep pcv in rbx
+        XSAVE_VTL1_ASM!(rbx, {vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
+        "mov rbp, [rbx + {cur_kernel_bp_off}]",
+        "mov rsp, [rbx + {cur_kernel_sp_off}]",
         // Handle the syscall. This will jump back to the user but
         // will return if the thread is exiting.
         "mov rdi, [rsp]", // pass `thread_ctx`
@@ -1684,24 +1746,29 @@ unsafe extern "C" fn run_thread_arch(
         "jmp done",
         // Exception callback: entered from ISR stubs for user-mode exceptions.
         // At this point:
-        // - rsp = ISR stack: [vector, error_code, rip, cs, rflags, rsp, ss]
+        // - rsp = ISR stack: [vector, error_code, rip, cs, rflags, rsp, ss],
+        //   hardware-loaded from TSS.RSP0 (or TSS.IST1 for a double fault) —
+        //   both stacks live inside PerCpuVariables, so masking RSP recovers
+        //   the per-CPU base
         // - All GPRs contain user-mode values
         // - Interrupts are disabled (IDT gate clears IF)
-        // - GS = user (swapgs has NOT happened yet)
         ".globl exception_callback",
         "exception_callback:",
         "cld",
         "clac",
-        "swapgs",
-        "mov gs:[{scratch_off}], rax", // Save `rax` to per-CPU scratch
-        "mov al, [rsp]",
-        "mov gs:[{exception_trapno_off}], al", // vector number from ISR stack
-        "mov rax, rsp", // store ISR `rsp` in `rax`
-        "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
+        "push rax", // free rax (user value preserved at [rbx - 8] below)
+        "push rbx", // free rbx (user value preserved at [rbx - 16] below)
+        "lea rbx, [rsp + 16]", // rbx = ISR frame pointer ([rbx] = vector)
+        "mov rax, rsp",
+        "and rax, {neg_pcv_align}", // rax = per-CPU base
+        "mov rsp, [rax + {user_context_top_off}]", // `rsp` points to the top address of user context area
         SAVE_PF_USER_CONTEXT_ASM!(),
-        XSAVE_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
-        "mov rbp, gs:[{cur_kernel_bp_off}]",
-        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        "mov cl, [rbx]", // vector number from ISR stack (user rcx already saved)
+        "mov [rax + {exception_trapno_off}], cl",
+        "mov rbx, rax", // XSAVE clobbers rax/rcx/rdx; keep pcv in rbx
+        XSAVE_VTL1_ASM!(rbx, {vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
+        "mov rbp, [rbx + {cur_kernel_bp_off}]",
+        "mov rsp, [rbx + {cur_kernel_sp_off}]",
         "mov rdi, [rsp]", // pass `thread_ctx`
         "xor esi, esi",   // kernel_mode = false
         "mov rdx, cr2",   // cr2 (still valid — nothing overwrites it)
@@ -1711,9 +1778,9 @@ unsafe extern "C" fn run_thread_arch(
         // and exception-table fixup).
         // At entry:
         // - rsp = ISR stack: [vector, error_code, rip, cs, rflags, rsp, ss]
+        //   (the interrupted kernel stack, inside PerCpuVariables)
         // - All GPRs = kernel values at time of fault
         // - Interrupts are disabled (IDT gate clears IF)
-        // - GS = kernel (no swapgs needed)
         //
         // Saves GPRs, then passes exception info (CR2, error code, faulting
         // RIP) to exception_handler via registers. exception_handler will try
@@ -1725,15 +1792,19 @@ unsafe extern "C" fn run_thread_arch(
         SAVE_CPU_CONTEXT_ASM!(),
         "mov rbp, rsp",
         "and rsp, -16",
+        // Derive the per-CPU base from RSP (rax is dead: SAVE_CPU_CONTEXT
+        // already saved it).
+        "mov rax, rsp",
+        "and rax, {neg_pcv_align}",
         // Check if we are inside a user/TA context (is_in_user flag).
         // When is_in_user is set, a valid ThreadContext exists on the
-        // kernel stack at [gs:cur_kernel_sp] and we can attempt demand
+        // kernel stack at [pcv cur_kernel_sp] and we can attempt demand
         // paging through the shim.  When clear, the page fault occurred
         // outside run_thread_arch and only exception-table fixup is available.
-        "cmp byte ptr gs:[{is_in_user_off}], 0",
+        "cmp byte ptr [rax + {is_in_user_off}], 0",
         "je 6f",
         // In-user path: load ThreadContext and call full exception_handler.
-        "mov rdi, gs:[{cur_kernel_sp_off}]",
+        "mov rdi, [rax + {cur_kernel_sp_off}]",
         // Pass exception info via registers (SysV ABI args 1-5)
         "mov rdi, [rdi]",                   // arg1: thread_ctx
         "mov esi, 1",                       // arg2: kernel_mode = true
@@ -1763,15 +1834,18 @@ unsafe extern "C" fn run_thread_arch(
         "interrupt_callback:",
         "jmp done",
         "done:",
+        // Derive the per-CPU base from RSP (rdi is dead here).
+        "mov rdi, rsp",
+        "and rdi, {neg_pcv_align}",
         // We are leaving the user/TA context. Clear is_in_user first
         // so that any kernel-mode page fault from this point on takes the
         // exception-table-only path in kernel_exception_callback.
-        "mov byte ptr gs:[{is_in_user_off}], 0",
-        "mov rbp, gs:[{cur_kernel_bp_off}]",
-        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        "mov byte ptr [rdi + {is_in_user_off}], 0",
+        "mov rbp, [rdi + {cur_kernel_bp_off}]",
+        "mov rsp, [rdi + {cur_kernel_sp_off}]",
         // Zero cur_kernel_sp as defence in depth
-        "mov qword ptr gs:[{cur_kernel_sp_off}], 0",
-        XRSTOR_VTL1_ASM!({vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
+        "mov qword ptr [rdi + {cur_kernel_sp_off}], 0",
+        XRSTOR_VTL1_ASM!(rdi, {vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
         RESTORE_CALLEE_SAVED_REGISTERS_ASM!(),
         "ret",
         cur_kernel_sp_off = const { PerCpuVariablesAsm::cur_kernel_stack_ptr_offset() },
@@ -1786,8 +1860,10 @@ unsafe extern "C" fn run_thread_arch(
         USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
         scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
         user_rflags_off = const { PerCpuVariablesAsm::user_rflags_offset() },
+        syscall_slot_ptr_off = const { PerCpuVariablesAsm::syscall_slot_ptr_offset() },
         exception_trapno_off = const { PerCpuVariablesAsm::exception_trapno_offset() },
         is_in_user_off = const { PerCpuVariablesAsm::is_in_user_offset() },
+        neg_pcv_align = const { PER_CPU_ALIGN_NEG },
         init_handler = sym init_handler,
         reenter_handler = sym reenter_handler,
         syscall_handler = sym syscall_handler,
@@ -1970,19 +2046,24 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         "mov cr3, rax",
         // Clear rax to not leak CR3 value to user
         "xor eax, eax",
-        XRSTOR_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
+        // Derive the per-CPU base from RSP (the caller's kernel stack, inside
+        // PerCpuVariables). r8 is overwritten by the context pops below, so
+        // no kernel address leaks to user.
+        "mov r8, rsp",
+        "and r8, {neg_pcv_align}",
+        XRSTOR_VTL1_ASM!(r8, {vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
         // Restore user context from ctx.
         "mov rsp, rdi",
         RESTORE_CPU_CONTEXT_ASM!(),
-        // clear the GS base register (as the `KernelGsBase` MSR contains 0)
-        // while writing the current GS base value to `KernelGsBase`.
-        "swapgs",
+        // The kernel never touches GS: the TA's GSBASE is still live and
+        // needs no restore (no swapgs; KernelGsBase stays 0 forever).
         "iretq",
         "switch_to_user_end:",
         vtl1_user_xsave_area_off = const { PerCpuVariablesAsm::vtl1_user_xsave_area_addr_offset() },
         vtl1_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_lo_offset() },
         vtl1_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_hi_offset() },
         vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
+        neg_pcv_align = const { PER_CPU_ALIGN_NEG },
     );
 }
 

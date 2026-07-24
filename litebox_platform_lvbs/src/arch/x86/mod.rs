@@ -85,11 +85,6 @@ pub fn enable_extended_states() {
     );
 }
 
-#[inline]
-pub fn write_kernel_gsbase_msr(addr: VirtAddr) {
-    x86_64::registers::model_specific::KernelGsBase::write(addr);
-}
-
 /// Enable Data Execution Prevention (DEP).
 ///
 /// This enables support for the `NO_EXECUTE` page table flag, allowing

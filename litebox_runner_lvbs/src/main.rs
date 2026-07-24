@@ -9,12 +9,7 @@ use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_platform_lvbs::{
     arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap, instrs::hlt_loop},
-    host::{
-        bootparam::save_boot_info,
-        per_cpu_variables::{
-            PerCpuVariablesAsm, allocate_per_cpu_variables, init_per_cpu_variables,
-        },
-    },
+    host::{bootparam::save_boot_info, per_cpu_variables::allocate_per_cpu_variables},
     mshv::vtl1_mem_layout::{self, VTL1_REMAP_PDE_PAGE, VTL1_REMAP_PDPT_PAGE},
     serial_println,
 };
@@ -259,7 +254,7 @@ unsafe fn apply_relocations() {
 /// # Safety
 /// - Must be called exactly once on BSP in `_start()`, after `apply_relocations()`
 /// - Must be called before any heap/allocator initialization
-/// - Must be called before `enable_fsgsbase()` and `init_per_cpu_variables()`
+/// - Must be called before `enable_fsgsbase()` and `allocate_per_cpu_variables()`
 /// - The VTL0-provided page table must be at the expected layout (pages 2-12)
 #[inline(never)]
 #[allow(clippy::similar_names)]
@@ -394,6 +389,9 @@ pub unsafe extern "C" fn _ap_start() -> ! {
 ///
 /// When `is_bsp` is `true`, seeds the initial heap.
 unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
+    // FSGSBASE now serves user mode only (kernel `wrfsbase` for FsBase
+    // support and TA-side rd/wr fs/gs base); the kernel itself is
+    // gsbase-less and never reads or swaps GS.
     enable_fsgsbase();
     enable_extended_states();
 
@@ -401,18 +399,27 @@ unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
         litebox_runner_lvbs::seed_initial_heap();
     }
 
-    // Each core heap-allocates its own PerCpuVariables and sets GSBASE
-    // to point at it (assembly fields are at GS offset 0).
-    allocate_per_cpu_variables();
+    // Each core heap-allocates its own PerCpuVariables. The kernel never
+    // touches GS after this point: per-CPU state is found by masking RSP
+    // (all kernel stacks live inside the 256 KiB-aligned struct).
+    let pcv = allocate_per_cpu_variables();
 
-    init_per_cpu_variables();
+    // One-time GS MSR hygiene: clear any VTL0-inherited value from both GS
+    // base MSRs. The kernel never writes them again (no swapgs exists), so
+    // no kernel address can ever reside in either.
+    unsafe { litebox_common_linux::wrgsbase(0) };
+    x86_64::registers::model_specific::KernelGsBase::write(VirtAddr::zero());
+
+    // Compute this core's kernel stack pointer while still on the boot stack.
+    let kernel_sp = pcv.kernel_stack_top() & !15;
 
     // Switch to the kernel stack and tail-call kernel_main with is_bsp
     let is_bsp_u32 = u32::from(is_bsp);
     unsafe {
         asm!(
-            // Now use this core's heap-allocated kernel stack.
-            "mov rsp, gs:[{kernel_sp_off}]",
+            // Now use this core's heap-allocated kernel stack. From here on,
+            // RSP-mask per-CPU derivation (with_per_cpu_variables) is valid.
+            "mov rsp, {kernel_sp}",
             // The boot stack is no longer in use. Release the AP boot stack
             // spinlock so the next AP can proceed. For the BSP this is a
             // harmless no-op (the lock was never held).
@@ -420,7 +427,7 @@ unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
             "call {release_lock}",
             "pop rdi",
             "call {kernel_main}",
-            kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
+            kernel_sp = in(reg) kernel_sp,
             in("edi") is_bsp_u32,
             release_lock = sym release_boot_stack_lock,
             kernel_main = sym kernel_main,

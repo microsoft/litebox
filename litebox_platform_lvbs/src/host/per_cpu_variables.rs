@@ -15,17 +15,34 @@ use alloc::boxed::Box;
 use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::{rdgsbase, wrgsbase};
 use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
 pub const EXCEPTION_STACK_SIZE: usize = PAGE_SIZE;
 pub const KERNEL_STACK_SIZE: usize = 32 * PAGE_SIZE;
 
+/// Size and alignment of [`PerCpuVariables`]. Must be a power of two so the
+/// per-CPU base can be derived by masking any in-struct stack pointer.
+pub const PER_CPU_ALIGN: usize = 262144;
+
 /// Per-CPU VTL1 kernel variables
-#[repr(C, align(4096))]
+///
+/// This kernel is *gsbase-less* (Coconut-SVSM-style, see issue #514): kernel
+/// mode never executes `swapgs`/`rdgsbase`/`wrgsbase` and never addresses
+/// through `gs:`. Instead, the per-CPU base is derived positionally from RSP:
+/// the struct is aligned to **and** exactly [`PER_CPU_ALIGN`] bytes in size,
+/// and every stack the kernel ever runs on after boot (kernel stack,
+/// TSS.RSP0 exception stack, TSS.IST1 double-fault stack) is a field *inside*
+/// this struct. Therefore `rsp & !(PER_CPU_ALIGN - 1)` recovers the struct
+/// base from any kernel context. The invariant "every kernel-mode stack lives
+/// inside the 256 KiB-aligned `PerCpuVariables`" is load-bearing: code must
+/// never run on a foreign stack (the `self_ptr` canary converts violations
+/// into panics on Rust paths). The one path with an untrusted RSP (syscall
+/// entry) is anchored by per-core LSTAR stubs instead (see `syscall_entry`).
+#[repr(C, align(262144))]
 pub struct PerCpuVariables {
-    /// Assembly-accessible fields at GS offset 0 (`gs:[offset]` in inline asm).
+    /// Assembly-accessible fields at offset 0 (addressed as `[base + offset]`
+    /// in inline asm, where `base` is the masked per-CPU pointer).
     ///
     /// All fields use `Cell<T>` for interior mutability, so they can be accessed
     /// through `&PerCpuVariables` without requiring `&mut`.
@@ -42,9 +59,8 @@ pub struct PerCpuVariables {
     hv_simp_page: UnsafeCell<[u8; PAGE_SIZE]>,
     hvcall_input: UnsafeCell<[u8; PAGE_SIZE]>,
     hvcall_output: UnsafeCell<[u8; PAGE_SIZE]>,
-    /// VTL0 general-purpose register state, saved/restored by assembly
-    /// (`SAVE_VTL_STATE_ASM`/`LOAD_VTL_STATE_ASM`) via raw pushes/pops to
-    /// the address cached in `PerCpuVariablesAsm::vtl0_state_top_addr`.
+    /// VTL0 general-purpose register state, saved/restored by the
+    /// `vtl_switch` assembly via direct `[base + offset]` stores/loads.
     /// Rust code accesses it only between save and load (i.e., while VTL1
     /// is executing), so there is no data race with the assembly.
     pub(crate) vtl0_state: Cell<VtlState>,
@@ -63,6 +79,11 @@ pub struct PerCpuVariables {
     pub(crate) preemption_armed: Cell<bool>,
     /// Set when a preemption timer killed user-mode code.
     pub(crate) preemption_timeout_killed_user: Cell<bool>,
+    /// Canary holding this struct's own address, set once by
+    /// [`allocate_per_cpu_variables`]. [`get_per_cpu_variables_ptr`] asserts
+    /// it against the RSP-derived base, converting any "kernel code running
+    /// on a foreign stack" bug from silent corruption into a panic.
+    self_ptr: Cell<usize>,
 }
 
 // These Hyper-V pages must be page-aligned.
@@ -72,13 +93,37 @@ const _: () = assert!(offset_of!(PerCpuVariables, hv_simp_page) % PAGE_SIZE == 0
 const _: () = assert!(offset_of!(PerCpuVariables, hvcall_input) % PAGE_SIZE == 0);
 const _: () = assert!(offset_of!(PerCpuVariables, hvcall_output) % PAGE_SIZE == 0);
 
+// RSP-mask derivation requires size == align (a power of two): masking any
+// address inside the struct with `!(PER_CPU_ALIGN - 1)` must yield the struct
+// base. `repr(C, align(N))` rounds the size up to the alignment, so equality
+// also proves the fields fit in one 256 KiB block. If a future field/stack
+// growth trips this, size/align/mask must all move to 512 KiB together
+// (doubling per-core memory) — a deliberate policy decision, not a tweak.
+// The size == align invariant also guarantees the allocation is served by the
+// buddy allocator (256 KiB > slab MAX_ALLOC_SIZE), which returns naturally
+// size-aligned power-of-two blocks.
+const _: () = assert!(align_of::<PerCpuVariables>() == PER_CPU_ALIGN);
+const _: () = assert!(size_of::<PerCpuVariables>() == PER_CPU_ALIGN);
+// Every kernel-mode stack must be strictly interior to the struct so that
+// masking any RSP within it (including a full stack) recovers the base.
+const _: () = {
+    assert!(offset_of!(PerCpuVariables, double_fault_stack) > 0);
+    assert!(
+        offset_of!(PerCpuVariables, double_fault_stack) + DOUBLE_FAULT_STACK_SIZE < PER_CPU_ALIGN
+    );
+    assert!(offset_of!(PerCpuVariables, exception_stack) > 0);
+    assert!(offset_of!(PerCpuVariables, exception_stack) + EXCEPTION_STACK_SIZE < PER_CPU_ALIGN);
+    assert!(offset_of!(PerCpuVariables, kernel_stack) > 0);
+    assert!(offset_of!(PerCpuVariables, kernel_stack) + KERNEL_STACK_SIZE < PER_CPU_ALIGN);
+};
+
 impl PerCpuVariables {
     const XSAVE_ALIGNMENT: usize = 64; // XSAVE and XRSTORE require a 64-byte aligned buffer
     pub const VTL1_XSAVE_MASK: u64 = 0b11; // let XSAVE and XRSTORE deal with x87 and SSE states
     // XSAVE area size for VTL1: 512 bytes (legacy x87+SSE area) + 64 bytes (XSAVE header)
     const VTL1_XSAVE_AREA_SIZE: usize = 512 + 64;
 
-    pub(crate) fn kernel_stack_top(&self) -> u64 {
+    pub fn kernel_stack_top(&self) -> u64 {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
     }
 
@@ -259,20 +304,14 @@ impl PerCpuVariables {
 #[repr(C, align(4096))]
 #[derive(Clone)]
 pub struct PerCpuVariablesAsm {
-    /// Initial kernel stack pointer to reset the kernel stack on VTL switch
-    kernel_stack_ptr: Cell<usize>,
-    /// Double fault stack pointer (TSS.IST1)
-    double_fault_stack_ptr: Cell<usize>,
-    /// Exception stack pointer (TSS.RSP0)
-    exception_stack_ptr: Cell<usize>,
-    /// Return address for call-based VTL switching
-    vtl_return_addr: Cell<usize>,
+    /// Address of this core's `SyscallSlot` (see `syscall_entry`), cached so
+    /// the syscall entry path can fetch the stub-spilled user `rax` with one
+    /// indirection from the per-CPU base.
+    syscall_slot_ptr: Cell<usize>,
     /// Scratch pad
     scratch: Cell<usize>,
     /// User-mode RFLAGS captured at `syscall` entry
     user_rflags: Cell<usize>,
-    /// Top address of VTL0 VtlState
-    vtl0_state_top_addr: Cell<usize>,
     /// Current kernel stack pointer
     cur_kernel_stack_ptr: Cell<usize>,
     /// Current kernel base pointer
@@ -310,29 +349,8 @@ pub struct PerCpuVariablesAsm {
 }
 
 impl PerCpuVariablesAsm {
-    pub fn set_kernel_stack_ptr(&self, sp: usize) {
-        self.kernel_stack_ptr.set(sp);
-    }
-    pub fn set_double_fault_stack_ptr(&self, sp: usize) {
-        self.double_fault_stack_ptr.set(sp);
-    }
-    pub fn get_double_fault_stack_ptr(&self) -> usize {
-        self.double_fault_stack_ptr.get()
-    }
-    pub fn set_exception_stack_ptr(&self, sp: usize) {
-        self.exception_stack_ptr.set(sp);
-    }
-    pub fn get_exception_stack_ptr(&self) -> usize {
-        self.exception_stack_ptr.get()
-    }
-    pub fn set_vtl_return_addr(&self, addr: usize) {
-        self.vtl_return_addr.set(addr);
-    }
-    pub fn get_vtl_return_addr(&self) -> usize {
-        self.vtl_return_addr.get()
-    }
-    pub fn set_vtl0_state_top_addr(&self, addr: usize) {
-        self.vtl0_state_top_addr.set(addr);
+    pub fn set_syscall_slot_ptr(&self, addr: usize) {
+        self.syscall_slot_ptr.set(addr);
     }
     pub fn set_vtl0_xsave_area_addr(&self, addr: usize) {
         self.vtl0_xsave_area_addr.set(addr);
@@ -353,26 +371,14 @@ impl PerCpuVariablesAsm {
         self.vtl1_xsave_mask_hi
             .set(((mask >> 32) & 0xffff_ffff) as u32);
     }
-    pub const fn kernel_stack_ptr_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, kernel_stack_ptr)
-    }
-    pub const fn double_fault_stack_ptr_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, double_fault_stack_ptr)
-    }
-    pub const fn exception_stack_ptr_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, exception_stack_ptr)
-    }
-    pub const fn vtl_return_addr_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, vtl_return_addr)
+    pub const fn syscall_slot_ptr_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, syscall_slot_ptr)
     }
     pub const fn scratch_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, scratch)
     }
     pub const fn user_rflags_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, user_rflags)
-    }
-    pub const fn vtl0_state_top_addr_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, vtl0_state_top_addr)
     }
     pub const fn cur_kernel_stack_ptr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, cur_kernel_stack_ptr)
@@ -435,12 +441,15 @@ impl PerCpuVariablesAsm {
 /// Execute a closure with a shared reference to the current core's per-CPU variables.
 ///
 /// # Safety
-/// The GSBASE register must point to a valid, heap-allocated `PerCpuVariables`
-/// (set by [`allocate_per_cpu_variables`]). Each core must have a distinct
-/// GSBASE value.
+/// The caller must be executing on a stack inside this core's
+/// `PerCpuVariables` (kernel/exception/double-fault stack) — true for every
+/// kernel context after the boot stack switch. Boot code running on the
+/// shared boot stack must not call this; it receives the pointer returned by
+/// [`allocate_per_cpu_variables`] explicitly instead.
 ///
 /// # Panics
-/// Panics if GSBASE is not set or contains a non-canonical address.
+/// Panics if the RSP-derived base fails the `self_ptr` canary check
+/// (i.e., the current stack is not inside a `PerCpuVariables`).
 pub fn with_per_cpu_variables<F, R>(f: F) -> R
 where
     F: FnOnce(&PerCpuVariables) -> R,
@@ -453,36 +462,55 @@ where
     f(pcv)
 }
 
-/// Get a raw pointer to the current core's `PerCpuVariables` from GSBASE.
+/// Get a raw pointer to the current core's `PerCpuVariables` by masking RSP.
+///
+/// Every post-boot kernel stack lives inside the 256 KiB-aligned
+/// `PerCpuVariables` (see the struct doc), so `rsp & !(PER_CPU_ALIGN - 1)`
+/// is the struct base regardless of which in-struct stack is active.
 ///
 /// # Panics
-/// Panics if GSBASE is zero or non-canonical.
+/// Panics if the derived base fails the `self_ptr` canary check. This is a
+/// release-mode assert on purpose: it replaces the two release asserts the
+/// old GSBASE-based accessor performed (gsbase != 0 + canonical check) at
+/// cost parity (one dependent load + compare), and it turns execution on a
+/// foreign stack from silent corruption into a panic.
 fn get_per_cpu_variables_ptr() -> *mut PerCpuVariables {
-    let gsbase = unsafe { rdgsbase() };
+    let rsp: usize;
+    // Safety: reading RSP has no side effects.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, rsp",
+            out(reg) rsp,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let ptr = (rsp & !(PER_CPU_ALIGN - 1)) as *mut PerCpuVariables;
+    // Safety: if the invariant holds, `ptr` is this core's PerCpuVariables;
+    // if it does not, this read is the canary check that catches it (the
+    // masked address is at worst a wild kernel read that faults loudly).
     assert!(
-        gsbase != 0,
-        "GSBASE not set. Call allocate_per_cpu_variables() first"
+        unsafe { (*ptr).self_ptr.get() } == ptr as usize,
+        "per-CPU derivation on a stack outside PerCpuVariables"
     );
-    let _ = VirtAddr::try_new(gsbase as u64).expect("GS contains a non-canonical address");
-    gsbase as *mut PerCpuVariables
+    ptr
 }
 
-/// Heap-allocate this core's per-CPU variables and set GSBASE to point at them.
+/// Heap-allocate this core's per-CPU variables and return them.
 ///
 /// Every core (BSP and AP) calls this exactly once during its boot path,
-/// **before** [`init_per_cpu_variables`].
-///
-/// GSBASE will point directly at the `PerCpuVariables` struct, so assembly
-/// code can access the `asm` field at GS offset 0 (guaranteed by `#[repr(C)]`).
+/// while still on the boot stack. The returned reference must be passed
+/// explicitly to boot code that needs it (e.g., to compute the kernel stack
+/// pointer); [`with_per_cpu_variables`] only works after the caller has
+/// switched RSP onto the in-struct kernel stack.
 ///
 /// The caller must have already:
-///   1. Enabled FSGSBASE (`enable_fsgsbase()`).
-///   2. Enabled extended CPU states (`enable_extended_states()`).
-///   3. (BSP only) Seeded the global heap (`seed_initial_heap()`).
+///   1. Enabled extended CPU states (`enable_extended_states()`).
+///   2. (BSP only) Seeded the global heap (`seed_initial_heap()`).
 ///
 /// # Panics
-/// Panics if the heap allocation fails.
-pub fn allocate_per_cpu_variables() {
+/// Panics if the heap allocation fails or returns a block that is not
+/// `PER_CPU_ALIGN`-aligned (the RSP-mask derivation depends on it).
+pub fn allocate_per_cpu_variables() -> &'static PerCpuVariables {
     let mut per_cpu_variables = Box::<PerCpuVariables>::new_uninit();
     // Safety: `PerCpuVariables` is too large for the stack, so we zero-init
     // via `write_bytes` then fix up the `vp_index` sentinel. Zero is valid
@@ -499,58 +527,28 @@ pub fn allocate_per_cpu_variables() {
 
     // Leak the box so it lives for the core's lifetime.
     let pcv = Box::leak(per_cpu_variables);
-    let addr = &raw const *pcv as u64;
-    unsafe {
-        wrgsbase(addr.trunc());
-    }
+    let addr = &raw const *pcv as usize;
+    // The 256 KiB layout is served by the buddy allocator, whose power-of-two
+    // blocks are naturally size-aligned. Assert so any future allocator
+    // change that breaks the RSP-mask invariant fails loudly here rather
+    // than corrupting per-CPU state at the first masked access.
+    assert!(
+        addr.is_multiple_of(PER_CPU_ALIGN),
+        "PerCpuVariables allocation is not PER_CPU_ALIGN-aligned"
+    );
+    pcv.self_ptr.set(addr);
+    pcv
 }
 
 /// Allocate XSAVE areas for the current core.
 ///
-/// Must be called **after** [`allocate_per_cpu_variables`] (so GSBASE is
-/// set) and **after** switching to the kernel stack. The CPUID queries and
-/// `avec!` allocations inside `PerCpuVariables::allocate_xsave_area` use
-/// significant stack space that exceeds the 4 KiB boot stack.
+/// Must be called **after** switching to the in-struct kernel stack (so the
+/// RSP-mask accessor works). The CPUID queries and `avec!` allocations
+/// inside `PerCpuVariables::allocate_xsave_area` also use significant stack
+/// space that exceeds the 4 KiB boot stack.
 pub fn allocate_xsave_area() {
     with_per_cpu_variables(|pcv| {
         PerCpuVariables::allocate_xsave_area(&pcv.asm);
-    });
-}
-
-/// Initialize PerCpuVariable and PerCpuVariableAsm for the current core.
-///
-/// Currently, it initializes the kernel and interrupt stack pointers and the top address of VTL0 VtlState
-/// in the PerCpuVariablesAsm area.
-///
-/// # Panics
-/// Panics if the per-CPU variables are not properly initialized.
-pub fn init_per_cpu_variables() {
-    const STACK_ALIGNMENT: usize = 16;
-    with_per_cpu_variables(|per_cpu_variables| {
-        let kernel_sp = TruncateExt::<usize>::trunc(per_cpu_variables.kernel_stack_top())
-            & !(STACK_ALIGNMENT - 1);
-        let double_fault_sp =
-            TruncateExt::<usize>::trunc(per_cpu_variables.double_fault_stack_top())
-                & !(STACK_ALIGNMENT - 1);
-        let exception_sp = TruncateExt::<usize>::trunc(per_cpu_variables.exception_stack_top())
-            & !(STACK_ALIGNMENT - 1);
-        // `Cell<VtlState>` is `#[repr(transparent)]`, so its address equals
-        // the inner `VtlState`'s address. Assembly code (`SAVE_VTL_STATE_ASM`
-        // / `LOAD_VTL_STATE_ASM`) pushes/pops registers directly to/from this
-        // address. This is sound because the assembly executes outside any
-        // Rust reference scope and the Cell is only accessed in Rust between
-        // the save and load points (i.e., while VTL1 is executing).
-        let vtl0_state_top_addr =
-            TruncateExt::<usize>::trunc(&raw const per_cpu_variables.vtl0_state as u64)
-                + core::mem::size_of::<VtlState>();
-        per_cpu_variables.asm.set_kernel_stack_ptr(kernel_sp);
-        per_cpu_variables
-            .asm
-            .set_double_fault_stack_ptr(double_fault_sp);
-        per_cpu_variables.asm.set_exception_stack_ptr(exception_sp);
-        per_cpu_variables
-            .asm
-            .set_vtl0_state_top_addr(vtl0_state_top_addr);
     });
 }
 

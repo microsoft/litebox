@@ -173,7 +173,16 @@ fn test_page_table() {
 
     // update flags
     let new_vmflags = VmFlags::empty();
-    let new_pteflags = vmflags_to_pteflags(new_vmflags) | PageTableFlags::PRESENT;
+    // Explicit expectation: mprotect preserves the PTE's pre-existing
+    // ACCESSED/DIRTY via `(flags & !MPROTECT_PTE_MASK) | new`, while
+    // `vmflags_to_pteflags` derives them fresh (ACCESSED always; DIRTY only
+    // with VM_WRITE). The initial mapping above is read-only (VM_READ), so its
+    // PTE carries ACCESSED but no DIRTY, and after mprotect(VmFlags::empty())
+    // the PTE is exactly PRESENT | ACCESSED | NO_EXECUTE. If the initial
+    // mapping ever becomes writable, its preserved DIRTY must be added here —
+    // the derived form of this expression would then be wrong.
+    let new_pteflags =
+        PageTableFlags::PRESENT | PageTableFlags::ACCESSED | PageTableFlags::NO_EXECUTE;
     unsafe {
         assert!(
             pgtable

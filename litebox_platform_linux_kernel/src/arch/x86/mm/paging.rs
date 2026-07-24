@@ -65,12 +65,19 @@ impl<M: MemoryProvider> FrameDeallocator<Size4KiB> for PageTableAllocator<M> {
 }
 
 pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
-    let mut flags = PageTableFlags::empty();
+    // ACCESSED is pre-set on every newly-constructed leaf PTE, and DIRTY only
+    // on writable ones, so the CPU's page-table walker doesn't need an atomic
+    // read-modify-write to set them on first access (mirroring the Linux
+    // kernel's pre-set A/D on populated PTEs). DIRTY must never be pre-set on
+    // a read-only PTE: WRITABLE=0 + DIRTY=1 is the CET shadow-stack PTE shape.
+    // mprotect masks with `MPROTECT_PTE_MASK`, so the A/D added here are
+    // stripped on that path and the live PTE's A/D bits are preserved instead.
+    let mut flags = PageTableFlags::ACCESSED;
     if values.intersects(VmFlags::VM_READ | VmFlags::VM_WRITE) {
         flags |= PageTableFlags::USER_ACCESSIBLE;
     }
     if values.contains(VmFlags::VM_WRITE) {
-        flags |= PageTableFlags::WRITABLE;
+        flags |= PageTableFlags::WRITABLE | PageTableFlags::DIRTY;
     }
     if !values.contains(VmFlags::VM_EXEC) {
         flags |= PageTableFlags::NO_EXECUTE;
@@ -172,7 +179,30 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     flags,
                 } => match inner.unmap(start) {
                     Ok((frame, fl)) => {
-                        match unsafe { inner.map_to(new_start, frame, flags, &mut allocator) } {
+                        // `map_to` internally derives parent-table flags as
+                        // `flags & (PRESENT | WRITABLE | USER_ACCESSIBLE)`. Do the
+                        // same masking here (stripping leaf-only bits such as
+                        // NO_EXECUTE and any ACCESSED/DIRTY carried over from the
+                        // old leaf), then pre-set ACCESSED and DIRTY (mirroring the
+                        // Linux kernel's `_KERNPG_TABLE`) so the CPU's page-table
+                        // walker doesn't need an atomic read-modify-write on newly
+                        // created parent entries. Both bits are ignored by hardware
+                        // on non-leaf entries.
+                        let table_flags = (flags
+                            & (PageTableFlags::PRESENT
+                                | PageTableFlags::WRITABLE
+                                | PageTableFlags::USER_ACCESSIBLE))
+                            | PageTableFlags::ACCESSED
+                            | PageTableFlags::DIRTY;
+                        match unsafe {
+                            inner.map_to_with_table_flags(
+                                new_start,
+                                frame,
+                                flags,
+                                table_flags,
+                                &mut allocator,
+                            )
+                        } {
                             Ok(_) => {}
                             Err(e) => match e {
                                 MapToError::PageAlreadyMapped(_) => {

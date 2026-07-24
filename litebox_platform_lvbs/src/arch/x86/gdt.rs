@@ -80,15 +80,22 @@ impl Default for GdtWrapper {
 }
 
 fn setup_gdt_tss() {
-    let double_fault_stack_top = with_per_cpu_variables(|pcv| pcv.asm.get_double_fault_stack_ptr());
-    let exception_stack_top = with_per_cpu_variables(|pcv| pcv.asm.get_exception_stack_ptr());
+    // Stack tops come straight from the per-CPU struct fields (16-byte
+    // aligned down, as hardware stack switching requires).
+    const STACK_ALIGNMENT: u64 = 16;
+    let (double_fault_stack_top, exception_stack_top) = with_per_cpu_variables(|pcv| {
+        (
+            pcv.double_fault_stack_top() & !(STACK_ALIGNMENT - 1),
+            pcv.exception_stack_top() & !(STACK_ALIGNMENT - 1),
+        )
+    });
 
     let mut tss = Box::new(AlignedTss(TaskStateSegment::new()));
     // TSS.IST1: dedicated stack for double faults
-    tss.0.interrupt_stack_table[0] = VirtAddr::new(double_fault_stack_top as u64);
+    tss.0.interrupt_stack_table[0] = VirtAddr::new(double_fault_stack_top);
     // TSS.RSP0: stack loaded by the CPU on Ring 3 -> Ring 0 transition when the IDT
     // entry's IST index is 0. In our setup, all exceptions except for double faults.
-    tss.0.privilege_stack_table[0] = VirtAddr::new(exception_stack_top as u64);
+    tss.0.privilege_stack_table[0] = VirtAddr::new(exception_stack_top);
     // `tss_segment()` requires `&'static TaskStateSegment`. Leaking `tss` is fine because
     // it will be used until the LVBS kernel resets.
     let tss = Box::leak(tss);

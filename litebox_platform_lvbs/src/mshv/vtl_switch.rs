@@ -5,7 +5,9 @@
 
 use crate::host::{
     hv_hypercall_page_address,
-    per_cpu_variables::{PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables},
+    per_cpu_variables::{
+        PER_CPU_ALIGN, PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables,
+    },
 };
 use crate::mshv::{
     HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
@@ -13,7 +15,7 @@ use crate::mshv::{
     VTL_ENTRY_REASON_RESERVED, error::VsmError, hvcall_vp::hvcall_get_vp_registers,
     vsm_intercept::vsm_handle_intercept,
 };
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
 use num_enum::TryFromPrimitive;
 
@@ -135,17 +137,25 @@ pub(crate) fn is_only_vp_in_vtl1() -> bool {
 // context switches), so we cannot rely on XSAVEOPT's tracking. Always use plain XSAVE.
 
 /// Assembly macro to save VTL0 extended states using plain XSAVE.
+/// `$base` is a register holding the `PerCpuVariables` pointer; it must not
+/// be rax/rcx/rdx (clobbered by this macro).
 /// Clobbers: rax, rcx, rdx
 macro_rules! XSAVE_VTL0_ASM {
-    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt) => {
+    ($base:tt, $xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt) => {
         concat!(
-            "mov rcx, gs:[",
+            "mov rcx, [",
+            stringify!($base),
+            " + ",
             stringify!($xsave_area_off),
             "]\n",
-            "mov eax, gs:[",
+            "mov eax, [",
+            stringify!($base),
+            " + ",
             stringify!($mask_lo_off),
             "]\n",
-            "mov edx, gs:[",
+            "mov edx, [",
+            stringify!($base),
+            " + ",
             stringify!($mask_hi_off),
             "]\n",
             "xsave [rcx]\n",
@@ -154,17 +164,25 @@ macro_rules! XSAVE_VTL0_ASM {
 }
 
 /// Assembly macro to restore VTL0 extended states using plain XRSTOR.
+/// `$base` is a register holding the `PerCpuVariables` pointer; it must not
+/// be rax/rcx/rdx (clobbered by this macro).
 /// Clobbers: rax, rcx, rdx
 macro_rules! XRSTOR_VTL0_ASM {
-    ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt) => {
+    ($base:tt, $xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt) => {
         concat!(
-            "mov rcx, gs:[",
+            "mov rcx, [",
+            stringify!($base),
+            " + ",
             stringify!($xsave_area_off),
             "]\n",
-            "mov eax, gs:[",
+            "mov eax, [",
+            stringify!($base),
+            " + ",
             stringify!($mask_lo_off),
             "]\n",
-            "mov edx, gs:[",
+            "mov edx, [",
+            stringify!($base),
+            " + ",
             stringify!($mask_hi_off),
             "]\n",
             "xrstor [rcx]\n",
@@ -172,20 +190,19 @@ macro_rules! XRSTOR_VTL0_ASM {
     };
 }
 
-/// Assembly macro to return to VTL0 using the Hyper-V hypercall stub.
-/// Although Hyper-V lets each core use the same VTL return address, this implementation
-/// uses per-CPU return address to avoid using a mutable global variable.
-/// `ret_off` is the offset of the PerCpuVariablesAsm which holds the VTL return address.
-macro_rules! VTL_RETURN_ASM {
-    ($ret_off:tt) => {
-        concat!(
-            "xor ecx, ecx\n",
-            "mov rax, gs:[",
-            stringify!($ret_off),
-            "]\n",
-            "call rax\n",
-        )
-    };
+/// VTL return address inside the Hyper-V hypercall page (hypercall page
+/// address + the hypervisor-reported VTL-return code offset). The value is
+/// identical on every core; it is written by
+/// [`mshv_vsm_get_code_page_offsets`] during each core's boot (BSP first,
+/// before any AP exists) and read by the `vtl_switch` asm via RIP-relative
+/// addressing.
+static VTL_RETURN_TARGET: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the VTL return target (and hence the hypercall page) has been
+/// configured. Used by `is_hvcall_ready`.
+#[cfg(not(test))]
+pub(crate) fn is_vtl_return_target_set() -> bool {
+    VTL_RETURN_TARGET.load(Ordering::Relaxed) != 0
 }
 
 // The following registers are shared between different VTLs.
@@ -218,6 +235,17 @@ pub struct VtlState {
     // X87, XMM, AVX, XCR
 }
 
+/// Byte offset of `PerCpuVariables::vtl0_state` (a `#[repr(transparent)]`
+/// `Cell<VtlState>`, so this is also the offset of the inner `VtlState`).
+/// Used by the `vtl_switch` asm to address VTL0 GPR slots directly.
+#[cfg(target_arch = "x86_64")]
+const VTL0_STATE_OFF: usize = core::mem::offset_of!(PerCpuVariables, vtl0_state);
+
+/// Negated `PER_CPU_ALIGN` for `and reg, imm32` per-CPU base derivation.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::cast_possible_wrap)]
+const PER_CPU_ALIGN_NEG: i64 = -(PER_CPU_ALIGN as i64);
+
 impl VtlState {
     pub fn new() -> Self {
         VtlState {
@@ -247,84 +275,6 @@ pub fn vtl_switch_init(platform: Option<&'static crate::Platform>) {
     // in the mask so TLB flushes during the first VTL call dispatch
     // target this VP.
     vtl1_vp_enter();
-}
-
-/// Assembly macro to save VTL state to the VtlState memory area.
-///
-/// This macro saves the current `rsp` to scratch, sets `rsp` to point to the top of
-/// the VtlState area, pushes all general-purpose registers, then restores `rsp` from scratch.
-///
-/// Clobbers: none (rsp is saved and restored)
-macro_rules! SAVE_VTL_STATE_ASM {
-    ($scratch_off:tt, $vtl_state_top_addr_off:tt) => {
-        concat!(
-            "mov gs:[",
-            stringify!($scratch_off),
-            "], rsp\n",
-            "mov rsp, gs:[",
-            stringify!($vtl_state_top_addr_off),
-            "]\n",
-            "push r15\n",
-            "push r14\n",
-            "push r13\n",
-            "push r12\n",
-            "push r11\n",
-            "push r10\n",
-            "push r9\n",
-            "push r8\n",
-            "push rdi\n",
-            "push rsi\n",
-            "push rdx\n",
-            "push rcx\n",
-            "push rbx\n",
-            "push rax\n",
-            "push rbp\n",
-            "mov rsp, gs:[",
-            stringify!($scratch_off),
-            "]\n",
-        )
-    };
-}
-
-/// Assembly macro to restore VTL state from the VtlState memory area.
-///
-/// This macro saves the current `rsp` to scratch, sets `rsp` to point to the start of
-/// the VtlState area (top - size), pops all general-purpose registers, then restores
-/// `rsp` from scratch.
-///
-/// Clobbers: none (rsp is saved and restored)
-macro_rules! LOAD_VTL_STATE_ASM {
-    ($scratch_off:tt, $vtl_state_top_addr_off:tt, $vtl_state_size:tt) => {
-        concat!(
-            "mov gs:[",
-            stringify!($scratch_off),
-            "], rsp\n",
-            "mov rsp, gs:[",
-            stringify!($vtl_state_top_addr_off),
-            "]\n",
-            "sub rsp, ",
-            stringify!($vtl_state_size),
-            "\n",
-            "pop rbp\n",
-            "pop rax\n",
-            "pop rbx\n",
-            "pop rcx\n",
-            "pop rdx\n",
-            "pop rsi\n",
-            "pop rdi\n",
-            "pop r8\n",
-            "pop r9\n",
-            "pop r10\n",
-            "pop r11\n",
-            "pop r12\n",
-            "pop r13\n",
-            "pop r14\n",
-            "pop r15\n",
-            "mov rsp, gs:[",
-            stringify!($scratch_off),
-            "]\n",
-        )
-    };
 }
 
 /// Handle a VTL entry event.
@@ -401,9 +351,13 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), VsmError> {
     let vtl_return_address = hvcall_page
         .checked_add(usize::from(code_page_offsets.vtl_return_offset()))
         .ok_or(VsmError::CodePageOffsetOverflow)?;
-    with_per_cpu_variables(|pcv| {
-        pcv.asm.set_vtl_return_addr(vtl_return_address);
-    });
+    // Every core computes the same value (the hypercall page is shared and
+    // the offset is partition-wide); the redundant stores from APs are
+    // benign. The BSP's store happens during its boot, strictly before any
+    // AP is started (APs boot via a BootAps VTL call, which requires the BSP
+    // to have completed init and entered its vtl_switch loop), so the target
+    // is always non-zero by the time any core executes a VTL return.
+    VTL_RETURN_TARGET.store(vtl_return_address, Ordering::Relaxed);
     Ok(())
 }
 
@@ -437,9 +391,17 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
         // the VTL1 mask before the asm block.
 
         // Inline asm performs the VTL switch:
-        // 1. Restore VTL0 state (XRSTOR + load GP registers)
+        // 1. Restore VTL0 state (XRSTOR + load GP registers from vtl0_state)
         // 2. Return to VTL0 (cli + hypercall)
-        // 3. Save VTL0 state when VTL1 resumes (save GP registers + XSAVE)
+        // 3. Save VTL0 state when VTL1 resumes (store GP registers + XSAVE)
+        //
+        // The per-CPU base is derived by masking RSP (the kernel stack lives
+        // inside the 256 KiB-aligned PerCpuVariables) and parked on the
+        // hypervisor-preserved kernel stack across the VTL round trip.
+        // VTL0 GPRs are moved directly between registers and the vtl0_state
+        // cell — RSP never leaves the kernel stack (the old push/pop scheme
+        // pointed RSP into vtl0_state while IF was still set, so an
+        // interrupt there could clobber adjacent per-CPU data).
         //
         // All GP registers are clobbered by loading VTL0's state.
         // - rbx and rbp cannot be in clobber list (LLVM restriction), so we manually save/restore
@@ -451,26 +413,81 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
             core::arch::asm!(
                 "push rbx",
                 "push rbp",
-                XRSTOR_VTL0_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
-                LOAD_VTL_STATE_ASM!({scratch_off}, {vtl0_state_top_addr_off}, {VTL_STATE_SIZE}),
+                // rsi := per-CPU base; park it for the resume side.
+                "mov rsi, rsp",
+                "and rsi, {neg_pcv_align}",
+                "push rsi",
+                XRSTOR_VTL0_ASM!(rsi, {vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
+                // Load VTL0 GPRs from vtl0_state (base register rsi last).
+                // rax and rcx are skipped: they are immediately clobbered by
+                // the VTL return sequence below (the old code popped them and
+                // then clobbered them the same way).
+                "mov rbp, [rsi + {o_rbp}]",
+                "mov rbx, [rsi + {o_rbx}]",
+                "mov rdx, [rsi + {o_rdx}]",
+                "mov rdi, [rsi + {o_rdi}]",
+                "mov r8, [rsi + {o_r8}]",
+                "mov r9, [rsi + {o_r9}]",
+                "mov r10, [rsi + {o_r10}]",
+                "mov r11, [rsi + {o_r11}]",
+                "mov r12, [rsi + {o_r12}]",
+                "mov r13, [rsi + {o_r13}]",
+                "mov r14, [rsi + {o_r14}]",
+                "mov r15, [rsi + {o_r15}]",
+                "mov rsi, [rsi + {o_rsi}]",
                 // *** VTL0 state is restored. Return to VTL0 immediately ***
                 "cli", // disable VTL1 interrupts before returning to VTL0
-                VTL_RETURN_ASM!({vtl_ret_addr_off}),
+                "xor ecx, ecx",
+                "mov rax, [rip + {vtl_return_target}]",
+                "call rax",
                 // *** VTL1 resumes here regardless of the entry reason (VTL switch or intercept) ***
-                // Hyper-V restored VTL1's rip and rsp, so we're back on the original stack.
-                SAVE_VTL_STATE_ASM!({scratch_off}, {vtl0_state_top_addr_off}),
-                XSAVE_VTL0_ASM!({vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
+                // Hyper-V restored VTL1's rip and rsp, so we're back on the
+                // original stack with the parked per-CPU base at [rsp].
+                // All 15 GPRs hold live VTL0 values; free rdi by pushing it.
+                "push rdi",
+                "mov rdi, [rsp + 8]", // rdi := parked per-CPU base
+                "mov [rdi + {o_rbp}], rbp",
+                "mov [rdi + {o_rax}], rax",
+                "mov [rdi + {o_rbx}], rbx",
+                "mov [rdi + {o_rcx}], rcx",
+                "mov [rdi + {o_rdx}], rdx",
+                "mov [rdi + {o_rsi}], rsi",
+                "mov [rdi + {o_r8}], r8",
+                "mov [rdi + {o_r9}], r9",
+                "mov [rdi + {o_r10}], r10",
+                "mov [rdi + {o_r11}], r11",
+                "mov [rdi + {o_r12}], r12",
+                "mov [rdi + {o_r13}], r13",
+                "mov [rdi + {o_r14}], r14",
+                "mov [rdi + {o_r15}], r15",
+                "pop rax", // VTL0's rdi
+                "mov [rdi + {o_rdi}], rax",
+                XSAVE_VTL0_ASM!(rdi, {vtl0_xsave_area_off}, {vtl0_xsave_mask_lo_off}, {vtl0_xsave_mask_hi_off}),
                 "sti", // enable VTL1 interrupts after saving VTL0 state
                 // A pending SINT can be fired here. Our SINT handler only executes `iretq` so returns to here immediately.
+                "add rsp, 8", // drop the parked per-CPU base
                 "pop rbp",
                 "pop rbx",
-                vtl_ret_addr_off = const { PerCpuVariablesAsm::vtl_return_addr_offset() },
-                scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
-                vtl0_state_top_addr_off = const { PerCpuVariablesAsm::vtl0_state_top_addr_offset() },
                 vtl0_xsave_area_off = const { PerCpuVariablesAsm::vtl0_xsave_area_addr_offset() },
                 vtl0_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_lo_offset() },
                 vtl0_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_hi_offset() },
-                VTL_STATE_SIZE = const core::mem::size_of::<VtlState>(),
+                neg_pcv_align = const { PER_CPU_ALIGN_NEG },
+                vtl_return_target = sym VTL_RETURN_TARGET,
+                o_rbp = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, rbp) },
+                o_rax = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, rax) },
+                o_rbx = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, rbx) },
+                o_rcx = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, rcx) },
+                o_rdx = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, rdx) },
+                o_rsi = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, rsi) },
+                o_rdi = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, rdi) },
+                o_r8 = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, r8) },
+                o_r9 = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, r9) },
+                o_r10 = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, r10) },
+                o_r11 = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, r11) },
+                o_r12 = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, r12) },
+                o_r13 = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, r13) },
+                o_r14 = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, r14) },
+                o_r15 = const { VTL0_STATE_OFF + core::mem::offset_of!(VtlState, r15) },
                 clobber_abi("C"),
                 out("r12") _,
                 out("r13") _,
