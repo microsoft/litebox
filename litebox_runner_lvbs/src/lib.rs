@@ -264,13 +264,12 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
     }
 }
 
-/// Returns the process-wide [`litebox_platform_lvbs::mshv::heki_service::HekiState`], the single
+/// Returns the process-wide [`litebox_service_heki::HekiState`], the single
 /// long-lived HEKI/VSM service state owned by the runner (the VSM composition
 /// root), initializing it on first access.
-fn heki_state() -> &'static litebox_platform_lvbs::mshv::heki_service::HekiState {
-    static HEKI_STATE: spin::Once<litebox_platform_lvbs::mshv::heki_service::HekiState> =
-        spin::Once::new();
-    HEKI_STATE.call_once(litebox_platform_lvbs::mshv::heki_service::HekiState::new)
+fn heki_state() -> &'static litebox_service_heki::HekiState {
+    static HEKI_STATE: spin::Once<litebox_service_heki::HekiState> = spin::Once::new();
+    HEKI_STATE.call_once(litebox_service_heki::HekiState::new)
 }
 
 /// Dispatch a VSM function to its handler and return the result.
@@ -286,7 +285,7 @@ fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
 
     let state = heki_state();
     let mediation = LvbsVsmMediation::mint();
-    let vsm = litebox_platform_lvbs::mshv::heki_service::Vsm::new(&mediation, state);
+    let vsm = litebox_service_heki::Vsm::new(&mediation, state);
     let result: Result<i64, VsmError> = match func_id {
         // AP enablement is a no-op in this implementation.
         VsmFunction::EnableAPsVtl => Ok(0),

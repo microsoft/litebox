@@ -7,7 +7,7 @@
 //! memory metadata, precomputed patches, symbol tables, system certificates).
 //! Memory-touching helpers reach VTL0 through the [`Vsm`] they are passed.
 
-use crate::mshv::heki_service::vsm::Vsm;
+use crate::vsm::Vsm;
 use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
 use core::ffi::{CStr, c_char};
 use core::{

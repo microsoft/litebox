@@ -9,12 +9,12 @@
 //! mediation.
 
 #[cfg(debug_assertions)]
-use crate::mshv::heki_service::mem_integrity::parse_modinfo;
-use crate::mshv::heki_service::mem_integrity::{
+use crate::mem_integrity::parse_modinfo;
+use crate::mem_integrity::{
     validate_kernel_module_against_elf, validate_text_patch, verify_kernel_module_signature,
     verify_kernel_pe_signature,
 };
-use crate::mshv::heki_service::state::{
+use crate::state::{
     HekiState, KexecMemoryMetadata, KexecMemoryRange, MemoryContainer, ModuleMemory,
     ModuleMemoryMetadata,
 };
