@@ -106,8 +106,13 @@ struct PublisherState {
 struct ReadinessEntry {
     /// Newest authoritative flags recorded by a backend source.
     readiness: ReadinessFlags,
-    /// Advances whenever `readiness` changes, identifying the exact value a
-    /// claim was taken from.
+    /// Advances whenever `readiness` changes.
+    ///
+    /// Confirmation compares this rather than the published flags because a
+    /// notification only tells the local endpoint to re-check; the endpoint
+    /// then samples authoritative state itself and may observe a value the
+    /// publisher never sent. Flags that change and return to the published
+    /// value are therefore still a change the endpoint must be told about.
     generation: u64,
     /// A change has not yet been confirmed as published.
     dirty: bool,
@@ -210,9 +215,11 @@ impl ReadinessPublisher {
     /// Reports that a claimed notification reached the notification channel.
     ///
     /// The pending mark is cleared only when the object still holds the
-    /// generation the claim was taken from. A change recorded while the
-    /// notification was in flight leaves the object pending and already queued
-    /// it for another claim.
+    /// generation the claim was taken from. Any change recorded while the
+    /// notification was in flight leaves the object pending, including a change
+    /// that returned to the published flags, because the local endpoint samples
+    /// authoritative state independently and may have observed the intermediate
+    /// value.
     pub fn confirm(&self, pending: &PendingReadiness) {
         let mut state = self.state.lock();
         if let Some(entry) = state.entries.get_mut(&pending.notification.handle)
@@ -384,6 +391,29 @@ mod tests {
             [ReadinessNotification {
                 handle: HANDLE,
                 readiness: ReadinessFlags::WRITE,
+            }]
+        );
+    }
+
+    #[test]
+    fn readiness_that_returns_to_the_claimed_value_is_still_republished() {
+        let publisher = ReadinessPublisher::new();
+        publish(&publisher, HANDLE, ReadinessFlags::READ);
+        let pending = publisher.take_pending().unwrap();
+
+        // The local endpoint re-checks authoritative state on its own after a
+        // notification, so it may sample the intermediate value. Returning to
+        // the claimed value is therefore still a change it must be told about,
+        // which is why confirmation compares generations and not flags.
+        publish(&publisher, HANDLE, ReadinessFlags::WRITE);
+        publish(&publisher, HANDLE, ReadinessFlags::READ);
+        publisher.confirm(&pending);
+
+        assert_eq!(
+            drain(&publisher),
+            [ReadinessNotification {
+                handle: HANDLE,
+                readiness: ReadinessFlags::READ,
             }]
         );
     }
