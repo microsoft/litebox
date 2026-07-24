@@ -129,7 +129,7 @@ unsafe extern "system" {
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn mainCRTStartup() -> ! {
     unsafe {
-        static MESSAGE: &[u8] = b"hello world\n";
+        let MESSAGE: &[u8] = b"hello world\n";
         let stdout = GetStdHandle(0xffff_fff5);
         let mut written = 0u32;
         let ok = WriteFile(
