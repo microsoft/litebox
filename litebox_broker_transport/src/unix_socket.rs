@@ -19,7 +19,7 @@ use std::time::Instant;
 use std::{collections::HashMap, thread};
 
 use crate::control_ring::{
-    ControlRing, ControlRingConsumer, ControlRingError, ControlRingReadError,
+    ControlRing, ControlRingConsumer, ControlRingError, ControlRingProducer, ControlRingReadError,
     ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
 };
 use crate::shared_memory::MemfdSharedMemory;
@@ -618,27 +618,14 @@ impl UnixStreamHostResponseSink {
             .lock()
             .map_err(|_| Error::other("broker response writer mutex poisoned"))?;
         loop {
-            self.active.ensure_response_path_live()?;
-            match producer.try_write(&frame).map_err(Error::from) {
-                Ok(ControlRingWriteStatus::Written) => {
-                    if let Err(error) = producer.wake_consumer() {
-                        let result = Err(copy_io_error(&error));
-                        let _ = self.active.fail(error);
-                        return result;
-                    }
-                    return Ok(());
-                }
-                Ok(ControlRingWriteStatus::Full { wait_epoch }) => {
+            match self.active.try_publish_response(&mut producer, &frame)? {
+                ControlRingWriteStatus::Written => return Ok(()),
+                ControlRingWriteStatus::Full { wait_epoch } => {
                     if let Err(error) = producer.wait_for_capacity(wait_epoch) {
                         let result = Err(copy_io_error(&error));
                         let _ = self.active.fail(error);
                         return result;
                     }
-                }
-                Err(error) => {
-                    let result = Err(copy_io_error(&error));
-                    let _ = self.active.fail(error);
-                    return result;
                 }
             }
         }
@@ -903,19 +890,42 @@ impl HostActiveState {
         }
     }
 
-    fn ensure_response_path_live(&self) -> IoResult<()> {
-        match &*self
-            .status
-            .lock()
-            .expect("broker host active-state mutex poisoned")
-        {
-            HostActiveStatus::Live => Ok(()),
-            HostActiveStatus::PeerClosed => Err(Error::new(
-                ErrorKind::BrokenPipe,
-                "runner closed the active control channel",
-            )),
-            HostActiveStatus::Failed(error) => Err(copy_io_error(error)),
+    fn try_publish_response(
+        &self,
+        producer: &mut ControlRingProducer<MemfdSharedMemory>,
+        frame: &[u8],
+    ) -> IoResult<ControlRingWriteStatus> {
+        let result = {
+            let status = self
+                .status
+                .lock()
+                .expect("broker host active-state mutex poisoned");
+            match &*status {
+                HostActiveStatus::Live => {}
+                HostActiveStatus::PeerClosed => {
+                    return Err(Error::new(
+                        ErrorKind::BrokenPipe,
+                        "runner closed the active control channel",
+                    ));
+                }
+                HostActiveStatus::Failed(error) => return Err(copy_io_error(error)),
+            }
+            producer
+                .try_write(frame)
+                .map_err(Error::from)
+                .and_then(|write_status| {
+                    if matches!(write_status, ControlRingWriteStatus::Written) {
+                        producer.wake_consumer()?;
+                    }
+                    Ok(write_status)
+                })
+        };
+        if let Err(error) = result {
+            let result = Err(copy_io_error(&error));
+            let _ = self.fail(error);
+            return result;
         }
+        result
     }
 }
 
