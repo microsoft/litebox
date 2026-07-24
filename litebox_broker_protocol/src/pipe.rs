@@ -4,10 +4,10 @@
 use crate::ObjectHandle;
 use crate::shared_memory::SharedBufferDescriptor;
 
-/// Maximum pipe transfer described by one control-path request or response.
+/// Maximum pipe bytes transferred by one broker request.
 ///
-/// This leaves room for the broker envelope and operation metadata within the
-/// smallest currently supported transport frame.
+/// Each association shared-buffer slot has this size. Larger blocking writes
+/// are split across requests, while reads may return at most this amount.
 pub const MAX_PIPE_TRANSFER_SIZE: u32 = 32 * 1024;
 
 /// Request to create a broker-owned byte pipe.
