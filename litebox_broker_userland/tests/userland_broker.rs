@@ -14,7 +14,7 @@ use litebox_broker_protocol::shared_memory::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
-use litebox_broker_transport::unix_socket::UnixControlRingLocalControlChannel;
+use litebox_broker_transport::unix_socket::UnixStreamLocalSetupChannel;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 
@@ -75,14 +75,14 @@ fn run_fake_runner(args: &[OsString]) {
     assert_eq!(args.len(), 4, "unexpected runner arguments: {args:?}");
 
     let control_socket_path = args.get(2).unwrap();
-    let control_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
+    let setup_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
     let local = Arc::new(
-        BrokerLocal::negotiate(control_channel, |channel| {
-            let shared_memory = channel.receive_memfd(
+        BrokerLocal::negotiate(setup_channel, |mut setup| {
+            let shared_memory = setup.receive_memfd(
                 SHARED_BUFFER_POOL_SIZE,
                 Some(Instant::now() + Duration::from_secs(5)),
             )?;
-            let control_memory = channel.receive_memfd(
+            let control_memory = setup.receive_memfd(
                 CONTROL_RING_MEMORY_SIZE,
                 Some(Instant::now() + Duration::from_secs(5)),
             )?;
@@ -92,8 +92,9 @@ fn run_fake_runner(args: &[OsString]) {
                     format!("invalid test control ring: {error:?}"),
                 )
             })?;
-            let (_cancellation, _notifications) = channel.activate(control_ring, || {})?;
-            Ok(Arc::new(shared_memory))
+            let (call_channel, _notifications, _shutdown) =
+                setup.into_active(control_ring, || {})?;
+            Ok((call_channel, Arc::new(shared_memory)))
         })
         .unwrap(),
     );
@@ -172,11 +173,10 @@ impl Drop for ChildGuard {
     }
 }
 
-fn connect_control_with_retry(socket_path: &Path) -> Result<UnixControlRingLocalControlChannel> {
+fn connect_control_with_retry(socket_path: &Path) -> Result<UnixStreamLocalSetupChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixControlRingLocalControlChannel::connect_with_setup_deadline(socket_path, deadline)
-        {
+        match UnixStreamLocalSetupChannel::connect_with_setup_deadline(socket_path, deadline) {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != ErrorKind::NotFound

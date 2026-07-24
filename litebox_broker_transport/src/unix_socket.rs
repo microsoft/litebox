@@ -29,8 +29,8 @@ use crate::unix_io::{
 };
 use litebox_broker_protocol::RequestId;
 use litebox_broker_protocol::channel::{
-    HostNotificationChannel, HostReceive, HostSetupChannel, LocalControlChannel,
-    LocalNotificationChannel, PeerCredential,
+    HostNotificationChannel, HostReceive, HostSetupChannel, LocalCallChannel,
+    LocalNotificationChannel, LocalSetupChannel, PeerCredential,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
@@ -64,21 +64,16 @@ fn peer_process_id(stream: &UnixStream) -> IoResult<u32> {
         .map_err(|_| invalid_data("Unix peer process ID is invalid"))
 }
 
-/// Local control channel using a Unix stream for setup and control rings for active calls.
-pub struct UnixControlRingLocalControlChannel {
-    state: LocalControlState,
-}
-
-enum LocalControlState {
-    Setup(LocalSetupState),
-    Active(Arc<LocalRingAssociation>),
-    Failed,
-}
-
-struct LocalSetupState {
+/// Local-side broker association setup channel over a Unix stream.
+pub struct UnixStreamLocalSetupChannel {
     stream: UnixStream,
     setup_deadline: Option<Instant>,
     negotiated: bool,
+}
+
+/// Call-issuing endpoint of an active local control-ring association.
+pub struct UnixControlRingLocalCallChannel {
+    association: Arc<LocalRingAssociation>,
 }
 
 /// Independently owned handle for interrupting all local active-ring I/O.
@@ -105,15 +100,13 @@ pub struct UnixControlRingLocalNotificationChannel {
     association: Arc<LocalRingAssociation>,
 }
 
-impl UnixControlRingLocalControlChannel {
-    /// Creates a local control channel from an already-connected Unix stream.
+impl UnixStreamLocalSetupChannel {
+    /// Creates a local setup channel from an already-connected Unix stream.
     pub const fn from_connected(stream: UnixStream) -> Self {
         Self {
-            state: LocalControlState::Setup(LocalSetupState {
-                stream,
-                setup_deadline: None,
-                negotiated: false,
-            }),
+            stream,
+            setup_deadline: None,
+            negotiated: false,
         }
     }
 
@@ -132,56 +125,45 @@ impl UnixControlRingLocalControlChannel {
         deadline: Instant,
     ) -> IoResult<Self> {
         UnixStream::connect(path).map(|stream| Self {
-            state: LocalControlState::Setup(LocalSetupState {
-                stream,
-                setup_deadline: Some(deadline),
-                negotiated: false,
-            }),
+            stream,
+            setup_deadline: Some(deadline),
+            negotiated: false,
         })
     }
 
-    /// Receives the memfd associated with this control channel.
+    /// Receives one memfd offered by the broker during setup.
     pub fn receive_memfd(
         &mut self,
         expected_len: usize,
         deadline: Option<Instant>,
     ) -> IoResult<MemfdSharedMemory> {
-        let LocalControlState::Setup(setup) = &mut self.state else {
-            return Err(invalid_data("broker control setup already completed"));
-        };
-        crate::shared_memory::receive_memfd(&mut setup.stream, expected_len, deadline)
+        crate::shared_memory::receive_memfd(&mut self.stream, expected_len, deadline)
     }
 
-    /// Completes setup, starts the response dispatcher, and returns the
-    /// notification receiver for the active shared-ring association.
+    /// Consumes a negotiated setup channel into independently usable active
+    /// call, notification, and shutdown handles, starting the response
+    /// dispatcher and liveness monitor.
     ///
     /// The ring must be the validated control-ring memfd received during this
     /// setup exchange.
-    pub fn activate(
-        &mut self,
+    pub fn into_active(
+        self,
         ring: ControlRing<MemfdSharedMemory>,
         on_failure: impl Fn() + Send + Sync + 'static,
     ) -> IoResult<(
-        UnixControlRingLocalShutdown,
+        UnixControlRingLocalCallChannel,
         UnixControlRingLocalNotificationChannel,
+        UnixControlRingLocalShutdown,
     )> {
-        let LocalControlState::Setup(setup) = &self.state else {
-            return Err(invalid_data("broker control channel already active"));
-        };
-        if !setup.negotiated {
+        if !self.negotiated {
             return Err(invalid_data(
-                "broker control channel activated before negotiation completed",
+                "broker local setup channel activated before negotiation completed",
             ));
         }
-        let LocalControlState::Setup(setup) =
-            core::mem::replace(&mut self.state, LocalControlState::Failed)
-        else {
-            unreachable!("broker control setup state disappeared");
-        };
 
-        let mut setup_stream = setup.stream;
-        write_setup_frame(&mut setup_stream, CONTROL_RING_READY, setup.setup_deadline)?;
-        let Some(ready) = read_setup_frame(&mut setup_stream, setup.setup_deadline)? else {
+        let mut setup_stream = self.stream;
+        write_setup_frame(&mut setup_stream, CONTROL_RING_READY, self.setup_deadline)?;
+        let Some(ready) = read_setup_frame(&mut setup_stream, self.setup_deadline)? else {
             return Err(Error::new(
                 ErrorKind::UnexpectedEof,
                 "broker closed before control-ring setup acknowledgement",
@@ -231,15 +213,15 @@ impl UnixControlRingLocalControlChannel {
             return Err(Error::other("failed to start broker liveness monitor"));
         }
 
-        self.state = LocalControlState::Active(Arc::clone(&association));
         Ok((
-            UnixControlRingLocalShutdown {
+            UnixControlRingLocalCallChannel {
                 association: Arc::clone(&association),
             },
             UnixControlRingLocalNotificationChannel {
                 consumer: notification_consumer,
-                association,
+                association: Arc::clone(&association),
             },
+            UnixControlRingLocalShutdown { association },
         ))
     }
 }
@@ -254,14 +236,11 @@ impl UnixControlRingLocalShutdown {
     }
 }
 
-impl Drop for UnixControlRingLocalControlChannel {
+impl Drop for UnixControlRingLocalCallChannel {
     fn drop(&mut self) {
-        let LocalControlState::Active(association) = &self.state else {
-            return;
-        };
-        let _ = association.fail(Error::new(
+        let _ = self.association.fail(Error::new(
             ErrorKind::ConnectionAborted,
-            "broker local control channel dropped",
+            "broker local call channel dropped",
         ));
     }
 }
@@ -436,36 +415,32 @@ impl Drop for UnixControlRingHostShutdown {
     }
 }
 
-impl LocalControlChannel for UnixControlRingLocalControlChannel {
+impl LocalSetupChannel for UnixStreamLocalSetupChannel {
     type Error = Error;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
-        let LocalControlState::Setup(setup) = &mut self.state else {
-            return Err(invalid_data("broker control channel is already active"));
-        };
         let frame = encode_handshake_request(request.clone());
-        write_setup_frame(&mut setup.stream, &frame, setup.setup_deadline)
+        write_setup_frame(&mut self.stream, &frame, self.setup_deadline)
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
-        let LocalControlState::Setup(setup) = &mut self.state else {
-            return Err(invalid_data("broker control channel is already active"));
-        };
-        let frame = read_setup_frame(&mut setup.stream, setup.setup_deadline)?;
+        let frame = read_setup_frame(&mut self.stream, self.setup_deadline)?;
         match frame {
             Some(frame) => {
                 let response = decode_handshake_response(&frame).map_err(wire_error)?;
-                setup.negotiated = matches!(&response, BrokerHandshakeResponse::Negotiated { .. });
+                self.negotiated = matches!(&response, BrokerHandshakeResponse::Negotiated { .. });
                 Ok(Some(response))
             }
             None => Ok(None),
         }
     }
+}
+
+impl LocalCallChannel for UnixControlRingLocalCallChannel {
+    type Error = Error;
 
     fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
-        let LocalControlState::Active(association) = &self.state else {
-            return Err(invalid_data("broker control channel is not active"));
-        };
+        let association = &self.association;
         let request_id = request.request_id;
         let pending_call = association.pending_calls.register(request_id)?;
         let request_frame = encode_request(request);
@@ -1153,7 +1128,7 @@ mod control_ring_tests {
     use crate::control_ring::{
         CONTROL_RING_MEMORY_SIZE, CONTROL_RING_SLOT_COUNT, ControlRingProducer,
     };
-    use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::{
         BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     };
@@ -1186,20 +1161,18 @@ mod control_ring_tests {
         )
     }
 
-    fn negotiated_local(stream: UnixStream) -> UnixControlRingLocalControlChannel {
-        UnixControlRingLocalControlChannel {
-            state: LocalControlState::Setup(LocalSetupState {
-                stream,
-                setup_deadline: Some(Instant::now() + Duration::from_secs(2)),
-                negotiated: true,
-            }),
+    fn negotiated_local(stream: UnixStream) -> UnixStreamLocalSetupChannel {
+        UnixStreamLocalSetupChannel {
+            stream,
+            setup_deadline: Some(Instant::now() + Duration::from_secs(2)),
+            negotiated: true,
         }
     }
 
     fn activate_local(
         on_failure: impl Fn() + Send + Sync + 'static,
     ) -> (
-        UnixControlRingLocalControlChannel,
+        UnixControlRingLocalCallChannel,
         UnixControlRingLocalShutdown,
         Producer,
         Consumer,
@@ -1215,8 +1188,9 @@ mod control_ring_tests {
             write_setup_frame(&mut ack_stream, CONTROL_RING_READY, None).unwrap();
         });
         let (local_ring, broker_ring) = ring_pair();
-        let mut channel = negotiated_local(local_stream);
-        let (shutdown, _notifications) = channel.activate(local_ring, on_failure).unwrap();
+        let setup = negotiated_local(local_stream);
+        let (channel, _notifications, shutdown) =
+            setup.into_active(local_ring, on_failure).unwrap();
         acknowledgement.join().unwrap();
         let crate::control_ring::BrokerControlRingEndpoints {
             request_consumer,
@@ -1274,14 +1248,14 @@ mod control_ring_tests {
     }
 
     fn notification_channel_pair() -> (
-        UnixControlRingLocalControlChannel,
+        UnixControlRingLocalCallChannel,
         UnixControlRingLocalNotificationChannel,
         UnixControlRingHostNotificationChannel,
         UnixControlRingHostShutdown,
     ) {
         let (local_stream, host_stream) = UnixStream::pair().unwrap();
         let (local_ring, host_ring) = ring_pair();
-        let mut local_control = negotiated_local(local_stream);
+        let local_setup = negotiated_local(local_stream);
         let host_control = UnixStreamHostSetupChannel {
             stream: host_stream,
             peer_credential: PeerCredential::HostGuaranteed,
@@ -1289,10 +1263,11 @@ mod control_ring_tests {
             negotiated: true,
         };
         let host_active = thread::spawn(move || host_control.into_active(host_ring).unwrap());
-        let (_shutdown, local_notifications) = local_control.activate(local_ring, || {}).unwrap();
+        let (local_call, local_notifications, _local_shutdown) =
+            local_setup.into_active(local_ring, || {}).unwrap();
         let (_source, _sink, host_notifications, shutdown) = host_active.join().unwrap();
         (
-            local_control,
+            local_call,
             local_notifications,
             host_notifications,
             shutdown,
@@ -1412,23 +1387,25 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn local_control_channel_enforces_setup_and_active_phases() {
-        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let mut channel = UnixControlRingLocalControlChannel::from_connected(local_stream);
-        assert_eq!(
-            channel.call(request(0)).unwrap_err().kind(),
-            ErrorKind::InvalidData
-        );
+    fn local_setup_rejects_activation_before_negotiation() {
+        let (local_stream, _host_stream) = UnixStream::pair().unwrap();
+        let setup = UnixStreamLocalSetupChannel::from_connected(local_stream);
         let (ring, _) = ring_pair();
-        assert_eq!(
-            channel.activate(ring, || {}).err().unwrap().kind(),
-            ErrorKind::InvalidData
-        );
+        let Err(error) = setup.into_active(ring, || {}) else {
+            panic!("local setup channel activated before negotiation");
+        };
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn local_setup_negotiates_then_activates_and_closes_on_drop() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let mut setup = UnixStreamLocalSetupChannel::from_connected(local_stream);
 
         let handshake_request = BrokerHandshakeRequest {
             protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
         };
-        channel.send_handshake_request(&handshake_request).unwrap();
+        setup.send_handshake_request(&handshake_request).unwrap();
         assert_eq!(
             decode_handshake_request(&read_setup_frame(&mut host_stream, None).unwrap().unwrap())
                 .unwrap(),
@@ -1443,7 +1420,7 @@ mod control_ring_tests {
         )
         .unwrap();
         assert!(matches!(
-            channel.recv_handshake_response().unwrap(),
+            setup.recv_handshake_response().unwrap(),
             Some(BrokerHandshakeResponse::Negotiated { .. })
         ));
 
@@ -1456,26 +1433,13 @@ mod control_ring_tests {
             host_stream
         });
         let (ring, _) = ring_pair();
-        let _shutdown = channel.activate(ring, || {}).unwrap();
+        let (call_channel, _notifications, _shutdown) = setup.into_active(ring, || {}).unwrap();
         let mut host_stream = acknowledgement.join().unwrap();
-
-        let (ring, _) = ring_pair();
-        assert_eq!(
-            channel.activate(ring, || {}).err().unwrap().kind(),
-            ErrorKind::InvalidData
-        );
-        assert_eq!(
-            channel
-                .send_handshake_request(&handshake_request)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::InvalidData
-        );
 
         host_stream
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        drop(channel);
+        drop(call_channel);
         let mut byte = [0];
         assert_eq!(host_stream.read(&mut byte).unwrap(), 0);
     }
@@ -1484,7 +1448,7 @@ mod control_ring_tests {
     fn two_way_ready_ack_activates_ring_transport() {
         let (local_stream, host_stream) = UnixStream::pair().unwrap();
         let (local_ring, host_ring) = ring_pair();
-        let mut local = negotiated_local(local_stream);
+        let local_setup = negotiated_local(local_stream);
         let host = UnixStreamHostSetupChannel {
             stream: host_stream,
             peer_credential: PeerCredential::HostGuaranteed,
@@ -1492,7 +1456,8 @@ mod control_ring_tests {
             negotiated: true,
         };
         let host_active = thread::spawn(move || host.into_active(host_ring).unwrap());
-        let (_shutdown, _local_notifications) = local.activate(local_ring, || {}).unwrap();
+        let (local, _local_notifications, _local_shutdown) =
+            local_setup.into_active(local_ring, || {}).unwrap();
         let (mut source, sink, _host_notifications, _shutdown) = host_active.join().unwrap();
 
         let caller = thread::spawn(move || local.call(request(7)));
@@ -1771,14 +1736,12 @@ mod control_ring_tests {
     fn ready_ack_uses_absolute_setup_deadline() {
         let (local_stream, _peer) = UnixStream::pair().unwrap();
         let (ring, _) = ring_pair();
-        let mut local = UnixControlRingLocalControlChannel {
-            state: LocalControlState::Setup(LocalSetupState {
-                stream: local_stream,
-                setup_deadline: Some(Instant::now() + Duration::from_millis(30)),
-                negotiated: true,
-            }),
+        let local = UnixStreamLocalSetupChannel {
+            stream: local_stream,
+            setup_deadline: Some(Instant::now() + Duration::from_millis(30)),
+            negotiated: true,
         };
-        let Err(error) = local.activate(ring, || {}) else {
+        let Err(error) = local.into_active(ring, || {}) else {
             panic!("activation unexpectedly succeeded");
         };
         assert!(matches!(
@@ -1790,12 +1753,10 @@ mod control_ring_tests {
     #[test]
     fn handshake_reads_use_absolute_setup_deadlines() {
         let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
-        let mut local = UnixControlRingLocalControlChannel {
-            state: LocalControlState::Setup(LocalSetupState {
-                stream: local_stream,
-                setup_deadline: Some(Instant::now() + Duration::from_millis(50)),
-                negotiated: false,
-            }),
+        let mut local = UnixStreamLocalSetupChannel {
+            stream: local_stream,
+            setup_deadline: Some(Instant::now() + Duration::from_millis(50)),
+            negotiated: false,
         };
         let local_reader = thread::spawn(move || local.recv_handshake_response().unwrap_err());
         host_stream.write_all(&8u32.to_le_bytes()).unwrap();
@@ -1909,10 +1870,13 @@ mod control_ring_tests {
             local.recv_notification().unwrap_err().kind(),
             ErrorKind::InvalidData
         );
-        let LocalControlState::Active(association) = &control.state else {
-            panic!("control channel is not active");
-        };
-        assert!(association.pending_calls.current_failure().is_some());
+        assert!(
+            control
+                .association
+                .pending_calls
+                .current_failure()
+                .is_some()
+        );
     }
 
     #[test]

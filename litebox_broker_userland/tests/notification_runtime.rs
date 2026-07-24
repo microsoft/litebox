@@ -17,7 +17,7 @@ use litebox_broker_protocol::shared_memory::{
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixControlRingLocalControlChannel, UnixStreamHostSetupChannel,
+    UnixStreamHostSetupChannel, UnixStreamLocalSetupChannel,
 };
 
 #[test]
@@ -65,19 +65,20 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
 
     let mut notification_channel = None;
     let local = BrokerLocal::negotiate(
-        UnixControlRingLocalControlChannel::from_connected(local_control),
-        |channel| {
-            let shared_memory = channel.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
-            let control_memory = channel.receive_memfd(CONTROL_RING_MEMORY_SIZE, None)?;
+        UnixStreamLocalSetupChannel::from_connected(local_control),
+        |mut setup| {
+            let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
+            let control_memory = setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, None)?;
             let control_ring = ControlRing::new(control_memory).map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("invalid test control ring: {error:?}"),
                 )
             })?;
-            let (_cancellation, notifications) = channel.activate(control_ring, || {})?;
+            let (call_channel, notifications, _shutdown) =
+                setup.into_active(control_ring, || {})?;
             notification_channel = Some(notifications);
-            Ok(Arc::new(shared_memory))
+            Ok((call_channel, Arc::new(shared_memory)))
         },
     )
     .unwrap();

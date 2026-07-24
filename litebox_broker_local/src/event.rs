@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
     EventConsumeMode,
@@ -14,7 +14,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
-impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
+impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned event object with initial readiness credits.
     ///
     /// # Panics

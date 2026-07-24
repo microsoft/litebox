@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, PipeRequest, PipeResponse};
 use litebox_broker_protocol::pipe::{
     CreatePipeRequest, CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeRequest,
@@ -12,7 +12,7 @@ use litebox_broker_protocol::shared_memory::SharedBufferDescriptor;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
-impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
+impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned byte pipe.
     ///
     /// # Panics
@@ -146,7 +146,7 @@ mod tests {
     use std::sync::Mutex;
 
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
         BrokerResponse, BrokerResult,
@@ -170,7 +170,8 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 2 })),
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
         ]);
-        let local = BrokerLocal::negotiate(channel, |_| Ok(memory.clone())).unwrap();
+        let local =
+            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory.clone()))).unwrap();
         let write_buffer = descriptor(2, 3);
         let read_buffer = descriptor(4, 3);
 
@@ -219,7 +220,7 @@ mod tests {
     fn pipe_rejects_oversized_transfers_before_request() {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([]);
-        let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
+        let local = BrokerLocal::negotiate(channel, |channel| Ok((channel, memory))).unwrap();
         let oversized = descriptor(0, MAX_PIPE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
@@ -245,7 +246,7 @@ mod tests {
                 read: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
+        let local = BrokerLocal::negotiate(channel, |channel| Ok((channel, memory))).unwrap();
         let mut destination = [0];
 
         let _ = local.read_pipe(ObjectHandle(1), descriptor(0, 1), &mut destination);
@@ -259,7 +260,7 @@ mod tests {
                 written: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = BrokerLocal::negotiate(channel, |_| Ok(memory)).unwrap();
+        let local = BrokerLocal::negotiate(channel, |channel| Ok((channel, memory))).unwrap();
 
         let _ = local.write_pipe(ObjectHandle(1), descriptor(0, 1), &[0]);
     }
@@ -332,7 +333,7 @@ mod tests {
         }
     }
 
-    impl LocalControlChannel for ScriptedChannel {
+    impl LocalSetupChannel for ScriptedChannel {
         type Error = Infallible;
 
         fn send_handshake_request(
@@ -350,6 +351,11 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }))
         }
+    }
+
+    impl LocalCallChannel for ScriptedChannel {
+        type Error = Infallible;
+
         fn call(
             &self,
             request: BrokerRequest,

@@ -4,8 +4,10 @@
 //! Typed broker-local adapters for broker requests and notifications.
 //!
 //! The local control adapter owns request identifiers but does not own transport
-//! sequencing. Userland, kernel, or ring-buffer deployments provide control
-//! channels by implementing [`litebox_broker_protocol::channel::LocalControlChannel`].
+//! sequencing. Userland, kernel, or ring-buffer deployments provide channels by
+//! implementing [`litebox_broker_protocol::channel::LocalSetupChannel`] for
+//! association setup and
+//! [`litebox_broker_protocol::channel::LocalCallChannel`] for active calls.
 //! Notification receive adapters are intentionally separate so active control
 //! requests remain strictly paired with their responses.
 
@@ -23,7 +25,9 @@ mod pipe;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use litebox_broker_protocol::channel::{LocalControlChannel, LocalNotificationChannel};
+use litebox_broker_protocol::channel::{
+    LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
@@ -41,7 +45,7 @@ pub use error::{BrokerLocalError, Result};
 ///
 /// The shared-buffer pool belongs to the broker association. Payload request
 /// descriptors identify operation-scoped slots managed by the caller.
-pub struct BrokerLocal<Channel: LocalControlChannel> {
+pub struct BrokerLocal<Channel: LocalCallChannel> {
     channel: Channel,
     shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
     next_request_id: AtomicU64,
@@ -52,29 +56,35 @@ pub struct BrokerNotifications<Channel: LocalNotificationChannel> {
     channel: Channel,
 }
 
-impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
-    /// Negotiates the broker protocol, then establishes the association shared
-    /// memory before active requests begin.
+impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
+    /// Negotiates the broker protocol on `setup`, then consumes it into the
+    /// active call channel and association shared memory before active requests
+    /// begin.
+    ///
+    /// `activate` owns every deployment-specific setup step that must complete
+    /// after negotiation, such as receiving shared memory and starting the
+    /// active transport.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error, returns a protocol
     /// response that does not match the negotiation request, or setup returns
     /// shared memory with an invalid size.
-    pub fn negotiate(
-        mut channel: Channel,
+    pub fn negotiate<Setup: LocalSetupChannel<Error = Channel::Error>>(
+        mut setup: Setup,
         activate: impl FnOnce(
-            &mut Channel,
-        ) -> core::result::Result<Arc<dyn SharedMemory>, Channel::Error>,
+            Setup,
+        )
+            -> core::result::Result<(Channel, Arc<dyn SharedMemory>), Channel::Error>,
     ) -> Result<Self, Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         let request = BrokerHandshakeRequest {
             protocol_version: requested,
         };
-        channel
+        setup
             .send_handshake_request(&request)
             .map_err(BrokerLocalError::Channel)?;
-        match channel
+        match setup
             .recv_handshake_response()
             .map_err(BrokerLocalError::Channel)?
             .ok_or(BrokerLocalError::ChannelClosed)?
@@ -86,7 +96,8 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                     requested, broker_protocol_version,
                     "broker returned unexpected negotiation response: {response:?}"
                 );
-                let shared_memory = activate(&mut channel).map_err(BrokerLocalError::Channel)?;
+                let (channel, shared_memory) =
+                    activate(setup).map_err(BrokerLocalError::Channel)?;
                 let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
                     .expect("broker association shared memory has an invalid size");
                 Ok(Self {
@@ -242,7 +253,7 @@ mod tests {
             assert!(channel.handshake_response.is_none());
             assert!(channel.sent_request.borrow().is_none());
             setup_calls.set(setup_calls.get() + 1);
-            Ok(noop_shared_memory())
+            Ok((channel, noop_shared_memory()))
         })
         .unwrap();
 
@@ -416,9 +427,9 @@ mod tests {
         let setup_called = Cell::new(false);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = BrokerLocal::negotiate(channel, |_| {
+            let _ = BrokerLocal::negotiate(channel, |channel| {
                 setup_called.set(true);
-                Ok(noop_shared_memory())
+                Ok((channel, noop_shared_memory()))
             });
         }));
         assert_panic_contains(result, "broker returned unexpected negotiation response");
@@ -451,9 +462,9 @@ mod tests {
 
         let setup_called = Cell::new(false);
         assert!(matches!(
-            BrokerLocal::negotiate(channel, |_| {
+            BrokerLocal::negotiate(channel, |channel| {
                 setup_called.set(true);
-                Ok(noop_shared_memory())
+                Ok((channel, noop_shared_memory()))
             }),
             Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
         ));
@@ -469,9 +480,9 @@ mod tests {
         let setup_called = Cell::new(false);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = BrokerLocal::negotiate(channel, |_| {
+            let _ = BrokerLocal::negotiate(channel, |channel| {
                 setup_called.set(true);
-                Ok(noop_shared_memory())
+                Ok((channel, noop_shared_memory()))
             });
         }));
         assert_panic_contains(result, "broker returned unrecoverable error");
@@ -507,10 +518,13 @@ mod tests {
             None,
         );
 
-        let _ = BrokerLocal::negotiate(channel, |_| {
-            Ok(Arc::new(NoopSharedMemory {
-                length: litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE - 1,
-            }) as Arc<dyn SharedMemory>)
+        let _ = BrokerLocal::negotiate(channel, |channel| {
+            Ok((
+                channel,
+                Arc::new(NoopSharedMemory {
+                    length: litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE - 1,
+                }) as Arc<dyn SharedMemory>,
+            ))
         });
     }
 
@@ -596,7 +610,7 @@ mod tests {
         }
     }
 
-    impl LocalControlChannel for FakeControlChannel {
+    impl LocalSetupChannel for FakeControlChannel {
         type Error = FakeChannelError;
 
         fn send_handshake_request(
@@ -612,6 +626,11 @@ mod tests {
         ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
             Ok(self.handshake_response.take())
         }
+    }
+
+    impl LocalCallChannel for FakeControlChannel {
+        type Error = FakeChannelError;
+
         fn call(
             &self,
             request: BrokerRequest,
@@ -643,7 +662,7 @@ mod tests {
         request_ids: Mutex<std::vec::Vec<RequestId>>,
     }
 
-    impl LocalControlChannel for ConcurrentCallChannel {
+    impl LocalSetupChannel for ConcurrentCallChannel {
         type Error = Infallible;
 
         fn send_handshake_request(
@@ -660,6 +679,10 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }))
         }
+    }
+
+    impl LocalCallChannel for ConcurrentCallChannel {
+        type Error = Infallible;
 
         fn call(
             &self,

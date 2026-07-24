@@ -6,7 +6,7 @@
 use alloc::sync::Arc;
 
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::message::BrokerNotification;
 
 use crate::{
@@ -50,7 +50,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> Self
     where
         Platform: TimeProvider,
-        Channel: LocalControlChannel + Send + Sync + 'static,
+        Channel: LocalCallChannel + Send + Sync + 'static,
     {
         let broker_pollables = Arc::new(broker::BrokerPollableRegistry::new());
         let broker_control = Arc::new(broker::BrokerLocalControl::<Platform, Channel>::new(

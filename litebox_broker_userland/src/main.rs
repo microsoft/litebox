@@ -324,22 +324,22 @@ fn accept_runner_stream(
 mod tests {
     use super::*;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::channel::{HostSetupChannel, LocalControlChannel};
+    use litebox_broker_protocol::channel::{HostSetupChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::BrokerHandshakeResponse;
-    use litebox_broker_transport::unix_socket::UnixControlRingLocalControlChannel;
+    use litebox_broker_transport::unix_socket::UnixStreamLocalSetupChannel;
     use std::os::fd::AsFd;
 
     #[test]
     fn first_failure_is_preserved_and_unblocks_request_reading() {
         let (peer_stream, host_stream) = UnixStream::pair().unwrap();
-        let mut local_channel = UnixControlRingLocalControlChannel::from_connected(peer_stream);
+        let mut local_setup = UnixStreamLocalSetupChannel::from_connected(peer_stream);
         let mut control_channel = UnixStreamHostSetupChannel::from_accepted(host_stream);
         control_channel
             .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             })
             .unwrap();
-        local_channel.recv_handshake_response().unwrap().unwrap();
+        local_setup.recv_handshake_response().unwrap().unwrap();
         let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
         let host_memory = MemfdSharedMemory::from_received_fd(
             local_memory.as_fd().try_clone_to_owned().unwrap(),
@@ -348,13 +348,11 @@ mod tests {
         .unwrap();
         let local_ring = ControlRing::new(local_memory).unwrap();
         let host_ring = ControlRing::new(host_memory).unwrap();
-        let local_activation = std::thread::spawn(move || {
-            let local_shutdown = local_channel.activate(local_ring, || {}).unwrap();
-            (local_channel, local_shutdown)
-        });
+        let local_activation =
+            std::thread::spawn(move || local_setup.into_active(local_ring, || {}).unwrap());
         let (mut request_source, _response_sink, _notifications, shutdown) =
             control_channel.into_active(host_ring).unwrap();
-        let (_local_channel, _local_shutdown) = local_activation.join().unwrap();
+        let (_local_call, _local_notifications, _local_shutdown) = local_activation.join().unwrap();
         let failure_coordinator = HostAssociationFailureCoordinator::new(shutdown);
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
         let reader = std::thread::spawn(move || {

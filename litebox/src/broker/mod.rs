@@ -9,7 +9,7 @@ use alloc::{
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
@@ -146,7 +146,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
 
 pub(crate) struct BrokerLocalControl<
     Platform: RawSyncPrimitivesProvider,
-    Channel: LocalControlChannel + Send + Sync,
+    Channel: LocalCallChannel + Send + Sync,
 > {
     local: Mutex<Platform, Option<Arc<BrokerLocal<Channel>>>>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
@@ -156,7 +156,7 @@ pub(crate) struct BrokerLocalControl<
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
-    Channel: LocalControlChannel + Send + Sync,
+    Channel: LocalCallChannel + Send + Sync,
 {
     pub(crate) fn new(
         local: BrokerLocal<Channel>,
@@ -208,7 +208,7 @@ where
 impl<Platform, Channel> BrokerControl for BrokerLocalControl<Platform, Channel>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
-    Channel: LocalControlChannel + Send + Sync,
+    Channel: LocalCallChannel + Send + Sync,
 {
     fn create_event_with_count(
         &self,
@@ -308,7 +308,7 @@ mod tests {
     use std::time::Duration;
 
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
         BrokerResponse, BrokerResult, PipeRequest, PipeResponse,
@@ -331,9 +331,10 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let local =
-            BrokerLocal::negotiate(channel, |_| Ok(Arc::new(memory) as Arc<dyn SharedMemory>))
-                .unwrap();
+        let local = BrokerLocal::negotiate(channel, |channel| {
+            Ok((channel, Arc::new(memory) as Arc<dyn SharedMemory>))
+        })
+        .unwrap();
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
             local,
             Arc::new(BrokerPollableRegistry::new()),
@@ -375,9 +376,10 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let local =
-            BrokerLocal::negotiate(channel, |_| Ok(Arc::new(memory) as Arc<dyn SharedMemory>))
-                .unwrap();
+        let local = BrokerLocal::negotiate(channel, |channel| {
+            Ok((channel, Arc::new(memory) as Arc<dyn SharedMemory>))
+        })
+        .unwrap();
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
             local,
             Arc::new(BrokerPollableRegistry::new()),
@@ -468,7 +470,7 @@ mod tests {
         release: StdArc<(StdMutex<bool>, StdCondvar)>,
     }
 
-    impl LocalControlChannel for ConcurrentPipeChannel {
+    impl LocalSetupChannel for ConcurrentPipeChannel {
         type Error = Infallible;
 
         fn send_handshake_request(
@@ -486,6 +488,10 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }))
         }
+    }
+
+    impl LocalCallChannel for ConcurrentPipeChannel {
+        type Error = Infallible;
 
         fn call(
             &self,
@@ -516,7 +522,7 @@ mod tests {
         }
     }
 
-    impl LocalControlChannel for ConcurrentPipeReadChannel {
+    impl LocalSetupChannel for ConcurrentPipeReadChannel {
         type Error = Infallible;
 
         fn send_handshake_request(
@@ -534,6 +540,10 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }))
         }
+    }
+
+    impl LocalCallChannel for ConcurrentPipeReadChannel {
+        type Error = Infallible;
 
         fn call(
             &self,
