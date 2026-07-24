@@ -128,21 +128,21 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
 ///
 /// `send_shared_memory` runs after version negotiation and before the active
 /// association is returned.
-pub fn setup_connection<'a, ControlChannel, Memory, ChannelError>(
+pub fn setup_connection<'a, SetupChannel, Memory, ChannelError>(
     core: &BrokerCore,
-    control_channel: &mut ControlChannel,
+    setup_channel: &mut SetupChannel,
     shared_buffers: &'a SharedBufferPool<Memory>,
-    send_shared_memory: impl FnOnce(&mut ControlChannel) -> core::result::Result<(), ChannelError>,
+    send_shared_memory: impl FnOnce(&mut SetupChannel) -> core::result::Result<(), ChannelError>,
 ) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
 where
-    ControlChannel: HostSetupChannel<Error = ChannelError>,
+    SetupChannel: HostSetupChannel<Error = ChannelError>,
     Memory: SharedMemory,
 {
     if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
         return Err(BrokerHostError::SharedBufferLayoutMismatch);
     }
 
-    let peer_credential = control_channel
+    let peer_credential = setup_channel
         .peer_credential()
         .map_err(BrokerHostError::Channel)?;
     let caller_credential = match peer_credential {
@@ -152,13 +152,13 @@ where
     };
     let session = core.create_session(caller_credential)?;
     loop {
-        let request = match control_channel
+        let request = match setup_channel
             .recv_handshake_request()
             .map_err(BrokerHostError::Channel)?
         {
             HostReceive::Message(request) => request,
             HostReceive::ProtocolViolation => {
-                control_channel
+                setup_channel
                     .send_handshake_response(&BrokerHandshakeResponse::Error(
                         ErrorCode::ProtocolState,
                     ))
@@ -180,11 +180,11 @@ where
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }
         };
-        control_channel
+        setup_channel
             .send_handshake_response(&response)
             .map_err(BrokerHostError::Channel)?;
         if negotiated {
-            send_shared_memory(control_channel).map_err(BrokerHostError::Channel)?;
+            send_shared_memory(setup_channel).map_err(BrokerHostError::Channel)?;
             return Ok(Ok(BrokerHostAssociation {
                 session,
                 shared_buffers,
