@@ -160,7 +160,7 @@ fn dispatch_requests<Memory: SharedMemory>(
     shutdown: UnixStreamHostControlShutdown,
 ) -> IoResult<()> {
     let association = Arc::new(association);
-    let failure = Arc::new(HostAssociationFailure::new(shutdown));
+    let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
     let request_receiver = Arc::new(Mutex::new(request_receiver));
 
@@ -170,7 +170,7 @@ fn dispatch_requests<Memory: SharedMemory>(
             let association = Arc::clone(&association);
             let request_receiver = Arc::clone(&request_receiver);
             let response_sink = response_sink.clone();
-            let worker_failure = Arc::clone(&failure);
+            let worker_failure_coordinator = Arc::clone(&failure_coordinator);
             match std::thread::Builder::new()
                 .name(format!("litebox-broker-worker-{worker_id}"))
                 .spawn_scoped(scope, move || {
@@ -178,26 +178,26 @@ fn dispatch_requests<Memory: SharedMemory>(
                         &association,
                         &request_receiver,
                         &response_sink,
-                        &worker_failure,
+                        &worker_failure_coordinator,
                     );
                 }) {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
-                    failure.report(error);
+                    failure_coordinator.report(error);
                     break;
                 }
             }
         }
 
-        read_requests(&mut request_source, request_sender, &failure);
+        read_requests(&mut request_source, request_sender, &failure_coordinator);
         for worker in workers {
             if worker.join().is_err() {
-                failure.report(IoError::other("broker request worker panicked"));
+                failure_coordinator.report(IoError::other("broker request worker panicked"));
             }
         }
     });
 
-    match failure.take_error() {
+    match failure_coordinator.take_error() {
         Some(error) => Err(error),
         None => Ok(()),
     }
@@ -206,16 +206,16 @@ fn dispatch_requests<Memory: SharedMemory>(
 fn read_requests(
     request_source: &mut UnixStreamHostRequestSource,
     request_sender: SyncSender<BrokerRequest>,
-    failure: &HostAssociationFailure,
+    failure_coordinator: &HostAssociationFailureCoordinator,
 ) {
     loop {
-        if failure.failed() {
+        if failure_coordinator.failed() {
             break;
         }
         match request_source.recv_request() {
             Ok(HostReceive::Message(request)) => {
                 if request_sender.send(request).is_err() {
-                    failure.report(IoError::new(
+                    failure_coordinator.report(IoError::new(
                         ErrorKind::BrokenPipe,
                         "broker request workers stopped",
                     ));
@@ -223,7 +223,7 @@ fn read_requests(
                 }
             }
             Ok(HostReceive::ProtocolViolation) => {
-                failure.report(IoError::new(
+                failure_coordinator.report(IoError::new(
                     ErrorKind::InvalidData,
                     "runner sent a request for the wrong protocol phase",
                 ));
@@ -231,7 +231,7 @@ fn read_requests(
             }
             Ok(HostReceive::PeerClosed) => break,
             Err(error) => {
-                failure.report(error);
+                failure_coordinator.report(error);
                 break;
             }
         }
@@ -242,7 +242,7 @@ fn run_worker<Memory: SharedMemory>(
     association: &BrokerHostAssociation<'_, Memory>,
     request_receiver: &Mutex<Receiver<BrokerRequest>>,
     response_sink: &UnixStreamHostResponseSink,
-    failure: &HostAssociationFailure,
+    failure_coordinator: &HostAssociationFailureCoordinator,
 ) {
     loop {
         let request = request_receiver
@@ -252,26 +252,28 @@ fn run_worker<Memory: SharedMemory>(
         let Ok(request) = request else {
             break;
         };
-        if failure.failed() {
+        if failure_coordinator.failed() {
             continue;
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             association.execute_request(request, |response| response_sink.send_response(response))
         })) {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => failure.report(IoError::other(error)),
-            Err(_) => failure.report(IoError::other("broker request worker panicked")),
+            Ok(Err(error)) => failure_coordinator.report(IoError::other(error)),
+            Err(_) => {
+                failure_coordinator.report(IoError::other("broker request worker panicked"));
+            }
         }
     }
 }
 
-struct HostAssociationFailure {
+struct HostAssociationFailureCoordinator {
     failed: AtomicBool,
     error: Mutex<Option<IoError>>,
     shutdown: UnixStreamHostControlShutdown,
 }
 
-impl HostAssociationFailure {
+impl HostAssociationFailureCoordinator {
     const fn new(shutdown: UnixStreamHostControlShutdown) -> Self {
         Self {
             failed: AtomicBool::new(false),
@@ -372,14 +374,14 @@ mod tests {
         let (mut request_source, _response_sink, shutdown) =
             control_channel.into_active(host_ring).unwrap();
         let (_local_channel, _cancellation) = local_activation.join().unwrap();
-        let failure = HostAssociationFailure::new(shutdown);
+        let failure_coordinator = HostAssociationFailureCoordinator::new(shutdown);
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
         let reader = std::thread::spawn(move || {
             result_sender.send(request_source.recv_request()).unwrap();
         });
 
-        failure.report(IoError::new(ErrorKind::TimedOut, "first failure"));
-        failure.report(IoError::other("second failure"));
+        failure_coordinator.report(IoError::new(ErrorKind::TimedOut, "first failure"));
+        failure_coordinator.report(IoError::other("second failure"));
         let receive_result = result_receiver.recv_timeout(Duration::from_secs(1));
         reader.join().unwrap();
 
@@ -387,7 +389,7 @@ mod tests {
             receive_result.unwrap(),
             Ok(HostReceive::PeerClosed) | Err(_)
         ));
-        let error = failure.take_error().unwrap();
+        let error = failure_coordinator.take_error().unwrap();
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "first failure");
     }

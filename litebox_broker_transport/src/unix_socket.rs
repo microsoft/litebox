@@ -93,15 +93,15 @@ struct UnixStreamLocalSetup {
 
 /// Independently owned handle for interrupting local control-channel I/O.
 pub struct UnixStreamLocalControlCancellation {
-    failure: Arc<LocalActiveFailure>,
+    failure_coordinator: Arc<LocalActiveFailureCoordinator>,
 }
 
 struct UnixStreamLocalActive {
     request_producer: Mutex<crate::control_ring::ControlRingProducer<MemfdSharedMemory>>,
-    failure: Arc<LocalActiveFailure>,
+    failure_coordinator: Arc<LocalActiveFailureCoordinator>,
 }
 
-struct LocalActiveFailure {
+struct LocalActiveFailureCoordinator {
     stream: UnixStream,
     pending_calls: Arc<PendingCalls>,
     association_failure: Arc<dyn Fn() + Send + Sync>,
@@ -202,44 +202,48 @@ impl UnixStreamLocalControlChannel {
         let (request_producer, response_consumer) = ring.into_local();
         let pending_calls = Arc::new(PendingCalls::new());
         let association_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(association_failure);
-        let failure = Arc::new(LocalActiveFailure {
+        let failure_coordinator = Arc::new(LocalActiveFailureCoordinator {
             stream: shutdown_stream,
             pending_calls: Arc::clone(&pending_calls),
             association_failure,
             request_wait: request_producer.wake_handle(),
             response_wait: response_consumer.wake_handle(),
         });
-        let response_failure = Arc::clone(&failure);
+        let response_failure_coordinator = Arc::clone(&failure_coordinator);
         if let Err(error) = thread::Builder::new()
             .name("litebox-broker-responses".to_owned())
             .spawn(move || {
-                dispatch_responses(response_consumer, response_failure);
+                dispatch_responses(response_consumer, response_failure_coordinator);
             })
         {
-            let _ = failure.fail(error);
+            let _ = failure_coordinator.fail(error);
             return Err(Error::other("failed to start broker response pump"));
         }
-        let monitor_failure = Arc::clone(&failure);
+        let monitor_failure_coordinator = Arc::clone(&failure_coordinator);
         if let Err(error) = thread::Builder::new()
             .name("litebox-broker-liveness".to_owned())
-            .spawn(move || monitor_local_socket(&mut monitor_stream, &monitor_failure))
+            .spawn(move || {
+                monitor_local_socket(&mut monitor_stream, &monitor_failure_coordinator);
+            })
         {
-            let _ = failure.fail(error);
+            let _ = failure_coordinator.fail(error);
             return Err(Error::other("failed to start broker liveness monitor"));
         }
 
         self.state = UnixStreamLocalControlState::Active(UnixStreamLocalActive {
             request_producer: Mutex::new(request_producer),
-            failure: Arc::clone(&failure),
+            failure_coordinator: Arc::clone(&failure_coordinator),
         });
-        Ok(UnixStreamLocalControlCancellation { failure })
+        Ok(UnixStreamLocalControlCancellation {
+            failure_coordinator,
+        })
     }
 }
 
 impl UnixStreamLocalControlCancellation {
     /// Shuts down the control stream, unblocking pending reads or writes.
     pub fn cancel(&self) -> IoResult<()> {
-        self.failure.fail(Error::new(
+        self.failure_coordinator.fail(Error::new(
             ErrorKind::ConnectionAborted,
             "broker association cancelled",
         ))
@@ -251,7 +255,7 @@ impl Drop for UnixStreamLocalControlChannel {
         let UnixStreamLocalControlState::Active(active) = &self.state else {
             return;
         };
-        let _ = active.failure.fail(Error::new(
+        let _ = active.failure_coordinator.fail(Error::new(
             ErrorKind::ConnectionAborted,
             "broker active channel dropped",
         ));
@@ -494,7 +498,10 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
             return Err(invalid_data("broker control channel is not active"));
         };
         let request_id = request.request_id;
-        let pending_call = active.failure.pending_calls.register(request_id)?;
+        let pending_call = active
+            .failure_coordinator
+            .pending_calls
+            .register(request_id)?;
         let request_frame = encode_request(request);
 
         let write_result = {
@@ -503,7 +510,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
                 .lock()
                 .expect("broker request writer mutex poisoned");
             loop {
-                if let Some(error) = active.failure.pending_calls.current_failure() {
+                if let Some(error) = active.failure_coordinator.pending_calls.current_failure() {
                     break Err(copy_io_error(&error));
                 }
                 match producer
@@ -526,7 +533,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
             }
         };
         if let Err(error) = write_result {
-            let _ = active.failure.fail(error);
+            let _ = active.failure_coordinator.fail(error);
         }
 
         pending_call.wait()
@@ -804,7 +811,7 @@ impl PendingCalls {
     }
 }
 
-impl LocalActiveFailure {
+impl LocalActiveFailureCoordinator {
     fn fail(&self, error: Error) -> IoResult<()> {
         let first_failure = self.pending_calls.record_failure(Arc::new(error));
         let request_wake = self.request_wait.interrupt_wait();
@@ -875,9 +882,12 @@ impl HostActiveState {
     }
 }
 
-fn monitor_local_socket(stream: &mut UnixStream, failure: &LocalActiveFailure) {
+fn monitor_local_socket(
+    stream: &mut UnixStream,
+    failure_coordinator: &LocalActiveFailureCoordinator,
+) {
     let error = monitor_socket(stream, "broker");
-    let _ = failure.fail(error);
+    let _ = failure_coordinator.fail(error);
 }
 
 fn monitor_host_socket(stream: &mut UnixStream, active: &HostActiveState) {
@@ -924,7 +934,7 @@ fn monitor_socket(stream: &mut UnixStream, peer: &'static str) -> Error {
 
 fn dispatch_responses(
     mut consumer: ControlRingConsumer<MemfdSharedMemory>,
-    failure: Arc<LocalActiveFailure>,
+    failure_coordinator: Arc<LocalActiveFailureCoordinator>,
 ) {
     loop {
         match consumer.try_read(decode_response) {
@@ -933,27 +943,31 @@ fn dispatch_responses(
                     .publish_head()
                     .map_err(control_ring_error)
                     .and_then(|()| consumer.wake_producer())
-                    .and_then(|()| failure.pending_calls.complete(response))
+                    .and_then(|()| failure_coordinator.pending_calls.complete(response))
                 {
-                    let _ = failure.fail(error);
+                    let _ = failure_coordinator.fail(error);
                     return;
                 }
             }
             Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                if failure.pending_calls.current_failure().is_some() {
+                if failure_coordinator
+                    .pending_calls
+                    .current_failure()
+                    .is_some()
+                {
                     return;
                 }
                 if let Err(error) = consumer.wait_for_message(wait_epoch) {
-                    let _ = failure.fail(error);
+                    let _ = failure_coordinator.fail(error);
                     return;
                 }
             }
             Err(ControlRingReadError::Ring(error)) => {
-                let _ = failure.fail(control_ring_error(error));
+                let _ = failure_coordinator.fail(control_ring_error(error));
                 return;
             }
             Err(ControlRingReadError::Decode(error)) => {
-                let _ = failure.fail(wire_error(error));
+                let _ = failure_coordinator.fail(wire_error(error));
                 return;
             }
         }
