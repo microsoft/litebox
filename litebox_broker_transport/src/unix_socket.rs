@@ -588,7 +588,7 @@ impl UnixStreamHostRequestSource {
                     return Ok(HostReceive::Message(request));
                 }
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                    if let Some(terminal) = self.active.request_terminal() {
+                    if let Some(terminal) = self.active.request_terminal_result() {
                         return terminal;
                     }
                     if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
@@ -854,7 +854,7 @@ impl HostActiveState {
         let _ = self.response_wait.interrupt_wait();
     }
 
-    fn request_terminal(&self) -> Option<IoResult<HostReceive<BrokerRequest>>> {
+    fn request_terminal_result(&self) -> Option<IoResult<HostReceive<BrokerRequest>>> {
         match &*self
             .status
             .lock()
