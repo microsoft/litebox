@@ -321,7 +321,24 @@ pub struct ControlRingProducer<Memory: AtomicSharedMemory> {
 #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
 pub(crate) struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
     ring: Arc<ControlRing<Memory>>,
-    wait_epoch_offset: usize,
+    wait_epoch: ControlRingWaitEpoch,
+}
+
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+#[derive(Clone, Copy)]
+enum ControlRingWaitEpoch {
+    Producer(ControlRingDirection),
+    Consumer(ControlRingDirection),
+}
+
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+impl ControlRingWaitEpoch {
+    const fn offset(self) -> usize {
+        match self {
+            Self::Producer(direction) => direction.producer_epoch_offset(),
+            Self::Consumer(direction) => direction.consumer_epoch_offset(),
+        }
+    }
 }
 
 #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
@@ -329,7 +346,7 @@ impl<Memory: AtomicSharedMemory> Clone for ControlRingWakeHandle<Memory> {
     fn clone(&self) -> Self {
         Self {
             ring: Arc::clone(&self.ring),
-            wait_epoch_offset: self.wait_epoch_offset,
+            wait_epoch: self.wait_epoch,
         }
     }
 }
@@ -337,7 +354,7 @@ impl<Memory: AtomicSharedMemory> Clone for ControlRingWakeHandle<Memory> {
 #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
 impl<Memory: AtomicSharedMemory> ControlRingWakeHandle<Memory> {
     pub(crate) const fn wait_epoch_offset(&self) -> usize {
-        self.wait_epoch_offset
+        self.wait_epoch.offset()
     }
 
     pub(crate) fn memory(&self) -> &Memory {
@@ -364,7 +381,7 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
     pub(crate) fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
         ControlRingWakeHandle {
             ring: Arc::clone(&self.ring),
-            wait_epoch_offset: self.direction.consumer_epoch_offset(),
+            wait_epoch: ControlRingWaitEpoch::Consumer(self.direction),
         }
     }
 
@@ -456,7 +473,7 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
     pub(crate) fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
         ControlRingWakeHandle {
             ring: Arc::clone(&self.ring),
-            wait_epoch_offset: self.direction.producer_epoch_offset(),
+            wait_epoch: ControlRingWaitEpoch::Producer(self.direction),
         }
     }
 
