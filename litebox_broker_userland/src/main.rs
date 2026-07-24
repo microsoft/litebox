@@ -25,9 +25,11 @@ use litebox_broker_protocol::shared_memory::{
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixControlRingHostRequestSource, UnixControlRingHostResponseSink, UnixControlRingHostShutdown,
-    UnixStreamHostSetupChannel, validate_peer_process,
+    UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
+    UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
+    validate_peer_process,
 };
+use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -128,9 +130,15 @@ fn serve_runner(
                 .into());
             }
         };
-    let (request_source, response_sink, _notification_channel, shutdown) =
+    let (request_source, response_sink, notification_channel, shutdown) =
         control_channel.into_active(control_ring)?;
-    dispatch_requests(association, request_source, response_sink, shutdown)?;
+    dispatch_requests(
+        association,
+        request_source,
+        response_sink,
+        notification_channel,
+        shutdown,
+    )?;
     Ok(())
 }
 
@@ -138,14 +146,35 @@ fn dispatch_requests<Memory: SharedMemory>(
     association: BrokerHostAssociation<'_, Memory>,
     mut request_source: UnixControlRingHostRequestSource,
     response_sink: UnixControlRingHostResponseSink,
+    mut notification_channel: UnixControlRingHostNotificationChannel,
     shutdown: UnixControlRingHostShutdown,
 ) -> IoResult<()> {
     let association = Arc::new(association);
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
+    let readiness = Arc::new(ReadinessPublisherRuntime::new());
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
     let request_receiver = Arc::new(Mutex::new(request_receiver));
 
     std::thread::scope(|scope| {
+        let publisher_readiness = Arc::clone(&readiness);
+        let publisher = std::thread::Builder::new()
+            .name("litebox-broker-notifier".to_owned())
+            .spawn_scoped(scope, move || {
+                // The request reader owns association termination. A failing
+                // notification transport fails the association, so the reader
+                // observes and reports the same error, and a peer that closed
+                // cleanly is not a failure at all. Reporting here would turn a
+                // clean shutdown into a reported error.
+                let _ = publisher_readiness.run(&mut notification_channel);
+            });
+        let publisher = match publisher {
+            Ok(publisher) => Some(publisher),
+            Err(error) => {
+                failure_coordinator.report(error);
+                None
+            }
+        };
+
         let mut workers = Vec::with_capacity(WORKER_COUNT);
         for worker_id in 0..WORKER_COUNT {
             let association = Arc::clone(&association);
@@ -171,10 +200,18 @@ fn dispatch_requests<Memory: SharedMemory>(
         }
 
         read_requests(&mut request_source, request_sender, &failure_coordinator);
+        // Request reading ends on peer closure or on any reported failure, both
+        // of which end the association, so readiness publication stops here.
+        readiness.close();
         for worker in workers {
             if worker.join().is_err() {
                 failure_coordinator.report(IoError::other("broker request worker panicked"));
             }
+        }
+        if let Some(publisher) = publisher
+            && publisher.join().is_err()
+        {
+            failure_coordinator.report(IoError::other("broker readiness publisher panicked"));
         }
     });
 

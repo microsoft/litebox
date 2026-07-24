@@ -35,6 +35,7 @@ use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use spin::mutex::SpinMutex;
 
 mod error;
+pub mod readiness;
 
 pub use error::{BrokerHostError, Result};
 

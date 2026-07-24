@@ -3,6 +3,9 @@
 
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::sync::mpsc::channel;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
@@ -14,11 +17,98 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_memory::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool,
 };
-use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
+use litebox_broker_transport::control_ring::{
+    CONTROL_RING_MEMORY_SIZE, CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing,
+};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
+    UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown,
+    UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
     UnixStreamHostSetupChannel, UnixStreamLocalSetupChannel,
 };
+use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
+
+/// Long enough that a hung wakeup fails the test instead of hanging CI.
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Long enough for the local endpoint to reach its blocking receive.
+const BLOCK_DELAY: Duration = Duration::from_millis(50);
+/// More objects than the notification ring holds, so publication must block.
+const OVERSUBSCRIBED_OBJECT_COUNT: u64 = CONTROL_RING_NOTIFICATION_SLOT_COUNT * 3;
+
+/// Runs one host association whose only traffic is readiness notifications.
+///
+/// The reader thread mirrors production: it is the endpoint that observes local
+/// termination and interrupts every ring wait of the association.
+fn spawn_host(
+    stream: UnixStream,
+    host: impl FnOnce(UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown)
+    + Send
+    + 'static,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .unwrap();
+        let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
+        let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
+        let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let control_ring = ControlRing::new(control_memory).unwrap();
+        let mut control = UnixStreamHostSetupChannel::from_accepted(stream);
+        let association = setup_connection(&broker, &mut control, &shared_buffers, |channel| {
+            channel.send_memfd(shared_buffers.memory(), None)?;
+            channel.send_memfd(control_ring.memory(), None)
+        })
+        .unwrap()
+        .unwrap();
+        let (mut request_source, response_sink, notifications, shutdown) =
+            control.into_active(control_ring).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while let Ok(HostReceive::Message(request)) = request_source.recv_request() {
+                    association
+                        .execute_request(request, |response| response_sink.send_response(response))
+                        .unwrap();
+                }
+            });
+            host(notifications, shutdown);
+        });
+    })
+}
+
+/// Negotiates the local half of an association created by [`spawn_host`].
+fn negotiate_local(
+    stream: UnixStream,
+) -> (
+    BrokerLocal<UnixControlRingLocalCallChannel>,
+    BrokerNotifications<UnixControlRingLocalNotificationChannel>,
+) {
+    let (local, notifications) = BrokerLocal::negotiate(
+        UnixStreamLocalSetupChannel::from_connected(stream),
+        |mut setup| {
+            let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
+            let control_memory = setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, None)?;
+            let control_ring = ControlRing::new(control_memory).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid test control ring: {error:?}"),
+                )
+            })?;
+            let (call_channel, notifications, _shutdown) =
+                setup.into_active(control_ring, || {})?;
+            Ok((call_channel, Arc::new(shared_memory), notifications))
+        },
+    )
+    .unwrap();
+    (local, BrokerNotifications::new(notifications))
+}
+
+fn readiness_of(notification: Option<BrokerNotification>) -> ReadinessNotification {
+    let Some(BrokerNotification::Readiness(readiness)) = notification else {
+        panic!("expected a readiness notification, got {notification:?}");
+    };
+    readiness
+}
 
 #[test]
 fn host_serves_control_requests_and_notifications_over_shared_rings() {
@@ -95,4 +185,122 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         host_thread.join().unwrap(),
         ConnectionTermination::PeerClosed
     );
+}
+
+#[test]
+fn a_host_readiness_source_wakes_a_blocked_local_receiver() {
+    const HANDLE: ObjectHandle = ObjectHandle(11);
+    let readiness = ReadinessFlags::READ | ReadinessFlags::WRITE;
+    let (local_control, host_control) = UnixStream::pair().unwrap();
+    let (finish_sender, finish_receiver) = channel::<()>();
+
+    let host = spawn_host(host_control, move |mut notifications, _shutdown| {
+        let runtime = Arc::new(ReadinessPublisherRuntime::new());
+        let publishing = Arc::clone(&runtime);
+        let publisher = std::thread::spawn(move || publishing.run(&mut notifications));
+
+        // The local endpoint is blocked in its notification receive by now, so
+        // this update is the only thing that can wake it.
+        std::thread::sleep(BLOCK_DELAY);
+        runtime.publish(HANDLE, readiness).unwrap();
+
+        let _ = finish_receiver.recv();
+        runtime.close();
+        publisher.join().unwrap().unwrap();
+    });
+
+    let (local, mut notifications) = negotiate_local(local_control);
+    let received = readiness_of(notifications.recv_notification().unwrap());
+
+    assert_eq!(
+        received,
+        ReadinessNotification {
+            handle: HANDLE,
+            readiness,
+        }
+    );
+    drop(finish_sender);
+    drop(local);
+    host.join().unwrap();
+}
+
+#[test]
+fn a_full_notification_ring_does_not_block_readiness_sources() {
+    let (local_control, host_control) = UnixStream::pair().unwrap();
+    let (published_sender, published_receiver) = channel::<()>();
+    let (finish_sender, finish_receiver) = channel::<()>();
+
+    let host = spawn_host(host_control, move |mut notifications, _shutdown| {
+        let runtime = Arc::new(ReadinessPublisherRuntime::new());
+        let publishing = Arc::clone(&runtime);
+        let publisher = std::thread::spawn(move || publishing.run(&mut notifications));
+
+        // The local endpoint drains nothing until it sees this signal, so the
+        // ring fills and the publisher blocks while the source runs to
+        // completion.
+        for handle in 0..OVERSUBSCRIBED_OBJECT_COUNT {
+            runtime
+                .publish(ObjectHandle(handle), ReadinessFlags::READ)
+                .unwrap();
+        }
+        published_sender.send(()).unwrap();
+
+        let _ = finish_receiver.recv();
+        runtime.close();
+        publisher.join().unwrap().unwrap();
+    });
+
+    let (local, mut notifications) = negotiate_local(local_control);
+    published_receiver.recv_timeout(TEST_TIMEOUT).unwrap();
+    for handle in 0..OVERSUBSCRIBED_OBJECT_COUNT {
+        assert_eq!(
+            readiness_of(notifications.recv_notification().unwrap()),
+            ReadinessNotification {
+                handle: ObjectHandle(handle),
+                readiness: ReadinessFlags::READ,
+            }
+        );
+    }
+
+    drop(finish_sender);
+    drop(local);
+    host.join().unwrap();
+}
+
+#[test]
+fn a_clean_local_close_ends_a_publisher_blocked_on_a_full_ring() {
+    let (local_control, host_control) = UnixStream::pair().unwrap();
+    let (published_sender, published_receiver) = channel::<()>();
+    let (outcome_sender, outcome_receiver) = channel();
+
+    let host = spawn_host(host_control, move |mut notifications, _shutdown| {
+        let runtime = Arc::new(ReadinessPublisherRuntime::new());
+        let publishing = Arc::clone(&runtime);
+        let publisher = std::thread::spawn(move || publishing.run(&mut notifications));
+
+        for handle in 0..OVERSUBSCRIBED_OBJECT_COUNT {
+            runtime
+                .publish(ObjectHandle(handle), ReadinessFlags::READ)
+                .unwrap();
+        }
+        published_sender.send(()).unwrap();
+
+        // The publisher is blocked on notification-ring capacity that the local
+        // endpoint will never make available. Only teardown can end it.
+        outcome_sender.send(publisher.join().unwrap()).unwrap();
+    });
+
+    let (local, notifications) = negotiate_local(local_control);
+    published_receiver.recv_timeout(TEST_TIMEOUT).unwrap();
+    drop(notifications);
+    drop(local);
+
+    let outcome = outcome_receiver.recv_timeout(TEST_TIMEOUT).unwrap();
+    let error = outcome.expect_err("a closed association must end the blocked publisher");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "a closed peer must end publication as a closure rather than a transport failure, got {error:?}"
+    );
+    host.join().unwrap();
 }
