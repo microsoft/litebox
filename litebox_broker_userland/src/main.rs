@@ -200,14 +200,16 @@ fn dispatch_requests<Memory: SharedMemory>(
         }
 
         read_requests(&mut request_source, request_sender, &failure_coordinator);
-        // Request reading ends on peer closure or on any reported failure, both
-        // of which end the association, so readiness publication stops here.
-        readiness.close();
         for worker in workers {
             if worker.join().is_err() {
                 failure_coordinator.report(IoError::other("broker request worker panicked"));
             }
         }
+        // Readiness publication lives exactly as long as the association. The
+        // request reader returns only once the association is over, but workers
+        // keep draining already-queued requests after that, so publication must
+        // outlive them or a late readiness change would be discarded.
+        readiness.close();
         if let Some(publisher) = publisher
             && publisher.join().is_err()
         {
