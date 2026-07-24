@@ -157,6 +157,12 @@ enum ThreadInformationClass {
     SchedulerSharedDataSlot = 57,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
+enum QueryThreadInformationClass {
+    AmILastThread = 12,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable)]
 struct ThreadSchedulerSharedDataSlotInformation {
@@ -265,6 +271,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             initial_context: Some(initial_context),
             thread_object: Some(thread),
         };
+        self.process
+            .active_thread_count
+            .fetch_add(1, Ordering::AcqRel);
         // SAFETY: `child_ctx` points at mapped guest code and stack created above, and the
         // destination thread constructs its non-Send shim entrypoints inside `InitThread::init`.
         if let Err(error) = unsafe {
@@ -274,10 +283,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } {
             litebox_util_log::error!(error:% = error; "Failed to spawn Windows guest thread");
             self.close_typed_handle::<ThreadSubsystem<Platform>>(handle, drop);
+            self.process
+                .active_thread_count
+                .fetch_sub(1, Ordering::AcqRel);
             return NtStatus::NO_MEMORY;
         }
 
         if thread_handle.write_at_offset(0, handle).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_query_information_thread(
+        &self,
+        thread_handle: ThreadHandle,
+        thread_information_class: u32,
+        thread_information: MutPtr<Platform, u8>,
+        thread_information_length: u32,
+        return_length: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        let Ok(QueryThreadInformationClass::AmILastThread) =
+            QueryThreadInformationClass::try_from(thread_information_class)
+        else {
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+        if thread_information_length as usize != core::mem::size_of::<u32>() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if !thread_handle.is_current() {
+            return NtStatus::NOT_SUPPORTED;
+        }
+
+        let is_last_thread =
+            u32::from(self.process.active_thread_count.load(Ordering::Acquire) == 1);
+        let output = MutPtr::<Platform, u32>::from_usize(thread_information.as_usize());
+        if output.write_at_offset(0, is_last_thread).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if let Some(return_length) = return_length
+            && return_length
+                .write_at_offset(0, core::mem::size_of::<u32>().trunc())
+                .is_none()
+        {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS

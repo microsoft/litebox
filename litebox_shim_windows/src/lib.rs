@@ -588,6 +588,7 @@ pub struct Process<Platform: ShimPlatform> {
     cookie: u32,
     exit_code: AtomicI32,
     next_thread_id: AtomicUsize,
+    active_thread_count: AtomicUsize,
 }
 
 impl<Platform: ShimPlatform> Process<Platform> {
@@ -636,6 +637,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
             next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
+            active_thread_count: AtomicUsize::new(1),
         }
     }
 }
@@ -1665,6 +1667,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     thread_information_class,
                     thread_information,
                     thread_information_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryInformationThread {
+                thread_handle,
+                thread_information_class,
+                thread_information,
+                thread_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_information_thread(
+                    thread_handle,
+                    thread_information_class,
+                    thread_information,
+                    thread_information_length,
+                    return_length,
                 );
                 (status, ContinueOperation::Resume)
             }

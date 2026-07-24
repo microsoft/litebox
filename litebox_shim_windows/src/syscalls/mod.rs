@@ -494,6 +494,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         thread_information: Platform::RawConstPointer<u8>,
         thread_information_length: u32,
     },
+    NtQueryInformationThread {
+        thread_handle: ThreadHandle,
+        thread_information_class: u32,
+        thread_information: Platform::RawMutPointer<u8>,
+        thread_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
     NtCreateThreadEx {
         thread_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -1041,6 +1048,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 thread_information_class,
                 thread_information:*,
                 thread_information_length,
+            })),
+            NtSysno::NtQueryInformationThread => Some(sys_req!(NtQueryInformationThread {
+                thread_handle:{ThreadHandle::from_raw},
+                thread_information_class,
+                thread_information:*,
+                thread_information_length,
+                return_length:*,
             })),
             NtSysno::NtCreateThreadEx => Some(sys_req!(NtCreateThreadEx {
                 thread_handle:*,
