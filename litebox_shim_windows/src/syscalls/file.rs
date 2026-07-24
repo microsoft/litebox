@@ -9,7 +9,7 @@ use core::mem::size_of;
 use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
 use litebox::fs::errors::{FileStatusError, MkdirError, OpenError, PathError, WriteError};
-use litebox::fs::{FileType, Mode, OFlags};
+use litebox::fs::{FileType, Mode, OFlags, SeekWhence};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -29,6 +29,12 @@ const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+/// Append at the current end of file
+const FILE_WRITE_TO_END_OF_FILE: i64 = -1;
+
+/// Use the file object's current position
+const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
 
 // These names and values are Windows ABI constants from WDK headers; Wine's
 // regular file/directory branch and ReactOS' filesystem device query path use
@@ -564,8 +570,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let offset = match byte_offset {
             Some(byte_offset) => match byte_offset.read_at_offset(0) {
-                Some(-2) => None,
-                Some(-1) => {
+                Some(FILE_USE_FILE_POINTER_POSITION) => None,
+                Some(FILE_WRITE_TO_END_OF_FILE) => {
                     let file = match self.file_entry(file_handle) {
                         Ok(file) => file,
                         Err(status) => return status,
@@ -584,8 +590,15 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
             None => None,
         };
-        if key.is_some_and(|key| key.read_at_offset(0).is_none()) {
-            return NtStatus::ACCESS_VIOLATION;
+        if let Some(key) = key {
+            let Some(key) = key.read_at_offset(0) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw(),
+                key = key;
+                "Ignoring NtWriteFile byte-range lock key; byte-range locking is not supported yet"
+            );
         }
 
         let file = match self.file_entry(file_handle) {
@@ -606,10 +619,24 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let result = file.with_entry(|file| match &file.backing {
             FileObjectBacking::Filesystem { fd, is_directory } => {
                 if *is_directory {
-                    Err(WriteError::NotAFile)
-                } else {
-                    self.fs.write(fd, &buffer, offset)
+                    return Err(WriteError::NotAFile);
                 }
+                let written = self.fs.write(fd, &buffer, offset)?;
+                // A positional write leaves the backing file offset untouched, but NT advances a
+                // synchronous file object's position past the end of every write, including
+                // explicit-offset and append writes. Asynchronous handles keep their position.
+                if let Some(offset) = offset
+                    && file
+                        .create_options
+                        .intersects(FileCreateOptions::SYNCHRONOUS_IO)
+                {
+                    let _ = self.fs.seek(
+                        fd,
+                        (offset + written).cast_signed(),
+                        SeekWhence::RelativeToBeginning,
+                    );
+                }
+                Ok(written)
             }
             FileObjectBacking::CondrvStream { fd, .. } => self.fs.write(fd, &buffer, offset),
             FileObjectBacking::CondrvControl(_) => Err(WriteError::NotAFile),

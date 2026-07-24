@@ -3,30 +3,20 @@
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
+/// Runs a hello-world guest PE end to end.
 #[test]
-fn loads_minimal_pe_without_imports() {
-    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no_import");
+fn run_hello_world_pe() {
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import");
     let _ = std::fs::remove_dir_all(&test_dir);
     std::fs::create_dir_all(&test_dir).unwrap();
-    let pe_path = build_no_import_pe(&test_dir);
+    let pe_path = build_kernel32_import_pe(&test_dir);
     println!(
-        "Built rewritten no-import PE fixture at `{}`",
+        "Built rewritten kernel32-import PE fixture at `{}`",
         pe_path.display()
     );
-    for dll_name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
-        let dll_path = build_rewritten_system_dll(&test_dir, dll_name);
-        println!(
-            "Built rewritten {dll_name} fixture at `{}`",
-            dll_path.display()
-        );
-    }
-    // ntdll's NLS init opens these locale tables before reaching the test's
-    // `NtTerminateProcess` syscall; copy them verbatim from the host.
-    for nls_name in ["c_1252.nls", "c_437.nls", "c_10000.nls", "locale.nls"] {
-        let nls_path = copy_host_system32_file(&test_dir, nls_name);
-        println!("Copied {nls_name} fixture at `{}`", nls_path.display());
-    }
-    let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no_import.tar");
+    stage_system_fixtures(&test_dir);
+    let tar_path =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
     let mut command =
@@ -36,7 +26,7 @@ fn loads_minimal_pe_without_imports() {
     command.args([
         "--initial-files",
         tar_path.to_str().unwrap(),
-        "/no_import.exe",
+        "/kernel32_import.exe",
     ]);
     println!("Running `{command:?}`");
     let output = command
@@ -47,7 +37,7 @@ fn loads_minimal_pe_without_imports() {
 
     assert!(
         output.status.success(),
-        "runner failed to run no-import PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        "runner failed to run kernel32-import PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         stdout,
         stderr
@@ -58,17 +48,26 @@ fn loads_minimal_pe_without_imports() {
     );
 }
 
-fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
-    let source_path = test_dir.join("no_import.rs");
-    let raw_exe_path = test_dir.join("no_import.raw.exe");
-    let exe_path = test_dir.join("no_import.exe");
-    let terminate_syscall_number = litebox_common_windows::NtSysno::NtTerminateProcess.as_raw();
-    let write_syscall_number = litebox_common_windows::NtSysno::NtWriteFile.as_raw();
-    std::fs::write(
-        &source_path,
-        minimal_pe_source(write_syscall_number, terminate_syscall_number),
-    )
-    .unwrap();
+/// Stages the guest system DLLs and locale tables the PE fixture needs.
+fn stage_system_fixtures(test_dir: &std::path::Path) {
+    for dll_name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
+        let dll_path = build_rewritten_system_dll(test_dir, dll_name);
+        println!(
+            "Built rewritten {dll_name} fixture at `{}`",
+            dll_path.display()
+        );
+    }
+    for nls_name in ["c_1252.nls", "c_437.nls", "c_10000.nls", "locale.nls"] {
+        let nls_path = copy_host_system32_file(test_dir, nls_name);
+        println!("Copied {nls_name} fixture at `{}`", nls_path.display());
+    }
+}
+
+fn build_kernel32_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
+    let source_path = test_dir.join("kernel32_import.rs");
+    let raw_exe_path = test_dir.join("kernel32_import.raw.exe");
+    let exe_path = test_dir.join("kernel32_import.exe");
+    std::fs::write(&source_path, KERNEL32_IMPORT_PE_SOURCE).unwrap();
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let output = std::process::Command::new(rustc)
@@ -79,6 +78,8 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
             "panic=abort",
             "-C",
             "opt-level=1",
+            "-l",
+            "dylib=kernel32",
             "-C",
             "link-arg=/ENTRY:mainCRTStartup",
             "-C",
@@ -89,120 +90,66 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
             raw_exe_path.to_str().unwrap(),
         ])
         .output()
-        .expect("failed to run rustc for the no-import Windows PE fixture");
+        .expect("failed to run rustc for the kernel32-import Windows PE fixture");
 
     assert!(
         output.status.success(),
-        "failed to build no-import Windows PE fixture\nstdout:\n{}\nstderr:\n{}",
+        "failed to build kernel32-import Windows PE fixture\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
     let rewritten =
-        litebox_syscall_rewriter::rewrite_binary(&std::fs::read(raw_exe_path).unwrap(), None)
-            .expect("failed to rewrite no-import Windows PE fixture");
+        litebox_syscall_rewriter::rewrite_binary(&std::fs::read(&raw_exe_path).unwrap(), None)
+            .expect("failed to rewrite kernel32-import Windows PE fixture");
     std::fs::write(&exe_path, rewritten).unwrap();
+    // Keep the unrewritten build out of the fixture tar.
+    std::fs::remove_file(&raw_exe_path).unwrap();
     exe_path
 }
 
-fn minimal_pe_source(write_syscall_number: u32, terminate_syscall_number: u32) -> String {
-    format!(
-        r#"
+/// `STD_OUTPUT_HANDLE` is `(DWORD)-11`.
+const KERNEL32_IMPORT_PE_SOURCE: &str = r#"
 #![no_std]
 #![no_main]
 
-#[repr(C)]
-struct ProcessEnvironmentBlock {{
-    reserved: [u8; 0x20],
-    process_parameters: *const RtlUserProcessParameters,
-}}
-
-#[repr(C)]
-struct RtlUserProcessParameters {{
-    maximum_length: u32,
-    length: u32,
-    flags: u32,
-    debug_flags: u32,
-    console_handle: usize,
-    console_flags: u32,
-    padding: u32,
-    standard_input: usize,
-    standard_output: usize,
-    standard_error: usize,
-}}
-
-#[repr(C)]
-struct IoStatusBlock {{
-    status: i32,
-    padding: u32,
-    information: usize,
-}}
-
-#[unsafe(naked)]
-unsafe extern "system" fn nt_write_file(
-    _file_handle: usize,
-    _event: usize,
-    _apc_routine: usize,
-    _apc_context: usize,
-    _io_status_block: *mut IoStatusBlock,
-    _buffer: *const u8,
-    _length: u32,
-    _byte_offset: usize,
-    _key: usize,
-) -> i32 {{
-    core::arch::naked_asm!(
-        "mov r10, rcx",
-        "mov eax, {write_syscall_number:#x}",
-        "syscall",
-        "ret",
-    );
-}}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(std_handle: u32) -> usize;
+    fn WriteFile(
+        file: usize,
+        buffer: *const u8,
+        length: u32,
+        written: *mut u32,
+        overlapped: usize,
+    ) -> i32;
+    fn ExitProcess(exit_code: u32) -> !;
+}
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn mainCRTStartup() -> ! {{
-    unsafe {{
+pub unsafe extern "system" fn mainCRTStartup() -> ! {
+    unsafe {
         static MESSAGE: &[u8] = b"hello world\n";
-        let peb: *const ProcessEnvironmentBlock;
-        core::arch::asm!("mov {{}}, gs:[0x60]", out(reg) peb);
-        let stdout = (*(*peb).process_parameters).standard_output;
-        let mut io_status = IoStatusBlock {{
-            status: -1,
-            padding: 0,
-            information: 0,
-        }};
-        let status = nt_write_file(
+        let stdout = GetStdHandle(0xffff_fff5);
+        let mut written = 0u32;
+        let ok = WriteFile(
             stdout,
-            0,
-            0,
-            0,
-            &raw mut io_status,
             MESSAGE.as_ptr(),
             MESSAGE.len() as u32,
-            0,
+            &raw mut written,
             0,
         );
-        let exit_status =
-            i32::from(status != 0 || io_status.status != 0 || io_status.information != MESSAGE.len());
-        core::arch::asm!(
-            "mov rcx, -1",
-            "mov r10, rcx",
-            "mov eax, {terminate_syscall_number:#x}",
-            "syscall",
-            in("edx") exit_status,
-            options(noreturn),
-        );
-    }}
-}}
+        ExitProcess(u32::from(ok == 0 || written as usize != MESSAGE.len()));
+    }
+}
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {{
-    loop {{
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {
         core::hint::spin_loop();
-    }}
-}}
-"#
-    )
+    }
 }
+"#;
 
 fn build_rewritten_system_dll(test_dir: &std::path::Path, dll_name: &str) -> std::path::PathBuf {
     let dll_path = fixture_system32_path(test_dir, dll_name);
@@ -243,13 +190,13 @@ fn host_system32_file_path(file_name: &str) -> std::path::PathBuf {
 }
 
 fn create_tar_with_dir(test_dir: &std::path::Path, tar_path: &std::path::Path) {
-    let output_file = std::fs::File::create(tar_path)
-        .expect("failed to create tar for the no-import Windows PE fixture");
+    let output_file =
+        std::fs::File::create(tar_path).expect("failed to create tar for the Windows PE fixture");
     let mut builder = tar::Builder::new(output_file);
     append_regular_files_to_ustar(&mut builder, test_dir, test_dir);
     builder
         .finish()
-        .expect("failed to finalize tar for the no-import Windows PE fixture");
+        .expect("failed to finalize tar for the Windows PE fixture");
 }
 
 fn append_regular_files_to_ustar(
