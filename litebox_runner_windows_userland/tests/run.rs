@@ -9,7 +9,7 @@ fn run_hello_world_pe() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import");
     let _ = std::fs::remove_dir_all(&test_dir);
     std::fs::create_dir_all(&test_dir).unwrap();
-    let pe_path = build_kernel32_import_pe(&test_dir);
+    let pe_path = build_kernel32_import_pe(&test_dir, "kernel32_import", KERNEL32_IMPORT_PE_SOURCE);
     println!(
         "Built rewritten kernel32-import PE fixture at `{}`",
         pe_path.display()
@@ -48,6 +48,61 @@ fn run_hello_world_pe() {
     );
 }
 
+/// Runs a guest PE that creates and joins a child thread.
+#[test]
+fn run_multithreaded_pe() {
+    let test_dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_multithread");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+    let pe_path = build_kernel32_import_pe(
+        &test_dir,
+        "kernel32_multithread",
+        KERNEL32_MULTITHREAD_PE_SOURCE,
+    );
+    println!(
+        "Built rewritten multithreaded PE fixture at `{}`",
+        pe_path.display()
+    );
+    stage_system_fixtures(&test_dir);
+    let tar_path =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_multithread.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let mut command =
+        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    command.env("LITEBOX_LOG", "debug");
+    command.args([
+        "--initial-files",
+        tar_path.to_str().unwrap(),
+        "/kernel32_multithread.exe",
+    ]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "runner failed to run multithreaded PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    let child_position = stdout.find("child thread\n");
+    let joined_position = stdout.find("main joined\n");
+    assert!(
+        child_position.is_some() && joined_position.is_some(),
+        "guest thread output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        child_position < joined_position,
+        "main reported joining before the child ran\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 /// Stages the guest system DLLs and locale tables the PE fixture needs.
 fn stage_system_fixtures(test_dir: &std::path::Path) {
     for dll_name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
@@ -63,11 +118,15 @@ fn stage_system_fixtures(test_dir: &std::path::Path) {
     }
 }
 
-fn build_kernel32_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
-    let source_path = test_dir.join("kernel32_import.rs");
-    let raw_exe_path = test_dir.join("kernel32_import.raw.exe");
-    let exe_path = test_dir.join("kernel32_import.exe");
-    std::fs::write(&source_path, KERNEL32_IMPORT_PE_SOURCE).unwrap();
+fn build_kernel32_import_pe(
+    test_dir: &std::path::Path,
+    fixture_name: &str,
+    source: &str,
+) -> std::path::PathBuf {
+    let source_path = test_dir.join(format!("{fixture_name}.rs"));
+    let raw_exe_path = test_dir.join(format!("{fixture_name}.raw.exe"));
+    let exe_path = test_dir.join(format!("{fixture_name}.exe"));
+    std::fs::write(&source_path, source).unwrap();
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let output = std::process::Command::new(rustc)
@@ -140,6 +199,77 @@ pub unsafe extern "system" fn mainCRTStartup() -> ! {
             0,
         );
         ExitProcess(u32::from(ok == 0 || written as usize != MESSAGE.len()));
+    }
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+"#;
+
+const KERNEL32_MULTITHREAD_PE_SOURCE: &str = r#"
+#![no_std]
+#![no_main]
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(std_handle: u32) -> usize;
+    fn WriteFile(
+        file: usize,
+        buffer: *const u8,
+        length: u32,
+        written: *mut u32,
+        overlapped: usize,
+    ) -> i32;
+    fn CreateThread(
+        thread_attributes: *const u8,
+        stack_size: usize,
+        start_routine: unsafe extern "system" fn(*mut u8) -> u32,
+        parameter: *mut u8,
+        creation_flags: u32,
+        thread_id: *mut u32,
+    ) -> usize;
+    fn WaitForSingleObject(handle: usize, milliseconds: u32) -> u32;
+    fn ExitProcess(exit_code: u32) -> !;
+}
+
+unsafe fn write_stdout(message: &[u8]) -> bool {
+    unsafe {
+        let stdout = GetStdHandle(0xffff_fff5);
+        let mut written = 0u32;
+        WriteFile(
+            stdout,
+            message.as_ptr(),
+            message.len() as u32,
+            &raw mut written,
+            0,
+        ) != 0
+            && written as usize == message.len()
+    }
+}
+
+unsafe extern "system" fn child_thread(_parameter: *mut u8) -> u32 {
+    u32::from(!unsafe { write_stdout(b"child thread\n") })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn mainCRTStartup() -> ! {
+    unsafe {
+        let thread = CreateThread(
+            core::ptr::null(),
+            0,
+            child_thread,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+        );
+        if thread == 0 || WaitForSingleObject(thread, u32::MAX) != 0 {
+            ExitProcess(1);
+        }
+        ExitProcess(u32::from(!write_stdout(b"main joined\n")));
     }
 }
 
