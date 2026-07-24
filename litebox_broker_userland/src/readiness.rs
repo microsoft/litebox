@@ -43,7 +43,7 @@ impl Default for ReadinessPublisherRuntime {
 impl ReadinessPublisherRuntime {
     /// Creates idle readiness publication state.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             publisher: ReadinessPublisher::new(),
             signaled: Mutex::new(false),

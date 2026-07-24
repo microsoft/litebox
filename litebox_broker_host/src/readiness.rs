@@ -31,8 +31,9 @@
 //! [`confirm`]: ReadinessPublisher::confirm
 //! [`BrokerNotification::Readiness`]: litebox_broker_protocol::message::BrokerNotification::Readiness
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::VecDeque;
 
+use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::HostNotificationChannel;
 use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
@@ -97,7 +98,7 @@ pub struct ReadinessPublisher {
 
 #[derive(Debug)]
 struct PublisherState {
-    entries: BTreeMap<ObjectHandle, ReadinessEntry>,
+    entries: HashMap<ObjectHandle, ReadinessEntry>,
     queue: VecDeque<ObjectHandle>,
     closed: bool,
 }
@@ -129,10 +130,10 @@ impl Default for ReadinessPublisher {
 impl ReadinessPublisher {
     /// Creates empty readiness publication state.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: SpinMutex::new(PublisherState {
-                entries: BTreeMap::new(),
+                entries: HashMap::new(),
                 queue: VecDeque::new(),
                 closed: false,
             }),

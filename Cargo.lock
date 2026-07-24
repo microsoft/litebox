@@ -1470,6 +1470,7 @@ dependencies = [
 name = "litebox_broker_host"
 version = "0.1.0"
 dependencies = [
+ "hashbrown",
  "litebox_broker_core",
  "litebox_broker_protocol",
  "spin 0.9.8",

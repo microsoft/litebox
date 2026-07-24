@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+hashbrown = "0.15.2"
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
