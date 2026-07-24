@@ -26,7 +26,7 @@ use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRi
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
     UnixControlRingHostRequestSource, UnixControlRingHostResponseSink, UnixControlRingHostShutdown,
-    UnixStreamHostControlChannel, validate_peer_process,
+    UnixStreamHostSetupChannel, validate_peer_process,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -98,7 +98,7 @@ fn serve_runner(
     let control_ring = ControlRing::new(control_memory)
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let mut control_channel =
-        UnixStreamHostControlChannel::from_host_guaranteed(control_stream, setup_deadline);
+        UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
     let association =
         match setup_connection(broker, &mut control_channel, &shared_buffers, |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
@@ -326,14 +326,14 @@ mod tests {
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::channel::{HostSetupChannel, LocalControlChannel};
     use litebox_broker_protocol::message::BrokerHandshakeResponse;
-    use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
+    use litebox_broker_transport::unix_socket::UnixControlRingLocalControlChannel;
     use std::os::fd::AsFd;
 
     #[test]
     fn first_failure_is_preserved_and_unblocks_request_reading() {
         let (peer_stream, host_stream) = UnixStream::pair().unwrap();
-        let mut local_channel = UnixStreamLocalControlChannel::from_connected(peer_stream);
-        let mut control_channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        let mut local_channel = UnixControlRingLocalControlChannel::from_connected(peer_stream);
+        let mut control_channel = UnixStreamHostSetupChannel::from_accepted(host_stream);
         control_channel
             .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,

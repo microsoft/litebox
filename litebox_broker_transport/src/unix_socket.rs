@@ -64,18 +64,18 @@ fn peer_process_id(stream: &UnixStream) -> IoResult<u32> {
         .map_err(|_| invalid_data("Unix peer process ID is invalid"))
 }
 
-/// Local-side Unix-domain-socket control channel for the hosted userland POC.
-pub struct UnixStreamLocalControlChannel {
-    state: UnixStreamLocalControlState,
+/// Local control channel using a Unix stream for setup and control rings for active calls.
+pub struct UnixControlRingLocalControlChannel {
+    state: LocalControlState,
 }
 
-enum UnixStreamLocalControlState {
-    Setup(UnixStreamLocalSetup),
+enum LocalControlState {
+    Setup(LocalSetupState),
     Active(Arc<LocalActiveState>),
     Failed,
 }
 
-struct UnixStreamLocalSetup {
+struct LocalSetupState {
     stream: UnixStream,
     setup_deadline: Option<Instant>,
     negotiated: bool,
@@ -88,12 +88,12 @@ pub struct UnixControlRingLocalCancellation {
 
 struct LocalActiveState {
     request_producer: Mutex<crate::control_ring::ControlRingProducer<MemfdSharedMemory>>,
-    stream: UnixStream,
+    control_stream: UnixStream,
     pending_calls: Arc<PendingCalls>,
     association_failure: Arc<dyn Fn() + Send + Sync>,
-    request_wait: ControlRingWakeHandle<MemfdSharedMemory>,
-    response_wait: ControlRingWakeHandle<MemfdSharedMemory>,
-    notification_wait: ControlRingWakeHandle<MemfdSharedMemory>,
+    request_wake: ControlRingWakeHandle<MemfdSharedMemory>,
+    response_wake: ControlRingWakeHandle<MemfdSharedMemory>,
+    notification_wake: ControlRingWakeHandle<MemfdSharedMemory>,
 }
 
 /// Local notification receiver for a shared-ring Unix broker association.
@@ -102,11 +102,11 @@ pub struct UnixControlRingLocalNotificationChannel {
     active: Arc<LocalActiveState>,
 }
 
-impl UnixStreamLocalControlChannel {
+impl UnixControlRingLocalControlChannel {
     /// Creates a local control channel from an already-connected Unix stream.
     pub const fn from_connected(stream: UnixStream) -> Self {
         Self {
-            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+            state: LocalControlState::Setup(LocalSetupState {
                 stream,
                 setup_deadline: None,
                 negotiated: false,
@@ -129,7 +129,7 @@ impl UnixStreamLocalControlChannel {
         deadline: Instant,
     ) -> IoResult<Self> {
         UnixStream::connect(path).map(|stream| Self {
-            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+            state: LocalControlState::Setup(LocalSetupState {
                 stream,
                 setup_deadline: Some(deadline),
                 negotiated: false,
@@ -143,7 +143,7 @@ impl UnixStreamLocalControlChannel {
         expected_len: usize,
         deadline: Option<Instant>,
     ) -> IoResult<MemfdSharedMemory> {
-        let UnixStreamLocalControlState::Setup(setup) = &mut self.state else {
+        let LocalControlState::Setup(setup) = &mut self.state else {
             return Err(invalid_data("broker control setup already completed"));
         };
         crate::shared_memory::receive_memfd(&mut setup.stream, expected_len, deadline)
@@ -162,7 +162,7 @@ impl UnixStreamLocalControlChannel {
         UnixControlRingLocalCancellation,
         UnixControlRingLocalNotificationChannel,
     )> {
-        let UnixStreamLocalControlState::Setup(setup) = &self.state else {
+        let LocalControlState::Setup(setup) = &self.state else {
             return Err(invalid_data("broker control channel already active"));
         };
         if !setup.negotiated {
@@ -170,8 +170,8 @@ impl UnixStreamLocalControlChannel {
                 "broker control channel activated before negotiation completed",
             ));
         }
-        let UnixStreamLocalControlState::Setup(setup) =
-            core::mem::replace(&mut self.state, UnixStreamLocalControlState::Failed)
+        let LocalControlState::Setup(setup) =
+            core::mem::replace(&mut self.state, LocalControlState::Failed)
         else {
             unreachable!("broker control setup state disappeared");
         };
@@ -204,13 +204,13 @@ impl UnixStreamLocalControlChannel {
         let pending_calls = Arc::new(PendingCalls::new());
         let association_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(association_failure);
         let active = Arc::new(LocalActiveState {
-            request_wait: request_producer.wake_handle(),
+            request_wake: request_producer.wake_handle(),
             request_producer: Mutex::new(request_producer),
-            stream: shutdown_stream,
+            control_stream: shutdown_stream,
             pending_calls: Arc::clone(&pending_calls),
             association_failure,
-            response_wait: response_consumer.wake_handle(),
-            notification_wait: notification_consumer.wake_handle(),
+            response_wake: response_consumer.wake_handle(),
+            notification_wake: notification_consumer.wake_handle(),
         });
         let response_active = Arc::clone(&active);
         if let Err(error) = thread::Builder::new()
@@ -233,7 +233,7 @@ impl UnixStreamLocalControlChannel {
             return Err(Error::other("failed to start broker liveness monitor"));
         }
 
-        self.state = UnixStreamLocalControlState::Active(Arc::clone(&active));
+        self.state = LocalControlState::Active(Arc::clone(&active));
         Ok((
             UnixControlRingLocalCancellation {
                 active: Arc::clone(&active),
@@ -247,7 +247,7 @@ impl UnixStreamLocalControlChannel {
 }
 
 impl UnixControlRingLocalCancellation {
-    /// Shuts down the control stream, unblocking pending reads or writes.
+    /// Cancels the active association, unblocking ring and socket waits.
     pub fn cancel(&self) -> IoResult<()> {
         self.active.fail(Error::new(
             ErrorKind::ConnectionAborted,
@@ -256,40 +256,40 @@ impl UnixControlRingLocalCancellation {
     }
 }
 
-impl Drop for UnixStreamLocalControlChannel {
+impl Drop for UnixControlRingLocalControlChannel {
     fn drop(&mut self) {
-        let UnixStreamLocalControlState::Active(active) = &self.state else {
+        let LocalControlState::Active(active) = &self.state else {
             return;
         };
         let _ = active.fail(Error::new(
             ErrorKind::ConnectionAborted,
-            "broker active channel dropped",
+            "broker local control channel dropped",
         ));
     }
 }
 
-fn shutdown(stream: &UnixStream) -> IoResult<()> {
+fn shutdown_socket(stream: &UnixStream) -> IoResult<()> {
     match stream.shutdown(Shutdown::Both) {
         Err(error) if error.kind() == ErrorKind::NotConnected => Ok(()),
         result => result,
     }
 }
 
-/// Host-side Unix-domain-socket control channel for the hosted userland POC.
-pub struct UnixStreamHostControlChannel {
+/// Host-side broker association setup channel over a Unix stream.
+pub struct UnixStreamHostSetupChannel {
     stream: UnixStream,
     peer_credential: PeerCredential,
     setup_deadline: Option<Instant>,
     negotiated: bool,
 }
 
-/// Request-reading half of an active host control channel.
+/// Request-reading endpoint of an active host control-ring association.
 pub struct UnixControlRingHostRequestSource {
     consumer: ControlRingConsumer<MemfdSharedMemory>,
     active: Arc<HostActiveState>,
 }
 
-/// Shared response-writing half of an active host control channel.
+/// Shared response-writing endpoint of an active host control-ring association.
 #[derive(Clone)]
 pub struct UnixControlRingHostResponseSink {
     producer: Arc<Mutex<crate::control_ring::ControlRingProducer<MemfdSharedMemory>>>,
@@ -302,11 +302,11 @@ pub struct UnixControlRingHostShutdown {
 }
 
 struct HostActiveState {
-    stream: UnixStream,
+    control_stream: UnixStream,
     status: Mutex<HostActiveStatus>,
-    request_wait: ControlRingWakeHandle<MemfdSharedMemory>,
-    response_wait: ControlRingWakeHandle<MemfdSharedMemory>,
-    notification_wait: ControlRingWakeHandle<MemfdSharedMemory>,
+    request_wake: ControlRingWakeHandle<MemfdSharedMemory>,
+    response_wake: ControlRingWakeHandle<MemfdSharedMemory>,
+    notification_wake: ControlRingWakeHandle<MemfdSharedMemory>,
 }
 
 enum HostActiveStatus {
@@ -321,8 +321,8 @@ pub struct UnixControlRingHostNotificationChannel {
     active: Arc<HostActiveState>,
 }
 
-impl UnixStreamHostControlChannel {
-    /// Creates a host control channel from an accepted Unix stream.
+impl UnixStreamHostSetupChannel {
+    /// Creates a host setup channel from an accepted Unix stream.
     pub const fn from_accepted(stream: UnixStream) -> Self {
         Self {
             stream,
@@ -332,7 +332,7 @@ impl UnixStreamHostControlChannel {
         }
     }
 
-    /// Creates a host control channel after the deployment has authenticated
+    /// Creates a host setup channel after the deployment has authenticated
     /// and bound the accepted peer. `setup_deadline` bounds handshake I/O.
     pub const fn from_host_guaranteed(stream: UnixStream, setup_deadline: Instant) -> Self {
         Self {
@@ -343,7 +343,7 @@ impl UnixStreamHostControlChannel {
         }
     }
 
-    /// Sends the memfd associated with this control channel.
+    /// Sends a memfd during association setup.
     pub fn send_memfd(
         &mut self,
         shared_memory: &MemfdSharedMemory,
@@ -365,7 +365,7 @@ impl UnixStreamHostControlChannel {
     )> {
         if !self.negotiated {
             return Err(invalid_data(
-                "broker host control channel activated before negotiation completed",
+                "broker host setup channel activated before negotiation completed",
             ));
         }
         let Some(ready) = read_frame_with_deadline(&mut self.stream, self.setup_deadline)? else {
@@ -388,11 +388,11 @@ impl UnixStreamHostControlChannel {
             notification_producer,
         } = ring.into_broker();
         let active = Arc::new(HostActiveState {
-            stream: shutdown_stream,
+            control_stream: shutdown_stream,
             status: Mutex::new(HostActiveStatus::Live),
-            request_wait: request_consumer.wake_handle(),
-            response_wait: response_producer.wake_handle(),
-            notification_wait: notification_producer.wake_handle(),
+            request_wake: request_consumer.wake_handle(),
+            response_wake: response_producer.wake_handle(),
+            notification_wake: notification_producer.wake_handle(),
         });
         let monitor_active = Arc::clone(&active);
         thread::Builder::new()
@@ -435,11 +435,11 @@ impl Drop for UnixControlRingHostShutdown {
     }
 }
 
-impl LocalControlChannel for UnixStreamLocalControlChannel {
+impl LocalControlChannel for UnixControlRingLocalControlChannel {
     type Error = Error;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
-        let UnixStreamLocalControlState::Setup(setup) = &mut self.state else {
+        let LocalControlState::Setup(setup) = &mut self.state else {
             return Err(invalid_data("broker control channel is already active"));
         };
         let frame = encode_handshake_request(request.clone());
@@ -447,7 +447,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
-        let UnixStreamLocalControlState::Setup(setup) = &mut self.state else {
+        let LocalControlState::Setup(setup) = &mut self.state else {
             return Err(invalid_data("broker control channel is already active"));
         };
         let frame = read_frame_with_deadline(&mut setup.stream, setup.setup_deadline)?;
@@ -462,7 +462,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
     }
 
     fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
-        let UnixStreamLocalControlState::Active(active) = &self.state else {
+        let LocalControlState::Active(active) = &self.state else {
             return Err(invalid_data("broker control channel is not active"));
         };
         let request_id = request.request_id;
@@ -502,7 +502,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
     }
 }
 
-impl HostSetupChannel for UnixStreamHostControlChannel {
+impl HostSetupChannel for UnixStreamHostSetupChannel {
     type Error = Error;
 
     fn peer_credential(&self) -> IoResult<PeerCredential> {
@@ -657,11 +657,11 @@ impl HostNotificationChannel for UnixControlRingHostNotificationChannel {
 }
 
 struct PendingCalls {
-    state: Mutex<PendingCallState>,
+    state: Mutex<PendingCallsState>,
     capacity_available: Condvar,
 }
 
-struct PendingCallState {
+struct PendingCallsState {
     calls: HashMap<RequestId, Arc<PendingCall>>,
     failure: Option<Arc<Error>>,
 }
@@ -717,7 +717,7 @@ impl PendingCall {
 impl PendingCalls {
     fn new() -> Self {
         Self {
-            state: Mutex::new(PendingCallState {
+            state: Mutex::new(PendingCallsState {
                 calls: HashMap::new(),
                 failure: None,
             }),
@@ -821,10 +821,10 @@ impl LocalActiveState {
 
     fn fail(&self, error: Error) -> IoResult<()> {
         let first_failure = self.pending_calls.record_failure(Arc::new(error));
-        let request_wake = self.request_wait.interrupt_wait();
-        let response_wake = self.response_wait.interrupt_wait();
-        let notification_wake = self.notification_wait.interrupt_wait();
-        let shutdown_result = shutdown(&self.stream);
+        let request_wake = self.request_wake.interrupt_wait();
+        let response_wake = self.response_wake.interrupt_wait();
+        let notification_wake = self.notification_wake.interrupt_wait();
+        let shutdown_result = shutdown_socket(&self.control_stream);
         if first_failure {
             (self.association_failure)();
         }
@@ -871,13 +871,13 @@ impl HostActiveState {
                 *status = HostActiveStatus::Failed(Arc::new(error));
             }
         }
-        let request_wake = self.request_wait.interrupt_wait();
-        let response_wake = self.response_wait.interrupt_wait();
-        let notification_wake = self.notification_wait.interrupt_wait();
+        let request_wake = self.request_wake.interrupt_wait();
+        let response_wake = self.response_wake.interrupt_wait();
+        let notification_wake = self.notification_wake.interrupt_wait();
         request_wake
             .and(response_wake)
             .and(notification_wake)
-            .and(shutdown(&self.stream))
+            .and(shutdown_socket(&self.control_stream))
     }
 
     fn peer_closed(&self) {
@@ -890,9 +890,9 @@ impl HostActiveState {
                 *status = HostActiveStatus::PeerClosed;
             }
         }
-        let _ = self.request_wait.interrupt_wait();
-        let _ = self.response_wait.interrupt_wait();
-        let _ = self.notification_wait.interrupt_wait();
+        let _ = self.request_wake.interrupt_wait();
+        let _ = self.response_wake.interrupt_wait();
+        let _ = self.notification_wake.interrupt_wait();
     }
 
     fn request_terminal_result(&self) -> Option<IoResult<HostReceive<BrokerRequest>>> {
@@ -933,7 +933,7 @@ impl HostActiveState {
                 HostActiveStatus::PeerClosed => {
                     return Err(Error::new(
                         ErrorKind::BrokenPipe,
-                        "runner closed the active control channel",
+                        "runner closed the active broker association",
                     ));
                 }
                 HostActiveStatus::Failed(error) => return Err(copy_io_error(error)),
@@ -992,7 +992,7 @@ fn monitor_socket(stream: &mut UnixStream, peer: &'static str) -> Error {
             Ok(0) => {
                 return Error::new(
                     ErrorKind::UnexpectedEof,
-                    format!("{peer} closed the active control channel"),
+                    format!("{peer} closed the active broker association"),
                 );
             }
             Ok(_) => {
@@ -1183,9 +1183,9 @@ mod control_ring_tests {
         )
     }
 
-    fn negotiated_local(stream: UnixStream) -> UnixStreamLocalControlChannel {
-        UnixStreamLocalControlChannel {
-            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+    fn negotiated_local(stream: UnixStream) -> UnixControlRingLocalControlChannel {
+        UnixControlRingLocalControlChannel {
+            state: LocalControlState::Setup(LocalSetupState {
                 stream,
                 setup_deadline: Some(Instant::now() + Duration::from_secs(2)),
                 negotiated: true,
@@ -1196,7 +1196,7 @@ mod control_ring_tests {
     fn activate_local(
         association_failure: impl Fn() + Send + Sync + 'static,
     ) -> (
-        UnixStreamLocalControlChannel,
+        UnixControlRingLocalControlChannel,
         UnixControlRingLocalCancellation,
         Producer,
         Consumer,
@@ -1232,7 +1232,7 @@ mod control_ring_tests {
         )
     }
 
-    fn split_host() -> (
+    fn activate_host() -> (
         UnixControlRingHostRequestSource,
         UnixControlRingHostResponseSink,
         UnixControlRingHostShutdown,
@@ -1252,7 +1252,7 @@ mod control_ring_tests {
             );
         });
         let (local_ring, host_ring) = ring_pair();
-        let channel = UnixStreamHostControlChannel {
+        let channel = UnixStreamHostSetupChannel {
             stream: host_stream,
             peer_credential: PeerCredential::HostGuaranteed,
             setup_deadline: Some(Instant::now() + Duration::from_secs(2)),
@@ -1276,7 +1276,7 @@ mod control_ring_tests {
     }
 
     fn active_notification_channels() -> (
-        UnixStreamLocalControlChannel,
+        UnixControlRingLocalControlChannel,
         UnixControlRingLocalNotificationChannel,
         UnixControlRingHostNotificationChannel,
         UnixControlRingHostShutdown,
@@ -1284,7 +1284,7 @@ mod control_ring_tests {
         let (local_stream, host_stream) = UnixStream::pair().unwrap();
         let (local_ring, host_ring) = ring_pair();
         let mut local_control = negotiated_local(local_stream);
-        let host_control = UnixStreamHostControlChannel {
+        let host_control = UnixStreamHostSetupChannel {
             stream: host_stream,
             peer_credential: PeerCredential::HostGuaranteed,
             setup_deadline: Some(Instant::now() + Duration::from_secs(2)),
@@ -1427,7 +1427,7 @@ mod control_ring_tests {
     #[test]
     fn local_control_channel_enforces_setup_and_active_phases() {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        let mut channel = UnixControlRingLocalControlChannel::from_connected(local_stream);
         assert_eq!(
             channel.call(request(0)).unwrap_err().kind(),
             ErrorKind::InvalidData
@@ -1504,7 +1504,7 @@ mod control_ring_tests {
         let (local_stream, host_stream) = UnixStream::pair().unwrap();
         let (local_ring, host_ring) = ring_pair();
         let mut local = negotiated_local(local_stream);
-        let host = UnixStreamHostControlChannel {
+        let host = UnixStreamHostSetupChannel {
             stream: host_stream,
             peer_credential: PeerCredential::HostGuaranteed,
             setup_deadline: Some(Instant::now() + Duration::from_secs(2)),
@@ -1633,8 +1633,8 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn host_split_decodes_requests_and_cloned_sinks_publish_complete_responses() {
-        let (mut source, sink, _shutdown, mut requests, mut responses, _peer) = split_host();
+    fn host_activation_decodes_requests_and_cloned_sinks_publish_complete_responses() {
+        let (mut source, sink, _shutdown, mut requests, mut responses, _peer) = activate_host();
         write_payload(&mut requests, &encode_request(request(1)));
         assert!(matches!(
             source.recv_request().unwrap(),
@@ -1658,7 +1658,7 @@ mod control_ring_tests {
 
     #[test]
     fn host_clean_close_wakes_request_wait_as_peer_closed() {
-        let (mut source, _sink, _shutdown, _requests, _responses, peer) = split_host();
+        let (mut source, _sink, _shutdown, _requests, _responses, peer) = activate_host();
         let receiver = thread::spawn(move || source.recv_request());
         drop(peer);
         assert_eq!(receiver.join().unwrap().unwrap(), HostReceive::PeerClosed);
@@ -1666,7 +1666,7 @@ mod control_ring_tests {
 
     #[test]
     fn host_failure_preempts_queued_and_decoded_requests_but_peer_close_drains() {
-        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
+        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = activate_host();
         write_payload(&mut requests, &encode_request(request(1)));
         source
             .active
@@ -1677,7 +1677,7 @@ mod control_ring_tests {
             ErrorKind::TimedOut
         );
 
-        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
+        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = activate_host();
         write_payload(&mut requests, &encode_request(request(2)));
         assert!(matches!(
             source.consumer.try_read(decode_request).unwrap(),
@@ -1696,7 +1696,7 @@ mod control_ring_tests {
             ErrorKind::TimedOut
         );
 
-        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
+        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = activate_host();
         write_payload(&mut requests, &encode_request(request(3)));
         source.active.peer_closed();
         assert!(matches!(
@@ -1711,7 +1711,7 @@ mod control_ring_tests {
 
     #[test]
     fn dropping_host_shutdown_guard_wakes_request_wait_and_closes_socket() {
-        let (mut source, sink, shutdown, _requests, _responses, mut peer) = split_host();
+        let (mut source, sink, shutdown, _requests, _responses, mut peer) = activate_host();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let receiver = thread::spawn(move || source.recv_request());
 
@@ -1728,7 +1728,7 @@ mod control_ring_tests {
 
     #[test]
     fn host_close_wakes_response_producer_blocked_on_full_ring() {
-        let (_source, sink, _shutdown, _requests, _responses, peer) = split_host();
+        let (_source, sink, _shutdown, _requests, _responses, peer) = activate_host();
         for id in 0..CONTROL_RING_SLOT_COUNT {
             sink.send_response(&response(RequestId(id))).unwrap();
         }
@@ -1744,7 +1744,7 @@ mod control_ring_tests {
 
     #[test]
     fn host_reports_wrong_phase_ring_message_as_protocol_violation() {
-        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
+        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = activate_host();
         write_payload(
             &mut requests,
             &encode_handshake_request(BrokerHandshakeRequest {
@@ -1759,7 +1759,7 @@ mod control_ring_tests {
 
     #[test]
     fn malformed_host_ring_request_is_fatal_invalid_data() {
-        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
+        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = activate_host();
         write_payload(&mut requests, &[u8::MAX]);
         assert_eq!(
             source.recv_request().unwrap_err().kind(),
@@ -1770,7 +1770,7 @@ mod control_ring_tests {
     #[test]
     fn host_setup_rejects_active_frames_and_requires_negotiation() {
         let (mut peer_stream, host_stream) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        let mut channel = UnixStreamHostSetupChannel::from_accepted(host_stream);
         write_frame_with_deadline(&mut peer_stream, &encode_request(request(0)), None).unwrap();
         assert_eq!(
             channel.recv_handshake_request().unwrap(),
@@ -1778,7 +1778,7 @@ mod control_ring_tests {
         );
 
         let (_peer_stream, host_stream) = UnixStream::pair().unwrap();
-        let channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        let channel = UnixStreamHostSetupChannel::from_accepted(host_stream);
         let (ring, _) = ring_pair();
         let Err(error) = channel.into_active(ring) else {
             panic!("host control channel activated before negotiation");
@@ -1790,8 +1790,8 @@ mod control_ring_tests {
     fn ready_ack_uses_absolute_setup_deadline() {
         let (local_stream, _peer) = UnixStream::pair().unwrap();
         let (ring, _) = ring_pair();
-        let mut local = UnixStreamLocalControlChannel {
-            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+        let mut local = UnixControlRingLocalControlChannel {
+            state: LocalControlState::Setup(LocalSetupState {
                 stream: local_stream,
                 setup_deadline: Some(Instant::now() + Duration::from_millis(30)),
                 negotiated: true,
@@ -1809,8 +1809,8 @@ mod control_ring_tests {
     #[test]
     fn handshake_reads_use_absolute_setup_deadlines() {
         let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
-        let mut local = UnixStreamLocalControlChannel {
-            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+        let mut local = UnixControlRingLocalControlChannel {
+            state: LocalControlState::Setup(LocalSetupState {
                 stream: local_stream,
                 setup_deadline: Some(Instant::now() + Duration::from_millis(50)),
                 negotiated: false,
@@ -1831,7 +1831,7 @@ mod control_ring_tests {
         );
 
         let (mut local_stream, host_stream) = UnixStream::pair().unwrap();
-        let mut host = UnixStreamHostControlChannel::from_host_guaranteed(
+        let mut host = UnixStreamHostSetupChannel::from_host_guaranteed(
             host_stream,
             Instant::now() + Duration::from_millis(50),
         );
@@ -1928,7 +1928,7 @@ mod control_ring_tests {
             local.recv_notification().unwrap_err().kind(),
             ErrorKind::InvalidData
         );
-        let UnixStreamLocalControlState::Active(active) = &control.state else {
+        let LocalControlState::Active(active) = &control.state else {
             panic!("control channel is not active");
         };
         assert!(active.pending_calls.current_failure().is_some());

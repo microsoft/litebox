@@ -16,8 +16,8 @@ use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::unix_socket::{
-    UnixControlRingLocalCancellation, UnixControlRingLocalNotificationChannel,
-    UnixStreamLocalControlChannel,
+    UnixControlRingLocalCancellation, UnixControlRingLocalControlChannel,
+    UnixControlRingLocalNotificationChannel,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,7 +26,7 @@ const RETRY_DELAY: Duration = Duration::from_millis(20);
 pub(crate) fn connect(
     control_socket_path: &Path,
 ) -> Result<(
-    BrokerLocal<UnixStreamLocalControlChannel>,
+    BrokerLocal<UnixControlRingLocalControlChannel>,
     BrokerNotifications<UnixControlRingLocalNotificationChannel>,
     Arc<BrokerAssociationFailureCoordinator>,
 )> {
@@ -35,7 +35,9 @@ pub(crate) fn connect(
         control_socket_path,
         setup_deadline,
         "timed out connecting to broker",
-        |path, deadline| UnixStreamLocalControlChannel::connect_with_setup_deadline(path, deadline),
+        |path, deadline| {
+            UnixControlRingLocalControlChannel::connect_with_setup_deadline(path, deadline)
+        },
     )
     .with_context(|| {
         format!(
@@ -213,7 +215,7 @@ mod tests {
         UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
         UnixControlRingHostResponseSink, UnixControlRingHostShutdown,
         UnixControlRingLocalCancellation, UnixControlRingLocalNotificationChannel,
-        UnixStreamHostControlChannel,
+        UnixStreamHostSetupChannel,
     };
     use std::io::ErrorKind;
     use std::os::fd::AsFd;
@@ -223,9 +225,12 @@ mod tests {
     fn negotiate_control_pair(
         local_stream: UnixStream,
         host_stream: UnixStream,
-    ) -> (UnixStreamLocalControlChannel, UnixStreamHostControlChannel) {
-        let mut local = UnixStreamLocalControlChannel::from_connected(local_stream);
-        let mut host = UnixStreamHostControlChannel::from_accepted(host_stream);
+    ) -> (
+        UnixControlRingLocalControlChannel,
+        UnixStreamHostSetupChannel,
+    ) {
+        let mut local = UnixControlRingLocalControlChannel::from_connected(local_stream);
+        let mut host = UnixStreamHostSetupChannel::from_accepted(host_stream);
         let request = litebox_broker_protocol::message::BrokerHandshakeRequest {
             protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
         };
@@ -248,8 +253,8 @@ mod tests {
     }
 
     fn activate_control_channel(
-        channel: &mut UnixStreamLocalControlChannel,
-        host_channel: UnixStreamHostControlChannel,
+        channel: &mut UnixControlRingLocalControlChannel,
+        host_channel: UnixStreamHostSetupChannel,
         association_coordinator: &Arc<BrokerAssociationFailureCoordinator>,
     ) -> (
         UnixControlRingLocalCancellation,

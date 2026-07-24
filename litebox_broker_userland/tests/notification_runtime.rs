@@ -17,7 +17,7 @@ use litebox_broker_protocol::shared_memory::{
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixStreamHostControlChannel, UnixStreamLocalControlChannel,
+    UnixControlRingLocalControlChannel, UnixStreamHostSetupChannel,
 };
 
 #[test]
@@ -39,7 +39,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let host_notification = notification.clone();
 
     let host_thread = std::thread::spawn(move || {
-        let mut control = UnixStreamHostControlChannel::from_accepted(host_control);
+        let mut control = UnixStreamHostSetupChannel::from_accepted(host_control);
         let association =
             setup_connection(&broker, &mut control, &host_shared_buffers, |channel| {
                 channel.send_memfd(host_shared_buffers.memory(), None)?;
@@ -65,7 +65,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
 
     let mut notification_channel = None;
     let local = BrokerLocal::negotiate(
-        UnixStreamLocalControlChannel::from_connected(local_control),
+        UnixControlRingLocalControlChannel::from_connected(local_control),
         |channel| {
             let shared_memory = channel.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
             let control_memory = channel.receive_memfd(CONTROL_RING_MEMORY_SIZE, None)?;

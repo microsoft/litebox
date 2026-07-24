@@ -14,7 +14,7 @@ use litebox_broker_protocol::shared_memory::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
-use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
+use litebox_broker_transport::unix_socket::UnixControlRingLocalControlChannel;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 
@@ -172,10 +172,11 @@ impl Drop for ChildGuard {
     }
 }
 
-fn connect_control_with_retry(socket_path: &Path) -> Result<UnixStreamLocalControlChannel> {
+fn connect_control_with_retry(socket_path: &Path) -> Result<UnixControlRingLocalControlChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixStreamLocalControlChannel::connect_with_setup_deadline(socket_path, deadline) {
+        match UnixControlRingLocalControlChannel::connect_with_setup_deadline(socket_path, deadline)
+        {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != ErrorKind::NotFound
