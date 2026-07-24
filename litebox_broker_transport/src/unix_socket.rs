@@ -19,8 +19,8 @@ use std::time::Instant;
 use std::{collections::HashMap, thread};
 
 use crate::control_ring::{
-    ControlRing, ControlRingConsumer, ControlRingReadError, ControlRingReadStatus,
-    ControlRingWakeHandle, ControlRingWriteStatus,
+    ControlRing, ControlRingConsumer, ControlRingError, ControlRingReadError,
+    ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
 };
 use crate::shared_memory::MemfdSharedMemory;
 use crate::unix_io::{
@@ -513,10 +513,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
                 if let Some(error) = active.failure_coordinator.pending_calls.current_failure() {
                     break Err(copy_io_error(&error));
                 }
-                match producer
-                    .try_write(&request_frame)
-                    .map_err(control_ring_error)
-                {
+                match producer.try_write(&request_frame).map_err(Error::from) {
                     Ok(ControlRingWriteStatus::Written) => {
                         if let Err(error) = producer.wake_consumer() {
                             break Err(error);
@@ -578,7 +575,7 @@ impl UnixStreamHostRequestSource {
                     if let Err(error) = self
                         .consumer
                         .publish_head()
-                        .map_err(control_ring_error)
+                        .map_err(Error::from)
                         .and_then(|()| self.consumer.wake_producer())
                     {
                         let result = Err(copy_io_error(&error));
@@ -607,7 +604,7 @@ impl UnixStreamHostRequestSource {
                     return result;
                 }
                 Err(ControlRingReadError::Ring(error)) => {
-                    let error = control_ring_error(error);
+                    let error = Error::from(error);
                     let result = Err(copy_io_error(&error));
                     let _ = self.active.fail(error);
                     return result;
@@ -627,7 +624,7 @@ impl UnixStreamHostResponseSink {
             .map_err(|_| Error::other("broker response writer mutex poisoned"))?;
         loop {
             self.active.ensure_response_path_live()?;
-            match producer.try_write(&frame).map_err(control_ring_error) {
+            match producer.try_write(&frame).map_err(Error::from) {
                 Ok(ControlRingWriteStatus::Written) => {
                     if let Err(error) = producer.wake_consumer() {
                         let result = Err(copy_io_error(&error));
@@ -941,7 +938,7 @@ fn dispatch_responses(
             Ok(ControlRingReadStatus::Message(response)) => {
                 if let Err(error) = consumer
                     .publish_head()
-                    .map_err(control_ring_error)
+                    .map_err(Error::from)
                     .and_then(|()| consumer.wake_producer())
                     .and_then(|()| failure_coordinator.pending_calls.complete(response))
                 {
@@ -963,7 +960,7 @@ fn dispatch_responses(
                 }
             }
             Err(ControlRingReadError::Ring(error)) => {
-                let _ = failure_coordinator.fail(control_ring_error(error));
+                let _ = failure_coordinator.fail(Error::from(error));
                 return;
             }
             Err(ControlRingReadError::Decode(error)) => {
@@ -1067,11 +1064,13 @@ fn wire_error(error: WireError) -> Error {
     )
 }
 
-fn control_ring_error(error: crate::control_ring::ControlRingError) -> Error {
-    Error::new(
-        ErrorKind::InvalidData,
-        format!("invalid broker control ring: {error:?}"),
-    )
+impl From<ControlRingError> for Error {
+    fn from(error: ControlRingError) -> Self {
+        Self::new(
+            ErrorKind::InvalidData,
+            format!("invalid broker control ring: {error:?}"),
+        )
+    }
 }
 
 #[cfg(test)]
