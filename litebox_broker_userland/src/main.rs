@@ -25,8 +25,8 @@ use litebox_broker_protocol::shared_memory::{
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixStreamHostControlChannel, UnixStreamHostControlShutdown, UnixStreamHostRequestSource,
-    UnixStreamHostResponseSink, validate_peer_process,
+    UnixControlRingHostRequestSource, UnixControlRingHostResponseSink,
+    UnixStreamHostControlChannel, UnixStreamHostControlShutdown, validate_peer_process,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -136,8 +136,8 @@ fn serve_runner(
 
 fn dispatch_requests<Memory: SharedMemory>(
     association: BrokerHostAssociation<'_, Memory>,
-    mut request_source: UnixStreamHostRequestSource,
-    response_sink: UnixStreamHostResponseSink,
+    mut request_source: UnixControlRingHostRequestSource,
+    response_sink: UnixControlRingHostResponseSink,
     shutdown: UnixStreamHostControlShutdown,
 ) -> IoResult<()> {
     let association = Arc::new(association);
@@ -185,7 +185,7 @@ fn dispatch_requests<Memory: SharedMemory>(
 }
 
 fn read_requests(
-    request_source: &mut UnixStreamHostRequestSource,
+    request_source: &mut UnixControlRingHostRequestSource,
     request_sender: SyncSender<BrokerRequest>,
     failure_coordinator: &HostAssociationFailureCoordinator,
 ) {
@@ -222,7 +222,7 @@ fn read_requests(
 fn run_worker<Memory: SharedMemory>(
     association: &BrokerHostAssociation<'_, Memory>,
     request_receiver: &Mutex<Receiver<BrokerRequest>>,
-    response_sink: &UnixStreamHostResponseSink,
+    response_sink: &UnixControlRingHostResponseSink,
     failure_coordinator: &HostAssociationFailureCoordinator,
 ) {
     loop {

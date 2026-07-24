@@ -210,9 +210,9 @@ mod tests {
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_transport::shared_memory::MemfdSharedMemory;
     use litebox_broker_transport::unix_socket::{
-        UnixControlRingHostNotificationChannel, UnixControlRingLocalNotificationChannel,
-        UnixStreamHostControlChannel, UnixStreamHostControlShutdown, UnixStreamHostRequestSource,
-        UnixStreamHostResponseSink,
+        UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
+        UnixControlRingHostResponseSink, UnixControlRingLocalNotificationChannel,
+        UnixStreamHostControlChannel, UnixStreamHostControlShutdown,
     };
     use std::io::ErrorKind;
     use std::os::fd::AsFd;
@@ -253,8 +253,8 @@ mod tests {
     ) -> (
         UnixStreamLocalControlCancellation,
         UnixControlRingLocalNotificationChannel,
-        UnixStreamHostRequestSource,
-        UnixStreamHostResponseSink,
+        UnixControlRingHostRequestSource,
+        UnixControlRingHostResponseSink,
         UnixControlRingHostNotificationChannel,
         UnixStreamHostControlShutdown,
     ) {
