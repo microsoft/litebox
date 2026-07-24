@@ -1967,6 +1967,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(()) => return ContinueOperation::Resume,
                 Err(status) => (status, ContinueOperation::Resume),
             },
+            SyscallRequest::NtTraceEvent {
+                trace_handle,
+                flags,
+                field_size,
+                fields,
+            } => {
+                let status = self.sys_nt_trace_event(trace_handle, flags, field_size, fields);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,

@@ -19,6 +19,7 @@ pub(crate) mod sysinfo;
 pub(crate) mod thread;
 pub(crate) mod timer;
 pub(crate) mod token;
+pub(crate) mod trace;
 pub(crate) mod wait_completion_packet;
 pub(crate) mod wnf;
 pub(crate) mod worker_factory;
@@ -550,6 +551,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         source: Platform::RawConstPointer<u64>,
         destination: Platform::RawMutPointer<u64>,
         conversion_error: Option<Platform::RawMutPointer<u64>>,
+    },
+    NtTraceEvent {
+        trace_handle: Handle,
+        flags: u32,
+        field_size: u32,
+        fields: Platform::RawConstPointer<trace::EventHeader>,
     },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
@@ -1097,6 +1104,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     conversion_error:*,
                 }),
             ),
+            NtSysno::NtTraceEvent => Some(sys_req!(NtTraceEvent {
+                trace_handle: { Handle::from_raw },
+                flags,
+                field_size,
+                fields:*,
+            })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },
                 base_address:*,

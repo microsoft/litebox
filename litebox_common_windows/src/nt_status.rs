@@ -215,6 +215,7 @@ impl NtStatus {
             0xC0000285 => "STATUS_ILLEGAL_ELEMENT_ADDRESS: Illegal element address",
             0xC0000286 => "STATUS_MAGAZINE_NOT_PRESENT: Magazine not present",
             0xC0000287 => "STATUS_REINITIALIZATION_NEEDED: Reinitialization needed",
+            0xC0000302 => "STATUS_WMI_ALREADY_DISABLED: WMI collection or events already disabled",
             _ => "STATUS_UNKNOWN: Unknown status code",
         }
     }
@@ -615,6 +616,9 @@ impl NtStatus {
 
     /// STATUS_REINITIALIZATION_NEEDED
     pub const REINITIALIZATION_NEEDED: Self = Self::from_raw(0xC0000287);
+
+    /// STATUS_WMI_ALREADY_DISABLED
+    pub const WMI_ALREADY_DISABLED: Self = Self::from_raw(0xC0000302);
 }
 
 impl From<i32> for NtStatus {
