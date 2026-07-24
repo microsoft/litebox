@@ -19,27 +19,38 @@ pub const CONTROL_RING_SLOT_SIZE: usize = 128;
 /// Size of the fixed metadata at the start of a control-ring slot.
 pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;
 
-/// Maximum encoded request or response size in one control-ring slot.
+/// Maximum encoded control message size in one ring slot.
 pub const CONTROL_RING_PAYLOAD_CAPACITY: usize =
     CONTROL_RING_SLOT_SIZE - CONTROL_RING_SLOT_HEADER_SIZE;
 
 const _: () = assert!(
     CONTROL_RING_PAYLOAD_CAPACITY >= litebox_broker_protocol::wire::MAX_ENCODED_ACTIVE_MESSAGE_SIZE
 );
+const _: () = assert!(
+    CONTROL_RING_PAYLOAD_CAPACITY >= litebox_broker_protocol::wire::MAX_ENCODED_NOTIFICATION_SIZE
+);
 const _: () = assert!(CONTROL_RING_SLOT_SIZE.is_multiple_of(size_of::<u64>()));
 
-/// Number of slots in each direction of the shared control ring.
+/// Number of slots in each request or response direction.
 pub const CONTROL_RING_SLOT_COUNT: u64 = 64;
 
-/// Exact shared-memory size required for both control-ring directions.
+/// Number of slots in the broker-to-local notification direction.
+pub const CONTROL_RING_NOTIFICATION_SLOT_COUNT: u64 = 256;
+
+/// Exact shared-memory size required for all association control directions.
 pub const CONTROL_RING_MEMORY_SIZE: usize =
-    CONTROL_RING_DATA_SIZE + CONTROL_RING_SYNC_DIRECTION_SIZE * 2;
+    CONTROL_RING_DATA_SIZE + CONTROL_RING_SYNC_DIRECTION_SIZE * 3;
 
 // The fixed count is representable by `usize` on every supported target.
 #[allow(clippy::cast_possible_truncation)]
 const CONTROL_RING_DIRECTION_SIZE: usize =
     CONTROL_RING_SLOT_SIZE * CONTROL_RING_SLOT_COUNT as usize;
-const CONTROL_RING_DATA_SIZE: usize = CONTROL_RING_DIRECTION_SIZE * 2;
+// The fixed count is representable by `usize` on every supported target.
+#[allow(clippy::cast_possible_truncation)]
+const CONTROL_RING_NOTIFICATION_DIRECTION_SIZE: usize =
+    CONTROL_RING_SLOT_SIZE * CONTROL_RING_NOTIFICATION_SLOT_COUNT as usize;
+const CONTROL_RING_DATA_SIZE: usize =
+    CONTROL_RING_DIRECTION_SIZE * 2 + CONTROL_RING_NOTIFICATION_DIRECTION_SIZE;
 const CONTROL_RING_SYNC_DIRECTION_SIZE: usize = 16;
 const PRODUCER_EPOCH_OFFSET: usize = 0;
 const CONSUMER_EPOCH_OFFSET: usize = 4;
@@ -52,18 +63,24 @@ pub enum ControlRingDirection {
     Requests,
     /// Broker-to-local response ring.
     Responses,
+    /// Broker-to-local asynchronous notification ring.
+    Notifications,
 }
 
 impl ControlRingDirection {
     fn slot_range(self, slot: u64) -> Range<usize> {
-        debug_assert!(slot < CONTROL_RING_SLOT_COUNT);
+        debug_assert!(slot < self.slot_count());
         let slot = usize::try_from(slot).expect("control-ring slot index is bounded");
-        let direction_offset = match self {
-            Self::Requests => 0,
-            Self::Responses => CONTROL_RING_DIRECTION_SIZE,
-        };
-        let start = direction_offset + slot * CONTROL_RING_SLOT_SIZE;
+        let start = self.data_offset() + slot * CONTROL_RING_SLOT_SIZE;
         start..start + CONTROL_RING_SLOT_SIZE
+    }
+
+    /// Returns the number of slots in this direction.
+    pub const fn slot_count(self) -> u64 {
+        match self {
+            Self::Requests | Self::Responses => CONTROL_RING_SLOT_COUNT,
+            Self::Notifications => CONTROL_RING_NOTIFICATION_SLOT_COUNT,
+        }
     }
 
     /// Returns the atomic `u32` epoch incremented when the producer publishes
@@ -88,7 +105,16 @@ impl ControlRingDirection {
             + match self {
                 Self::Requests => 0,
                 Self::Responses => CONTROL_RING_SYNC_DIRECTION_SIZE,
+                Self::Notifications => CONTROL_RING_SYNC_DIRECTION_SIZE * 2,
             }
+    }
+
+    const fn data_offset(self) -> usize {
+        match self {
+            Self::Requests => 0,
+            Self::Responses => CONTROL_RING_DIRECTION_SIZE,
+            Self::Notifications => CONTROL_RING_DIRECTION_SIZE * 2,
+        }
     }
 }
 
@@ -186,9 +212,29 @@ pub enum ControlRingReadError<DecodeError> {
     Decode(DecodeError),
 }
 
-/// Exact-size shared memory containing request and response control rings.
+/// Exact-size shared memory containing request, response, and notification rings.
 pub struct ControlRing<Memory: AtomicSharedMemory> {
     memory: Memory,
+}
+
+/// Role-bound association ring endpoints owned by the local peer.
+pub struct LocalControlRingEndpoints<Memory: AtomicSharedMemory> {
+    /// Local-to-broker request producer.
+    pub request_producer: ControlRingProducer<Memory>,
+    /// Broker-to-local response consumer.
+    pub response_consumer: ControlRingConsumer<Memory>,
+    /// Broker-to-local notification consumer.
+    pub notification_consumer: ControlRingConsumer<Memory>,
+}
+
+/// Role-bound association ring endpoints owned by the broker peer.
+pub struct BrokerControlRingEndpoints<Memory: AtomicSharedMemory> {
+    /// Local-to-broker request consumer.
+    pub request_consumer: ControlRingConsumer<Memory>,
+    /// Broker-to-local response producer.
+    pub response_producer: ControlRingProducer<Memory>,
+    /// Broker-to-local notification producer.
+    pub notification_producer: ControlRingProducer<Memory>,
 }
 
 impl<Memory: AtomicSharedMemory> ControlRing<Memory> {
@@ -209,24 +255,45 @@ impl<Memory: AtomicSharedMemory> ControlRing<Memory> {
         &self.memory
     }
 
-    /// Consumes the mapping into the local request producer and response
-    /// consumer.
-    pub fn into_local(self) -> (ControlRingProducer<Memory>, ControlRingConsumer<Memory>) {
-        self.into_endpoints(
-            ControlRingDirection::Requests,
-            ControlRingDirection::Responses,
-        )
+    /// Consumes the mapping into endpoints owned by the local peer.
+    pub fn into_local(self) -> LocalControlRingEndpoints<Memory> {
+        let ring = Arc::new(self);
+        LocalControlRingEndpoints {
+            request_producer: ControlRingProducer::new(
+                Arc::clone(&ring),
+                ControlRingDirection::Requests,
+            ),
+            response_consumer: ControlRingConsumer::new(
+                Arc::clone(&ring),
+                ControlRingDirection::Responses,
+            ),
+            notification_consumer: ControlRingConsumer::new(
+                ring,
+                ControlRingDirection::Notifications,
+            ),
+        }
     }
 
-    /// Consumes the mapping into the broker response producer and request
-    /// consumer.
-    pub fn into_broker(self) -> (ControlRingProducer<Memory>, ControlRingConsumer<Memory>) {
-        self.into_endpoints(
-            ControlRingDirection::Responses,
-            ControlRingDirection::Requests,
-        )
+    /// Consumes the mapping into endpoints owned by the broker peer.
+    pub fn into_broker(self) -> BrokerControlRingEndpoints<Memory> {
+        let ring = Arc::new(self);
+        BrokerControlRingEndpoints {
+            request_consumer: ControlRingConsumer::new(
+                Arc::clone(&ring),
+                ControlRingDirection::Requests,
+            ),
+            response_producer: ControlRingProducer::new(
+                Arc::clone(&ring),
+                ControlRingDirection::Responses,
+            ),
+            notification_producer: ControlRingProducer::new(
+                ring,
+                ControlRingDirection::Notifications,
+            ),
+        }
     }
 
+    #[cfg(test)]
     fn into_endpoints(
         self,
         producer_direction: ControlRingDirection,
@@ -247,7 +314,7 @@ impl<Memory: AtomicSharedMemory> ControlRing<Memory> {
         payload: &[u8],
         sequence: u64,
     ) -> Result<(), ControlRingError> {
-        let slot = position % CONTROL_RING_SLOT_COUNT;
+        let slot = position % direction.slot_count();
         let range = direction.slot_range(slot);
         self.memory
             .write(range.start + CONTROL_RING_SLOT_HEADER_SIZE, payload)?;
@@ -267,7 +334,7 @@ impl<Memory: AtomicSharedMemory> ControlRing<Memory> {
         direction: ControlRingDirection,
         position: u64,
     ) -> Result<u64, ControlRingError> {
-        let slot = position % CONTROL_RING_SLOT_COUNT;
+        let slot = position % direction.slot_count();
         let range = direction.slot_range(slot);
         Ok(u64::from_le(self.memory.load_u64_acquire(range.start)?))
     }
@@ -278,7 +345,7 @@ impl<Memory: AtomicSharedMemory> ControlRing<Memory> {
         position: u64,
         body: &mut [u8],
     ) -> Result<(), ControlRingError> {
-        let slot = position % CONTROL_RING_SLOT_COUNT;
+        let slot = position % direction.slot_count();
         let range = direction.slot_range(slot);
         self.memory.read(range.start + size_of::<u64>(), body)?;
         Ok(())
@@ -429,10 +496,11 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
         if self.tail == u64::MAX {
             return Err(ControlRingError::CounterExhausted);
         }
-        if self.tail - self.acknowledged_head == CONTROL_RING_SLOT_COUNT {
+        let slot_count = self.direction.slot_count();
+        if self.tail - self.acknowledged_head == slot_count {
             let wait_epoch = self.ring.load_consumer_epoch(self.direction)?;
             self.refresh_head()?;
-            if self.tail - self.acknowledged_head == CONTROL_RING_SLOT_COUNT {
+            if self.tail - self.acknowledged_head == slot_count {
                 return Ok(ControlRingWriteStatus::Full { wait_epoch });
             }
         }
@@ -522,7 +590,7 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
             .ring
             .load_sequence(self.direction, self.head)
             .map_err(ControlRingReadError::Ring)?;
-        let stale_sequence = expected_sequence.saturating_sub(CONTROL_RING_SLOT_COUNT);
+        let stale_sequence = expected_sequence.saturating_sub(self.direction.slot_count());
         if actual_sequence == stale_sequence {
             return Ok(ControlRingReadStatus::Empty { wait_epoch });
         }
@@ -595,6 +663,7 @@ mod tests {
 
     #[test]
     fn mapping_requires_the_exact_control_ring_size() {
+        assert_eq!(CONTROL_RING_MEMORY_SIZE, 49_200);
         assert!(matches!(
             ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE - 1)),
             Err(ControlRingError::MemoryLengthMismatch {
@@ -613,20 +682,99 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_roles_bind_opposite_directions_to_one_mapping() {
-        let (local_producer, local_consumer) = test_ring().into_local();
-        assert_eq!(local_producer.direction(), ControlRingDirection::Requests);
-        assert_eq!(local_consumer.direction(), ControlRingDirection::Responses);
-        assert!(Arc::ptr_eq(&local_producer.ring, &local_consumer.ring));
+    fn directions_occupy_disjoint_data_and_sync_ranges() {
+        let directions = [
+            ControlRingDirection::Requests,
+            ControlRingDirection::Responses,
+            ControlRingDirection::Notifications,
+        ];
+        let mut next_data_offset = 0;
+        for direction in directions {
+            let first = direction.slot_range(0);
+            let last = direction.slot_range(direction.slot_count() - 1);
+            assert_eq!(first.start, next_data_offset);
+            assert_eq!(
+                last.end - first.start,
+                usize::try_from(direction.slot_count()).unwrap() * CONTROL_RING_SLOT_SIZE
+            );
+            next_data_offset = last.end;
+        }
+        assert_eq!(next_data_offset, CONTROL_RING_DATA_SIZE);
 
-        let (broker_producer, broker_consumer) = test_ring().into_broker();
-        assert_eq!(broker_producer.direction(), ControlRingDirection::Responses);
-        assert_eq!(broker_consumer.direction(), ControlRingDirection::Requests);
-        assert!(Arc::ptr_eq(&broker_producer.ring, &broker_consumer.ring));
+        for (index, direction) in directions.into_iter().enumerate() {
+            assert_eq!(
+                direction.producer_epoch_offset(),
+                CONTROL_RING_DATA_SIZE + index * CONTROL_RING_SYNC_DIRECTION_SIZE
+            );
+            assert_eq!(
+                direction.consumer_epoch_offset(),
+                direction.producer_epoch_offset() + size_of::<u32>()
+            );
+            assert_eq!(
+                direction.consumer_head_offset(),
+                direction.producer_epoch_offset() + size_of::<u64>()
+            );
+            assert!(
+                direction
+                    .consumer_head_offset()
+                    .is_multiple_of(align_of::<u64>())
+            );
+        }
+        assert_eq!(
+            ControlRingDirection::Notifications.consumer_head_offset() + size_of::<u64>(),
+            CONTROL_RING_MEMORY_SIZE
+        );
     }
 
     #[test]
-    fn request_and_response_rings_publish_independently() {
+    fn endpoint_roles_bind_opposite_directions_to_one_mapping() {
+        let local = test_ring().into_local();
+        assert_eq!(
+            local.request_producer.direction(),
+            ControlRingDirection::Requests
+        );
+        assert_eq!(
+            local.response_consumer.direction(),
+            ControlRingDirection::Responses
+        );
+        assert_eq!(
+            local.notification_consumer.direction(),
+            ControlRingDirection::Notifications
+        );
+        assert!(Arc::ptr_eq(
+            &local.request_producer.ring,
+            &local.response_consumer.ring
+        ));
+        assert!(Arc::ptr_eq(
+            &local.request_producer.ring,
+            &local.notification_consumer.ring
+        ));
+
+        let broker = test_ring().into_broker();
+        assert_eq!(
+            broker.request_consumer.direction(),
+            ControlRingDirection::Requests
+        );
+        assert_eq!(
+            broker.response_producer.direction(),
+            ControlRingDirection::Responses
+        );
+        assert_eq!(
+            broker.notification_producer.direction(),
+            ControlRingDirection::Notifications
+        );
+        assert!(Arc::ptr_eq(
+            &broker.request_consumer.ring,
+            &broker.response_producer.ring
+        ));
+        assert!(Arc::ptr_eq(
+            &broker.request_consumer.ring,
+            &broker.notification_producer.ring
+        ));
+    }
+
+    #[test]
+    fn request_response_and_notification_rings_publish_independently() {
         let ring = Arc::new(test_ring());
         let mut request_producer =
             ControlRingProducer::new(Arc::clone(&ring), ControlRingDirection::Requests);
@@ -634,7 +782,12 @@ mod tests {
             ControlRingConsumer::new(Arc::clone(&ring), ControlRingDirection::Requests);
         let mut response_producer =
             ControlRingProducer::new(Arc::clone(&ring), ControlRingDirection::Responses);
-        let mut response_consumer = ControlRingConsumer::new(ring, ControlRingDirection::Responses);
+        let mut response_consumer =
+            ControlRingConsumer::new(Arc::clone(&ring), ControlRingDirection::Responses);
+        let mut notification_producer =
+            ControlRingProducer::new(Arc::clone(&ring), ControlRingDirection::Notifications);
+        let mut notification_consumer =
+            ControlRingConsumer::new(ring, ControlRingDirection::Notifications);
 
         assert_eq!(
             request_producer.try_write(&[1, 2, 3]),
@@ -642,6 +795,10 @@ mod tests {
         );
         assert_eq!(
             response_producer.try_write(&[4, 5]),
+            Ok(ControlRingWriteStatus::Written)
+        );
+        assert_eq!(
+            notification_producer.try_write(&[6]),
             Ok(ControlRingWriteStatus::Written)
         );
 
@@ -654,11 +811,19 @@ mod tests {
             Ok(ControlRingReadStatus::Message(vec![4, 5]))
         );
         assert_eq!(
+            notification_consumer.try_read(owned_bytes),
+            Ok(ControlRingReadStatus::Message(vec![6]))
+        );
+        assert_eq!(
             request_consumer.try_read(owned_bytes),
             Ok(ControlRingReadStatus::Empty { wait_epoch: 1 })
         );
         assert_eq!(
             response_consumer.try_read(owned_bytes),
+            Ok(ControlRingReadStatus::Empty { wait_epoch: 1 })
+        );
+        assert_eq!(
+            notification_consumer.try_read(owned_bytes),
             Ok(ControlRingReadStatus::Empty { wait_epoch: 1 })
         );
     }
@@ -685,6 +850,42 @@ mod tests {
                 CONTROL_RING_PAYLOAD_CAPACITY
             ))
         );
+    }
+
+    #[test]
+    fn each_direction_enforces_its_own_capacity() {
+        for direction in [
+            ControlRingDirection::Requests,
+            ControlRingDirection::Responses,
+            ControlRingDirection::Notifications,
+        ] {
+            let (mut producer, mut consumer) = test_endpoints_for(direction);
+            for value in 0..direction.slot_count() {
+                assert_eq!(
+                    producer.try_write(&[u8::try_from(value % 256).unwrap()]),
+                    Ok(ControlRingWriteStatus::Written)
+                );
+            }
+            assert_eq!(
+                producer.try_write(&[0xff]),
+                Ok(ControlRingWriteStatus::Full { wait_epoch: 0 })
+            );
+
+            for value in 0..direction.slot_count() {
+                assert_eq!(
+                    consumer.try_read(owned_bytes),
+                    Ok(ControlRingReadStatus::Message(vec![
+                        u8::try_from(value % 256).unwrap()
+                    ]))
+                );
+            }
+            assert_eq!(
+                consumer.try_read(owned_bytes),
+                Ok(ControlRingReadStatus::Empty {
+                    wait_epoch: u32::try_from(direction.slot_count()).unwrap()
+                })
+            );
+        }
     }
 
     #[test]
@@ -1115,10 +1316,16 @@ mod tests {
         ControlRingProducer<TestMemory>,
         ControlRingConsumer<TestMemory>,
     ) {
-        test_ring().into_endpoints(
-            ControlRingDirection::Requests,
-            ControlRingDirection::Requests,
-        )
+        test_endpoints_for(ControlRingDirection::Requests)
+    }
+
+    fn test_endpoints_for(
+        direction: ControlRingDirection,
+    ) -> (
+        ControlRingProducer<TestMemory>,
+        ControlRingConsumer<TestMemory>,
+    ) {
+        test_ring().into_endpoints(direction, direction)
     }
 
     fn owned_bytes(payload: &[u8]) -> Result<Vec<u8>, ()> {

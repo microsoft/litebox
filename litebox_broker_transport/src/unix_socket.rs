@@ -199,7 +199,11 @@ impl UnixStreamLocalControlChannel {
         }
 
         let shutdown_stream = monitor_stream.try_clone()?;
-        let (request_producer, response_consumer) = ring.into_local();
+        let crate::control_ring::LocalControlRingEndpoints {
+            request_producer,
+            response_consumer,
+            notification_consumer: _,
+        } = ring.into_local();
         let pending_calls = Arc::new(PendingCalls::new());
         let association_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(association_failure);
         let failure_coordinator = Arc::new(LocalActiveFailureCoordinator {
@@ -383,7 +387,11 @@ impl UnixStreamHostControlChannel {
         write_frame_with_deadline(&mut self.stream, CONTROL_RING_READY, self.setup_deadline)?;
 
         let shutdown_stream = self.stream.try_clone()?;
-        let (response_producer, request_consumer) = ring.into_broker();
+        let crate::control_ring::BrokerControlRingEndpoints {
+            request_consumer,
+            response_producer,
+            notification_producer: _,
+        } = ring.into_broker();
         let active = Arc::new(HostActiveState {
             stream: shutdown_stream,
             status: Mutex::new(HostActiveStatus::Live),
@@ -1196,7 +1204,11 @@ mod control_ring_tests {
         let mut channel = negotiated_local(local_stream);
         let cancellation = channel.activate(local_ring, association_failure).unwrap();
         acknowledgement.join().unwrap();
-        let (response_producer, request_consumer) = broker_ring.into_broker();
+        let crate::control_ring::BrokerControlRingEndpoints {
+            request_consumer,
+            response_producer,
+            notification_producer: _,
+        } = broker_ring.into_broker();
         (
             channel,
             cancellation,
@@ -1234,7 +1246,11 @@ mod control_ring_tests {
         };
         let (source, sink, shutdown) = channel.into_active(host_ring).unwrap();
         acknowledgement.join().unwrap();
-        let (request_producer, response_consumer) = local_ring.into_local();
+        let crate::control_ring::LocalControlRingEndpoints {
+            request_producer,
+            response_consumer,
+            notification_consumer: _,
+        } = local_ring.into_local();
         (
             source,
             sink,

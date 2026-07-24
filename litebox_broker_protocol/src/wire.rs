@@ -51,6 +51,9 @@ const NOTIFICATION_TAG_READINESS: u8 = 0;
 /// Maximum byte length of any encoded active request or response.
 pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 26;
 
+/// Maximum byte length of any encoded broker notification.
+pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
+
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -497,13 +500,15 @@ mod tests {
             handle,
             readiness: ReadinessFlags::READ | ReadinessFlags::HANGUP,
         })];
+        let mut maximum_encoded_size = 0;
 
         for notification in notifications {
-            assert_eq!(
-                decode_notification(&encode_notification(notification.clone())).unwrap(),
-                notification
-            );
+            let encoded = encode_notification(notification.clone());
+            maximum_encoded_size = maximum_encoded_size.max(encoded.len());
+            assert!(encoded.len() <= MAX_ENCODED_NOTIFICATION_SIZE);
+            assert_eq!(decode_notification(&encoded).unwrap(), notification);
         }
+        assert_eq!(maximum_encoded_size, MAX_ENCODED_NOTIFICATION_SIZE);
     }
 
     #[test]

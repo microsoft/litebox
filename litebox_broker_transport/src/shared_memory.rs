@@ -665,8 +665,14 @@ mod tests {
             CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
-        let (mut producer, _) = ControlRing::new(local_memory).unwrap().into_local();
-        let (_, mut consumer) = ControlRing::new(broker_memory).unwrap().into_broker();
+        let mut producer = ControlRing::new(local_memory)
+            .unwrap()
+            .into_local()
+            .request_producer;
+        let mut consumer = ControlRing::new(broker_memory)
+            .unwrap()
+            .into_broker()
+            .request_consumer;
         let empty_checked = Arc::new(Barrier::new(2));
         let broker_empty_checked = Arc::clone(&empty_checked);
 
