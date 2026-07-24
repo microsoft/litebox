@@ -950,13 +950,13 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let request_count = Arc::new(AtomicUsize::new(0));
         let force_transport = Arc::new(AtomicBool::new(false));
-        let local = BrokerLocal::negotiate(
+        let (local, ()) = BrokerLocal::negotiate(
             FailingPipeChannel {
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::Transport,
                 force_transport,
             },
-            |channel| Ok((channel, Arc::new(NoopSharedMemory))),
+            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
         )
         .unwrap();
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
@@ -996,13 +996,13 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let request_count = Arc::new(AtomicUsize::new(0));
         let force_transport = Arc::new(AtomicBool::new(false));
-        let local = BrokerLocal::negotiate(
+        let (local, ()) = BrokerLocal::negotiate(
             FailingPipeChannel {
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
             },
-            |channel| Ok((channel, Arc::new(NoopSharedMemory))),
+            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
         )
         .unwrap();
         let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));

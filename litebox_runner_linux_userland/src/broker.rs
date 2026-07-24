@@ -44,8 +44,7 @@ pub(crate) fn connect(
         )
     })?;
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
-    let mut notification_channel = None;
-    let local = BrokerLocal::negotiate(setup_channel, |mut setup| {
+    let (local, notification_channel) = BrokerLocal::negotiate(setup_channel, |mut setup| {
         let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
         let control_memory = setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, Some(setup_deadline))?;
         let control_ring = ControlRing::new(control_memory).map_err(|error| {
@@ -55,19 +54,16 @@ pub(crate) fn connect(
             )
         })?;
         let weak_association_coordinator = Arc::downgrade(&association_coordinator);
-        let (call_channel, active_notification_channel, association_shutdown) =
+        let (call_channel, notification_channel, association_shutdown) =
             setup.into_active(control_ring, move || {
                 if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
                     association_coordinator.report_failure();
                 }
             })?;
         association_coordinator.install_shutdown(association_shutdown)?;
-        notification_channel = Some(active_notification_channel);
-        Ok((call_channel, Arc::new(shared_memory)))
+        Ok((call_channel, Arc::new(shared_memory), notification_channel))
     })
     .context("broker negotiation failed")?;
-    let notification_channel =
-        notification_channel.expect("successful broker activation must return notifications");
     Ok((
         local,
         BrokerNotifications::new(notification_channel),

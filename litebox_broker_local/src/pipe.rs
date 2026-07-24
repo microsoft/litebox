@@ -170,8 +170,8 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 2 })),
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
         ]);
-        let local =
-            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory.clone()))).unwrap();
+        let (local, ()) =
+            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory.clone(), ()))).unwrap();
         let write_buffer = descriptor(2, 3);
         let read_buffer = descriptor(4, 3);
 
@@ -220,7 +220,8 @@ mod tests {
     fn pipe_rejects_oversized_transfers_before_request() {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([]);
-        let local = BrokerLocal::negotiate(channel, |channel| Ok((channel, memory))).unwrap();
+        let (local, ()) =
+            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
         let oversized = descriptor(0, MAX_PIPE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
@@ -246,7 +247,8 @@ mod tests {
                 read: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = BrokerLocal::negotiate(channel, |channel| Ok((channel, memory))).unwrap();
+        let (local, ()) =
+            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
         let mut destination = [0];
 
         let _ = local.read_pipe(ObjectHandle(1), descriptor(0, 1), &mut destination);
@@ -260,7 +262,8 @@ mod tests {
                 written: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = BrokerLocal::negotiate(channel, |channel| Ok((channel, memory))).unwrap();
+        let (local, ()) =
+            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
 
         let _ = local.write_pipe(ObjectHandle(1), descriptor(0, 1), &[0]);
     }

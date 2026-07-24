@@ -63,8 +63,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         }
     });
 
-    let mut notification_channel = None;
-    let local = BrokerLocal::negotiate(
+    let (local, notification_channel) = BrokerLocal::negotiate(
         UnixStreamLocalSetupChannel::from_connected(local_control),
         |mut setup| {
             let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
@@ -77,14 +76,11 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
             })?;
             let (call_channel, notifications, _shutdown) =
                 setup.into_active(control_ring, || {})?;
-            notification_channel = Some(notifications);
-            Ok((call_channel, Arc::new(shared_memory)))
+            Ok((call_channel, Arc::new(shared_memory), notifications))
         },
     )
     .unwrap();
-    let mut notifications = BrokerNotifications::new(
-        notification_channel.expect("activation must return a notification receiver"),
-    );
+    let mut notifications = BrokerNotifications::new(notification_channel);
     assert_eq!(
         notifications.recv_notification().unwrap(),
         Some(notification)

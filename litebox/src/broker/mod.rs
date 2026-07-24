@@ -331,8 +331,8 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let local = BrokerLocal::negotiate(channel, |channel| {
-            Ok((channel, Arc::new(memory) as Arc<dyn SharedMemory>))
+        let (local, ()) = BrokerLocal::negotiate(channel, |channel| {
+            Ok((channel, Arc::new(memory) as Arc<dyn SharedMemory>, ()))
         })
         .unwrap();
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
@@ -376,8 +376,8 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let local = BrokerLocal::negotiate(channel, |channel| {
-            Ok((channel, Arc::new(memory) as Arc<dyn SharedMemory>))
+        let (local, ()) = BrokerLocal::negotiate(channel, |channel| {
+            Ok((channel, Arc::new(memory) as Arc<dyn SharedMemory>, ()))
         })
         .unwrap();
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(

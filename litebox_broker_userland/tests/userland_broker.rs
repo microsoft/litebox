@@ -76,28 +76,26 @@ fn run_fake_runner(args: &[OsString]) {
 
     let control_socket_path = args.get(2).unwrap();
     let setup_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
-    let local = Arc::new(
-        BrokerLocal::negotiate(setup_channel, |mut setup| {
-            let shared_memory = setup.receive_memfd(
-                SHARED_BUFFER_POOL_SIZE,
-                Some(Instant::now() + Duration::from_secs(5)),
-            )?;
-            let control_memory = setup.receive_memfd(
-                CONTROL_RING_MEMORY_SIZE,
-                Some(Instant::now() + Duration::from_secs(5)),
-            )?;
-            let control_ring = ControlRing::new(control_memory).map_err(|error| {
-                std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("invalid test control ring: {error:?}"),
-                )
-            })?;
-            let (call_channel, _notifications, _shutdown) =
-                setup.into_active(control_ring, || {})?;
-            Ok((call_channel, Arc::new(shared_memory)))
-        })
-        .unwrap(),
-    );
+    let (local, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
+        let shared_memory = setup.receive_memfd(
+            SHARED_BUFFER_POOL_SIZE,
+            Some(Instant::now() + Duration::from_secs(5)),
+        )?;
+        let control_memory = setup.receive_memfd(
+            CONTROL_RING_MEMORY_SIZE,
+            Some(Instant::now() + Duration::from_secs(5)),
+        )?;
+        let control_ring = ControlRing::new(control_memory).map_err(|error| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid test control ring: {error:?}"),
+            )
+        })?;
+        let (call_channel, _notifications, _shutdown) = setup.into_active(control_ring, || {})?;
+        Ok((call_channel, Arc::new(shared_memory), ()))
+    })
+    .unwrap();
+    let local = Arc::new(local);
 
     let start = Arc::new(std::sync::Barrier::new(17));
     let callers = (0..16)
