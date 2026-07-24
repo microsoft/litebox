@@ -349,12 +349,12 @@ mod tests {
         let local_ring = ControlRing::new(local_memory).unwrap();
         let host_ring = ControlRing::new(host_memory).unwrap();
         let local_activation = std::thread::spawn(move || {
-            let cancellation = local_channel.activate(local_ring, || {}).unwrap();
-            (local_channel, cancellation)
+            let local_shutdown = local_channel.activate(local_ring, || {}).unwrap();
+            (local_channel, local_shutdown)
         });
         let (mut request_source, _response_sink, _notifications, shutdown) =
             control_channel.into_active(host_ring).unwrap();
-        let (_local_channel, _cancellation) = local_activation.join().unwrap();
+        let (_local_channel, _local_shutdown) = local_activation.join().unwrap();
         let failure_coordinator = HostAssociationFailureCoordinator::new(shutdown);
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
         let reader = std::thread::spawn(move || {

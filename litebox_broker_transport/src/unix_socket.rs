@@ -8,8 +8,8 @@
 //! no_std protocol, local, core, and host crates.
 //!
 //! After setup, the authenticated socket is retained only for liveness and
-//! cancellation. Active requests, responses, and notifications use shared
-//! control rings.
+//! fail-closed shutdown. Active requests, responses, and notifications use
+//! shared control rings.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
 use std::net::Shutdown;
@@ -42,7 +42,7 @@ use litebox_broker_protocol::wire::{
     encode_notification, encode_request, encode_response,
 };
 
-const MAX_FRAME_LEN: usize = 64 * 1024;
+const MAX_SETUP_FRAME_LEN: usize = 64 * 1024;
 const CONTROL_RING_READY: &[u8] = b"litebox-control-ring-ready-v1";
 /// Maximum number of active calls waiting for broker responses.
 pub const MAX_PENDING_CALLS: usize = 64;
@@ -82,7 +82,7 @@ struct LocalSetupState {
 }
 
 /// Independently owned handle for interrupting all local active-ring I/O.
-pub struct UnixControlRingLocalCancellation {
+pub struct UnixControlRingLocalShutdown {
     association: Arc<LocalRingAssociation>,
 }
 
@@ -152,8 +152,8 @@ impl UnixControlRingLocalControlChannel {
         crate::shared_memory::receive_memfd(&mut setup.stream, expected_len, deadline)
     }
 
-    /// Completes setup, starts the response pump, and returns the notification
-    /// receiver for the active shared-ring association.
+    /// Completes setup, starts the response dispatcher, and returns the
+    /// notification receiver for the active shared-ring association.
     ///
     /// The ring must be the validated control-ring memfd received during this
     /// setup exchange.
@@ -162,7 +162,7 @@ impl UnixControlRingLocalControlChannel {
         ring: ControlRing<MemfdSharedMemory>,
         on_failure: impl Fn() + Send + Sync + 'static,
     ) -> IoResult<(
-        UnixControlRingLocalCancellation,
+        UnixControlRingLocalShutdown,
         UnixControlRingLocalNotificationChannel,
     )> {
         let LocalControlState::Setup(setup) = &self.state else {
@@ -179,14 +179,9 @@ impl UnixControlRingLocalControlChannel {
             unreachable!("broker control setup state disappeared");
         };
 
-        let mut monitor_stream = setup.stream;
-        write_frame_with_deadline(
-            &mut monitor_stream,
-            CONTROL_RING_READY,
-            setup.setup_deadline,
-        )?;
-        let Some(ready) = read_frame_with_deadline(&mut monitor_stream, setup.setup_deadline)?
-        else {
+        let mut setup_stream = setup.stream;
+        write_setup_frame(&mut setup_stream, CONTROL_RING_READY, setup.setup_deadline)?;
+        let Some(ready) = read_setup_frame(&mut setup_stream, setup.setup_deadline)? else {
             return Err(Error::new(
                 ErrorKind::UnexpectedEof,
                 "broker closed before control-ring setup acknowledgement",
@@ -198,7 +193,7 @@ impl UnixControlRingLocalControlChannel {
             ));
         }
 
-        let shutdown_stream = monitor_stream.try_clone()?;
+        let shutdown_stream = setup_stream.try_clone()?;
         let crate::control_ring::LocalControlRingEndpoints {
             request_producer,
             response_consumer,
@@ -223,13 +218,13 @@ impl UnixControlRingLocalControlChannel {
             })
         {
             let _ = association.fail(error);
-            return Err(Error::other("failed to start broker response pump"));
+            return Err(Error::other("failed to start broker response dispatcher"));
         }
         let monitor_association = Arc::clone(&association);
         if let Err(error) = thread::Builder::new()
             .name("litebox-broker-liveness".to_owned())
             .spawn(move || {
-                monitor_local_socket(&mut monitor_stream, &monitor_association);
+                monitor_local_socket(&mut setup_stream, &monitor_association);
             })
         {
             let _ = association.fail(error);
@@ -238,7 +233,7 @@ impl UnixControlRingLocalControlChannel {
 
         self.state = LocalControlState::Active(Arc::clone(&association));
         Ok((
-            UnixControlRingLocalCancellation {
+            UnixControlRingLocalShutdown {
                 association: Arc::clone(&association),
             },
             UnixControlRingLocalNotificationChannel {
@@ -249,12 +244,12 @@ impl UnixControlRingLocalControlChannel {
     }
 }
 
-impl UnixControlRingLocalCancellation {
-    /// Cancels the active association, unblocking ring and socket waits.
-    pub fn cancel(&self) -> IoResult<()> {
+impl UnixControlRingLocalShutdown {
+    /// Shuts down the active association, unblocking ring and socket waits.
+    pub fn shutdown(&self) -> IoResult<()> {
         self.association.fail(Error::new(
             ErrorKind::ConnectionAborted,
-            "broker association cancelled",
+            "broker local association shut down",
         ))
     }
 }
@@ -374,7 +369,7 @@ impl UnixStreamHostSetupChannel {
                 "broker host setup channel activated before negotiation completed",
             ));
         }
-        let Some(ready) = read_frame_with_deadline(&mut self.stream, self.setup_deadline)? else {
+        let Some(ready) = read_setup_frame(&mut self.stream, self.setup_deadline)? else {
             return Err(Error::new(
                 ErrorKind::UnexpectedEof,
                 "runner closed before control-ring setup acknowledgement",
@@ -385,7 +380,7 @@ impl UnixStreamHostSetupChannel {
                 "runner sent an invalid control-ring setup acknowledgement",
             ));
         }
-        write_frame_with_deadline(&mut self.stream, CONTROL_RING_READY, self.setup_deadline)?;
+        write_setup_frame(&mut self.stream, CONTROL_RING_READY, self.setup_deadline)?;
 
         let shutdown_stream = self.stream.try_clone()?;
         let crate::control_ring::BrokerControlRingEndpoints {
@@ -449,14 +444,14 @@ impl LocalControlChannel for UnixControlRingLocalControlChannel {
             return Err(invalid_data("broker control channel is already active"));
         };
         let frame = encode_handshake_request(request.clone());
-        write_frame_with_deadline(&mut setup.stream, &frame, setup.setup_deadline)
+        write_setup_frame(&mut setup.stream, &frame, setup.setup_deadline)
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
         let LocalControlState::Setup(setup) = &mut self.state else {
             return Err(invalid_data("broker control channel is already active"));
         };
-        let frame = read_frame_with_deadline(&mut setup.stream, setup.setup_deadline)?;
+        let frame = read_setup_frame(&mut setup.stream, setup.setup_deadline)?;
         match frame {
             Some(frame) => {
                 let response = decode_handshake_response(&frame).map_err(wire_error)?;
@@ -516,7 +511,7 @@ impl HostSetupChannel for UnixStreamHostSetupChannel {
     }
 
     fn recv_handshake_request(&mut self) -> IoResult<HostReceive<BrokerHandshakeRequest>> {
-        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.setup_deadline)? else {
+        let Some(frame) = read_setup_frame(&mut self.stream, self.setup_deadline)? else {
             return Ok(HostReceive::PeerClosed);
         };
         match decode_handshake_request(&frame) {
@@ -527,7 +522,7 @@ impl HostSetupChannel for UnixStreamHostSetupChannel {
     }
 
     fn send_handshake_response(&mut self, response: &BrokerHandshakeResponse) -> IoResult<()> {
-        write_frame_with_deadline(
+        write_setup_frame(
             &mut self.stream,
             &encode_handshake_response(response.clone()),
             self.setup_deadline,
@@ -541,7 +536,7 @@ impl UnixControlRingHostRequestSource {
     /// Receives one active broker request.
     pub fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
         loop {
-            if let Some(error) = self.association.request_failure() {
+            if let Some(error) = self.association.current_failure() {
                 return Err(error);
             }
             match self.consumer.try_read(decode_request) {
@@ -914,7 +909,7 @@ impl HostRingAssociation {
         }
     }
 
-    fn request_failure(&self) -> Option<Error> {
+    fn current_failure(&self) -> Option<Error> {
         match &*self
             .status
             .lock()
@@ -965,7 +960,7 @@ impl HostRingAssociation {
 }
 
 fn monitor_local_socket(stream: &mut UnixStream, association: &LocalRingAssociation) {
-    let error = monitor_socket(stream, "broker");
+    let error = wait_for_socket_termination(stream, "broker");
     let _ = association.fail(error);
 }
 
@@ -992,7 +987,7 @@ fn monitor_host_socket(stream: &mut UnixStream, association: &HostRingAssociatio
     }
 }
 
-fn monitor_socket(stream: &mut UnixStream, peer: &'static str) -> Error {
+fn wait_for_socket_termination(stream: &mut UnixStream, peer: &'static str) -> Error {
     let mut byte = [0];
     loop {
         match stream.read(&mut byte) {
@@ -1056,7 +1051,7 @@ fn copy_io_error(error: &Error) -> Error {
     }
 }
 
-fn read_frame_with_deadline(
+fn read_setup_frame(
     stream: &mut UnixStream,
     deadline: Option<Instant>,
 ) -> IoResult<Option<Vec<u8>>> {
@@ -1067,7 +1062,7 @@ fn read_frame_with_deadline(
             refresh_read_deadline(stream, deadline)?;
             match stream.read(&mut len_buf[read..]) {
                 Ok(0) if read == 0 => return Ok(None),
-                Ok(0) => return Err(invalid_data("truncated broker frame length")),
+                Ok(0) => return Err(invalid_data("truncated broker setup frame length")),
                 Ok(len) => read += len,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
@@ -1075,8 +1070,8 @@ fn read_frame_with_deadline(
         }
 
         let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > MAX_FRAME_LEN {
-            return Err(invalid_data("invalid broker frame length"));
+        if len == 0 || len > MAX_SETUP_FRAME_LEN {
+            return Err(invalid_data("invalid broker setup frame length"));
         }
 
         let mut frame = vec![0; len];
@@ -1084,7 +1079,7 @@ fn read_frame_with_deadline(
         while read < frame.len() {
             refresh_read_deadline(stream, deadline)?;
             match stream.read(&mut frame[read..]) {
-                Ok(0) => return Err(invalid_data("truncated broker frame")),
+                Ok(0) => return Err(invalid_data("truncated broker setup frame")),
                 Ok(len) => read += len,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
@@ -1094,16 +1089,17 @@ fn read_frame_with_deadline(
     })
 }
 
-fn write_frame_with_deadline(
+fn write_setup_frame(
     stream: &mut UnixStream,
     frame: &[u8],
     deadline: Option<Instant>,
 ) -> IoResult<()> {
     with_write_deadline(stream, deadline, |stream, deadline| {
-        if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
-            return Err(invalid_data("invalid broker frame length"));
+        if frame.is_empty() || frame.len() > MAX_SETUP_FRAME_LEN {
+            return Err(invalid_data("invalid broker setup frame length"));
         }
-        let len = u32::try_from(frame.len()).map_err(|_| invalid_data("broker frame too large"))?;
+        let len =
+            u32::try_from(frame.len()).map_err(|_| invalid_data("broker setup frame too large"))?;
         write_all_with_deadline(stream, &len.to_le_bytes(), deadline)?;
         write_all_with_deadline(stream, frame, deadline)
     })
@@ -1120,7 +1116,7 @@ fn write_all_with_deadline(
             Ok(0) => {
                 return Err(Error::new(
                     ErrorKind::WriteZero,
-                    "failed to write broker frame",
+                    "failed to write broker setup frame",
                 ));
             }
             Ok(written) => buffer = &buffer[written..],
@@ -1204,7 +1200,7 @@ mod control_ring_tests {
         on_failure: impl Fn() + Send + Sync + 'static,
     ) -> (
         UnixControlRingLocalControlChannel,
-        UnixControlRingLocalCancellation,
+        UnixControlRingLocalShutdown,
         Producer,
         Consumer,
         UnixStream,
@@ -1213,16 +1209,14 @@ mod control_ring_tests {
         let mut ack_stream = peer_stream.try_clone().unwrap();
         let acknowledgement = thread::spawn(move || {
             assert_eq!(
-                read_frame_with_deadline(&mut ack_stream, None)
-                    .unwrap()
-                    .unwrap(),
+                read_setup_frame(&mut ack_stream, None).unwrap().unwrap(),
                 CONTROL_RING_READY
             );
-            write_frame_with_deadline(&mut ack_stream, CONTROL_RING_READY, None).unwrap();
+            write_setup_frame(&mut ack_stream, CONTROL_RING_READY, None).unwrap();
         });
         let (local_ring, broker_ring) = ring_pair();
         let mut channel = negotiated_local(local_stream);
-        let (cancellation, _notifications) = channel.activate(local_ring, on_failure).unwrap();
+        let (shutdown, _notifications) = channel.activate(local_ring, on_failure).unwrap();
         acknowledgement.join().unwrap();
         let crate::control_ring::BrokerControlRingEndpoints {
             request_consumer,
@@ -1231,7 +1225,7 @@ mod control_ring_tests {
         } = broker_ring.into_broker();
         (
             channel,
-            cancellation,
+            shutdown,
             response_producer,
             request_consumer,
             peer_stream,
@@ -1249,11 +1243,9 @@ mod control_ring_tests {
         let (peer_stream, host_stream) = UnixStream::pair().unwrap();
         let mut ack_stream = peer_stream.try_clone().unwrap();
         let acknowledgement = thread::spawn(move || {
-            write_frame_with_deadline(&mut ack_stream, CONTROL_RING_READY, None).unwrap();
+            write_setup_frame(&mut ack_stream, CONTROL_RING_READY, None).unwrap();
             assert_eq!(
-                read_frame_with_deadline(&mut ack_stream, None)
-                    .unwrap()
-                    .unwrap(),
+                read_setup_frame(&mut ack_stream, None).unwrap().unwrap(),
                 CONTROL_RING_READY
             );
         });
@@ -1281,7 +1273,7 @@ mod control_ring_tests {
         )
     }
 
-    fn active_notification_channels() -> (
+    fn notification_channel_pair() -> (
         UnixControlRingLocalControlChannel,
         UnixControlRingLocalNotificationChannel,
         UnixControlRingHostNotificationChannel,
@@ -1297,8 +1289,7 @@ mod control_ring_tests {
             negotiated: true,
         };
         let host_active = thread::spawn(move || host_control.into_active(host_ring).unwrap());
-        let (_cancellation, local_notifications) =
-            local_control.activate(local_ring, || {}).unwrap();
+        let (_shutdown, local_notifications) = local_control.activate(local_ring, || {}).unwrap();
         let (_source, _sink, host_notifications, shutdown) = host_active.join().unwrap();
         (
             local_control,
@@ -1383,26 +1374,20 @@ mod control_ring_tests {
     #[test]
     fn setup_frames_round_trip_and_reject_invalid_boundaries() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
-        write_frame_with_deadline(&mut writer, &[1, 2, 3], None).unwrap();
+        write_setup_frame(&mut writer, &[1, 2, 3], None).unwrap();
         assert_eq!(
-            read_frame_with_deadline(&mut reader, None)
-                .unwrap()
-                .unwrap(),
+            read_setup_frame(&mut reader, None).unwrap().unwrap(),
             [1, 2, 3]
         );
 
         let (writer, mut reader) = UnixStream::pair().unwrap();
         drop(writer);
-        assert!(
-            read_frame_with_deadline(&mut reader, None)
-                .unwrap()
-                .is_none()
-        );
+        assert!(read_setup_frame(&mut reader, None).unwrap().is_none());
 
         for frame_prefix in [
             vec![1, 0],
             0u32.to_le_bytes().to_vec(),
-            u32::try_from(MAX_FRAME_LEN + 1)
+            u32::try_from(MAX_SETUP_FRAME_LEN + 1)
                 .unwrap()
                 .to_le_bytes()
                 .to_vec(),
@@ -1411,9 +1396,7 @@ mod control_ring_tests {
             writer.write_all(&frame_prefix).unwrap();
             drop(writer);
             assert_eq!(
-                read_frame_with_deadline(&mut reader, None)
-                    .unwrap_err()
-                    .kind(),
+                read_setup_frame(&mut reader, None).unwrap_err().kind(),
                 ErrorKind::InvalidData
             );
         }
@@ -1423,9 +1406,7 @@ mod control_ring_tests {
         writer.write_all(&[1, 2]).unwrap();
         drop(writer);
         assert_eq!(
-            read_frame_with_deadline(&mut reader, None)
-                .unwrap_err()
-                .kind(),
+            read_setup_frame(&mut reader, None).unwrap_err().kind(),
             ErrorKind::InvalidData
         );
     }
@@ -1449,15 +1430,11 @@ mod control_ring_tests {
         };
         channel.send_handshake_request(&handshake_request).unwrap();
         assert_eq!(
-            decode_handshake_request(
-                &read_frame_with_deadline(&mut host_stream, None)
-                    .unwrap()
-                    .unwrap()
-            )
-            .unwrap(),
+            decode_handshake_request(&read_setup_frame(&mut host_stream, None).unwrap().unwrap())
+                .unwrap(),
             handshake_request
         );
-        write_frame_with_deadline(
+        write_setup_frame(
             &mut host_stream,
             &encode_handshake_response(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
@@ -1472,16 +1449,14 @@ mod control_ring_tests {
 
         let acknowledgement = thread::spawn(move || {
             assert_eq!(
-                read_frame_with_deadline(&mut host_stream, None)
-                    .unwrap()
-                    .unwrap(),
+                read_setup_frame(&mut host_stream, None).unwrap().unwrap(),
                 CONTROL_RING_READY
             );
-            write_frame_with_deadline(&mut host_stream, CONTROL_RING_READY, None).unwrap();
+            write_setup_frame(&mut host_stream, CONTROL_RING_READY, None).unwrap();
             host_stream
         });
         let (ring, _) = ring_pair();
-        let _cancellation = channel.activate(ring, || {}).unwrap();
+        let _shutdown = channel.activate(ring, || {}).unwrap();
         let mut host_stream = acknowledgement.join().unwrap();
 
         let (ring, _) = ring_pair();
@@ -1517,7 +1492,7 @@ mod control_ring_tests {
             negotiated: true,
         };
         let host_active = thread::spawn(move || host.into_active(host_ring).unwrap());
-        let (_cancellation, _local_notifications) = local.activate(local_ring, || {}).unwrap();
+        let (_shutdown, _local_notifications) = local.activate(local_ring, || {}).unwrap();
         let (mut source, sink, _host_notifications, _shutdown) = host_active.join().unwrap();
 
         let caller = thread::spawn(move || local.call(request(7)));
@@ -1530,7 +1505,7 @@ mod control_ring_tests {
 
     #[test]
     fn local_matches_out_of_order_ring_responses_without_socket_frames() {
-        let (channel, _cancellation, mut responses, mut requests, mut peer) = activate_local(|| {});
+        let (channel, _shutdown, mut responses, mut requests, mut peer) = activate_local(|| {});
         peer.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let channel = Arc::new(channel);
@@ -1558,7 +1533,7 @@ mod control_ring_tests {
 
     #[test]
     fn pending_capacity_blocks_before_sixty_fifth_publication() {
-        let (channel, cancellation, mut responses, mut requests, _peer) = activate_local(|| {});
+        let (channel, shutdown, mut responses, mut requests, _peer) = activate_local(|| {});
         let channel = Arc::new(channel);
         let start = Arc::new(Barrier::new(MAX_PENDING_CALLS + 2));
         let callers = (0..=MAX_PENDING_CALLS)
@@ -1581,7 +1556,7 @@ mod control_ring_tests {
         let released = read_request(&mut requests).request_id;
         assert!(!published.contains(&released));
 
-        cancellation.cancel().unwrap();
+        shutdown.shutdown().unwrap();
         let completed = callers
             .into_iter()
             .map(|caller| usize::from(caller.join().unwrap().is_ok()))
@@ -1594,7 +1569,7 @@ mod control_ring_tests {
         for payload_kind in 0..3 {
             let failures = Arc::new(AtomicUsize::new(0));
             let callback_failures = Arc::clone(&failures);
-            let (channel, _cancellation, mut responses, mut requests, _peer) =
+            let (channel, _shutdown, mut responses, mut requests, _peer) =
                 activate_local(move || {
                     callback_failures.fetch_add(1, Ordering::SeqCst);
                 });
@@ -1624,15 +1599,15 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn local_socket_eof_and_cancellation_wake_pending_calls() {
+    fn local_socket_eof_and_shutdown_wake_pending_calls() {
         for close_peer in [false, true] {
-            let (channel, cancellation, _responses, mut requests, peer) = activate_local(|| {});
+            let (channel, shutdown, _responses, mut requests, peer) = activate_local(|| {});
             let caller = thread::spawn(move || channel.call(request(1)));
             read_request(&mut requests);
             if close_peer {
                 drop(peer);
             } else {
-                cancellation.cancel().unwrap();
+                shutdown.shutdown().unwrap();
             }
             assert!(caller.join().unwrap().is_err());
         }
@@ -1777,7 +1752,7 @@ mod control_ring_tests {
     fn host_setup_rejects_active_frames_and_requires_negotiation() {
         let (mut peer_stream, host_stream) = UnixStream::pair().unwrap();
         let mut channel = UnixStreamHostSetupChannel::from_accepted(host_stream);
-        write_frame_with_deadline(&mut peer_stream, &encode_request(request(0)), None).unwrap();
+        write_setup_frame(&mut peer_stream, &encode_request(request(0)), None).unwrap();
         assert_eq!(
             channel.recv_handshake_request().unwrap(),
             HostReceive::ProtocolViolation
@@ -1858,7 +1833,7 @@ mod control_ring_tests {
 
     #[test]
     fn notification_ring_round_trips() {
-        let (_control, mut local, mut host, _shutdown) = active_notification_channels();
+        let (_control, mut local, mut host, _shutdown) = notification_channel_pair();
         let notification = BrokerNotification::Readiness(
             litebox_broker_protocol::message::ReadinessNotification {
                 handle: ObjectHandle(7),
@@ -1875,7 +1850,7 @@ mod control_ring_tests {
 
     #[test]
     fn full_notification_ring_wakes_after_consumer_progress() {
-        let (_control, mut local, mut host, _shutdown) = active_notification_channels();
+        let (_control, mut local, mut host, _shutdown) = notification_channel_pair();
         let notification = BrokerNotification::Readiness(
             litebox_broker_protocol::message::ReadinessNotification {
                 handle: ObjectHandle(7),
@@ -1910,7 +1885,7 @@ mod control_ring_tests {
 
     #[test]
     fn association_shutdown_interrupts_notification_wait() {
-        let (_control, mut local, _host, shutdown) = active_notification_channels();
+        let (_control, mut local, _host, shutdown) = notification_channel_pair();
         let receiver = thread::spawn(move || local.recv_notification());
 
         shutdown.shutdown().unwrap();
@@ -1923,7 +1898,7 @@ mod control_ring_tests {
 
     #[test]
     fn malformed_notification_fails_the_association() {
-        let (control, mut local, mut host, _shutdown) = active_notification_channels();
+        let (control, mut local, mut host, _shutdown) = notification_channel_pair();
         assert_eq!(
             host.producer.try_write(&[0xff]).unwrap(),
             ControlRingWriteStatus::Written
