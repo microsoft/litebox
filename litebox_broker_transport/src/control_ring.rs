@@ -35,7 +35,7 @@ const _: () = assert!(CONTROL_RING_SLOT_SIZE.is_multiple_of(size_of::<u64>()));
 pub const CONTROL_RING_SLOT_COUNT: u64 = 64;
 
 /// Number of slots in the broker-to-local notification direction.
-pub const CONTROL_RING_NOTIFICATION_SLOT_COUNT: u64 = 256;
+pub const CONTROL_RING_NOTIFICATION_SLOT_COUNT: u64 = 64;
 
 /// Exact shared-memory size required for all association control directions.
 pub const CONTROL_RING_MEMORY_SIZE: usize =
@@ -71,7 +71,12 @@ impl ControlRingDirection {
     fn slot_range(self, slot: u64) -> Range<usize> {
         debug_assert!(slot < self.slot_count());
         let slot = usize::try_from(slot).expect("control-ring slot index is bounded");
-        let start = self.data_offset() + slot * CONTROL_RING_SLOT_SIZE;
+        let data_offset = match self {
+            Self::Requests => 0,
+            Self::Responses => CONTROL_RING_DIRECTION_SIZE,
+            Self::Notifications => CONTROL_RING_DIRECTION_SIZE * 2,
+        };
+        let start = data_offset + slot * CONTROL_RING_SLOT_SIZE;
         start..start + CONTROL_RING_SLOT_SIZE
     }
 
@@ -107,14 +112,6 @@ impl ControlRingDirection {
                 Self::Responses => CONTROL_RING_SYNC_DIRECTION_SIZE,
                 Self::Notifications => CONTROL_RING_SYNC_DIRECTION_SIZE * 2,
             }
-    }
-
-    const fn data_offset(self) -> usize {
-        match self {
-            Self::Requests => 0,
-            Self::Responses => CONTROL_RING_DIRECTION_SIZE,
-            Self::Notifications => CONTROL_RING_DIRECTION_SIZE * 2,
-        }
     }
 }
 
@@ -663,7 +660,7 @@ mod tests {
 
     #[test]
     fn mapping_requires_the_exact_control_ring_size() {
-        assert_eq!(CONTROL_RING_MEMORY_SIZE, 49_200);
+        assert_eq!(CONTROL_RING_MEMORY_SIZE, 24_624);
         assert!(matches!(
             ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE - 1)),
             Err(ControlRingError::MemoryLengthMismatch {
@@ -859,7 +856,7 @@ mod tests {
             ControlRingDirection::Responses,
             ControlRingDirection::Notifications,
         ] {
-            let (mut producer, mut consumer) = test_endpoints_for(direction);
+            let (mut producer, mut consumer) = test_ring().into_endpoints(direction, direction);
             for value in 0..direction.slot_count() {
                 assert_eq!(
                     producer.try_write(&[u8::try_from(value % 256).unwrap()]),
@@ -1316,16 +1313,10 @@ mod tests {
         ControlRingProducer<TestMemory>,
         ControlRingConsumer<TestMemory>,
     ) {
-        test_endpoints_for(ControlRingDirection::Requests)
-    }
-
-    fn test_endpoints_for(
-        direction: ControlRingDirection,
-    ) -> (
-        ControlRingProducer<TestMemory>,
-        ControlRingConsumer<TestMemory>,
-    ) {
-        test_ring().into_endpoints(direction, direction)
+        test_ring().into_endpoints(
+            ControlRingDirection::Requests,
+            ControlRingDirection::Requests,
+        )
     }
 
     fn owned_bytes(payload: &[u8]) -> Result<Vec<u8>, ()> {
