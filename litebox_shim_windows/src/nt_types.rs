@@ -4,6 +4,7 @@
 use alloc::string::String;
 use core::mem::offset_of;
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -131,7 +132,7 @@ impl X64Context {
         thread_entry_point: usize,
         application_entry_point: usize,
         stack_top: usize,
-        peb: usize,
+        thread_start_argument: usize,
     ) -> X64Context {
         X64Context {
             context_flags: ContextFlags::CONTROL
@@ -144,11 +145,34 @@ impl X64Context {
             seg_ss: USER_MODE_STACK_SELECTOR,
             e_flags: INITIAL_CONTEXT_EFLAGS,
             rcx: application_entry_point as u64,
-            rdx: peb as u64,
+            rdx: thread_start_argument as u64,
             rsp: stack_top as u64,
             rip: thread_entry_point as u64,
             ..X64Context::default()
         }
+    }
+
+    pub(crate) fn apply_to_regs(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        ctx.rax = self.rax.trunc();
+        ctx.rbx = self.rbx.trunc();
+        ctx.rcx = self.rcx.trunc();
+        ctx.rdx = self.rdx.trunc();
+        ctx.rsi = self.rsi.trunc();
+        ctx.rdi = self.rdi.trunc();
+        ctx.rbp = self.rbp.trunc();
+        ctx.rsp = self.rsp.trunc();
+        ctx.r8 = self.r8.trunc();
+        ctx.r9 = self.r9.trunc();
+        ctx.r10 = self.r10.trunc();
+        ctx.r11 = self.r11.trunc();
+        ctx.r12 = self.r12.trunc();
+        ctx.r13 = self.r13.trunc();
+        ctx.r14 = self.r14.trunc();
+        ctx.r15 = self.r15.trunc();
+        ctx.rip = self.rip.trunc();
+        ctx.eflags = self.e_flags as usize;
+        ctx.cs = self.seg_cs as usize;
+        ctx.ss = self.seg_ss as usize;
     }
 }
 

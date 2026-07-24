@@ -165,6 +165,8 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         stack_top: 0,
         context: 0,
         teb_address: 0,
+        initial_context: None,
+        thread_object: None,
     }
 }
 

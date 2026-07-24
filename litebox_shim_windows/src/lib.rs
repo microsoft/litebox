@@ -16,7 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
@@ -44,6 +44,7 @@ use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
 };
 use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
+use crate::syscalls::thread::{ThreadHandleObject, ThreadSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::token::{TokenHandleObject, TokenObject, TokenSubsystem};
 use crate::syscalls::wait_completion_packet::{
@@ -72,6 +73,7 @@ pub trait ShimPlatform:
     + ArchSpecificProvider
     + SystemInfoProvider
     + TimeProvider
+    + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + 'static
 {
 }
@@ -83,6 +85,7 @@ impl<T> ShimPlatform for T where
         + ArchSpecificProvider
         + SystemInfoProvider
         + TimeProvider
+        + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + 'static
 {
 }
@@ -526,6 +529,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         let mut process =
             Process::default(Some(load_info.virtual_allocations), windows_shared_section);
         process.ntdll_mapping = load_info.ntdll_mapping;
+        process.rtl_user_thread_start = load_info.rtl_user_thread_start;
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
         Ok(LoadedProgram {
@@ -538,6 +542,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
                     stack_top: load_info.stack_top,
                     teb_address: load_info.environment.teb,
                     context: load_info.environment.context,
+                    initial_context: None,
+                    thread_object: None,
                 },
                 _not_send: PhantomData,
             },
@@ -560,6 +566,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
 /// Per-process Windows state shared by every thread in the process.
 pub struct Process<Platform: ShimPlatform> {
     ntdll_mapping: Option<MappingInfo>,
+    rtl_user_thread_start: Option<usize>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
     token: Arc<TokenObject>,
@@ -580,6 +587,7 @@ pub struct Process<Platform: ShimPlatform> {
     default_hard_error_mode: AtomicU32,
     cookie: u32,
     exit_code: AtomicI32,
+    next_thread_id: AtomicUsize,
 }
 
 impl<Platform: ShimPlatform> Process<Platform> {
@@ -608,6 +616,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
         );
         Process {
             ntdll_mapping: None,
+            rtl_user_thread_start: None,
             peb_address: 0,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
             token: Arc::new(TokenObject::primary()),
@@ -626,6 +635,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             default_hard_error_mode: AtomicU32::new(0),
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
+            next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
         }
     }
 }
@@ -638,6 +648,12 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     stack_top: usize,
     context: usize,
     teb_address: usize,
+    initial_context: Option<nt_types::X64Context>,
+    #[expect(
+        dead_code,
+        reason = "the termination slice will signal the current task's shared thread object"
+    )]
+    thread_object: Option<Arc<syscalls::thread::ThreadObject<Platform>>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -646,16 +662,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return ContinueOperation::Terminate;
         }
 
-        ctx.rip = self.entry_point;
-        debug_assert_eq!(self.stack_top % 16, core::mem::size_of::<usize>());
-        ctx.rsp = self.stack_top;
-        ctx.eflags = 0x202;
-        ctx.rcx = self.context;
-        ctx.rdx = self
-            .process
-            .ntdll_mapping
-            .as_ref()
-            .map_or(0, |mapping| mapping.base_addr);
+        if let Some(initial_context) = &self.initial_context {
+            initial_context.apply_to_regs(ctx);
+        } else {
+            ctx.rip = self.entry_point;
+            debug_assert_eq!(self.stack_top % 16, core::mem::size_of::<usize>());
+            ctx.rsp = self.stack_top;
+            ctx.eflags = 0x202;
+            ctx.rcx = self.context;
+            ctx.rdx = self
+                .process
+                .ntdll_mapping
+                .as_ref()
+                .map_or(0, |mapping| mapping.base_addr);
+        }
         litebox_util_log::debug!(
             entry_point:% = format_args!("{:#x}", self.entry_point),
             stack_top:% = format_args!("{:#x}", self.stack_top);
@@ -1648,6 +1668,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtCreateThreadEx {
+                thread_handle,
+                desired_access,
+                object_attributes,
+                process_handle,
+                start_routine,
+                argument,
+                create_flags,
+                zero_bits,
+                stack_size,
+                maximum_stack_size,
+                attribute_list,
+            } => {
+                let status = self.sys_nt_create_thread_ex(
+                    ctx,
+                    thread_handle,
+                    desired_access,
+                    object_attributes,
+                    process_handle,
+                    start_routine,
+                    argument,
+                    create_flags,
+                    zero_bits,
+                    stack_size,
+                    maximum_stack_size,
+                    attribute_list,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenThreadToken {
                 thread_handle,
                 desired_access,
@@ -2245,6 +2294,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_close!(WorkerFactorySubsystem<Platform>, worker_factory);
         try_close!(SectionSubsystem<Platform>, section);
         try_close!(TokenSubsystem, token);
+        try_close!(ThreadSubsystem<Platform>, thread);
 
         NtStatus::INVALID_HANDLE
     }
@@ -2323,6 +2373,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     fn section(&self, section: SectionHandleObject<Platform>);
 
     fn token(&self, token: TokenHandleObject);
+
+    fn thread(&self, thread: ThreadHandleObject<Platform>);
 }
 
 struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
@@ -2381,6 +2433,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn token(&self, token: TokenHandleObject) {
         Task::<Platform, FS>::close_token(token);
+    }
+
+    fn thread(&self, thread: ThreadHandleObject<Platform>) {
+        Task::<Platform, FS>::close_thread(thread);
     }
 }
 
