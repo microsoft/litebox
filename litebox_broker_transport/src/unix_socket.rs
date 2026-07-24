@@ -81,8 +81,8 @@ struct UnixStreamLocalSetup {
     negotiated: bool,
 }
 
-/// Independently owned handle for interrupting local control-channel I/O.
-pub struct UnixStreamLocalControlCancellation {
+/// Independently owned handle for interrupting all local active-ring I/O.
+pub struct UnixControlRingLocalCancellation {
     active: Arc<LocalActiveState>,
 }
 
@@ -159,7 +159,7 @@ impl UnixStreamLocalControlChannel {
         ring: ControlRing<MemfdSharedMemory>,
         association_failure: impl Fn() + Send + Sync + 'static,
     ) -> IoResult<(
-        UnixStreamLocalControlCancellation,
+        UnixControlRingLocalCancellation,
         UnixControlRingLocalNotificationChannel,
     )> {
         let UnixStreamLocalControlState::Setup(setup) = &self.state else {
@@ -235,7 +235,7 @@ impl UnixStreamLocalControlChannel {
 
         self.state = UnixStreamLocalControlState::Active(Arc::clone(&active));
         Ok((
-            UnixStreamLocalControlCancellation {
+            UnixControlRingLocalCancellation {
                 active: Arc::clone(&active),
             },
             UnixControlRingLocalNotificationChannel {
@@ -246,7 +246,7 @@ impl UnixStreamLocalControlChannel {
     }
 }
 
-impl UnixStreamLocalControlCancellation {
+impl UnixControlRingLocalCancellation {
     /// Shuts down the control stream, unblocking pending reads or writes.
     pub fn cancel(&self) -> IoResult<()> {
         self.active.fail(Error::new(
@@ -296,8 +296,8 @@ pub struct UnixControlRingHostResponseSink {
     active: Arc<HostActiveState>,
 }
 
-/// RAII guard that interrupts all active host control-channel I/O when dropped.
-pub struct UnixStreamHostControlShutdown {
+/// RAII guard that interrupts all active host ring I/O when dropped.
+pub struct UnixControlRingHostShutdown {
     active: Arc<HostActiveState>,
 }
 
@@ -361,7 +361,7 @@ impl UnixStreamHostControlChannel {
         UnixControlRingHostRequestSource,
         UnixControlRingHostResponseSink,
         UnixControlRingHostNotificationChannel,
-        UnixStreamHostControlShutdown,
+        UnixControlRingHostShutdown,
     )> {
         if !self.negotiated {
             return Err(invalid_data(
@@ -411,27 +411,26 @@ impl UnixStreamHostControlChannel {
                 producer: notification_producer,
                 active: Arc::clone(&active),
             },
-            UnixStreamHostControlShutdown { active },
+            UnixControlRingHostShutdown { active },
         ))
     }
 }
 
-impl UnixStreamHostControlShutdown {
-    /// Shuts down the active control socket without waiting for the response
-    /// writer mutex.
+impl UnixControlRingHostShutdown {
+    /// Shuts down the active association without waiting for a ring lock.
     pub fn shutdown(&self) -> IoResult<()> {
         self.active.fail(Error::new(
             ErrorKind::ConnectionAborted,
-            "broker host control channel shut down",
+            "broker host association shut down",
         ))
     }
 }
 
-impl Drop for UnixStreamHostControlShutdown {
+impl Drop for UnixControlRingHostShutdown {
     fn drop(&mut self) {
         let _ = self.active.fail(Error::new(
             ErrorKind::ConnectionAborted,
-            "broker host control shutdown guard dropped",
+            "broker host association shutdown guard dropped",
         ));
     }
 }
@@ -1198,7 +1197,7 @@ mod control_ring_tests {
         association_failure: impl Fn() + Send + Sync + 'static,
     ) -> (
         UnixStreamLocalControlChannel,
-        UnixStreamLocalControlCancellation,
+        UnixControlRingLocalCancellation,
         Producer,
         Consumer,
         UnixStream,
@@ -1236,7 +1235,7 @@ mod control_ring_tests {
     fn split_host() -> (
         UnixControlRingHostRequestSource,
         UnixControlRingHostResponseSink,
-        UnixStreamHostControlShutdown,
+        UnixControlRingHostShutdown,
         Producer,
         Consumer,
         UnixStream,
@@ -1280,7 +1279,7 @@ mod control_ring_tests {
         UnixStreamLocalControlChannel,
         UnixControlRingLocalNotificationChannel,
         UnixControlRingHostNotificationChannel,
-        UnixStreamHostControlShutdown,
+        UnixControlRingHostShutdown,
     ) {
         let (local_stream, host_stream) = UnixStream::pair().unwrap();
         let (local_ring, host_ring) = ring_pair();
@@ -1904,7 +1903,7 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn control_shutdown_interrupts_notification_wait() {
+    fn association_shutdown_interrupts_notification_wait() {
         let (_control, mut local, _host, shutdown) = active_notification_channels();
         let receiver = thread::spawn(move || local.recv_notification());
 

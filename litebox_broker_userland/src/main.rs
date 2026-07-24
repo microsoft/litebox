@@ -25,8 +25,8 @@ use litebox_broker_protocol::shared_memory::{
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixControlRingHostRequestSource, UnixControlRingHostResponseSink,
-    UnixStreamHostControlChannel, UnixStreamHostControlShutdown, validate_peer_process,
+    UnixControlRingHostRequestSource, UnixControlRingHostResponseSink, UnixControlRingHostShutdown,
+    UnixStreamHostControlChannel, validate_peer_process,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -138,7 +138,7 @@ fn dispatch_requests<Memory: SharedMemory>(
     association: BrokerHostAssociation<'_, Memory>,
     mut request_source: UnixControlRingHostRequestSource,
     response_sink: UnixControlRingHostResponseSink,
-    shutdown: UnixStreamHostControlShutdown,
+    shutdown: UnixControlRingHostShutdown,
 ) -> IoResult<()> {
     let association = Arc::new(association);
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
@@ -251,11 +251,11 @@ fn run_worker<Memory: SharedMemory>(
 struct HostAssociationFailureCoordinator {
     failed: AtomicBool,
     error: Mutex<Option<IoError>>,
-    shutdown: UnixStreamHostControlShutdown,
+    shutdown: UnixControlRingHostShutdown,
 }
 
 impl HostAssociationFailureCoordinator {
-    const fn new(shutdown: UnixStreamHostControlShutdown) -> Self {
+    const fn new(shutdown: UnixControlRingHostShutdown) -> Self {
         Self {
             failed: AtomicBool::new(false),
             error: Mutex::new(None),
