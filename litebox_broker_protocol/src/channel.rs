@@ -83,15 +83,6 @@ pub trait HostSetupChannel {
     ) -> Result<(), Self::Error>;
 }
 
-/// Host-side control channel that carries both setup and active broker calls.
-pub trait HostControlChannel: HostSetupChannel {
-    /// Receives one active broker request.
-    fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
-
-    /// Sends one active broker response.
-    fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;
-}
-
 /// Local-side receive channel for broker-initiated asynchronous notifications.
 ///
 /// A notification channel is separate from the control channel so active broker
@@ -112,7 +103,7 @@ pub trait LocalNotificationChannel {
 /// Host-side send channel for broker-initiated asynchronous notifications.
 ///
 /// Implementations carry notification frames only; object operation responses
-/// continue to use [`HostControlChannel::send_response`].
+/// remain on the active control transport.
 pub trait HostNotificationChannel {
     /// Channel-specific error type.
     type Error;
