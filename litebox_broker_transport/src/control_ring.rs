@@ -14,7 +14,7 @@ use litebox_broker_protocol::shared_memory::SharedMemory;
 use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemoryError};
 
 /// Size of one shared control-ring slot.
-pub const CONTROL_RING_SLOT_SIZE: usize = 4096;
+pub const CONTROL_RING_SLOT_SIZE: usize = 128;
 
 /// Size of the fixed metadata at the start of a control-ring slot.
 pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;
@@ -22,6 +22,11 @@ pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;
 /// Maximum encoded request or response size in one control-ring slot.
 pub const CONTROL_RING_PAYLOAD_CAPACITY: usize =
     CONTROL_RING_SLOT_SIZE - CONTROL_RING_SLOT_HEADER_SIZE;
+
+const _: () = assert!(
+    CONTROL_RING_PAYLOAD_CAPACITY >= litebox_broker_protocol::wire::MAX_ENCODED_ACTIVE_MESSAGE_SIZE
+);
+const _: () = assert!(CONTROL_RING_SLOT_SIZE.is_multiple_of(size_of::<u64>()));
 
 /// Number of slots in each direction of the shared control ring.
 pub const CONTROL_RING_SLOT_COUNT: u64 = 64;

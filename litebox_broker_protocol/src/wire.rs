@@ -48,6 +48,9 @@ const RESPONSE_TAG_ERROR: u8 = 7;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
+/// Maximum byte length of any encoded active request or response.
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 26;
+
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -381,17 +384,19 @@ mod tests {
                 },
             })),
         ];
+        let mut maximum_encoded_size = 0;
 
         for operation in operations {
             let request = BrokerRequest {
                 request_id: TEST_REQUEST_ID,
                 operation,
             };
-            assert_eq!(
-                decode_request(&encode_request(request.clone())).unwrap(),
-                request
-            );
+            let encoded = encode_request(request.clone());
+            maximum_encoded_size = maximum_encoded_size.max(encoded.len());
+            assert!(encoded.len() <= MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+            assert_eq!(decode_request(&encoded).unwrap(), request);
         }
+        assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
     }
 
     #[test]
@@ -456,17 +461,19 @@ mod tests {
             BrokerResult::Error(ErrorCode::OutOfMemory),
             BrokerResult::Error(ErrorCode::Internal),
         ];
+        let mut maximum_encoded_size = 0;
 
         for result in results {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,
                 result,
             };
-            assert_eq!(
-                decode_response(&encode_response(response.clone())).unwrap(),
-                response
-            );
+            let encoded = encode_response(response.clone());
+            maximum_encoded_size = maximum_encoded_size.max(encoded.len());
+            assert!(encoded.len() <= MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+            assert_eq!(decode_response(&encoded).unwrap(), response);
         }
+        assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
     }
 
     #[test]
