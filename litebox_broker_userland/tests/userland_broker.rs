@@ -14,9 +14,7 @@ use litebox_broker_protocol::shared_memory::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
-use litebox_broker_transport::unix_socket::{
-    UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
-};
+use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 
@@ -36,8 +34,8 @@ fn run_parent_test() {
     // This custom-harness integration test uses its own executable as the broker's
     // runner. Cargo starts this executable without broker args, so it runs the
     // parent path here. The broker then starts the same executable with the real
-    // runner argv (`--unstable --broker-control-socket <path>
-    // --broker-notification-socket <path>`), which runs `run_fake_runner`. After
+    // runner argv (`--unstable --broker-control-socket <path>`), which runs
+    // `run_fake_runner`. After
     // the fake runner finishes its broker requests, it terminates the broker
     // parent process; this lets the test exercise the long-running broker
     // without a test-only shutdown path.
@@ -72,19 +70,12 @@ fn run_fake_runner(args: &[OsString]) {
     );
     assert_eq!(
         args.get(3).map(OsString::as_os_str),
-        Some(OsStr::new("--broker-notification-socket"))
-    );
-    assert_eq!(
-        args.get(5).map(OsString::as_os_str),
         Some(OsStr::new(RUNNER_ARGUMENT))
     );
-    assert_eq!(args.len(), 6, "unexpected runner arguments: {args:?}");
+    assert_eq!(args.len(), 4, "unexpected runner arguments: {args:?}");
 
     let control_socket_path = args.get(2).unwrap();
-    let notification_socket_path = args.get(4).unwrap();
     let control_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
-    let _notification_channel =
-        connect_notification_with_retry(Path::new(notification_socket_path)).unwrap();
     let local = Arc::new(
         BrokerLocal::negotiate(control_channel, |channel| {
             let shared_memory = channel.receive_memfd(
@@ -101,7 +92,7 @@ fn run_fake_runner(args: &[OsString]) {
                     format!("invalid test control ring: {error:?}"),
                 )
             })?;
-            let _cancellation = channel.activate(control_ring, || {})?;
+            let (_cancellation, _notifications) = channel.activate(control_ring, || {})?;
             Ok(Arc::new(shared_memory))
         })
         .unwrap(),
@@ -185,26 +176,6 @@ fn connect_control_with_retry(socket_path: &Path) -> Result<UnixStreamLocalContr
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match UnixStreamLocalControlChannel::connect_with_setup_deadline(socket_path, deadline) {
-            Ok(channel) => return Ok(channel),
-            Err(error) if Instant::now() < deadline => {
-                if error.kind() != ErrorKind::NotFound
-                    && error.kind() != ErrorKind::ConnectionRefused
-                {
-                    return Err(error);
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn connect_notification_with_retry(
-    socket_path: &Path,
-) -> Result<UnixStreamLocalNotificationChannel> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match UnixStreamLocalNotificationChannel::connect(socket_path) {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != ErrorKind::NotFound

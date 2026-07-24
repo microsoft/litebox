@@ -16,8 +16,8 @@ use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::unix_socket::{
-    UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
-    UnixStreamLocalNotificationCancellation, UnixStreamLocalNotificationChannel,
+    UnixControlRingLocalNotificationChannel, UnixStreamLocalControlCancellation,
+    UnixStreamLocalControlChannel,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -25,10 +25,9 @@ const RETRY_DELAY: Duration = Duration::from_millis(20);
 
 pub(crate) fn connect(
     control_socket_path: &Path,
-    notification_socket_path: &Path,
 ) -> Result<(
     BrokerLocal<UnixStreamLocalControlChannel>,
-    BrokerNotifications<UnixStreamLocalNotificationChannel>,
+    BrokerNotifications<UnixControlRingLocalNotificationChannel>,
     Arc<BrokerAssociationFailureCoordinator>,
 )> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
@@ -44,49 +43,32 @@ pub(crate) fn connect(
             control_socket_path.display()
         )
     })?;
-    let notification_channel = connect_with_retry(
-        notification_socket_path,
-        setup_deadline,
-        "timed out connecting to broker notifications",
-        |path, _deadline| UnixStreamLocalNotificationChannel::connect(path),
-    )
-    .with_context(|| {
-        format!(
-            "failed to connect to broker notifications at {}",
-            notification_socket_path.display()
-        )
-    })?;
-    let notification_cancellation_handle = notification_channel
-        .cancellation_handle()
-        .context("failed to create broker notification cancellation handle")?;
-    let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
-        notification_cancellation_handle,
-    ));
-    let local = BrokerLocal::negotiate(control_channel, {
-        let association_coordinator = Arc::clone(&association_coordinator);
-        move |channel| {
-            let shared_memory =
-                channel.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
-            let control_memory =
-                channel.receive_memfd(CONTROL_RING_MEMORY_SIZE, Some(setup_deadline))?;
-            let control_ring = ControlRing::new(control_memory).map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid broker control ring: {error:?}"),
-                )
-            })?;
-            let weak_association_coordinator = Arc::downgrade(&association_coordinator);
-            let control_cancellation_handle = channel.activate(control_ring, move || {
+    let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
+    let mut notification_channel = None;
+    let local = BrokerLocal::negotiate(control_channel, |channel| {
+        let shared_memory = channel.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
+        let control_memory =
+            channel.receive_memfd(CONTROL_RING_MEMORY_SIZE, Some(setup_deadline))?;
+        let control_ring = ControlRing::new(control_memory).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid broker control ring: {error:?}"),
+            )
+        })?;
+        let weak_association_coordinator = Arc::downgrade(&association_coordinator);
+        let (control_cancellation_handle, active_notification_channel) =
+            channel.activate(control_ring, move || {
                 if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
                     association_coordinator.report_failure();
                 }
             })?;
-            association_coordinator
-                .install_control_cancellation_handle(control_cancellation_handle)?;
-            Ok(Arc::new(shared_memory))
-        }
+        association_coordinator.install_control_cancellation_handle(control_cancellation_handle)?;
+        notification_channel = Some(active_notification_channel);
+        Ok(Arc::new(shared_memory))
     })
     .context("broker negotiation failed")?;
+    let notification_channel =
+        notification_channel.expect("successful broker activation must return notifications");
     Ok((
         local,
         BrokerNotifications::new(notification_channel),
@@ -95,7 +77,7 @@ pub(crate) fn connect(
 }
 
 pub(crate) fn start_notification_receiver(
-    mut notifications: BrokerNotifications<UnixStreamLocalNotificationChannel>,
+    mut notifications: BrokerNotifications<UnixControlRingLocalNotificationChannel>,
     association_coordinator: Arc<BrokerAssociationFailureCoordinator>,
     dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
 ) -> Result<()> {
@@ -121,16 +103,14 @@ pub(crate) fn start_notification_receiver(
 pub(crate) struct BrokerAssociationFailureCoordinator {
     failed: AtomicBool,
     control_cancellation_handle: Mutex<Option<UnixStreamLocalControlCancellation>>,
-    notification_cancellation_handle: UnixStreamLocalNotificationCancellation,
     dispatch_failure: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl BrokerAssociationFailureCoordinator {
-    fn new(notification_cancellation_handle: UnixStreamLocalNotificationCancellation) -> Self {
+    fn new() -> Self {
         Self {
             failed: AtomicBool::new(false),
             control_cancellation_handle: Mutex::new(None),
-            notification_cancellation_handle,
             dispatch_failure: Mutex::new(None),
         }
     }
@@ -188,9 +168,6 @@ impl BrokerAssociationFailureCoordinator {
         {
             eprintln!("failed to cancel broker control channel: {error}");
         }
-        if let Err(error) = self.notification_cancellation_handle.cancel() {
-            eprintln!("failed to cancel broker notification channel: {error}");
-        }
         let dispatch_failure = self
             .dispatch_failure
             .lock()
@@ -225,15 +202,19 @@ fn connect_with_retry<Channel>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_protocol::channel::{HostReceive, HostSetupChannel, LocalControlChannel};
-    use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
-    use litebox_broker_protocol::{ObjectHandle, RequestId};
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::channel::{
+        HostNotificationChannel, HostReceive, HostSetupChannel, LocalControlChannel,
+    };
+    use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
+    use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_transport::shared_memory::MemfdSharedMemory;
     use litebox_broker_transport::unix_socket::{
+        UnixControlRingHostNotificationChannel, UnixControlRingLocalNotificationChannel,
         UnixStreamHostControlChannel, UnixStreamHostControlShutdown, UnixStreamHostRequestSource,
         UnixStreamHostResponseSink,
     };
-    use std::io::{ErrorKind, Read};
+    use std::io::ErrorKind;
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
@@ -271,8 +252,10 @@ mod tests {
         association_coordinator: &Arc<BrokerAssociationFailureCoordinator>,
     ) -> (
         UnixStreamLocalControlCancellation,
+        UnixControlRingLocalNotificationChannel,
         UnixStreamHostRequestSource,
         UnixStreamHostResponseSink,
+        UnixControlRingHostNotificationChannel,
         UnixStreamHostControlShutdown,
     ) {
         let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
@@ -286,15 +269,23 @@ mod tests {
         let host_activation =
             std::thread::spawn(move || host_channel.into_active(host_ring).unwrap());
         let weak_association_coordinator = Arc::downgrade(association_coordinator);
-        let cancellation = channel
+        let (cancellation, local_notifications) = channel
             .activate(local_ring, move || {
                 if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
                     association_coordinator.report_failure();
                 }
             })
             .unwrap();
-        let (request_source, response_sink, shutdown) = host_activation.join().unwrap();
-        (cancellation, request_source, response_sink, shutdown)
+        let (request_source, response_sink, host_notifications, shutdown) =
+            host_activation.join().unwrap();
+        (
+            cancellation,
+            local_notifications,
+            request_source,
+            response_sink,
+            host_notifications,
+            shutdown,
+        )
     }
 
     #[test]
@@ -302,22 +293,26 @@ mod tests {
         let (local_control, host_control) = UnixStream::pair().unwrap();
         let (mut active_channel, host_control) =
             negotiate_control_pair(local_control, host_control);
-        let (local_notification, mut host_notification) = UnixStream::pair().unwrap();
-        host_notification
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let notification_channel =
-            UnixStreamLocalNotificationChannel::from_connected(local_notification);
-        let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
-            notification_channel.cancellation_handle().unwrap(),
-        ));
-        let (control_cancellation_handle, host_request_source, host_response_sink, host_shutdown) =
-            activate_control_channel(&mut active_channel, host_control, &association_coordinator);
+        let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
+        let (
+            control_cancellation_handle,
+            notification_channel,
+            host_request_source,
+            host_response_sink,
+            _host_notifications,
+            host_shutdown,
+        ) = activate_control_channel(&mut active_channel, host_control, &association_coordinator);
         association_coordinator
             .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
         let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
         association_coordinator.install_dispatch(move || failure_sender.send(()).unwrap());
+        start_notification_receiver(
+            BrokerNotifications::new(notification_channel),
+            Arc::clone(&association_coordinator),
+            |_| {},
+        )
+        .unwrap();
 
         host_shutdown.shutdown().unwrap();
         drop(host_request_source);
@@ -326,10 +321,7 @@ mod tests {
         failure_receiver
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
-        let mut byte = [0];
-        assert_eq!(host_notification.read(&mut byte).unwrap(), 0);
         drop(active_channel);
-        drop(notification_channel);
     }
 
     #[test]
@@ -340,19 +332,13 @@ mod tests {
             .unwrap();
         let (mut active_channel, host_control) =
             negotiate_control_pair(local_control, host_control);
-        let (local_notification, mut host_notification) = UnixStream::pair().unwrap();
-        host_notification
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let notification_channel =
-            UnixStreamLocalNotificationChannel::from_connected(local_notification);
-        let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
-            notification_channel.cancellation_handle().unwrap(),
-        ));
+        let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
         let (
             control_cancellation_handle,
+            _notification_channel,
             mut host_request_source,
             _host_response_sink,
+            _host_notifications,
             _host_shutdown,
         ) = activate_control_channel(&mut active_channel, host_control, &association_coordinator);
 
@@ -372,62 +358,48 @@ mod tests {
             host_request_source.recv_request().unwrap(),
             HostReceive::PeerClosed
         );
-        let mut byte = [0];
-        assert_eq!(host_notification.read(&mut byte).unwrap(), 0);
         drop(active_channel);
-        drop(notification_channel);
     }
 
     #[test]
-    fn notification_failure_cancels_control() {
+    fn notification_receiver_dispatches_ring_message() {
         let (local_control, host_control) = UnixStream::pair().unwrap();
         let (mut active_channel, host_control) =
             negotiate_control_pair(local_control, host_control);
-        let (local_notification, host_notification) = UnixStream::pair().unwrap();
-        let notification_channel =
-            UnixStreamLocalNotificationChannel::from_connected(local_notification);
-        let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new(
-            notification_channel.cancellation_handle().unwrap(),
-        ));
+        let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
         let (
             control_cancellation_handle,
-            mut host_request_source,
+            notification_channel,
+            _host_request_source,
             _host_response_sink,
-            _host_shutdown,
+            mut host_notifications,
+            host_shutdown,
         ) = activate_control_channel(&mut active_channel, host_control, &association_coordinator);
         association_coordinator
             .install_control_cancellation_handle(control_cancellation_handle)
             .unwrap();
-        let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
-        association_coordinator.install_dispatch(move || failure_sender.send(()).unwrap());
+        association_coordinator.install_dispatch(|| {});
+        let (notification_sender, notification_receiver) = mpsc::sync_channel(1);
         start_notification_receiver(
             BrokerNotifications::new(notification_channel),
             Arc::clone(&association_coordinator),
-            |_| {},
+            move |notification| notification_sender.send(notification).unwrap(),
         )
         .unwrap();
-        let active_channel = Arc::new(active_channel);
-        let pending_channel = Arc::clone(&active_channel);
-        let pending_call = std::thread::spawn(move || {
-            pending_channel.call(BrokerRequest {
-                request_id: RequestId(1),
-                operation: BrokerOperation::CloseObject(ObjectHandle(1)),
-            })
+        let notification = BrokerNotification::Readiness(ReadinessNotification {
+            handle: ObjectHandle(7),
+            readiness: ReadinessFlags::READ,
         });
-        assert!(matches!(
-            host_request_source.recv_request().unwrap(),
-            HostReceive::Message(_)
-        ));
 
-        drop(host_notification);
+        host_notifications.send_notification(&notification).unwrap();
 
-        failure_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        assert!(pending_call.join().unwrap().is_err());
         assert_eq!(
-            host_request_source.recv_request().unwrap(),
-            HostReceive::PeerClosed
+            notification_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            notification
         );
+        host_shutdown.shutdown().unwrap();
+        drop(active_channel);
     }
 }

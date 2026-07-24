@@ -25,8 +25,8 @@ use litebox_broker_protocol::shared_memory::{
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixStreamHostControlChannel, UnixStreamHostControlShutdown, UnixStreamHostNotificationChannel,
-    UnixStreamHostRequestSource, UnixStreamHostResponseSink, validate_peer_process,
+    UnixStreamHostControlChannel, UnixStreamHostControlShutdown, UnixStreamHostRequestSource,
+    UnixStreamHostResponseSink, validate_peer_process,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,11 +50,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .prefix("litebox-broker-userland-")
         .tempdir()?;
     let control_socket_path = socket_dir.path().join("broker.sock");
-    let notification_socket_path = socket_dir.path().join("broker-notification.sock");
     let control_listener = UnixListener::bind(&control_socket_path)?;
-    let notification_listener = UnixListener::bind(&notification_socket_path)?;
     control_listener.set_nonblocking(true)?;
-    notification_listener.set_nonblocking(true)?;
     let broker = BrokerCore::new(PolicyEngine::with_host_guaranteed_rights(
         ObjectRights::all(),
     ))?;
@@ -64,19 +61,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .arg("--unstable")
         .arg("--broker-control-socket")
         .arg(&control_socket_path)
-        .arg("--broker-notification-socket")
-        .arg(&notification_socket_path)
         .args(&args.runner_arguments);
     let mut runner = runner_command.spawn()?;
     let runner_process_id = runner.id();
 
-    let association_result = serve_runner(
-        &broker,
-        &control_listener,
-        &notification_listener,
-        &mut runner,
-        runner_process_id,
-    );
+    let association_result =
+        serve_runner(&broker, &control_listener, &mut runner, runner_process_id);
     if association_result.is_err() {
         let _ = runner.kill();
     }
@@ -91,7 +81,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn serve_runner(
     broker: &BrokerCore,
     control_listener: &UnixListener,
-    notification_listener: &UnixListener,
     runner: &mut Child,
     runner_process_id: u32,
 ) -> Result<(), Box<dyn Error>> {
@@ -103,13 +92,6 @@ fn serve_runner(
         setup_deadline,
         "control",
     )?;
-    let notification_stream = accept_runner_stream(
-        notification_listener,
-        runner,
-        runner_process_id,
-        setup_deadline,
-        "notification",
-    )?;
     let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE)?;
     let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)?;
     let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE)?;
@@ -117,8 +99,6 @@ fn serve_runner(
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let mut control_channel =
         UnixStreamHostControlChannel::from_host_guaranteed(control_stream, setup_deadline);
-    let _notification_channel =
-        UnixStreamHostNotificationChannel::from_accepted(notification_stream);
     let association =
         match setup_connection(broker, &mut control_channel, &shared_buffers, |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
@@ -148,7 +128,8 @@ fn serve_runner(
                 .into());
             }
         };
-    let (request_source, response_sink, shutdown) = control_channel.into_active(control_ring)?;
+    let (request_source, response_sink, _notification_channel, shutdown) =
+        control_channel.into_active(control_ring)?;
     dispatch_requests(association, request_source, response_sink, shutdown)?;
     Ok(())
 }
@@ -371,7 +352,7 @@ mod tests {
             let cancellation = local_channel.activate(local_ring, || {}).unwrap();
             (local_channel, cancellation)
         });
-        let (mut request_source, _response_sink, shutdown) =
+        let (mut request_source, _response_sink, _notifications, shutdown) =
             control_channel.into_active(host_ring).unwrap();
         let (_local_channel, _cancellation) = local_activation.join().unwrap();
         let failure_coordinator = HostAssociationFailureCoordinator::new(shutdown);

@@ -119,17 +119,10 @@ impl Runner {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn broker_sockets(
-        &mut self,
-        control_socket_path: &Path,
-        notification_socket_path: &Path,
-    ) -> &mut Self {
+    fn broker_socket(&mut self, control_socket_path: &Path) -> &mut Self {
         self.command
             .arg("--broker-control-socket")
             .arg(control_socket_path);
-        self.command
-            .arg("--broker-notification-socket")
-            .arg(notification_socket_path);
         self
     }
 
@@ -312,7 +305,6 @@ struct TestBroker {
     done_rx: std::sync::mpsc::Receiver<()>,
     close_object_count_rx: std::sync::mpsc::Receiver<usize>,
     control_socket_path: PathBuf,
-    notification_socket_path: PathBuf,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -333,7 +325,6 @@ impl TestBroker {
             .join()
             .expect("broker test host panicked");
         let _ = std::fs::remove_file(&self.control_socket_path);
-        let _ = std::fs::remove_file(&self.notification_socket_path);
     }
 }
 
@@ -341,35 +332,27 @@ impl TestBroker {
 impl Drop for TestBroker {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.control_socket_path);
-        let _ = std::fs::remove_file(&self.notification_socket_path);
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn spawn_test_broker(
     control_socket_path: &Path,
-    notification_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
 ) -> TestBroker {
     let _ = std::fs::remove_file(control_socket_path);
-    let _ = std::fs::remove_file(notification_socket_path);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let (close_object_count_tx, close_object_count_rx) = std::sync::mpsc::channel();
     let server_control_socket_path = control_socket_path.to_path_buf();
-    let server_notification_socket_path = notification_socket_path.to_path_buf();
     let cleanup_control_socket_path = control_socket_path.to_path_buf();
-    let cleanup_notification_socket_path = notification_socket_path.to_path_buf();
     let broker_thread = std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let control_listener =
                 std::os::unix::net::UnixListener::bind(&server_control_socket_path)
                     .expect("failed to bind broker test control socket");
-            let notification_listener =
-                std::os::unix::net::UnixListener::bind(&server_notification_socket_path)
-                    .expect("failed to bind broker test notification socket");
             let broker =
                 litebox_broker_core::BrokerCore::new(policy).expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
@@ -396,33 +379,17 @@ fn spawn_test_broker(
                 let control_ring =
                     litebox_broker_transport::control_ring::ControlRing::new(control_memory)
                         .expect("failed to attach broker test control ring");
-                let (notification_stream, _) = notification_listener
-                    .accept()
-                    .expect("failed to accept broker local notification connection");
-                litebox_broker_transport::unix_socket::validate_same_peer_process(
-                    &control_stream,
-                    &notification_stream,
-                )
-                .expect("broker channels must belong to the same runner process");
                 control_stream
                     .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test read timeout");
                 control_stream
                     .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test write timeout");
-                notification_stream
-                    .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
-                    .expect("failed to configure broker notification test read timeout");
-                notification_stream
-                    .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
-                    .expect("failed to configure broker notification test write timeout");
                 let mut channel =
                     litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_host_guaranteed(
                         control_stream,
                         std::time::Instant::now() + BROKER_HELPER_TIMEOUT,
                     );
-                let _notification_channel =
-                    litebox_broker_transport::unix_socket::UnixStreamHostNotificationChannel::from_accepted(notification_stream);
                 let association = litebox_broker_host::setup_connection(
                     &broker,
                     &mut channel,
@@ -434,7 +401,7 @@ fn spawn_test_broker(
                 )
                 .expect("broker host setup failed")
                 .expect("broker setup terminated before activation");
-                let (mut request_source, response_sink, _shutdown) = channel
+                let (mut request_source, response_sink, _notifications, _shutdown) = channel
                     .into_active(control_ring)
                     .expect("failed to activate broker test control ring");
                 let mut close_object_count = 0;
@@ -474,7 +441,6 @@ fn spawn_test_broker(
             }
         }));
         let _ = std::fs::remove_file(&server_control_socket_path);
-        let _ = std::fs::remove_file(&server_notification_socket_path);
         let _ = done_tx.send(());
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
@@ -489,7 +455,6 @@ fn spawn_test_broker(
         done_rx,
         close_object_count_rx,
         control_socket_path: cleanup_control_socket_path,
-        notification_socket_path: cleanup_notification_socket_path,
     }
 }
 
@@ -513,10 +478,8 @@ console.log(content);
         false,
     );
     let control_socket_path = unique_test_socket_path("runner-broker-control");
-    let notification_socket_path = unique_test_socket_path("runner-broker-notification");
     let broker_thread = spawn_test_broker(
         &control_socket_path,
-        &notification_socket_path,
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         ),
@@ -524,24 +487,24 @@ console.log(content);
     );
 
     Runner::new(&true_path, "broker_true_rewriter")
-        .broker_sockets(&control_socket_path, &notification_socket_path)
+        .broker_socket(&control_socket_path)
         .run();
     assert_eq!(broker_thread.next_close_object_count(), 0);
 
     Runner::new(&target, "broker_eventfd_rewriter")
-        .broker_sockets(&control_socket_path, &notification_socket_path)
+        .broker_socket(&control_socket_path)
         .run();
     // eventfd.c creates thirteen eventfd objects; each should release one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 13);
 
     Runner::new(&pipe_target, "broker_pipe_rewriter")
-        .broker_sockets(&control_socket_path, &notification_socket_path)
+        .broker_socket(&control_socket_path)
         .run();
     // pipe_broker.c creates five pipes; each endpoint owns one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 10);
 
     Runner::new(&node_path, "hello_node_broker_rewriter")
-        .broker_sockets(&control_socket_path, &notification_socket_path)
+        .broker_socket(&control_socket_path)
         .arg("/out/hello_world.js")
         .with_fs_path(|out_dir| {
             std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();

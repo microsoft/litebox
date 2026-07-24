@@ -85,20 +85,10 @@ pub struct CliArgs {
         value_name = "PATH",
         value_hint = clap::ValueHint::FilePath,
         hide = true,
-        requires_all = ["unstable", "broker_notification_socket"],
+        requires = "unstable",
         help_heading = "Unstable Options"
     )]
     pub broker_control_socket: Option<PathBuf>,
-    /// Broker-supplied Unix socket path for the local notification channel.
-    #[arg(
-        long = "broker-notification-socket",
-        value_name = "PATH",
-        value_hint = clap::ValueHint::FilePath,
-        hide = true,
-        requires_all = ["unstable", "broker_control_socket"],
-        help_heading = "Unstable Options"
-    )]
-    pub broker_notification_socket: Option<PathBuf>,
 }
 
 struct MmappedFile {
@@ -159,21 +149,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
 
-    let broker_connection = match (
-        cli_args.broker_control_socket.as_deref(),
-        cli_args.broker_notification_socket.as_deref(),
-    ) {
-        (Some(control_socket_path), Some(notification_socket_path)) => Some(broker::connect(
-            control_socket_path,
-            notification_socket_path,
-        )?),
-        (None, None) => None,
-        (Some(_), None) => {
-            anyhow::bail!("broker notification socket is required with broker control socket")
-        }
-        (None, Some(_)) => {
-            anyhow::bail!("broker control socket is required with broker notification socket")
-        }
+    let broker_connection = match cli_args.broker_control_socket.as_deref() {
+        Some(control_socket_path) => Some(broker::connect(control_socket_path)?),
+        None => None,
     };
 
     let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();

@@ -85,10 +85,10 @@ pub trait HostSetupChannel {
 
 /// Local-side receive channel for broker-initiated asynchronous notifications.
 ///
-/// A notification channel is separate from the control channel so active broker
-/// requests remain strictly paired with their responses. The deployment is
-/// responsible for binding this channel to the same authenticated broker
-/// association as the matching control channel.
+/// The notification path is logically separate from request and response
+/// traffic so active broker requests remain strictly paired with their
+/// responses. A deployment may carry notifications in the same authenticated
+/// association as its control path.
 pub trait LocalNotificationChannel {
     /// Channel-specific error type.
     type Error;

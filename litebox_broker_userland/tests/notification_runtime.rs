@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
-use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::channel::HostReceive;
+use litebox_broker_local::{BrokerLocal, BrokerNotifications};
+use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::channel::{HostNotificationChannel, HostReceive};
+use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_memory::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool,
@@ -15,26 +17,29 @@ use litebox_broker_protocol::shared_memory::{
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixStreamHostControlChannel, UnixStreamHostNotificationChannel, UnixStreamLocalControlChannel,
+    UnixStreamHostControlChannel, UnixStreamLocalControlChannel,
 };
 
 #[test]
-fn host_serves_control_requests_over_paired_userland_channels() {
+fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();
-    let (_local_notification, host_notification) = UnixStream::pair().unwrap();
     let host_shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
     let host_shared_buffers =
         SharedBufferPool::new(host_shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
     let host_control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
     let host_control_ring = ControlRing::new(host_control_memory).unwrap();
+    let notification = BrokerNotification::Readiness(ReadinessNotification {
+        handle: ObjectHandle(7),
+        readiness: ReadinessFlags::READ,
+    });
+    let host_notification = notification.clone();
 
     let host_thread = std::thread::spawn(move || {
         let mut control = UnixStreamHostControlChannel::from_accepted(host_control);
-        let _notification = UnixStreamHostNotificationChannel::from_accepted(host_notification);
         let association =
             setup_connection(&broker, &mut control, &host_shared_buffers, |channel| {
                 channel.send_memfd(host_shared_buffers.memory(), None)?;
@@ -42,8 +47,9 @@ fn host_serves_control_requests_over_paired_userland_channels() {
             })
             .unwrap()
             .unwrap();
-        let (mut request_source, response_sink, _shutdown) =
+        let (mut request_source, response_sink, mut notifications, _shutdown) =
             control.into_active(host_control_ring).unwrap();
+        notifications.send_notification(&host_notification).unwrap();
         loop {
             match request_source.recv_request().unwrap() {
                 HostReceive::Message(request) => association
@@ -57,6 +63,7 @@ fn host_serves_control_requests_over_paired_userland_channels() {
         }
     });
 
+    let mut notification_channel = None;
     let local = BrokerLocal::negotiate(
         UnixStreamLocalControlChannel::from_connected(local_control),
         |channel| {
@@ -68,11 +75,19 @@ fn host_serves_control_requests_over_paired_userland_channels() {
                     format!("invalid test control ring: {error:?}"),
                 )
             })?;
-            let _cancellation = channel.activate(control_ring, || {})?;
+            let (_cancellation, notifications) = channel.activate(control_ring, || {})?;
+            notification_channel = Some(notifications);
             Ok(Arc::new(shared_memory))
         },
     )
     .unwrap();
+    let mut notifications = BrokerNotifications::new(
+        notification_channel.expect("activation must return a notification receiver"),
+    );
+    assert_eq!(
+        notifications.recv_notification().unwrap(),
+        Some(notification)
+    );
 
     let handle = local.create_event_with_count(0).unwrap();
     let readiness = ReadinessFlags::READ | ReadinessFlags::WRITE;
