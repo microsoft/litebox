@@ -570,8 +570,14 @@ impl UnixStreamHostRequestSource {
     /// Receives one active broker request.
     pub fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
         loop {
+            if let Some(error) = self.active.request_failure() {
+                return Err(error);
+            }
             match self.consumer.try_read(decode_request) {
                 Ok(ControlRingReadStatus::Message(request)) => {
+                    if let Some(error) = self.active.request_failure() {
+                        return Err(error);
+                    }
                     if let Err(error) = self
                         .consumer
                         .publish_head()
@@ -860,6 +866,17 @@ impl HostActiveState {
             HostActiveStatus::Live => None,
             HostActiveStatus::PeerClosed => Some(Ok(HostReceive::PeerClosed)),
             HostActiveStatus::Failed(error) => Some(Err(copy_io_error(error))),
+        }
+    }
+
+    fn request_failure(&self) -> Option<Error> {
+        match &*self
+            .status
+            .lock()
+            .expect("broker host active-state mutex poisoned")
+        {
+            HostActiveStatus::Failed(error) => Some(copy_io_error(error)),
+            HostActiveStatus::Live | HostActiveStatus::PeerClosed => None,
         }
     }
 
@@ -1556,6 +1573,32 @@ mod control_ring_tests {
         let receiver = thread::spawn(move || source.recv_request());
         drop(peer);
         assert_eq!(receiver.join().unwrap().unwrap(), HostReceive::PeerClosed);
+    }
+
+    #[test]
+    fn host_failure_preempts_queued_request_but_peer_close_drains_it() {
+        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
+        write_payload(&mut requests, &encode_request(request(1)));
+        source
+            .active
+            .fail(Error::new(ErrorKind::TimedOut, "test failure"))
+            .unwrap();
+        assert_eq!(
+            source.recv_request().unwrap_err().kind(),
+            ErrorKind::TimedOut
+        );
+
+        let (mut source, _sink, _shutdown, mut requests, _responses, _peer) = split_host();
+        write_payload(&mut requests, &encode_request(request(2)));
+        source.active.peer_closed();
+        assert!(matches!(
+            source.recv_request().unwrap(),
+            HostReceive::Message(BrokerRequest {
+                request_id: RequestId(2),
+                ..
+            })
+        ));
+        assert_eq!(source.recv_request().unwrap(), HostReceive::PeerClosed);
     }
 
     #[test]
