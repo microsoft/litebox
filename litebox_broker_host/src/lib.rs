@@ -28,7 +28,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
-    EventRequest, EventResponse, PipeRequest, PipeResponse,
+    EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -84,10 +84,13 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
         let buffer_descriptor = match &operation {
             BrokerOperation::Pipe(PipeRequest::Read(request)) => Some(request.buffer),
             BrokerOperation::Pipe(PipeRequest::Write(request)) => Some(request.buffer),
+            BrokerOperation::Socket(SocketRequest::Send(request)) => Some(request.buffer),
+            BrokerOperation::Socket(SocketRequest::Receive(request)) => Some(request.buffer),
             BrokerOperation::CloseObject(_)
             | BrokerOperation::CheckReadiness(_)
             | BrokerOperation::Event(_)
-            | BrokerOperation::Pipe(PipeRequest::Create(_)) => None,
+            | BrokerOperation::Pipe(PipeRequest::Create(_))
+            | BrokerOperation::Socket(_) => None,
         };
 
         {
@@ -300,6 +303,19 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::Pipe(request) => {
             handle_pipe_request(session, request, shared_buffers).map(BrokerResult::Pipe)
         }
+        // The socket protocol is defined before the broker implements it, so
+        // the operations decode and their shared-buffer leases are validated,
+        // but no socket object exists to act on one yet.
+        //
+        // `UnsupportedOperation` is deliberately in the local endpoint's fatal
+        // group alongside `MalformedRequest` and `ProtocolState`: it means the
+        // local sent an operation this broker never serves, which cannot happen
+        // unless the two sides disagree about the protocol. No local code
+        // constructs a socket request today, so this is unreachable; reporting
+        // a recoverable code instead would let a future wiring mistake look
+        // like an ordinary runtime failure rather than the contract violation
+        // it is.
+        BrokerOperation::Socket(_) => Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation)),
     }
 }
 

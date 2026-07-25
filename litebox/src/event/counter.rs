@@ -485,7 +485,9 @@ mod tests {
                 BrokerOperation::CheckReadiness(_) => {
                     BrokerResult::Readiness(ReadinessFlags::WRITE)
                 }
-                request @ (BrokerOperation::Event(_) | BrokerOperation::Pipe(_)) => {
+                request @ (BrokerOperation::Event(_)
+                | BrokerOperation::Pipe(_)
+                | BrokerOperation::Socket(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
             };

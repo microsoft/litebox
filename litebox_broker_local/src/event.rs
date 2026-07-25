@@ -76,7 +76,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response @ (BrokerResult::ObjectClosed
             | BrokerResult::Readiness(_)
-            | BrokerResult::Pipe(_)) => {
+            | BrokerResult::Pipe(_)
+            | BrokerResult::Socket(_)) => {
                 panic!("broker returned unexpected event response: {response:?}");
             }
         }

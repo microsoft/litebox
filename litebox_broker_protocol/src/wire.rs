@@ -30,12 +30,14 @@ use primitive::{Decoder, Encoder};
 mod event;
 mod pipe;
 mod primitive;
+mod socket;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
 const REQUEST_TAG_CLOSE_OBJECT: u8 = 2;
 const REQUEST_TAG_PIPE: u8 = 3;
 const REQUEST_TAG_CHECK_READINESS: u8 = 4;
+const REQUEST_TAG_SOCKET: u8 = 5;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
@@ -45,11 +47,12 @@ const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
 const RESPONSE_TAG_PIPE: u8 = 5;
 const RESPONSE_TAG_READINESS: u8 = 6;
 const RESPONSE_TAG_ERROR: u8 = 7;
+const RESPONSE_TAG_SOCKET: u8 = 8;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 26;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 30;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -92,7 +95,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         REQUEST_TAG_EVENT
         | REQUEST_TAG_CLOSE_OBJECT
         | REQUEST_TAG_PIPE
-        | REQUEST_TAG_CHECK_READINESS => {
+        | REQUEST_TAG_CHECK_READINESS
+        | REQUEST_TAG_SOCKET => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -132,6 +136,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             pipe::encode_pipe_request(&mut encoder, request);
         }
+        BrokerOperation::Socket(request) => {
+            encoder.u8(REQUEST_TAG_SOCKET);
+            encoder.request_id(request_id);
+            socket::encode_socket_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -145,7 +154,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_CLOSE_OBJECT
         | REQUEST_TAG_CHECK_READINESS
         | REQUEST_TAG_EVENT
-        | REQUEST_TAG_PIPE => {}
+        | REQUEST_TAG_PIPE
+        | REQUEST_TAG_SOCKET => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -154,6 +164,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_CHECK_READINESS => BrokerOperation::CheckReadiness(decoder.handle()?),
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
+        REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -202,7 +213,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_OBJECT_CLOSED
         | RESPONSE_TAG_PIPE
         | RESPONSE_TAG_READINESS
-        | RESPONSE_TAG_ERROR => {
+        | RESPONSE_TAG_ERROR
+        | RESPONSE_TAG_SOCKET => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -245,6 +257,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             pipe::encode_pipe_response(&mut encoder, response);
         }
+        BrokerResult::Socket(response) => {
+            encoder.u8(RESPONSE_TAG_SOCKET);
+            encoder.request_id(request_id);
+            socket::encode_socket_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -266,13 +283,15 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_OBJECT_CLOSED
         | RESPONSE_TAG_PIPE
         | RESPONSE_TAG_READINESS
-        | RESPONSE_TAG_ERROR => {}
+        | RESPONSE_TAG_ERROR
+        | RESPONSE_TAG_SOCKET => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
     let result = match tag {
         RESPONSE_TAG_EVENT => BrokerResult::Event(event::decode_event_response(&mut decoder)?),
         RESPONSE_TAG_PIPE => BrokerResult::Pipe(pipe::decode_pipe_response(&mut decoder)?),
+        RESPONSE_TAG_SOCKET => BrokerResult::Socket(socket::decode_socket_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerResult::Error(error)
@@ -323,12 +342,21 @@ mod tests {
         AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
         CreateEventResponse, EventConsumeMode, EventConsumption,
     };
-    use crate::message::{EventRequest, EventResponse, PipeRequest, PipeResponse};
+    use crate::message::{
+        EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest, SocketResponse,
+    };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
     };
     use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
+    use crate::socket::{
+        AddressFamily, ConnectSocketRequest, ConnectSocketResponse, ConnectStatus,
+        CreateSocketRequest, CreateSocketResponse, IpProtocol, Ipv4Address, Port, ReceiveFlags,
+        ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest,
+        SendSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketAddressV4, SocketError,
+        SocketStatusRequest, SocketStatusResponse, SocketType,
+    };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
@@ -386,6 +414,47 @@ mod tests {
                     length: 3,
                 },
             })),
+            BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Stream,
+                protocol: IpProtocol::Tcp,
+            })),
+            BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
+                handle,
+                address: SocketAddressV4 {
+                    address: Ipv4Address([203, 0, 113, 7]),
+                    port: Port(443),
+                },
+            })),
+            BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(15),
+                    length: 3,
+                },
+                flags: SendFlags::NONE,
+            })),
+            BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(15),
+                    length: 3,
+                },
+                flags: ReceiveFlags::PEEK,
+            })),
+            BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+                handle,
+                mode: ShutdownMode::Read,
+            })),
+            BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+                handle,
+                mode: ShutdownMode::Write,
+            })),
+            BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+                handle,
+                mode: ShutdownMode::Both,
+            })),
+            BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -398,8 +467,85 @@ mod tests {
             maximum_encoded_size = maximum_encoded_size.max(encoded.len());
             assert!(encoded.len() <= MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
             assert_eq!(decode_request(&encoded).unwrap(), request);
+            // Every active tag must be reported as a phase violation during
+            // the handshake, not as an unknown tag: only the former is turned
+            // into a clean protocol-violation shutdown by the transport.
+            assert_eq!(
+                decode_handshake_request(&encoded),
+                Err(WireError::WrongMessagePhase)
+            );
         }
         assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn flag_bits_round_trip_unmasked() {
+        // The codec carries flags verbatim so the core can reject unsupported
+        // bits; masking them here would hide them from that check, and a
+        // dropped field would make an unsupported flag look like none at all.
+        let handle = ObjectHandle(13);
+        let buffer = SharedBufferDescriptor {
+            slot_index: SharedBufferSlotIndex(15),
+            length: 3,
+        };
+        let unsupported = 0x8000_0001;
+        for operation in [
+            BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
+                handle,
+                buffer,
+                flags: SendFlags(unsupported),
+            })),
+            BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+                handle,
+                buffer,
+                flags: ReceiveFlags(unsupported),
+            })),
+        ] {
+            let request = BrokerRequest {
+                request_id: TEST_REQUEST_ID,
+                operation,
+            };
+            assert_eq!(
+                decode_request(&encode_request(request.clone())).unwrap(),
+                request
+            );
+        }
+
+        assert!(SendFlags(unsupported).has_unsupported_bits());
+        assert!(ReceiveFlags(unsupported).has_unsupported_bits());
+        // No send flag exists yet, so every bit is unsupported there.
+        assert!(SendFlags(ReceiveFlags::PEEK.0).has_unsupported_bits());
+        assert!(!SendFlags::NONE.has_unsupported_bits());
+        assert!(!ReceiveFlags::PEEK.has_unsupported_bits());
+        assert!(ReceiveFlags::PEEK.contains(ReceiveFlags::PEEK));
+        assert!(!ReceiveFlags::NONE.contains(ReceiveFlags::PEEK));
+    }
+
+    #[test]
+    fn socket_error_codec_round_trips_all_variants() {
+        for error in [
+            SocketError::ConnectionRefused,
+            SocketError::ConnectionReset,
+            SocketError::ConnectionAborted,
+            SocketError::NetworkUnreachable,
+            SocketError::HostUnreachable,
+            SocketError::TimedOut,
+            SocketError::AddressInUse,
+            SocketError::AddressNotAvailable,
+            SocketError::PolicyDenied,
+            SocketError::Other,
+        ] {
+            let response = BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+                    error: Some(error),
+                })),
+            };
+            assert_eq!(
+                decode_response(&encode_response(response.clone())).unwrap(),
+                response
+            );
+        }
     }
 
     #[test]
@@ -458,6 +604,22 @@ mod tests {
             })),
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 })),
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
+            BrokerResult::Socket(SocketResponse::Create(CreateSocketResponse { handle })),
+            BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+                status: ConnectStatus::Connected,
+            })),
+            BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+                status: ConnectStatus::InProgress,
+            })),
+            BrokerResult::Socket(SocketResponse::Send(SendSocketResponse { sent: 3 })),
+            BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse {
+                received: 3,
+            })),
+            BrokerResult::Socket(SocketResponse::Shutdown),
+            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse { error: None })),
+            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+                error: Some(SocketError::ConnectionRefused),
+            })),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -475,8 +637,14 @@ mod tests {
             maximum_encoded_size = maximum_encoded_size.max(encoded.len());
             assert!(encoded.len() <= MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
             assert_eq!(decode_response(&encoded).unwrap(), response);
+            assert_eq!(
+                decode_handshake_response(&encoded),
+                Err(WireError::WrongMessagePhase)
+            );
         }
-        assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+        // Requests bind the shared limit, so responses only have to fit under
+        // it. The request test asserts the limit is reached and therefore tight.
+        assert!(maximum_encoded_size <= MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
     }
 
     #[test]
@@ -580,6 +748,144 @@ mod tests {
         });
         frame.push(0xff);
         assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
+    }
+
+    #[test]
+    fn decode_rejects_malformed_socket_request_frames() {
+        let mut unknown_operation = Vec::from([REQUEST_TAG_SOCKET]);
+        unknown_operation.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
+        unknown_operation.push(0xff);
+        assert_eq!(
+            decode_request(&unknown_operation),
+            Err(WireError::InvalidTag)
+        );
+
+        // A socket envelope carrying no family tag at all.
+        assert_eq!(
+            decode_request(&unknown_operation[..unknown_operation.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+
+        // Address family, type, and protocol are the last three bytes of a
+        // create frame, so each unknown tag is rejected on its own.
+        let create = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Stream,
+                protocol: IpProtocol::Tcp,
+            })),
+        });
+        for offset in 1..=3 {
+            let mut frame = create.clone();
+            let index = frame.len() - offset;
+            frame[index] = 0xff;
+            assert_eq!(decode_request(&frame), Err(WireError::InvalidTag));
+        }
+        assert_eq!(
+            decode_request(&create[..create.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+
+        let mut unknown_shutdown_mode = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+                handle: ObjectHandle(9),
+                mode: ShutdownMode::Both,
+            })),
+        });
+        *unknown_shutdown_mode.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_request(&unknown_shutdown_mode),
+            Err(WireError::InvalidTag)
+        );
+
+        let connect = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
+                handle: ObjectHandle(9),
+                address: SocketAddressV4 {
+                    address: Ipv4Address([203, 0, 113, 7]),
+                    port: Port(443),
+                },
+            })),
+        });
+        assert_eq!(
+            decode_request(&connect[..connect.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+
+        let mut trailing = connect;
+        trailing.push(0);
+        assert_eq!(decode_request(&trailing), Err(WireError::TrailingBytes));
+    }
+
+    #[test]
+    fn decode_rejects_malformed_socket_response_frames() {
+        let mut unknown_response = Vec::from([RESPONSE_TAG_SOCKET]);
+        unknown_response.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
+        unknown_response.push(0xff);
+        assert_eq!(
+            decode_response(&unknown_response),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_response(&unknown_response[..unknown_response.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+
+        let mut unknown_connect_status = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+                status: ConnectStatus::InProgress,
+            })),
+        });
+        *unknown_connect_status.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_response(&unknown_connect_status),
+            Err(WireError::InvalidTag)
+        );
+
+        // The status response encodes presence and, when present, the error
+        // itself, so both tags reject unknown values.
+        let mut unknown_status_presence = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+                error: None,
+            })),
+        });
+        *unknown_status_presence.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_response(&unknown_status_presence),
+            Err(WireError::InvalidTag)
+        );
+
+        let mut unknown_socket_error = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+                error: Some(SocketError::TimedOut),
+            })),
+        });
+        *unknown_socket_error.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_response(&unknown_socket_error),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_response(&unknown_socket_error[..unknown_socket_error.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+
+        let received = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse {
+                received: 4096,
+            })),
+        });
+        assert_eq!(
+            decode_response(&received[..received.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
     }
 
     #[test]
@@ -716,6 +1022,25 @@ mod tests {
                 })),
             }),
             [1, 13, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn socket_connect_request_wire_shape_is_pinned() {
+        assert_eq!(
+            encode_request(BrokerRequest {
+                request_id: RequestId(13),
+                operation: BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
+                    handle: ObjectHandle(9),
+                    address: SocketAddressV4 {
+                        address: Ipv4Address([203, 0, 113, 7]),
+                        port: Port(443),
+                    },
+                })),
+            }),
+            [
+                5, 13, 0, 0, 0, 0, 0, 0, 0, 1, 9, 0, 0, 0, 0, 0, 0, 0, 203, 0, 113, 7, 187, 1
+            ]
         );
     }
 

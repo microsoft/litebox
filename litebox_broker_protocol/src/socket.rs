@@ -1,0 +1,282 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Typed values for broker-mediated network sockets.
+//!
+//! These describe what a local endpoint may ask the broker to do with a socket,
+//! never how the broker does it: no descriptor, poll registration, or platform
+//! error appears here. Every value is a closed set rather than a passthrough
+//! integer, so a local endpoint cannot name an address family, type, protocol,
+//! or flag the broker has not agreed to support.
+
+use crate::ObjectHandle;
+use crate::shared_buffer::SharedBufferDescriptor;
+
+/// Address family of a broker socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AddressFamily {
+    /// IPv4.
+    Ipv4,
+}
+
+/// Communication semantics of a broker socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SocketType {
+    /// Reliable ordered byte stream.
+    Stream,
+}
+
+/// IP protocol carried by a broker socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IpProtocol {
+    /// TCP.
+    Tcp,
+}
+
+/// Which directions of a socket to shut down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShutdownMode {
+    /// Further receives return end of stream.
+    Read,
+    /// The peer sees end of stream.
+    Write,
+    /// Both directions.
+    Both,
+}
+
+/// IPv4 address in network byte order.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ipv4Address(pub [u8; 4]);
+
+/// Transport port in host byte order.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Port(pub u16);
+
+/// IPv4 socket address.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SocketAddressV4 {
+    /// IPv4 address.
+    pub address: Ipv4Address,
+    /// Transport port.
+    pub port: Port,
+}
+
+/// Flags for a send operation.
+///
+/// Send and receive flags are separate types because their underlying flag sets
+/// are disjoint: a receive-only flag such as [`ReceiveFlags::PEEK`] is
+/// meaningless on a send, and one shared type would let a local endpoint name it
+/// there.
+///
+/// Like [`ReceiveFlags`] and unlike [`ReadinessFlags`], which preserves bits a
+/// peer may not understand, this is bounded: flags are forwarded to a host
+/// socket operation, so a bit the broker does not recognize must never reach
+/// one. [`Self::SUPPORTED`] defines the bound as part of the ABI, and the broker
+/// rejects anything outside it rather than masking it away, which would silently
+/// perform an operation the caller did not ask for.
+///
+/// No send flag is supported yet, so any nonzero value is rejected.
+///
+/// [`ReadinessFlags`]: crate::readiness::ReadinessFlags
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SendFlags(pub u32);
+
+impl SendFlags {
+    /// No flags.
+    pub const NONE: Self = Self(0);
+
+    /// Every send flag this protocol version defines.
+    pub const SUPPORTED: Self = Self(0);
+
+    /// Returns whether any bit outside [`Self::SUPPORTED`] is set.
+    #[must_use]
+    pub const fn has_unsupported_bits(self) -> bool {
+        self.0 & !Self::SUPPORTED.0 != 0
+    }
+}
+
+/// Flags for a receive operation.
+///
+/// See [`SendFlags`] for why the two directions are separate types and why both
+/// are bounded rather than passthrough.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReceiveFlags(pub u32);
+
+impl ReceiveFlags {
+    /// No flags.
+    pub const NONE: Self = Self(0);
+    /// Return data without consuming it.
+    pub const PEEK: Self = Self(1 << 0);
+
+    /// Every receive flag this protocol version defines.
+    pub const SUPPORTED: Self = Self(Self::PEEK.0);
+
+    /// Returns whether any bit outside [`Self::SUPPORTED`] is set.
+    #[must_use]
+    pub const fn has_unsupported_bits(self) -> bool {
+        self.0 & !Self::SUPPORTED.0 != 0
+    }
+
+    /// Returns whether every flag in `other` is set.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// Reason a socket connection failed.
+///
+/// This is a bounded restatement of the connection-level failures a host stack
+/// reports, kept separate from [`ErrorCode`] because those describe how the
+/// broker handled a request, not what a remote peer or network did. Keeping
+/// them apart also means adding a network failure never widens the error type
+/// every broker operation can return.
+///
+/// [`ErrorCode`]: crate::error::ErrorCode
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SocketError {
+    /// The peer refused the connection.
+    ConnectionRefused,
+    /// The connection was reset by the peer.
+    ConnectionReset,
+    /// The connection was aborted before it completed.
+    ConnectionAborted,
+    /// No route to the network.
+    NetworkUnreachable,
+    /// No route to the host.
+    HostUnreachable,
+    /// The connection attempt timed out.
+    TimedOut,
+    /// The address is already in use.
+    AddressInUse,
+    /// The address is not available on this host.
+    AddressNotAvailable,
+    /// The policy engine refused the destination.
+    PolicyDenied,
+    /// The host stack failed in a way this protocol does not distinguish.
+    Other,
+}
+
+/// Request to create a broker-owned socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateSocketRequest {
+    /// Address family.
+    pub address_family: AddressFamily,
+    /// Communication semantics.
+    pub socket_type: SocketType,
+    /// Transport protocol.
+    pub protocol: IpProtocol,
+}
+
+/// Response to a socket create request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateSocketResponse {
+    /// Handle naming the new socket.
+    pub handle: ObjectHandle,
+}
+
+/// Request to connect a socket to a remote address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Remote address to connect to.
+    pub address: SocketAddressV4,
+}
+
+/// Response to a socket connect request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectSocketResponse {
+    /// Whether the connection completed or is still in progress.
+    pub status: ConnectStatus,
+}
+
+/// Outcome of a connect attempt.
+///
+/// The broker only performs non-blocking operations, so a connect that cannot
+/// complete immediately reports [`Self::InProgress`] rather than waiting. The
+/// caller waits for write readiness and then reads the outcome with a status
+/// request, which is the only way a failed connect is reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectStatus {
+    /// The connection is established.
+    Connected,
+    /// The connection is still being established.
+    InProgress,
+}
+
+/// Request to send bytes staged in shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Leased shared-buffer region containing the staged bytes.
+    pub buffer: SharedBufferDescriptor,
+    /// Send flags.
+    pub flags: SendFlags,
+}
+
+/// Response describing a completed send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendSocketResponse {
+    /// Number of bytes accepted by the socket.
+    pub sent: u32,
+}
+
+/// Request to receive bytes into shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Leased shared-buffer region to receive the bytes.
+    pub buffer: SharedBufferDescriptor,
+    /// Receive flags.
+    pub flags: ReceiveFlags,
+}
+
+/// Response describing bytes received into shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveSocketResponse {
+    /// Number of bytes placed in the receive region.
+    ///
+    /// Zero means the peer closed its write side; a socket with nothing to read
+    /// yet reports [`ErrorCode::WouldBlock`] instead.
+    ///
+    /// [`ErrorCode::WouldBlock`]: crate::error::ErrorCode::WouldBlock
+    pub received: u32,
+}
+
+/// Request to shut down one or both directions of a socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShutdownSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Directions to shut down.
+    pub mode: ShutdownMode,
+}
+
+/// Request for a socket's pending connection outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketStatusRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+}
+
+/// Response describing a socket's pending connection outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketStatusResponse {
+    /// The failure the socket recorded, if any.
+    ///
+    /// Reading the status clears it, so each failure is reported once.
+    pub error: Option<SocketError>,
+}

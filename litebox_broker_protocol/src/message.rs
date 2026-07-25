@@ -11,6 +11,11 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::readiness::ReadinessFlags;
+use crate::socket::{
+    ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
+    ReceiveSocketRequest, ReceiveSocketResponse, SendSocketRequest, SendSocketResponse,
+    ShutdownSocketRequest, SocketStatusRequest, SocketStatusResponse,
+};
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
 /// Broker handshake request sent before the control channel is active.
@@ -31,6 +36,8 @@ pub enum BrokerOperation {
     Event(EventRequest),
     /// Pipe object request family.
     Pipe(PipeRequest),
+    /// Socket object request family.
+    Socket(SocketRequest),
 }
 
 /// Request sent over an active broker control channel.
@@ -88,6 +95,23 @@ pub enum PipeRequest {
     Write(WritePipeRequest),
 }
 
+/// Broker-owned socket object request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SocketRequest {
+    /// Create a broker-owned socket.
+    Create(CreateSocketRequest),
+    /// Connect a socket to a remote address.
+    Connect(ConnectSocketRequest),
+    /// Send bytes staged in shared memory.
+    Send(SendSocketRequest),
+    /// Receive bytes into shared memory.
+    Receive(ReceiveSocketRequest),
+    /// Shut down one or both directions.
+    Shutdown(ShutdownSocketRequest),
+    /// Read a socket's pending connection outcome.
+    Status(SocketStatusRequest),
+}
+
 /// Result returned for an active broker operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResult {
@@ -99,6 +123,8 @@ pub enum BrokerResult {
     Event(EventResponse),
     /// Pipe object response family.
     Pipe(PipeResponse),
+    /// Socket object response family.
+    Socket(SocketResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -132,6 +158,23 @@ pub enum PipeResponse {
     Read(ReadPipeResponse),
     /// Write operation response.
     Write(WritePipeResponse),
+}
+
+/// Broker-owned socket object response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SocketResponse {
+    /// Create operation response.
+    Create(CreateSocketResponse),
+    /// Connect operation response.
+    Connect(ConnectSocketResponse),
+    /// Send operation response.
+    Send(SendSocketResponse),
+    /// Receive operation response.
+    Receive(ReceiveSocketResponse),
+    /// Shutdown operation completed.
+    Shutdown,
+    /// Status operation response.
+    Status(SocketStatusResponse),
 }
 
 /// Broker-initiated asynchronous notification.
