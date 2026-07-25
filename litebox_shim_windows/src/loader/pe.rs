@@ -436,8 +436,16 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
         teb_ptr + core::mem::offset_of!(ThreadEnvironmentBlock, tls_slots);
     teb.process_environment_block = peb;
     teb.real_client_id = client_id;
-    teb.activation_context_stack_pointer =
+    let activation_context_stack =
         teb_ptr + core::mem::offset_of!(ThreadEnvironmentBlock, activation_stack);
+    let activation_frame_list = activation_context_stack
+        + core::mem::offset_of!(crate::nt_types::ActivationContextStack, frame_list_cache);
+    teb.activation_stack.frame_list_cache = crate::nt_types::ListEntry {
+        flink: activation_frame_list,
+        blink: activation_frame_list,
+    };
+    teb.activation_stack.next_cookie_sequence_number = 1;
+    teb.activation_context_stack_pointer = activation_context_stack;
     teb.static_unicode_string =
         initial_teb_static_unicode_string(teb_ptr, &teb.static_unicode_buffer)?;
     teb.deallocation_stack = stack_base.as_usize();
@@ -2132,6 +2140,20 @@ mod tests {
         );
         assert_eq!(current_teb.process_environment_block, peb_address);
         assert_eq!(current_teb.client_id, host_client_id());
+        let activation_frame_list = synthetic.environment.teb
+            + core::mem::offset_of!(ThreadEnvironmentBlock, activation_stack)
+            + core::mem::offset_of!(crate::nt_types::ActivationContextStack, frame_list_cache);
+        assert_eq!(
+            synthetic.teb.activation_stack.frame_list_cache,
+            crate::nt_types::ListEntry {
+                flink: activation_frame_list,
+                blink: activation_frame_list,
+            }
+        );
+        assert_eq!(
+            synthetic.teb.activation_stack.next_cookie_sequence_number,
+            1
+        );
 
         print_diff_header("synthetic TEB vs host TEB");
         print_diff_fields!(

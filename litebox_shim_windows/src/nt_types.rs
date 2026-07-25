@@ -483,8 +483,15 @@ pub struct NtTib {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
 pub struct ActivationContextStack {
-    _reserved: [u8; 0x28],
+    pub(crate) active_frame: usize,
+    pub(crate) frame_list_cache: ListEntry,
+    pub(crate) flags: u32,
+    pub(crate) next_cookie_sequence_number: u32,
+    pub(crate) stack_id: u32,
+    pub(crate) _padding: u32,
 }
+
+const _: () = assert!(core::mem::size_of::<ActivationContextStack>() == 0x28);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
@@ -500,7 +507,7 @@ pub struct ClientId {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, Immutable)]
 pub struct ListEntry {
     pub flink: usize,
     pub blink: usize,
