@@ -309,6 +309,13 @@ impl ReadinessPublisher {
     pub fn tracked_objects(&self) -> usize {
         self.state.lock().entries.len()
     }
+
+    /// Number of queue slots holding work, which must never exceed the number
+    /// of tracked objects.
+    #[cfg(test)]
+    fn queued_updates(&self) -> usize {
+        self.state.lock().queue.len()
+    }
 }
 
 /// Publishes coalesced readiness updates until publication closes.
@@ -511,6 +518,9 @@ mod tests {
         publisher.retire(HANDLE);
 
         assert_eq!(publisher.tracked_objects(), 1);
+        // The queued slot goes with the object; leaving it behind would let a
+        // local grow the queue without bound by cycling objects.
+        assert_eq!(publisher.queued_updates(), 1);
         assert_eq!(
             drain(&publisher),
             [ReadinessNotification {
@@ -676,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn publishing_drains_pending_work_before_observing_closure() {
+    fn queued_updates_publish_in_order_until_the_waiter_closes() {
         let publisher = ReadinessPublisher::new();
         publish(&publisher, HANDLE, ReadinessFlags::READ);
         publish(&publisher, OTHER_HANDLE, ReadinessFlags::WRITE);
@@ -801,6 +811,9 @@ mod tests {
         publish(&publisher, HANDLE, ReadinessFlags::WRITE);
         drop(stale);
 
+        // The newer change already queued the object, so the abandoned claim
+        // must not queue it a second time.
+        assert_eq!(publisher.queued_updates(), 1);
         assert_eq!(
             drain(&publisher),
             [ReadinessNotification {
