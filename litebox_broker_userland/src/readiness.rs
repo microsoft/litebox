@@ -54,8 +54,12 @@ impl ReadinessPublisherRuntime {
     /// Records the authoritative readiness of one broker object.
     ///
     /// Updates are coalesced per object, so a source may call this as often as
-    /// its backend state changes. Returns an error only when the association
-    /// already tracks the maximum number of objects.
+    /// its backend state changes. An update recorded after [`close`] is
+    /// discarded rather than reported, because the association it would reach
+    /// is already over. Returns an error only when the association already
+    /// tracks the maximum number of objects.
+    ///
+    /// [`close`]: Self::close
     pub fn publish(
         &self,
         handle: ObjectHandle,

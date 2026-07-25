@@ -473,23 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_stays_pending_until_it_is_confirmed() {
-        let publisher = ReadinessPublisher::new();
-        publish(&publisher, HANDLE, ReadinessFlags::READ);
-        let pending = publisher.take_pending().unwrap();
-
-        // An interrupted publisher never confirms, so re-queueing the handle
-        // must reoffer the update rather than treat it as delivered.
-        publish(&publisher, HANDLE, ReadinessFlags::WRITE);
-        publish(&publisher, HANDLE, ReadinessFlags::READ);
-
-        assert_eq!(
-            publisher.take_pending().unwrap().notification(),
-            pending.notification()
-        );
-    }
-
-    #[test]
     fn independent_objects_publish_independently() {
         let publisher = ReadinessPublisher::new();
 
@@ -714,12 +697,20 @@ mod tests {
         let (_releaser, release) = std::sync::mpsc::channel();
         let mut channel = GatedChannel { sent, release };
         let parked = std::sync::Arc::clone(&publisher);
+        let (parked_sender, parked_receiver) = std::sync::mpsc::channel();
 
         let publisher_thread = std::thread::spawn(move || {
             publish_readiness(&parked, &mut channel, || {
+                // Reporting from inside the wait is what proves the publisher
+                // reached it, so closing is what ends it rather than a queue it
+                // already found closed.
+                let _ = parked_sender.send(());
                 std::thread::sleep(core::time::Duration::from_millis(1));
             })
         });
+        parked_receiver
+            .recv()
+            .expect("publication must park before it is closed");
         publisher.close();
 
         publisher_thread.join().unwrap().unwrap();

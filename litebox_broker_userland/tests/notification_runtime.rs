@@ -209,16 +209,28 @@ fn a_host_readiness_source_wakes_a_blocked_local_receiver() {
         publisher.join().unwrap().unwrap();
     });
 
-    let (local, mut notifications) = negotiate_local(local_control);
-    let received = readiness_of(notifications.recv_notification().unwrap());
+    let (local, notifications) = negotiate_local(local_control);
+    let (notification_sender, notification_receiver) = channel();
+    let receiver_thread = std::thread::spawn(move || {
+        let mut notifications = notifications;
+        // Receiving on a helper thread keeps a wake that never arrives a test
+        // failure rather than a hang: the notification wait has no deadline of
+        // its own.
+        let notification = readiness_of(notifications.recv_notification().unwrap());
+        notification_sender.send(notification).unwrap();
+        notifications
+    });
 
     assert_eq!(
-        received,
+        notification_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("a host readiness source must wake the blocked local receiver"),
         ReadinessNotification {
             handle: HANDLE,
             readiness,
         }
     );
+    let _notifications = receiver_thread.join().unwrap();
     drop(finish_sender);
     drop(local);
     host.join().unwrap();
