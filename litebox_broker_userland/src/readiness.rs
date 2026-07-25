@@ -85,7 +85,12 @@ impl ReadinessPublisherRuntime {
         publish_readiness(&self.publisher, channel, || self.wait_for_work())
     }
 
-    /// Closes publication and wakes the publisher so [`run`] returns.
+    /// Closes publication and wakes a publisher parked for work so [`run`]
+    /// returns.
+    ///
+    /// A publisher already inside a blocking send is not woken by this; the
+    /// notification transport ends that send when the association fails or its
+    /// peer closes.
     ///
     /// [`run`]: Self::run
     pub fn close(&self) {
@@ -181,6 +186,9 @@ mod tests {
             publishing.run(&mut channel)
         });
 
+        // The publisher parks on an empty queue first, so closing is what must
+        // end it rather than a queue it already found closed.
+        std::thread::sleep(Duration::from_millis(20));
         runtime.close();
 
         publisher.join().unwrap().unwrap();

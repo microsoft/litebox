@@ -62,9 +62,9 @@ pub enum PublishOutcome {
     /// The update queued work the publisher may not know about yet, so the
     /// deployment must wake its publisher.
     Queued,
-    /// The update matched the newest recorded state, so delivery for it is
-    /// already known to the local endpoint, queued, or in flight. No wake is
-    /// required.
+    /// The update needs no wake: it either matched the newest recorded state or
+    /// joined a notification that is already queued or in flight, which carries
+    /// the newest flags when it is published.
     Coalesced,
     /// The publisher is closed and the update was discarded.
     Closed,
@@ -333,7 +333,9 @@ impl ReadinessPublisher {
 ///
 /// Returns `Ok(())` once publication is closed and no claim is outstanding. A
 /// failed send returns its error with the claimed update left publishable, so
-/// resuming on a replacement channel does not lose the notification.
+/// resuming on a replacement channel does not lose the notification; the
+/// requeue raises no wake of its own, so a deployment that resumes must call
+/// this again rather than wait for one.
 pub fn publish_readiness<Channel: HostNotificationChannel>(
     publisher: &ReadinessPublisher,
     channel: &mut Channel,

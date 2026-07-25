@@ -142,6 +142,20 @@ fn serve_runner(
     Ok(())
 }
 
+/// Closes readiness publication when an association scope ends for any reason.
+///
+/// The publisher is a scoped thread, so the scope joins it before propagating a
+/// panic out of the association. A publisher parked for work only returns once
+/// publication closes, so an unwind that skipped closing would hang teardown
+/// forever instead of reporting the panic.
+struct ReadinessPublicationGuard<'runtime>(&'runtime ReadinessPublisherRuntime);
+
+impl Drop for ReadinessPublicationGuard<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 fn dispatch_requests<Memory: SharedMemory>(
     association: BrokerHostAssociation<'_, Memory>,
     mut request_source: UnixControlRingHostRequestSource,
@@ -174,6 +188,11 @@ fn dispatch_requests<Memory: SharedMemory>(
                 None
             }
         };
+
+        // Publication must close on every exit, including an unwind: the scope
+        // joins the publisher before it propagates a panic, and a publisher
+        // parked for work would never return, hanging teardown instead.
+        let _publication = ReadinessPublicationGuard(&readiness);
 
         let mut workers = Vec::with_capacity(WORKER_COUNT);
         for worker_id in 0..WORKER_COUNT {
@@ -208,7 +227,9 @@ fn dispatch_requests<Memory: SharedMemory>(
         // Readiness publication lives exactly as long as the association. The
         // request reader returns only once the association is over, but workers
         // keep draining already-queued requests after that, so publication must
-        // outlive them or a late readiness change would be discarded.
+        // outlive them or a late readiness change would be discarded. Closing
+        // here rather than leaving it to the guard orders it before the join
+        // that observes a panicking publisher.
         readiness.close();
         if let Some(publisher) = publisher
             && publisher.join().is_err()
@@ -367,6 +388,44 @@ mod tests {
     use litebox_broker_protocol::message::BrokerHandshakeResponse;
     use litebox_broker_transport::unix_socket::UnixStreamLocalSetupChannel;
     use std::os::fd::AsFd;
+
+    #[test]
+    fn dropping_the_publication_guard_ends_a_parked_publisher() {
+        use litebox_broker_protocol::channel::HostNotificationChannel;
+        use litebox_broker_protocol::message::BrokerNotification;
+
+        struct DiscardingChannel;
+
+        impl HostNotificationChannel for DiscardingChannel {
+            type Error = IoError;
+
+            fn send_notification(&mut self, _notification: &BrokerNotification) -> IoResult<()> {
+                Ok(())
+            }
+        }
+
+        let readiness = Arc::new(ReadinessPublisherRuntime::new());
+        let publishing = Arc::clone(&readiness);
+        let (finished, finish) = sync_channel(1);
+        let publisher = std::thread::spawn(move || {
+            finished
+                .send(publishing.run(&mut DiscardingChannel))
+                .unwrap();
+        });
+
+        // The publisher parks on an empty queue, so only closing publication
+        // ends it. An unwind past the explicit close leaves the guard as the
+        // only thing that can, and the scope joins the publisher before it
+        // propagates the panic.
+        std::thread::sleep(Duration::from_millis(20));
+        drop(ReadinessPublicationGuard(&readiness));
+
+        finish
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("dropping the guard must end the parked publisher")
+            .unwrap();
+        publisher.join().unwrap();
+    }
 
     #[test]
     fn first_failure_is_preserved_and_unblocks_request_reading() {
