@@ -127,6 +127,7 @@ mod tests {
     use super::*;
 
     const HANDLE: ObjectHandle = ObjectHandle(3);
+    const OTHER_HANDLE: ObjectHandle = ObjectHandle(5);
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct RecordingChannel {
@@ -187,15 +188,33 @@ mod tests {
 
     #[test]
     fn retired_objects_stop_being_published() {
-        let runtime = ReadinessPublisherRuntime::new();
+        let runtime = Arc::new(ReadinessPublisherRuntime::new());
         let (sent, received) = channel();
-        let mut channel = RecordingChannel { sent };
+
+        // The retired handle is queued ahead of the surviving one, so it would
+        // arrive first if retirement had not dropped its queued update. The
+        // publisher starts only once both calls have run, which keeps it from
+        // draining the queue before retirement.
         runtime.publish(HANDLE, ReadinessFlags::READ).unwrap();
-
         runtime.retire(HANDLE);
-        runtime.close();
-        runtime.run(&mut channel).unwrap();
+        runtime.publish(OTHER_HANDLE, ReadinessFlags::READ).unwrap();
 
+        let publishing = Arc::clone(&runtime);
+        let publisher = std::thread::spawn(move || {
+            let mut channel = RecordingChannel { sent };
+            publishing.run(&mut channel)
+        });
+
+        assert_eq!(
+            received.recv_timeout(TEST_TIMEOUT).unwrap(),
+            ReadinessNotification {
+                handle: OTHER_HANDLE,
+                readiness: ReadinessFlags::READ,
+            },
+            "a retired object must not be published"
+        );
+        runtime.close();
+        publisher.join().unwrap().unwrap();
         assert!(received.try_iter().next().is_none());
     }
 }
