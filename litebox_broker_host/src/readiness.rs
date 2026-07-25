@@ -41,10 +41,10 @@ use thiserror::Error;
 
 /// Maximum number of objects one association tracks readiness for.
 ///
-/// An association cannot hold more object references than the broker core
-/// grants in total, so this bound is not reachable before the core reference
-/// limit is. It exists so that a defective readiness source cannot grow
-/// publication state without limit.
+/// This matches the default broker-core reference limit, so a source that
+/// retires an object as its backend resource is released stays well inside it.
+/// It exists so that a source which does not, or a deployment that raises the
+/// core limit, cannot grow publication state without limit.
 pub const MAX_TRACKED_READINESS_OBJECTS: usize = 4096;
 
 /// Error returned when readiness state cannot record an update.

@@ -3,7 +3,7 @@
 
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -103,6 +103,15 @@ fn negotiate_local(
     (local, BrokerNotifications::new(notifications))
 }
 
+/// Receives a publisher's outcome under the test deadline, so publication that
+/// never ends fails the test instead of hanging its join.
+fn expect_publication_ended(outcomes: &Receiver<std::io::Result<()>>) {
+    outcomes
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("publication must end")
+        .expect("publication must end without a transport error");
+}
+
 fn readiness_of(notification: Option<BrokerNotification>) -> ReadinessNotification {
     let Some(BrokerNotification::Readiness(readiness)) = notification else {
         panic!("expected a readiness notification, got {notification:?}");
@@ -193,6 +202,7 @@ fn a_host_readiness_source_wakes_a_blocked_local_receiver() {
     let readiness = ReadinessFlags::READ | ReadinessFlags::WRITE;
     let (local_control, host_control) = UnixStream::pair().unwrap();
     let (finish_sender, finish_receiver) = channel::<()>();
+    let (outcome_sender, outcome_receiver) = channel();
 
     let host = spawn_host(host_control, move |mut notifications, _shutdown| {
         let runtime = Arc::new(ReadinessPublisherRuntime::new());
@@ -206,7 +216,9 @@ fn a_host_readiness_source_wakes_a_blocked_local_receiver() {
 
         let _ = finish_receiver.recv();
         runtime.close();
-        publisher.join().unwrap().unwrap();
+        // Reporting the publisher's outcome rather than joining here keeps a
+        // close that stops waking it a test failure instead of a hang.
+        outcome_sender.send(publisher.join().unwrap()).unwrap();
     });
 
     let (local, notifications) = negotiate_local(local_control);
@@ -233,6 +245,7 @@ fn a_host_readiness_source_wakes_a_blocked_local_receiver() {
     let _notifications = receiver_thread.join().unwrap();
     drop(finish_sender);
     drop(local);
+    expect_publication_ended(&outcome_receiver);
     host.join().unwrap();
 }
 
@@ -241,6 +254,7 @@ fn a_full_notification_ring_does_not_block_readiness_sources() {
     let (local_control, host_control) = UnixStream::pair().unwrap();
     let (published_sender, published_receiver) = channel::<()>();
     let (finish_sender, finish_receiver) = channel::<()>();
+    let (outcome_sender, outcome_receiver) = channel();
 
     let host = spawn_host(host_control, move |mut notifications, _shutdown| {
         let runtime = Arc::new(ReadinessPublisherRuntime::new());
@@ -259,7 +273,7 @@ fn a_full_notification_ring_does_not_block_readiness_sources() {
 
         let _ = finish_receiver.recv();
         runtime.close();
-        publisher.join().unwrap().unwrap();
+        outcome_sender.send(publisher.join().unwrap()).unwrap();
     });
 
     let (local, mut notifications) = negotiate_local(local_control);
@@ -276,6 +290,7 @@ fn a_full_notification_ring_does_not_block_readiness_sources() {
 
     drop(finish_sender);
     drop(local);
+    expect_publication_ended(&outcome_receiver);
     host.join().unwrap();
 }
 

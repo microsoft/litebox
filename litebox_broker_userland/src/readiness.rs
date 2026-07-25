@@ -8,6 +8,7 @@
 //! deployment supplies one. This module pairs that state with a condition
 //! variable and the thread-facing API the broker host binary needs.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use litebox_broker_host::readiness::{
@@ -32,6 +33,7 @@ pub struct ReadinessPublisherRuntime {
     publisher: ReadinessPublisher,
     signaled: Mutex<bool>,
     work_available: Condvar,
+    running: AtomicBool,
 }
 
 impl Default for ReadinessPublisherRuntime {
@@ -48,6 +50,7 @@ impl ReadinessPublisherRuntime {
             publisher: ReadinessPublisher::new(),
             signaled: Mutex::new(false),
             work_available: Condvar::new(),
+            running: AtomicBool::new(false),
         }
     }
 
@@ -82,10 +85,21 @@ impl ReadinessPublisherRuntime {
     /// local endpoint leaves the notification transport full; that is confined
     /// to this thread by design, and association teardown fails the blocked
     /// send through the transport.
+    ///
+    /// # Panics
+    ///
+    /// Panics if publication has already run. Closure is terminal, so a runtime
+    /// serves exactly one publisher, and a second one would park on a wake that
+    /// only ever releases one waiter. That is a silent hang, so the second
+    /// caller is rejected loudly instead.
     pub fn run<Channel: HostNotificationChannel>(
         &self,
         channel: &mut Channel,
     ) -> Result<(), Channel::Error> {
+        assert!(
+            !self.running.swap(true, Ordering::Relaxed),
+            "readiness publication must run exactly once per runtime"
+        );
         publish_readiness(&self.publisher, channel, || self.wait_for_work())
     }
 
@@ -197,6 +211,21 @@ mod tests {
         );
         runtime.close();
         expect_publication_ended(&finish);
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly once")]
+    fn publication_runs_at_most_once() {
+        let runtime = ReadinessPublisherRuntime::new();
+        let (sent, _received) = channel();
+        let mut channel = RecordingChannel { sent };
+
+        // Closure is terminal, so the first run returns at once and the second
+        // would otherwise park on a wake that can never come.
+        runtime.close();
+        runtime.run(&mut channel).unwrap();
+
+        let _ = runtime.run(&mut channel);
     }
 
     #[test]
