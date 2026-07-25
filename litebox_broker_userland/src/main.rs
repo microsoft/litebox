@@ -142,17 +142,24 @@ fn serve_runner(
     Ok(())
 }
 
-/// Closes readiness publication when an association scope ends for any reason.
+/// Ends readiness publication when an association scope ends for any reason.
 ///
 /// The publisher is a scoped thread, so the scope joins it before propagating a
-/// panic out of the association. A publisher parked for work only returns once
-/// publication closes, so an unwind that skipped closing would hang teardown
-/// forever instead of reporting the panic.
-struct ReadinessPublicationGuard<'runtime>(&'runtime ReadinessPublisherRuntime);
+/// panic out of the association, and both states it can rest in have to end for
+/// that join to complete. Closing publication returns a publisher parked for
+/// work, and ending the transport returns one blocked on notification capacity
+/// that a local endpoint stopped draining. The failure coordinator owns the
+/// association until `dispatch_requests` returns, which is after that join, so
+/// an unwind cannot leave ending the transport to dropping it.
+struct ReadinessPublicationGuard<'association> {
+    readiness: &'association ReadinessPublisherRuntime,
+    failure_coordinator: &'association HostAssociationFailureCoordinator,
+}
 
 impl Drop for ReadinessPublicationGuard<'_> {
     fn drop(&mut self) {
-        self.0.close();
+        self.readiness.close();
+        self.failure_coordinator.shutdown();
     }
 }
 
@@ -191,10 +198,14 @@ fn dispatch_requests<Memory: SharedMemory>(
             }
         };
 
-        // Publication must close on every exit, including an unwind: the scope
+        // Publication must end on every exit, including an unwind: the scope
         // joins the publisher before it propagates a panic, and a publisher
-        // parked for work would never return, hanging teardown instead.
-        let _publication = ReadinessPublicationGuard(&readiness);
+        // still parked or still blocked on ring capacity would never return,
+        // hanging teardown instead.
+        let _publication = ReadinessPublicationGuard {
+            readiness: &readiness,
+            failure_coordinator: &failure_coordinator,
+        };
 
         let mut workers = Vec::with_capacity(WORKER_COUNT);
         for worker_id in 0..WORKER_COUNT {
@@ -340,6 +351,14 @@ impl HostAssociationFailureCoordinator {
         let _ = self.shutdown.shutdown();
     }
 
+    /// Ends the association transport without recording a failure.
+    ///
+    /// Teardown uses this to release endpoints blocked on the control ring
+    /// without turning a shutdown that reported nothing into a reported error.
+    fn shutdown(&self) {
+        let _ = self.shutdown.shutdown();
+    }
+
     fn take_error(&self) -> Option<IoError> {
         self.error
             .lock()
@@ -388,49 +407,27 @@ mod tests {
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::channel::{HostSetupChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::BrokerHandshakeResponse;
-    use litebox_broker_transport::unix_socket::UnixStreamLocalSetupChannel;
+    use litebox_broker_transport::unix_socket::{
+        UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
+        UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
+    };
     use std::os::fd::AsFd;
 
-    #[test]
-    fn dropping_the_publication_guard_ends_a_parked_publisher() {
-        use litebox_broker_protocol::channel::HostNotificationChannel;
-        use litebox_broker_protocol::message::BrokerNotification;
-
-        struct DiscardingChannel;
-
-        impl HostNotificationChannel for DiscardingChannel {
-            type Error = IoError;
-
-            fn send_notification(&mut self, _notification: &BrokerNotification) -> IoResult<()> {
-                Ok(())
-            }
-        }
-
-        let readiness = Arc::new(ReadinessPublisherRuntime::new());
-        let publishing = Arc::clone(&readiness);
-        let (finished, finish) = sync_channel(1);
-        let publisher = std::thread::spawn(move || {
-            finished
-                .send(publishing.run(&mut DiscardingChannel))
-                .unwrap();
-        });
-
-        // The publisher parks on an empty queue, so only closing publication
-        // ends it. An unwind past the explicit close leaves the guard as the
-        // only thing that can, and the scope joins the publisher before it
-        // propagates the panic.
-        std::thread::sleep(Duration::from_millis(20));
-        drop(ReadinessPublicationGuard(&readiness));
-
-        finish
-            .recv_timeout(SETUP_TIMEOUT)
-            .expect("dropping the guard must end the parked publisher")
-            .unwrap();
-        publisher.join().unwrap();
+    /// One live host association: the endpoints teardown acts on, and the rest
+    /// held open so the association stays up for the duration of a test.
+    struct LiveAssociation {
+        request_source: UnixControlRingHostRequestSource,
+        shutdown: UnixControlRingHostShutdown,
+        _response_sink: UnixControlRingHostResponseSink,
+        _notifications: UnixControlRingHostNotificationChannel,
+        _local: (
+            UnixControlRingLocalCallChannel,
+            UnixControlRingLocalNotificationChannel,
+            UnixControlRingLocalShutdown,
+        ),
     }
 
-    #[test]
-    fn first_failure_is_preserved_and_unblocks_request_reading() {
+    fn live_association() -> LiveAssociation {
         let (peer_stream, host_stream) = UnixStream::pair().unwrap();
         let mut local_setup = UnixStreamLocalSetupChannel::from_connected(peer_stream);
         let mut control_channel = UnixStreamHostSetupChannel::from_accepted(host_stream);
@@ -450,10 +447,95 @@ mod tests {
         let host_ring = ControlRing::new(host_memory).unwrap();
         let local_activation =
             std::thread::spawn(move || local_setup.into_active(local_ring, || {}).unwrap());
-        let (mut request_source, _response_sink, _notifications, shutdown) =
+        let (request_source, response_sink, notifications, shutdown) =
             control_channel.into_active(host_ring).unwrap();
-        let (_local_call, _local_notifications, _local_shutdown) = local_activation.join().unwrap();
-        let failure_coordinator = HostAssociationFailureCoordinator::new(shutdown);
+        LiveAssociation {
+            request_source,
+            shutdown,
+            _response_sink: response_sink,
+            _notifications: notifications,
+            _local: local_activation.join().unwrap(),
+        }
+    }
+
+    #[test]
+    fn dropping_the_publication_guard_ends_a_parked_publisher() {
+        use litebox_broker_protocol::channel::HostNotificationChannel;
+        use litebox_broker_protocol::message::BrokerNotification;
+
+        struct DiscardingChannel;
+
+        impl HostNotificationChannel for DiscardingChannel {
+            type Error = IoError;
+
+            fn send_notification(&mut self, _notification: &BrokerNotification) -> IoResult<()> {
+                Ok(())
+            }
+        }
+
+        let association = live_association();
+        let failure_coordinator = HostAssociationFailureCoordinator::new(association.shutdown);
+        let readiness = Arc::new(ReadinessPublisherRuntime::new());
+        let publishing = Arc::clone(&readiness);
+        let (finished, finish) = sync_channel(1);
+        let publisher = std::thread::spawn(move || {
+            finished
+                .send(publishing.run(&mut DiscardingChannel))
+                .unwrap();
+        });
+
+        // The publisher parks on an empty queue, so only closing publication
+        // ends it. An unwind past the explicit close leaves the guard as the
+        // only thing that can, and the scope joins the publisher before it
+        // propagates the panic.
+        std::thread::sleep(Duration::from_millis(20));
+        drop(ReadinessPublicationGuard {
+            readiness: &readiness,
+            failure_coordinator: &failure_coordinator,
+        });
+
+        finish
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("dropping the guard must end the parked publisher")
+            .unwrap();
+        publisher.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_the_publication_guard_ends_the_notification_transport() {
+        let association = live_association();
+        let mut request_source = association.request_source;
+        let failure_coordinator = HostAssociationFailureCoordinator::new(association.shutdown);
+        let readiness = ReadinessPublisherRuntime::new();
+        let (received, receive) = sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            received.send(request_source.recv_request()).unwrap();
+        });
+
+        // Closing publication cannot reach a publisher blocked on notification
+        // capacity, and an unwind reaches the scope join before anything else
+        // ends the transport, so the guard has to end it too.
+        drop(ReadinessPublicationGuard {
+            readiness: &readiness,
+            failure_coordinator: &failure_coordinator,
+        });
+
+        let result = receive
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("dropping the guard must end the association transport");
+        reader.join().unwrap();
+        assert!(matches!(result, Ok(HostReceive::PeerClosed) | Err(_)));
+        assert!(
+            failure_coordinator.take_error().is_none(),
+            "ending the transport during teardown must not report a failure"
+        );
+    }
+
+    #[test]
+    fn first_failure_is_preserved_and_unblocks_request_reading() {
+        let association = live_association();
+        let mut request_source = association.request_source;
+        let failure_coordinator = HostAssociationFailureCoordinator::new(association.shutdown);
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
         let reader = std::thread::spawn(move || {
             result_sender.send(request_source.recv_request()).unwrap();
