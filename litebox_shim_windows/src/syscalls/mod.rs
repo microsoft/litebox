@@ -119,6 +119,11 @@ impl ThreadHandle {
     pub(crate) fn is_current(self) -> bool {
         self == Self::CURRENT
     }
+
+    #[must_use]
+    pub(crate) fn is_null(self) -> bool {
+        self.0.is_null()
+    }
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -514,6 +519,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         maximum_stack_size: usize,
         attribute_list: Option<Platform::RawConstPointer<u8>>,
     },
+    NtWaitForSingleObject {
+        handle: Handle,
+        alertable: bool,
+        timeout: Option<Platform::RawConstPointer<i64>>,
+    },
     NtOpenThreadToken {
         thread_handle: ThreadHandle,
         desired_access: u32,
@@ -645,6 +655,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     },
     NtTerminateProcess {
         process_handle: ProcessHandle,
+        exit_status: i32,
+    },
+    NtTerminateThread {
+        thread_handle: ThreadHandle,
         exit_status: i32,
     },
     NtTestAlert,
@@ -1069,6 +1083,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 maximum_stack_size,
                 attribute_list:*,
             })),
+            NtSysno::NtWaitForSingleObject => Some(sys_req!(NtWaitForSingleObject {
+                handle: { Handle::from_raw },
+                alertable: { |value: u8| value != 0 },
+                timeout:*,
+            })),
             NtSysno::NtOpenThreadToken => Some(sys_req!(NtOpenThreadToken {
                 thread_handle: { ThreadHandle::from_raw },
                 desired_access,
@@ -1203,6 +1222,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             })),
             NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
                 process_handle: { ProcessHandle::from_raw },
+                exit_status,
+            })),
+            NtSysno::NtTerminateThread => Some(sys_req!(NtTerminateThread {
+                thread_handle: { ThreadHandle::from_raw },
                 exit_status,
             })),
             NtSysno::NtTestAlert => Some(SyscallRequest::NtTestAlert),

@@ -161,6 +161,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         global,
         process: Arc::new(Process::default(None, windows_shared_section)),
         fs,
+        wait_state: litebox::event::wait::WaitState::new(platform),
         entry_point: 0,
         stack_top: 0,
         context: 0,

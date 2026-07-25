@@ -214,6 +214,10 @@ const KERNEL32_MULTITHREAD_PE_SOURCE: &str = r#"
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static CHILD_MAY_EXIT: AtomicBool = AtomicBool::new(false);
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetStdHandle(std_handle: u32) -> usize;
@@ -252,6 +256,9 @@ unsafe fn write_stdout(message: &[u8]) -> bool {
 }
 
 unsafe extern "system" fn child_thread(_parameter: *mut u8) -> u32 {
+    while !CHILD_MAY_EXIT.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
     u32::from(!unsafe { write_stdout(b"child thread\n") })
 }
 
@@ -266,7 +273,11 @@ pub unsafe extern "system" fn mainCRTStartup() -> ! {
             0,
             core::ptr::null_mut(),
         );
-        if thread == 0 || WaitForSingleObject(thread, u32::MAX) != 0 {
+        if thread == 0 || WaitForSingleObject(thread, 0) != 258 {
+            ExitProcess(1);
+        }
+        CHILD_MAY_EXIT.store(true, Ordering::Release);
+        if WaitForSingleObject(thread, u32::MAX) != 0 {
             ExitProcess(1);
         }
         ExitProcess(u32::from(!write_stdout(b"main joined\n")));

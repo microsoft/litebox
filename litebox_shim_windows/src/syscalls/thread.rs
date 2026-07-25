@@ -8,8 +8,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use int_enum::IntEnum;
 use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
+use litebox::event::{polling::TryOpError, wait::WaitError};
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemTime as _};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable};
@@ -22,6 +23,8 @@ use crate::{
     ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, WindowsShimEntrypoints,
     probe_guest_output_preserving_value,
 };
+
+const STATUS_ALERTED: NtStatus = NtStatus::from_raw(0x0000_0101);
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,15 +100,12 @@ impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for ThreadSubsystem<P
 }
 
 pub(crate) struct ThreadHandleObject<Platform: ShimPlatform> {
-    #[expect(
-        dead_code,
-        reason = "the wait slice will resolve handles to their shared thread object"
-    )]
     pub(crate) thread: Arc<ThreadObject<Platform>>,
 }
 
 pub(crate) struct ThreadObject<Platform: ShimPlatform> {
     signaled: AtomicBool,
+    exit_status: core::sync::atomic::AtomicI32,
     pollee: Pollee<Platform>,
 }
 
@@ -113,8 +113,15 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
     fn new() -> Self {
         Self {
             signaled: AtomicBool::new(false),
+            exit_status: core::sync::atomic::AtomicI32::new(0),
             pollee: Pollee::new(),
         }
+    }
+
+    pub(crate) fn complete(&self, exit_status: i32) {
+        self.exit_status.store(exit_status, Ordering::Relaxed);
+        self.signaled.store(true, Ordering::Release);
+        self.pollee.notify_observers(Events::IN);
     }
 }
 
@@ -279,6 +286,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             global: self.global.clone(),
             process: self.process.clone(),
             fs: self.fs.clone(),
+            wait_state: litebox::event::wait::WaitState::new(self.global.platform),
             entry_point: ldr_initialize_thunk,
             stack_top: environment.stack_top,
             context: environment.context,
@@ -308,6 +316,85 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_wait_for_single_object(
+        &self,
+        handle: Handle,
+        alertable: bool,
+        timeout: Option<ConstPtr<Platform, i64>>,
+    ) -> NtStatus {
+        let entry = match self.typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
+            handle,
+            AccessMask::SYNCHRONIZE.bits(),
+        ) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        let thread = entry.with_entry(|entry| Arc::clone(&entry.thread));
+        let timeout = match timeout {
+            Some(timeout) => {
+                let Some(timeout) = timeout.read_at_offset(0) else {
+                    return NtStatus::ACCESS_VIOLATION;
+                };
+                Some(self.wait_timeout_duration(timeout))
+            }
+            None => None,
+        };
+        if alertable {
+            // TODO(windows-apc): interrupt alertable waits when user APC delivery is modeled.
+            litebox_util_log::debug!("Treating alertable thread wait as non-alertable");
+        }
+
+        let wait_cx = self.wait_state.context().with_timeout(timeout);
+        match thread.pollee.wait(&wait_cx, false, Events::IN, || {
+            if thread.signaled.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(TryOpError::<NtStatus>::TryAgain)
+            }
+        }) {
+            Ok(()) => {
+                litebox_util_log::debug!(
+                    exit_status = thread.exit_status.load(Ordering::Relaxed);
+                    "Thread wait completed"
+                );
+                NtStatus::SUCCESS
+            }
+            Err(TryOpError::WaitError(WaitError::TimedOut)) => NtStatus::TIMEOUT,
+            Err(TryOpError::WaitError(WaitError::Interrupted)) => STATUS_ALERTED,
+            Err(TryOpError::TryAgain) => unreachable!("blocking wait cannot return TryAgain"),
+            Err(TryOpError::Other(status)) => status,
+        }
+    }
+
+    fn duration_from_100ns(intervals: u64) -> core::time::Duration {
+        const INTERVALS_PER_SECOND: u64 = 10_000_000;
+
+        core::time::Duration::new(
+            intervals / INTERVALS_PER_SECOND,
+            ((intervals % INTERVALS_PER_SECOND) * 100)
+                .try_into()
+                .expect("subsecond 100ns intervals fit in u32 nanoseconds"),
+        )
+    }
+
+    fn wait_timeout_duration(&self, timeout: i64) -> core::time::Duration {
+        const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+
+        if timeout <= 0 {
+            return Self::duration_from_100ns(timeout.unsigned_abs());
+        }
+
+        let target = Self::duration_from_100ns(timeout.cast_unsigned());
+        let unix_now = self
+            .global
+            .platform
+            .current_time()
+            .duration_since(&Platform::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        let windows_now = core::time::Duration::from_secs(WINDOWS_TO_UNIX_EPOCH_SECONDS) + unix_now;
+        target.saturating_sub(windows_now)
     }
 
     pub(crate) fn sys_nt_query_information_thread(

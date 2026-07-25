@@ -54,7 +54,7 @@ use crate::syscalls::wait_completion_packet::{
 use crate::syscalls::worker_factory::{
     WorkerFactoryCreateParameters, WorkerFactoryHandleObject, WorkerFactorySubsystem,
 };
-use crate::syscalls::{SyscallRequest, mm};
+use crate::syscalls::{SyscallRequest, ThreadHandle, mm};
 
 mod loader;
 mod nt_types;
@@ -539,6 +539,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
                     global: self.0.clone(),
                     process: process.clone(),
                     fs,
+                    wait_state: litebox::event::wait::WaitState::new(self.0.platform),
                     entry_point: load_info.entry_point,
                     stack_top: load_info.stack_top,
                     teb_address: load_info.environment.teb,
@@ -649,15 +650,12 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     global: Arc<GlobalState<Platform, FS>>,
     process: Arc<Process<Platform>>,
     fs: Arc<FS>,
+    wait_state: litebox::event::wait::WaitState<Platform>,
     entry_point: usize,
     stack_top: usize,
     context: usize,
     teb_address: usize,
     initial_context: Option<nt_types::X64Context>,
-    #[expect(
-        dead_code,
-        reason = "the termination slice will signal the current task's shared thread object"
-    )]
     thread_object: Option<Arc<syscalls::thread::ThreadObject<Platform>>>,
 }
 
@@ -1718,6 +1716,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtWaitForSingleObject {
+                handle,
+                alertable,
+                timeout,
+            } => {
+                let status = self.sys_nt_wait_for_single_object(handle, alertable, timeout);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenThreadToken {
                 thread_handle,
                 desired_access,
@@ -2008,6 +2014,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 } else {
                     // TODO: Terminate all threads except the calling one if process_handle is zero.
                     self.process.exit_code.store(exit_status, Ordering::Relaxed);
+                    (NtStatus::SUCCESS, ContinueOperation::Terminate)
+                }
+            }
+            SyscallRequest::NtTerminateThread {
+                thread_handle,
+                exit_status,
+            } => {
+                if !thread_handle.is_null() && thread_handle != ThreadHandle::CURRENT {
+                    (NtStatus::NOT_SUPPORTED, ContinueOperation::Resume)
+                } else {
+                    let Some(thread) = &self.thread_object else {
+                        return ContinueOperation::Terminate;
+                    };
+                    thread.complete(exit_status);
+                    self.process
+                        .active_thread_count
+                        .fetch_sub(1, Ordering::AcqRel);
                     (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
             }
