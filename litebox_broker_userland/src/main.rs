@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_publication_guard_ends_a_parked_publisher() {
+    fn publication_guard_ends_a_parked_publisher() {
         use litebox_broker_protocol::channel::HostNotificationChannel;
         use litebox_broker_protocol::message::BrokerNotification;
 
@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_publication_guard_ends_a_publisher_blocked_on_ring_capacity() {
+    fn publication_guard_ends_a_capacity_blocked_publisher() {
         use litebox_broker_protocol::ObjectHandle;
         use litebox_broker_protocol::readiness::ReadinessFlags;
         use litebox_broker_transport::control_ring::CONTROL_RING_NOTIFICATION_SLOT_COUNT;

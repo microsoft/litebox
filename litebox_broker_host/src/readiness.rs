@@ -545,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn confirming_a_claim_taken_before_reuse_does_not_clear_the_new_update() {
+    fn confirming_a_stale_claim_keeps_the_new_update() {
         let publisher = ReadinessPublisher::new();
         publish(&publisher, HANDLE, ReadinessFlags::READ);
         let stale = publisher.take_pending().unwrap();
@@ -822,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoning_a_stale_claim_does_not_requeue_a_newer_update_twice() {
+    fn abandoning_a_stale_claim_requeues_nothing() {
         let publisher = ReadinessPublisher::new();
         publish(&publisher, HANDLE, ReadinessFlags::READ);
         let stale = publisher.take_pending().unwrap();
