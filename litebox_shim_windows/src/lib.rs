@@ -529,6 +529,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         let mut process =
             Process::default(Some(load_info.virtual_allocations), windows_shared_section);
         process.ntdll_mapping = load_info.ntdll_mapping;
+        process.ldr_initialize_thunk = load_info.ldr_initialize_thunk;
         process.rtl_user_thread_start = load_info.rtl_user_thread_start;
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
@@ -566,6 +567,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
 /// Per-process Windows state shared by every thread in the process.
 pub struct Process<Platform: ShimPlatform> {
     ntdll_mapping: Option<MappingInfo>,
+    ldr_initialize_thunk: Option<usize>,
     rtl_user_thread_start: Option<usize>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
@@ -617,6 +619,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
         );
         Process {
             ntdll_mapping: None,
+            ldr_initialize_thunk: None,
             rtl_user_thread_start: None,
             peb_address: 0,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),

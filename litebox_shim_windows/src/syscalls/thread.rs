@@ -220,7 +220,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_util_log::debug!("Ignoring NtCreateThreadEx attribute list");
         }
 
-        let Some(rtl_user_thread_start) = self.process.rtl_user_thread_start else {
+        let (Some(ldr_initialize_thunk), Some(rtl_user_thread_start), Some(ntdll_mapping)) = (
+            self.process.ldr_initialize_thunk,
+            self.process.rtl_user_thread_start,
+            self.process.ntdll_mapping,
+        ) else {
             return NtStatus::NOT_SUPPORTED;
         };
         let thread_id = self.process.next_thread_id.fetch_add(1, Ordering::Relaxed);
@@ -245,8 +249,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             environment.stack_top,
             argument,
         );
+        if MutPtr::<Platform, X64Context>::from_usize(environment.context)
+            .write_at_offset(0, initial_context)
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
         let mut child_ctx = ctx.clone();
-        initial_context.apply_to_regs(&mut child_ctx);
+        child_ctx.rip = ldr_initialize_thunk;
+        child_ctx.rsp = environment.stack_top;
+        child_ctx.eflags = 0x202;
+        child_ctx.rcx = environment.context;
+        child_ctx.rdx = ntdll_mapping.base_addr;
 
         let thread = Arc::new(ThreadObject::new());
         let granted_access = ThreadAccess::from_desired_access(desired_access);
@@ -264,11 +278,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             global: self.global.clone(),
             process: self.process.clone(),
             fs: self.fs.clone(),
-            entry_point: rtl_user_thread_start,
+            entry_point: ldr_initialize_thunk,
             stack_top: environment.stack_top,
-            context: argument,
+            context: environment.context,
             teb_address: environment.teb,
-            initial_context: Some(initial_context),
+            initial_context: None,
             thread_object: Some(thread),
         };
         self.process
