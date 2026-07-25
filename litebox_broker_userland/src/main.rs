@@ -142,6 +142,27 @@ fn serve_runner(
     Ok(())
 }
 
+/// Fails the association if readiness publication unwinds.
+///
+/// The request reader owns association termination but does not depend on the
+/// publisher, so an unwinding publisher would otherwise leave a live
+/// association with no notification source. The join that turns that panic into
+/// a reported failure is reached only once the reader has returned, and a peer
+/// that is waiting for a readiness change it will never be told about does not
+/// return it. Failing the association here ends that wait instead.
+struct PublisherPanicGuard<'association> {
+    failure_coordinator: &'association HostAssociationFailureCoordinator,
+}
+
+impl Drop for PublisherPanicGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.failure_coordinator
+                .report(IoError::other("broker readiness publisher panicked"));
+        }
+    }
+}
+
 /// Ends readiness publication when an association scope ends for any reason.
 ///
 /// The publisher is a scoped thread, so the scope joins it before propagating a
@@ -178,9 +199,13 @@ fn dispatch_requests<Memory: SharedMemory>(
 
     std::thread::scope(|scope| {
         let publisher_readiness = Arc::clone(&readiness);
+        let publisher_failure_coordinator = Arc::clone(&failure_coordinator);
         let publisher = std::thread::Builder::new()
             .name("litebox-broker-notifier".to_owned())
             .spawn_scoped(scope, move || {
+                let _panicking = PublisherPanicGuard {
+                    failure_coordinator: &publisher_failure_coordinator,
+                };
                 // The request reader owns association termination. A failing
                 // notification transport fails the association, so a reader
                 // still running observes and reports the same error, and a peer
@@ -549,6 +574,39 @@ mod tests {
             failure_coordinator.take_error().is_none(),
             "ending the transport during teardown must not report a failure"
         );
+    }
+
+    #[test]
+    fn a_panicking_publisher_ends_a_blocked_request_reader() {
+        let association = live_association();
+        let mut request_source = association.request_source;
+        let failure_coordinator =
+            Arc::new(HostAssociationFailureCoordinator::new(association.shutdown));
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            result_sender.send(request_source.recv_request()).unwrap();
+        });
+
+        // The peer sends nothing and never closes, so the reader returns only
+        // if the publisher's unwind fails the association.
+        let publisher_failure_coordinator = Arc::clone(&failure_coordinator);
+        let publisher = std::thread::spawn(move || {
+            let _panicking = PublisherPanicGuard {
+                failure_coordinator: &publisher_failure_coordinator,
+            };
+            panic!("readiness publication panicked");
+        });
+
+        let receive_result = result_receiver
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("a panicking publisher must end a blocked request reader");
+        assert!(matches!(
+            receive_result,
+            Ok(HostReceive::PeerClosed) | Err(_)
+        ));
+        reader.join().unwrap();
+        assert!(publisher.join().is_err());
+        assert!(failure_coordinator.take_error().is_some());
     }
 
     #[test]
