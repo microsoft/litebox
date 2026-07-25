@@ -91,7 +91,10 @@ impl ReadinessPublisherRuntime {
     /// Panics if publication has already run. Closure is terminal, so a runtime
     /// serves exactly one publisher, and a second one would park on a wake that
     /// only ever releases one waiter. That is a silent hang, so the second
-    /// caller is rejected loudly instead.
+    /// caller is rejected loudly instead. A returned error is therefore
+    /// terminal for this runtime as well: the portable loop leaves the failed
+    /// update publishable, but resuming it on a replacement channel needs a new
+    /// runtime rather than a second call.
     pub fn run<Channel: HostNotificationChannel>(
         &self,
         channel: &mut Channel,

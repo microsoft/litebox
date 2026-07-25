@@ -358,6 +358,8 @@ pub fn publish_readiness<Channel: HostNotificationChannel>(
 mod tests {
     use super::*;
 
+    /// Deadline for every test wait, so a regression fails instead of hanging.
+    const TEST_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
     const HANDLE: ObjectHandle = ObjectHandle(7);
     const OTHER_HANDLE: ObjectHandle = ObjectHandle(9);
 
@@ -670,9 +672,35 @@ mod tests {
         *readiness
     }
 
+    /// Runs publication on its own thread and reports its result through a
+    /// channel, so a loop that never ends fails a test on the deadline instead
+    /// of blocking it forever.
+    fn spawn_publication(
+        publisher: std::sync::Arc<ReadinessPublisher>,
+        mut channel: GatedChannel,
+        mut wait_for_work: impl FnMut() + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<Result<(), &'static str>> {
+        let (finished, finish) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = finished.send(publish_readiness(
+                &publisher,
+                &mut channel,
+                &mut wait_for_work,
+            ));
+        });
+        finish
+    }
+
+    fn expect_publication_ended(finish: &std::sync::mpsc::Receiver<Result<(), &'static str>>) {
+        finish
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("publication must end")
+            .expect("publication must end without a channel error");
+    }
+
     #[test]
     fn queued_updates_publish_in_order_until_the_waiter_closes() {
-        let publisher = ReadinessPublisher::new();
+        let publisher = std::sync::Arc::new(ReadinessPublisher::new());
         publish(&publisher, HANDLE, ReadinessFlags::READ);
         publish(&publisher, OTHER_HANDLE, ReadinessFlags::WRITE);
         let (sent, received) = std::sync::mpsc::sync_channel(4);
@@ -680,9 +708,11 @@ mod tests {
         for _ in 0..2 {
             releaser.send(()).unwrap();
         }
-        let mut channel = GatedChannel { sent, release };
+        let channel = GatedChannel { sent, release };
+        let closing = std::sync::Arc::clone(&publisher);
 
-        publish_readiness(&publisher, &mut channel, || publisher.close()).unwrap();
+        let finish = spawn_publication(publisher, channel, move || closing.close());
+        expect_publication_ended(&finish);
 
         let drained: alloc::vec::Vec<_> = received.try_iter().map(|n| readiness_of(&n)).collect();
         assert_eq!(drained.len(), 2);
@@ -695,25 +725,23 @@ mod tests {
         let publisher = std::sync::Arc::new(ReadinessPublisher::new());
         let (sent, _received) = std::sync::mpsc::sync_channel(1);
         let (_releaser, release) = std::sync::mpsc::channel();
-        let mut channel = GatedChannel { sent, release };
+        let channel = GatedChannel { sent, release };
         let parked = std::sync::Arc::clone(&publisher);
         let (parked_sender, parked_receiver) = std::sync::mpsc::channel();
 
-        let publisher_thread = std::thread::spawn(move || {
-            publish_readiness(&parked, &mut channel, || {
-                // Reporting from inside the wait is what proves the publisher
-                // reached it, so closing is what ends it rather than a queue it
-                // already found closed.
-                let _ = parked_sender.send(());
-                std::thread::sleep(core::time::Duration::from_millis(1));
-            })
+        let finish = spawn_publication(parked, channel, move || {
+            // Reporting from inside the wait is what proves the publisher
+            // reached it, so closing is what ends it rather than a queue it
+            // already found closed.
+            let _ = parked_sender.send(());
+            std::thread::sleep(core::time::Duration::from_millis(1));
         });
         parked_receiver
-            .recv()
+            .recv_timeout(TEST_TIMEOUT)
             .expect("publication must park before it is closed");
         publisher.close();
 
-        publisher_thread.join().unwrap().unwrap();
+        expect_publication_ended(&finish);
     }
 
     #[test]
@@ -722,17 +750,15 @@ mod tests {
         publish(&publisher, HANDLE, ReadinessFlags::READ);
         let (sent, received) = std::sync::mpsc::sync_channel(0);
         let (releaser, release) = std::sync::mpsc::channel();
-        let mut channel = GatedChannel { sent, release };
+        let channel = GatedChannel { sent, release };
         let publishing = std::sync::Arc::clone(&publisher);
-        let publisher_thread = std::thread::spawn(move || {
-            publish_readiness(&publishing, &mut channel, || {
-                std::thread::sleep(core::time::Duration::from_millis(1));
-            })
+        let finish = spawn_publication(publishing, channel, || {
+            std::thread::sleep(core::time::Duration::from_millis(1));
         });
 
         // The first notification is now in flight and cannot be confirmed yet.
         assert_eq!(
-            readiness_of(&received.recv().unwrap()).readiness,
+            readiness_of(&received.recv_timeout(TEST_TIMEOUT).unwrap()).readiness,
             ReadinessFlags::READ
         );
         assert_eq!(
@@ -742,12 +768,12 @@ mod tests {
         releaser.send(()).unwrap();
 
         assert_eq!(
-            readiness_of(&received.recv().unwrap()).readiness,
+            readiness_of(&received.recv_timeout(TEST_TIMEOUT).unwrap()).readiness,
             ReadinessFlags::HANGUP
         );
         releaser.send(()).unwrap();
         publisher.close();
-        publisher_thread.join().unwrap().unwrap();
+        expect_publication_ended(&finish);
     }
 
     #[test]

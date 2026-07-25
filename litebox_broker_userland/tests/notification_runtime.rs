@@ -276,13 +276,31 @@ fn a_full_notification_ring_does_not_block_readiness_sources() {
         outcome_sender.send(publisher.join().unwrap()).unwrap();
     });
 
-    let (local, mut notifications) = negotiate_local(local_control);
+    let (local, notifications) = negotiate_local(local_control);
     published_receiver.recv_timeout(TEST_TIMEOUT).unwrap();
-    for handle in 0..OVERSUBSCRIBED_OBJECT_COUNT {
+
+    // Draining on a helper thread keeps an update that is wrongly coalesced
+    // away a test failure rather than a hang, because only this thread can
+    // release the host closure.
+    let (drained_sender, drained_receiver) = channel();
+    let drain = std::thread::spawn(move || {
+        let mut notifications = notifications;
+        let drained: Vec<_> = (0..OVERSUBSCRIBED_OBJECT_COUNT)
+            .map(|_| readiness_of(notifications.recv_notification().unwrap()))
+            .collect();
+        drained_sender.send(drained).unwrap();
+        notifications
+    });
+    let drained = drained_receiver
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("a full ring must still deliver every published update");
+    let _notifications = drain.join().unwrap();
+
+    for (handle, notification) in drained.into_iter().enumerate() {
         assert_eq!(
-            readiness_of(notifications.recv_notification().unwrap()),
+            notification,
             ReadinessNotification {
-                handle: ObjectHandle(handle),
+                handle: ObjectHandle(handle as u64),
                 readiness: ReadinessFlags::READ,
             }
         );
