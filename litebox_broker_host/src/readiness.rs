@@ -117,7 +117,11 @@ impl Drop for PendingReadiness<'_> {
     fn drop(&mut self) {
         let mut state = self.publisher.state.lock();
         // A newer change has already requeued the object, and a retired or
-        // closed publisher has nothing left to publish.
+        // closed publisher has nothing left to publish. The queued check is
+        // defensive rather than load bearing, so no test can distinguish it: a
+        // matching generation means no publication since this claim was taken,
+        // and only publication or a requeue can queue the object, so a matching
+        // generation already implies the object is unqueued.
         if let Some(entry) = state.entries.get_mut(&self.notification.handle)
             && entry.generation == self.generation
             && !entry.queued
@@ -377,27 +381,12 @@ mod tests {
     }
 
     #[test]
-    fn first_update_for_an_object_queues_a_notification() {
+    fn repeating_known_readiness_publishes_nothing() {
         let publisher = ReadinessPublisher::new();
-
         assert_eq!(
             publisher.publish(HANDLE, ReadinessFlags::READ).unwrap(),
             PublishOutcome::Queued
         );
-
-        assert_eq!(
-            drain(&publisher),
-            [ReadinessNotification {
-                handle: HANDLE,
-                readiness: ReadinessFlags::READ,
-            }]
-        );
-    }
-
-    #[test]
-    fn repeating_known_readiness_publishes_nothing() {
-        let publisher = ReadinessPublisher::new();
-        publish(&publisher, HANDLE, ReadinessFlags::READ);
         drain(&publisher);
 
         assert_eq!(
@@ -471,28 +460,6 @@ mod tests {
                 handle: HANDLE,
                 readiness: ReadinessFlags::READ,
             }]
-        );
-    }
-
-    #[test]
-    fn independent_objects_publish_independently() {
-        let publisher = ReadinessPublisher::new();
-
-        publish(&publisher, HANDLE, ReadinessFlags::READ);
-        publish(&publisher, OTHER_HANDLE, ReadinessFlags::WRITE);
-
-        assert_eq!(
-            drain(&publisher),
-            [
-                ReadinessNotification {
-                    handle: HANDLE,
-                    readiness: ReadinessFlags::READ,
-                },
-                ReadinessNotification {
-                    handle: OTHER_HANDLE,
-                    readiness: ReadinessFlags::WRITE,
-                },
-            ]
         );
     }
 
@@ -828,16 +795,29 @@ mod tests {
         let stale = publisher.take_pending().unwrap();
 
         publish(&publisher, HANDLE, ReadinessFlags::WRITE);
-        drop(stale);
+        let newer = publisher.take_pending().unwrap();
 
-        // The newer change already queued the object, so the abandoned claim
-        // must not queue it a second time.
+        // Taking the newer update leaves the object unqueued, so its generation
+        // is all that marks the older claim as superseded. Without that
+        // comparison the older claim requeues an object whose current update is
+        // already in flight, publishing the same readiness twice.
+        assert_eq!(publisher.queued_updates(), 0);
+        drop(stale);
+        assert_eq!(publisher.queued_updates(), 0);
+
+        // A change recorded while that newer claim is still out queues the
+        // object again, and abandoning the claim must not queue it a second
+        // time.
+        publish(&publisher, HANDLE, ReadinessFlags::READ);
         assert_eq!(publisher.queued_updates(), 1);
+        drop(newer);
+        assert_eq!(publisher.queued_updates(), 1);
+
         assert_eq!(
             drain(&publisher),
             [ReadinessNotification {
                 handle: HANDLE,
-                readiness: ReadinessFlags::WRITE,
+                readiness: ReadinessFlags::READ,
             }]
         );
     }

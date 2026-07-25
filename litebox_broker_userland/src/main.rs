@@ -134,6 +134,7 @@ fn serve_runner(
         control_channel.into_active(control_ring)?;
     dispatch_requests(
         association,
+        Arc::new(ReadinessPublisherRuntime::new()),
         request_source,
         response_sink,
         notification_channel,
@@ -235,8 +236,14 @@ impl Drop for ReadinessPublicationGuard<'_> {
     }
 }
 
+/// Serves one association until it ends, then reports its first failure.
+///
+/// `readiness` is created by the caller rather than here so readiness sources
+/// can record into the same runtime this publishes from. Nothing publishes into
+/// it in production yet; the Linux network reactor is its first source.
 fn dispatch_requests<Memory: SharedMemory>(
     association: BrokerHostAssociation<'_, Memory>,
+    readiness: Arc<ReadinessPublisherRuntime>,
     mut request_source: UnixControlRingHostRequestSource,
     response_sink: UnixControlRingHostResponseSink,
     mut notification_channel: UnixControlRingHostNotificationChannel,
@@ -244,7 +251,6 @@ fn dispatch_requests<Memory: SharedMemory>(
 ) -> IoResult<()> {
     let association = Arc::new(association);
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
-    let readiness = Arc::new(ReadinessPublisherRuntime::new());
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
     let request_receiver = Arc::new(Mutex::new(request_receiver));
 
@@ -490,21 +496,106 @@ mod tests {
         }
     }
 
+    /// A notification channel that accepts every send and keeps nothing.
+    struct DiscardingChannel;
+
+    impl litebox_broker_protocol::channel::HostNotificationChannel for DiscardingChannel {
+        type Error = IoError;
+
+        fn send_notification(
+            &mut self,
+            _notification: &litebox_broker_protocol::message::BrokerNotification,
+        ) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Negotiates the local half of an association served by [`spawn_dispatch`].
+    fn negotiate_local(
+        stream: UnixStream,
+    ) -> (
+        litebox_broker_local::BrokerLocal<UnixControlRingLocalCallChannel>,
+        UnixControlRingLocalNotificationChannel,
+    ) {
+        litebox_broker_local::BrokerLocal::negotiate(
+            UnixStreamLocalSetupChannel::from_connected(stream),
+            |mut setup| {
+                let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
+                let control_memory = setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, None)?;
+                let control_ring = ControlRing::new(control_memory).map_err(|error| {
+                    IoError::new(
+                        ErrorKind::InvalidData,
+                        format!("invalid test control ring: {error:?}"),
+                    )
+                })?;
+                let (call_channel, notifications, _shutdown) =
+                    setup.into_active(control_ring, || {})?;
+                Ok((call_channel, Arc::new(shared_memory), notifications))
+            },
+        )
+        .unwrap()
+    }
+
+    /// One association served by `dispatch_requests` exactly as production
+    /// serves it.
+    ///
+    /// The guard tests above cover what the teardown guards do; only this
+    /// covers that `dispatch_requests` installs them and starts a publisher at
+    /// all, because its single production caller is unreachable from a test.
+    /// Dispatch starts only once the local half has finished negotiating, so a
+    /// publisher that fails immediately cannot race activation.
+    fn spawn_dispatch(
+        readiness: Arc<ReadinessPublisherRuntime>,
+    ) -> (
+        litebox_broker_local::BrokerLocal<UnixControlRingLocalCallChannel>,
+        UnixControlRingLocalNotificationChannel,
+        Receiver<IoResult<()>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (local_stream, host_stream) = UnixStream::pair().unwrap();
+        let (outcome_sender, outcome) = sync_channel(1);
+        let (start, started) = sync_channel(1);
+        let host = std::thread::spawn(move || {
+            let broker = BrokerCore::new(PolicyEngine::with_host_guaranteed_rights(
+                ObjectRights::all(),
+            ))
+            .unwrap();
+            let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
+            let shared_buffers =
+                SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
+            let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+            let control_ring = ControlRing::new(control_memory).unwrap();
+            let mut control = UnixStreamHostSetupChannel::from_host_guaranteed(
+                host_stream,
+                Instant::now() + SETUP_TIMEOUT,
+            );
+            let association = setup_connection(&broker, &mut control, &shared_buffers, |channel| {
+                channel.send_memfd(shared_buffers.memory(), None)?;
+                channel.send_memfd(control_ring.memory(), None)
+            })
+            .unwrap()
+            .unwrap();
+            let (request_source, response_sink, notifications, shutdown) =
+                control.into_active(control_ring).unwrap();
+            started.recv().unwrap();
+            outcome_sender
+                .send(dispatch_requests(
+                    association,
+                    readiness,
+                    request_source,
+                    response_sink,
+                    notifications,
+                    shutdown,
+                ))
+                .unwrap();
+        });
+        let (local, notifications) = negotiate_local(local_stream);
+        start.send(()).unwrap();
+        (local, notifications, outcome, host)
+    }
+
     #[test]
     fn publication_guard_ends_a_parked_publisher() {
-        use litebox_broker_protocol::channel::HostNotificationChannel;
-        use litebox_broker_protocol::message::BrokerNotification;
-
-        struct DiscardingChannel;
-
-        impl HostNotificationChannel for DiscardingChannel {
-            type Error = IoError;
-
-            fn send_notification(&mut self, _notification: &BrokerNotification) -> IoResult<()> {
-                Ok(())
-            }
-        }
-
         let association = live_association();
         let failure_coordinator = HostAssociationFailureCoordinator::new(association.shutdown);
         let readiness = Arc::new(ReadinessPublisherRuntime::new());
@@ -636,5 +727,72 @@ mod tests {
         let error = failure_coordinator.take_error().unwrap();
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "first failure");
+    }
+
+    #[test]
+    fn dispatching_requests_publishes_readiness_until_the_association_ends() {
+        use litebox_broker_protocol::ObjectHandle;
+        use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
+        use litebox_broker_protocol::readiness::ReadinessFlags;
+
+        const HANDLE: ObjectHandle = ObjectHandle(11);
+        let expected = ReadinessFlags::READ | ReadinessFlags::WRITE;
+        let readiness = Arc::new(ReadinessPublisherRuntime::new());
+        let (local, mut notifications, outcome, host) = spawn_dispatch(Arc::clone(&readiness));
+
+        readiness.publish(HANDLE, expected).unwrap();
+
+        // The receive has no deadline of its own, so a publisher that dispatch
+        // never started has to fail the test rather than hang it.
+        let (notified, notifications_seen) = sync_channel(1);
+        let receiver = std::thread::spawn(move || {
+            use litebox_broker_protocol::channel::LocalNotificationChannel;
+
+            let notification = notifications.recv_notification().unwrap();
+            notified.send(notification).unwrap();
+            notifications
+        });
+        let notification = notifications_seen
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("dispatch must publish readiness recorded in its runtime");
+        assert_eq!(
+            notification,
+            Some(BrokerNotification::Readiness(ReadinessNotification {
+                handle: HANDLE,
+                readiness: expected,
+            }))
+        );
+        let notifications = receiver.join().unwrap();
+
+        // A publisher parked for work outlives a clean local close unless
+        // dispatch ends publication, so this deadline covers that too.
+        drop(local);
+        drop(notifications);
+        outcome
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("a clean local close must end dispatch")
+            .unwrap();
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn dispatching_requests_fails_when_its_readiness_publisher_panics() {
+        // Publication is one-shot, so a runtime that has already run makes the
+        // publisher thread panic as soon as dispatch starts it.
+        let readiness = Arc::new(ReadinessPublisherRuntime::new());
+        readiness.close();
+        readiness.run(&mut DiscardingChannel).unwrap();
+
+        // The local half stays connected and idle, so nothing but the panic can
+        // release the request reader that owns association termination.
+        let (local, _notifications, outcome, host) = spawn_dispatch(Arc::clone(&readiness));
+
+        let error = outcome
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("a panicking publisher must end dispatch")
+            .expect_err("a panicking publisher must fail the association");
+        assert_eq!(error.to_string(), "broker readiness publisher panicked");
+        drop(local);
+        host.join().unwrap();
     }
 }
