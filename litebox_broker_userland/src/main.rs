@@ -175,10 +175,12 @@ fn dispatch_requests<Memory: SharedMemory>(
             .name("litebox-broker-notifier".to_owned())
             .spawn_scoped(scope, move || {
                 // The request reader owns association termination. A failing
-                // notification transport fails the association, so the reader
-                // observes and reports the same error, and a peer that closed
-                // cleanly is not a failure at all. Reporting here would turn a
-                // clean shutdown into a reported error.
+                // notification transport fails the association, so a reader
+                // still running observes and reports the same error, and a peer
+                // that closed cleanly is not a failure at all. Reporting here
+                // would turn a clean shutdown into a reported error. A failure
+                // that first appears once the reader has returned is dropped
+                // deliberately, because the association is already over.
                 let _ = publisher_readiness.run(&mut notification_channel);
             });
         let publisher = match publisher {
