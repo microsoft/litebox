@@ -74,9 +74,10 @@ pub enum PublishOutcome {
 ///
 /// The claim borrows the publisher it came from, so it cannot be confirmed
 /// against a different one, and it is not `Copy`, so it cannot be replayed.
-/// Dropping it without calling [`confirm`] requeues the update rather than
-/// stranding it, which is what returns the object to a publishable state when
-/// a send fails or unwinds.
+/// Dropping it without calling [`confirm`] requeues the update it carried, so
+/// a send that fails or unwinds leaves the object publishable again. The
+/// requeue is skipped when the update is no longer the current one to send:
+/// retirement, closure, and a newer recorded change all supersede it.
 ///
 /// [`confirm`]: Self::confirm
 #[derive(Debug)]
@@ -656,6 +657,19 @@ mod tests {
         }
     }
 
+    struct PanickingChannel;
+
+    impl HostNotificationChannel for PanickingChannel {
+        type Error = &'static str;
+
+        fn send_notification(
+            &mut self,
+            _notification: &BrokerNotification,
+        ) -> Result<(), Self::Error> {
+            panic!("notification channel panicked")
+        }
+    }
+
     fn readiness_of(notification: &BrokerNotification) -> ReadinessNotification {
         let BrokerNotification::Readiness(readiness) = notification;
         *readiness
@@ -792,6 +806,33 @@ mod tests {
             [ReadinessNotification {
                 handle: HANDLE,
                 readiness: ReadinessFlags::WRITE,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_panicking_send_returns_its_update_to_the_queue() {
+        let publisher = ReadinessPublisher::new();
+        publish(&publisher, HANDLE, ReadinessFlags::READ);
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(alloc::boxed::Box::new(|_| {}));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = publish_readiness(&publisher, &mut PanickingChannel, || {
+                unreachable!("a panicking send must not park the publisher")
+            });
+        }));
+        std::panic::set_hook(previous_hook);
+
+        assert!(unwound.is_err());
+
+        // Unwinding past the claim runs its drop, which must leave the update
+        // publishable rather than stranded.
+        assert_eq!(
+            drain(&publisher),
+            [ReadinessNotification {
+                handle: HANDLE,
+                readiness: ReadinessFlags::READ,
             }]
         );
     }
