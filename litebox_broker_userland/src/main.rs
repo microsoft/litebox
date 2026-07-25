@@ -202,7 +202,7 @@ fn dispatch_requests<Memory: SharedMemory>(
         // joins the publisher before it propagates a panic, and a publisher
         // still parked or still blocked on ring capacity would never return,
         // hanging teardown instead.
-        let _publication = ReadinessPublicationGuard {
+        let publication = ReadinessPublicationGuard {
             readiness: &readiness,
             failure_coordinator: &failure_coordinator,
         };
@@ -240,10 +240,12 @@ fn dispatch_requests<Memory: SharedMemory>(
         // Readiness publication lives exactly as long as the association. The
         // request reader returns only once the association is over, but workers
         // keep draining already-queued requests after that, so publication must
-        // outlive them or a late readiness change would be discarded. Closing
-        // here rather than leaving it to the guard orders it before the join
-        // that observes a panicking publisher.
-        readiness.close();
+        // outlive them or a late readiness change would be discarded. Ending it
+        // here rather than leaving it to the scope orders it before the join
+        // that observes a panicking publisher, and dropping the guard is what
+        // ends both states the publisher can rest in without depending on the
+        // reader having failed the association already.
+        drop(publication);
         if let Some(publisher) = publisher
             && publisher.join().is_err()
         {
