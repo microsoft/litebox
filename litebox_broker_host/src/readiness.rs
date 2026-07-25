@@ -11,24 +11,21 @@
 //!
 //! [`ReadinessPublisher`] separates the two. Sources call [`publish`] to record
 //! the authoritative flags for an object, which only updates in-memory state.
-//! One dedicated publisher owns the notification channel and repeatedly claims
-//! pending updates with [`take_pending`], sends them, and reports completion
-//! with [`confirm`].
+//! [`publish_readiness`] owns the notification channel and repeatedly claims
+//! pending updates, sends them, and reports completion.
 //!
 //! Because [`BrokerNotification::Readiness`] is a hint to re-check state rather
 //! than an ordered transition, repeated updates for one handle collapse into a
 //! single notification carrying the newest flags. Updates that arrive while a
 //! notification is in flight are not lost: each entry carries a generation that
-//! advances on every observable change, and [`confirm`] clears the pending mark
-//! only when the published generation is still current.
+//! identifies its newest change, and a claim is confirmed only while the
+//! generation it was taken from is still current.
 //!
 //! This type is transport-neutral and never blocks, so it holds no thread,
 //! timer, or wake primitive. Deployments own those and wake their publisher
 //! whenever [`publish`] reports [`PublishOutcome::Queued`].
 //!
 //! [`publish`]: ReadinessPublisher::publish
-//! [`take_pending`]: ReadinessPublisher::take_pending
-//! [`confirm`]: ReadinessPublisher::confirm
 //! [`BrokerNotification::Readiness`]: litebox_broker_protocol::message::BrokerNotification::Readiness
 
 use alloc::collections::VecDeque;
@@ -74,17 +71,20 @@ pub enum PublishOutcome {
 /// One readiness notification claimed for publication.
 ///
 /// The claim is returned to the publisher by [`ReadinessPublisher::confirm`]
-/// after the notification is durably handed to the transport.
+/// after the notification is durably handed to the transport. It is crate
+/// private because a claim is only meaningful to the publisher it was taken
+/// from: confirming it against another publisher, or never confirming it at
+/// all, strands the update it describes. [`publish_readiness`] is the only
+/// consumer and does neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingReadiness {
+pub(crate) struct PendingReadiness {
     notification: ReadinessNotification,
     generation: u64,
 }
 
 impl PendingReadiness {
     /// Notification to send on the association notification channel.
-    #[must_use]
-    pub const fn notification(&self) -> ReadinessNotification {
+    pub(crate) const fn notification(&self) -> ReadinessNotification {
         self.notification
     }
 }
@@ -104,8 +104,10 @@ struct PublisherState {
     ///
     /// Generations are allocated publisher-wide rather than per object so that
     /// an object re-registered under a recycled handle cannot reuse a value a
-    /// still-unconfirmed claim was taken from. Values may be skipped; only
-    /// their uniqueness matters.
+    /// still-unconfirmed claim was taken from. Values are skipped freely; only
+    /// their distinctness matters, which holds for as long as the counter does
+    /// not wrap. Wrapping would need `u64::MAX` recorded changes to elapse
+    /// while one claim stayed in flight, so it is treated as unreachable.
     next_generation: u64,
     closed: bool,
 }
@@ -201,15 +203,15 @@ impl ReadinessPublisher {
     ///
     /// The claim leaves the object marked pending until [`confirm`] reports it
     /// as published, so a change recorded while it is in flight is republished
-    /// rather than lost. The caller must confirm every claim it takes: a claim
-    /// that is dropped leaves the object pending but unqueued, and only a
-    /// later *changed* publication requeues it. Callers that cannot confirm
-    /// must treat publication as finished, which is what a failed send means
-    /// because it has already broken the association's notification channel.
+    /// rather than lost. Every claim must be confirmed against the publisher it
+    /// came from: a claim that is dropped leaves the object pending but
+    /// unqueued, and only a later *changed* publication requeues it.
+    /// [`publish_readiness`] drops a claim only when the send that carried it
+    /// failed, which ends publication for good.
     ///
     /// [`confirm`]: Self::confirm
     #[must_use]
-    pub fn take_pending(&self) -> Option<PendingReadiness> {
+    pub(crate) fn take_pending(&self) -> Option<PendingReadiness> {
         let mut state = self.state.lock();
         while let Some(handle) = state.queue.pop_front() {
             let Some(entry) = state.entries.get_mut(&handle) else {
@@ -238,7 +240,7 @@ impl ReadinessPublisher {
     /// that returned to the published flags, because the local endpoint samples
     /// authoritative state independently and may have observed the intermediate
     /// value.
-    pub fn confirm(&self, pending: &PendingReadiness) {
+    pub(crate) fn confirm(&self, pending: &PendingReadiness) {
         let mut state = self.state.lock();
         if let Some(entry) = state.entries.get_mut(&pending.notification.handle)
             && entry.generation == pending.generation
@@ -249,8 +251,10 @@ impl ReadinessPublisher {
 
     /// Drops readiness state for an object whose backend resource is retired.
     ///
-    /// Notifications already claimed for the object stay valid to send. The
-    /// local endpoint ignores notifications for objects it no longer holds.
+    /// Notifications already claimed for the object stay valid to send. A
+    /// notification that arrives after retirement is ignored by the local
+    /// endpoint, or, if the handle has since been recycled, is treated as a
+    /// spurious hint to re-check the new object.
     pub fn retire(&self, handle: ObjectHandle) {
         let mut state = self.state.lock();
         if state.entries.remove(&handle).is_some() {
@@ -260,11 +264,10 @@ impl ReadinessPublisher {
 
     /// Closes publication permanently and discards pending state.
     ///
-    /// Later updates are discarded and [`take_pending`] yields nothing, so a
+    /// Later updates are discarded and no further claim is produced, so a
     /// publisher woken during association teardown observes [`is_closed`] and
     /// stops.
     ///
-    /// [`take_pending`]: Self::take_pending
     /// [`is_closed`]: Self::is_closed
     pub fn close(&self) {
         let mut state = self.state.lock();
