@@ -142,6 +142,57 @@ fn serve_runner(
     Ok(())
 }
 
+/// Records the first failure of an association and ends its transport.
+///
+/// Every thread serving an association reports through this, and the endpoints
+/// they block on are released by ending the transport, so it is what the
+/// teardown guards below reach for.
+struct HostAssociationFailureCoordinator {
+    failed: AtomicBool,
+    error: Mutex<Option<IoError>>,
+    shutdown: UnixControlRingHostShutdown,
+}
+
+impl HostAssociationFailureCoordinator {
+    const fn new(shutdown: UnixControlRingHostShutdown) -> Self {
+        Self {
+            failed: AtomicBool::new(false),
+            error: Mutex::new(None),
+            shutdown,
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    fn report(&self, error: IoError) {
+        if self.failed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        *self
+            .error
+            .lock()
+            .expect("broker association failure mutex poisoned") = Some(error);
+        let _ = self.shutdown.shutdown();
+    }
+
+    /// Ends the association transport without recording a failure.
+    ///
+    /// Teardown uses this to release endpoints blocked on the control ring
+    /// without turning a shutdown that reported nothing into a reported error.
+    fn shutdown(&self) {
+        let _ = self.shutdown.shutdown();
+    }
+
+    fn take_error(&self) -> Option<IoError> {
+        self.error
+            .lock()
+            .expect("broker association failure mutex poisoned")
+            .take()
+    }
+}
+
 /// Fails the association if readiness publication unwinds.
 ///
 /// The request reader owns association termination but does not depend on the
@@ -345,52 +396,6 @@ fn run_worker<Memory: SharedMemory>(
                 failure_coordinator.report(IoError::other("broker request worker panicked"));
             }
         }
-    }
-}
-
-struct HostAssociationFailureCoordinator {
-    failed: AtomicBool,
-    error: Mutex<Option<IoError>>,
-    shutdown: UnixControlRingHostShutdown,
-}
-
-impl HostAssociationFailureCoordinator {
-    const fn new(shutdown: UnixControlRingHostShutdown) -> Self {
-        Self {
-            failed: AtomicBool::new(false),
-            error: Mutex::new(None),
-            shutdown,
-        }
-    }
-
-    fn failed(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
-    }
-
-    fn report(&self, error: IoError) {
-        if self.failed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        *self
-            .error
-            .lock()
-            .expect("broker association failure mutex poisoned") = Some(error);
-        let _ = self.shutdown.shutdown();
-    }
-
-    /// Ends the association transport without recording a failure.
-    ///
-    /// Teardown uses this to release endpoints blocked on the control ring
-    /// without turning a shutdown that reported nothing into a reported error.
-    fn shutdown(&self) {
-        let _ = self.shutdown.shutdown();
-    }
-
-    fn take_error(&self) -> Option<IoError> {
-        self.error
-            .lock()
-            .expect("broker association failure mutex poisoned")
-            .take()
     }
 }
 
