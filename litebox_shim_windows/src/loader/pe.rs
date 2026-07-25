@@ -71,6 +71,7 @@ pub(crate) struct WindowsProcessEnvironment {
 pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
+    pub(crate) ldr_initialize_thunk: Option<usize>,
     pub(crate) rtl_user_thread_start: Option<usize>,
     pub(crate) ntdll_mapping: Option<MappingInfo>,
     pub(crate) virtual_allocations: crate::WindowsVirtualAllocations<Platform>,
@@ -87,6 +88,7 @@ struct ProcessEnvironmentInput<'a> {
 
 pub(crate) struct WindowsThreadEnvironment {
     pub(crate) teb: usize,
+    pub(crate) context: usize,
     pub(crate) stack_top: usize,
 }
 
@@ -152,6 +154,9 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         let rtl_user_thread_start = ntdll
             .as_ref()
             .map(|ntdll| ntdll.exports.rtl_user_thread_start);
+        let ldr_initialize_thunk = ntdll
+            .as_ref()
+            .map(|ntdll| ntdll.exports.ldr_initialize_thunk);
         let ntdll_mapping = if let Some(ntdll) = ntdll {
             let mapping = ntdll.image.mapping;
             register_image_virtual_allocation(&virtual_allocations, mapping, ntdll.image.pages);
@@ -163,6 +168,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         Ok(PeLoadInfo {
             entry_point,
             stack_top: environment.stack_top,
+            ldr_initialize_thunk,
             rtl_user_thread_start,
             ntdll_mapping,
             virtual_allocations,
@@ -231,8 +237,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             .map_err(|_| PeImageAccessError::AddressOverflow)?;
         let api_set_map_ptr = create_pages(api_set_map.len())?;
         write_guest_slice::<Platform, _>(api_set_map_ptr, &api_set_map)?;
-        let ctx_ptr = create_pages(size_of::<X64Context>())?;
-
         let win32_image_path = win32_image_path(input.image_path);
         let dos_image_path = dos_image_path(input.image_path);
         let current_directory_path = Utf16StringBuffer::new(r"C:\")?;
@@ -376,11 +380,12 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
                 unique_process: INITIAL_PROCESS_ID,
                 unique_thread: INITIAL_THREAD_ID,
             },
+            true,
         )?;
         Ok(WindowsProcessEnvironment {
             peb: peb_ptr,
             teb: thread.teb,
-            context: ctx_ptr,
+            context: thread.context,
             stack_top: thread.stack_top,
             windows_shared_section: read_only_shared_memory_base,
         })
@@ -392,6 +397,7 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
     stack_size: usize,
     peb: usize,
     client_id: ClientId,
+    initialize_embedded_activation_context_stack: bool,
 ) -> Result<WindowsThreadEnvironment, PeImageAccessError> {
     let stack_size = if stack_size == 0 {
         INITIAL_STACK_SIZE
@@ -424,6 +430,15 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
     }
     .map_err(PeImageAccessError::Mapping)?
     .as_usize();
+    let context_length = NonZeroPageSize::new(size_of::<X64Context>().next_multiple_of(PAGE_SIZE))
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    // SAFETY: address selection is left to the page manager, so this cannot replace a mapping.
+    let context = unsafe {
+        page_manager
+            .create_writable_pages(None, context_length, CreatePagesFlags::empty(), |_| Ok(0))
+    }
+    .map_err(PeImageAccessError::Mapping)?
+    .as_usize();
 
     let mut teb = ThreadEnvironmentBlock::new_zeroed();
     teb.nt_tib.exception_list = 0;
@@ -432,20 +447,20 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
     teb.nt_tib.fiber_data_or_version = WINDOWS_NT_TIB_VERSION;
     teb.nt_tib.self_pointer = teb_ptr;
     teb.client_id = client_id;
-    teb.thread_local_storage_pointer =
-        teb_ptr + core::mem::offset_of!(ThreadEnvironmentBlock, tls_slots);
     teb.process_environment_block = peb;
     teb.real_client_id = client_id;
-    let activation_context_stack =
-        teb_ptr + core::mem::offset_of!(ThreadEnvironmentBlock, activation_stack);
-    let activation_frame_list = activation_context_stack
-        + core::mem::offset_of!(crate::nt_types::ActivationContextStack, frame_list_cache);
-    teb.activation_stack.frame_list_cache = crate::nt_types::ListEntry {
-        flink: activation_frame_list,
-        blink: activation_frame_list,
-    };
-    teb.activation_stack.next_cookie_sequence_number = 1;
-    teb.activation_context_stack_pointer = activation_context_stack;
+    if initialize_embedded_activation_context_stack {
+        let activation_context_stack =
+            teb_ptr + core::mem::offset_of!(ThreadEnvironmentBlock, activation_stack);
+        let activation_frame_list = activation_context_stack
+            + core::mem::offset_of!(crate::nt_types::ActivationContextStack, frame_list_cache);
+        teb.activation_stack.frame_list_cache = crate::nt_types::ListEntry {
+            flink: activation_frame_list,
+            blink: activation_frame_list,
+        };
+        teb.activation_stack.next_cookie_sequence_number = 1;
+        teb.activation_context_stack_pointer = activation_context_stack;
+    }
     teb.static_unicode_string =
         initial_teb_static_unicode_string(teb_ptr, &teb.static_unicode_buffer)?;
     teb.deallocation_stack = stack_base.as_usize();
@@ -453,6 +468,7 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
 
     Ok(WindowsThreadEnvironment {
         teb: teb_ptr,
+        context,
         stack_top,
     })
 }
@@ -2138,6 +2154,7 @@ mod tests {
             synthetic.teb.process_environment_block,
             synthetic.environment.peb
         );
+        assert_eq!(synthetic.teb.thread_local_storage_pointer, 0);
         assert_eq!(current_teb.process_environment_block, peb_address);
         assert_eq!(current_teb.client_id, host_client_id());
         let activation_frame_list = synthetic.environment.teb
@@ -2154,6 +2171,7 @@ mod tests {
             synthetic.teb.activation_stack.next_cookie_sequence_number,
             1
         );
+        assert_eq!(synthetic.teb.activation_stack.flags, 0);
 
         print_diff_header("synthetic TEB vs host TEB");
         print_diff_fields!(
@@ -2292,6 +2310,28 @@ mod tests {
                 rcu,
             ]
         );
+    }
+
+    #[test]
+    fn secondary_thread_defers_activation_context_stack_to_loader() {
+        let platform = crate::tests::test_platform();
+        let litebox = litebox::LiteBox::new(platform);
+        let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
+        let environment = create_thread_environment(
+            &page_manager,
+            INITIAL_STACK_SIZE,
+            0x1234_0000,
+            ClientId {
+                unique_process: INITIAL_PROCESS_ID,
+                unique_thread: INITIAL_THREAD_ID + 1,
+            },
+            false,
+        )
+        .expect("failed to create secondary thread environment");
+        let teb = read_guest_value::<ThreadEnvironmentBlock>(environment.teb);
+
+        assert_eq!(teb.activation_context_stack_pointer, 0);
+        assert_eq!(teb.activation_stack.as_bytes(), &[0; 0x28]);
     }
 
     #[test]
