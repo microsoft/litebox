@@ -417,9 +417,9 @@ mod tests {
     /// held open so the association stays up for the duration of a test.
     struct LiveAssociation {
         request_source: UnixControlRingHostRequestSource,
+        notifications: UnixControlRingHostNotificationChannel,
         shutdown: UnixControlRingHostShutdown,
         _response_sink: UnixControlRingHostResponseSink,
-        _notifications: UnixControlRingHostNotificationChannel,
         _local: (
             UnixControlRingLocalCallChannel,
             UnixControlRingLocalNotificationChannel,
@@ -451,9 +451,9 @@ mod tests {
             control_channel.into_active(host_ring).unwrap();
         LiveAssociation {
             request_source,
+            notifications,
             shutdown,
             _response_sink: response_sink,
-            _notifications: notifications,
             _local: local_activation.join().unwrap(),
         }
     }
@@ -502,29 +502,47 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_publication_guard_ends_the_notification_transport() {
-        let association = live_association();
-        let mut request_source = association.request_source;
-        let failure_coordinator = HostAssociationFailureCoordinator::new(association.shutdown);
-        let readiness = ReadinessPublisherRuntime::new();
-        let (received, receive) = sync_channel(1);
-        let reader = std::thread::spawn(move || {
-            received.send(request_source.recv_request()).unwrap();
-        });
+    fn dropping_the_publication_guard_ends_a_publisher_blocked_on_ring_capacity() {
+        use litebox_broker_protocol::ObjectHandle;
+        use litebox_broker_protocol::readiness::ReadinessFlags;
+        use litebox_broker_transport::control_ring::CONTROL_RING_NOTIFICATION_SLOT_COUNT;
 
-        // Closing publication cannot reach a publisher blocked on notification
-        // capacity, and an unwind reaches the scope join before anything else
-        // ends the transport, so the guard has to end it too.
+        let association = live_association();
+        let mut notifications = association.notifications;
+        let failure_coordinator = HostAssociationFailureCoordinator::new(association.shutdown);
+        let readiness = Arc::new(ReadinessPublisherRuntime::new());
+
+        // The local endpoint never drains, so the ring fills and the publisher
+        // ends up blocked on capacity rather than parked for work. Closing
+        // publication cannot reach it there, and an unwind reaches the scope
+        // join before anything else ends the transport.
+        for handle in 0..CONTROL_RING_NOTIFICATION_SLOT_COUNT * 3 {
+            readiness
+                .publish(ObjectHandle(handle), ReadinessFlags::READ)
+                .unwrap();
+        }
+        let publishing = Arc::clone(&readiness);
+        let (finished, finish) = sync_channel(1);
+        let publisher = std::thread::spawn(move || {
+            finished.send(publishing.run(&mut notifications)).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(20));
+
         drop(ReadinessPublicationGuard {
             readiness: &readiness,
             failure_coordinator: &failure_coordinator,
         });
 
-        let result = receive
+        let outcome = finish
             .recv_timeout(SETUP_TIMEOUT)
-            .expect("dropping the guard must end the association transport");
-        reader.join().unwrap();
-        assert!(matches!(result, Ok(HostReceive::PeerClosed) | Err(_)));
+            .expect("dropping the guard must end a publisher blocked on capacity");
+        publisher.join().unwrap();
+        assert_eq!(
+            outcome
+                .expect_err("ending the transport must fail the blocked send")
+                .kind(),
+            ErrorKind::ConnectionAborted
+        );
         assert!(
             failure_coordinator.take_error().is_none(),
             "ending the transport during teardown must not report a failure"
