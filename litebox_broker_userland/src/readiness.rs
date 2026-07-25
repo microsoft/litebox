@@ -91,10 +91,12 @@ impl ReadinessPublisherRuntime {
     /// Panics if publication has already run. Closure is terminal, so a runtime
     /// serves exactly one publisher, and a second one would park on a wake that
     /// only ever releases one waiter. That is a silent hang, so the second
-    /// caller is rejected loudly instead. A returned error is therefore
-    /// terminal for this runtime as well: the portable loop leaves the failed
-    /// update publishable, but resuming it on a replacement channel needs a new
-    /// runtime rather than a second call.
+    /// caller is rejected loudly instead. A returned error is terminal for the
+    /// same reason: the portable loop leaves the failed update publishable, but
+    /// no later publisher can send it, so this closes publication rather than
+    /// leave sources recording into state nothing will drain. Resuming on a
+    /// replacement channel means a new runtime, which starts empty, so the
+    /// failed update is lost at this layer.
     pub fn run<Channel: HostNotificationChannel>(
         &self,
         channel: &mut Channel,
@@ -103,7 +105,11 @@ impl ReadinessPublisherRuntime {
             !self.running.swap(true, Ordering::Relaxed),
             "readiness publication must run exactly once per runtime"
         );
-        publish_readiness(&self.publisher, channel, || self.wait_for_work())
+        let outcome = publish_readiness(&self.publisher, channel, || self.wait_for_work());
+        if outcome.is_err() {
+            self.publisher.close();
+        }
+        outcome
     }
 
     /// Closes publication and wakes a publisher parked for work so [`run`]
@@ -214,6 +220,37 @@ mod tests {
         );
         runtime.close();
         expect_publication_ended(&finish);
+    }
+
+    use litebox_broker_host::readiness::MAX_TRACKED_READINESS_OBJECTS;
+
+    struct FailingChannel;
+
+    impl HostNotificationChannel for FailingChannel {
+        type Error = &'static str;
+
+        fn send_notification(
+            &mut self,
+            _notification: &BrokerNotification,
+        ) -> Result<(), Self::Error> {
+            Err("notification channel failed")
+        }
+    }
+
+    #[test]
+    fn a_failed_publication_closes_the_runtime() {
+        let runtime = ReadinessPublisherRuntime::new();
+        runtime.publish(HANDLE, ReadinessFlags::READ).unwrap();
+
+        runtime.run(&mut FailingChannel).unwrap_err();
+
+        // Publication cannot run again, so a closed runtime must discard later
+        // updates rather than let sources fill tracking state to its limit.
+        for handle in 0..=MAX_TRACKED_READINESS_OBJECTS as u64 {
+            runtime
+                .publish(ObjectHandle(handle), ReadinessFlags::READ)
+                .unwrap();
+        }
     }
 
     #[test]
