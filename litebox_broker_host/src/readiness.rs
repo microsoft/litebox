@@ -21,9 +21,10 @@
 //! identifies its newest change, and a claim is confirmed only while the
 //! generation it was taken from is still current.
 //!
-//! This type is transport-neutral and never blocks, so it holds no thread,
-//! timer, or wake primitive. Deployments own those and wake their publisher
-//! whenever [`publish`] reports [`PublishOutcome::Queued`].
+//! This type is transport-neutral and performs no transport I/O, so it holds no
+//! thread, timer, or wake primitive and never waits for notification-ring
+//! capacity. Deployments own those and wake their publisher whenever
+//! [`publish`] reports [`PublishOutcome::Queued`].
 //!
 //! [`publish`]: ReadinessPublisher::publish
 //! [`BrokerNotification::Readiness`]: litebox_broker_protocol::message::BrokerNotification::Readiness
@@ -61,8 +62,9 @@ pub enum PublishOutcome {
     /// The update queued work the publisher may not know about yet, so the
     /// deployment must wake its publisher.
     Queued,
-    /// The update matched state already known to the local endpoint, or work
-    /// for this object was already queued. No wake is required.
+    /// The update matched the newest recorded state, so delivery for it is
+    /// already known to the local endpoint, queued, or in flight. No wake is
+    /// required.
     Coalesced,
     /// The publisher is closed and the update was discarded.
     Closed,
@@ -70,22 +72,58 @@ pub enum PublishOutcome {
 
 /// One readiness notification claimed for publication.
 ///
-/// The claim is returned to the publisher by [`ReadinessPublisher::confirm`]
-/// after the notification is durably handed to the transport. It is crate
-/// private because a claim is only meaningful to the publisher it was taken
-/// from: confirming it against another publisher, or never confirming it at
-/// all, strands the update it describes. [`publish_readiness`] is the only
-/// consumer and does neither.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PendingReadiness {
+/// The claim borrows the publisher it came from, so it cannot be confirmed
+/// against a different one, and it is not `Copy`, so it cannot be replayed.
+/// Dropping it without calling [`confirm`] requeues the update rather than
+/// stranding it, which is what returns the object to a publishable state when
+/// a send fails or unwinds.
+///
+/// [`confirm`]: Self::confirm
+#[derive(Debug)]
+pub(crate) struct PendingReadiness<'publisher> {
+    publisher: &'publisher ReadinessPublisher,
     notification: ReadinessNotification,
     generation: u64,
 }
 
-impl PendingReadiness {
+impl PendingReadiness<'_> {
     /// Notification to send on the association notification channel.
     pub(crate) const fn notification(&self) -> ReadinessNotification {
         self.notification
+    }
+
+    /// Reports that the notification reached the notification channel.
+    ///
+    /// The pending mark is cleared only when the object still holds the
+    /// generation the claim was taken from. Any change recorded while the
+    /// notification was in flight leaves the object pending, including a change
+    /// that returned to the published flags, because the local endpoint samples
+    /// authoritative state independently and may have observed the intermediate
+    /// value.
+    pub(crate) fn confirm(self) {
+        let mut state = self.publisher.state.lock();
+        if let Some(entry) = state.entries.get_mut(&self.notification.handle)
+            && entry.generation == self.generation
+        {
+            entry.dirty = false;
+        }
+        drop(state);
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for PendingReadiness<'_> {
+    fn drop(&mut self) {
+        let mut state = self.publisher.state.lock();
+        // A newer change has already requeued the object, and a retired or
+        // closed publisher has nothing left to publish.
+        if let Some(entry) = state.entries.get_mut(&self.notification.handle)
+            && entry.generation == self.generation
+            && !entry.queued
+        {
+            entry.queued = true;
+            state.queue.push_back(self.notification.handle);
+        }
     }
 }
 
@@ -105,9 +143,10 @@ struct PublisherState {
     /// Generations are allocated publisher-wide rather than per object so that
     /// an object re-registered under a recycled handle cannot reuse a value a
     /// still-unconfirmed claim was taken from. Values are skipped freely; only
-    /// their distinctness matters, which holds for as long as the counter does
-    /// not wrap. Wrapping would need `u64::MAX` recorded changes to elapse
-    /// while one claim stayed in flight, so it is treated as unreachable.
+    /// their distinctness matters, which holds unless the counter wraps all the
+    /// way back to a value a claim is still holding. That needs `2^64` recorded
+    /// changes to elapse while one send is in flight, so it is treated as
+    /// unreachable.
     next_generation: u64,
     closed: bool,
 }
@@ -201,17 +240,12 @@ impl ReadinessPublisher {
 
     /// Claims the next pending readiness notification, if any.
     ///
-    /// The claim leaves the object marked pending until [`confirm`] reports it
-    /// as published, so a change recorded while it is in flight is republished
-    /// rather than lost. Every claim must be confirmed against the publisher it
-    /// came from: a claim that is dropped leaves the object pending but
-    /// unqueued, and only a later *changed* publication requeues it.
-    /// [`publish_readiness`] drops a claim only when the send that carried it
-    /// failed, which ends publication for good.
-    ///
-    /// [`confirm`]: Self::confirm
+    /// The claim leaves the object marked pending until it is confirmed, so a
+    /// change recorded while it is in flight is republished rather than lost.
+    /// A claim that is dropped unconfirmed requeues the object, so a failed or
+    /// unwinding send leaves the update publishable by a later publisher.
     #[must_use]
-    pub(crate) fn take_pending(&self) -> Option<PendingReadiness> {
+    pub(crate) fn take_pending(&self) -> Option<PendingReadiness<'_>> {
         let mut state = self.state.lock();
         while let Some(handle) = state.queue.pop_front() {
             let Some(entry) = state.entries.get_mut(&handle) else {
@@ -221,32 +255,19 @@ impl ReadinessPublisher {
             if !entry.dirty {
                 continue;
             }
+            let notification = ReadinessNotification {
+                handle,
+                readiness: entry.readiness,
+            };
+            let generation = entry.generation;
+            drop(state);
             return Some(PendingReadiness {
-                notification: ReadinessNotification {
-                    handle,
-                    readiness: entry.readiness,
-                },
-                generation: entry.generation,
+                publisher: self,
+                notification,
+                generation,
             });
         }
         None
-    }
-
-    /// Reports that a claimed notification reached the notification channel.
-    ///
-    /// The pending mark is cleared only when the object still holds the
-    /// generation the claim was taken from. Any change recorded while the
-    /// notification was in flight leaves the object pending, including a change
-    /// that returned to the published flags, because the local endpoint samples
-    /// authoritative state independently and may have observed the intermediate
-    /// value.
-    pub(crate) fn confirm(&self, pending: &PendingReadiness) {
-        let mut state = self.state.lock();
-        if let Some(entry) = state.entries.get_mut(&pending.notification.handle)
-            && entry.generation == pending.generation
-        {
-            entry.dirty = false;
-        }
     }
 
     /// Drops readiness state for an object whose backend resource is retired.
@@ -302,7 +323,9 @@ impl ReadinessPublisher {
 /// loop. Deployments that must also interrupt an in-progress send do so through
 /// their transport, which fails the blocked send.
 ///
-/// Returns `Ok(())` once publication is closed and no claim is outstanding.
+/// Returns `Ok(())` once publication is closed and no claim is outstanding. A
+/// failed send returns its error with the claimed update left publishable, so
+/// resuming on a replacement channel does not lose the notification.
 pub fn publish_readiness<Channel: HostNotificationChannel>(
     publisher: &ReadinessPublisher,
     channel: &mut Channel,
@@ -311,7 +334,7 @@ pub fn publish_readiness<Channel: HostNotificationChannel>(
     loop {
         if let Some(pending) = publisher.take_pending() {
             channel.send_notification(&BrokerNotification::Readiness(pending.notification()))?;
-            publisher.confirm(&pending);
+            pending.confirm();
             continue;
         }
         if publisher.is_closed() {
@@ -335,8 +358,8 @@ mod tests {
     fn drain(publisher: &ReadinessPublisher) -> alloc::vec::Vec<ReadinessNotification> {
         let mut drained = alloc::vec::Vec::new();
         while let Some(pending) = publisher.take_pending() {
-            publisher.confirm(&pending);
             drained.push(pending.notification());
+            pending.confirm();
         }
         drained
     }
@@ -405,7 +428,7 @@ mod tests {
             publisher.publish(HANDLE, ReadinessFlags::WRITE).unwrap(),
             PublishOutcome::Queued
         );
-        publisher.confirm(&pending);
+        pending.confirm();
 
         assert_eq!(
             drain(&publisher),
@@ -428,7 +451,7 @@ mod tests {
         // which is why confirmation compares generations and not flags.
         publish(&publisher, HANDLE, ReadinessFlags::WRITE);
         publish(&publisher, HANDLE, ReadinessFlags::READ);
-        publisher.confirm(&pending);
+        pending.confirm();
 
         assert_eq!(
             drain(&publisher),
@@ -503,7 +526,7 @@ mod tests {
         let pending = publisher.take_pending().unwrap();
 
         publisher.retire(HANDLE);
-        publisher.confirm(&pending);
+        pending.confirm();
 
         assert_eq!(publisher.tracked_objects(), 0);
         assert!(publisher.take_pending().is_none());
@@ -533,7 +556,7 @@ mod tests {
         // while the first claim is still in flight.
         publisher.retire(HANDLE);
         publish(&publisher, HANDLE, ReadinessFlags::WRITE);
-        publisher.confirm(&stale);
+        stale.confirm();
 
         assert_eq!(
             drain(&publisher),
@@ -721,5 +744,55 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "notification channel failed");
+
+        // The claim was dropped by the failed send rather than confirmed, so
+        // the update it carried is still publishable on a replacement channel.
+        assert_eq!(
+            drain(&publisher),
+            [ReadinessNotification {
+                handle: HANDLE,
+                readiness: ReadinessFlags::READ,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_abandoned_claim_returns_its_update_to_the_queue() {
+        let publisher = ReadinessPublisher::new();
+        publish(&publisher, HANDLE, ReadinessFlags::READ);
+
+        drop(publisher.take_pending().unwrap());
+
+        // Republishing the same flags coalesces, so nothing else can rescue the
+        // update if abandoning the claim strands it.
+        assert_eq!(
+            publisher.publish(HANDLE, ReadinessFlags::READ).unwrap(),
+            PublishOutcome::Coalesced
+        );
+        assert_eq!(
+            drain(&publisher),
+            [ReadinessNotification {
+                handle: HANDLE,
+                readiness: ReadinessFlags::READ,
+            }]
+        );
+    }
+
+    #[test]
+    fn abandoning_a_stale_claim_does_not_requeue_a_newer_update_twice() {
+        let publisher = ReadinessPublisher::new();
+        publish(&publisher, HANDLE, ReadinessFlags::READ);
+        let stale = publisher.take_pending().unwrap();
+
+        publish(&publisher, HANDLE, ReadinessFlags::WRITE);
+        drop(stale);
+
+        assert_eq!(
+            drain(&publisher),
+            [ReadinessNotification {
+                handle: HANDLE,
+                readiness: ReadinessFlags::WRITE,
+            }]
+        );
     }
 }
