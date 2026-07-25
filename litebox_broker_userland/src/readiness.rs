@@ -128,7 +128,7 @@ impl ReadinessPublisherRuntime {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::mpsc::{Sender, channel};
+    use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::Duration;
 
     use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
@@ -155,15 +155,34 @@ mod tests {
         }
     }
 
+    /// Runs a publisher on its own thread and reports its result through a
+    /// channel, so a publisher that never ends fails a test on the deadline
+    /// instead of hanging its join.
+    fn spawn_publisher(
+        runtime: &Arc<ReadinessPublisherRuntime>,
+        sent: Sender<ReadinessNotification>,
+    ) -> Receiver<Result<(), &'static str>> {
+        let publishing = Arc::clone(runtime);
+        let (finished, finish) = channel();
+        std::thread::spawn(move || {
+            let mut channel = RecordingChannel { sent };
+            let _ = finished.send(publishing.run(&mut channel));
+        });
+        finish
+    }
+
+    fn expect_publication_ended(finish: &Receiver<Result<(), &'static str>>) {
+        finish
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("publication must end")
+            .expect("publication must end without a channel error");
+    }
+
     #[test]
     fn a_parked_publisher_wakes_for_a_later_readiness_update() {
         let runtime = Arc::new(ReadinessPublisherRuntime::new());
         let (sent, received) = channel();
-        let publishing = Arc::clone(&runtime);
-        let publisher = std::thread::spawn(move || {
-            let mut channel = RecordingChannel { sent };
-            publishing.run(&mut channel)
-        });
+        let finish = spawn_publisher(&runtime, sent);
 
         // The publisher parks first, so this update must wake it.
         std::thread::sleep(Duration::from_millis(20));
@@ -177,25 +196,27 @@ mod tests {
             }
         );
         runtime.close();
-        publisher.join().unwrap().unwrap();
+        expect_publication_ended(&finish);
     }
 
     #[test]
-    fn closing_ends_a_parked_publisher() {
+    fn closing_wakes_a_publisher_waiting_for_work() {
         let runtime = Arc::new(ReadinessPublisherRuntime::new());
-        let (sent, _received) = channel();
-        let publishing = Arc::clone(&runtime);
-        let publisher = std::thread::spawn(move || {
-            let mut channel = RecordingChannel { sent };
-            publishing.run(&mut channel)
+        let waiting = Arc::clone(&runtime);
+        let (wake_sender, wakes) = channel();
+        std::thread::spawn(move || {
+            waiting.wait_for_work();
+            let _ = wake_sender.send(());
         });
 
-        // The publisher parks on an empty queue first, so closing is what must
-        // end it rather than a queue it already found closed.
-        std::thread::sleep(Duration::from_millis(20));
+        // The latch is sticky, so this must end the wait whether it lands
+        // before the waiter parks or after it, which is why the test needs no
+        // rendezvous with a park it cannot observe.
         runtime.close();
 
-        publisher.join().unwrap().unwrap();
+        wakes
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("closing must end a wait for work");
     }
 
     #[test]
@@ -211,11 +232,7 @@ mod tests {
         runtime.retire(HANDLE);
         runtime.publish(OTHER_HANDLE, ReadinessFlags::READ).unwrap();
 
-        let publishing = Arc::clone(&runtime);
-        let publisher = std::thread::spawn(move || {
-            let mut channel = RecordingChannel { sent };
-            publishing.run(&mut channel)
-        });
+        let finish = spawn_publisher(&runtime, sent);
 
         assert_eq!(
             received.recv_timeout(TEST_TIMEOUT).unwrap(),
@@ -226,7 +243,7 @@ mod tests {
             "a retired object must not be published"
         );
         runtime.close();
-        publisher.join().unwrap().unwrap();
+        expect_publication_ended(&finish);
         assert!(received.try_iter().next().is_none());
     }
 }
