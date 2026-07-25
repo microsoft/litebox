@@ -71,7 +71,6 @@ pub(crate) struct WindowsProcessEnvironment {
 pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
-    pub(crate) ldr_initialize_thunk: Option<usize>,
     pub(crate) rtl_user_thread_start: Option<usize>,
     pub(crate) ntdll_mapping: Option<MappingInfo>,
     pub(crate) virtual_allocations: crate::WindowsVirtualAllocations<Platform>,
@@ -88,7 +87,6 @@ struct ProcessEnvironmentInput<'a> {
 
 pub(crate) struct WindowsThreadEnvironment {
     pub(crate) teb: usize,
-    pub(crate) context: usize,
     pub(crate) stack_top: usize,
 }
 
@@ -154,9 +152,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         let rtl_user_thread_start = ntdll
             .as_ref()
             .map(|ntdll| ntdll.exports.rtl_user_thread_start);
-        let ldr_initialize_thunk = ntdll
-            .as_ref()
-            .map(|ntdll| ntdll.exports.ldr_initialize_thunk);
         let ntdll_mapping = if let Some(ntdll) = ntdll {
             let mapping = ntdll.image.mapping;
             register_image_virtual_allocation(&virtual_allocations, mapping, ntdll.image.pages);
@@ -168,7 +163,6 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         Ok(PeLoadInfo {
             entry_point,
             stack_top: environment.stack_top,
-            ldr_initialize_thunk,
             rtl_user_thread_start,
             ntdll_mapping,
             virtual_allocations,
@@ -237,6 +231,8 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             .map_err(|_| PeImageAccessError::AddressOverflow)?;
         let api_set_map_ptr = create_pages(api_set_map.len())?;
         write_guest_slice::<Platform, _>(api_set_map_ptr, &api_set_map)?;
+        let ctx_ptr = create_pages(size_of::<X64Context>())?;
+
         let win32_image_path = win32_image_path(input.image_path);
         let dos_image_path = dos_image_path(input.image_path);
         let current_directory_path = Utf16StringBuffer::new(r"C:\")?;
@@ -384,7 +380,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         Ok(WindowsProcessEnvironment {
             peb: peb_ptr,
             teb: thread.teb,
-            context: thread.context,
+            context: ctx_ptr,
             stack_top: thread.stack_top,
             windows_shared_section: read_only_shared_memory_base,
         })
@@ -428,15 +424,6 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
     }
     .map_err(PeImageAccessError::Mapping)?
     .as_usize();
-    let context_length = NonZeroPageSize::new(size_of::<X64Context>().next_multiple_of(PAGE_SIZE))
-        .ok_or(PeImageAccessError::AddressOverflow)?;
-    // SAFETY: address selection is left to the page manager, so this cannot replace a mapping.
-    let context = unsafe {
-        page_manager
-            .create_writable_pages(None, context_length, CreatePagesFlags::empty(), |_| Ok(0))
-    }
-    .map_err(PeImageAccessError::Mapping)?
-    .as_usize();
 
     let mut teb = ThreadEnvironmentBlock::new_zeroed();
     teb.nt_tib.exception_list = 0;
@@ -458,7 +445,6 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
 
     Ok(WindowsThreadEnvironment {
         teb: teb_ptr,
-        context,
         stack_top,
     })
 }
