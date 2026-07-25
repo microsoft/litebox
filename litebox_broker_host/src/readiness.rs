@@ -100,6 +100,13 @@ pub struct ReadinessPublisher {
 struct PublisherState {
     entries: HashMap<ObjectHandle, ReadinessEntry>,
     queue: VecDeque<ObjectHandle>,
+    /// Generation to hand to the next recorded change.
+    ///
+    /// Generations are allocated publisher-wide rather than per object so that
+    /// an object re-registered under a recycled handle cannot reuse a value a
+    /// still-unconfirmed claim was taken from. Values may be skipped; only
+    /// their uniqueness matters.
+    next_generation: u64,
     closed: bool,
 }
 
@@ -107,7 +114,7 @@ struct PublisherState {
 struct ReadinessEntry {
     /// Newest authoritative flags recorded by a backend source.
     readiness: ReadinessFlags,
-    /// Advances whenever `readiness` changes.
+    /// Identifies the recorded change, and is replaced whenever one arrives.
     ///
     /// Confirmation compares this rather than the published flags because a
     /// notification only tells the local endpoint to re-check; the endpoint
@@ -135,6 +142,7 @@ impl ReadinessPublisher {
             state: SpinMutex::new(PublisherState {
                 entries: HashMap::new(),
                 queue: VecDeque::new(),
+                next_generation: 0,
                 closed: false,
             }),
         }
@@ -154,6 +162,7 @@ impl ReadinessPublisher {
         if state.closed {
             return Ok(PublishOutcome::Closed);
         }
+        let generation = state.next_generation;
         if let Some(entry) = state.entries.get_mut(&handle) {
             if entry.readiness == readiness {
                 // Either the local endpoint already knows this value or a
@@ -161,12 +170,14 @@ impl ReadinessPublisher {
                 return Ok(PublishOutcome::Coalesced);
             }
             entry.readiness = readiness;
-            entry.generation = entry.generation.wrapping_add(1);
+            entry.generation = generation;
             entry.dirty = true;
-            if entry.queued {
+            let already_queued = entry.queued;
+            entry.queued = true;
+            state.next_generation = generation.wrapping_add(1);
+            if already_queued {
                 return Ok(PublishOutcome::Coalesced);
             }
-            entry.queued = true;
         } else {
             if state.entries.len() >= MAX_TRACKED_READINESS_OBJECTS {
                 return Err(ReadinessPublishError::TooManyObjects);
@@ -175,11 +186,12 @@ impl ReadinessPublisher {
                 handle,
                 ReadinessEntry {
                     readiness,
-                    generation: 0,
+                    generation,
                     dirty: true,
                     queued: true,
                 },
             );
+            state.next_generation = generation.wrapping_add(1);
         }
         state.queue.push_back(handle);
         Ok(PublishOutcome::Queued)
@@ -187,8 +199,13 @@ impl ReadinessPublisher {
 
     /// Claims the next pending readiness notification, if any.
     ///
-    /// The claim stays pending until [`confirm`] reports it as published, so a
-    /// publisher that fails or is interrupted does not silently drop it.
+    /// The claim leaves the object marked pending until [`confirm`] reports it
+    /// as published, so a change recorded while it is in flight is republished
+    /// rather than lost. The caller must confirm every claim it takes: a claim
+    /// that is dropped leaves the object pending but unqueued, and only a
+    /// later *changed* publication requeues it. Callers that cannot confirm
+    /// must treat publication as finished, which is what a failed send means
+    /// because it has already broken the association's notification channel.
     ///
     /// [`confirm`]: Self::confirm
     #[must_use]
@@ -500,6 +517,27 @@ mod tests {
         assert_eq!(
             publisher.publish(HANDLE, ReadinessFlags::READ).unwrap(),
             PublishOutcome::Queued
+        );
+    }
+
+    #[test]
+    fn confirming_a_claim_taken_before_reuse_does_not_clear_the_new_update() {
+        let publisher = ReadinessPublisher::new();
+        publish(&publisher, HANDLE, ReadinessFlags::READ);
+        let stale = publisher.take_pending().unwrap();
+
+        // The object is retired and the handle is recycled for a new object
+        // while the first claim is still in flight.
+        publisher.retire(HANDLE);
+        publish(&publisher, HANDLE, ReadinessFlags::WRITE);
+        publisher.confirm(&stale);
+
+        assert_eq!(
+            drain(&publisher),
+            [ReadinessNotification {
+                handle: HANDLE,
+                readiness: ReadinessFlags::WRITE,
+            }]
         );
     }
 
