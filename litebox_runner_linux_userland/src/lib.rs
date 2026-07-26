@@ -218,14 +218,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     let mut broker_positional_io_fds = Vec::new();
+    let mut broker_shutdown_fds = Vec::new();
     let shim_builder = if let Some(broker_connection) = broker_connection {
         let broker::BrokerConnection {
             local: broker_local,
             notifications: broker_notifications,
             coordinator: broker_association_coordinator,
             positional_io_fds,
+            shutdown_fd,
         } = broker_connection;
         broker_positional_io_fds.extend(positional_io_fds);
+        broker_shutdown_fds.push(shutdown_fd);
         let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
         broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
         broker::start_notification_receiver(
@@ -409,6 +412,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     #[cfg(target_arch = "x86_64")]
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
         &broker_positional_io_fds,
+        &broker_shutdown_fds,
     );
 
     let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;

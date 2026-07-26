@@ -29,6 +29,7 @@ pub(crate) struct BrokerConnection {
     pub(crate) notifications: BrokerNotifications<UnixControlRingLocalNotificationChannel>,
     pub(crate) coordinator: Arc<BrokerAssociationFailureCoordinator>,
     pub(crate) positional_io_fds: [RawFd; 2],
+    pub(crate) shutdown_fd: RawFd,
 }
 
 pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
@@ -46,7 +47,7 @@ pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
         )
     })?;
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
-    let (local, (notification_channel, positional_io_fds)) =
+    let (local, (notification_channel, positional_io_fds, shutdown_fd)) =
         BrokerLocal::negotiate(setup_channel, |mut setup| {
             let shared_memory =
                 setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
@@ -69,11 +70,12 @@ pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
                         association_coordinator.report_failure();
                     }
                 })?;
+            let shutdown_fd = association_shutdown.as_fd().as_raw_fd();
             association_coordinator.install_shutdown(association_shutdown)?;
             Ok((
                 call_channel,
                 Arc::new(shared_memory),
-                (notification_channel, positional_io_fds),
+                (notification_channel, positional_io_fds, shutdown_fd),
             ))
         })
         .context("broker negotiation failed")?;
@@ -82,6 +84,7 @@ pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
         notifications: BrokerNotifications::new(notification_channel),
         coordinator: association_coordinator,
         positional_io_fds,
+        shutdown_fd,
     })
 }
 

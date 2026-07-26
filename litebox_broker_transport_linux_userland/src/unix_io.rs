@@ -65,7 +65,7 @@ fn combine_result_with_restore<Output>(
     }
 }
 
-fn io_timeout_for_deadline(deadline: Instant) -> IoResult<Duration> {
+pub(crate) fn io_timeout_for_deadline(deadline: Instant) -> IoResult<Duration> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|timeout| !timeout.is_zero())

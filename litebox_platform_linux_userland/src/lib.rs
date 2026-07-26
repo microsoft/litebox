@@ -425,8 +425,13 @@ impl LinuxUserland {
     /// Installs the runner seccomp filter.
     ///
     /// Positional reads and writes are allowed only for the supplied
-    /// descriptors; all other positional I/O remains blocked.
-    pub fn enable_seccomp_filter(positional_io_fds: &[std::os::fd::RawFd]) {
+    /// descriptors. Socket shutdown is allowed only for the supplied
+    /// descriptors and only in both directions. All other positional I/O and
+    /// socket shutdown calls remain blocked.
+    pub fn enable_seccomp_filter(
+        positional_io_fds: &[std::os::fd::RawFd],
+        shutdown_fds: &[std::os::fd::RawFd],
+    ) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
             SeccompFilter, SeccompRule,
@@ -542,6 +547,36 @@ impl LinuxUserland {
             };
             rules.push((libc::SYS_pread64, fd_rules()));
             rules.push((libc::SYS_pwrite64, fd_rules()));
+        }
+        if !shutdown_fds.is_empty() {
+            let shutdown_rules = shutdown_fds
+                .iter()
+                .map(|fd| {
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            0,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            u64::from(
+                                u32::try_from(*fd).expect("shutdown descriptor must be valid"),
+                            ),
+                        )
+                        .unwrap(),
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            u64::from(
+                                u32::try_from(libc::SHUT_RDWR)
+                                    .expect("SHUT_RDWR must be non-negative"),
+                            ),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap()
+                })
+                .collect();
+            rules.push((libc::SYS_shutdown, shutdown_rules));
         }
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
             rules.into_iter().collect();
@@ -2474,7 +2509,9 @@ impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
+    use std::net::Shutdown;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
     use std::thread::sleep;
 
     use litebox::{fs::OFlags, platform::RawMutex};
@@ -2531,7 +2568,12 @@ mod tests {
         let _platform: &LinuxUserland = LinuxUserland::new(None);
         let allowed = test_memfd(c"seccomp-allowed-positional-io");
         let denied = test_memfd(c"seccomp-denied-positional-io");
-        LinuxUserland::enable_seccomp_filter(&[allowed.as_raw_fd()]);
+        let (allowed_shutdown, _allowed_peer) = UnixStream::pair().unwrap();
+        let (denied_shutdown, _denied_peer) = UnixStream::pair().unwrap();
+        LinuxUserland::enable_seccomp_filter(
+            &[allowed.as_raw_fd()],
+            &[allowed_shutdown.as_raw_fd()],
+        );
 
         let written = [7_u8];
         // SAFETY: The buffers are valid for their lengths, and both descriptors
@@ -2570,6 +2612,11 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::EINVAL)
         );
+        let error = allowed_shutdown.shutdown(Shutdown::Write).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        allowed_shutdown.shutdown(Shutdown::Both).unwrap();
+        let error = denied_shutdown.shutdown(Shutdown::Both).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
 
         let pathname = c"/tmp/test_seccomp";
         let mkdir_res = unsafe {

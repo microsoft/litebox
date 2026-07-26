@@ -202,6 +202,10 @@ fn write_all_at(
 
 const FUTEX_INCREMENT_OPERATION: libc::c_int =
     (libc::FUTEX_OP_ADD << 28) | (libc::FUTEX_OP_CMP_EQ << 24) | (1 << 12);
+const FUTEX_WAIT_RECHECK_TIMEOUT: libc::timespec = libc::timespec {
+    tv_sec: 0,
+    tv_nsec: 100_000_000,
+};
 
 // The rustix futex API requires `AtomicU32` references. Raw syscalls keep Rust
 // references out of memory that a peer can modify through an uncontrolled fd.
@@ -228,16 +232,16 @@ fn futex_increment(address: *mut u32) -> IoResult<()> {
 }
 
 fn futex_wait(address: *mut u32, expected: u32) -> IoResult<()> {
+    let timeout = FUTEX_WAIT_RECHECK_TIMEOUT;
     // SAFETY: `address` is aligned and lies within the live shared mapping. The
-    // null timeout requests an unbounded wait, and the other unused pointer is
-    // null.
+    // timeout and the other unused pointer are valid for the syscall.
     let result = unsafe {
         libc::syscall(
             libc::SYS_futex,
             address,
             libc::FUTEX_WAIT,
             expected,
-            std::ptr::null::<libc::timespec>(),
+            &raw const timeout,
             std::ptr::null::<u32>(),
             0,
         )
@@ -352,12 +356,19 @@ impl WaitableSharedMemory for MemfdSharedMemory {
     /// Waits while a shared `u32` still equals `expected`.
     ///
     /// A value change or signal interruption is reported as a successful,
-    /// possibly spurious wakeup. The caller must recheck its wait condition.
+    /// possibly spurious wakeup. A bounded wait also lets callers recheck
+    /// trusted cancellation state if a hostile peer restores the sampled shared
+    /// value after cancellation. The caller must recheck its wait condition.
     fn wait_while_equal(&self, offset: usize, expected: u32) -> IoResult<()> {
         let address = u32_address(self, offset).map_err(Self::wait_access_error)?;
         match futex_wait(address, expected) {
             Ok(()) => Ok(()),
-            Err(error) if matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) => {
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EAGAIN | libc::EINTR | libc::ETIMEDOUT)
+                ) =>
+            {
                 Ok(())
             }
             Err(error) => Err(error),
@@ -704,6 +715,19 @@ mod tests {
             second.wake_one(body_offset).unwrap_err().kind(),
             ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn futex_wait_returns_without_peer_cooperation() {
+        let memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
+            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u32(*offset))
+            .unwrap();
+        let start = Instant::now();
+
+        memory.wait_while_equal(epoch_offset, 0).unwrap();
+
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
