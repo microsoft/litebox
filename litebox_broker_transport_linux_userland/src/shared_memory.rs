@@ -27,7 +27,7 @@ use rustix::net::{
 };
 use rustix::thread::futex;
 
-use litebox_broker_transport::control_ring::ControlRingBlocking;
+use litebox_broker_transport::control_ring::WaitableSharedMemory;
 use litebox_broker_transport::shared_memory::{
     AtomicSharedMemory, SharedMemory, SharedMemoryError,
 };
@@ -211,7 +211,7 @@ impl MemfdSharedMemory {
     }
 }
 
-impl ControlRingBlocking for MemfdSharedMemory {
+impl WaitableSharedMemory for MemfdSharedMemory {
     type Error = Error;
 
     fn wait_access_error(error: SharedMemoryError) -> Error {

@@ -393,29 +393,29 @@ pub struct ControlRingProducer<Memory: AtomicSharedMemory> {
 /// Cloneable, narrow handle for interrupting a wait on one ring endpoint.
 ///
 /// This handle intentionally exposes neither the backing memory nor endpoint
-/// state. Concrete transports use it to interrupt a [`ControlRingBlocking`]
-/// wait when liveness or cancellation state changes. It is public so that
-/// transport bindings outside this crate, such as the endpoints in
-/// `litebox_broker_transport_linux_userland`, can interrupt ring waits without
-/// gaining access to ring memory.
+/// state. Concrete transports use it to interrupt a ring wait provided by
+/// [`WaitableSharedMemory`] when liveness or cancellation state changes. It is
+/// public so that transport bindings outside this crate, such as the endpoints
+/// in `litebox_broker_transport_linux_userland`, can interrupt ring waits
+/// without gaining access to ring memory.
 pub struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
     ring: Arc<ControlRing<Memory>>,
     wait_epoch: ControlRingWaitEpoch,
 }
 
-/// Blocking wait and wake support for control-ring epoch words.
+/// Shared-memory wait and wake support for control-ring epoch words.
 ///
 /// The ring state machines themselves are nonblocking: they report
 /// [`Full`](ControlRingWriteStatus::Full) or [`Empty`](ControlRingReadStatus::Empty)
 /// together with the epoch that was sampled before the final check. Shared
 /// memory that can also block and wake threads on those epoch words implements
 /// this trait, which lets ring endpoints offer blocking waits without knowing
-/// whether a deployment blocks on a futex, a kernel event, or something else.
+/// whether the backing memory uses a futex, a kernel event, or something else.
 ///
 /// Implementations must publish and observe epoch changes through the same
 /// coherent shared memory the ring uses, so a wake that follows an epoch change
 /// can never be missed by a waiter that sampled the previous epoch.
-pub trait ControlRingBlocking: AtomicSharedMemory {
+pub trait WaitableSharedMemory: AtomicSharedMemory {
     /// Error reported by blocking operations on this shared memory.
     type Error;
 
@@ -466,7 +466,7 @@ impl<Memory: AtomicSharedMemory> ControlRingWakeHandle<Memory> {
     }
 }
 
-impl<Memory: ControlRingBlocking> ControlRingWakeHandle<Memory> {
+impl<Memory: WaitableSharedMemory> ControlRingWakeHandle<Memory> {
     /// Changes and wakes the epoch observed by this endpoint's wait operation.
     ///
     /// Incrementing before waking closes the race where cancellation happens
@@ -564,7 +564,7 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
     }
 }
 
-impl<Memory: ControlRingBlocking> ControlRingProducer<Memory> {
+impl<Memory: WaitableSharedMemory> ControlRingProducer<Memory> {
     /// Waits for consumer progress after [`ControlRingWriteStatus::Full`].
     ///
     /// The caller must retry the write after this possibly spurious wakeup.
@@ -701,7 +701,7 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
     }
 }
 
-impl<Memory: ControlRingBlocking> ControlRingConsumer<Memory> {
+impl<Memory: WaitableSharedMemory> ControlRingConsumer<Memory> {
     /// Waits for producer progress after [`ControlRingReadStatus::Empty`].
     ///
     /// The caller must retry the read after this possibly spurious wakeup.
