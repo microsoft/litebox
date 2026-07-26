@@ -1,35 +1,33 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+//! Runtime broker transport interfaces and portable transport mechanisms.
+//!
+//! This crate owns what a broker association needs in order to *move* messages
+//! once both peers agree on the protocol: the local-side and host-side channel
+//! contracts, the runtime shared-memory interfaces and the checked
+//! shared-buffer pool built on them, and the portable shared control-ring state
+//! machines.
+//!
+//! Nothing here is tied to an operating system or to hosted userland. The crate
+//! is unconditionally `no_std`, so a kernel deployment can use the same
+//! interfaces and control rings. Concrete association bindings, such as the
+//! Unix-domain-socket and memfd endpoints in
+//! `litebox_broker_transport_linux_userland`, live in separate crates, and a
+//! deployment may implement the channel traits directly instead of using the
+//! control ring.
+//!
+//! Peer-visible message and layout contracts live in `litebox_broker_protocol`,
+//! while the portable local-side, host-side, and core authority adapters live in
+//! their own crates.
 
-//! Broker transport implementations.
-//!
-//! Transports own hosted or platform-specific framing and I/O. Portable broker
-//! protocol messages, local-side adapters, host-side request handling, and core
-//! authority state live in separate crates.
-//!
-//! This crate owns the portable control-ring primitives, the Linux-userland
-//! shared memory that backs them, and the concrete *local* (guest-side) Unix
-//! endpoints. The matching *host* (broker-side) Unix endpoints live in the
-//! platform binding crate `litebox_broker_platform_linux_userland`, which
-//! builds on the shared surface in [`platform_support`].
+#![no_std]
 
 extern crate alloc;
 
 #[cfg(test)]
 extern crate std;
 
+pub mod channel;
 pub mod control_ring;
-
-#[cfg(all(feature = "linux-userland", target_os = "linux"))]
-pub mod platform_support;
-
-#[cfg(all(feature = "linux-userland", target_os = "linux"))]
 pub mod shared_memory;
-
-#[cfg(all(feature = "linux-userland", target_os = "linux"))]
-pub mod unix_socket;
-
-#[cfg(all(feature = "linux-userland", target_os = "linux"))]
-mod unix_io;

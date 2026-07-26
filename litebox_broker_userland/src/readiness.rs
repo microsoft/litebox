@@ -15,8 +15,8 @@ use litebox_broker_host::readiness::{
     PublishOutcome, ReadinessPublishError, ReadinessPublisher, publish_readiness,
 };
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::HostNotificationChannel;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_transport::channel::HostNotificationChannel;
 
 /// Readiness publication state plus the wake primitive its publisher parks on.
 ///

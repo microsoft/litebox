@@ -1,16 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Unix-domain-socket broker host endpoints for hosted userland deployments.
+//! Host (broker-side) endpoints of a Unix-domain-socket broker association.
 //!
-//! This module deliberately uses `std` because Unix-domain sockets and `std::io`
-//! framing are hosted userland concerns. Portable broker interfaces live in the
-//! no_std protocol, local, core, and host crates, and the matching local
-//! endpoints live in `litebox_broker_transport::unix_socket`.
-//!
-//! After setup, the authenticated socket is retained only for liveness and
-//! fail-closed shutdown. Active requests, responses, and notifications use
-//! shared control rings.
+//! The matching local endpoints live in the sibling `local` module, and both
+//! sides share the crate-private `setup` framing. Portable broker interfaces
+//! live in the no_std protocol, transport, local, core, and host crates.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult};
 use std::os::unix::net::UnixStream;
@@ -18,9 +13,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use litebox_broker_protocol::channel::{
-    HostNotificationChannel, HostReceive, HostSetupChannel, PeerCredential,
-};
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
     BrokerResponse,
@@ -29,15 +21,19 @@ use litebox_broker_protocol::wire::{
     WireError, decode_handshake_request, decode_request, encode_handshake_response,
     encode_notification, encode_response,
 };
-use litebox_broker_transport::control_ring::{
-    ControlRing, ControlRingConsumer, ControlRingProducer, ControlRingReadError,
-    ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+use litebox_broker_transport::channel::{
+    HostNotificationChannel, HostReceive, HostSetupChannel, PeerCredential,
 };
-use litebox_broker_transport::platform_support::{
-    CONTROL_RING_READY, copy_io_error, invalid_data, read_setup_frame, shutdown_socket, wire_error,
+use litebox_broker_transport::control_ring::{
+    CONTROL_RING_READY, ControlRing, ControlRingConsumer, ControlRingProducer,
+    ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+};
+
+use crate::setup::{
+    copy_io_error, invalid_data, read_setup_frame, ring_error, shutdown_socket, wire_error,
     write_setup_frame,
 };
-use litebox_broker_transport::shared_memory::MemfdSharedMemory;
+use crate::shared_memory::MemfdSharedMemory;
 
 /// Validates that a connected Unix socket belongs to `expected_process_id`.
 pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> IoResult<()> {
@@ -133,11 +129,7 @@ impl UnixStreamHostSetupChannel {
         shared_memory: &MemfdSharedMemory,
         deadline: Option<Instant>,
     ) -> IoResult<()> {
-        litebox_broker_transport::shared_memory::send_memfd(
-            &mut self.stream,
-            shared_memory,
-            deadline,
-        )
+        crate::shared_memory::send_memfd(&mut self.stream, shared_memory, deadline)
     }
 
     /// Consumes a negotiated setup channel into independently usable active
@@ -284,7 +276,7 @@ impl UnixControlRingHostRequestSource {
                     return result;
                 }
                 Err(ControlRingReadError::Ring(error)) => {
-                    let error = Error::from(error);
+                    let error = ring_error(error);
                     let result = Err(copy_io_error(&error));
                     let _ = self.association.fail(error);
                     return result;
@@ -352,7 +344,7 @@ impl HostRingAssociation {
             }
             consumer
                 .publish_head()
-                .map_err(Error::from)
+                .map_err(ring_error)
                 .and_then(|()| consumer.wake_producer())
         };
         if let Err(error) = result {
@@ -442,7 +434,7 @@ impl HostRingAssociation {
             }
             producer
                 .try_write(frame)
-                .map_err(Error::from)
+                .map_err(ring_error)
                 .and_then(|write_status| {
                     if matches!(write_status, ControlRingWriteStatus::Written) {
                         producer.wake_consumer()?;
@@ -485,9 +477,6 @@ fn monitor_host_socket(stream: &mut UnixStream, association: &HostRingAssociatio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_protocol::channel::{
-        LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
-    };
     use litebox_broker_protocol::message::{
         BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
     };
@@ -496,11 +485,15 @@ mod tests {
         decode_response, encode_handshake_request, encode_request,
     };
     use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, RequestId};
+    use litebox_broker_transport::channel::{
+        LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
+    };
     use litebox_broker_transport::control_ring::{
         CONTROL_RING_MEMORY_SIZE, CONTROL_RING_NOTIFICATION_SLOT_COUNT, CONTROL_RING_SLOT_COUNT,
         LocalControlRingEndpoints,
     };
-    use litebox_broker_transport::unix_socket::{
+
+    use crate::unix_socket::local::{
         UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
         UnixStreamLocalSetupChannel,
     };

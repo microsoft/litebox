@@ -10,21 +10,20 @@ use std::time::Duration;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
-use litebox_broker_platform_linux_userland::unix_socket::{
-    UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
-};
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::{HostNotificationChannel, HostReceive};
 use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::shared_memory::{
-    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool,
-};
+use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
+use litebox_broker_transport::channel::{HostNotificationChannel, HostReceive};
 use litebox_broker_transport::control_ring::{
     CONTROL_RING_MEMORY_SIZE, CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing,
 };
-use litebox_broker_transport::shared_memory::MemfdSharedMemory;
-use litebox_broker_transport::unix_socket::{
+use litebox_broker_transport::shared_memory::SharedBufferPool;
+use litebox_broker_transport_linux_userland::shared_memory::MemfdSharedMemory;
+use litebox_broker_transport_linux_userland::unix_socket::{
+    UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
+};
+use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
     UnixStreamLocalSetupChannel,
 };

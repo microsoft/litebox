@@ -2,7 +2,6 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
     EventConsumeMode,
@@ -11,6 +10,7 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, EventRequest, EventResponse,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 

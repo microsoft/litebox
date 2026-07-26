@@ -1,17 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Unix-domain-socket broker local endpoints for hosted userland deployments.
+//! Local (guest-side) endpoints of a Unix-domain-socket broker association.
 //!
-//! This module deliberately uses `std` because Unix-domain sockets and `std::io`
-//! framing are hosted userland concerns. Portable broker interfaces live in the
-//! no_std protocol, local, core, and host crates. The matching host endpoints
-//! live in the platform binding crate `litebox_broker_platform_linux_userland`
-//! and share this crate's [setup framing](crate::platform_support).
-//!
-//! After setup, the authenticated socket is retained only for liveness and
-//! fail-closed shutdown. Active requests, responses, and notifications use
-//! shared control rings.
+//! The matching host endpoints live in the sibling `host` module, and both
+//! sides share the crate-private `setup` framing. Portable broker interfaces
+//! live in the no_std protocol, transport, local, core, and host crates.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult};
 use std::os::unix::net::UnixStream;
@@ -20,19 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use std::{collections::HashMap, thread};
 
-use crate::control_ring::{
-    ControlRing, ControlRingConsumer, ControlRingReadError, ControlRingReadStatus,
-    ControlRingWakeHandle, ControlRingWriteStatus,
-};
-use crate::platform_support::{
-    CONTROL_RING_READY, copy_io_error, invalid_data, read_setup_frame, shutdown_socket, wire_error,
-    write_setup_frame,
-};
-use crate::shared_memory::MemfdSharedMemory;
 use litebox_broker_protocol::RequestId;
-use litebox_broker_protocol::channel::{
-    LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
-};
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
     BrokerResponse,
@@ -41,6 +23,19 @@ use litebox_broker_protocol::wire::{
     decode_handshake_response, decode_notification, decode_response, encode_handshake_request,
     encode_request,
 };
+use litebox_broker_transport::channel::{
+    LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
+};
+use litebox_broker_transport::control_ring::{
+    CONTROL_RING_READY, ControlRing, ControlRingConsumer, ControlRingProducer,
+    ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+};
+
+use crate::setup::{
+    copy_io_error, invalid_data, read_setup_frame, ring_error, shutdown_socket, wire_error,
+    write_setup_frame,
+};
+use crate::shared_memory::MemfdSharedMemory;
 
 /// Maximum number of active calls waiting for broker responses.
 pub const MAX_PENDING_CALLS: usize = 64;
@@ -66,7 +61,7 @@ pub struct UnixControlRingLocalShutdown {
 /// request producer, the setup socket used for liveness and teardown, pending
 /// call tracking, and the wake handles of all three ring directions.
 struct LocalRingAssociation {
-    request_producer: Mutex<crate::control_ring::ControlRingProducer<MemfdSharedMemory>>,
+    request_producer: Mutex<ControlRingProducer<MemfdSharedMemory>>,
     control_stream: UnixStream,
     pending_calls: Arc<PendingCalls>,
     on_failure: Arc<dyn Fn() + Send + Sync>,
@@ -157,7 +152,7 @@ impl UnixStreamLocalSetupChannel {
         }
 
         let shutdown_stream = setup_stream.try_clone()?;
-        let crate::control_ring::LocalControlRingEndpoints {
+        let litebox_broker_transport::control_ring::LocalControlRingEndpoints {
             request_producer,
             response_consumer,
             notification_consumer,
@@ -264,7 +259,7 @@ impl LocalCallChannel for UnixControlRingLocalCallChannel {
             loop {
                 let write_status = association
                     .pending_calls
-                    .run_if_live(|| producer.try_write(&request_frame).map_err(Error::from));
+                    .run_if_live(|| producer.try_write(&request_frame).map_err(ring_error));
                 match write_status {
                     Ok(ControlRingWriteStatus::Written) => {
                         if let Err(error) = producer.wake_consumer() {
@@ -314,7 +309,7 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
                     }
                 }
                 Err(ControlRingReadError::Ring(error)) => {
-                    let error = Error::from(error);
+                    let error = ring_error(error);
                     let result = Err(copy_io_error(&error));
                     let _ = self.association.fail(error);
                     return result;
@@ -482,7 +477,7 @@ impl LocalRingAssociation {
         let result = self.pending_calls.run_if_live(|| {
             consumer
                 .publish_head()
-                .map_err(Error::from)
+                .map_err(ring_error)
                 .and_then(|()| consumer.wake_producer())
         });
         if let Err(error) = result {
@@ -542,7 +537,7 @@ fn dispatch_responses(
             Ok(ControlRingReadStatus::Message(response)) => {
                 if let Err(error) = consumer
                     .publish_head()
-                    .map_err(Error::from)
+                    .map_err(ring_error)
                     .and_then(|()| consumer.wake_producer())
                     .and_then(|()| association.pending_calls.complete(response))
                 {
@@ -560,7 +555,7 @@ fn dispatch_responses(
                 }
             }
             Err(ControlRingReadError::Ring(error)) => {
-                let _ = association.fail(Error::from(error));
+                let _ = association.fail(ring_error(error));
                 return;
             }
             Err(ControlRingReadError::Decode(error)) => {
@@ -574,8 +569,6 @@ fn dispatch_responses(
 #[cfg(test)]
 mod control_ring_tests {
     use super::*;
-    use crate::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRingProducer};
-    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::{
         BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     };
@@ -583,6 +576,8 @@ mod control_ring_tests {
         decode_handshake_request, decode_request, encode_handshake_response, encode_response,
     };
     use litebox_broker_protocol::{ObjectHandle, RequestId};
+    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_transport::control_ring::CONTROL_RING_MEMORY_SIZE;
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
     use std::sync::Barrier;
@@ -639,7 +634,7 @@ mod control_ring_tests {
         let (channel, _notifications, shutdown) =
             setup.into_active(local_ring, on_failure).unwrap();
         acknowledgement.join().unwrap();
-        let crate::control_ring::BrokerControlRingEndpoints {
+        let litebox_broker_transport::control_ring::BrokerControlRingEndpoints {
             request_consumer,
             response_producer,
             notification_producer: _,

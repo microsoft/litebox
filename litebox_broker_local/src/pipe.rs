@@ -2,13 +2,13 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, PipeRequest, PipeResponse};
 use litebox_broker_protocol::pipe::{
     CreatePipeRequest, CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeRequest,
     WritePipeRequest,
 };
-use litebox_broker_protocol::shared_memory::SharedBufferDescriptor;
+use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
+use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
@@ -146,16 +146,16 @@ mod tests {
     use std::sync::Mutex;
 
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
         BrokerResponse, BrokerResult,
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
-    use litebox_broker_protocol::shared_memory::{
-        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex, SharedMemory,
-        SharedMemoryError,
+    use litebox_broker_protocol::shared_buffer::{
+        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex,
     };
+    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
 
     #[test]
     fn pipe_uses_the_descriptor_slot_for_data_operations() {

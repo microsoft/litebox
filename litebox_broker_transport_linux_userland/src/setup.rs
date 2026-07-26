@@ -1,16 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Shared Unix setup framing and failure helpers for platform bindings.
+//! Unix setup framing and failure helpers shared by both association sides.
 //!
-//! Concrete broker endpoints are split across crates: the local endpoints live
-//! in [`crate::unix_socket`], while the broker/host endpoints live in the
-//! platform binding crate `litebox_broker_platform_linux_userland`. Both sides
-//! must frame setup traffic and report failures identically, so this module is
-//! the deliberately narrow surface they share instead of each endpoint
-//! reimplementing security-sensitive setup framing.
+//! The local and host endpoints in [`crate::unix_socket`] must frame setup
+//! traffic and report failures identically, so this crate-private module is the
+//! single source of that security-sensitive framing instead of each endpoint
+//! reimplementing it.
 //!
-//! This module exists to support platform bindings. It is not part of the
+//! Setup framing is a property of this Linux-userland binding, not of the
 //! broker wire protocol; portable messages live in `litebox_broker_protocol`.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
@@ -19,8 +17,8 @@ use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
 use litebox_broker_protocol::wire::WireError;
+use litebox_broker_transport::control_ring::ControlRingError;
 
-use crate::control_ring::ControlRingError;
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
 };
@@ -28,13 +26,10 @@ use crate::unix_io::{
 /// Largest setup frame either endpoint accepts or produces.
 const MAX_SETUP_FRAME_LEN: usize = 64 * 1024;
 
-/// Readiness token both endpoints exchange before activating the control ring.
-pub const CONTROL_RING_READY: &[u8] = b"litebox-control-ring-ready-v1";
-
 /// Reads one length-prefixed setup frame, bounded by `deadline`.
 ///
 /// Returns `Ok(None)` when the peer closed cleanly on a frame boundary.
-pub fn read_setup_frame(
+pub(crate) fn read_setup_frame(
     stream: &mut UnixStream,
     deadline: Option<Instant>,
 ) -> IoResult<Option<Vec<u8>>> {
@@ -73,7 +68,7 @@ pub fn read_setup_frame(
 }
 
 /// Writes one length-prefixed setup frame, bounded by `deadline`.
-pub fn write_setup_frame(
+pub(crate) fn write_setup_frame(
     stream: &mut UnixStream,
     frame: &[u8],
     deadline: Option<Instant>,
@@ -113,7 +108,7 @@ fn write_all_with_deadline(
 
 /// Shuts down both directions of an association socket, tolerating a peer that
 /// already disconnected.
-pub fn shutdown_socket(stream: &UnixStream) -> IoResult<()> {
+pub(crate) fn shutdown_socket(stream: &UnixStream) -> IoResult<()> {
     match stream.shutdown(Shutdown::Both) {
         Err(error) if error.kind() == ErrorKind::NotConnected => Ok(()),
         result => result,
@@ -121,12 +116,12 @@ pub fn shutdown_socket(stream: &UnixStream) -> IoResult<()> {
 }
 
 /// Builds the fail-closed error both endpoints report for malformed input.
-pub fn invalid_data(message: &'static str) -> Error {
+pub(crate) fn invalid_data(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, message)
 }
 
 /// Maps a decode failure to the fail-closed error both endpoints report.
-pub fn wire_error(error: WireError) -> Error {
+pub(crate) fn wire_error(error: WireError) -> Error {
     Error::new(
         ErrorKind::InvalidData,
         format!("invalid broker wire message: {error}"),
@@ -135,20 +130,19 @@ pub fn wire_error(error: WireError) -> Error {
 
 /// Clones an error so one recorded terminal failure can be reported to every
 /// waiter of an association.
-pub fn copy_io_error(error: &Error) -> Error {
+pub(crate) fn copy_io_error(error: &Error) -> Error {
     match error.raw_os_error() {
         Some(code) => Error::from_raw_os_error(code),
         None => Error::new(error.kind(), error.to_string()),
     }
 }
 
-impl From<ControlRingError> for Error {
-    fn from(error: ControlRingError) -> Self {
-        Self::new(
-            ErrorKind::InvalidData,
-            format!("invalid broker control ring: {error:?}"),
-        )
-    }
+/// Maps a control-ring failure to the fail-closed error both endpoints report.
+pub(crate) fn ring_error(error: ControlRingError) -> Error {
+    Error::new(
+        ErrorKind::InvalidData,
+        format!("invalid broker control ring: {error:?}"),
+    )
 }
 
 #[cfg(test)]

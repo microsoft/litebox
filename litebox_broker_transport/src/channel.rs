@@ -1,7 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::message::{
+//! Runtime control-channel contracts for broker associations.
+//!
+//! These traits describe how an association moves protocol messages between the
+//! local endpoint and the broker host. They are transport-neutral: an
+//! implementation may use Unix sockets, shared rings, kernel traps, or another
+//! IPC mechanism.
+
+use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
     BrokerResponse,
 };

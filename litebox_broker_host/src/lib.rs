@@ -4,9 +4,10 @@
 //! Channel-neutral broker-side protocol/core adapter.
 //!
 //! This crate wires `litebox_broker_core` to any implementation of the neutral
-//! host-side control-channel trait. Concrete host channels live in platform
-//! binding crates such as `litebox_broker_platform_linux_userland`, which build
-//! on the portable transport primitives in `litebox_broker_transport`.
+//! host-side control-channel trait in `litebox_broker_transport`. Concrete host
+//! channels live in transport binding crates such as
+//! `litebox_broker_transport_linux_userland`, which build on the portable
+//! transport interfaces and control rings.
 
 #![no_std]
 
@@ -18,7 +19,6 @@ extern crate std;
 use alloc::vec::Vec;
 
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
-use litebox_broker_protocol::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::message::{
@@ -28,11 +28,12 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
-use litebox_broker_protocol::shared_memory::{
-    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferPool,
-    SharedBufferSlotIndex, SharedMemory,
+use litebox_broker_protocol::shared_buffer::{
+    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
+use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
+use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
 
 mod error;
@@ -231,7 +232,7 @@ impl SharedBufferUsage {
         &mut self,
         request_id: RequestId,
         descriptor: SharedBufferDescriptor,
-        layout: litebox_broker_protocol::shared_memory::SharedBufferLayout,
+        layout: litebox_broker_protocol::shared_buffer::SharedBufferLayout,
     ) -> core::result::Result<(), ErrorCode> {
         if layout
             .range(descriptor.slot_index, descriptor.length as usize)
@@ -399,11 +400,12 @@ mod tests {
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
-    use litebox_broker_protocol::shared_memory::{
+    use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
-        SharedBufferDescriptor, SharedBufferPool, SharedMemoryError,
+        SharedBufferDescriptor,
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
+    use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
@@ -702,7 +704,7 @@ mod tests {
             }))]),
             std::vec::Vec::new(),
         );
-        let incompatible_layout = litebox_broker_protocol::shared_memory::SharedBufferLayout::new(
+        let incompatible_layout = litebox_broker_protocol::shared_buffer::SharedBufferLayout::new(
             u32::try_from(SHARED_BUFFER_POOL_SIZE).unwrap(),
             1,
         )

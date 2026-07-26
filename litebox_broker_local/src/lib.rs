@@ -5,9 +5,9 @@
 //!
 //! The local control adapter owns request identifiers but does not own transport
 //! sequencing. Userland, kernel, or ring-buffer deployments provide channels by
-//! implementing [`litebox_broker_protocol::channel::LocalSetupChannel`] for
+//! implementing [`litebox_broker_transport::channel::LocalSetupChannel`] for
 //! association setup and
-//! [`litebox_broker_protocol::channel::LocalCallChannel`] for active calls.
+//! [`litebox_broker_transport::channel::LocalCallChannel`] for active calls.
 //! Notification receive adapters are intentionally separate so active control
 //! requests remain strictly paired with their responses.
 
@@ -25,19 +25,18 @@ mod pipe;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use litebox_broker_protocol::channel::{
-    LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
-};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::shared_memory::{
-    SHARED_BUFFER_LAYOUT, SharedBufferPool, SharedMemory,
-};
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, RequestId};
+use litebox_broker_transport::channel::{
+    LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
+};
+use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 
 pub use error::{BrokerLocalError, Result};
 
@@ -240,9 +239,9 @@ mod tests {
     use core::convert::Infallible;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::ProtocolVersion;
-    use litebox_broker_protocol::channel::LocalNotificationChannel;
     use litebox_broker_protocol::message::ReadinessNotification;
     use litebox_broker_protocol::readiness::ReadinessFlags;
+    use litebox_broker_transport::channel::LocalNotificationChannel;
     use std::sync::Mutex;
 
     #[test]
@@ -530,7 +529,7 @@ mod tests {
             Ok((
                 channel,
                 Arc::new(NoopSharedMemory {
-                    length: litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE - 1,
+                    length: litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE - 1,
                 }) as Arc<dyn SharedMemory>,
                 (),
             ))
@@ -578,7 +577,7 @@ mod tests {
             &self,
             _offset: usize,
             destination: &mut [u8],
-        ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
+        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
         {
             destination.fill(0);
             Ok(())
@@ -588,7 +587,7 @@ mod tests {
             &self,
             _offset: usize,
             _source: &[u8],
-        ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
+        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
         {
             Ok(())
         }
@@ -596,7 +595,7 @@ mod tests {
 
     fn noop_shared_memory() -> Arc<dyn SharedMemory> {
         Arc::new(NoopSharedMemory {
-            length: litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE,
+            length: litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
         })
     }
 

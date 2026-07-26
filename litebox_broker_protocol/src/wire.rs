@@ -328,7 +328,7 @@ mod tests {
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
     };
-    use crate::shared_memory::{SharedBufferDescriptor, SharedBufferSlotIndex};
+    use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);

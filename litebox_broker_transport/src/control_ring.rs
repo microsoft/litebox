@@ -2,6 +2,11 @@
 // Licensed under the MIT license.
 
 //! Hostile-peer-safe shared control-ring state machines.
+//!
+//! The memory layout in this module is a transport ABI shared by both
+//! control-ring endpoints. Layout changes must also change the versioned
+//! activation token so endpoints with incompatible ring layouts fail setup
+//! rather than interpreting the same shared memory differently.
 
 use alloc::sync::Arc;
 use core::mem::size_of;
@@ -10,11 +15,14 @@ use core::ops::Range;
 use core::sync::atomic::fence;
 
 #[cfg(test)]
-use litebox_broker_protocol::shared_memory::SharedMemory;
-use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemoryError};
+use crate::shared_memory::SharedMemory;
+use crate::shared_memory::{AtomicSharedMemory, SharedMemoryError};
 
 /// Size of one shared control-ring slot.
 pub const CONTROL_RING_SLOT_SIZE: usize = 128;
+
+/// Versioned token exchanged before endpoints activate this control-ring ABI.
+pub const CONTROL_RING_READY: &[u8] = b"litebox-control-ring-ready-v1";
 
 /// Size of the fixed metadata at the start of a control-ring slot.
 pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;
@@ -385,25 +393,51 @@ pub struct ControlRingProducer<Memory: AtomicSharedMemory> {
 /// Cloneable, narrow handle for interrupting a wait on one ring endpoint.
 ///
 /// This handle intentionally exposes neither the backing memory nor endpoint
-/// state. Hosted transports use it to make liveness and cancellation events
-/// visible to a thread blocked in an OS-specific wait. It is public so that
-/// platform bindings outside this crate, such as the host endpoints in
-/// `litebox_broker_platform_linux_userland`, can interrupt ring waits without
+/// state. Deployments use it to make liveness and cancellation events visible to
+/// a thread blocked in a [`ControlRingBlocking`] wait. It is public so that
+/// concrete transports outside this crate, such as the endpoints in
+/// `litebox_broker_transport_linux_userland`, can interrupt ring waits without
 /// gaining access to ring memory.
-#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
 pub struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
     ring: Arc<ControlRing<Memory>>,
     wait_epoch: ControlRingWaitEpoch,
 }
 
-#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+/// Blocking wait and wake support for control-ring epoch words.
+///
+/// The ring state machines themselves are nonblocking: they report
+/// [`Full`](ControlRingWriteStatus::Full) or [`Empty`](ControlRingReadStatus::Empty)
+/// together with the epoch that was sampled before the final check. Shared
+/// memory that can also block and wake threads on those epoch words implements
+/// this trait, which lets ring endpoints offer blocking waits without knowing
+/// whether a deployment blocks on a futex, a kernel event, or something else.
+///
+/// Implementations must publish and observe epoch changes through the same
+/// coherent shared memory the ring uses, so a wake that follows an epoch change
+/// can never be missed by a waiter that sampled the previous epoch.
+pub trait ControlRingBlocking: AtomicSharedMemory {
+    /// Error reported by blocking operations on this shared memory.
+    type Error;
+
+    /// Converts a shared-memory access failure into [`Self::Error`].
+    fn wait_access_error(error: SharedMemoryError) -> Self::Error;
+
+    /// Waits while the naturally aligned `u32` at `offset` equals `expected`.
+    ///
+    /// A value change or an interruption must be reported as a successful,
+    /// possibly spurious wakeup, so callers must recheck their wait condition.
+    fn wait_while_equal(&self, offset: usize, expected: u32) -> Result<(), Self::Error>;
+
+    /// Wakes one waiter blocked on the naturally aligned `u32` at `offset`.
+    fn wake_one(&self, offset: usize) -> Result<(), Self::Error>;
+}
+
 #[derive(Clone, Copy)]
 enum ControlRingWaitEpoch {
     Producer(ControlRingDirection),
     Consumer(ControlRingDirection),
 }
 
-#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
 impl ControlRingWaitEpoch {
     const fn offset(self) -> usize {
         match self {
@@ -413,7 +447,6 @@ impl ControlRingWaitEpoch {
     }
 }
 
-#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
 impl<Memory: AtomicSharedMemory> Clone for ControlRingWakeHandle<Memory> {
     fn clone(&self) -> Self {
         Self {
@@ -423,7 +456,6 @@ impl<Memory: AtomicSharedMemory> Clone for ControlRingWakeHandle<Memory> {
     }
 }
 
-#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
 impl<Memory: AtomicSharedMemory> ControlRingWakeHandle<Memory> {
     pub(crate) const fn wait_epoch_offset(&self) -> usize {
         self.wait_epoch.offset()
@@ -431,6 +463,19 @@ impl<Memory: AtomicSharedMemory> ControlRingWakeHandle<Memory> {
 
     pub(crate) fn memory(&self) -> &Memory {
         self.ring.memory()
+    }
+}
+
+impl<Memory: ControlRingBlocking> ControlRingWakeHandle<Memory> {
+    /// Changes and wakes the epoch observed by this endpoint's wait operation.
+    ///
+    /// Incrementing before waking closes the race where cancellation happens
+    /// after a ring operation samples its epoch but before it starts to wait.
+    pub fn interrupt_wait(&self) -> Result<(), Memory::Error> {
+        self.memory()
+            .fetch_add_u32_release(self.wait_epoch_offset(), 1)
+            .map_err(Memory::wait_access_error)?;
+        self.memory().wake_one(self.wait_epoch_offset())
     }
 }
 
@@ -451,7 +496,6 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
 
     /// Returns a handle that can interrupt a wait on this producer's ring
     /// direction.
-    #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
     pub fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
         ControlRingWakeHandle {
             ring: Arc::clone(&self.ring),
@@ -459,7 +503,6 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
         }
     }
 
-    #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
     pub(crate) fn memory(&self) -> &Memory {
         self.ring.memory()
     }
@@ -521,6 +564,22 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
     }
 }
 
+impl<Memory: ControlRingBlocking> ControlRingProducer<Memory> {
+    /// Waits for consumer progress after [`ControlRingWriteStatus::Full`].
+    ///
+    /// The caller must retry the write after this possibly spurious wakeup.
+    pub fn wait_for_capacity(&mut self, wait_epoch: u32) -> Result<(), Memory::Error> {
+        self.memory()
+            .wait_while_equal(self.direction().consumer_epoch_offset(), wait_epoch)
+    }
+
+    /// Wakes the consumer after publishing one or more messages.
+    pub fn wake_consumer(&self) -> Result<(), Memory::Error> {
+        self.memory()
+            .wake_one(self.direction().producer_epoch_offset())
+    }
+}
+
 /// Trusted endpoint-local state for one control-ring consumer.
 pub struct ControlRingConsumer<Memory: AtomicSharedMemory> {
     ring: Arc<ControlRing<Memory>>,
@@ -546,7 +605,6 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
 
     /// Returns a handle that can interrupt a wait on this consumer's ring
     /// direction.
-    #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
     pub fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
         ControlRingWakeHandle {
             ring: Arc::clone(&self.ring),
@@ -554,7 +612,6 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
         }
     }
 
-    #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
     pub(crate) fn memory(&self) -> &Memory {
         self.ring.memory()
     }
@@ -641,6 +698,22 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
         let message = decode(payload).map_err(ControlRingReadError::Decode)?;
         self.head = expected_sequence;
         Ok(ControlRingReadStatus::Message(message))
+    }
+}
+
+impl<Memory: ControlRingBlocking> ControlRingConsumer<Memory> {
+    /// Waits for producer progress after [`ControlRingReadStatus::Empty`].
+    ///
+    /// The caller must retry the read after this possibly spurious wakeup.
+    pub fn wait_for_message(&mut self, wait_epoch: u32) -> Result<(), Memory::Error> {
+        self.memory()
+            .wait_while_equal(self.direction().producer_epoch_offset(), wait_epoch)
+    }
+
+    /// Wakes the producer after publishing newly consumed slots.
+    pub fn wake_producer(&self) -> Result<(), Memory::Error> {
+        self.memory()
+            .wake_one(self.direction().consumer_epoch_offset())
     }
 }
 

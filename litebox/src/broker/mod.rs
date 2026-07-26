@@ -9,11 +9,11 @@ use alloc::{
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::LocalCallChannel;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::event::{Events, polling::Pollee};
 use crate::platform::TimeProvider;
@@ -308,16 +308,16 @@ mod tests {
     use std::time::Duration;
 
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
         BrokerResponse, BrokerResult, PipeRequest, PipeResponse,
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
-    use litebox_broker_protocol::shared_memory::{
-        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor, SharedMemory,
-        SharedMemoryError,
+    use litebox_broker_protocol::shared_buffer::{
+        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor,
     };
+    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
 
     use crate::platform::mock::MockPlatform;
 

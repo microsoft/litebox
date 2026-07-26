@@ -1,12 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Shared broker protocol types and channel contracts.
+//! Shared broker protocol contracts.
 //!
-//! This crate describes broker-visible opaque handles, errors, versions,
-//! request/response messages, and the transport-neutral control-channel
-//! contracts used to carry them. It does not know whether messages move over
-//! Unix sockets, shared rings, kernel traps, or another IPC mechanism.
+//! This crate describes what broker peers agree on: opaque handles, errors,
+//! versions, handshake/request/response/notification messages, the shared-buffer
+//! layout those messages reference, and the wire codecs that encode them. It
+//! does not describe how messages move; runtime channel and shared-memory
+//! interfaces live in `litebox_broker_transport`.
 
 #![no_std]
 
@@ -15,13 +16,12 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-pub mod channel;
 pub mod error;
 pub mod event;
 pub mod message;
 pub mod pipe;
 pub mod readiness;
-pub mod shared_memory;
+pub mod shared_buffer;
 pub mod wire;
 
 /// Opaque broker object reference handle.

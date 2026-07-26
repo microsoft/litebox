@@ -17,18 +17,17 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
-use litebox_broker_platform_linux_userland::unix_socket::{
+use litebox_broker_protocol::message::BrokerRequest;
+use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
+use litebox_broker_transport::channel::HostReceive;
+use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
+use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
+use litebox_broker_transport_linux_userland::shared_memory::MemfdSharedMemory;
+use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
     UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
     validate_peer_process,
 };
-use litebox_broker_protocol::channel::HostReceive;
-use litebox_broker_protocol::message::BrokerRequest;
-use litebox_broker_protocol::shared_memory::{
-    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedMemory,
-};
-use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
-use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -443,9 +442,9 @@ fn accept_runner_stream(
 mod tests {
     use super::*;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::channel::{HostSetupChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::BrokerHandshakeResponse;
-    use litebox_broker_transport::unix_socket::{
+    use litebox_broker_transport::channel::{HostSetupChannel, LocalSetupChannel};
+    use litebox_broker_transport_linux_userland::unix_socket::{
         UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
         UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
     };
@@ -499,7 +498,7 @@ mod tests {
     /// A notification channel that accepts every send and keeps nothing.
     struct DiscardingChannel;
 
-    impl litebox_broker_protocol::channel::HostNotificationChannel for DiscardingChannel {
+    impl litebox_broker_transport::channel::HostNotificationChannel for DiscardingChannel {
         type Error = IoError;
 
         fn send_notification(
@@ -746,7 +745,7 @@ mod tests {
         // never started has to fail the test rather than hang it.
         let (notified, notifications_seen) = sync_channel(1);
         let receiver = std::thread::spawn(move || {
-            use litebox_broker_protocol::channel::LocalNotificationChannel;
+            use litebox_broker_transport::channel::LocalNotificationChannel;
 
             let notification = notifications.recv_notification().unwrap();
             notified.send(notification).unwrap();

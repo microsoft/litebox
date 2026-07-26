@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::shared_memory::{
+use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
-use litebox_broker_transport::unix_socket::UnixStreamLocalSetupChannel;
+use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 

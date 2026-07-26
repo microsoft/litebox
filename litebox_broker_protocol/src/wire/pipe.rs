@@ -6,7 +6,7 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
-use crate::shared_memory::{SharedBufferDescriptor, SharedBufferSlotIndex};
+use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};

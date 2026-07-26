@@ -22,6 +22,7 @@ slabmalloc = { git = "https://github.com/gz/rust-slabmalloc.git", rev = "19480b2
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local" }
 litebox_broker_protocol = { version = "0.1.0", path = "../litebox_broker_protocol" }
+litebox_broker_transport = { version = "0.1.0", path = "../litebox_broker_transport" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60.2", features = [

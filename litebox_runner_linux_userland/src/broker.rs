@@ -13,9 +13,9 @@ use std::{
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
-use litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE;
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
-use litebox_broker_transport::unix_socket::{
+use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
     UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
 };
@@ -194,18 +194,18 @@ fn connect_with_retry<Channel>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_platform_linux_userland::unix_socket::{
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
+    use litebox_broker_protocol::readiness::ReadinessFlags;
+    use litebox_broker_transport::channel::{
+        HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
+    };
+    use litebox_broker_transport_linux_userland::shared_memory::MemfdSharedMemory;
+    use litebox_broker_transport_linux_userland::unix_socket::{
         UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
         UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
     };
-    use litebox_broker_protocol::ObjectHandle;
-    use litebox_broker_protocol::channel::{
-        HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
-    };
-    use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
-    use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_transport::shared_memory::MemfdSharedMemory;
-    use litebox_broker_transport::unix_socket::{
+    use litebox_broker_transport_linux_userland::unix_socket::{
         UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
         UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
     };

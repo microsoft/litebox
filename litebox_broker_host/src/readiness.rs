@@ -33,9 +33,9 @@ use alloc::collections::VecDeque;
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::channel::HostNotificationChannel;
 use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_transport::channel::HostNotificationChannel;
 use spin::mutex::SpinMutex;
 use thiserror::Error;
 

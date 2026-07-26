@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::ObjectHandle;
-use crate::shared_memory::SharedBufferDescriptor;
+use crate::shared_buffer::SharedBufferDescriptor;
 
 /// Maximum pipe bytes transferred by one broker request.
 ///

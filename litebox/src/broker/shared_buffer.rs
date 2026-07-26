@@ -5,7 +5,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering::{Acquire, Release};
 
-use litebox_broker_protocol::shared_memory::{
+use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
 

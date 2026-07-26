@@ -178,7 +178,6 @@ mod tests {
 
     use alloc::sync::Arc;
     use litebox_broker_local::BrokerLocal;
-    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption};
     use litebox_broker_protocol::message::{
@@ -187,6 +186,7 @@ mod tests {
         ReadinessNotification,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
+    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
 
     use super::*;
     use crate::LiteBox;
@@ -410,16 +410,16 @@ mod tests {
 
     struct NoopSharedMemory;
 
-    impl litebox_broker_protocol::shared_memory::SharedMemory for NoopSharedMemory {
+    impl litebox_broker_transport::shared_memory::SharedMemory for NoopSharedMemory {
         fn len(&self) -> usize {
-            litebox_broker_protocol::shared_memory::SHARED_BUFFER_POOL_SIZE
+            litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE
         }
 
         fn read(
             &self,
             _offset: usize,
             destination: &mut [u8],
-        ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
+        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
         {
             destination.fill(0);
             Ok(())
@@ -429,7 +429,7 @@ mod tests {
             &self,
             _offset: usize,
             _source: &[u8],
-        ) -> core::result::Result<(), litebox_broker_protocol::shared_memory::SharedMemoryError>
+        ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
         {
             Ok(())
         }
