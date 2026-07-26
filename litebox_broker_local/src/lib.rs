@@ -1,15 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Typed broker-local adapters for broker requests and notifications.
+//! Portable local endpoint for broker associations.
 //!
-//! The local control adapter owns request identifiers but does not own transport
-//! sequencing. Userland, kernel, or ring-buffer deployments provide channels by
-//! implementing [`litebox_broker_transport::channel::LocalSetupChannel`] for
-//! association setup and
-//! [`litebox_broker_transport::channel::LocalCallChannel`] for active calls.
-//! Notification receive adapters are intentionally separate so active control
-//! requests remain strictly paired with their responses.
+//! This crate is the in-sandbox counterpart to `litebox_broker_host`. It
+//! negotiates an association, turns typed object operations into broker
+//! requests, manages access to the association's shared buffers, assigns request
+//! identifiers, and verifies that responses are correctly correlated. A
+//! separate notification adapter receives broker-to-local readiness updates.
+//!
+//! The endpoint is channel-neutral. Deployments provide local channels through
+//! `litebox_broker_transport`; concrete bindings such as
+//! `litebox_broker_transport_linux_userland` decide how messages move.
 
 #![no_std]
 
