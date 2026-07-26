@@ -393,9 +393,9 @@ pub struct ControlRingProducer<Memory: AtomicSharedMemory> {
 /// Cloneable, narrow handle for interrupting a wait on one ring endpoint.
 ///
 /// This handle intentionally exposes neither the backing memory nor endpoint
-/// state. Deployments use it to make liveness and cancellation events visible to
-/// a thread blocked in a [`ControlRingBlocking`] wait. It is public so that
-/// concrete transports outside this crate, such as the endpoints in
+/// state. Concrete transports use it to interrupt a [`ControlRingBlocking`]
+/// wait when liveness or cancellation state changes. It is public so that
+/// transport bindings outside this crate, such as the endpoints in
 /// `litebox_broker_transport_linux_userland`, can interrupt ring waits without
 /// gaining access to ring memory.
 pub struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
