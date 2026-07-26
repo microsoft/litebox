@@ -17,14 +17,12 @@
 //! machines live in `litebox_broker_transport`, and the local, host, and core
 //! authority adapters live in their own OS-neutral crates.
 
-#[cfg(target_os = "linux")]
+#![cfg(target_os = "linux")]
+
 mod setup;
 
-#[cfg(target_os = "linux")]
 pub mod shared_memory;
 
-#[cfg(target_os = "linux")]
 mod unix_io;
 
-#[cfg(target_os = "linux")]
 pub mod unix_socket;
