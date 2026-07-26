@@ -13,10 +13,8 @@ use core::ops::Range;
 
 use thiserror::Error;
 
-use crate::pipe::MAX_PIPE_TRANSFER_SIZE;
-
 /// Size of each association shared-buffer slot.
-pub const SHARED_BUFFER_SLOT_SIZE: u32 = MAX_PIPE_TRANSFER_SIZE;
+pub const SHARED_BUFFER_SLOT_SIZE: u32 = 32 * 1024;
 
 /// Number of slots in one association shared-buffer pool.
 pub const SHARED_BUFFER_SLOT_COUNT: u32 = 16;

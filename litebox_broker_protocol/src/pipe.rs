@@ -2,13 +2,14 @@
 // Licensed under the MIT license.
 
 use crate::ObjectHandle;
-use crate::shared_buffer::SharedBufferDescriptor;
+use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
 
 /// Maximum pipe bytes transferred by one broker request.
 ///
-/// Each association shared-buffer slot has this size. Larger blocking writes
-/// are split across requests, while reads may return at most this amount.
-pub const MAX_PIPE_TRANSFER_SIZE: u32 = 32 * 1024;
+/// One transfer occupies at most one association shared-buffer slot. Larger
+/// blocking writes are split across requests, while reads may return at most
+/// this amount.
+pub const MAX_PIPE_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE;
 
 /// Request to create a broker-owned byte pipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
