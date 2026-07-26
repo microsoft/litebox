@@ -264,7 +264,7 @@ impl ControlRingWakeHandle<MemfdSharedMemory> {
     ///
     /// Incrementing before waking closes the race where cancellation happens
     /// after a ring operation samples its epoch but before it enters futex wait.
-    pub(crate) fn interrupt_wait(&self) -> IoResult<()> {
+    pub fn interrupt_wait(&self) -> IoResult<()> {
         self.memory()
             .fetch_add_u32_release(self.wait_epoch_offset(), 1)
             .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;

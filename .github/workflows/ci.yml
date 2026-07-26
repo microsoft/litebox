@@ -257,7 +257,12 @@ jobs:
           #
           # - `litebox_broker_transport` is allowed to have `std` access,
           #   since it owns hosted concrete broker transport implementations,
-          #   including the current Unix-domain-socket control channel.
+          #   including the local endpoints of the current Unix-domain-socket
+          #   control channel.
+          #
+          # - `litebox_broker_platform_linux_userland` is allowed to have `std`
+          #   access, since it is the Linux-userland platform binding that owns
+          #   the broker/host endpoints of that same control channel.
           #
           # - `litebox_broker_userland` is allowed to have `std` access,
           #   since it is the hosted userland broker executable.
@@ -318,6 +323,7 @@ jobs:
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_transport/Cargo.toml' \
+            -not -path './litebox_broker_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_userland/Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \

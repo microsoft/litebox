@@ -4,8 +4,9 @@
 //! Channel-neutral broker-side protocol/core adapter.
 //!
 //! This crate wires `litebox_broker_core` to any implementation of the neutral
-//! host-side control-channel trait. Concrete channels live in separate crates such as
-//! `litebox_broker_transport`.
+//! host-side control-channel trait. Concrete host channels live in platform
+//! binding crates such as `litebox_broker_platform_linux_userland`, which build
+//! on the portable transport primitives in `litebox_broker_transport`.
 
 #![no_std]
 

@@ -386,9 +386,12 @@ pub struct ControlRingProducer<Memory: AtomicSharedMemory> {
 ///
 /// This handle intentionally exposes neither the backing memory nor endpoint
 /// state. Hosted transports use it to make liveness and cancellation events
-/// visible to a thread blocked in an OS-specific wait.
+/// visible to a thread blocked in an OS-specific wait. It is public so that
+/// platform bindings outside this crate, such as the host endpoints in
+/// `litebox_broker_platform_linux_userland`, can interrupt ring waits without
+/// gaining access to ring memory.
 #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
-pub(crate) struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
+pub struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
     ring: Arc<ControlRing<Memory>>,
     wait_epoch: ControlRingWaitEpoch,
 }
@@ -446,8 +449,10 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
         self.direction
     }
 
+    /// Returns a handle that can interrupt a wait on this producer's ring
+    /// direction.
     #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
-    pub(crate) fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
+    pub fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
         ControlRingWakeHandle {
             ring: Arc::clone(&self.ring),
             wait_epoch: ControlRingWaitEpoch::Consumer(self.direction),
@@ -539,8 +544,10 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
         self.direction
     }
 
+    /// Returns a handle that can interrupt a wait on this consumer's ring
+    /// direction.
     #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
-    pub(crate) fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
+    pub fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
         ControlRingWakeHandle {
             ring: Arc::clone(&self.ring),
             wait_epoch: ControlRingWaitEpoch::Producer(self.direction),

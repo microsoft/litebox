@@ -17,6 +17,11 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
+use litebox_broker_platform_linux_userland::unix_socket::{
+    UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
+    UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
+    validate_peer_process,
+};
 use litebox_broker_protocol::channel::HostReceive;
 use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_memory::{
@@ -24,11 +29,6 @@ use litebox_broker_protocol::shared_memory::{
 };
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
-use litebox_broker_transport::unix_socket::{
-    UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
-    UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
-    validate_peer_process,
-};
 use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);

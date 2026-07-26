@@ -1,0 +1,16 @@
+[package]
+name = "litebox_broker_platform_linux_userland"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0", features = ["linux-userland"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Needed only for `SO_PEERCRED` lookups when authenticating an accepted peer;
+# the rest of the endpoint I/O goes through `std` and `litebox_broker_transport`.
+rustix = { version = "1.1.2", default-features = false, features = ["std", "net"] }
+
+[lints]
+workspace = true

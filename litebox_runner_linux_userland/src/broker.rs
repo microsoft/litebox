@@ -194,6 +194,10 @@ fn connect_with_retry<Channel>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_broker_platform_linux_userland::unix_socket::{
+        UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
+        UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
+    };
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::channel::{
         HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
@@ -202,10 +206,8 @@ mod tests {
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_transport::shared_memory::MemfdSharedMemory;
     use litebox_broker_transport::unix_socket::{
-        UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
-        UnixControlRingHostResponseSink, UnixControlRingHostShutdown,
         UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
-        UnixControlRingLocalShutdown, UnixStreamHostSetupChannel, UnixStreamLocalSetupChannel,
+        UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
     };
     use std::io::ErrorKind;
     use std::os::fd::AsFd;

@@ -10,6 +10,9 @@ use std::time::Duration;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
+use litebox_broker_platform_linux_userland::unix_socket::{
+    UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
+};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::{HostNotificationChannel, HostReceive};
 use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
@@ -22,9 +25,8 @@ use litebox_broker_transport::control_ring::{
 };
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown,
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
-    UnixStreamHostSetupChannel, UnixStreamLocalSetupChannel,
+    UnixStreamLocalSetupChannel,
 };
 use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
 

@@ -386,7 +386,7 @@ fn spawn_test_broker(
                     .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test write timeout");
                 let mut channel =
-                    litebox_broker_transport::unix_socket::UnixStreamHostSetupChannel::from_host_guaranteed(
+                    litebox_broker_platform_linux_userland::unix_socket::UnixStreamHostSetupChannel::from_host_guaranteed(
                         control_stream,
                         std::time::Instant::now() + BROKER_HELPER_TIMEOUT,
                     );
