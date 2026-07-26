@@ -11,7 +11,7 @@
 use std::io::{Error, Result as IoResult};
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::mem::{align_of, size_of};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
 use std::sync::Mutex;
@@ -21,6 +21,7 @@ use rustix::fs::{
     MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, fstat, ftruncate, memfd_create,
 };
 use rustix::io::Errno;
+use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags,
@@ -186,22 +187,19 @@ impl MemfdSharedMemory {
                 "shared-memory length exceeds pointer offset range",
             ));
         }
-        // SAFETY: `fd` refers to a file at least `length` bytes long. The
-        // returned mapping is checked against `MAP_FAILED` and owned by
-        // `MappedRegion`.
+        // SAFETY: `fd` refers to a file at least `length` bytes long. A null
+        // address lets the kernel choose the mapping location, and
+        // `MappedRegion` owns the returned mapping.
         let address = unsafe {
-            libc::mmap(
+            mmap(
                 std::ptr::null_mut(),
                 length,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED,
+                &fd,
                 0,
             )
-        };
-        if address == libc::MAP_FAILED {
-            return Err(Error::last_os_error());
-        }
+        }?;
         let address =
             NonNull::new(address.cast()).ok_or_else(|| invalid_data("mmap returned null"))?;
         Ok(Self {
@@ -265,9 +263,9 @@ impl SharedMemory for MemfdSharedMemory {
         // `destination` is valid for its full length, and no Rust reference is
         // created for the byte-addressed shared mapping.
         unsafe {
-            libc::memcpy(
-                destination.as_mut_ptr().cast(),
-                mapping.address.as_ptr().add(offset).cast(),
+            std::ptr::copy(
+                mapping.address.as_ptr().add(offset),
+                destination.as_mut_ptr(),
                 destination.len(),
             );
         }
@@ -287,9 +285,9 @@ impl SharedMemory for MemfdSharedMemory {
         // valid for its full length, and no Rust reference is created for the
         // byte-addressed shared mapping.
         unsafe {
-            libc::memcpy(
-                mapping.address.as_ptr().add(offset).cast(),
-                source.as_ptr().cast(),
+            std::ptr::copy(
+                source.as_ptr(),
+                mapping.address.as_ptr().add(offset),
                 source.len(),
             );
         }
@@ -439,8 +437,8 @@ impl Drop for MappedRegion {
     fn drop(&mut self) {
         // SAFETY: `address` and `length` describe the mapping exclusively owned
         // by this value, and it is unmapped exactly once here.
-        let result = unsafe { libc::munmap(self.address.as_ptr().cast(), self.length) };
-        debug_assert_eq!(result, 0, "failed to unmap broker shared memory");
+        let result = unsafe { munmap(self.address.as_ptr().cast(), self.length) };
+        debug_assert!(result.is_ok(), "failed to unmap broker shared memory");
     }
 }
 
