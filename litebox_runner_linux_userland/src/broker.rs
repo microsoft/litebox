@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use std::{
+    os::fd::{AsFd, AsRawFd, RawFd},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -23,13 +24,14 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
-pub(crate) fn connect(
-    control_socket_path: &Path,
-) -> Result<(
-    BrokerLocal<UnixControlRingLocalCallChannel>,
-    BrokerNotifications<UnixControlRingLocalNotificationChannel>,
-    Arc<BrokerAssociationFailureCoordinator>,
-)> {
+pub(crate) struct BrokerConnection {
+    pub(crate) local: BrokerLocal<UnixControlRingLocalCallChannel>,
+    pub(crate) notifications: BrokerNotifications<UnixControlRingLocalNotificationChannel>,
+    pub(crate) coordinator: Arc<BrokerAssociationFailureCoordinator>,
+    pub(crate) positional_io_fds: [RawFd; 2],
+}
+
+pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let setup_channel = connect_with_retry(
         control_socket_path,
@@ -44,31 +46,43 @@ pub(crate) fn connect(
         )
     })?;
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
-    let (local, notification_channel) = BrokerLocal::negotiate(setup_channel, |mut setup| {
-        let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
-        let control_memory = setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, Some(setup_deadline))?;
-        let control_ring = ControlRing::new(control_memory).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid broker control ring: {error:?}"),
-            )
-        })?;
-        let weak_association_coordinator = Arc::downgrade(&association_coordinator);
-        let (call_channel, notification_channel, association_shutdown) =
-            setup.into_active(control_ring, move || {
-                if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
-                    association_coordinator.report_failure();
-                }
+    let (local, (notification_channel, positional_io_fds)) =
+        BrokerLocal::negotiate(setup_channel, |mut setup| {
+            let shared_memory =
+                setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
+            let control_memory =
+                setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, Some(setup_deadline))?;
+            let positional_io_fds = [
+                shared_memory.as_fd().as_raw_fd(),
+                control_memory.as_fd().as_raw_fd(),
+            ];
+            let control_ring = ControlRing::new(control_memory).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid broker control ring: {error:?}"),
+                )
             })?;
-        association_coordinator.install_shutdown(association_shutdown)?;
-        Ok((call_channel, Arc::new(shared_memory), notification_channel))
-    })
-    .context("broker negotiation failed")?;
-    Ok((
+            let weak_association_coordinator = Arc::downgrade(&association_coordinator);
+            let (call_channel, notification_channel, association_shutdown) =
+                setup.into_active(control_ring, move || {
+                    if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
+                        association_coordinator.report_failure();
+                    }
+                })?;
+            association_coordinator.install_shutdown(association_shutdown)?;
+            Ok((
+                call_channel,
+                Arc::new(shared_memory),
+                (notification_channel, positional_io_fds),
+            ))
+        })
+        .context("broker negotiation failed")?;
+    Ok(BrokerConnection {
         local,
-        BrokerNotifications::new(notification_channel),
-        association_coordinator,
-    ))
+        notifications: BrokerNotifications::new(notification_channel),
+        coordinator: association_coordinator,
+        positional_io_fds,
+    })
 }
 
 pub(crate) fn start_notification_receiver(

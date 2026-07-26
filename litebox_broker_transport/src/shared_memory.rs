@@ -3,9 +3,10 @@
 
 //! Runtime shared-memory access for broker transports.
 //!
-//! [`SharedMemory`] and [`AtomicSharedMemory`] abstract a concrete shared-memory
-//! mapping. [`SharedBufferPool`] applies the peer-visible fixed-slot layout from
-//! [`litebox_broker_protocol::shared_buffer`] and bounds-checks each slot access.
+//! [`SharedMemory`] and [`ControlRingMemory`] abstract a concrete shared-memory
+//! resource. [`SharedBufferPool`] applies the peer-visible fixed-slot layout
+//! from [`litebox_broker_protocol::shared_buffer`] and bounds-checks each slot
+//! access.
 
 use alloc::sync::Arc;
 
@@ -22,9 +23,12 @@ pub enum SharedMemoryError {
     /// The requested byte range is outside the shared-memory resource.
     #[error("shared-memory range is out of bounds")]
     InvalidRange,
-    /// An atomic access is not naturally aligned.
-    #[error("shared-memory atomic access is not naturally aligned")]
-    UnalignedAtomic,
+    /// A typed word access is not naturally aligned.
+    #[error("shared-memory word access is not naturally aligned")]
+    UnalignedWord,
+    /// The backing resource could not complete an otherwise valid access.
+    #[error("shared-memory backing resource access failed")]
+    AccessFailed,
 }
 
 /// Byte-copy access to a shared-memory mapping.
@@ -64,47 +68,50 @@ pub trait SharedMemory: Send + Sync + 'static {
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError>;
 }
 
-/// Ordered atomic access to shared-memory synchronization values.
+/// Ordered access to shared control-ring synchronization values.
 ///
-/// Implementations must provide naturally aligned, indivisible operations that
-/// are coherent with every endpoint mapping the same backing memory. A
-/// conforming endpoint must not access an atomic location through
-/// [`SharedMemory::read`] or [`SharedMemory::write`]. Implementations exposed
-/// through safe APIs must enforce disjoint byte, `u32`, and `u64` access regions
-/// so callers cannot create conflicting accesses of different sizes.
-pub trait AtomicSharedMemory: SharedMemory {
-    /// Atomically loads a naturally aligned native-endian `u32` with acquire
-    /// ordering.
+/// A peer may modify any backing byte through an uncontrolled alias, including
+/// with non-atomic or mixed-width accesses. Implementations must therefore
+/// perform these operations without creating Rust references into peer-writable
+/// memory. Reads return untrusted snapshots that may contain any bit pattern;
+/// the control ring validates them against trusted endpoint-local state.
+///
+/// Word operations must be indivisible and ordered between conforming
+/// endpoints. An uncontrolled peer alias may bypass those guarantees, but must
+/// not compromise the implementation's Rust memory safety.
+///
+/// Safe implementations must enforce disjoint byte, `u32`, and `u64` access
+/// regions for their own APIs. The `u32` increment must be indivisible between
+/// conforming endpoints and must wrap on overflow.
+pub trait ControlRingMemory: SharedMemory {
+    /// Reads a naturally aligned native-endian `u32` with acquire semantics.
     fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError>;
 
-    /// Atomically adds `value` to a naturally aligned native-endian `u32` with
-    /// release ordering and returns its previous value.
-    fn fetch_add_u32_release(&self, offset: usize, value: u32) -> Result<u32, SharedMemoryError>;
+    /// Indivisibly increments a naturally aligned native-endian `u32` with
+    /// release semantics, wrapping on overflow.
+    fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError>;
 
-    /// Atomically loads a naturally aligned native-endian `u64` with acquire
-    /// ordering.
+    /// Reads a naturally aligned native-endian `u64` with acquire semantics.
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError>;
 
-    /// Atomically stores a naturally aligned native-endian `u64` with release
-    /// ordering.
+    /// Writes a naturally aligned native-endian `u64` with release semantics.
     ///
     /// On error, the value must not have been stored.
     fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError>;
 
-    /// Release-stores a native-endian `u64`, then performs a release fetch-add on
-    /// a native-endian `u32`, returning the previous `u32`.
+    /// Release-writes a native-endian `u64`, then indivisibly increments a
+    /// native-endian `u32` with release semantics.
     ///
     /// Both values must be naturally aligned and occupy non-overlapping ranges.
-    /// Implementations must validate both accesses before storing either value.
-    /// On error, neither value may have been modified. The two operations are
-    /// ordered but are not one indivisible transaction.
-    fn store_u64_and_fetch_add_u32_release(
+    /// Implementations must validate both accesses before writing either value.
+    /// The two operations are ordered but are not one indivisible transaction,
+    /// so a backing-resource failure may leave only the `u64` written.
+    fn store_u64_and_increment_u32_release(
         &self,
         store_offset: usize,
         value: u64,
-        add_offset: usize,
-        add_value: u32,
-    ) -> Result<u32, SharedMemoryError>;
+        increment_offset: usize,
+    ) -> Result<(), SharedMemoryError>;
 }
 
 impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {

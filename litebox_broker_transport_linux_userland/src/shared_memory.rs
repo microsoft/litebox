@@ -7,6 +7,10 @@
 //! control ring. The mapping implements the portable shared-memory interfaces in
 //! `litebox_broker_transport`, and its futex support lets portable control-ring
 //! endpoints block and wake without knowing anything about Linux.
+//!
+//! Rust never dereferences the peer-writable mapping. Byte and word access uses
+//! positional descriptor I/O into private buffers; the mapping exists only to
+//! provide checked addresses to the kernel's futex operations.
 
 use std::io::{Error, Result as IoResult};
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
@@ -19,23 +23,18 @@ use std::time::Instant;
 use rustix::fs::{
     MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, fstat, ftruncate, memfd_create,
 };
-use rustix::io::Errno;
+use rustix::io::{Errno, pread, pwrite};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags,
 };
-use rustix::thread::futex;
 
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::{
     CONTROL_RING_MEMORY_LAYOUT, CONTROL_RING_MEMORY_SIZE, WaitableSharedMemory,
 };
-use litebox_broker_transport::shared_memory::{
-    AtomicSharedMemory, SharedMemory, SharedMemoryError,
-};
-
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
@@ -50,7 +49,7 @@ const _: () = assert!(SHARED_BUFFER_POOL_SIZE != CONTROL_RING_MEMORY_SIZE);
 pub struct MemfdSharedMemory {
     fd: OwnedFd,
     mapping: MappedRegion,
-    access: MemoryAccessPolicy,
+    policy: MemoryAccessPolicy,
 }
 
 struct MappedRegion {
@@ -80,71 +79,61 @@ impl MemoryAccessPolicy {
         }
     }
 
-    const fn permits_atomic_u32(self, offset: usize) -> bool {
+    const fn permits_u32(self, offset: usize) -> bool {
         match self {
             Self::Bytes => false,
-            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(offset),
+            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_u32(offset),
         }
     }
 
-    const fn permits_atomic_u64(self, offset: usize) -> bool {
+    const fn permits_u64(self, offset: usize) -> bool {
         match self {
             Self::Bytes => false,
-            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(offset),
+            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_u64(offset),
         }
     }
 }
 
 // SAFETY: Moving or sharing this owner does not move or invalidate its OS
-// mapping. Its metadata is immutable, and contents are accessed through a fixed
-// atomic representation without exposing references to callers.
+// mapping. Its metadata is immutable, and mapped contents are never
+// dereferenced by Rust.
 unsafe impl Send for MappedRegion {}
-// SAFETY: See the `Send` justification. Concurrent content access uses atomics.
+// SAFETY: See the `Send` justification. Only checked raw futex addresses are
+// derived from the mapping and passed to the kernel.
 unsafe impl Sync for MappedRegion {}
 
-fn atomic_u64_at(
-    memory: &MemfdSharedMemory,
-    offset: usize,
-) -> Result<&AtomicU64, SharedMemoryError> {
-    if !memory.access.permits_atomic_u64(offset) {
+fn u64_offset(memory: &MemfdSharedMemory, offset: usize) -> Result<(), SharedMemoryError> {
+    if !memory.policy.permits_u64(offset) {
         return Err(SharedMemoryError::InvalidRange);
     }
-    let byte_address = shared_address(
-        &memory.mapping,
-        offset,
-        size_of::<u64>(),
-        align_of::<AtomicU64>(),
-    )?;
-    // The runtime check above establishes the stronger alignment.
-    #[allow(clippy::cast_ptr_alignment)]
-    let address = byte_address.cast::<u64>();
-    // SAFETY: The pointer is valid and aligned for a `u64`. Control-ring
-    // sequence words are accessed atomically by conforming endpoints, and
-    // `memory` keeps the immutable mapping alive for the returned reference.
-    Ok(unsafe { AtomicU64::from_ptr(address) })
+    checked_range(&memory.mapping, offset, size_of::<u64>(), align_of::<u64>())
 }
 
-fn atomic_u32_at(
-    memory: &MemfdSharedMemory,
-    offset: usize,
-) -> Result<&AtomicU32, SharedMemoryError> {
-    if !memory.access.permits_atomic_u32(offset) {
+fn u32_address(memory: &MemfdSharedMemory, offset: usize) -> Result<*mut u32, SharedMemoryError> {
+    if !memory.policy.permits_u32(offset) {
         return Err(SharedMemoryError::InvalidRange);
     }
-    let byte_address = shared_address(
-        &memory.mapping,
-        offset,
-        size_of::<u32>(),
-        align_of::<AtomicU32>(),
-    )?;
-    // The runtime check above establishes the stronger alignment.
+    let byte_address =
+        shared_address(&memory.mapping, offset, size_of::<u32>(), align_of::<u32>())?;
+    // The runtime check above establishes the required alignment.
     #[allow(clippy::cast_ptr_alignment)]
-    let address = byte_address.cast::<u32>();
-    // SAFETY: The pointer is valid and aligned for a `u32`. Control-ring epoch
-    // words are accessed atomically by conforming endpoints and the futex
-    // syscall, and `memory` keeps the immutable mapping alive for the returned
-    // reference.
-    Ok(unsafe { AtomicU32::from_ptr(address) })
+    Ok(byte_address.cast::<u32>())
+}
+
+fn checked_range(
+    mapping: &MappedRegion,
+    offset: usize,
+    size: usize,
+    alignment: usize,
+) -> Result<(), SharedMemoryError> {
+    offset
+        .checked_add(size)
+        .filter(|end| *end <= mapping.length)
+        .ok_or(SharedMemoryError::InvalidRange)?;
+    if !offset.is_multiple_of(alignment) {
+        return Err(SharedMemoryError::UnalignedWord);
+    }
+    Ok(())
 }
 
 fn shared_address(
@@ -153,124 +142,131 @@ fn shared_address(
     size: usize,
     alignment: usize,
 ) -> Result<*mut u8, SharedMemoryError> {
-    offset
-        .checked_add(size)
-        .filter(|end| *end <= mapping.length)
-        .ok_or(SharedMemoryError::InvalidRange)?;
-    // SAFETY: The checked offset is inside the live mapping.
-    let byte_address = unsafe { mapping.address.as_ptr().add(offset) };
-    if !byte_address.addr().is_multiple_of(alignment) {
-        return Err(SharedMemoryError::UnalignedAtomic);
-    }
-    Ok(byte_address)
+    checked_range(mapping, offset, size, alignment)?;
+    Ok(mapping.address.as_ptr().wrapping_add(offset))
 }
 
-fn atomic_word_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU64, SharedMemoryError> {
-    let address = shared_address(mapping, offset, size_of::<u64>(), align_of::<AtomicU64>())?;
-    // SAFETY: The checked address is valid and aligned for one word, the mapping
-    // stays live for the returned reference, and every full word in a byte
-    // region uses this same atomic representation.
-    Ok(unsafe { AtomicU64::from_ptr(address.cast()) })
-}
-
-fn atomic_byte_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU8, SharedMemoryError> {
-    let address = shared_address(mapping, offset, size_of::<u8>(), align_of::<AtomicU8>())?;
-    // SAFETY: The checked address is valid and aligned for one byte, the mapping
-    // stays live for the returned reference, and only a trailing partial word
-    // uses this byte representation.
-    Ok(unsafe { AtomicU8::from_ptr(address) })
-}
-
-fn read_atomic_bytes(
-    mapping: &MappedRegion,
-    offset: usize,
-    destination: &mut [u8],
-) -> Result<(), SharedMemoryError> {
-    shared_address(mapping, offset, destination.len(), align_of::<AtomicU8>())?;
-    let mut copied = 0;
-    while copied < destination.len() {
-        let absolute = offset + copied;
-        let word_start = absolute - absolute % size_of::<u64>();
-        if word_start + size_of::<u64>() <= mapping.length {
-            let word = atomic_word_at(mapping, word_start)?
-                .load(Ordering::Relaxed)
-                .to_ne_bytes();
-            let word_offset = absolute - word_start;
-            let count = (size_of::<u64>() - word_offset).min(destination.len() - copied);
-            destination[copied..copied + count]
-                .copy_from_slice(&word[word_offset..word_offset + count]);
-            copied += count;
-        } else {
-            destination[copied] = atomic_byte_at(mapping, absolute)?.load(Ordering::Relaxed);
-            copied += 1;
-        }
-    }
-    Ok(())
-}
-
-fn write_atomic_bytes(
-    mapping: &MappedRegion,
-    offset: usize,
-    source: &[u8],
-) -> Result<(), SharedMemoryError> {
-    shared_address(mapping, offset, source.len(), align_of::<AtomicU8>())?;
-    let mut copied = 0;
-    while copied < source.len() {
-        let absolute = offset + copied;
-        let word_start = absolute - absolute % size_of::<u64>();
-        if word_start + size_of::<u64>() <= mapping.length {
-            let word = atomic_word_at(mapping, word_start)?;
-            let word_offset = absolute - word_start;
-            let count = (size_of::<u64>() - word_offset).min(source.len() - copied);
-            if word_offset == 0 && count == size_of::<u64>() {
-                word.store(
-                    u64::from_ne_bytes(
-                        source[copied..copied + count]
-                            .try_into()
-                            .expect("full atomic word"),
-                    ),
-                    Ordering::Relaxed,
-                );
-            } else {
-                let mut current = word.load(Ordering::Relaxed);
-                loop {
-                    let mut updated = current.to_ne_bytes();
-                    updated[word_offset..word_offset + count]
-                        .copy_from_slice(&source[copied..copied + count]);
-                    match word.compare_exchange_weak(
-                        current,
-                        u64::from_ne_bytes(updated),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(observed) => current = observed,
-                    }
-                }
-            }
-            copied += count;
-        } else {
-            atomic_byte_at(mapping, absolute)?.store(source[copied], Ordering::Relaxed);
-            copied += 1;
-        }
-    }
-    Ok(())
-}
-
-fn validate_nonoverlapping_atomic_ranges(
+fn validate_nonoverlapping_word_ranges(
     store_offset: usize,
-    add_offset: usize,
+    increment_offset: usize,
 ) -> Result<(), SharedMemoryError> {
     let store_end = store_offset
         .checked_add(size_of::<u64>())
         .ok_or(SharedMemoryError::InvalidRange)?;
-    let add_end = add_offset
+    let increment_end = increment_offset
         .checked_add(size_of::<u32>())
         .ok_or(SharedMemoryError::InvalidRange)?;
-    if store_offset < add_end && add_offset < store_end {
+    if store_offset < increment_end && increment_offset < store_end {
         return Err(SharedMemoryError::InvalidRange);
     }
     Ok(())
+}
+
+fn read_exact_at(
+    memory: &MemfdSharedMemory,
+    offset: usize,
+    destination: &mut [u8],
+) -> Result<(), SharedMemoryError> {
+    let mut completed = 0;
+    while completed < destination.len() {
+        let file_offset =
+            u64::try_from(offset + completed).map_err(|_| SharedMemoryError::InvalidRange)?;
+        match pread(&memory.fd, &mut destination[completed..], file_offset) {
+            Ok(0) => return Err(SharedMemoryError::AccessFailed),
+            Ok(read) => completed += read,
+            Err(Errno::INTR) => {}
+            Err(_) => return Err(SharedMemoryError::AccessFailed),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_at(
+    memory: &MemfdSharedMemory,
+    offset: usize,
+    source: &[u8],
+) -> Result<(), SharedMemoryError> {
+    let mut completed = 0;
+    while completed < source.len() {
+        let file_offset =
+            u64::try_from(offset + completed).map_err(|_| SharedMemoryError::InvalidRange)?;
+        match pwrite(&memory.fd, &source[completed..], file_offset) {
+            Ok(0) => return Err(SharedMemoryError::AccessFailed),
+            Ok(written) => completed += written,
+            Err(Errno::INTR) => {}
+            Err(_) => return Err(SharedMemoryError::AccessFailed),
+        }
+    }
+    Ok(())
+}
+
+const FUTEX_INCREMENT_OPERATION: libc::c_int =
+    (libc::FUTEX_OP_ADD << 28) | (libc::FUTEX_OP_CMP_EQ << 24) | (1 << 12);
+
+// The rustix futex API requires `AtomicU32` references. Raw syscalls keep Rust
+// references out of memory that a peer can modify through an uncontrolled fd.
+fn futex_increment(address: *mut u32) -> IoResult<()> {
+    // SAFETY: `address` is aligned and lies within the live shared mapping.
+    // FUTEX_WAKE_OP atomically increments it in the kernel, so Rust never forms
+    // an atomic reference that a peer could invalidate through another alias.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            address,
+            libc::FUTEX_WAKE_OP,
+            0,
+            0,
+            address,
+            FUTEX_INCREMENT_OPERATION,
+        )
+    };
+    if result == -1 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn futex_wait(address: *mut u32, expected: u32) -> IoResult<()> {
+    // SAFETY: `address` is aligned and lies within the live shared mapping. The
+    // null timeout requests an unbounded wait, and the other unused pointer is
+    // null.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            address,
+            libc::FUTEX_WAIT,
+            expected,
+            std::ptr::null::<libc::timespec>(),
+            std::ptr::null::<u32>(),
+            0,
+        )
+    };
+    if result == -1 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn futex_wake_one(address: *mut u32) -> IoResult<()> {
+    // SAFETY: `address` is aligned and lies within the live shared mapping.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            address,
+            libc::FUTEX_WAKE,
+            1,
+            std::ptr::null::<libc::timespec>(),
+            std::ptr::null::<u32>(),
+            0,
+        )
+    };
+    if result == -1 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 impl MemfdSharedMemory {
@@ -341,7 +337,7 @@ impl MemfdSharedMemory {
         Ok(Self {
             fd,
             mapping: MappedRegion { address, length },
-            access: MemoryAccessPolicy::for_length(length),
+            policy: MemoryAccessPolicy::for_length(length),
         })
     }
 }
@@ -353,23 +349,25 @@ impl WaitableSharedMemory for MemfdSharedMemory {
         Error::new(ErrorKind::InvalidInput, error)
     }
 
-    /// Waits while a shared atomic `u32` still equals `expected`.
+    /// Waits while a shared `u32` still equals `expected`.
     ///
     /// A value change or signal interruption is reported as a successful,
     /// possibly spurious wakeup. The caller must recheck its wait condition.
     fn wait_while_equal(&self, offset: usize, expected: u32) -> IoResult<()> {
-        let word = atomic_u32_at(self, offset).map_err(Self::wait_access_error)?;
-        match futex::wait(word, futex::Flags::empty(), expected, None) {
-            Ok(()) | Err(Errno::AGAIN | Errno::INTR) => Ok(()),
-            Err(error) => Err(error.into()),
+        let address = u32_address(self, offset).map_err(Self::wait_access_error)?;
+        match futex_wait(address, expected) {
+            Ok(()) => Ok(()),
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) => {
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 
-    /// Wakes one waiter blocked on a shared atomic `u32`.
+    /// Wakes one waiter blocked on a shared `u32`.
     fn wake_one(&self, offset: usize) -> IoResult<()> {
-        let word = atomic_u32_at(self, offset).map_err(Self::wait_access_error)?;
-        futex::wake(word, futex::Flags::empty(), 1)?;
-        Ok(())
+        let address = u32_address(self, offset).map_err(Self::wait_access_error)?;
+        futex_wake_one(address)
     }
 }
 
@@ -385,57 +383,58 @@ impl SharedMemory for MemfdSharedMemory {
     }
 
     fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-        shared_address(
-            &self.mapping,
-            offset,
-            destination.len(),
-            align_of::<AtomicU8>(),
-        )?;
-        if !self.access.permits_byte_range(offset, destination.len()) {
+        checked_range(&self.mapping, offset, destination.len(), 1)?;
+        if !self.policy.permits_byte_range(offset, destination.len()) {
             return Err(SharedMemoryError::InvalidRange);
         }
-        read_atomic_bytes(&self.mapping, offset, destination)
+        read_exact_at(self, offset, destination)
     }
 
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-        shared_address(&self.mapping, offset, source.len(), align_of::<AtomicU8>())?;
-        if !self.access.permits_byte_range(offset, source.len()) {
+        checked_range(&self.mapping, offset, source.len(), 1)?;
+        if !self.policy.permits_byte_range(offset, source.len()) {
             return Err(SharedMemoryError::InvalidRange);
         }
-        write_atomic_bytes(&self.mapping, offset, source)
+        write_all_at(self, offset, source)
     }
 }
 
-impl AtomicSharedMemory for MemfdSharedMemory {
+impl ControlRingMemory for MemfdSharedMemory {
     fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
-        Ok(atomic_u32_at(self, offset)?.load(Ordering::Acquire))
+        u32_address(self, offset)?;
+        let mut bytes = [0; size_of::<u32>()];
+        read_exact_at(self, offset, &mut bytes)?;
+        Ok(u32::from_ne_bytes(bytes))
     }
 
-    fn fetch_add_u32_release(&self, offset: usize, value: u32) -> Result<u32, SharedMemoryError> {
-        Ok(atomic_u32_at(self, offset)?.fetch_add(value, Ordering::Release))
+    fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
+        let address = u32_address(self, offset)?;
+        futex_increment(address).map_err(|_| SharedMemoryError::AccessFailed)
     }
 
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
-        Ok(atomic_u64_at(self, offset)?.load(Ordering::Acquire))
+        u64_offset(self, offset)?;
+        let mut bytes = [0; size_of::<u64>()];
+        read_exact_at(self, offset, &mut bytes)?;
+        Ok(u64::from_ne_bytes(bytes))
     }
 
     fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
-        atomic_u64_at(self, offset)?.store(value, Ordering::Release);
-        Ok(())
+        u64_offset(self, offset)?;
+        write_all_at(self, offset, &value.to_ne_bytes())
     }
 
-    fn store_u64_and_fetch_add_u32_release(
+    fn store_u64_and_increment_u32_release(
         &self,
         store_offset: usize,
         value: u64,
-        add_offset: usize,
-        add_value: u32,
-    ) -> Result<u32, SharedMemoryError> {
-        validate_nonoverlapping_atomic_ranges(store_offset, add_offset)?;
-        let stored = atomic_u64_at(self, store_offset)?;
-        let added = atomic_u32_at(self, add_offset)?;
-        stored.store(value, Ordering::Release);
-        Ok(added.fetch_add(add_value, Ordering::Release))
+        increment_offset: usize,
+    ) -> Result<(), SharedMemoryError> {
+        validate_nonoverlapping_word_ranges(store_offset, increment_offset)?;
+        u64_offset(self, store_offset)?;
+        let increment_address = u32_address(self, increment_offset)?;
+        write_all_at(self, store_offset, &value.to_ne_bytes())?;
+        futex_increment(increment_address).map_err(|_| SharedMemoryError::AccessFailed)
     }
 }
 
@@ -449,7 +448,7 @@ pub fn send_memfd(
     deadline: Option<Instant>,
 ) -> IoResult<()> {
     with_write_deadline(stream, deadline, |stream, deadline| {
-        send_fd(stream, memory.as_fd(), deadline)
+        send_fd(stream, memory.fd.as_fd(), deadline)
     })
 }
 
@@ -578,7 +577,7 @@ mod tests {
     fn mappings_share_bytes_and_validate_ranges() {
         let first = MemfdSharedMemory::create(64).unwrap();
         let second =
-            MemfdSharedMemory::from_received_fd(first.as_fd().try_clone_to_owned().unwrap(), 64)
+            MemfdSharedMemory::from_received_fd(first.fd.as_fd().try_clone_to_owned().unwrap(), 64)
                 .unwrap();
 
         first.write(0, &[1, 2, 3]).unwrap();
@@ -604,7 +603,7 @@ mod tests {
     fn mappings_preserve_disjoint_partial_word_writes() {
         let first = MemfdSharedMemory::create(10).unwrap();
         let second =
-            MemfdSharedMemory::from_received_fd(first.as_fd().try_clone_to_owned().unwrap(), 10)
+            MemfdSharedMemory::from_received_fd(first.fd.as_fd().try_clone_to_owned().unwrap(), 10)
                 .unwrap();
         let start = Barrier::new(3);
         thread::scope(|scope| {
@@ -628,15 +627,15 @@ mod tests {
     fn mappings_enforce_control_ring_typed_access() {
         let first = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
         let second = MemfdSharedMemory::from_received_fd(
-            first.as_fd().try_clone_to_owned().unwrap(),
+            first.fd.as_fd().try_clone_to_owned().unwrap(),
             CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
         let sequence_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(*offset))
+            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u64(*offset))
             .unwrap();
         let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(*offset))
+            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u32(*offset))
             .unwrap();
         let body_offset = (0..CONTROL_RING_MEMORY_SIZE)
             .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(*offset, 1))
@@ -649,22 +648,21 @@ mod tests {
             second.load_u64_acquire(sequence_offset),
             Ok(0x0102_0304_0506_0708)
         );
-        assert_eq!(first.fetch_add_u32_release(epoch_offset, 3), Ok(0));
-        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(3));
+        assert_eq!(first.increment_u32_release(epoch_offset), Ok(()));
+        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(1));
         assert_eq!(
-            first.store_u64_and_fetch_add_u32_release(
+            first.store_u64_and_increment_u32_release(
                 sequence_offset,
                 0x1112_1314_1516_1718,
                 epoch_offset,
-                2
             ),
-            Ok(3)
+            Ok(())
         );
         assert_eq!(
             second.load_u64_acquire(sequence_offset),
             Ok(0x1112_1314_1516_1718)
         );
-        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(5));
+        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(2));
         second.write(body_offset, &[7]).unwrap();
         let mut byte = [0];
         first.read(body_offset, &mut byte).unwrap();
@@ -688,7 +686,7 @@ mod tests {
         );
         second.wait_while_equal(epoch_offset, 0).unwrap();
         assert_eq!(
-            second.store_u64_and_fetch_add_u32_release(sequence_offset, 0, sequence_offset, 1),
+            second.store_u64_and_increment_u32_release(sequence_offset, 0, sequence_offset),
             Err(SharedMemoryError::InvalidRange)
         );
         assert_eq!(
@@ -709,6 +707,44 @@ mod tests {
     }
 
     #[test]
+    fn peer_descriptor_writes_are_read_as_untrusted_snapshots() {
+        let memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let peer_fd = memory.as_fd().try_clone_to_owned().unwrap();
+        let sequence_offset = (0..CONTROL_RING_MEMORY_SIZE)
+            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u64(*offset))
+            .unwrap();
+        let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
+            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u32(*offset))
+            .unwrap();
+
+        let mut expected_sequence = [0; size_of::<u64>()];
+        expected_sequence[1..4].copy_from_slice(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(
+            rustix::io::pwrite(
+                &peer_fd,
+                &expected_sequence[1..4],
+                u64::try_from(sequence_offset).unwrap() + 1,
+            ),
+            Ok(3)
+        );
+        assert_eq!(
+            memory.load_u64_acquire(sequence_offset),
+            Ok(u64::from_ne_bytes(expected_sequence))
+        );
+
+        assert_eq!(
+            rustix::io::pwrite(
+                &peer_fd,
+                &u32::MAX.to_ne_bytes(),
+                u64::try_from(epoch_offset).unwrap(),
+            ),
+            Ok(size_of::<u32>())
+        );
+        memory.increment_u32_release(epoch_offset).unwrap();
+        assert_eq!(memory.load_u32_acquire(epoch_offset), Ok(0));
+    }
+
+    #[test]
     fn rejects_unsealed_mismatched_and_oversized_mappings() {
         let fd = memfd_create("litebox-broker-shm-test", MemfdFlags::CLOEXEC).unwrap();
         ftruncate(&fd, 1).unwrap();
@@ -722,10 +758,13 @@ mod tests {
 
         let memory = MemfdSharedMemory::create(64).unwrap();
         assert_eq!(
-            MemfdSharedMemory::from_received_fd(memory.as_fd().try_clone_to_owned().unwrap(), 32,)
-                .err()
-                .expect("mismatched memfd size should fail")
-                .kind(),
+            MemfdSharedMemory::from_received_fd(
+                memory.fd.as_fd().try_clone_to_owned().unwrap(),
+                32,
+            )
+            .err()
+            .expect("mismatched memfd size should fail")
+            .kind(),
             std::io::ErrorKind::InvalidData
         );
 
@@ -763,7 +802,7 @@ mod tests {
                 .unwrap();
             assert_eq!(byte, [u8::try_from(index).unwrap()]);
         }
-        let flags = rustix::io::fcntl_getfd(mapped_pool.memory().as_fd()).unwrap();
+        let flags = rustix::io::fcntl_getfd(mapped_pool.memory().fd.as_fd()).unwrap();
         assert!(flags.contains(FdFlags::CLOEXEC));
     }
 
@@ -781,9 +820,9 @@ mod tests {
         mapped_ring.memory().read(13, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2, 3]);
 
-        let flags = rustix::io::fcntl_getfd(mapped_ring.memory().as_fd()).unwrap();
+        let flags = rustix::io::fcntl_getfd(mapped_ring.memory().fd.as_fd()).unwrap();
         assert!(flags.contains(FdFlags::CLOEXEC));
-        let seals = fcntl_get_seals(mapped_ring.memory().as_fd()).unwrap();
+        let seals = fcntl_get_seals(mapped_ring.memory().fd.as_fd()).unwrap();
         assert!(seals.contains(REQUIRED_MEMFD_SEALS));
         assert!(!seals.contains(SealFlags::WRITE));
     }
@@ -792,7 +831,7 @@ mod tests {
     fn shared_futex_wakeup_prevents_missed_cross_mapping_work() {
         let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
         let broker_memory = MemfdSharedMemory::from_received_fd(
-            local_memory.as_fd().try_clone_to_owned().unwrap(),
+            local_memory.fd.as_fd().try_clone_to_owned().unwrap(),
             CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
@@ -820,10 +859,20 @@ mod tests {
             consumer.wait_for_message(producer_epoch).unwrap();
             for expected in 0..CONTROL_RING_SLOT_COUNT {
                 let expected = u8::try_from(expected).unwrap();
-                assert_eq!(
-                    consumer.try_read(|payload| Ok::<_, ()>(payload[0])),
-                    Ok(ControlRingReadStatus::Message(expected))
-                );
+                loop {
+                    match consumer
+                        .try_read(|payload| Ok::<_, ()>(payload[0]))
+                        .unwrap()
+                    {
+                        ControlRingReadStatus::Message(value) => {
+                            assert_eq!(value, expected);
+                            break;
+                        }
+                        ControlRingReadStatus::Empty { wait_epoch } => {
+                            consumer.wait_for_message(wait_epoch).unwrap();
+                        }
+                    }
+                }
             }
 
             consumer.publish_head().unwrap();
@@ -885,7 +934,7 @@ mod tests {
 
         let memory = MemfdSharedMemory::create(length).unwrap();
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_test_fds(&mut sender, &[memory.as_fd(), memory.as_fd()]);
+        send_test_fds(&mut sender, &[memory.fd.as_fd(), memory.fd.as_fd()]);
         assert_eq!(
             receive_memfd(&mut receiver, length, None)
                 .err()
@@ -895,7 +944,7 @@ mod tests {
         );
 
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        let fd = memory.as_fd();
+        let fd = memory.fd.as_fd();
         send_test_fds(&mut sender, &[fd, fd, fd, fd, fd]);
         assert_eq!(
             receive_memfd(&mut receiver, length, None)

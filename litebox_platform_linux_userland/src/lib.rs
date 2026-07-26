@@ -422,13 +422,17 @@ impl LinuxUserland {
         clippy::missing_panics_doc,
         reason = "the seccomp filter rules are hardcoded and not expected to fail"
     )]
-    pub fn enable_seccomp_filter() {
+    /// Installs the runner seccomp filter.
+    ///
+    /// Positional reads and writes are allowed only for the supplied
+    /// descriptors; all other positional I/O remains blocked.
+    pub fn enable_seccomp_filter(positional_io_fds: &[std::os::fd::RawFd]) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
             SeccompFilter, SeccompRule,
         };
 
-        let rules = vec![
+        let mut rules = vec![
             // TUN and terminal
             (libc::SYS_read, vec![]),
             (libc::SYS_write, vec![]),
@@ -515,6 +519,30 @@ impl LinuxUserland {
             ),
             (libc::SYS_close, vec![]),
         ];
+        if !positional_io_fds.is_empty() {
+            let fd_rules = || {
+                positional_io_fds
+                    .iter()
+                    .map(|fd| {
+                        SeccompRule::new(vec![
+                            SeccompCondition::new(
+                                0,
+                                SeccompCmpArgLen::Dword,
+                                SeccompCmpOp::Eq,
+                                u64::from(
+                                    u32::try_from(*fd)
+                                        .expect("positional I/O descriptor must be valid"),
+                                ),
+                            )
+                            .unwrap(),
+                        ])
+                        .unwrap()
+                    })
+                    .collect()
+            };
+            rules.push((libc::SYS_pread64, fd_rules()));
+            rules.push((libc::SYS_pwrite64, fd_rules()));
+        }
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
             rules.into_iter().collect();
         let filter = SeccompFilter::new(
@@ -2446,6 +2474,7 @@ impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::thread::sleep;
 
     use litebox::{fs::OFlags, platform::RawMutex};
@@ -2490,8 +2519,57 @@ mod tests {
 
     #[test]
     fn test_seccomp_filter() {
+        fn test_memfd(name: &std::ffi::CStr) -> OwnedFd {
+            // SAFETY: `name` is a valid C string and the returned descriptor is
+            // transferred immediately into `OwnedFd`.
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            assert!(fd >= 0);
+            // SAFETY: `fd` was just returned as an owned descriptor.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
+
         let _platform: &LinuxUserland = LinuxUserland::new(None);
-        LinuxUserland::enable_seccomp_filter();
+        let allowed = test_memfd(c"seccomp-allowed-positional-io");
+        let denied = test_memfd(c"seccomp-denied-positional-io");
+        LinuxUserland::enable_seccomp_filter(&[allowed.as_raw_fd()]);
+
+        let written = [7_u8];
+        // SAFETY: The buffers are valid for their lengths, and both descriptors
+        // remain open for the calls.
+        assert_eq!(
+            unsafe {
+                libc::pwrite(
+                    allowed.as_raw_fd(),
+                    written.as_ptr().cast(),
+                    written.len(),
+                    0,
+                )
+            },
+            1
+        );
+        let mut read = [0_u8];
+        // SAFETY: See the `pwrite` call above.
+        assert_eq!(
+            unsafe { libc::pread(allowed.as_raw_fd(), read.as_mut_ptr().cast(), read.len(), 0,) },
+            1
+        );
+        assert_eq!(read, written);
+        // SAFETY: See the allowed `pwrite` call above.
+        assert_eq!(
+            unsafe {
+                libc::pwrite(
+                    denied.as_raw_fd(),
+                    written.as_ptr().cast(),
+                    written.len(),
+                    0,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
 
         let pathname = c"/tmp/test_seccomp";
         let mkdir_res = unsafe {

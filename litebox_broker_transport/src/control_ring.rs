@@ -15,7 +15,7 @@ use core::sync::atomic::{Ordering, fence};
 
 #[cfg(test)]
 use crate::shared_memory::SharedMemory;
-use crate::shared_memory::{AtomicSharedMemory, SharedMemoryError};
+use crate::shared_memory::{ControlRingMemory, SharedMemoryError};
 
 /// Size of one shared control-ring slot.
 pub const CONTROL_RING_SLOT_SIZE: usize = 128;
@@ -50,9 +50,10 @@ pub const CONTROL_RING_MEMORY_SIZE: usize =
 
 /// Typed access policy for the control-ring shared-memory ABI.
 ///
-/// Concrete shared-memory implementations use this policy to prevent byte,
-/// `u32`, and `u64` atomic accesses from overlapping, including across distinct
-/// mappings of the same backing resource.
+/// Concrete shared-memory implementations use this policy to prevent their own
+/// byte, `u32`, and `u64` accesses from overlapping. A peer can bypass this
+/// policy through its backing-resource alias, so implementations must remain
+/// memory-safe under arbitrary peer writes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ControlRingMemoryLayout;
 
@@ -101,8 +102,8 @@ impl ControlRingMemoryLayout {
             )
     }
 
-    /// Returns whether `offset` names one control-ring atomic `u32`.
-    pub const fn permits_atomic_u32(self, offset: usize) -> bool {
+    /// Returns whether `offset` names one control-ring `u32`.
+    pub const fn permits_u32(self, offset: usize) -> bool {
         let Some(relative) = offset.checked_sub(CONTROL_RING_DATA_SIZE) else {
             return false;
         };
@@ -113,8 +114,8 @@ impl ControlRingMemoryLayout {
             )
     }
 
-    /// Returns whether `offset` names one control-ring atomic `u64`.
-    pub const fn permits_atomic_u64(self, offset: usize) -> bool {
+    /// Returns whether `offset` names one control-ring `u64`.
+    pub const fn permits_u64(self, offset: usize) -> bool {
         if offset < CONTROL_RING_DATA_SIZE {
             return offset.is_multiple_of(CONTROL_RING_SLOT_SIZE);
         }
@@ -177,19 +178,19 @@ impl ControlRingDirection {
         }
     }
 
-    /// Returns the atomic `u32` epoch incremented when the producer publishes
-    /// work for this direction.
+    /// Returns the `u32` epoch incremented when the producer publishes work for
+    /// this direction.
     pub const fn producer_epoch_offset(self) -> usize {
         self.sync_offset() + PRODUCER_EPOCH_OFFSET
     }
 
-    /// Returns the atomic `u32` epoch incremented when the consumer publishes
-    /// progress for this direction.
+    /// Returns the `u32` epoch incremented when the consumer publishes progress
+    /// for this direction.
     pub const fn consumer_epoch_offset(self) -> usize {
         self.sync_offset() + CONSUMER_EPOCH_OFFSET
     }
 
-    /// Returns the atomic `u64` consumer-head offset for this direction.
+    /// Returns the `u64` consumer-head offset for this direction.
     pub const fn consumer_head_offset(self) -> usize {
         self.sync_offset() + CONSUMER_HEAD_OFFSET
     }
@@ -299,12 +300,12 @@ pub enum ControlRingReadError<DecodeError> {
 }
 
 /// Exact-size shared memory containing request, response, and notification rings.
-pub struct ControlRing<Memory: AtomicSharedMemory> {
+pub struct ControlRing<Memory: ControlRingMemory> {
     memory: Memory,
 }
 
 /// Role-bound association ring endpoints owned by the local peer.
-pub struct LocalControlRingEndpoints<Memory: AtomicSharedMemory> {
+pub struct LocalControlRingEndpoints<Memory: ControlRingMemory> {
     /// Local-to-broker request producer.
     pub request_producer: ControlRingProducer<Memory>,
     /// Broker-to-local response consumer.
@@ -314,7 +315,7 @@ pub struct LocalControlRingEndpoints<Memory: AtomicSharedMemory> {
 }
 
 /// Role-bound association ring endpoints owned by the broker peer.
-pub struct BrokerControlRingEndpoints<Memory: AtomicSharedMemory> {
+pub struct BrokerControlRingEndpoints<Memory: ControlRingMemory> {
     /// Local-to-broker request consumer.
     pub request_consumer: ControlRingConsumer<Memory>,
     /// Broker-to-local response producer.
@@ -323,7 +324,7 @@ pub struct BrokerControlRingEndpoints<Memory: AtomicSharedMemory> {
     pub notification_producer: ControlRingProducer<Memory>,
 }
 
-impl<Memory: AtomicSharedMemory> ControlRing<Memory> {
+impl<Memory: ControlRingMemory> ControlRing<Memory> {
     /// Attaches to an exact-size shared control-ring mapping.
     pub fn new(memory: Memory) -> Result<Self, ControlRingError> {
         let actual = memory.len();
@@ -406,11 +407,10 @@ impl<Memory: AtomicSharedMemory> ControlRing<Memory> {
             .write(range.start + CONTROL_RING_SLOT_HEADER_SIZE, payload)?;
         self.memory
             .write(range.start + size_of::<u64>(), &metadata)?;
-        self.memory.store_u64_and_fetch_add_u32_release(
+        self.memory.store_u64_and_increment_u32_release(
             range.start,
             sequence.to_le(),
             direction.producer_epoch_offset(),
-            1,
         )?;
         Ok(())
     }
@@ -464,7 +464,7 @@ impl<Memory: AtomicSharedMemory> ControlRing<Memory> {
 }
 
 /// Trusted endpoint-local state for one control-ring producer.
-pub struct ControlRingProducer<Memory: AtomicSharedMemory> {
+pub struct ControlRingProducer<Memory: ControlRingMemory> {
     ring: Arc<ControlRing<Memory>>,
     direction: ControlRingDirection,
     tail: u64,
@@ -479,7 +479,7 @@ pub struct ControlRingProducer<Memory: AtomicSharedMemory> {
 /// public so that transport bindings outside this crate, such as the endpoints
 /// in `litebox_broker_transport_linux_userland`, can interrupt ring waits
 /// without gaining access to ring memory.
-pub struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
+pub struct ControlRingWakeHandle<Memory: ControlRingMemory> {
     ring: Arc<ControlRing<Memory>>,
     wait_epoch: ControlRingWaitEpoch,
 }
@@ -496,7 +496,7 @@ pub struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
 /// Implementations must publish and observe epoch changes through the same
 /// coherent shared memory the ring uses, so a wake that follows an epoch change
 /// can never be missed by a waiter that sampled the previous epoch.
-pub trait WaitableSharedMemory: AtomicSharedMemory {
+pub trait WaitableSharedMemory: ControlRingMemory {
     /// Error reported by blocking operations on this shared memory.
     type Error;
 
@@ -528,7 +528,7 @@ impl ControlRingWaitEpoch {
     }
 }
 
-impl<Memory: AtomicSharedMemory> Clone for ControlRingWakeHandle<Memory> {
+impl<Memory: ControlRingMemory> Clone for ControlRingWakeHandle<Memory> {
     fn clone(&self) -> Self {
         Self {
             ring: Arc::clone(&self.ring),
@@ -537,7 +537,7 @@ impl<Memory: AtomicSharedMemory> Clone for ControlRingWakeHandle<Memory> {
     }
 }
 
-impl<Memory: AtomicSharedMemory> ControlRingWakeHandle<Memory> {
+impl<Memory: ControlRingMemory> ControlRingWakeHandle<Memory> {
     pub(crate) const fn wait_epoch_offset(&self) -> usize {
         self.wait_epoch.offset()
     }
@@ -554,13 +554,13 @@ impl<Memory: WaitableSharedMemory> ControlRingWakeHandle<Memory> {
     /// after a ring operation samples its epoch but before it starts to wait.
     pub fn interrupt_wait(&self) -> Result<(), Memory::Error> {
         self.memory()
-            .fetch_add_u32_release(self.wait_epoch_offset(), 1)
+            .increment_u32_release(self.wait_epoch_offset())
             .map_err(Memory::wait_access_error)?;
         self.memory().wake_one(self.wait_epoch_offset())
     }
 }
 
-impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
+impl<Memory: ControlRingMemory> ControlRingProducer<Memory> {
     fn new(ring: Arc<ControlRing<Memory>>, direction: ControlRingDirection) -> Self {
         Self {
             ring,
@@ -662,14 +662,14 @@ impl<Memory: WaitableSharedMemory> ControlRingProducer<Memory> {
 }
 
 /// Trusted endpoint-local state for one control-ring consumer.
-pub struct ControlRingConsumer<Memory: AtomicSharedMemory> {
+pub struct ControlRingConsumer<Memory: ControlRingMemory> {
     ring: Arc<ControlRing<Memory>>,
     direction: ControlRingDirection,
     head: u64,
     published_head: u64,
 }
 
-impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
+impl<Memory: ControlRingMemory> ControlRingConsumer<Memory> {
     fn new(ring: Arc<ControlRing<Memory>>, direction: ControlRingDirection) -> Self {
         Self {
             ring,
@@ -702,11 +702,10 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
         if self.head == self.published_head {
             return Ok(());
         }
-        self.ring.memory.store_u64_and_fetch_add_u32_release(
+        self.ring.memory.store_u64_and_increment_u32_release(
             self.direction.consumer_head_offset(),
             self.head.to_le(),
             self.direction.consumer_epoch_offset(),
-            1,
         )?;
         self.published_head = self.head;
         Ok(())
@@ -843,9 +842,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_layout_separates_byte_and_atomic_regions() {
-        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(0));
-        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(0));
+    fn memory_layout_separates_byte_and_word_regions() {
+        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_u64(0));
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_u32(0));
         assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(0, 1));
         assert!(
             CONTROL_RING_MEMORY_LAYOUT
@@ -857,12 +856,12 @@ mod tests {
         ));
 
         let sync_start = CONTROL_RING_DATA_SIZE;
-        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(sync_start + PRODUCER_EPOCH_OFFSET));
-        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(sync_start + CONSUMER_EPOCH_OFFSET));
-        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(sync_start + CONSUMER_HEAD_OFFSET));
+        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_u32(sync_start + PRODUCER_EPOCH_OFFSET));
+        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_u32(sync_start + CONSUMER_EPOCH_OFFSET));
+        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_u64(sync_start + CONSUMER_HEAD_OFFSET));
         assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(sync_start, 1));
-        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(CONTROL_RING_MEMORY_SIZE));
-        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(CONTROL_RING_MEMORY_SIZE));
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_u32(CONTROL_RING_MEMORY_SIZE));
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_u64(CONTROL_RING_MEMORY_SIZE));
         assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(CONTROL_RING_MEMORY_SIZE, 1));
     }
 
@@ -1099,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_payload_metadata_or_atomic_publication_does_not_publish_progress() {
+    fn failed_payload_metadata_or_word_publication_does_not_publish_progress() {
         for failed_write in [1, 2, 3] {
             let ring = ControlRing::new(FailingWriteMemory::new()).unwrap();
             let (mut producer, mut consumer) = ring.into_endpoints(
@@ -1213,13 +1212,10 @@ mod tests {
     fn wakeup_epochs_wrap_without_controlling_ring_progress() {
         let (mut producer, mut consumer) = test_endpoints();
 
-        producer
-            .memory()
-            .fetch_add_u32_release(
-                ControlRingDirection::Requests.producer_epoch_offset(),
-                u32::MAX,
-            )
-            .unwrap();
+        producer.memory().store_u32_for_test(
+            ControlRingDirection::Requests.producer_epoch_offset(),
+            u32::MAX,
+        );
         producer.try_write(&[7]).unwrap();
         assert_eq!(
             consumer.try_read(owned_bytes),
@@ -1230,13 +1226,10 @@ mod tests {
             Ok(ControlRingReadStatus::Empty { wait_epoch: 0 })
         );
 
-        consumer
-            .memory()
-            .fetch_add_u32_release(
-                ControlRingDirection::Requests.consumer_epoch_offset(),
-                u32::MAX,
-            )
-            .unwrap();
+        consumer.memory().store_u32_for_test(
+            ControlRingDirection::Requests.consumer_epoch_offset(),
+            u32::MAX,
+        );
         consumer.publish_head().unwrap();
         assert_eq!(
             producer
@@ -1569,6 +1562,11 @@ mod tests {
         fn write_log(&self) -> Vec<(usize, usize)> {
             self.write_log.lock().unwrap().clone()
         }
+
+        fn store_u32_for_test(&self, offset: usize, value: u32) {
+            self.bytes.lock().unwrap()[offset..offset + size_of::<u32>()]
+                .copy_from_slice(&value.to_ne_bytes());
+        }
     }
 
     impl SharedMemory for TestMemory {
@@ -1604,23 +1602,19 @@ mod tests {
         }
     }
 
-    impl AtomicSharedMemory for TestMemory {
+    impl ControlRingMemory for TestMemory {
         fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
             test_load_u32_acquire(&self.bytes, offset)
         }
 
-        fn fetch_add_u32_release(
-            &self,
-            offset: usize,
-            value: u32,
-        ) -> Result<u32, SharedMemoryError> {
-            let previous = test_fetch_add_u32_release(&self.bytes, offset, value)?;
+        fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
+            test_increment_u32_release(&self.bytes, offset)?;
             self.write_log
                 .lock()
                 .unwrap()
                 .push((offset, size_of::<u32>()));
             self.write_count.fetch_add(1, Ordering::Relaxed);
-            Ok(previous)
+            Ok(())
         }
 
         fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
@@ -1637,26 +1631,24 @@ mod tests {
             Ok(())
         }
 
-        fn store_u64_and_fetch_add_u32_release(
+        fn store_u64_and_increment_u32_release(
             &self,
             store_offset: usize,
             value: u64,
-            add_offset: usize,
-            add_value: u32,
-        ) -> Result<u32, SharedMemoryError> {
-            let previous = test_store_u64_and_fetch_add_u32_release(
+            increment_offset: usize,
+        ) -> Result<(), SharedMemoryError> {
+            test_store_u64_and_increment_u32_release(
                 &self.bytes,
                 store_offset,
                 value,
-                add_offset,
-                add_value,
+                increment_offset,
             )?;
             self.write_log.lock().unwrap().extend([
                 (store_offset, size_of::<u64>()),
-                (add_offset, size_of::<u32>()),
+                (increment_offset, size_of::<u32>()),
             ]);
             self.write_count.fetch_add(2, Ordering::Relaxed);
-            Ok(previous)
+            Ok(())
         }
     }
 
@@ -1719,17 +1711,13 @@ mod tests {
         }
     }
 
-    impl AtomicSharedMemory for FailingWriteMemory {
+    impl ControlRingMemory for FailingWriteMemory {
         fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
             test_load_u32_acquire(&self.bytes, offset)
         }
 
-        fn fetch_add_u32_release(
-            &self,
-            offset: usize,
-            value: u32,
-        ) -> Result<u32, SharedMemoryError> {
-            test_fetch_add_u32_release(&self.bytes, offset, value)
+        fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
+            test_increment_u32_release(&self.bytes, offset)
         }
 
         fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
@@ -1738,7 +1726,7 @@ mod tests {
 
         fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
             if !offset.is_multiple_of(align_of::<u64>()) {
-                return Err(SharedMemoryError::UnalignedAtomic);
+                return Err(SharedMemoryError::UnalignedWord);
             }
             let call = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
             if call == self.fail_on_write.load(Ordering::Relaxed) {
@@ -1747,23 +1735,21 @@ mod tests {
             test_store_u64_release(&self.bytes, offset, value)
         }
 
-        fn store_u64_and_fetch_add_u32_release(
+        fn store_u64_and_increment_u32_release(
             &self,
             store_offset: usize,
             value: u64,
-            add_offset: usize,
-            add_value: u32,
-        ) -> Result<u32, SharedMemoryError> {
+            increment_offset: usize,
+        ) -> Result<(), SharedMemoryError> {
             let call = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
             if call == self.fail_on_write.load(Ordering::Relaxed) {
                 return Err(SharedMemoryError::InvalidRange);
             }
-            test_store_u64_and_fetch_add_u32_release(
+            test_store_u64_and_increment_u32_release(
                 &self.bytes,
                 store_offset,
                 value,
-                add_offset,
-                add_value,
+                increment_offset,
             )
         }
     }
@@ -1838,17 +1824,13 @@ mod tests {
         }
     }
 
-    impl AtomicSharedMemory for TearingMemory {
+    impl ControlRingMemory for TearingMemory {
         fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
             test_load_u32_acquire(&self.bytes, offset)
         }
 
-        fn fetch_add_u32_release(
-            &self,
-            offset: usize,
-            value: u32,
-        ) -> Result<u32, SharedMemoryError> {
-            test_fetch_add_u32_release(&self.bytes, offset, value)
+        fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
+            test_increment_u32_release(&self.bytes, offset)
         }
 
         fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
@@ -1859,19 +1841,17 @@ mod tests {
             test_store_u64_release(&self.bytes, offset, value)
         }
 
-        fn store_u64_and_fetch_add_u32_release(
+        fn store_u64_and_increment_u32_release(
             &self,
             store_offset: usize,
             value: u64,
-            add_offset: usize,
-            add_value: u32,
-        ) -> Result<u32, SharedMemoryError> {
-            test_store_u64_and_fetch_add_u32_release(
+            increment_offset: usize,
+        ) -> Result<(), SharedMemoryError> {
+            test_store_u64_and_increment_u32_release(
                 &self.bytes,
                 store_offset,
                 value,
-                add_offset,
-                add_value,
+                increment_offset,
             )
         }
     }
@@ -1881,7 +1861,7 @@ mod tests {
         offset: usize,
     ) -> Result<u32, SharedMemoryError> {
         if !offset.is_multiple_of(align_of::<u32>()) {
-            return Err(SharedMemoryError::UnalignedAtomic);
+            return Err(SharedMemoryError::UnalignedWord);
         }
         let bytes = bytes.lock().unwrap();
         let end = offset
@@ -1898,13 +1878,12 @@ mod tests {
         Ok(value)
     }
 
-    fn test_fetch_add_u32_release(
+    fn test_increment_u32_release(
         bytes: &Mutex<Vec<u8>>,
         offset: usize,
-        value: u32,
-    ) -> Result<u32, SharedMemoryError> {
+    ) -> Result<(), SharedMemoryError> {
         if !offset.is_multiple_of(align_of::<u32>()) {
-            return Err(SharedMemoryError::UnalignedAtomic);
+            return Err(SharedMemoryError::UnalignedWord);
         }
         fence(Ordering::Release);
         let mut bytes = bytes.lock().unwrap();
@@ -1915,8 +1894,8 @@ mod tests {
             .get_mut(offset..end)
             .ok_or(SharedMemoryError::InvalidRange)?;
         let previous = u32::from_ne_bytes(destination.try_into().unwrap());
-        destination.copy_from_slice(&previous.wrapping_add(value).to_ne_bytes());
-        Ok(previous)
+        destination.copy_from_slice(&previous.wrapping_add(1).to_ne_bytes());
+        Ok(())
     }
 
     fn test_load_u64_acquire(
@@ -1924,7 +1903,7 @@ mod tests {
         offset: usize,
     ) -> Result<u64, SharedMemoryError> {
         if !offset.is_multiple_of(align_of::<u64>()) {
-            return Err(SharedMemoryError::UnalignedAtomic);
+            return Err(SharedMemoryError::UnalignedWord);
         }
         let bytes = bytes.lock().unwrap();
         let end = offset
@@ -1947,7 +1926,7 @@ mod tests {
         value: u64,
     ) -> Result<(), SharedMemoryError> {
         if !offset.is_multiple_of(align_of::<u64>()) {
-            return Err(SharedMemoryError::UnalignedAtomic);
+            return Err(SharedMemoryError::UnalignedWord);
         }
         fence(Ordering::Release);
         let mut bytes = bytes.lock().unwrap();
@@ -1961,39 +1940,39 @@ mod tests {
         Ok(())
     }
 
-    fn test_store_u64_and_fetch_add_u32_release(
+    fn test_store_u64_and_increment_u32_release(
         bytes: &Mutex<Vec<u8>>,
         store_offset: usize,
         value: u64,
-        add_offset: usize,
-        add_value: u32,
-    ) -> Result<u32, SharedMemoryError> {
+        increment_offset: usize,
+    ) -> Result<(), SharedMemoryError> {
         if !store_offset.is_multiple_of(align_of::<u64>())
-            || !add_offset.is_multiple_of(align_of::<u32>())
+            || !increment_offset.is_multiple_of(align_of::<u32>())
         {
-            return Err(SharedMemoryError::UnalignedAtomic);
+            return Err(SharedMemoryError::UnalignedWord);
         }
         let store_end = store_offset
             .checked_add(size_of::<u64>())
             .ok_or(SharedMemoryError::InvalidRange)?;
-        let add_end = add_offset
+        let increment_end = increment_offset
             .checked_add(size_of::<u32>())
             .ok_or(SharedMemoryError::InvalidRange)?;
-        if store_offset < add_end && add_offset < store_end {
+        if store_offset < increment_end && increment_offset < store_end {
             return Err(SharedMemoryError::InvalidRange);
         }
         let mut bytes = bytes.lock().unwrap();
-        if store_end > bytes.len() || add_end > bytes.len() {
+        if store_end > bytes.len() || increment_end > bytes.len() {
             return Err(SharedMemoryError::InvalidRange);
         }
         let previous = u32::from_ne_bytes(
-            bytes[add_offset..add_end]
+            bytes[increment_offset..increment_end]
                 .try_into()
                 .expect("checked u32 range"),
         );
         fence(Ordering::Release);
         bytes[store_offset..store_end].copy_from_slice(&value.to_ne_bytes());
-        bytes[add_offset..add_end].copy_from_slice(&previous.wrapping_add(add_value).to_ne_bytes());
-        Ok(previous)
+        bytes[increment_offset..increment_end]
+            .copy_from_slice(&previous.wrapping_add(1).to_ne_bytes());
+        Ok(())
     }
 }
