@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Runtime shared-memory interfaces and the checked shared-buffer pool.
+//! Runtime shared-memory access for broker transports.
 //!
-//! These interfaces describe how an endpoint reaches association shared memory
-//! at runtime. The peer-visible slot geometry they are attached to lives in
-//! [`litebox_broker_protocol::shared_buffer`].
+//! [`SharedMemory`] and [`AtomicSharedMemory`] abstract a concrete shared-memory
+//! mapping. [`SharedBufferPool`] applies the peer-visible fixed-slot layout from
+//! [`litebox_broker_protocol::shared_buffer`] and bounds-checks each slot access.
 
 use alloc::sync::Arc;
 
@@ -27,18 +27,17 @@ pub enum SharedMemoryError {
     UnalignedAtomic,
 }
 
-/// Byte-copy access to a shared-memory resource.
+/// Byte-copy access to a shared-memory mapping.
 ///
-/// A value may own a distinct shared-memory object or identify a region in a
-/// larger shared-memory resource. Each endpoint has its own implementation, and
-/// peers may use different implementation types, such as user and kernel
-/// mappings of the same physical memory. Implementations must keep the backing
-/// resource alive and make concurrent local calls safe without exposing Rust
-/// references into memory writable by the peer.
+/// A value may own a distinct shared-memory object or identify a region within
+/// a larger resource. Each endpoint has its own value, and peers may use
+/// different implementation types, such as user and kernel mappings of the same
+/// physical memory. Implementations must keep the backing resource alive, make
+/// concurrent local calls safe, and never expose Rust references into memory
+/// writable by a peer.
 ///
-/// Establishing the shared resource and coordinating access between endpoints
-/// are responsibilities of the deployment and protocol using the shared
-/// memory.
+/// The concrete transport establishes and shares the resource. The protocol
+/// using it determines which endpoint may access each byte range.
 pub trait SharedMemory: Send + Sync + 'static {
     /// Returns the mapped resource length in bytes.
     ///
@@ -50,25 +49,29 @@ pub trait SharedMemory: Send + Sync + 'static {
         self.len() == 0
     }
 
-    /// Copies bytes from shared memory into `destination`.
+    /// Copies bytes from shared memory at `offset` into `destination`.
+    ///
+    /// The entire range must be validated before any bytes are copied.
     fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError>;
 
-    /// Copies bytes from `source` into shared memory.
+    /// Copies `source` into shared memory at `offset`.
+    ///
+    /// The entire range must be validated before any bytes are copied.
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError>;
 }
 
 /// Ordered atomic access to shared-memory synchronization values.
 ///
-/// Implementations must provide naturally aligned, indivisible, system-visible
-/// operations over coherent shared memory. Atomic values must not also be
-/// accessed through [`SharedMemory::read`] or [`SharedMemory::write`] by a
-/// conforming endpoint.
+/// Implementations must provide naturally aligned, indivisible operations that
+/// are coherent with every endpoint mapping the same backing memory. A
+/// conforming endpoint must not access an atomic location through
+/// [`SharedMemory::read`] or [`SharedMemory::write`].
 pub trait AtomicSharedMemory: SharedMemory {
     /// Atomically loads a naturally aligned native-endian `u32` with acquire
     /// ordering.
     fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError>;
 
-    /// Atomically increments a naturally aligned native-endian `u32` with
+    /// Atomically adds `value` to a naturally aligned native-endian `u32` with
     /// release ordering and returns its previous value.
     fn fetch_add_u32_release(&self, offset: usize, value: u32) -> Result<u32, SharedMemoryError>;
 
@@ -82,12 +85,13 @@ pub trait AtomicSharedMemory: SharedMemory {
     /// On error, the value must not have been stored.
     fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError>;
 
-    /// Atomically release-stores a native-endian `u64`, then release-adds to a
-    /// native-endian `u32`, returning the previous `u32`.
+    /// Release-stores a native-endian `u64`, then performs a release fetch-add on
+    /// a native-endian `u32`, returning the previous `u32`.
     ///
     /// Both values must be naturally aligned and occupy non-overlapping ranges.
     /// Implementations must validate both accesses before storing either value.
-    /// On error, neither value may have been modified.
+    /// On error, neither value may have been modified. The two operations are
+    /// ordered but are not one indivisible transaction.
     fn store_u64_and_fetch_add_u32_release(
         &self,
         store_offset: usize,
@@ -115,7 +119,7 @@ impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SharedBufferError {
-    /// The layout rejected the pool or the requested slot range.
+    /// The requested slot or byte range is invalid for the layout.
     #[error("invalid shared-buffer layout access: {0}")]
     Layout(#[from] SharedBufferLayoutError),
     /// The backing shared-memory length does not exactly match the layout.
@@ -126,18 +130,19 @@ pub enum SharedBufferError {
     SharedMemory(#[from] SharedMemoryError),
 }
 
-/// A shared-memory resource viewed as a checked fixed-slot buffer pool.
+/// A shared-memory resource with bounds-checked fixed-slot access.
 ///
-/// Slot ownership and reuse remain responsibilities of the protocol using the
-/// pool. Accessors copy bytes and never expose references into peer-writable
-/// memory.
+/// Construction validates that the backing memory has the layout's exact size.
+/// Each read or write validates its slot and byte count before deriving an
+/// offset and copying data. The pool does not allocate, lease, or synchronize
+/// slots; the protocol using it owns those responsibilities.
 pub struct SharedBufferPool<Memory: SharedMemory> {
     memory: Memory,
     layout: SharedBufferLayout,
 }
 
 impl<Memory: SharedMemory> SharedBufferPool<Memory> {
-    /// Attaches a layout to an exact-size shared-memory resource.
+    /// Creates a fixed-slot view over an exact-size shared-memory resource.
     pub fn new(memory: Memory, layout: SharedBufferLayout) -> Result<Self, SharedBufferError> {
         if memory.len() != layout.total_len() {
             return Err(SharedBufferError::MemoryLengthMismatch);
@@ -151,6 +156,8 @@ impl<Memory: SharedMemory> SharedBufferPool<Memory> {
     }
 
     /// Returns the backing shared-memory resource.
+    ///
+    /// Direct access is not constrained by the pool's fixed-slot layout.
     pub const fn memory(&self) -> &Memory {
         &self.memory
     }
