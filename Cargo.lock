@@ -1507,6 +1507,7 @@ dependencies = [
 name = "litebox_broker_transport_linux_userland"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "litebox_broker_protocol",
  "litebox_broker_transport",
  "rustix",

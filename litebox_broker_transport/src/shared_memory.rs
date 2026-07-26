@@ -36,6 +36,10 @@ pub enum SharedMemoryError {
 /// concurrent local calls safe, and never expose Rust references into memory
 /// writable by a peer.
 ///
+/// A peer may access the same bytes concurrently, even if doing so violates the
+/// higher-level protocol. Implementations must keep such access memory-safe;
+/// callers that require a coherent snapshot must validate it separately.
+///
 /// The concrete transport establishes and shares the resource. The protocol
 /// using it determines which endpoint may access each byte range.
 pub trait SharedMemory: Send + Sync + 'static {
@@ -65,7 +69,9 @@ pub trait SharedMemory: Send + Sync + 'static {
 /// Implementations must provide naturally aligned, indivisible operations that
 /// are coherent with every endpoint mapping the same backing memory. A
 /// conforming endpoint must not access an atomic location through
-/// [`SharedMemory::read`] or [`SharedMemory::write`].
+/// [`SharedMemory::read`] or [`SharedMemory::write`]. Implementations exposed
+/// through safe APIs must enforce disjoint byte, `u32`, and `u64` access regions
+/// so callers cannot create conflicting accesses of different sizes.
 pub trait AtomicSharedMemory: SharedMemory {
     /// Atomically loads a naturally aligned native-endian `u32` with acquire
     /// ordering.

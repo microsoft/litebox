@@ -14,7 +14,6 @@ use std::mem::{align_of, size_of};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use rustix::fs::{
@@ -28,12 +27,15 @@ use rustix::net::{
 };
 use rustix::thread::futex;
 
-use litebox_broker_transport::control_ring::WaitableSharedMemory;
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
+use litebox_broker_transport::control_ring::{
+    CONTROL_RING_MEMORY_LAYOUT, CONTROL_RING_MEMORY_SIZE, WaitableSharedMemory,
+};
 use litebox_broker_transport::shared_memory::{
     AtomicSharedMemory, SharedMemory, SharedMemoryError,
 };
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
@@ -42,11 +44,13 @@ use crate::unix_io::{
 const REQUIRED_MEMFD_SEALS: SealFlags = SealFlags::from_bits_retain(
     SealFlags::GROW.bits() | SealFlags::SHRINK.bits() | SealFlags::SEAL.bits(),
 );
+const _: () = assert!(SHARED_BUFFER_POOL_SIZE != CONTROL_RING_MEMORY_SIZE);
 
 /// Linux memfd-backed shared memory usable by broker transports.
 pub struct MemfdSharedMemory {
     fd: OwnedFd,
-    mapping: Mutex<MappedRegion>,
+    mapping: MappedRegion,
+    access: MemoryAccessPolicy,
 }
 
 struct MappedRegion {
@@ -54,26 +58,66 @@ struct MappedRegion {
     length: usize,
 }
 
-// SAFETY: `MappedRegion` exclusively owns its mapping, and all byte access is
-// serialized by the enclosing `Mutex`.
+#[derive(Clone, Copy)]
+enum MemoryAccessPolicy {
+    Bytes,
+    ControlRing,
+}
+
+impl MemoryAccessPolicy {
+    const fn for_length(length: usize) -> Self {
+        if length == CONTROL_RING_MEMORY_SIZE {
+            Self::ControlRing
+        } else {
+            Self::Bytes
+        }
+    }
+
+    const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
+        match self {
+            Self::Bytes => true,
+            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(offset, length),
+        }
+    }
+
+    const fn permits_atomic_u32(self, offset: usize) -> bool {
+        match self {
+            Self::Bytes => false,
+            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(offset),
+        }
+    }
+
+    const fn permits_atomic_u64(self, offset: usize) -> bool {
+        match self {
+            Self::Bytes => false,
+            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(offset),
+        }
+    }
+}
+
+// SAFETY: Moving or sharing this owner does not move or invalidate its OS
+// mapping. Its metadata is immutable, and contents are accessed through a fixed
+// atomic representation without exposing references to callers.
 unsafe impl Send for MappedRegion {}
+// SAFETY: See the `Send` justification. Concurrent content access uses atomics.
+unsafe impl Sync for MappedRegion {}
 
 fn atomic_u64_at(
     memory: &MemfdSharedMemory,
     offset: usize,
 ) -> Result<&AtomicU64, SharedMemoryError> {
-    let address = {
-        let mapping = memory
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let byte_address =
-            shared_address(&mapping, offset, size_of::<u64>(), align_of::<AtomicU64>())?;
-        // The runtime check above establishes the stronger alignment.
-        #[allow(clippy::cast_ptr_alignment)]
-        let address = byte_address.cast::<u64>();
-        address
-    };
+    if !memory.access.permits_atomic_u64(offset) {
+        return Err(SharedMemoryError::InvalidRange);
+    }
+    let byte_address = shared_address(
+        &memory.mapping,
+        offset,
+        size_of::<u64>(),
+        align_of::<AtomicU64>(),
+    )?;
+    // The runtime check above establishes the stronger alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    let address = byte_address.cast::<u64>();
     // SAFETY: The pointer is valid and aligned for a `u64`. Control-ring
     // sequence words are accessed atomically by conforming endpoints, and
     // `memory` keeps the immutable mapping alive for the returned reference.
@@ -84,18 +128,18 @@ fn atomic_u32_at(
     memory: &MemfdSharedMemory,
     offset: usize,
 ) -> Result<&AtomicU32, SharedMemoryError> {
-    let address = {
-        let mapping = memory
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let byte_address =
-            shared_address(&mapping, offset, size_of::<u32>(), align_of::<AtomicU32>())?;
-        // The runtime check above establishes the stronger alignment.
-        #[allow(clippy::cast_ptr_alignment)]
-        let address = byte_address.cast::<u32>();
-        address
-    };
+    if !memory.access.permits_atomic_u32(offset) {
+        return Err(SharedMemoryError::InvalidRange);
+    }
+    let byte_address = shared_address(
+        &memory.mapping,
+        offset,
+        size_of::<u32>(),
+        align_of::<AtomicU32>(),
+    )?;
+    // The runtime check above establishes the stronger alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    let address = byte_address.cast::<u32>();
     // SAFETY: The pointer is valid and aligned for a `u32`. Control-ring epoch
     // words are accessed atomically by conforming endpoints and the futex
     // syscall, and `memory` keeps the immutable mapping alive for the returned
@@ -119,6 +163,98 @@ fn shared_address(
         return Err(SharedMemoryError::UnalignedAtomic);
     }
     Ok(byte_address)
+}
+
+fn atomic_word_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU64, SharedMemoryError> {
+    let address = shared_address(mapping, offset, size_of::<u64>(), align_of::<AtomicU64>())?;
+    // SAFETY: The checked address is valid and aligned for one word, the mapping
+    // stays live for the returned reference, and every full word in a byte
+    // region uses this same atomic representation.
+    Ok(unsafe { AtomicU64::from_ptr(address.cast()) })
+}
+
+fn atomic_byte_at(mapping: &MappedRegion, offset: usize) -> Result<&AtomicU8, SharedMemoryError> {
+    let address = shared_address(mapping, offset, size_of::<u8>(), align_of::<AtomicU8>())?;
+    // SAFETY: The checked address is valid and aligned for one byte, the mapping
+    // stays live for the returned reference, and only a trailing partial word
+    // uses this byte representation.
+    Ok(unsafe { AtomicU8::from_ptr(address) })
+}
+
+fn read_atomic_bytes(
+    mapping: &MappedRegion,
+    offset: usize,
+    destination: &mut [u8],
+) -> Result<(), SharedMemoryError> {
+    shared_address(mapping, offset, destination.len(), align_of::<AtomicU8>())?;
+    let mut copied = 0;
+    while copied < destination.len() {
+        let absolute = offset + copied;
+        let word_start = absolute - absolute % size_of::<u64>();
+        if word_start + size_of::<u64>() <= mapping.length {
+            let word = atomic_word_at(mapping, word_start)?
+                .load(Ordering::Relaxed)
+                .to_ne_bytes();
+            let word_offset = absolute - word_start;
+            let count = (size_of::<u64>() - word_offset).min(destination.len() - copied);
+            destination[copied..copied + count]
+                .copy_from_slice(&word[word_offset..word_offset + count]);
+            copied += count;
+        } else {
+            destination[copied] = atomic_byte_at(mapping, absolute)?.load(Ordering::Relaxed);
+            copied += 1;
+        }
+    }
+    Ok(())
+}
+
+fn write_atomic_bytes(
+    mapping: &MappedRegion,
+    offset: usize,
+    source: &[u8],
+) -> Result<(), SharedMemoryError> {
+    shared_address(mapping, offset, source.len(), align_of::<AtomicU8>())?;
+    let mut copied = 0;
+    while copied < source.len() {
+        let absolute = offset + copied;
+        let word_start = absolute - absolute % size_of::<u64>();
+        if word_start + size_of::<u64>() <= mapping.length {
+            let word = atomic_word_at(mapping, word_start)?;
+            let word_offset = absolute - word_start;
+            let count = (size_of::<u64>() - word_offset).min(source.len() - copied);
+            if word_offset == 0 && count == size_of::<u64>() {
+                word.store(
+                    u64::from_ne_bytes(
+                        source[copied..copied + count]
+                            .try_into()
+                            .expect("full atomic word"),
+                    ),
+                    Ordering::Relaxed,
+                );
+            } else {
+                let mut current = word.load(Ordering::Relaxed);
+                loop {
+                    let mut updated = current.to_ne_bytes();
+                    updated[word_offset..word_offset + count]
+                        .copy_from_slice(&source[copied..copied + count]);
+                    match word.compare_exchange_weak(
+                        current,
+                        u64::from_ne_bytes(updated),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => current = observed,
+                    }
+                }
+            }
+            copied += count;
+        } else {
+            atomic_byte_at(mapping, absolute)?.store(source[copied], Ordering::Relaxed);
+            copied += 1;
+        }
+    }
+    Ok(())
 }
 
 fn validate_nonoverlapping_atomic_ranges(
@@ -204,7 +340,8 @@ impl MemfdSharedMemory {
             NonNull::new(address.cast()).ok_or_else(|| invalid_data("mmap returned null"))?;
         Ok(Self {
             fd,
-            mapping: Mutex::new(MappedRegion { address, length }),
+            mapping: MappedRegion { address, length },
+            access: MemoryAccessPolicy::for_length(length),
         })
     }
 }
@@ -244,54 +381,28 @@ impl AsFd for MemfdSharedMemory {
 
 impl SharedMemory for MemfdSharedMemory {
     fn len(&self) -> usize {
-        self.mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .length
+        self.mapping.length
     }
 
     fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-        let mapping = self
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        offset
-            .checked_add(destination.len())
-            .filter(|end| *end <= mapping.length)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        // SAFETY: The range was checked against the live mapping,
-        // `destination` is valid for its full length, and no Rust reference is
-        // created for the byte-addressed shared mapping.
-        unsafe {
-            std::ptr::copy(
-                mapping.address.as_ptr().add(offset),
-                destination.as_mut_ptr(),
-                destination.len(),
-            );
+        shared_address(
+            &self.mapping,
+            offset,
+            destination.len(),
+            align_of::<AtomicU8>(),
+        )?;
+        if !self.access.permits_byte_range(offset, destination.len()) {
+            return Err(SharedMemoryError::InvalidRange);
         }
-        Ok(())
+        read_atomic_bytes(&self.mapping, offset, destination)
     }
 
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-        let mapping = self
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        offset
-            .checked_add(source.len())
-            .filter(|end| *end <= mapping.length)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        // SAFETY: The range was checked against the live mapping, `source` is
-        // valid for its full length, and no Rust reference is created for the
-        // byte-addressed shared mapping.
-        unsafe {
-            std::ptr::copy(
-                source.as_ptr(),
-                mapping.address.as_ptr().add(offset),
-                source.len(),
-            );
+        shared_address(&self.mapping, offset, source.len(), align_of::<AtomicU8>())?;
+        if !self.access.permits_byte_range(offset, source.len()) {
+            return Err(SharedMemoryError::InvalidRange);
         }
-        Ok(())
+        write_atomic_bytes(&self.mapping, offset, source)
     }
 }
 
@@ -483,61 +594,116 @@ mod tests {
             second.read(usize::MAX, &mut data),
             Err(SharedMemoryError::InvalidRange)
         );
+        assert_eq!(
+            second.load_u64_acquire(0),
+            Err(SharedMemoryError::InvalidRange)
+        );
     }
 
     #[test]
-    fn mappings_share_ordered_atomic_values_and_validate_alignment() {
-        let first = MemfdSharedMemory::create(64).unwrap();
+    fn mappings_preserve_disjoint_partial_word_writes() {
+        let first = MemfdSharedMemory::create(10).unwrap();
         let second =
-            MemfdSharedMemory::from_received_fd(first.as_fd().try_clone_to_owned().unwrap(), 64)
+            MemfdSharedMemory::from_received_fd(first.as_fd().try_clone_to_owned().unwrap(), 10)
                 .unwrap();
+        let start = Barrier::new(3);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                first.write(0, &[1; 4]).unwrap();
+            });
+            scope.spawn(|| {
+                start.wait();
+                second.write(4, &[2; 6]).unwrap();
+            });
+            start.wait();
+        });
 
-        first.store_u64_release(8, 0x0102_0304_0506_0708).unwrap();
-        assert_eq!(second.load_u64_acquire(8), Ok(0x0102_0304_0506_0708));
-        assert_eq!(first.fetch_add_u32_release(4, 3), Ok(0));
-        assert_eq!(second.load_u32_acquire(4), Ok(3));
+        let mut bytes = [0; 10];
+        first.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 1, 1, 1, 2, 2, 2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn mappings_enforce_control_ring_typed_access() {
+        let first = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let second = MemfdSharedMemory::from_received_fd(
+            first.as_fd().try_clone_to_owned().unwrap(),
+            CONTROL_RING_MEMORY_SIZE,
+        )
+        .unwrap();
+        let sequence_offset = (0..CONTROL_RING_MEMORY_SIZE)
+            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(*offset))
+            .unwrap();
+        let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
+            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(*offset))
+            .unwrap();
+        let body_offset = (0..CONTROL_RING_MEMORY_SIZE)
+            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(*offset, 1))
+            .unwrap();
+
+        first
+            .store_u64_release(sequence_offset, 0x0102_0304_0506_0708)
+            .unwrap();
         assert_eq!(
-            first.store_u64_and_fetch_add_u32_release(8, 0x1112_1314_1516_1718, 4, 2),
+            second.load_u64_acquire(sequence_offset),
+            Ok(0x0102_0304_0506_0708)
+        );
+        assert_eq!(first.fetch_add_u32_release(epoch_offset, 3), Ok(0));
+        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(3));
+        assert_eq!(
+            first.store_u64_and_fetch_add_u32_release(
+                sequence_offset,
+                0x1112_1314_1516_1718,
+                epoch_offset,
+                2
+            ),
             Ok(3)
         );
-        assert_eq!(second.load_u64_acquire(8), Ok(0x1112_1314_1516_1718));
-        assert_eq!(second.load_u32_acquire(4), Ok(5));
         assert_eq!(
-            first.store_u64_and_fetch_add_u32_release(8, 0, 64, 1),
+            second.load_u64_acquire(sequence_offset),
+            Ok(0x1112_1314_1516_1718)
+        );
+        assert_eq!(second.load_u32_acquire(epoch_offset), Ok(5));
+        second.write(body_offset, &[7]).unwrap();
+        let mut byte = [0];
+        first.read(body_offset, &mut byte).unwrap();
+        assert_eq!(byte, [7]);
+
+        assert_eq!(
+            second.read(sequence_offset, &mut byte),
             Err(SharedMemoryError::InvalidRange)
         );
         assert_eq!(
-            first.store_u64_and_fetch_add_u32_release(8, 0, 12, 1),
-            Err(SharedMemoryError::InvalidRange)
-        );
-        assert_eq!(second.load_u64_acquire(8), Ok(0x1112_1314_1516_1718));
-        second.wait_while_equal(4, 0).unwrap();
-        assert_eq!(
-            second.load_u64_acquire(1),
-            Err(SharedMemoryError::UnalignedAtomic)
-        );
-        assert_eq!(
-            second.store_u64_release(1, 0),
-            Err(SharedMemoryError::UnalignedAtomic)
-        );
-        assert_eq!(
-            second.load_u64_acquire(64),
+            second.write(epoch_offset, &[0]),
             Err(SharedMemoryError::InvalidRange)
         );
         assert_eq!(
-            second.load_u32_acquire(1),
-            Err(SharedMemoryError::UnalignedAtomic)
-        );
-        assert_eq!(
-            second.fetch_add_u32_release(64, 1),
+            second.load_u32_acquire(sequence_offset),
             Err(SharedMemoryError::InvalidRange)
         );
         assert_eq!(
-            second.wait_while_equal(64, 0).unwrap_err().kind(),
+            second.load_u64_acquire(body_offset),
+            Err(SharedMemoryError::InvalidRange)
+        );
+        second.wait_while_equal(epoch_offset, 0).unwrap();
+        assert_eq!(
+            second.store_u64_and_fetch_add_u32_release(sequence_offset, 0, sequence_offset, 1),
+            Err(SharedMemoryError::InvalidRange)
+        );
+        assert_eq!(
+            second.load_u64_acquire(CONTROL_RING_MEMORY_SIZE),
+            Err(SharedMemoryError::InvalidRange)
+        );
+        assert_eq!(
+            second
+                .wait_while_equal(sequence_offset, 0)
+                .unwrap_err()
+                .kind(),
             ErrorKind::InvalidInput
         );
         assert_eq!(
-            second.wake_one(1).unwrap_err().kind(),
+            second.wake_one(body_offset).unwrap_err().kind(),
             ErrorKind::InvalidInput
         );
     }

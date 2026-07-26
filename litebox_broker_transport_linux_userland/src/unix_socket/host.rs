@@ -8,6 +8,8 @@
 //! live in the no_std protocol, transport, local, core, and host crates.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult};
+use std::mem::size_of;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -47,9 +49,45 @@ pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> I
 }
 
 fn peer_process_id(stream: &UnixStream) -> IoResult<u32> {
-    let credentials = rustix::net::sockopt::socket_peercred(stream)?;
-    u32::try_from(credentials.pid.as_raw_pid())
-        .map_err(|_| invalid_data("Unix peer process ID is invalid"))
+    let expected_length = size_of::<libc::ucred>();
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut actual_length =
+        libc::socklen_t::try_from(expected_length).expect("Linux ucred size fits socklen_t");
+    // SAFETY: `stream` supplies a live socket descriptor, `credentials` is
+    // writable for `actual_length` bytes, and `actual_length` itself is a valid
+    // writable socklen_t.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut credentials).cast(),
+            &raw mut actual_length,
+        )
+    };
+    if result != 0 {
+        return Err(Error::last_os_error());
+    }
+    if actual_length as usize != expected_length {
+        return Err(invalid_data(
+            "Unix peer credentials have an unexpected size",
+        ));
+    }
+    validate_peer_process_id(credentials.pid)
+}
+
+fn validate_peer_process_id(process_id: i32) -> IoResult<u32> {
+    match u32::try_from(process_id) {
+        Ok(process_id) if process_id != 0 => Ok(process_id),
+        _ => Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket peer process ID is unavailable",
+        )),
+    }
 }
 
 /// Host-side broker association setup channel over a Unix stream.
@@ -671,6 +709,17 @@ mod tests {
                 .kind(),
             ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn linux_peer_validation_rejects_unavailable_process_ids() {
+        for process_id in [i32::MIN, -1, 0] {
+            assert_eq!(
+                validate_peer_process_id(process_id).unwrap_err().kind(),
+                ErrorKind::PermissionDenied
+            );
+        }
+        assert_eq!(validate_peer_process_id(1).unwrap(), 1);
     }
 
     #[test]

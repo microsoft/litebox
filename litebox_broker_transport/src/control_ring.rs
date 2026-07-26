@@ -11,8 +11,7 @@
 use alloc::sync::Arc;
 use core::mem::size_of;
 use core::ops::Range;
-#[cfg(test)]
-use core::sync::atomic::fence;
+use core::sync::atomic::{Ordering, fence};
 
 #[cfg(test)]
 use crate::shared_memory::SharedMemory;
@@ -49,6 +48,17 @@ pub const CONTROL_RING_NOTIFICATION_SLOT_COUNT: u64 = 64;
 pub const CONTROL_RING_MEMORY_SIZE: usize =
     CONTROL_RING_DATA_SIZE + CONTROL_RING_SYNC_DIRECTION_SIZE * 3;
 
+/// Typed access policy for the control-ring shared-memory ABI.
+///
+/// Concrete shared-memory implementations use this policy to prevent byte,
+/// `u32`, and `u64` atomic accesses from overlapping, including across distinct
+/// mappings of the same backing resource.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ControlRingMemoryLayout;
+
+/// Access policy for the control-ring shared-memory ABI.
+pub const CONTROL_RING_MEMORY_LAYOUT: ControlRingMemoryLayout = ControlRingMemoryLayout;
+
 // The fixed count is representable by `usize` on every supported target.
 #[allow(clippy::cast_possible_truncation)]
 const CONTROL_RING_DIRECTION_SIZE: usize =
@@ -63,6 +73,77 @@ const CONTROL_RING_SYNC_DIRECTION_SIZE: usize = 16;
 const PRODUCER_EPOCH_OFFSET: usize = 0;
 const CONSUMER_EPOCH_OFFSET: usize = 4;
 const CONSUMER_HEAD_OFFSET: usize = 8;
+
+impl ControlRingMemoryLayout {
+    /// Returns whether a byte-copy range lies entirely within one slot body.
+    pub const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
+        let Some(end) = offset.checked_add(length) else {
+            return false;
+        };
+        if end > CONTROL_RING_MEMORY_SIZE {
+            return false;
+        }
+        if length == 0 {
+            return true;
+        }
+        Self::direction_permits_byte_range(offset, length, 0, CONTROL_RING_SLOT_COUNT)
+            || Self::direction_permits_byte_range(
+                offset,
+                length,
+                CONTROL_RING_DIRECTION_SIZE,
+                CONTROL_RING_SLOT_COUNT,
+            )
+            || Self::direction_permits_byte_range(
+                offset,
+                length,
+                CONTROL_RING_DIRECTION_SIZE * 2,
+                CONTROL_RING_NOTIFICATION_SLOT_COUNT,
+            )
+    }
+
+    /// Returns whether `offset` names one control-ring atomic `u32`.
+    pub const fn permits_atomic_u32(self, offset: usize) -> bool {
+        let Some(relative) = offset.checked_sub(CONTROL_RING_DATA_SIZE) else {
+            return false;
+        };
+        relative < CONTROL_RING_SYNC_DIRECTION_SIZE * 3
+            && matches!(
+                relative % CONTROL_RING_SYNC_DIRECTION_SIZE,
+                PRODUCER_EPOCH_OFFSET | CONSUMER_EPOCH_OFFSET
+            )
+    }
+
+    /// Returns whether `offset` names one control-ring atomic `u64`.
+    pub const fn permits_atomic_u64(self, offset: usize) -> bool {
+        if offset < CONTROL_RING_DATA_SIZE {
+            return offset.is_multiple_of(CONTROL_RING_SLOT_SIZE);
+        }
+        let relative = offset - CONTROL_RING_DATA_SIZE;
+        relative < CONTROL_RING_SYNC_DIRECTION_SIZE * 3
+            && relative % CONTROL_RING_SYNC_DIRECTION_SIZE == CONSUMER_HEAD_OFFSET
+    }
+
+    const fn direction_permits_byte_range(
+        offset: usize,
+        length: usize,
+        direction_start: usize,
+        slot_count: u64,
+    ) -> bool {
+        let Some(relative) = offset.checked_sub(direction_start) else {
+            return false;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let direction_size = CONTROL_RING_SLOT_SIZE * slot_count as usize;
+        if relative >= direction_size {
+            return false;
+        }
+        let slot_offset = relative % CONTROL_RING_SLOT_SIZE;
+        let Some(slot_end) = slot_offset.checked_add(length) else {
+            return false;
+        };
+        slot_offset >= size_of::<u64>() && slot_end <= CONTROL_RING_SLOT_SIZE
+    }
+}
 
 /// One direction in the shared control-ring mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -668,6 +749,9 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
         self.ring
             .read_slot_body(self.direction, self.head, &mut image[size_of::<u64>()..])
             .map_err(ControlRingReadError::Ring)?;
+        // Keep every slot-body load before the sequence recheck so a hostile
+        // producer cannot pass validation with a body read after publication.
+        fence(Ordering::Acquire);
         let verified_sequence = self
             .ring
             .load_sequence(self.direction, self.head)
@@ -756,6 +840,30 @@ mod tests {
             }) if actual == CONTROL_RING_MEMORY_SIZE + 1
         ));
         assert!(ControlRing::new(TestMemory::new(CONTROL_RING_MEMORY_SIZE)).is_ok());
+    }
+
+    #[test]
+    fn memory_layout_separates_byte_and_atomic_regions() {
+        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(0));
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(0));
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(0, 1));
+        assert!(
+            CONTROL_RING_MEMORY_LAYOUT
+                .permits_byte_range(size_of::<u64>(), CONTROL_RING_SLOT_SIZE - size_of::<u64>())
+        );
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(
+            size_of::<u64>(),
+            CONTROL_RING_SLOT_SIZE - size_of::<u64>() + 1
+        ));
+
+        let sync_start = CONTROL_RING_DATA_SIZE;
+        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(sync_start + PRODUCER_EPOCH_OFFSET));
+        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(sync_start + CONSUMER_EPOCH_OFFSET));
+        assert!(CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(sync_start + CONSUMER_HEAD_OFFSET));
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(sync_start, 1));
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u32(CONTROL_RING_MEMORY_SIZE));
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_atomic_u64(CONTROL_RING_MEMORY_SIZE));
+        assert!(!CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(CONTROL_RING_MEMORY_SIZE, 1));
     }
 
     #[test]
