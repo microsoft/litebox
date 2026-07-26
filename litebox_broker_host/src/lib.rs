@@ -1,13 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Channel-neutral broker-side protocol/core adapter.
+//! Portable host endpoint for broker associations.
 //!
-//! This crate wires `litebox_broker_core` to any implementation of the neutral
-//! host-side control-channel trait in `litebox_broker_transport`. Concrete host
-//! channels live in transport binding crates such as
-//! `litebox_broker_transport_linux_userland`, which build on the portable
-//! transport interfaces and control rings.
+//! This crate is the trusted counterpart to `litebox_broker_local`. The local
+//! endpoint turns in-sandbox object operations into broker requests; this host
+//! endpoint authenticates the peer during association setup, creates its
+//! `litebox_broker_core` session, validates its shared-buffer use, dispatches
+//! requests to the core, and returns correlated responses. It also coordinates
+//! broker-to-local readiness notifications.
+//!
+//! The endpoint is channel-neutral. Deployments provide host channels through
+//! `litebox_broker_transport`; concrete bindings such as
+//! `litebox_broker_transport_linux_userland` decide how messages move.
 
 #![no_std]
 
