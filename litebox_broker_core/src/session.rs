@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
-        let broker = BrokerCore::new_with_limits_and_socket_provider(
+        let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
             BrokerCoreLimits::new_with_all_limits(2, 4, 2, 1),

@@ -193,7 +193,8 @@ pub trait PlatformSocket: Send + Sync {
     fn readiness(&self) -> ReadinessFlags;
 }
 
-pub(crate) struct UnsupportedSocketProvider;
+/// Placeholder provider for deployments that deliberately disable sockets.
+pub struct UnsupportedSocketProvider;
 
 impl SocketProvider for UnsupportedSocketProvider {
     fn create(

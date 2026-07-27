@@ -36,7 +36,7 @@ pub use error::BrokerError;
 pub use policy::{PolicyEngine, PolicyProfile, SocketPolicy};
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
-use socket::{SocketProvider, UnsupportedSocketProvider};
+use socket::SocketProvider;
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -118,37 +118,13 @@ pub struct BrokerCore {
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
-    /// Creates the broker core with the provided policy engine.
-    pub fn new(policy: PolicyEngine) -> Result<Self> {
-        Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT)
-    }
-
-    /// Creates the broker core with explicit authority-state limits.
-    pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Result<Self> {
-        if !policy.denies_socket_creation() {
-            return Err(BrokerError::UnsupportedOperation);
-        }
-        Self::new_with_limits_and_socket_provider(
-            policy,
-            limits,
-            Arc::new(UnsupportedSocketProvider),
-        )
-    }
-
-    /// Creates the broker core with an injected platform socket provider.
-    pub fn new_with_socket_provider(
-        policy: PolicyEngine,
-        socket_provider: Arc<dyn SocketProvider>,
-    ) -> Result<Self> {
-        Self::new_with_limits_and_socket_provider(
-            policy,
-            BrokerCoreLimits::DEFAULT,
-            socket_provider,
-        )
+    /// Creates the broker core with a platform socket provider.
+    pub fn new(policy: PolicyEngine, socket_provider: Arc<dyn SocketProvider>) -> Result<Self> {
+        Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT, socket_provider)
     }
 
     /// Creates the broker core with explicit limits and a platform socket provider.
-    pub fn new_with_limits_and_socket_provider(
+    pub fn new_with_limits(
         policy: PolicyEngine,
         limits: BrokerCoreLimits,
         socket_provider: Arc<dyn SocketProvider>,

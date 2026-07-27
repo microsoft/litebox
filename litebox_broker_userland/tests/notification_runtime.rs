@@ -7,6 +7,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use litebox_broker_core::socket::UnsupportedSocketProvider;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
@@ -47,9 +48,10 @@ fn spawn_host(
     + 'static,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
+        let broker = BrokerCore::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
+            Arc::new(UnsupportedSocketProvider),
+        )
         .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
@@ -128,9 +130,10 @@ fn readiness_of(notification: Option<BrokerNotification>) -> ReadinessNotificati
 
 #[test]
 fn host_serves_control_requests_and_notifications_over_shared_rings() {
-    let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
-        ObjectRights::all(),
-    ))
+    let broker = BrokerCore::new(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
+        Arc::new(UnsupportedSocketProvider),
+    )
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();
     let host_shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();

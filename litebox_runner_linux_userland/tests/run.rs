@@ -371,8 +371,11 @@ fn spawn_test_broker(
             let control_listener =
                 std::os::unix::net::UnixListener::bind(&server_control_socket_path)
                     .expect("failed to bind broker test control socket");
-            let broker =
-                litebox_broker_core::BrokerCore::new(policy).expect("failed to create broker core");
+            let broker = litebox_broker_core::BrokerCore::new(
+                policy,
+                std::sync::Arc::new(litebox_broker_core::socket::UnsupportedSocketProvider),
+            )
+            .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
 
             for _ in 0..connection_count {

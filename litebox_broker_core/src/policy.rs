@@ -112,10 +112,6 @@ impl PolicyEngine {
         }
     }
 
-    pub(crate) const fn denies_socket_creation(&self) -> bool {
-        matches!(self.socket_policy, SocketPolicy::Deny)
-    }
-
     pub(crate) fn authorize_socket_connect(
         &self,
         caller_credential: CallerCredential,

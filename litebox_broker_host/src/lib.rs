@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
-        let broker = BrokerCore::new_with_socket_provider(
+        let broker = BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
             Arc::new(TestSocketProvider),

@@ -15,6 +15,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use litebox_broker_core::socket::UnsupportedSocketProvider;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_protocol::message::BrokerRequest;
@@ -53,9 +54,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let control_socket_path = socket_dir.path().join("broker.sock");
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
-    let broker = BrokerCore::new(PolicyEngine::with_host_guaranteed_rights(
-        ObjectRights::all(),
-    ))?;
+    let broker = BrokerCore::new(
+        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
+        Arc::new(UnsupportedSocketProvider),
+    )?;
 
     let mut runner_command = Command::new(&args.runner);
     runner_command
@@ -561,9 +563,10 @@ mod tests {
         let (outcome_sender, outcome) = sync_channel(1);
         let (start, started) = sync_channel(1);
         let host = std::thread::spawn(move || {
-            let broker = BrokerCore::new(PolicyEngine::with_host_guaranteed_rights(
-                ObjectRights::all(),
-            ))
+            let broker = BrokerCore::new(
+                PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
+                Arc::new(UnsupportedSocketProvider),
+            )
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
             let shared_buffers =
