@@ -56,10 +56,16 @@ fn spawn_host(
         let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
         let control_ring = ControlRing::new(control_memory).unwrap();
         let mut control = UnixStreamHostSetupChannel::from_accepted(stream);
-        let association = setup_connection(&broker, &mut control, &shared_buffers, |channel| {
-            channel.send_memfd(shared_buffers.memory(), None)?;
-            channel.send_memfd(control_ring.memory(), None)
-        })
+        let association = setup_connection(
+            &broker,
+            &mut control,
+            &shared_buffers,
+            Arc::new(ReadinessPublisherRuntime::new()),
+            |channel| {
+                channel.send_memfd(shared_buffers.memory(), None)?;
+                channel.send_memfd(control_ring.memory(), None)
+            },
+        )
         .unwrap()
         .unwrap();
         let (mut request_source, response_sink, notifications, shutdown) =
@@ -140,13 +146,18 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
 
     let host_thread = std::thread::spawn(move || {
         let mut control = UnixStreamHostSetupChannel::from_accepted(host_control);
-        let association =
-            setup_connection(&broker, &mut control, &host_shared_buffers, |channel| {
+        let association = setup_connection(
+            &broker,
+            &mut control,
+            &host_shared_buffers,
+            Arc::new(ReadinessPublisherRuntime::new()),
+            |channel| {
                 channel.send_memfd(host_shared_buffers.memory(), None)?;
                 channel.send_memfd(host_control_ring.memory(), None)
-            })
-            .unwrap()
-            .unwrap();
+            },
+        )
+        .unwrap()
+        .unwrap();
         let (mut request_source, response_sink, mut notifications, _shutdown) =
             control.into_active(host_control_ring).unwrap();
         notifications.send_notification(&host_notification).unwrap();

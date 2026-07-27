@@ -534,6 +534,7 @@ mod tests {
             SocketError::AddressNotAvailable,
             SocketError::PolicyDenied,
             SocketError::Other,
+            SocketError::NotConnected,
         ] {
             for socket_response in [
                 SocketResponse::Failed(error),
@@ -879,7 +880,7 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Socket(SocketResponse::Failed(SocketError::TimedOut)),
         });
-        for raw in [0, 11, u8::MAX] {
+        for raw in [0, 12, u8::MAX] {
             let mut unknown_socket_error = socket_error.clone();
             *unknown_socket_error.last_mut().unwrap() = raw;
             assert_eq!(

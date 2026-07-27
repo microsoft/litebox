@@ -60,7 +60,7 @@ pub fn read(session: &BrokerSession, handle: ObjectHandle, length: u32) -> Resul
     }
     session.with_authorized_object(handle, ObjectRights::WAIT, |object| match object {
         ObjectEntry::Pipe(pipe) => pipe.read(length as usize),
-        ObjectEntry::Event(_) => Err(BrokerError::InvalidRights),
+        ObjectEntry::Event(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
     })
 }
 
@@ -71,7 +71,7 @@ pub fn write(session: &BrokerSession, handle: ObjectHandle, data: &[u8]) -> Resu
     }
     session.with_authorized_object(handle, ObjectRights::WRITE, |object| match object {
         ObjectEntry::Pipe(pipe) => pipe.write(data),
-        ObjectEntry::Event(_) => Err(BrokerError::InvalidRights),
+        ObjectEntry::Event(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
     })
 }
 

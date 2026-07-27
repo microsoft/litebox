@@ -21,20 +21,25 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 
+use litebox_broker_core::socket::{SocketOutcome, SocketReadinessSink};
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
-    EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest,
+    EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest, SocketResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
+};
+use litebox_broker_protocol::socket::{
+    ConnectSocketResponse, CreateSocketResponse, MAX_SOCKET_TRANSFER_SIZE, ReceiveSocketResponse,
+    SendSocketResponse, SocketStatusResponse,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -58,6 +63,7 @@ pub type ConnectionSetup<'a, Memory> =
 pub struct BrokerHostAssociation<'a, Memory: SharedMemory> {
     session: BrokerSession,
     shared_buffers: &'a SharedBufferPool<Memory>,
+    socket_readiness: Arc<dyn SocketReadinessSink>,
     state: SpinMutex<AssociationState>,
 }
 
@@ -119,6 +125,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             &self.session,
             operation,
             self.shared_buffers,
+            &self.socket_readiness,
         )) {
             Ok(result) => result,
             Err(error) => {
@@ -148,6 +155,7 @@ pub fn setup_connection<'a, SetupChannel, Memory, ChannelError>(
     core: &BrokerCore,
     setup_channel: &mut SetupChannel,
     shared_buffers: &'a SharedBufferPool<Memory>,
+    socket_readiness: Arc<dyn SocketReadinessSink>,
     send_shared_memory: impl FnOnce(&mut SetupChannel) -> core::result::Result<(), ChannelError>,
 ) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
 where
@@ -156,6 +164,14 @@ where
 {
     if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
         return Err(BrokerHostError::SharedBufferLayoutMismatch);
+    }
+    let limits = core.limits();
+    let max_live_session_sockets = limits
+        .max_references
+        .min(limits.max_sockets)
+        .min(limits.max_sockets_per_session);
+    if max_live_session_sockets > socket_readiness.max_tracked_sockets() {
+        return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
     }
 
     let peer_credential = setup_channel
@@ -204,6 +220,7 @@ where
             return Ok(Ok(BrokerHostAssociation {
                 session,
                 shared_buffers,
+                socket_readiness,
                 state: SpinMutex::new(AssociationState {
                     failed: false,
                     shared_buffer_usage: SharedBufferUsage::new(),
@@ -292,6 +309,7 @@ fn handle_request<Memory: SharedMemory>(
     session: &BrokerSession,
     operation: BrokerOperation,
     shared_buffers: &SharedBufferPool<Memory>,
+    socket_readiness: &Arc<dyn SocketReadinessSink>,
 ) -> RequestResult<BrokerResult> {
     match operation {
         BrokerOperation::CloseObject(handle) => session
@@ -308,19 +326,106 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::Pipe(request) => {
             handle_pipe_request(session, request, shared_buffers).map(BrokerResult::Pipe)
         }
-        // The socket protocol is defined before the broker implements it, so
-        // the operations decode and their shared-buffer leases are validated,
-        // but no socket object exists to act on one yet.
-        //
-        // `UnsupportedOperation` is deliberately in the local endpoint's fatal
-        // group alongside `MalformedRequest` and `ProtocolState`: it means the
-        // local sent an operation this broker never serves, which cannot happen
-        // unless the two sides disagree about the protocol. No local code
-        // constructs a socket request today, so this is unreachable; reporting
-        // a recoverable code instead would let a future wiring mistake look
-        // like an ordinary runtime failure rather than the contract violation
-        // it is.
-        BrokerOperation::Socket(_) => Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation)),
+        BrokerOperation::Socket(request) => {
+            handle_socket_request(session, request, shared_buffers, socket_readiness)
+                .map(BrokerResult::Socket)
+        }
+    }
+}
+
+fn handle_socket_request<Memory: SharedMemory>(
+    session: &BrokerSession,
+    request: SocketRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+    socket_readiness: &Arc<dyn SocketReadinessSink>,
+) -> RequestResult<SocketResponse> {
+    match request {
+        SocketRequest::Create(request) => {
+            let handle =
+                litebox_broker_core::socket::create(session, request, Arc::clone(socket_readiness))
+                    .map_err(socket_request_failure)?;
+            Ok(SocketResponse::Create(CreateSocketResponse { handle }))
+        }
+        SocketRequest::Connect(request) => {
+            litebox_broker_core::socket::connect(session, request.handle, request.address)
+                .map(|status| SocketResponse::Connect(ConnectSocketResponse { status }))
+                .map_err(socket_request_failure)
+        }
+        SocketRequest::Send(request) => {
+            if request.buffer.length > MAX_SOCKET_TRANSFER_SIZE {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            let length = request.buffer.length as usize;
+            let mut data = Vec::new();
+            if data.try_reserve_exact(length).is_err() {
+                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
+            }
+            data.resize(length, 0);
+            shared_buffers
+                .read(request.buffer.slot_index, &mut data)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            match litebox_broker_core::socket::send(session, request.handle, &data, request.flags)
+                .map_err(socket_request_failure)?
+            {
+                SocketOutcome::Completed(sent) => {
+                    let sent = sent
+                        .try_into()
+                        .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+                    Ok(SocketResponse::Send(SendSocketResponse { sent }))
+                }
+                SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
+            }
+        }
+        SocketRequest::Receive(request) => {
+            if request.buffer.length > MAX_SOCKET_TRANSFER_SIZE {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            let length = request.buffer.length as usize;
+            let mut data = Vec::new();
+            if data.try_reserve_exact(length).is_err() {
+                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
+            }
+            data.resize(length, 0);
+            match litebox_broker_core::socket::receive(
+                session,
+                request.handle,
+                &mut data,
+                request.flags,
+            )
+            .map_err(socket_request_failure)?
+            {
+                SocketOutcome::Completed(response) => {
+                    if let ReceiveSocketResponse::Received(received) = response {
+                        shared_buffers
+                            .write(request.buffer.slot_index, &data[..received as usize])
+                            .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+                    }
+                    Ok(SocketResponse::Receive(response))
+                }
+                SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
+            }
+        }
+        SocketRequest::Shutdown(request) => {
+            match litebox_broker_core::socket::shutdown(session, request.handle, request.mode)
+                .map_err(socket_request_failure)?
+            {
+                SocketOutcome::Completed(()) => Ok(SocketResponse::Shutdown),
+                SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
+            }
+        }
+        SocketRequest::Status(request) => {
+            litebox_broker_core::socket::status(session, request.handle)
+                .map(|status| SocketResponse::Status(SocketStatusResponse { status }))
+                .map_err(socket_request_failure)
+        }
+    }
+}
+
+fn socket_request_failure(error: litebox_broker_core::BrokerError) -> RequestFailure {
+    if error == litebox_broker_core::BrokerError::UnsupportedOperation {
+        RequestFailure::Abort(ErrorCode::MalformedRequest)
+    } else {
+        RequestFailure::Respond(error.into())
     }
 }
 
@@ -420,7 +525,10 @@ pub enum ConnectionTermination {
 mod tests {
     use super::*;
     use core::cell::Cell;
-    use litebox_broker_core::{ObjectRights, PolicyEngine};
+    use litebox_broker_core::socket::{
+        PlatformSocket, SocketOutcome, SocketProvider, SocketReadinessRegistration,
+    };
+    use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
@@ -430,16 +538,110 @@ mod tests {
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
         SharedBufferDescriptor,
     };
+    use litebox_broker_protocol::socket::{
+        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, Ipv4Address, Port,
+        ReceiveFlags, ReceiveSocketRequest, SendFlags, SendSocketRequest, ShutdownMode,
+        ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketStatusRequest,
+        SocketType,
+    };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
+    struct TestSocketReadiness;
+
+    impl SocketReadinessSink for TestSocketReadiness {
+        fn max_tracked_sockets(&self) -> usize {
+            usize::MAX
+        }
+
+        fn publish(
+            &self,
+            _handle: ObjectHandle,
+            _readiness: litebox_broker_protocol::readiness::ReadinessFlags,
+        ) -> litebox_broker_core::Result<()> {
+            Ok(())
+        }
+
+        fn retire(&self, _handle: ObjectHandle) {}
+    }
+
+    fn test_socket_readiness() -> Arc<dyn SocketReadinessSink> {
+        Arc::new(TestSocketReadiness)
+    }
+
+    #[derive(Default)]
+    struct TestSocketProvider;
+
+    impl SocketProvider for TestSocketProvider {
+        fn create(
+            &self,
+            _session_id: SessionId,
+            _request: CreateSocketRequest,
+            readiness: SocketReadinessRegistration,
+        ) -> litebox_broker_core::Result<Arc<dyn PlatformSocket>> {
+            Ok(Arc::new(TestPlatformSocket { readiness }))
+        }
+
+        fn close_session(&self, _session_id: SessionId) {}
+    }
+
+    struct TestPlatformSocket {
+        readiness: SocketReadinessRegistration,
+    }
+
+    impl PlatformSocket for TestPlatformSocket {
+        fn connect(
+            &self,
+            _address: SocketAddressV4,
+        ) -> litebox_broker_core::Result<SocketConnectionStatus> {
+            self.readiness
+                .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)?;
+            Ok(SocketConnectionStatus::Connecting)
+        }
+
+        fn send(
+            &self,
+            data: &[u8],
+            _flags: SendFlags,
+        ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
+            Ok(SocketOutcome::Completed(data.len()))
+        }
+
+        fn receive(
+            &self,
+            data: &mut [u8],
+            _flags: ReceiveFlags,
+        ) -> litebox_broker_core::Result<SocketOutcome<ReceiveSocketResponse>> {
+            let received = data.len().min(3);
+            data[..received].copy_from_slice(&[4, 5, 6][..received]);
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
+                u32::try_from(received).unwrap(),
+            )))
+        }
+
+        fn shutdown(&self, _mode: ShutdownMode) -> litebox_broker_core::Result<SocketOutcome<()>> {
+            Ok(SocketOutcome::Completed(()))
+        }
+
+        fn status(&self) -> litebox_broker_core::Result<SocketConnectionStatus> {
+            Ok(SocketConnectionStatus::Connected)
+        }
+
+        fn readiness(&self) -> litebox_broker_protocol::readiness::ReadinessFlags {
+            litebox_broker_protocol::readiness::ReadinessFlags::READ
+                | litebox_broker_protocol::readiness::ReadinessFlags::WRITE
+        }
+    }
+
     #[test]
     fn host_request_handling_uses_one_broker_core() {
-        let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
+        let broker = BrokerCore::new_with_socket_provider(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
+            Arc::new(TestSocketProvider),
+        )
         .unwrap();
 
         test_channel_negotiates_routes_one_request_and_returns_peer_closed(&broker);
@@ -455,6 +657,7 @@ mod tests {
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_closes_object_reference(&broker);
         association_shared_buffer_descriptors_stage_pipe_data(&broker);
+        association_shared_buffer_descriptors_stage_socket_data(&broker);
         shared_buffer_usage_rejects_invalid_descriptors();
         association_executes_distinct_slots_concurrently(&broker);
         association_allows_slot_reuse_during_response_emission(&broker);
@@ -846,6 +1049,113 @@ mod tests {
         assert_eq!(second_slot, [9]);
     }
 
+    fn association_shared_buffer_descriptors_stage_socket_data(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let created = handle_test_request_with_buffers(
+            &session,
+            BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Stream,
+                protocol: IpProtocol::Tcp,
+            })),
+            &shared_buffers,
+        );
+        let BrokerResult::Socket(SocketResponse::Create(response)) = created else {
+            panic!("expected successful socket creation");
+        };
+
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
+                    handle: response.handle,
+                    address: SocketAddressV4 {
+                        address: Ipv4Address([127, 0, 0, 1]),
+                        port: Port(8080),
+                    },
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Connecting,
+            }))
+        );
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest {
+                    handle: response.handle,
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+            }))
+        );
+
+        shared_buffers
+            .write(SharedBufferSlotIndex(2), &[1, 2, 3])
+            .unwrap();
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
+                    handle: response.handle,
+                    buffer: descriptor(2, 3),
+                    flags: SendFlags::NONE,
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Socket(SocketResponse::Send(SendSocketResponse { sent: 3 }))
+        );
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+                    handle: response.handle,
+                    buffer: descriptor(4, 4),
+                    flags: ReceiveFlags::PEEK,
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(3)))
+        );
+        let mut received = [0; 3];
+        shared_buffers
+            .read(SharedBufferSlotIndex(4), &mut received)
+            .unwrap();
+        assert_eq!(received, [4, 5, 6]);
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+                    handle: response.handle,
+                    mode: ShutdownMode::Both,
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Socket(SocketResponse::Shutdown)
+        );
+
+        assert_eq!(
+            complete_request(handle_request(
+                &session,
+                BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
+                    handle: response.handle,
+                    buffer: descriptor(2, 0),
+                    flags: SendFlags(1),
+                })),
+                &shared_buffers,
+                &test_socket_readiness(),
+            )),
+            Err(ErrorCode::MalformedRequest)
+        );
+        session.close_object_reference(response.handle).unwrap();
+    }
+
     fn shared_buffer_usage_rejects_invalid_descriptors() {
         let mut usage = SharedBufferUsage::new();
         usage
@@ -1014,6 +1324,7 @@ mod tests {
                 .create_session(CallerCredential::Unauthenticated)
                 .unwrap(),
             shared_buffers,
+            socket_readiness: test_socket_readiness(),
             state: SpinMutex::new(AssociationState {
                 failed: false,
                 shared_buffer_usage: SharedBufferUsage::new(),
@@ -1074,7 +1385,13 @@ mod tests {
         operation: BrokerOperation,
         shared_buffers: &SharedBufferPool<Memory>,
     ) -> BrokerResult {
-        complete_request(handle_request(session, operation, shared_buffers)).unwrap()
+        complete_request(handle_request(
+            session,
+            operation,
+            shared_buffers,
+            &test_socket_readiness(),
+        ))
+        .unwrap()
     }
 
     fn test_shared_buffers() -> SharedBufferPool<TestSharedMemory> {
@@ -1091,11 +1408,16 @@ mod tests {
         shared_buffers: &SharedBufferPool<Memory>,
         send_shared_memory: impl FnOnce(&mut FakeHostControlChannel) -> core::result::Result<(), ()>,
     ) -> Result<ConnectionTermination, ()> {
-        let association =
-            match setup_connection(broker, control_channel, shared_buffers, send_shared_memory)? {
-                Ok(association) => association,
-                Err(termination) => return Ok(termination),
-            };
+        let association = match setup_connection(
+            broker,
+            control_channel,
+            shared_buffers,
+            test_socket_readiness(),
+            send_shared_memory,
+        )? {
+            Ok(association) => association,
+            Err(termination) => return Ok(termination),
+        };
         loop {
             let request = match control_channel
                 .recv_request()

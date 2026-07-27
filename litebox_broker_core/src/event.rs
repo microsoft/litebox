@@ -25,7 +25,7 @@ pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<
     let required_rights = ObjectRights::WRITE;
     session.with_authorized_object_mut(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => event.add(value),
-        ObjectEntry::Pipe(_) => Err(BrokerError::InvalidRights),
+        ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
     })
 }
 
@@ -38,7 +38,7 @@ pub fn consume(
     let required_rights = ObjectRights::WAIT;
     session.with_authorized_object_mut(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => event.consume(mode),
-        ObjectEntry::Pipe(_) => Err(BrokerError::InvalidRights),
+        ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
     })
 }
 

@@ -10,8 +10,11 @@
 //! or flag the broker has not agreed to support.
 
 use crate::ObjectHandle;
-use crate::shared_buffer::SharedBufferDescriptor;
+use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
 use thiserror::Error;
+
+/// Maximum socket bytes transferred by one broker request.
+pub const MAX_SOCKET_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE;
 
 /// Address family of a broker socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +172,9 @@ pub enum SocketError {
     /// The address is not available on this host.
     #[error("address not available")]
     AddressNotAvailable,
+    /// The operation requires a connected socket.
+    #[error("socket is not connected")]
+    NotConnected,
     /// The policy engine refused the destination.
     #[error("socket policy denied the operation")]
     PolicyDenied,
@@ -194,6 +200,7 @@ impl SocketError {
             8 => Some(Self::AddressNotAvailable),
             9 => Some(Self::PolicyDenied),
             10 => Some(Self::Other),
+            11 => Some(Self::NotConnected),
             _ => None,
         }
     }
@@ -211,6 +218,7 @@ impl SocketError {
             Self::AddressNotAvailable => 8,
             Self::PolicyDenied => 9,
             Self::Other => 10,
+            Self::NotConnected => 11,
         }
     }
 }

@@ -5,6 +5,7 @@ use alloc::{sync::Arc, vec::Vec};
 
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
+use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -28,7 +29,19 @@ pub enum CallerCredential {
 /// Broker-assigned session identity.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct SessionId(pub u64);
+pub struct SessionId(u64);
+
+impl SessionId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the broker-assigned numeric identity.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
@@ -51,6 +64,12 @@ pub(crate) struct ObjectReference {
 pub(crate) enum ObjectEntry {
     Event(EventObject),
     Pipe(PipeObject),
+    Socket(SocketObject),
+}
+
+struct SessionReferences {
+    handles: Vec<ObjectHandle>,
+    pending: usize,
 }
 
 /// Broker-owned authority token for one authenticated caller session.
@@ -65,7 +84,8 @@ pub struct BrokerSession {
     /// Broker-entry-authenticated caller credential for this session.
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this session.
-    reference_handles: Mutex<Vec<ObjectHandle>>,
+    references: Mutex<SessionReferences>,
+    pub(crate) reserved_sockets: Arc<core::sync::atomic::AtomicUsize>,
 }
 
 impl BrokerSession {
@@ -79,7 +99,11 @@ impl BrokerSession {
             core,
             session_id,
             caller_credential,
-            reference_handles: Mutex::new(Vec::new()),
+            references: Mutex::new(SessionReferences {
+                handles: Vec::new(),
+                pending: 0,
+            }),
+            reserved_sockets: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -88,21 +112,51 @@ impl BrokerSession {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
-        let mut reference_handles = self.reference_handles.lock();
-        reference_handles
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)?;
+        let mut session_references = self.references.lock();
+        let additional = session_references
+            .pending
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        if session_references.handles.try_reserve(additional).is_err() {
+            return Err(BrokerError::OutOfMemory);
+        }
         let mut references = self.core.references.write();
-        if references.len() >= self.core.limits.max_references {
-            return Err(BrokerError::ResourceExhausted);
-        }
-        let handle = self.core.allocate_reference_handle()?;
-        if references.contains_key(&handle) {
-            return Err(BrokerError::Internal);
-        }
+        let preparation = (|| {
+            let pending = self
+                .core
+                .pending_references
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if references
+                .len()
+                .checked_add(pending)
+                .is_none_or(|count| count >= self.core.limits.max_references)
+            {
+                return Err(BrokerError::ResourceExhausted);
+            }
+            references
+                .try_reserve(
+                    pending
+                        .checked_add(1)
+                        .ok_or(BrokerError::ResourceExhausted)?,
+                )
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            let handle = self.core.allocate_reference_handle()?;
+            if references.contains_key(&handle) {
+                return Err(BrokerError::Internal);
+            }
+            Ok(handle)
+        })();
+        let handle = match preparation {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(references);
+                drop(session_references);
+                return Err(error);
+            }
+        };
         self.insert_object_reference(
             &mut references,
-            &mut reference_handles,
+            &mut session_references.handles,
             handle,
             object,
             rights,
@@ -120,35 +174,110 @@ impl BrokerSession {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
-        let mut reference_handles = self.reference_handles.lock();
-        reference_handles
-            .try_reserve(2)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        let mut references = self.core.references.write();
-        if references
-            .len()
+        let mut session_references = self.references.lock();
+        let additional = session_references
+            .pending
             .checked_add(2)
-            .is_none_or(|count| count > self.core.limits.max_references)
-        {
-            return Err(BrokerError::ResourceExhausted);
+            .ok_or(BrokerError::ResourceExhausted)?;
+        if session_references.handles.try_reserve(additional).is_err() {
+            return Err(BrokerError::OutOfMemory);
         }
-        let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
-        if first_handle == second_handle
-            || references.contains_key(&first_handle)
-            || references.contains_key(&second_handle)
-        {
-            return Err(BrokerError::Internal);
-        }
+        let mut references = self.core.references.write();
+        let preparation = (|| {
+            let pending = self
+                .core
+                .pending_references
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if references
+                .len()
+                .checked_add(pending)
+                .and_then(|count| count.checked_add(2))
+                .is_none_or(|count| count > self.core.limits.max_references)
+            {
+                return Err(BrokerError::ResourceExhausted);
+            }
+            references
+                .try_reserve(
+                    pending
+                        .checked_add(2)
+                        .ok_or(BrokerError::ResourceExhausted)?,
+                )
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
+            if first_handle == second_handle
+                || references.contains_key(&first_handle)
+                || references.contains_key(&second_handle)
+            {
+                return Err(BrokerError::Internal);
+            }
+            Ok((first_handle, second_handle))
+        })();
+        let (first_handle, second_handle) = match preparation {
+            Ok(handles) => handles,
+            Err(error) => {
+                drop(references);
+                drop(session_references);
+                return Err(error);
+            }
+        };
         for (handle, object) in [(first_handle, first), (second_handle, second)] {
             self.insert_object_reference(
                 &mut references,
-                &mut reference_handles,
+                &mut session_references.handles,
                 handle,
                 object,
                 rights,
             );
         }
         Ok((first_handle, second_handle))
+    }
+
+    pub(crate) fn reserve_object_reference(
+        &self,
+        rights: ObjectRights,
+    ) -> Result<PendingObjectReference<'_>> {
+        let mut session_references = self.references.lock();
+        let next_session_pending = session_references
+            .pending
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        session_references
+            .handles
+            .try_reserve(next_session_pending)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        let mut references = self.core.references.write();
+        let pending_references = self
+            .core
+            .pending_references
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if references
+            .len()
+            .checked_add(pending_references)
+            .is_none_or(|count| count >= self.core.limits.max_references)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        let handle = self.core.allocate_reference_handle()?;
+        if references.contains_key(&handle) {
+            return Err(BrokerError::Internal);
+        }
+        references
+            .try_reserve(
+                pending_references
+                    .checked_add(1)
+                    .ok_or(BrokerError::ResourceExhausted)?,
+            )
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        self.core
+            .pending_references
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        session_references.pending = next_session_pending;
+        Ok(PendingObjectReference {
+            session: self,
+            handle,
+            rights,
+            active: true,
+        })
     }
 
     fn insert_object_reference(
@@ -186,6 +315,15 @@ impl BrokerSession {
         f(&object)
     }
 
+    pub(crate) fn authorized_object(
+        &self,
+        handle: ObjectHandle,
+        required_rights: ObjectRights,
+    ) -> Result<Arc<RwLock<ObjectEntry>>> {
+        let references = self.core.references.read();
+        self.authorize_use_object(&references, handle, required_rights)
+    }
+
     pub(crate) fn with_authorized_object_mut<T>(
         &self,
         handle: ObjectHandle,
@@ -202,12 +340,16 @@ impl BrokerSession {
 
     /// Returns the current readiness of a broker-owned object.
     pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
-        self.with_authorized_object(handle, ObjectRights::WAIT, |object| {
-            Ok(match object {
-                ObjectEntry::Event(event) => event.readiness(),
-                ObjectEntry::Pipe(pipe) => pipe.readiness(),
-            })
-        })
+        let object = self.authorized_object(handle, ObjectRights::WAIT)?;
+        let socket = {
+            let object = object.read();
+            match &*object {
+                ObjectEntry::Event(event) => return Ok(event.readiness()),
+                ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
+                ObjectEntry::Socket(socket) => socket.resource(),
+            }
+        };
+        Ok(socket.readiness())
     }
 
     fn authorize_use_object(
@@ -239,7 +381,8 @@ impl BrokerSession {
     }
 
     fn remove_object_reference(&self, handle: ObjectHandle) -> Result<ObjectReference> {
-        let mut reference_handles = self.reference_handles.lock();
+        let mut session_references = self.references.lock();
+        let reference_handles = &mut session_references.handles;
         let mut references = self.core.references.write();
         let reference = references
             .remove(&handle)
@@ -280,7 +423,7 @@ impl BrokerSession {
         if let Err(error) = removal_result {
             let replaced_reference = references.insert(handle, reference);
             drop(references);
-            drop(reference_handles);
+            drop(session_references);
             if replaced_reference.is_some() {
                 return Err(BrokerError::Internal);
             }
@@ -290,10 +433,59 @@ impl BrokerSession {
     }
 }
 
+pub(crate) struct PendingObjectReference<'session> {
+    session: &'session BrokerSession,
+    handle: ObjectHandle,
+    rights: ObjectRights,
+    active: bool,
+}
+
+impl PendingObjectReference<'_> {
+    pub(crate) const fn handle(&self) -> ObjectHandle {
+        self.handle
+    }
+
+    pub(crate) fn commit(mut self, object: ObjectEntry) -> Result<ObjectHandle> {
+        let mut session_references = self.session.references.lock();
+        let mut references = self.session.core.references.write();
+        if references.contains_key(&self.handle) {
+            drop(references);
+            drop(session_references);
+            return Err(BrokerError::Internal);
+        }
+        self.session.insert_object_reference(
+            &mut references,
+            &mut session_references.handles,
+            self.handle,
+            object,
+            self.rights,
+        );
+        session_references.pending -= 1;
+        self.session
+            .core
+            .pending_references
+            .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        self.active = false;
+        Ok(self.handle)
+    }
+}
+
+impl Drop for PendingObjectReference<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.session.references.lock().pending -= 1;
+            self.session
+                .core
+                .pending_references
+                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl Drop for BrokerSession {
     fn drop(&mut self) {
         loop {
-            let Some(handle) = self.reference_handles.lock().pop() else {
+            let Some(handle) = self.references.lock().handles.pop() else {
                 break;
             };
             // Do not restore an inconsistent handle: retrying it forever would
@@ -315,6 +507,7 @@ impl Drop for BrokerSession {
             // run while either reference index lock is held.
             drop(reference);
         }
+        self.core.socket_provider.close_session(self.session_id);
     }
 }
 
@@ -324,16 +517,21 @@ mod tests {
 
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
+        SocketPolicy,
     };
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::readiness::ReadinessFlags;
+    use std::sync::Arc;
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
-        let broker = BrokerCore::new_with_limits(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            BrokerCoreLimits::new(2, 4),
+        let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
+        let broker = BrokerCore::new_with_limits_and_socket_provider(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
+            BrokerCoreLimits::new_with_socket_limits(2, 4, 2, 1),
+            socket_provider.clone(),
         )
         .unwrap();
 
@@ -343,6 +541,7 @@ mod tests {
         check_pipe_reader_closure(&broker);
         check_corrupt_index_fails_without_mutation(&broker);
         check_corrupt_index_does_not_break_teardown(&broker);
+        crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 
         assert!(broker.references.read().is_empty());

@@ -11,6 +11,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 
+use litebox_broker_core::socket::SocketReadinessSink;
+use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_host::readiness::{
     PublishOutcome, ReadinessPublishError, ReadinessPublisher, publish_readiness,
 };
@@ -145,6 +147,20 @@ impl ReadinessPublisherRuntime {
                 .expect("broker readiness publisher mutex poisoned");
         }
         *signaled = false;
+    }
+}
+
+impl SocketReadinessSink for ReadinessPublisherRuntime {
+    fn max_tracked_sockets(&self) -> usize {
+        litebox_broker_host::readiness::MAX_TRACKED_READINESS_OBJECTS
+    }
+
+    fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
+        Self::publish(self, handle, readiness).map_err(|_| BrokerError::ResourceExhausted)
+    }
+
+    fn retire(&self, handle: ObjectHandle) {
+        Self::retire(self, handle);
     }
 }
 
