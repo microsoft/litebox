@@ -32,7 +32,8 @@ use rustix::net::{
 
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_LAYOUT, CONTROL_RING_MEMORY_SIZE, WaitableSharedMemory,
+    CONTROL_RING_MEMORY_SIZE, WaitableSharedMemory, memory_permits_byte_range, memory_permits_u32,
+    memory_permits_u64,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 
@@ -75,21 +76,21 @@ impl MemoryAccessPolicy {
     const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
         match self {
             Self::Bytes => true,
-            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(offset, length),
+            Self::ControlRing => memory_permits_byte_range(offset, length),
         }
     }
 
     const fn permits_u32(self, offset: usize) -> bool {
         match self {
             Self::Bytes => false,
-            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_u32(offset),
+            Self::ControlRing => memory_permits_u32(offset),
         }
     }
 
     const fn permits_u64(self, offset: usize) -> bool {
         match self {
             Self::Bytes => false,
-            Self::ControlRing => CONTROL_RING_MEMORY_LAYOUT.permits_u64(offset),
+            Self::ControlRing => memory_permits_u64(offset),
         }
     }
 }
@@ -643,13 +644,13 @@ mod tests {
         )
         .unwrap();
         let sequence_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u64(*offset))
+            .find(|offset| memory_permits_u64(*offset))
             .unwrap();
         let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u32(*offset))
+            .find(|offset| memory_permits_u32(*offset))
             .unwrap();
         let body_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_byte_range(*offset, 1))
+            .find(|offset| memory_permits_byte_range(*offset, 1))
             .unwrap();
 
         first
@@ -721,7 +722,7 @@ mod tests {
     fn futex_wait_returns_without_peer_cooperation() {
         let memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
         let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u32(*offset))
+            .find(|offset| memory_permits_u32(*offset))
             .unwrap();
         let start = Instant::now();
 
@@ -735,10 +736,10 @@ mod tests {
         let memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
         let peer_fd = memory.as_fd().try_clone_to_owned().unwrap();
         let sequence_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u64(*offset))
+            .find(|offset| memory_permits_u64(*offset))
             .unwrap();
         let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
-            .find(|offset| CONTROL_RING_MEMORY_LAYOUT.permits_u32(*offset))
+            .find(|offset| memory_permits_u32(*offset))
             .unwrap();
 
         let mut expected_sequence = [0; size_of::<u64>()];
