@@ -45,8 +45,8 @@ pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
     pub(crate) session_id: SessionId,
     pub(crate) rights: ObjectRights,
-    previous_session_handle: Option<ObjectHandle>,
-    next_session_handle: Option<ObjectHandle>,
+    previous_reference_handle: Option<ObjectHandle>,
+    next_reference_handle: Option<ObjectHandle>,
 }
 
 pub(crate) enum ObjectEntry {
@@ -95,13 +95,13 @@ impl BrokerSession {
             return Err(BrokerError::ResourceExhausted);
         }
         let handle = self.core.allocate_reference_handle()?;
-        let next_session_handle = *reference_list_head;
-        if let Some(next_handle) = next_session_handle {
+        let next_reference_handle = *reference_list_head;
+        if let Some(next_handle) = next_reference_handle {
             let next_reference = references
                 .get_mut(&next_handle)
                 .expect("the session reference list must name a live reference");
             debug_assert_eq!(next_reference.session_id, self.session_id);
-            next_reference.previous_session_handle = Some(handle);
+            next_reference.previous_reference_handle = Some(handle);
         }
         references.insert(
             handle,
@@ -109,8 +109,8 @@ impl BrokerSession {
                 object: Arc::new(RwLock::new(object)),
                 session_id: self.session_id,
                 rights,
-                previous_session_handle: None,
-                next_session_handle,
+                previous_reference_handle: None,
+                next_reference_handle,
             },
         );
         *reference_list_head = Some(handle);
@@ -138,13 +138,13 @@ impl BrokerSession {
         }
         let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
         for (handle, object) in [(first_handle, first), (second_handle, second)] {
-            let next_session_handle = *reference_list_head;
-            if let Some(next_handle) = next_session_handle {
+            let next_reference_handle = *reference_list_head;
+            if let Some(next_handle) = next_reference_handle {
                 let next_reference = references
                     .get_mut(&next_handle)
                     .expect("the session reference list must name a live reference");
                 debug_assert_eq!(next_reference.session_id, self.session_id);
-                next_reference.previous_session_handle = Some(handle);
+                next_reference.previous_reference_handle = Some(handle);
             }
             references.insert(
                 handle,
@@ -152,8 +152,8 @@ impl BrokerSession {
                     object: Arc::new(RwLock::new(object)),
                     session_id: self.session_id,
                     rights,
-                    previous_session_handle: None,
-                    next_session_handle,
+                    previous_reference_handle: None,
+                    next_reference_handle,
                 },
             );
             *reference_list_head = Some(handle);
@@ -234,25 +234,25 @@ impl BrokerSession {
         if reference.session_id != self.session_id {
             return Err(BrokerError::UnknownObject);
         }
-        let previous_session_handle = reference.previous_session_handle;
-        let next_session_handle = reference.next_session_handle;
+        let previous_reference_handle = reference.previous_reference_handle;
+        let next_reference_handle = reference.next_reference_handle;
 
-        if let Some(previous_handle) = previous_session_handle {
+        if let Some(previous_handle) = previous_reference_handle {
             let previous_reference = references
                 .get_mut(&previous_handle)
                 .expect("the previous session reference must be live");
             debug_assert_eq!(previous_reference.session_id, self.session_id);
-            previous_reference.next_session_handle = next_session_handle;
+            previous_reference.next_reference_handle = next_reference_handle;
         } else {
             debug_assert_eq!(*reference_list_head, Some(handle));
-            *reference_list_head = next_session_handle;
+            *reference_list_head = next_reference_handle;
         }
-        if let Some(next_handle) = next_session_handle {
+        if let Some(next_handle) = next_reference_handle {
             let next_reference = references
                 .get_mut(&next_handle)
                 .expect("the next session reference must be live");
             debug_assert_eq!(next_reference.session_id, self.session_id);
-            next_reference.previous_session_handle = previous_session_handle;
+            next_reference.previous_reference_handle = previous_reference_handle;
         }
 
         let reference = references
