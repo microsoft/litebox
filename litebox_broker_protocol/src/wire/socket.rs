@@ -4,11 +4,11 @@
 use crate::message::{SocketRequest, SocketResponse};
 use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
 use crate::socket::{
-    AddressFamily, ConnectSocketRequest, ConnectSocketResponse, ConnectStatus, CreateSocketRequest,
+    AddressFamily, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
     CreateSocketResponse, IpProtocol, Ipv4Address, Port, ReceiveFlags, ReceiveSocketRequest,
     ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse, ShutdownMode,
-    ShutdownSocketRequest, SocketAddressV4, SocketError, SocketStatusRequest, SocketStatusResponse,
-    SocketType,
+    ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
+    SocketStatusRequest, SocketStatusResponse, SocketType,
 };
 
 use super::WireError;
@@ -27,6 +27,7 @@ const SOCKET_RESPONSE_TAG_SENT: u8 = 2;
 const SOCKET_RESPONSE_TAG_RECEIVED: u8 = 3;
 const SOCKET_RESPONSE_TAG_SHUTDOWN: u8 = 4;
 const SOCKET_RESPONSE_TAG_STATUS: u8 = 5;
+const SOCKET_RESPONSE_TAG_FAILED: u8 = 6;
 
 const ADDRESS_FAMILY_TAG_IPV4: u8 = 0;
 
@@ -38,11 +39,9 @@ const SHUTDOWN_TAG_READ: u8 = 0;
 const SHUTDOWN_TAG_WRITE: u8 = 1;
 const SHUTDOWN_TAG_BOTH: u8 = 2;
 
-const CONNECT_TAG_CONNECTED: u8 = 0;
-const CONNECT_TAG_IN_PROGRESS: u8 = 1;
-
-const STATUS_TAG_OK: u8 = 0;
-const STATUS_TAG_ERROR: u8 = 1;
+const CONNECTION_STATUS_TAG_CONNECTING: u8 = 0;
+const CONNECTION_STATUS_TAG_CONNECTED: u8 = 1;
+const CONNECTION_STATUS_TAG_FAILED: u8 = 2;
 
 const SOCKET_ERROR_TAG_CONNECTION_REFUSED: u8 = 0;
 const SOCKET_ERROR_TAG_CONNECTION_RESET: u8 = 1;
@@ -156,10 +155,7 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
         }
         SocketResponse::Connect(response) => {
             encoder.u8(SOCKET_RESPONSE_TAG_CONNECT);
-            encoder.u8(match response.status {
-                ConnectStatus::Connected => CONNECT_TAG_CONNECTED,
-                ConnectStatus::InProgress => CONNECT_TAG_IN_PROGRESS,
-            });
+            encode_connection_status(encoder, response.status);
         }
         SocketResponse::Send(response) => {
             encoder.u8(SOCKET_RESPONSE_TAG_SENT);
@@ -172,24 +168,11 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
         SocketResponse::Shutdown => encoder.u8(SOCKET_RESPONSE_TAG_SHUTDOWN),
         SocketResponse::Status(response) => {
             encoder.u8(SOCKET_RESPONSE_TAG_STATUS);
-            match response.error {
-                None => encoder.u8(STATUS_TAG_OK),
-                Some(error) => {
-                    encoder.u8(STATUS_TAG_ERROR);
-                    encoder.u8(match error {
-                        SocketError::ConnectionRefused => SOCKET_ERROR_TAG_CONNECTION_REFUSED,
-                        SocketError::ConnectionReset => SOCKET_ERROR_TAG_CONNECTION_RESET,
-                        SocketError::ConnectionAborted => SOCKET_ERROR_TAG_CONNECTION_ABORTED,
-                        SocketError::NetworkUnreachable => SOCKET_ERROR_TAG_NETWORK_UNREACHABLE,
-                        SocketError::HostUnreachable => SOCKET_ERROR_TAG_HOST_UNREACHABLE,
-                        SocketError::TimedOut => SOCKET_ERROR_TAG_TIMED_OUT,
-                        SocketError::AddressInUse => SOCKET_ERROR_TAG_ADDRESS_IN_USE,
-                        SocketError::AddressNotAvailable => SOCKET_ERROR_TAG_ADDRESS_NOT_AVAILABLE,
-                        SocketError::PolicyDenied => SOCKET_ERROR_TAG_POLICY_DENIED,
-                        SocketError::Other => SOCKET_ERROR_TAG_OTHER,
-                    });
-                }
-            }
+            encode_connection_status(encoder, response.status);
+        }
+        SocketResponse::Failed(error) => {
+            encoder.u8(SOCKET_RESPONSE_TAG_FAILED);
+            encode_socket_error(encoder, error);
         }
     }
 }
@@ -202,11 +185,7 @@ pub(super) fn decode_socket_response(
             handle: decoder.handle()?,
         })),
         SOCKET_RESPONSE_TAG_CONNECT => Ok(SocketResponse::Connect(ConnectSocketResponse {
-            status: match decoder.u8()? {
-                CONNECT_TAG_CONNECTED => ConnectStatus::Connected,
-                CONNECT_TAG_IN_PROGRESS => ConnectStatus::InProgress,
-                _ => return Err(WireError::InvalidTag),
-            },
+            status: decode_connection_status(decoder)?,
         })),
         SOCKET_RESPONSE_TAG_SENT => Ok(SocketResponse::Send(SendSocketResponse {
             sent: decoder.u32()?,
@@ -216,24 +195,64 @@ pub(super) fn decode_socket_response(
         })),
         SOCKET_RESPONSE_TAG_SHUTDOWN => Ok(SocketResponse::Shutdown),
         SOCKET_RESPONSE_TAG_STATUS => Ok(SocketResponse::Status(SocketStatusResponse {
-            error: match decoder.u8()? {
-                STATUS_TAG_OK => None,
-                STATUS_TAG_ERROR => Some(match decoder.u8()? {
-                    SOCKET_ERROR_TAG_CONNECTION_REFUSED => SocketError::ConnectionRefused,
-                    SOCKET_ERROR_TAG_CONNECTION_RESET => SocketError::ConnectionReset,
-                    SOCKET_ERROR_TAG_CONNECTION_ABORTED => SocketError::ConnectionAborted,
-                    SOCKET_ERROR_TAG_NETWORK_UNREACHABLE => SocketError::NetworkUnreachable,
-                    SOCKET_ERROR_TAG_HOST_UNREACHABLE => SocketError::HostUnreachable,
-                    SOCKET_ERROR_TAG_TIMED_OUT => SocketError::TimedOut,
-                    SOCKET_ERROR_TAG_ADDRESS_IN_USE => SocketError::AddressInUse,
-                    SOCKET_ERROR_TAG_ADDRESS_NOT_AVAILABLE => SocketError::AddressNotAvailable,
-                    SOCKET_ERROR_TAG_POLICY_DENIED => SocketError::PolicyDenied,
-                    SOCKET_ERROR_TAG_OTHER => SocketError::Other,
-                    _ => return Err(WireError::InvalidTag),
-                }),
-                _ => return Err(WireError::InvalidTag),
-            },
+            status: decode_connection_status(decoder)?,
         })),
+        SOCKET_RESPONSE_TAG_FAILED => Ok(SocketResponse::Failed(decode_socket_error(decoder)?)),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_connection_status(encoder: &mut Encoder, status: SocketConnectionStatus) {
+    match status {
+        SocketConnectionStatus::Connecting => encoder.u8(CONNECTION_STATUS_TAG_CONNECTING),
+        SocketConnectionStatus::Connected => encoder.u8(CONNECTION_STATUS_TAG_CONNECTED),
+        SocketConnectionStatus::Failed(error) => {
+            encoder.u8(CONNECTION_STATUS_TAG_FAILED);
+            encode_socket_error(encoder, error);
+        }
+    }
+}
+
+fn decode_connection_status(
+    decoder: &mut Decoder<'_>,
+) -> Result<SocketConnectionStatus, WireError> {
+    match decoder.u8()? {
+        CONNECTION_STATUS_TAG_CONNECTING => Ok(SocketConnectionStatus::Connecting),
+        CONNECTION_STATUS_TAG_CONNECTED => Ok(SocketConnectionStatus::Connected),
+        CONNECTION_STATUS_TAG_FAILED => Ok(SocketConnectionStatus::Failed(decode_socket_error(
+            decoder,
+        )?)),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_socket_error(encoder: &mut Encoder, error: SocketError) {
+    encoder.u8(match error {
+        SocketError::ConnectionRefused => SOCKET_ERROR_TAG_CONNECTION_REFUSED,
+        SocketError::ConnectionReset => SOCKET_ERROR_TAG_CONNECTION_RESET,
+        SocketError::ConnectionAborted => SOCKET_ERROR_TAG_CONNECTION_ABORTED,
+        SocketError::NetworkUnreachable => SOCKET_ERROR_TAG_NETWORK_UNREACHABLE,
+        SocketError::HostUnreachable => SOCKET_ERROR_TAG_HOST_UNREACHABLE,
+        SocketError::TimedOut => SOCKET_ERROR_TAG_TIMED_OUT,
+        SocketError::AddressInUse => SOCKET_ERROR_TAG_ADDRESS_IN_USE,
+        SocketError::AddressNotAvailable => SOCKET_ERROR_TAG_ADDRESS_NOT_AVAILABLE,
+        SocketError::PolicyDenied => SOCKET_ERROR_TAG_POLICY_DENIED,
+        SocketError::Other => SOCKET_ERROR_TAG_OTHER,
+    });
+}
+
+fn decode_socket_error(decoder: &mut Decoder<'_>) -> Result<SocketError, WireError> {
+    match decoder.u8()? {
+        SOCKET_ERROR_TAG_CONNECTION_REFUSED => Ok(SocketError::ConnectionRefused),
+        SOCKET_ERROR_TAG_CONNECTION_RESET => Ok(SocketError::ConnectionReset),
+        SOCKET_ERROR_TAG_CONNECTION_ABORTED => Ok(SocketError::ConnectionAborted),
+        SOCKET_ERROR_TAG_NETWORK_UNREACHABLE => Ok(SocketError::NetworkUnreachable),
+        SOCKET_ERROR_TAG_HOST_UNREACHABLE => Ok(SocketError::HostUnreachable),
+        SOCKET_ERROR_TAG_TIMED_OUT => Ok(SocketError::TimedOut),
+        SOCKET_ERROR_TAG_ADDRESS_IN_USE => Ok(SocketError::AddressInUse),
+        SOCKET_ERROR_TAG_ADDRESS_NOT_AVAILABLE => Ok(SocketError::AddressNotAvailable),
+        SOCKET_ERROR_TAG_POLICY_DENIED => Ok(SocketError::PolicyDenied),
+        SOCKET_ERROR_TAG_OTHER => Ok(SocketError::Other),
         _ => Err(WireError::InvalidTag),
     }
 }

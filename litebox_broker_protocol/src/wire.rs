@@ -351,10 +351,10 @@ mod tests {
     };
     use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use crate::socket::{
-        AddressFamily, ConnectSocketRequest, ConnectSocketResponse, ConnectStatus,
-        CreateSocketRequest, CreateSocketResponse, IpProtocol, Ipv4Address, Port, ReceiveFlags,
-        ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest,
-        SendSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketAddressV4, SocketError,
+        AddressFamily, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
+        CreateSocketResponse, IpProtocol, Ipv4Address, Port, ReceiveFlags, ReceiveSocketRequest,
+        ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse, ShutdownMode,
+        ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
         SocketStatusRequest, SocketStatusResponse, SocketType,
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
@@ -535,16 +535,24 @@ mod tests {
             SocketError::PolicyDenied,
             SocketError::Other,
         ] {
-            let response = BrokerResponse {
-                request_id: TEST_REQUEST_ID,
-                result: BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                    error: Some(error),
-                })),
-            };
-            assert_eq!(
-                decode_response(&encode_response(response.clone())).unwrap(),
-                response
-            );
+            for socket_response in [
+                SocketResponse::Failed(error),
+                SocketResponse::Connect(ConnectSocketResponse {
+                    status: SocketConnectionStatus::Failed(error),
+                }),
+                SocketResponse::Status(SocketStatusResponse {
+                    status: SocketConnectionStatus::Failed(error),
+                }),
+            ] {
+                let response = BrokerResponse {
+                    request_id: TEST_REQUEST_ID,
+                    result: BrokerResult::Socket(socket_response),
+                };
+                assert_eq!(
+                    decode_response(&encode_response(response.clone())).unwrap(),
+                    response
+                );
+            }
         }
     }
 
@@ -606,20 +614,29 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResult::Socket(SocketResponse::Create(CreateSocketResponse { handle })),
             BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
-                status: ConnectStatus::Connected,
+                status: SocketConnectionStatus::Connecting,
             })),
             BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
-                status: ConnectStatus::InProgress,
+                status: SocketConnectionStatus::Connected,
+            })),
+            BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
             })),
             BrokerResult::Socket(SocketResponse::Send(SendSocketResponse { sent: 3 })),
             BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse {
                 received: 3,
             })),
             BrokerResult::Socket(SocketResponse::Shutdown),
-            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse { error: None })),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                error: Some(SocketError::ConnectionRefused),
+                status: SocketConnectionStatus::Connecting,
             })),
+            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+            })),
+            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::TimedOut),
+            })),
+            BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -837,7 +854,7 @@ mod tests {
         let mut unknown_connect_status = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
-                status: ConnectStatus::InProgress,
+                status: SocketConnectionStatus::Connecting,
             })),
         });
         *unknown_connect_status.last_mut().unwrap() = 0xff;
@@ -846,25 +863,18 @@ mod tests {
             Err(WireError::InvalidTag)
         );
 
-        // The status response encodes presence and, when present, the error
-        // itself, so both tags reject unknown values.
-        let mut unknown_status_presence = encode_response(BrokerResponse {
+        let mut unknown_status = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                error: None,
+                status: SocketConnectionStatus::Connected,
             })),
         });
-        *unknown_status_presence.last_mut().unwrap() = 0xff;
-        assert_eq!(
-            decode_response(&unknown_status_presence),
-            Err(WireError::InvalidTag)
-        );
+        *unknown_status.last_mut().unwrap() = 0xff;
+        assert_eq!(decode_response(&unknown_status), Err(WireError::InvalidTag));
 
         let mut unknown_socket_error = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                error: Some(SocketError::TimedOut),
-            })),
+            result: BrokerResult::Socket(SocketResponse::Failed(SocketError::TimedOut)),
         });
         *unknown_socket_error.last_mut().unwrap() = 0xff;
         assert_eq!(
@@ -873,6 +883,17 @@ mod tests {
         );
         assert_eq!(
             decode_response(&unknown_socket_error[..unknown_socket_error.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+
+        let failed_connection = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
+            })),
+        });
+        assert_eq!(
+            decode_response(&failed_connection[..failed_connection.len() - 1]),
             Err(WireError::TruncatedFrame)
         );
 
@@ -1041,6 +1062,17 @@ mod tests {
             [
                 5, 13, 0, 0, 0, 0, 0, 0, 0, 1, 9, 0, 0, 0, 0, 0, 0, 0, 203, 0, 113, 7, 187, 1
             ]
+        );
+    }
+
+    #[test]
+    fn socket_failure_response_wire_shape_is_pinned() {
+        assert_eq!(
+            encode_response(BrokerResponse {
+                request_id: RequestId(13),
+                result: BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset,)),
+            }),
+            [8, 13, 0, 0, 0, 0, 0, 0, 0, 6, 1]
         );
     }
 

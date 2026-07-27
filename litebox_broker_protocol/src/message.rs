@@ -14,7 +14,7 @@ use crate::readiness::ReadinessFlags;
 use crate::socket::{
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
     ReceiveSocketRequest, ReceiveSocketResponse, SendSocketRequest, SendSocketResponse,
-    ShutdownSocketRequest, SocketStatusRequest, SocketStatusResponse,
+    ShutdownSocketRequest, SocketError, SocketStatusRequest, SocketStatusResponse,
 };
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
@@ -108,7 +108,7 @@ pub enum SocketRequest {
     Receive(ReceiveSocketRequest),
     /// Shut down one or both directions.
     Shutdown(ShutdownSocketRequest),
-    /// Read a socket's pending connection outcome.
+    /// Read a socket's connection state.
     Status(SocketStatusRequest),
 }
 
@@ -175,6 +175,15 @@ pub enum SocketResponse {
     Shutdown,
     /// Status operation response.
     Status(SocketStatusResponse),
+    /// A non-connect host network operation failed.
+    ///
+    /// Connect and status responses carry terminal failures in
+    /// [`SocketConnectionStatus`] so repeated status requests remain
+    /// idempotent. Broker and request-validation failures use
+    /// [`BrokerResult::Error`] instead.
+    ///
+    /// [`SocketConnectionStatus`]: crate::socket::SocketConnectionStatus
+    Failed(SocketError),
 }
 
 /// Broker-initiated asynchronous notification.

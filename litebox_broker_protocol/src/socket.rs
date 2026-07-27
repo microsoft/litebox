@@ -132,13 +132,13 @@ impl ReceiveFlags {
     }
 }
 
-/// Reason a socket connection failed.
+/// Reason a socket operation failed.
 ///
-/// This is a bounded restatement of the connection-level failures a host stack
-/// reports, kept separate from [`ErrorCode`] because those describe how the
-/// broker handled a request, not what a remote peer or network did. Keeping
-/// them apart also means adding a network failure never widens the error type
-/// every broker operation can return.
+/// This is a bounded restatement of the network failures a host stack reports,
+/// kept separate from [`ErrorCode`] because those describe how the broker
+/// handled a request, not what a remote peer or network did. Keeping them apart
+/// also means adding a network failure never widens the error type every broker
+/// operation can return.
 ///
 /// [`ErrorCode`]: crate::error::ErrorCode
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,23 +196,28 @@ pub struct ConnectSocketRequest {
 /// Response to a socket connect request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectSocketResponse {
-    /// Whether the connection completed or is still in progress.
-    pub status: ConnectStatus,
+    /// Connection state after the nonblocking attempt.
+    pub status: SocketConnectionStatus,
 }
 
-/// Outcome of a connect attempt.
+/// Broker-authoritative socket connection state.
 ///
 /// The broker only performs non-blocking operations, so a connect that cannot
-/// complete immediately reports [`Self::InProgress`] rather than waiting. The
-/// caller waits for write readiness and then reads the outcome with a status
-/// request, which is the only way a failed connect is reported.
+/// complete immediately reports [`Self::Connecting`] rather than waiting. The
+/// caller waits for write readiness and then reads the authoritative state with
+/// a status request.
+///
+/// Connected and failed states are terminal and idempotent: repeated status
+/// requests return the same state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ConnectStatus {
+pub enum SocketConnectionStatus {
+    /// The connection is still being established.
+    Connecting,
     /// The connection is established.
     Connected,
-    /// The connection is still being established.
-    InProgress,
+    /// The connection attempt failed.
+    Failed(SocketError),
 }
 
 /// Request to send bytes staged in shared memory.
@@ -265,18 +270,16 @@ pub struct ShutdownSocketRequest {
     pub mode: ShutdownMode,
 }
 
-/// Request for a socket's pending connection outcome.
+/// Request for a socket's connection state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SocketStatusRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
 }
 
-/// Response describing a socket's pending connection outcome.
+/// Response describing a socket's broker-authoritative connection state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SocketStatusResponse {
-    /// The failure the socket recorded, if any.
-    ///
-    /// Reading the status clears it, so each failure is reported once.
-    pub error: Option<SocketError>,
+    /// Current connection state.
+    pub status: SocketConnectionStatus,
 }

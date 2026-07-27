@@ -291,10 +291,10 @@ where
 
 pub(crate) fn readiness_events(readiness: ReadinessFlags) -> Events {
     let mut events = Events::empty();
-    events.set(Events::IN, readiness.0 & ReadinessFlags::READ.0 != 0);
-    events.set(Events::OUT, readiness.0 & ReadinessFlags::WRITE.0 != 0);
-    events.set(Events::HUP, readiness.0 & ReadinessFlags::HANGUP.0 != 0);
-    events.set(Events::ERR, readiness.0 & ReadinessFlags::ERROR.0 != 0);
+    events.set(Events::IN, readiness.contains(ReadinessFlags::READ));
+    events.set(Events::OUT, readiness.contains(ReadinessFlags::WRITE));
+    events.set(Events::HUP, readiness.contains(ReadinessFlags::HANGUP));
+    events.set(Events::ERR, readiness.contains(ReadinessFlags::ERROR));
     events
 }
 

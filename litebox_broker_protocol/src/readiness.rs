@@ -17,6 +17,12 @@ impl ReadinessFlags {
     pub const HANGUP: Self = Self(1 << 2);
     /// The object is in an error state.
     pub const ERROR: Self = Self(1 << 3);
+
+    /// Returns whether every flag in `other` is set.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
 }
 
 impl core::ops::BitOr for ReadinessFlags {
@@ -24,5 +30,19 @@ impl core::ops::BitOr for ReadinessFlags {
 
     fn bitor(self, rhs: Self) -> Self::Output {
         Self(self.0 | rhs.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadinessFlags;
+
+    #[test]
+    fn contains_requires_every_requested_flag() {
+        let readiness = ReadinessFlags::READ | ReadinessFlags::WRITE;
+        assert!(readiness.contains(ReadinessFlags::READ));
+        assert!(readiness.contains(ReadinessFlags::WRITE));
+        assert!(readiness.contains(ReadinessFlags::READ | ReadinessFlags::WRITE));
+        assert!(!readiness.contains(ReadinessFlags::ERROR));
     }
 }
