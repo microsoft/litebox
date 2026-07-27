@@ -57,7 +57,7 @@ pub(crate) enum ObjectEntry {
 
 struct SessionReferences {
     handles: Vec<ObjectHandle>,
-    pending_references: usize,
+    pending_handles: usize,
 }
 
 /// Broker-owned authority token for one authenticated caller session.
@@ -90,7 +90,7 @@ impl BrokerSession {
             caller_credential,
             references: Mutex::new(SessionReferences {
                 handles: Vec::new(),
-                pending_references: 0,
+                pending_handles: 0,
             }),
             reserved_sockets: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
         }
@@ -103,7 +103,7 @@ impl BrokerSession {
             .principal_object_rights(self.caller_credential)?;
         let mut session_references = self.references.lock();
         let additional = session_references
-            .pending_references
+            .pending_handles
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         if session_references.handles.try_reserve(additional).is_err() {
@@ -165,7 +165,7 @@ impl BrokerSession {
             .principal_object_rights(self.caller_credential)?;
         let mut session_references = self.references.lock();
         let additional = session_references
-            .pending_references
+            .pending_handles
             .checked_add(2)
             .ok_or(BrokerError::ResourceExhausted)?;
         if session_references.handles.try_reserve(additional).is_err() {
@@ -227,7 +227,7 @@ impl BrokerSession {
     ) -> Result<PendingObjectReference<'_>> {
         let mut session_references = self.references.lock();
         let next_session_pending = session_references
-            .pending_references
+            .pending_handles
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         session_references
@@ -260,7 +260,7 @@ impl BrokerSession {
         self.core
             .pending_references
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        session_references.pending_references = next_session_pending;
+        session_references.pending_handles = next_session_pending;
         Ok(PendingObjectReference {
             session: self,
             handle,
@@ -449,7 +449,7 @@ impl PendingObjectReference<'_> {
             object,
             self.rights,
         );
-        session_references.pending_references -= 1;
+        session_references.pending_handles -= 1;
         self.session
             .core
             .pending_references
@@ -462,7 +462,7 @@ impl PendingObjectReference<'_> {
 impl Drop for PendingObjectReference<'_> {
     fn drop(&mut self) {
         if self.active {
-            self.session.references.lock().pending_references -= 1;
+            self.session.references.lock().pending_handles -= 1;
             self.session
                 .core
                 .pending_references
