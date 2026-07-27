@@ -1,8 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Platform-side VSM bring-up and control-register locking.
+//! Enabling Virtual Secure Mode (VSM) using Hyper-V hypercalls to
+//! secure both VTL0 and VTL1.
 
+use crate::host::linux::CpuMask;
 use crate::{
     debug_serial_println,
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables::with_per_cpu_variables},
@@ -20,16 +22,28 @@ use crate::{
         vtl_switch::mshv_vsm_get_code_page_offsets,
     },
 };
+use alloc::vec::Vec;
+use core::ops::Range;
+use litebox::utils::TruncateExt;
+use litebox_common_linux::vmap::PhysPageAddr;
+use litebox_common_lvbs::{
+    FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, PRK_LEN, ReservationStatus,
+    VsmError, Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
+};
+use rangemap::RangeSet;
+use spin::{Once, rwlock::RwLock as SpinRwLock};
 use x86_64::{
     PhysAddr,
     structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
+use zerocopy::FromBytes;
+use zeroize::Zeroizing;
 
-use alloc::vec::Vec;
-use core::ops::Range;
-use rangemap::RangeSet;
-use spin::{Once, rwlock::RwLock as SpinRwLock};
+use super::{PrivilegedVtl0PhysMutPtr, Vtl0PhysConstPtr};
 
+// --- VSM: Hyper-V partition/VP configuration and intercepts -----------------
+
+/// Bring VSM up on this CPU. The BSP also protects VTL1's own memory here.
 pub(crate) fn init(is_bsp: bool) {
     assert!(
         !(is_bsp && mshv_vsm_configure_partition().is_err()),
@@ -72,7 +86,7 @@ pub(crate) fn init(is_bsp: bool) {
     }
 }
 
-/// VSM function for enforcing certain security features of VTL0
+/// VSM function for enforcing certain security features of VTL0 to protect VTL1
 pub(crate) fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Secure VTL0 configuration");
 
@@ -100,15 +114,16 @@ pub(crate) fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
     Ok(0)
 }
 
-/// VSM function for locking VTL0's control registers.
-///
-/// The end-of-boot guard is enforced by the runner-side dispatcher (which owns
-/// the `HekiState`) before this is called.
-///
-/// Returns the common wire error type so the runner can uniformly combine this
-/// platform-owned operation with the `litebox_service_heki` handlers.
+/// VSM function for locking VTL0's control registers, snapshotting their
+/// current values into VTL1 per-CPU state.
 pub(crate) fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Lock control registers");
+
+    if crate::platform_low().end_of_boot_reached() {
+        return Err(VsmError::OperationAfterEndOfBoot(
+            "control register locking",
+        ));
+    }
 
     let flag = HvCrInterceptControlFlags::CR0_WRITE.bits()
         | HvCrInterceptControlFlags::CR4_WRITE.bits()
@@ -226,6 +241,11 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
     Ok(0)
 }
 
+// --- VTL1 self-protection ---------------------------------------------------
+//
+// VTL1 locking down its own memory. Not HEKI: it runs during VTL1 setup, before
+// any HEKI policy exists.
+
 /// This function protects a VTL1 physical memory range, securing VTL1's own pages.
 /// VTL0 should never access VTL1 memory, so the memory attribute is always empty (no read, write, or execute).
 ///
@@ -245,22 +265,22 @@ pub(crate) fn protect_vtl1_physical_memory_range(
     Ok(())
 }
 
-// --- Protected-frame registry -----------------------------------------------
+// --- VTL0 frame protection --------------------------------------------------
 //
-// VTL0 protected-frame registry (mutual-exclusion guard). This is the platform's
-// authority over which VTL0 frames are non-writable or reserved by in-flight
-// module/kexec validation. Ordinary writable foreign mappings acquire a shared
-// access guard (see `LvbsPhysPageMapInfo` and `vmap`) so a concurrent VTL
-// protection change cannot alias a writable VTL0 mapping.
+// VTL0 frame arbitration: the VTL1-wide record of which VTL0 frames are
+// withheld from VTL0 or reserved by an in-flight validation.
 //
-// The registry is driven by the VSM/HEKI service through the `Vtl0Mediation` trait,
-// so its public surface speaks the common wire error type `VsmError`.
+// Although HEKI manages these frames (i.e., it is the only policy writer), we
+// cannot maintain them in the HEKI service crate because there are other VTL1
+// readers which is unaware of HEKI (e.g., OP-TEE shim's normal-world pointers).
+// Also, this is used by `protect_physical_memory_range` which invokes a hypercall.
 
-use litebox_common_lvbs::{HypervCallError, ReservationStatus, VsmError};
-
-/// RAII reservation over VTL0 physical frames, shared by module load and kexec validation.
-/// On drop without `commit`, every newly reserved range is restored to VTL0 read/write,
-/// non-executable access.
+/// RAII reservation over VTL0 physical frames. On drop without `commit`, every
+/// newly reserved range is restored to VTL0 read/write, non-executable access.
+///
+/// VTL1 has to record this itself because there is no Hyper-V hypercall to get
+/// a frame's current VTL protection mask. The reservation remembers which ranges
+/// it changed, enabling reliable rollback.
 pub(crate) struct FrameReservation {
     owned_ranges: Vec<PhysFrameRange<Size4KiB>>,
     owned_frames: RangeSet<u64>,
@@ -383,10 +403,10 @@ impl Drop for FrameReservation {
     }
 }
 
-/// Registry of VTL0 frames that are non-writable to VTL0 or reserved by in-flight module or kexec
-/// validation. Ordinary writable mappings retain shared access for their lifetime; reservations and
-/// VTL0 protection updates use exclusive access. Privileged HEKI and ring-buffer mappings bypass
-/// the registry.
+/// Registry of VTL0 frames that are non-writable to VTL0 or reserved by an
+/// in-flight claim. Ordinary writable mappings retain shared access for their
+/// lifetime; reservations and VTL0 protection updates use exclusive access.
+/// Privileged mappings bypass the registry.
 pub(crate) struct ProtectedFrameRegistry {
     frames: SpinRwLock<RangeSet<u64>>,
 }
@@ -536,7 +556,11 @@ pub(crate) fn protect_physical_memory_range(
     })
 }
 
-/// Restore VTL0 read/write access while leaving execution disabled, and removes the registry entry.
+/// Restore VTL0 read/write access and remove the registry entry.
+///
+/// This is `MEM_ATTR_READ | MEM_ATTR_WRITE` expressed in hypervisor flags, so
+/// it also restores user-mode execute — see [`mem_attr_to_hv_page_prot_flags`]
+/// for why that rides along with read.
 pub(crate) fn unprotect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
 ) -> Result<(), VsmError> {
@@ -546,4 +570,230 @@ pub(crate) fn unprotect_physical_memory_range(
             | HvPageProtFlags::HV_PAGE_USER_EXECUTABLE
             | HvPageProtFlags::HV_PAGE_WRITABLE,
     )
+}
+
+// --- The gates: platform implementation of the capability traits -----------
+
+/// Zero-sized capability implementing [`Vtl0Gate`]: mediated access to the
+/// untrusted VTL0. Held by the HEKI service.
+pub struct LvbsVtl0Gate {
+    /// Private, so the capability is built only via [`LvbsVtl0Gate::mint`],
+    /// never a bare literal.
+    _private: (),
+}
+
+/// Zero-sized capability implementing [`Vtl1Gate`]: the VTL1 setup steps VTL0
+/// may request. Held by the runner.
+pub struct LvbsVtl1Gate {
+    /// Private, so the capability is built only via [`LvbsVtl1Gate::mint`],
+    /// never a bare literal.
+    _private: (),
+}
+
+/// Zero-sized capability implementing [`Vtl0PrivilegedWrite`]: VTL0 writes with
+/// the protection masks bypassed.
+///
+/// Deliberately its own type rather than a method on [`LvbsVtl0Gate`], so this
+/// authority is granted per-operation and nothing holds it incidentally. Like a
+/// `PunchthroughToken`, it is an auditability aid rather than a boundary: it
+/// funnels every protection-bypassing write through one greppable mint point.
+pub struct LvbsVtl0PrivilegedWriter {
+    /// Private, so the capability is built only via
+    /// [`LvbsVtl0PrivilegedWriter::mint`], never a bare literal.
+    _private: (),
+}
+
+impl LvbsVtl0Gate {
+    /// Mint the VTL0 mediation capability. Reserved for VTL1-trusted
+    /// composition-root code (the runner).
+    #[must_use]
+    pub fn mint() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl LvbsVtl1Gate {
+    /// Mint the VTL1 setup capability. Reserved for VTL1-trusted
+    /// composition-root code (the runner).
+    #[must_use]
+    pub fn mint() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl LvbsVtl0PrivilegedWriter {
+    /// Mint the protection-mask-bypassing write capability. The audit point for
+    /// every privileged VTL0 write.
+    #[must_use]
+    pub fn mint() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Maps a [`MemAttr`] permission set (the Vtl0Gate permission type) to the
+/// corresponding Hyper-V page-protection flags.
+/// Maps a [`MemAttr`] permission set to hypervisor page-protection flags.
+///
+/// `HV_PAGE_USER_EXECUTABLE` accompanies read rather than exec: Hyper-V
+/// requires it for compatibility, so a VTL0 frame that HEKI marks read-only is
+/// still user-executable. Intentional.
+/// [`MemAttr::MEM_ATTR_EXEC`].
+pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
+    let mut flags = HvPageProtFlags::empty();
+    if attr.contains(MemAttr::MEM_ATTR_READ) {
+        flags.set(HvPageProtFlags::HV_PAGE_READABLE, true);
+        flags.set(HvPageProtFlags::HV_PAGE_USER_EXECUTABLE, true);
+    }
+    if attr.contains(MemAttr::MEM_ATTR_WRITE) {
+        flags.set(HvPageProtFlags::HV_PAGE_WRITABLE, true);
+    }
+    if attr.contains(MemAttr::MEM_ATTR_EXEC) {
+        flags.set(HvPageProtFlags::HV_PAGE_EXECUTABLE, true);
+    }
+    flags
+}
+
+/// Restricted transaction handle for a `protect_frames_transactionally` closure.
+/// Wraps the private platform [`FrameReservation`] guard so the service can
+/// never hold or leak a reservation across the trait boundary.
+struct PlatformFrameTxn<'a> {
+    guard: &'a mut FrameReservation,
+}
+
+impl FrameTxn for PlatformFrameTxn<'_> {
+    fn reserve(
+        &mut self,
+        ranges: &[PhysFrameRange<Size4KiB>],
+    ) -> Result<Vec<ReservationStatus>, VsmError> {
+        self.guard.reserve(ranges.iter().copied())
+    }
+
+    fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError> {
+        protect_physical_memory_range(range, mem_attr_to_hv_page_prot_flags(attr))
+    }
+}
+
+impl Vtl0Gate for LvbsVtl0Gate {
+    fn read_vtl0_bytes(
+        &self,
+        pages: &[PhysPageAddr<PAGE_SIZE>],
+        offset: usize,
+        out: &mut [u8],
+    ) -> Result<(), VsmError> {
+        let ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::new(pages, offset)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        ptr.read_slice_at_offset(0, out)
+            .map_err(|_| VsmError::Vtl0CopyFailed)
+    }
+
+    fn protect_frame(
+        &self,
+        range: PhysFrameRange<Size4KiB>,
+        attr: MemAttr,
+    ) -> Result<(), VsmError> {
+        protect_physical_memory_range(range, mem_attr_to_hv_page_prot_flags(attr))
+    }
+
+    fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError> {
+        unprotect_physical_memory_range(range)
+    }
+
+    fn protect_frames_transactionally(
+        &self,
+        initial: &[PhysFrameRange<Size4KiB>],
+        f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
+    ) -> Result<(), VsmError> {
+        let mut guard = FrameReservation::new();
+        guard.reserve(initial.iter().copied())?;
+        let mut txn = PlatformFrameTxn { guard: &mut guard };
+        let result = f(&mut txn);
+        if result.is_ok() {
+            txn.guard.commit();
+        }
+        // On `Err`, `guard` drops uncommitted, rolling back every reserved range.
+        result
+    }
+
+    fn install_ringbuffer(&self, pa: u64, size: u64) {
+        let _ = crate::mshv::ringbuffer::set_ringbuffer(PhysAddr::new(pa), size.trunc());
+    }
+
+    fn end_of_boot_reached(&self) -> bool {
+        crate::platform_low().end_of_boot_reached()
+    }
+
+    fn lock_control_registers(&self) -> Result<(), VsmError> {
+        mshv_vsm_lock_regs().map(|_| ())
+    }
+}
+
+impl Vtl0PrivilegedWrite for LvbsVtl0PrivilegedWriter {
+    fn write_vtl0_bytes(
+        &self,
+        pages: &[PhysPageAddr<PAGE_SIZE>],
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), VsmError> {
+        let ptr = PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::new(pages, offset)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        ptr.write_slice_at_offset(0, bytes)
+            .map_err(|_| VsmError::Vtl0CopyFailed)
+    }
+}
+
+impl Vtl1Gate for LvbsVtl1Gate {
+    fn enable_aps_vtl(&self, _cpu_present_mask_pfn: u64) -> Result<(), VsmError> {
+        // APs enter VTL1 via `boot_aps`; no separate enablement step is needed.
+        debug_serial_println!("VSM: Enable APs' VTL is not supported");
+        Ok(())
+    }
+
+    fn boot_aps(&self, cpu_online_mask_pfn: u64) -> Result<(), VsmError> {
+        let mask_pa = cpu_online_mask_pfn
+            .checked_shl(PAGE_SHIFT.trunc())
+            .and_then(|pa| PhysAddr::try_new(pa).ok())
+            .ok_or(VsmError::InvalidPhysicalAddress)?;
+
+        // Read exactly the fixed-size cpu_online_mask (MAX_CORES bits); bits
+        // beyond MAX_CORES are outside the ABI and cannot drive AP boots.
+        let mut mask_bytes = [0u8; core::mem::size_of::<CpuMask>()];
+        // Reading the argument out of VTL0 needs the VTL0 gate; the platform
+        // implements both capabilities, so it mints its own.
+        LvbsVtl0Gate::mint()
+            .read_vtl0_contiguous(mask_pa.as_u64(), &mut mask_bytes)
+            .map_err(|_| VsmError::CpuOnlineMaskCopyFailed)?;
+        let cpu_online_mask =
+            CpuMask::read_from_bytes(&mask_bytes).map_err(|_| VsmError::CpuOnlineMaskCopyFailed)?;
+
+        // Best-effort: attempt every online CPU, surfacing the last init failure.
+        let mut error = None;
+        cpu_online_mask.for_each_cpu(|cpu_id| {
+            if let Err(e) = crate::mshv::hvcall_vp::init_vtl_ap(TruncateExt::<u32>::trunc(cpu_id)) {
+                error = Some(e);
+            }
+        });
+        match error {
+            Some(e) => Err(VsmError::ApInitFailed(e)),
+            None => Ok(()),
+        }
+    }
+
+    fn signal_end_of_boot(&self) {
+        debug_serial_println!("VSM: End of boot; VTL0 is no longer trusted");
+        crate::platform_low().signal_end_of_boot();
+    }
+
+    fn set_platform_root_key(&self, key_pa: u64) -> Result<(), VsmError> {
+        if crate::platform_low().end_of_boot_reached() {
+            return Err(VsmError::OperationAfterEndOfBoot("set platform root key"));
+        }
+
+        let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+        let mut keybuf = Zeroizing::new([0u8; PRK_LEN]);
+        LvbsVtl0Gate::mint()
+            .read_vtl0_contiguous(key_pa.as_u64(), &mut *keybuf)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        crate::host::set_platform_root_key(&keybuf);
+        Ok(())
+    }
 }

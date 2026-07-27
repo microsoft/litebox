@@ -1,12 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! VSM/HEKI dispatch handler functions.
-//!
-//! The handlers and their helpers are methods on the [`Vsm`] context struct,
-//! which binds a [`Vtl0Mediation`] (`self.mediation`) and the [`HekiState`]
-//! (`self.state`) together, so the policy logic is decoupled from any concrete
-//! mediation.
+//! The VTL call entry points — one [`Heki`] method per HEKI function the runner
+//! dispatches — and the helpers they are built from.
 
 #[cfg(debug_assertions)]
 use crate::mem_integrity::parse_modinfo;
@@ -14,19 +10,18 @@ use crate::mem_integrity::{
     validate_kernel_module_against_elf, validate_text_patch, verify_kernel_module_signature,
     verify_kernel_pe_signature,
 };
-use crate::state::{
-    HekiState, KexecMemoryMetadata, KexecMemoryRange, MemoryContainer, ModuleMemory,
+use crate::{
+    Heki, KexecMemoryMetadata, KexecMemoryRange, MemoryContainer, ModuleMemory,
     ModuleMemoryMetadata,
 };
 
-use alloc::vec;
 use alloc::vec::Vec;
 use hashbrown::HashSet;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_lvbs::{
     HekiKdataType, HekiKernelInfo, HekiKexecType, HekiPage, HekiPatch, KEXEC_SEGMENT_MAX, Kimage,
-    MemAttr, ModMemType, PAGE_SIZE, ReservationStatus, VsmError, Vtl0Mediation,
+    MemAttr, ModMemType, PAGE_SIZE, ReservationStatus, VsmError, Vtl0Gate, Vtl0PrivilegedWrite,
     mod_mem_type_to_mem_attr,
 };
 use x86_64::{
@@ -39,62 +34,17 @@ use zerocopy::{FromBytes, FromZeros, IntoBytes};
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
 
-/// Binds the [`Vtl0Mediation`] capability (`mediation`) and the [`HekiState`]
-/// the VSM/HEKI handlers operate on.
-pub struct Vsm<'a, P: Vtl0Mediation> {
-    mediation: &'a P,
-    state: &'a HekiState,
-}
-
-impl<'a, P: Vtl0Mediation> Vsm<'a, P> {
-    /// Construct a new `Vsm` context from a mediation and state reference.
-    #[must_use]
-    pub fn new(mediation: &'a P, state: &'a HekiState) -> Self {
-        Self { mediation, state }
-    }
-
-    /// Read a contiguous VTL0 physical span into `out` through the mediation's
-    /// [`Vtl0Mediation::read_vtl0_contiguous`]. Exposed as a method because
-    /// `mediation` is private to `Vsm`.
-    pub(crate) fn read_vtl0_contiguous(
-        &self,
-        phys_addr: u64,
-        out: &mut [u8],
-    ) -> Result<(), VsmError> {
-        self.mediation.read_vtl0_contiguous(phys_addr, out)
-    }
-
-    /// Read a `FromBytes` value from a contiguous VTL0 physical span starting at `phys_addr`.
-    fn read_vtl0_val<T: FromBytes>(&self, phys_addr: u64) -> Result<T, VsmError> {
-        let mut buf = vec![0u8; core::mem::size_of::<T>()];
-        self.read_vtl0_contiguous(phys_addr, &mut buf)?;
-        T::read_from_bytes(&buf).map_err(|_| VsmError::Vtl0CopyFailed)
-    }
-
-    /// VSM function for signaling the end of VTL0 boot process
-    pub fn end_of_boot(&self) -> i64 {
-        log::debug!("VSM: End of boot");
-        self.state.set_end_of_boot();
-        0
-    }
-
-    /// Lock VTL0's control registers. Rejected after end-of-boot; otherwise the
-    /// platform arms the CR/MSR intercepts via [`Vtl0Mediation::lock_control_registers`].
+/// HEKI handlers for individual VTL call entry points.
+impl<P: Vtl0Gate> Heki<P> {
+    /// HEKI handler for locking VTL0's control registers
     pub fn lock_regs(&self) -> Result<i64, VsmError> {
-        if self.state.check_end_of_boot() {
-            return Err(VsmError::OperationAfterEndOfBoot(
-                "control register locking",
-            ));
-        }
-        self.mediation.lock_control_registers()?;
+        self.gate.lock_control_registers()?;
         Ok(0)
     }
 
-    /// VSM function for protecting certain memory ranges (e.g., kernel text, data, heap).
+    /// HEKI handler for protecting certain memory ranges (e.g., kernel text, data, heap).
     /// `pa` and `nranges` specify a memory area containing the information about the memory ranges to protect.
     pub fn protect_memory(&self, pa: u64, nranges: u64) -> Result<i64, VsmError> {
-        let mediation = self.mediation;
-        let state = self.state;
         if PhysAddr::try_new(pa)
             .ok()
             .as_ref()
@@ -104,14 +54,13 @@ impl<'a, P: Vtl0Mediation> Vsm<'a, P> {
             return Err(VsmError::InvalidInputAddress);
         }
 
-        if state.check_end_of_boot() {
+        if self.gate.end_of_boot_reached() {
             return Err(VsmError::OperationAfterEndOfBoot(
                 "kernel memory protection",
             ));
         }
 
-        let heki_pages = self
-            .copy_heki_pages_from_vtl0(pa, nranges)
+        let heki_pages = copy_heki_pages_from_vtl0(&self.gate, pa, nranges)
             .ok_or(VsmError::HekiPagesCopyFailed)?;
 
         for heki_page in heki_pages {
@@ -128,7 +77,7 @@ impl<'a, P: Vtl0Mediation> Vsm<'a, P> {
 
                 let va = heki_range.va;
                 log::debug!(
-                    "VSM: Protect memory: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
+                    "HEKI: Protect memory: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
                     va,
                     pa,
                     epa,
@@ -140,7 +89,7 @@ impl<'a, P: Vtl0Mediation> Vsm<'a, P> {
                     continue;
                 }
 
-                mediation.protect_frame(
+                self.gate.protect_frame(
                     PhysFrame::range(
                         // `HekiRange::is_valid` already validated both physical addresses.
                         PhysFrame::containing_address(PhysAddr::new(pa)),
@@ -152,37 +101,10 @@ impl<'a, P: Vtl0Mediation> Vsm<'a, P> {
         }
         Ok(0)
     }
-} // impl Vsm
 
-fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
-    let mut certs = Vec::new();
-
-    while buf.len() >= 4 && buf[0] == 0x30 && buf[1] == 0x82 {
-        let der_len = ((buf[2] as usize) << 8) | (buf[3] as usize);
-        let total_len = der_len + 4;
-
-        if buf.len() < total_len {
-            return Err(VsmError::CertificateDerLengthInvalid {
-                expected: total_len,
-                actual: buf.len(),
-            });
-        }
-
-        let cert_bytes = &buf[..total_len];
-        let cert =
-            Certificate::from_der(cert_bytes).map_err(|_| VsmError::CertificateParseFailed)?;
-        certs.push(cert);
-        buf = &buf[total_len..];
-    }
-    Ok(certs)
-}
-
-impl<P: Vtl0Mediation> Vsm<'_, P> {
-    /// VSM function for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
+    /// HEKI handler for loading kernel data (e.g., certificates, blocklist, kernel symbols) into VTL1.
     /// `pa` and `nranges` specify memory areas containing the information about the memory ranges to load.
     pub fn load_kdata(&self, pa: u64, nranges: u64) -> Result<i64, VsmError> {
-        let mediation = self.mediation;
-        let state = self.state;
         if PhysAddr::try_new(pa)
             .ok()
             .as_ref()
@@ -192,7 +114,7 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
             return Err(VsmError::InvalidInputAddress);
         }
 
-        if state.check_end_of_boot() {
+        if self.gate.end_of_boot_reached() {
             return Err(VsmError::OperationAfterEndOfBoot("loading kernel data"));
         }
 
@@ -203,13 +125,12 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         let mut kinfo_mem = MemoryContainer::new();
         let mut kdata_mem = MemoryContainer::new();
 
-        let heki_pages = self
-            .copy_heki_pages_from_vtl0(pa, nranges)
+        let heki_pages = copy_heki_pages_from_vtl0(&self.gate, pa, nranges)
             .ok_or(VsmError::HekiPagesCopyFailed)?;
 
         for heki_page in &heki_pages {
             for heki_range in heki_page {
-                log::debug!("VSM: Load kernel data {heki_range:?}");
+                log::debug!("HEKI: Load kernel data {heki_range:?}");
                 match heki_range.heki_kdata_type() {
                     HekiKdataType::SystemCerts => system_certs_mem
                         .extend_range(heki_range)
@@ -217,7 +138,7 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
                     HekiKdataType::KexecTrampoline => {
                         if let Err(e) = kexec_trampoline_metadata.insert_heki_range(heki_range) {
                             log::debug!(
-                                "VSM: KexecTrampoline insert_heki_range failed ({e:?}); skipping kexec trampoline protection"
+                                "HEKI: KexecTrampoline insert_heki_range failed ({e:?}); skipping kexec trampoline protection"
                             );
                             kexec_trampoline_insert_failed = true;
                         }
@@ -235,23 +156,23 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
                         return Err(VsmError::KernelDataTypeInvalid);
                     }
                     _ => {
-                        log::debug!("VSM: Unsupported kernel data not loaded {heki_range:?}");
+                        log::debug!("HEKI: Unsupported kernel data not loaded {heki_range:?}");
                     }
                 }
             }
         }
 
         system_certs_mem
-            .write_bytes_from_heki_range(self)
+            .write_bytes_from_heki_range(&self.gate)
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
         patch_info_mem
-            .write_bytes_from_heki_range(self)
+            .write_bytes_from_heki_range(&self.gate)
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
         kinfo_mem
-            .write_bytes_from_heki_range(self)
+            .write_bytes_from_heki_range(&self.gate)
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
         kdata_mem
-            .write_bytes_from_heki_range(self)
+            .write_bytes_from_heki_range(&self.gate)
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
 
         if system_certs_mem.is_empty() {
@@ -268,8 +189,8 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         // The system certificate is loaded into VTL1 and locked down before `end_of_boot` is signaled.
         // Its integrity depends on UEFI Secure Boot which ensures only trusted software is loaded during
         // the boot process.
-        state.set_system_certificates(certs.clone());
-        log::debug!("VSM: Loaded {} system certificate(s)", certs.len());
+        self.set_system_certificates(certs.clone());
+        log::debug!("HEKI: Loaded {} system certificate(s)", certs.len());
 
         // ToDo: Remove kexec_trampoline_insert_failed and protect kexec_trampoline_metadata
         // once we have a better solution to handle the non-page-aligned kexec trampoline metadata.
@@ -277,7 +198,7 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         // fails, letting kdata load proceed so that heki is not broken.
         if !kexec_trampoline_insert_failed {
             for kexec_trampoline_range in &kexec_trampoline_metadata {
-                mediation.protect_frame(
+                self.gate.protect_frame(
                     kexec_trampoline_range.phys_frame_range,
                     MemAttr::MEM_ATTR_READ,
                 )?;
@@ -287,8 +208,7 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         // pre-computed patch data for the kernel text
         if !patch_info_mem.is_empty() {
             let patch_info_buf = &patch_info_mem[..];
-            state
-                .precomputed_patches
+            self.precomputed_patches
                 .insert_patch_data_from_bytes(patch_info_buf, None)
                 .map_err(|_| VsmError::Vtl0CopyFailed)?;
         }
@@ -301,14 +221,14 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         let kdata_buf = &kdata_mem[..];
         let kinfo = HekiKernelInfo::from_bytes(kinfo_buf)?;
 
-        state.gpl_symbols.build_from_container(
+        self.gpl_symbols.build_from_container(
             VirtAddr::from_ptr(kinfo.ksymtab_gpl_start),
             VirtAddr::from_ptr(kinfo.ksymtab_gpl_end),
             &kdata_mem,
             kdata_buf,
         )?;
 
-        state.symbols.build_from_container(
+        self.symbols.build_from_container(
             VirtAddr::from_ptr(kinfo.ksymtab_start),
             VirtAddr::from_ptr(kinfo.ksymtab_end),
             &kdata_mem,
@@ -320,7 +240,7 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         // TODO: save blocklist hashes
     }
 
-    /// VSM function for validating a guest kernel module and applying specified protection to its memory ranges after validation.
+    /// HEKI handler for validating a guest kernel module and applying specified protection to its memory ranges after validation.
     /// `pa` and `nranges` specify a memory area containing the information about the kernel module to validate or protect.
     /// `flags` controls the validation process (unused for now).
     /// This function returns a unique `token` to VTL0, which is used to identify the module in subsequent calls.
@@ -330,8 +250,6 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         nranges: u64,
         _flags: u64,
     ) -> Result<i64, VsmError> {
-        let mediation = self.mediation;
-        let state = self.state;
         if PhysAddr::try_new(pa)
             .ok()
             .as_ref()
@@ -341,9 +259,9 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
             return Err(VsmError::InvalidInputAddress);
         }
 
-        log::debug!("VSM: Validate kernel module: pa {pa:#x} nranges {nranges}");
+        log::debug!("HEKI: Validate kernel module: pa {pa:#x} nranges {nranges}");
 
-        let certs = state
+        let certs = self
             .get_system_certificates()
             .ok_or(VsmError::SystemCertificatesNotLoaded)?;
 
@@ -357,8 +275,7 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         // patch info for the kernel module
         let mut patch_info_for_module = MemoryContainer::new();
 
-        let heki_pages = self
-            .copy_heki_pages_from_vtl0(pa, nranges)
+        let heki_pages = copy_heki_pages_from_vtl0(&self.gate, pa, nranges)
             .ok_or(VsmError::HekiPagesCopyFailed)?;
 
         for heki_page in &heki_pages {
@@ -389,109 +306,110 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
 
         // Reject overlap and reserve this module's frames. Legitimate module frames are never shared.
         // The reserve + freeze + validate + promote + patch-commit sequence runs transactionally: the
-        // mediation reserves `initial`, commits on `Ok`, and rolls back (unprotecting every newly
+        // gate reserves `initial`, commits on `Ok`, and rolls back (unprotecting every newly
         // reserved range) on `Err`.
         let initial: Vec<PhysFrameRange<Size4KiB>> = module_memory_metadata
             .iter()
             .map(|r| r.phys_frame_range)
             .collect();
-        mediation.protect_frames_transactionally(&initial, &mut |txn| {
-            // Freeze frames that require immutable copy/validation to avoid TOCTOU.
-            for mod_mem_range in &module_memory_metadata {
-                if !mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type)
-                    .contains(MemAttr::MEM_ATTR_WRITE)
-                {
-                    txn.protect(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
+        self.gate
+            .protect_frames_transactionally(&initial, &mut |txn| {
+                // Freeze frames that require immutable copy/validation to avoid TOCTOU.
+                for mod_mem_range in &module_memory_metadata {
+                    if !mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type)
+                        .contains(MemAttr::MEM_ATTR_WRITE)
+                    {
+                        txn.protect(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
+                    }
                 }
-            }
 
-            module_as_elf
-                .write_bytes_from_heki_range(self)
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
-            patch_info_for_module
-                .write_bytes_from_heki_range(self)
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
-            module_in_memory
-                .write_bytes_from_heki_range(self)
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
-
-            let elf_size = (module_as_elf[..]).len();
-            if elf_size > MODULE_VALIDATION_MAX_SIZE {
-                return Err(VsmError::ModuleElfSizeExceeded {
-                    size: elf_size,
-                    max: MODULE_VALIDATION_MAX_SIZE,
-                });
-            }
-
-            let original_elf_data = &module_as_elf[..];
-
-            #[cfg(debug_assertions)]
-            parse_modinfo(original_elf_data).map_err(|_| VsmError::Vtl0CopyFailed)?;
-
-            verify_kernel_module_signature(original_elf_data, certs)?;
-
-            if !validate_kernel_module_against_elf(&module_in_memory, original_elf_data)
-                .map_err(|_| VsmError::Vtl0CopyFailed)?
-            {
-                return Err(VsmError::ModuleRelocationInvalid);
-            }
-
-            // Both read-only and executable frames have been frozen above.
-            // Thus, only promote executable frames to RX.
-            for mod_mem_range in &module_memory_metadata {
-                if matches!(
-                    mod_mem_range.mod_mem_type,
-                    ModMemType::Text | ModMemType::InitText
-                ) {
-                    txn.protect(
-                        mod_mem_range.phys_frame_range,
-                        mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
-                    )?;
-                }
-            }
-
-            // Commit the module's pre-computed patch data (transactional).
-            if !patch_info_for_module.is_empty() {
-                let patch_info_buf = &patch_info_for_module[..];
-                state
-                    .precomputed_patches
-                    .insert_patch_data_from_bytes(patch_info_buf, Some(&mut module_memory_metadata))
+                module_as_elf
+                    .write_bytes_from_heki_range(&self.gate)
                     .map_err(|_| VsmError::Vtl0CopyFailed)?;
-            }
-            Ok(())
-        })?;
+                patch_info_for_module
+                    .write_bytes_from_heki_range(&self.gate)
+                    .map_err(|_| VsmError::Vtl0CopyFailed)?;
+                module_in_memory
+                    .write_bytes_from_heki_range(&self.gate)
+                    .map_err(|_| VsmError::Vtl0CopyFailed)?;
+
+                let elf_size = (module_as_elf[..]).len();
+                if elf_size > MODULE_VALIDATION_MAX_SIZE {
+                    return Err(VsmError::ModuleElfSizeExceeded {
+                        size: elf_size,
+                        max: MODULE_VALIDATION_MAX_SIZE,
+                    });
+                }
+
+                let original_elf_data = &module_as_elf[..];
+
+                #[cfg(debug_assertions)]
+                parse_modinfo(original_elf_data).map_err(|_| VsmError::Vtl0CopyFailed)?;
+
+                verify_kernel_module_signature(original_elf_data, certs)?;
+
+                if !validate_kernel_module_against_elf(&module_in_memory, original_elf_data)
+                    .map_err(|_| VsmError::Vtl0CopyFailed)?
+                {
+                    return Err(VsmError::ModuleRelocationInvalid);
+                }
+
+                // Both read-only and executable frames have been frozen above.
+                // Thus, only promote executable frames to RX.
+                for mod_mem_range in &module_memory_metadata {
+                    if matches!(
+                        mod_mem_range.mod_mem_type,
+                        ModMemType::Text | ModMemType::InitText
+                    ) {
+                        txn.protect(
+                            mod_mem_range.phys_frame_range,
+                            mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
+                        )?;
+                    }
+                }
+
+                // Commit the module's pre-computed patch data (transactional).
+                if !patch_info_for_module.is_empty() {
+                    let patch_info_buf = &patch_info_for_module[..];
+                    self.precomputed_patches
+                        .insert_patch_data_from_bytes(
+                            patch_info_buf,
+                            Some(&mut module_memory_metadata),
+                        )
+                        .map_err(|_| VsmError::Vtl0CopyFailed)?;
+                }
+                Ok(())
+            })?;
 
         // Fully validated and committed: register the module.
         // register the module memory in the global map and obtain a unique token for it
-        let token = state
+        let token = self
             .module_memory_metadata
             .register_module_memory_metadata(module_memory_metadata);
         Ok(token)
     }
 
-    /// VSM function for supporting the initialization of a guest kernel module including
+    /// HEKI handler for supporting the initialization of a guest kernel module including
     /// freeing the memory ranges that were used only for initialization and
     /// write-protecting the memory ranges that should be read-only after initialization.
     /// `token` is the unique identifier for the module.
     pub fn free_guest_module_init(&self, token: i64) -> Result<i64, VsmError> {
-        let mediation = self.mediation;
-        let state = self.state;
-        log::debug!("VSM: Free kernel module's init (token: {token})");
+        log::debug!("HEKI: Free kernel module's init (token: {token})");
 
-        if !state.module_memory_metadata.contains_key(token) {
+        if !self.module_memory_metadata.contains_key(token) {
             return Err(VsmError::ModuleTokenInvalid);
         }
 
         let mut result: Result<(), VsmError> = Ok(());
-        if let Some(entry) = state.module_memory_metadata.iter_entry(token) {
+        if let Some(entry) = self.module_memory_metadata.iter_entry(token) {
             for mod_mem_range in entry.iter_mem_ranges() {
                 let range_result = match mod_mem_range.mod_mem_type {
                     ModMemType::InitText | ModMemType::InitData | ModMemType::InitRoData => {
-                        mediation.unprotect_frames(mod_mem_range.phys_frame_range)
+                        self.gate.unprotect_frames(mod_mem_range.phys_frame_range)
                     }
                     ModMemType::RoAfterInit => {
                         // make this memory range read-only after initialization
-                        mediation
+                        self.gate
                             .protect_frame(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)
                     }
                     _ => Ok(()),
@@ -505,74 +423,70 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
 
         // Drop the init ranges from the module's metadata regardless of failures. This is intentional
         // since hypercalls shouldn't fail and avoiding double release is more important.
-        let freed_init_patch_targets = state.module_memory_metadata.remove_init_ranges(token);
+        let freed_init_patch_targets = self.module_memory_metadata.remove_init_ranges(token);
         // Remove the precomputed patches targeting those freed init frames so a stale init patch cannot
         // later be applied to recycled frames (no patch-after-free).
         if !freed_init_patch_targets.is_empty() {
-            state
-                .precomputed_patches
+            self.precomputed_patches
                 .remove_patch_data(&freed_init_patch_targets);
         }
 
         result.map(|()| 0)
     }
 
-    /// VSM function for supporting the unloading of a guest kernel module.
+    /// HEKI handler for supporting the unloading of a guest kernel module.
     /// `token` is the unique identifier for the module.
     pub fn unload_guest_module(&self, token: i64) -> Result<i64, VsmError> {
-        let mediation = self.mediation;
-        let state = self.state;
-        log::debug!("VSM: Unload kernel module (token: {token})");
+        log::debug!("HEKI: Unload kernel module (token: {token})");
 
-        if !state.module_memory_metadata.contains_key(token) {
+        if !self.module_memory_metadata.contains_key(token) {
             return Err(VsmError::ModuleTokenInvalid);
         }
 
-        if let Some(entry) = state.module_memory_metadata.iter_entry(token) {
+        if let Some(entry) = self.module_memory_metadata.iter_entry(token) {
             for mod_mem_range in entry.iter_mem_ranges() {
-                mediation.unprotect_frames(mod_mem_range.phys_frame_range)?;
+                self.gate.unprotect_frames(mod_mem_range.phys_frame_range)?;
             }
         }
 
-        if let Some(patch_targets) = state.module_memory_metadata.get_patch_targets(token) {
-            state.precomputed_patches.remove_patch_data(&patch_targets);
+        if let Some(patch_targets) = self.module_memory_metadata.get_patch_targets(token) {
+            self.precomputed_patches.remove_patch_data(&patch_targets);
         }
 
-        state.module_memory_metadata.remove(token);
+        self.module_memory_metadata.remove(token);
         Ok(0)
     }
 
-    /// VSM function for copying secondary key
+    /// HEKI handler for copying secondary key
     #[allow(clippy::unnecessary_wraps)]
     pub fn copy_secondary_key(&self, _pa: u64, _nranges: u64) -> Result<i64, VsmError> {
-        log::debug!("VSM: Copy secondary key");
+        log::debug!("HEKI: Copy secondary key");
         // TODO: copy secondary key
         Ok(0)
     }
 
-    /// VSM function for write protecting the memory regions of a verified kernel image for kexec.
+    /// HEKI handler for write protecting the memory regions of a verified kernel image for kexec.
     /// This function protects the kexec kernel blob (PE) only if it has a valid signature.
     /// Note: this function does not make kexec kernel pages executable, which should be done by
     /// another VTL1 method that can intercept the kexec/reset signal.
     pub fn kexec_validate(&self, pa: u64, nranges: u64, crash: u64) -> Result<i64, VsmError> {
-        let mediation = self.mediation;
-        let state = self.state;
-        log::debug!("VSM: Validate kexec pa {pa:#x} nranges {nranges} crash {crash}");
+        log::debug!("HEKI: Validate kexec pa {pa:#x} nranges {nranges} crash {crash}");
 
-        let certs = state
+        let certs = self
             .get_system_certificates()
             .ok_or(VsmError::SystemCertificatesNotLoaded)?;
 
         let is_crash = crash != 0;
         let kexec_metadata_ref = if is_crash {
-            &state.crash_kexec_metadata
+            &self.crash_kexec_metadata
         } else {
-            &state.kexec_metadata
+            &self.kexec_metadata
         };
 
         // invalidate (i.e., remove protection and clear) the kexec memory ranges which were loaded in the past
         for old_kexec_mem_range in kexec_metadata_ref.iter_guarded().iter_mem_ranges() {
-            mediation.unprotect_frames(old_kexec_mem_range.phys_frame_range)?;
+            self.gate
+                .unprotect_frames(old_kexec_mem_range.phys_frame_range)?;
         }
         kexec_metadata_ref.clear_memory();
 
@@ -585,8 +499,7 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         let mut kexec_image = MemoryContainer::new();
         let mut kexec_kernel_blob = MemoryContainer::new();
 
-        let heki_pages = self
-            .copy_heki_pages_from_vtl0(pa, nranges)
+        let heki_pages = copy_heki_pages_from_vtl0(&self.gate, pa, nranges)
             .ok_or(VsmError::HekiPagesCopyFailed)?;
 
         for heki_page in &heki_pages {
@@ -623,54 +536,57 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
             .iter()
             .map(|r| r.phys_frame_range)
             .collect();
-        mediation.protect_frames_transactionally(&initial, &mut |txn| {
-            for kexec_mem_range in &kexec_memory_metadata {
-                txn.protect(kexec_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
-            }
-
-            kexec_image
-                .write_bytes_from_heki_range(self)
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
-            kexec_kernel_blob
-                .write_bytes_from_heki_range(self)
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
-
-            // If this function is called for crash kexec, we protect its kimage segments as well.
-            if is_crash {
-                let kimage =
-                    Kimage::read_from_bytes(&kexec_image[..core::mem::size_of::<Kimage>()])
-                        .map_err(|_| VsmError::KexecImageSegmentsInvalid)?;
-                if kimage.nr_segments > KEXEC_SEGMENT_MAX as u64 {
-                    return Err(VsmError::KexecImageSegmentsInvalid);
+        self.gate
+            .protect_frames_transactionally(&initial, &mut |txn| {
+                for kexec_mem_range in &kexec_memory_metadata {
+                    txn.protect(kexec_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
                 }
-                let mut segment_ranges = Vec::new();
-                for i in 0..usize::try_from(kimage.nr_segments).unwrap_or(0) {
-                    let va = kimage.segment[i].buf;
-                    let pa = kimage.segment[i].mem;
-                    if let Some(epa) = pa.checked_add(kimage.segment[i].memsz) {
-                        segment_ranges.push(KexecMemoryRange::new(va, pa, epa)?);
-                    } else {
-                        return Err(VsmError::KexecSegmentRangeInvalid);
+
+                kexec_image
+                    .write_bytes_from_heki_range(&self.gate)
+                    .map_err(|_| VsmError::Vtl0CopyFailed)?;
+                kexec_kernel_blob
+                    .write_bytes_from_heki_range(&self.gate)
+                    .map_err(|_| VsmError::Vtl0CopyFailed)?;
+
+                // If this function is called for crash kexec, we protect its kimage segments as well.
+                if is_crash {
+                    let kimage =
+                        Kimage::read_from_bytes(&kexec_image[..core::mem::size_of::<Kimage>()])
+                            .map_err(|_| VsmError::KexecImageSegmentsInvalid)?;
+                    if kimage.nr_segments > KEXEC_SEGMENT_MAX as u64 {
+                        return Err(VsmError::KexecImageSegmentsInvalid);
+                    }
+                    let mut segment_ranges = Vec::new();
+                    for i in 0..usize::try_from(kimage.nr_segments).unwrap_or(0) {
+                        VirtAddr::try_new(kimage.segment[i].buf)
+                            .map_err(|_| VsmError::InvalidVirtualAddress)?;
+                        let pa = kimage.segment[i].mem;
+                        if let Some(epa) = pa.checked_add(kimage.segment[i].memsz) {
+                            segment_ranges.push(KexecMemoryRange::new(pa, epa)?);
+                        } else {
+                            return Err(VsmError::KexecSegmentRangeInvalid);
+                        }
+                    }
+                    let segment_frame_ranges: Vec<PhysFrameRange<Size4KiB>> =
+                        segment_ranges.iter().map(|r| r.phys_frame_range).collect();
+                    let reservation_statuses = txn.reserve(&segment_frame_ranges)?;
+                    for (segment_range, status) in
+                        segment_ranges.into_iter().zip(reservation_statuses)
+                    {
+                        if status == ReservationStatus::New {
+                            txn.protect(segment_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
+                            kexec_memory_metadata.insert_memory_range(segment_range);
+                        }
                     }
                 }
-                let segment_frame_ranges: Vec<PhysFrameRange<Size4KiB>> =
-                    segment_ranges.iter().map(|r| r.phys_frame_range).collect();
-                let reservation_statuses = txn.reserve(&segment_frame_ranges)?;
-                for (segment_range, status) in segment_ranges.into_iter().zip(reservation_statuses)
-                {
-                    if status == ReservationStatus::New {
-                        txn.protect(segment_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
-                        kexec_memory_metadata.insert_memory_range(segment_range);
-                    }
-                }
-            }
 
-            // verify the signature of the kexec blob
-            if let Err(result) = verify_kernel_pe_signature(&kexec_kernel_blob[..], certs) {
-                return Err(VsmError::SignatureVerificationFailed(result));
-            }
-            Ok(())
-        })?;
+                // verify the signature of the kexec blob
+                if let Err(result) = verify_kernel_pe_signature(&kexec_kernel_blob[..], certs) {
+                    return Err(VsmError::SignatureVerificationFailed(result));
+                }
+                Ok(())
+            })?;
 
         // register the protected kexec memory ranges to support possible invalidation in the future
         kexec_metadata_ref.register_memory(kexec_memory_metadata);
@@ -678,36 +594,174 @@ impl<P: Vtl0Mediation> Vsm<'_, P> {
         Ok(0)
     }
 
-    /// VSM function for patching kernel or module text. VTL0 kernel calls this function to patch certain kernel or module
+    /// HEKI handler for patching kernel or module text. VTL0 kernel calls this function to patch certain kernel or module
     /// text region (which it does not have a permission to modify). It passes `HekiPatch` structure which can be stored
     /// within one or across two likely non-contiguous physical pages.
-    pub fn patch_text(&self, patch_pa_0: u64, patch_pa_1: u64) -> Result<i64, VsmError> {
-        let mediation = self.mediation;
-        let state = self.state;
-        let heki_patch = self.copy_heki_patch_from_vtl0(patch_pa_0, patch_pa_1)?;
-        log::debug!("VSM: {heki_patch:?}");
+    pub fn patch_text<W: Vtl0PrivilegedWrite>(
+        &self,
+        writer: &W,
+        patch_pa_0: u64,
+        patch_pa_1: u64,
+    ) -> Result<i64, VsmError> {
+        let heki_patch = copy_heki_patch_from_vtl0(&self.gate, patch_pa_0, patch_pa_1)?;
+        log::debug!("HEKI: {heki_patch:?}");
 
-        let precomputed_patch = state
+        let precomputed_patch = self
             .find_precomputed_patch(&heki_patch)
             .ok_or(VsmError::PrecomputedPatchNotFound)?;
 
         if let Some(validated) = ValidatedTextPatch::prepare(&heki_patch, &precomputed_patch)? {
-            mediation.write_vtl0_privileged(
-                validated.pages(),
-                validated.offset(),
-                validated.bytes(),
-            )?;
+            validated.apply(writer)?;
         }
         Ok(0)
     }
-} // impl Vsm
 
-/// Proof that a text patch matched VTL1's precomputed patch data, bundled with the
+    pub fn allocate_ringbuffer_memory(&self, phys_addr: u64, size: u64) -> Result<i64, VsmError> {
+        if self.gate.end_of_boot_reached() {
+            return Err(VsmError::OperationAfterEndOfBoot("ring buffer allocation"));
+        }
+
+        let end = phys_addr
+            .checked_add(size)
+            .ok_or(VsmError::IntegerOverflow)
+            .and_then(|end| PhysAddr::try_new(end).map_err(|_| VsmError::InvalidPhysicalAddress))?;
+        let phys_addr = PhysAddr::new(phys_addr);
+        let frame_range = PhysFrame::range(
+            PhysFrame::from_start_address(phys_addr)
+                .map_err(|_| VsmError::AddressNotPageAligned)?,
+            PhysFrame::from_start_address(end).map_err(|_| VsmError::AddressNotPageAligned)?,
+        );
+        self.gate
+            .protect_frame(frame_range, MemAttr::MEM_ATTR_READ)?;
+        self.gate.install_ringbuffer(phys_addr.as_u64(), size);
+        log::debug!("HEKI: Ring buffer allocated");
+        Ok(0)
+    }
+} // impl Heki
+
+/// Copies patch data in a `HekiPatch` structure from VTL0 to VTL1. The patch
+/// data can live within one physical page or across two likely
+/// non-contiguous physical pages.
+fn copy_heki_patch_from_vtl0<P: Vtl0Gate>(
+    gate: &P,
+    patch_pa_0: u64,
+    patch_pa_1: u64,
+) -> Result<HekiPatch, VsmError> {
+    let patch_pa_0 = PhysAddr::try_new(patch_pa_0).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+    let patch_pa_1 = PhysAddr::try_new(patch_pa_1).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+    if patch_pa_0.is_null() || patch_pa_0 == patch_pa_1 || !patch_pa_1.is_aligned(Size4KiB::SIZE) {
+        return Err(VsmError::InvalidInputAddress);
+    }
+    let bytes_in_first_page = if patch_pa_0.is_aligned(Size4KiB::SIZE) {
+        core::cmp::min(PAGE_SIZE, core::mem::size_of::<HekiPatch>())
+    } else {
+        core::cmp::min(
+            (patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).trunc(),
+            core::mem::size_of::<HekiPatch>(),
+        )
+    };
+
+    if (bytes_in_first_page < core::mem::size_of::<HekiPatch>() && patch_pa_1.is_null())
+        || (bytes_in_first_page == core::mem::size_of::<HekiPatch>() && !patch_pa_1.is_null())
+    {
+        return Err(VsmError::InvalidInputAddress);
+    }
+
+    let heki_patch = if patch_pa_1.is_null()
+        || (patch_pa_0.align_up(Size4KiB::SIZE) == patch_pa_1.align_down(Size4KiB::SIZE))
+    {
+        gate.read_vtl0_val::<HekiPatch>(patch_pa_0.as_u64())
+    } else {
+        let mut heki_patch = HekiPatch::new_zeroed();
+        let heki_patch_bytes = heki_patch.as_mut_bytes();
+        let pages = [
+            PhysPageAddr::<PAGE_SIZE>::new(patch_pa_0.align_down(Size4KiB::SIZE).as_u64().trunc())
+                .ok_or(VsmError::Vtl0CopyFailed)?,
+            PhysPageAddr::<PAGE_SIZE>::new(patch_pa_1.as_u64().trunc())
+                .ok_or(VsmError::Vtl0CopyFailed)?,
+        ];
+        gate.read_vtl0_bytes(
+            &pages,
+            (patch_pa_0 - patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
+            heki_patch_bytes,
+        )
+        .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        Ok(heki_patch)
+    }?;
+
+    if heki_patch.is_valid() {
+        Ok(heki_patch)
+    } else {
+        Err(VsmError::InvalidInputAddress)
+    }
+}
+/// Copies `HekiPage` structures from VTL0 and returns a vector of them. `pa` and
+/// `nranges` specify the physical address range holding one or more `HekiPage`s.
+fn copy_heki_pages_from_vtl0<P: Vtl0Gate>(
+    gate: &P,
+    pa: u64,
+    nranges: u64,
+) -> Option<Vec<HekiPage>> {
+    let mut heki_pages = Vec::new();
+    heki_pages.try_reserve(nranges.trunc()).ok()?;
+    let mut visited_pages = HashSet::new();
+    let mut range: u64 = 0;
+
+    let mut cur_pa = PhysAddr::try_new(pa).ok()?;
+    while range < nranges {
+        if visited_pages.contains(&cur_pa.as_u64()) {
+            return None;
+        }
+        let heki_page = gate.read_vtl0_val::<HekiPage>(cur_pa.as_u64()).ok()?;
+        if !heki_page.is_valid() {
+            return None;
+        }
+        visited_pages.insert(cur_pa.as_u64());
+
+        range = range.checked_add(heki_page.nranges)?;
+        if range < nranges && (heki_page.next_pa == 0 || visited_pages.contains(&heki_page.next_pa))
+        {
+            return None;
+        }
+        // `HekiPage::is_valid` already validated `next_pa`.
+        cur_pa = PhysAddr::new(heki_page.next_pa);
+        heki_pages.push(heki_page);
+    }
+
+    Some(heki_pages)
+}
+
+/// Parse a concatenated run of DER-encoded X.509 certificates.
+fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
+    let mut certs = Vec::new();
+
+    while buf.len() >= 4 && buf[0] == 0x30 && buf[1] == 0x82 {
+        let der_len = ((buf[2] as usize) << 8) | (buf[3] as usize);
+        let total_len = der_len + 4;
+
+        if buf.len() < total_len {
+            return Err(VsmError::CertificateDerLengthInvalid {
+                expected: total_len,
+                actual: buf.len(),
+            });
+        }
+
+        let cert_bytes = &buf[..total_len];
+        let cert =
+            Certificate::from_der(cert_bytes).map_err(|_| VsmError::CertificateParseFailed)?;
+        certs.push(cert);
+        buf = &buf[total_len..];
+    }
+    Ok(certs)
+}
+
+/// A text patch that matched VTL1's precomputed patch data, bundled with the
 /// VTL0 write parameters it authorizes.
 ///
 /// Its fields are private and it is constructible only via `prepare`, which
-/// performs the `validate_text_patch` check — so a privileged text-patch write
-/// cannot be requested without a successful validation.
+/// performs the `validate_text_patch` check, so this answers *what* may be
+/// written. *Whether* the caller may bypass protection masks at all is a
+/// separate question, answered by holding a [`Vtl0PrivilegedWrite`].
 pub(crate) struct ValidatedTextPatch<'a> {
     pages: [PhysPageAddr<PAGE_SIZE>; 2],
     page_count: usize,
@@ -755,143 +809,11 @@ impl<'a> ValidatedTextPatch<'a> {
         }))
     }
 
-    /// The VTL0 physical page(s) the validated patch targets.
-    #[must_use]
-    pub(crate) fn pages(&self) -> &[PhysPageAddr<PAGE_SIZE>] {
-        &self.pages[..self.page_count]
-    }
-
-    /// The in-page offset of the write within the first page.
-    #[must_use]
-    pub(crate) fn offset(&self) -> usize {
-        self.offset
-    }
-
-    /// The validated bytes to write.
-    #[must_use]
-    pub(crate) fn bytes(&self) -> &[u8] {
-        self.bytes
+    /// Perform the write this patch authorizes, consuming the proof.
+    ///
+    /// The write parameters are never handed out separately, so a validated
+    /// page list cannot be paired with some other patch's offset or bytes.
+    fn apply(self, writer: &impl Vtl0PrivilegedWrite) -> Result<(), VsmError> {
+        writer.write_vtl0_bytes(&self.pages[..self.page_count], self.offset, self.bytes)
     }
 }
-
-/// This function copies patch data in `HekiPatch` structure from VTL0 to VTL1. This patch data can be
-/// stored within a physical page or across two likely non-contiguous physical pages.
-impl<P: Vtl0Mediation> Vsm<'_, P> {
-    fn copy_heki_patch_from_vtl0(
-        &self,
-        patch_pa_0: u64,
-        patch_pa_1: u64,
-    ) -> Result<HekiPatch, VsmError> {
-        let mediation = self.mediation;
-        let patch_pa_0 =
-            PhysAddr::try_new(patch_pa_0).map_err(|_| VsmError::InvalidPhysicalAddress)?;
-        let patch_pa_1 =
-            PhysAddr::try_new(patch_pa_1).map_err(|_| VsmError::InvalidPhysicalAddress)?;
-        if patch_pa_0.is_null()
-            || patch_pa_0 == patch_pa_1
-            || !patch_pa_1.is_aligned(Size4KiB::SIZE)
-        {
-            return Err(VsmError::InvalidInputAddress);
-        }
-        let bytes_in_first_page = if patch_pa_0.is_aligned(Size4KiB::SIZE) {
-            core::cmp::min(PAGE_SIZE, core::mem::size_of::<HekiPatch>())
-        } else {
-            core::cmp::min(
-                (patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).trunc(),
-                core::mem::size_of::<HekiPatch>(),
-            )
-        };
-
-        if (bytes_in_first_page < core::mem::size_of::<HekiPatch>() && patch_pa_1.is_null())
-            || (bytes_in_first_page == core::mem::size_of::<HekiPatch>() && !patch_pa_1.is_null())
-        {
-            return Err(VsmError::InvalidInputAddress);
-        }
-
-        let heki_patch = if patch_pa_1.is_null()
-            || (patch_pa_0.align_up(Size4KiB::SIZE) == patch_pa_1.align_down(Size4KiB::SIZE))
-        {
-            self.read_vtl0_val::<HekiPatch>(patch_pa_0.as_u64())
-        } else {
-            let mut heki_patch = HekiPatch::new_zeroed();
-            let heki_patch_bytes = heki_patch.as_mut_bytes();
-            let pages = [
-                PhysPageAddr::<PAGE_SIZE>::new(
-                    patch_pa_0.align_down(Size4KiB::SIZE).as_u64().trunc(),
-                )
-                .ok_or(VsmError::Vtl0CopyFailed)?,
-                PhysPageAddr::<PAGE_SIZE>::new(patch_pa_1.as_u64().trunc())
-                    .ok_or(VsmError::Vtl0CopyFailed)?,
-            ];
-            mediation
-                .read_vtl0_bytes(
-                    &pages,
-                    (patch_pa_0 - patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
-                    heki_patch_bytes,
-                )
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
-            Ok(heki_patch)
-        }?;
-
-        if heki_patch.is_valid() {
-            Ok(heki_patch)
-        } else {
-            Err(VsmError::InvalidInputAddress)
-        }
-    }
-
-    pub fn allocate_ringbuffer_memory(&self, phys_addr: u64, size: usize) -> Result<i64, VsmError> {
-        let mediation = self.mediation;
-        let state = self.state;
-        if state.check_end_of_boot() {
-            return Err(VsmError::OperationAfterEndOfBoot("ring buffer allocation"));
-        }
-
-        let end = phys_addr
-            .checked_add(size as u64)
-            .ok_or(VsmError::IntegerOverflow)
-            .and_then(|end| PhysAddr::try_new(end).map_err(|_| VsmError::InvalidPhysicalAddress))?;
-        let phys_addr = PhysAddr::new(phys_addr);
-        let frame_range = PhysFrame::range(
-            PhysFrame::from_start_address(phys_addr)
-                .map_err(|_| VsmError::AddressNotPageAligned)?,
-            PhysFrame::from_start_address(end).map_err(|_| VsmError::AddressNotPageAligned)?,
-        );
-        mediation.protect_frame(frame_range, MemAttr::MEM_ATTR_READ)?;
-        mediation.install_ringbuffer(phys_addr.as_u64(), size);
-        log::debug!("VSM: Ring buffer allocated");
-        Ok(0)
-    }
-
-    /// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
-    /// `pa` and `nranges` specify the physical address range containing one or more than one `HekiPage` structures.
-    fn copy_heki_pages_from_vtl0(&self, pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
-        let mut heki_pages = Vec::with_capacity(nranges.trunc());
-        let mut visited_pages = HashSet::new();
-        let mut range: u64 = 0;
-
-        let mut cur_pa = PhysAddr::try_new(pa).ok()?;
-        while range < nranges {
-            if visited_pages.contains(&cur_pa.as_u64()) {
-                return None;
-            }
-            let heki_page = self.read_vtl0_val::<HekiPage>(cur_pa.as_u64()).ok()?;
-            if !heki_page.is_valid() {
-                return None;
-            }
-            visited_pages.insert(cur_pa.as_u64());
-
-            range = range.checked_add(heki_page.nranges)?;
-            if range < nranges
-                && (heki_page.next_pa == 0 || visited_pages.contains(&heki_page.next_pa))
-            {
-                return None;
-            }
-            // `HekiPage::is_valid` already validated `next_pa`.
-            cur_pa = PhysAddr::new(heki_page.next_pa);
-            heki_pages.push(heki_page);
-        }
-
-        Some(heki_pages)
-    }
-} // impl Vsm

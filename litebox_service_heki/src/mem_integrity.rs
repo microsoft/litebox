@@ -3,7 +3,7 @@
 
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
-use crate::state::ModuleMemory;
+use crate::ModuleMemory;
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
@@ -128,10 +128,7 @@ pub(crate) fn validate_kernel_module_against_elf(
                 section_from_elf[reloc.clone()].copy_from_slice(&section_in_memory[reloc.clone()]);
             }
             if section_from_elf != section_in_memory {
-                log::warn!(
-                    "Found {} mismatches in {target_section_name}",
-                    target_section_name
-                );
+                log::warn!("Found mismatches in {target_section_name}");
                 result = false;
             }
         }

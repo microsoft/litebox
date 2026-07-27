@@ -13,11 +13,12 @@ use litebox::{
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
-use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction, VsmMediation};
+use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
+use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
 use litebox_platform_lvbs::{
     arch::{gdt, instrs::hlt_loop, interrupts, timer},
     debug_serial_println,
@@ -264,55 +265,52 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
     }
 }
 
-/// Returns the process-wide [`litebox_service_heki::HekiState`], the single
-/// long-lived HEKI/VSM service state owned by the runner (the VSM composition
-/// root), initializing it on first access.
-fn heki_state() -> &'static litebox_service_heki::HekiState {
-    static HEKI_STATE: spin::Once<litebox_service_heki::HekiState> = spin::Once::new();
-    HEKI_STATE.call_once(litebox_service_heki::HekiState::new)
+/// Returns this VTL1 kernel's HEKI service: a single long-lived instance owned
+/// by the runner (the VSM composition root), initialized on first access.
+///
+/// This is where the abstract service is bound to the concrete platform gate;
+/// the service holds it for its lifetime, so handlers need no gate argument.
+fn heki() -> &'static litebox_service_heki::Heki<LvbsVtl0Gate> {
+    static HEKI: spin::Once<litebox_service_heki::Heki<LvbsVtl0Gate>> = spin::Once::new();
+    HEKI.call_once(|| litebox_service_heki::Heki::new(LvbsVtl0Gate::mint()))
 }
 
 /// Dispatch a VSM function to its handler and return the result.
 ///
-/// HEKI/VSM policy is delegated to the service (`Vsm`) over the VTL0-mediation
-/// capability ([`Vtl0Mediation`], via `LvbsVsmMediation`). The VTL1 self-lifecycle
-/// operations (AP bring-up, root-key provisioning) are invoked by the runner
-/// itself as the VSM composition root, over the full [`VsmMediation`]; each
-/// reads its own VTL0 arguments internally. The runner owns the `HekiState`
-/// that gates end-of-boot-sensitive operations.
+/// Routes each call to the subsystem that owns it: HEKI (VTL0 protection) to
+/// the service, which only gets `Vtl0Gate`, and VTL1 setup `Vtl1Gate`.
+/// The Hyper-V mechanics behind both stay inside the platform, so nothing
+/// here talks to the hypervisor. As the VSM composition root, the runner
+/// mints the gate and owns the HEKI service.
 fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
-    use litebox_platform_lvbs::mshv::vsm_mediation::LvbsVsmMediation;
+    use litebox_common_lvbs::Vtl1Gate as _;
 
-    let state = heki_state();
-    let mediation = LvbsVsmMediation::mint();
-    let vsm = litebox_service_heki::Vsm::new(&mediation, state);
+    let vtl1 = LvbsVtl1Gate::mint();
+    let heki = heki();
     let result: Result<i64, VsmError> = match func_id {
-        // AP enablement is a no-op in this implementation.
-        VsmFunction::EnableAPsVtl => Ok(0),
-        VsmFunction::BootAPs => mediation.boot_aps(params[0]).map(|()| 0),
-        VsmFunction::LockRegs => vsm.lock_regs(),
-        VsmFunction::SignalEndOfBoot => Ok(vsm.end_of_boot()),
-        VsmFunction::ProtectMemory => vsm.protect_memory(params[0], params[1]),
-        VsmFunction::LoadKData => vsm.load_kdata(params[0], params[1]),
-        VsmFunction::ValidateModule => vsm.validate_guest_module(params[0], params[1], params[2]),
+        VsmFunction::EnableAPsVtl => vtl1.enable_aps_vtl(params[0]).map(|()| 0),
+        VsmFunction::BootAPs => vtl1.boot_aps(params[0]).map(|()| 0),
+        VsmFunction::LockRegs => heki.lock_regs(),
+        VsmFunction::SignalEndOfBoot => {
+            vtl1.signal_end_of_boot();
+            Ok(0)
+        }
+        VsmFunction::ProtectMemory => heki.protect_memory(params[0], params[1]),
+        VsmFunction::LoadKData => heki.load_kdata(params[0], params[1]),
+        VsmFunction::ValidateModule => heki.validate_guest_module(params[0], params[1], params[2]),
         VsmFunction::FreeModuleInit => {
-            vsm.free_guest_module_init(params[0].reinterpret_as_signed())
+            heki.free_guest_module_init(params[0].reinterpret_as_signed())
         }
-        VsmFunction::UnloadModule => vsm.unload_guest_module(params[0].reinterpret_as_signed()),
-        VsmFunction::CopySecondaryKey => vsm.copy_secondary_key(params[0], params[1]),
-        VsmFunction::KexecValidate => vsm.kexec_validate(params[0], params[1], params[2]),
-        VsmFunction::PatchText => vsm.patch_text(params[0], params[1]),
+        VsmFunction::UnloadModule => heki.unload_guest_module(params[0].reinterpret_as_signed()),
+        VsmFunction::CopySecondaryKey => heki.copy_secondary_key(params[0], params[1]),
+        VsmFunction::KexecValidate => heki.kexec_validate(params[0], params[1], params[2]),
+        VsmFunction::PatchText => {
+            heki.patch_text(&LvbsVtl0PrivilegedWriter::mint(), params[0], params[1])
+        }
         VsmFunction::AllocateRingbufferMemory => {
-            let size: usize = params[1].trunc();
-            vsm.allocate_ringbuffer_memory(params[0], size)
+            heki.allocate_ringbuffer_memory(params[0], params[1])
         }
-        VsmFunction::SetPlatformRootKey => {
-            if state.check_end_of_boot() {
-                Err(VsmError::OperationAfterEndOfBoot("set platform root key"))
-            } else {
-                mediation.set_platform_root_key(params[0]).map(|()| 0)
-            }
-        }
+        VsmFunction::SetPlatformRootKey => vtl1.set_platform_root_key(params[0]).map(|()| 0),
         VsmFunction::GenerateIdentitySigningKey => {
             Err(VsmError::OperationNotSupported("Identity key generation"))
         }
