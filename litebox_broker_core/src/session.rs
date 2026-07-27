@@ -304,6 +304,11 @@ impl BrokerSession {
         f(&object)
     }
 
+    /// Returns an authorized object lease without holding the reference-table lock.
+    ///
+    /// Socket operations use this to release all broker locks before calling an
+    /// external platform implementation, then reacquire only the object lock if
+    /// they need to update broker-owned state.
     pub(crate) fn authorized_object(
         &self,
         handle: ObjectHandle,
