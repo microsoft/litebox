@@ -21,6 +21,8 @@ pub enum BrokerError {
     BrokerCoreAlreadyExists,
     #[error("broker operation would block")]
     WouldBlock,
+    #[error("broker authority state is inconsistent")]
+    Internal,
     #[error("broker object peer is closed")]
     PeerClosed,
     #[error("broker memory allocation failed")]
@@ -36,7 +38,7 @@ impl From<BrokerError> for ErrorCode {
             BrokerError::UnknownObject => Self::UnknownObject,
             BrokerError::InvalidRights => Self::InvalidRights,
             BrokerError::ResourceExhausted => Self::ResourceExhausted,
-            BrokerError::BrokerCoreAlreadyExists => Self::Internal,
+            BrokerError::BrokerCoreAlreadyExists | BrokerError::Internal => Self::Internal,
             BrokerError::WouldBlock => Self::WouldBlock,
             BrokerError::PeerClosed => Self::PeerClosed,
             BrokerError::OutOfMemory => Self::OutOfMemory,

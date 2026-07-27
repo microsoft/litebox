@@ -101,7 +101,7 @@ impl BrokerSession {
             handle,
             object,
             rights,
-        );
+        )?;
 
         Ok(handle)
     }
@@ -132,7 +132,7 @@ impl BrokerSession {
                 handle,
                 object,
                 rights,
-            );
+            )?;
         }
         Ok((first_handle, second_handle))
     }
@@ -144,13 +144,20 @@ impl BrokerSession {
         handle: ObjectHandle,
         object: ObjectEntry,
         rights: ObjectRights,
-    ) {
+    ) -> Result<()> {
+        if references.contains_key(&handle) {
+            return Err(BrokerError::Internal);
+        }
         let next_reference_handle = *reference_list_head;
         if let Some(next_handle) = next_reference_handle {
             let next_reference = references
                 .get_mut(&next_handle)
-                .expect("the session reference list must name a live reference");
-            debug_assert_eq!(next_reference.session_id, self.session_id);
+                .ok_or(BrokerError::Internal)?;
+            if next_reference.session_id != self.session_id
+                || next_reference.previous_reference_handle.is_some()
+            {
+                return Err(BrokerError::Internal);
+            }
             next_reference.previous_reference_handle = Some(handle);
         }
         references.insert(
@@ -164,6 +171,7 @@ impl BrokerSession {
             },
         );
         *reference_list_head = Some(handle);
+        Ok(())
     }
 
     pub(crate) fn with_authorized_object<T>(
@@ -244,19 +252,37 @@ impl BrokerSession {
 
         if let Some(previous_handle) = previous_reference_handle {
             let previous_reference = references
+                .get(&previous_handle)
+                .ok_or(BrokerError::Internal)?;
+            if previous_reference.session_id != self.session_id
+                || previous_reference.next_reference_handle != Some(handle)
+            {
+                return Err(BrokerError::Internal);
+            }
+        } else if *reference_list_head != Some(handle) {
+            return Err(BrokerError::Internal);
+        }
+        if let Some(next_handle) = next_reference_handle {
+            let next_reference = references.get(&next_handle).ok_or(BrokerError::Internal)?;
+            if next_reference.session_id != self.session_id
+                || next_reference.previous_reference_handle != Some(handle)
+            {
+                return Err(BrokerError::Internal);
+            }
+        }
+
+        if let Some(previous_handle) = previous_reference_handle {
+            let previous_reference = references
                 .get_mut(&previous_handle)
-                .expect("the previous session reference must be live");
-            debug_assert_eq!(previous_reference.session_id, self.session_id);
+                .ok_or(BrokerError::Internal)?;
             previous_reference.next_reference_handle = next_reference_handle;
         } else {
-            debug_assert_eq!(*reference_list_head, Some(handle));
             *reference_list_head = next_reference_handle;
         }
         if let Some(next_handle) = next_reference_handle {
             let next_reference = references
                 .get_mut(&next_handle)
-                .expect("the next session reference must be live");
-            debug_assert_eq!(next_reference.session_id, self.session_id);
+                .ok_or(BrokerError::Internal)?;
             next_reference.previous_reference_handle = previous_reference_handle;
         }
 
@@ -266,21 +292,42 @@ impl BrokerSession {
         Ok(reference)
     }
 
-    fn remove_head_object_reference(&self) -> Option<ObjectReference> {
-        let handle = (*self.reference_list_head.read())?;
-        Some(
-            self.remove_object_reference(handle)
-                .expect("the session reference list must name a live owned reference"),
-        )
+    fn remove_head_object_reference(&self) -> Result<Option<ObjectReference>> {
+        let Some(handle) = *self.reference_list_head.read() else {
+            return Ok(None);
+        };
+        self.remove_object_reference(handle).map(Some)
+    }
+
+    fn remove_any_owned_object_reference(&self) -> Option<ObjectReference> {
+        let mut references = self.core.references.write();
+        let handle = references.iter().find_map(|(handle, reference)| {
+            (reference.session_id == self.session_id).then_some(*handle)
+        })?;
+        references.remove(&handle)
     }
 }
 
 impl Drop for BrokerSession {
     fn drop(&mut self) {
-        while let Some(reference) = self.remove_head_object_reference() {
-            // Object destruction may release platform resources and must never
-            // run while either reference index spin lock is held.
-            drop(reference);
+        loop {
+            match self.remove_head_object_reference() {
+                Ok(Some(reference)) => {
+                    // Object destruction may release platform resources and
+                    // must never run while either reference index lock is held.
+                    drop(reference);
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    // Corrupt link metadata must not panic during Drop. Fall
+                    // back to the global table so every owned object is still
+                    // destroyed after releasing its lock.
+                    while let Some(reference) = self.remove_any_owned_object_reference() {
+                        drop(reference);
+                    }
+                    break;
+                }
+            }
         }
     }
 }
@@ -308,6 +355,8 @@ mod tests {
         check_session_drop_releases_references(&broker);
         check_pipe_lifecycle(&broker);
         check_pipe_reader_closure(&broker);
+        check_corrupt_links_fail_without_mutation(&broker);
+        check_corrupt_teardown_falls_back_without_panicking(&broker);
         check_pair_handle_exhaustion(&broker);
 
         assert!(broker.references.read().is_empty());
@@ -452,6 +501,53 @@ mod tests {
         );
         assert_eq!(session.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+    }
+
+    fn check_corrupt_links_fail_without_mutation(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let older = crate::event::create(&session, 0).unwrap();
+        let head = crate::event::create(&session, 0).unwrap();
+        {
+            let mut references = broker.references.write();
+            references
+                .get_mut(&older)
+                .unwrap()
+                .previous_reference_handle = None;
+        }
+
+        assert_eq!(
+            session.close_object_reference(older),
+            Err(BrokerError::Internal)
+        );
+        {
+            let mut references = broker.references.write();
+            references
+                .get_mut(&older)
+                .unwrap()
+                .previous_reference_handle = Some(head);
+        }
+        assert_eq!(session.close_object_reference(older), Ok(()));
+        assert_eq!(session.close_object_reference(head), Ok(()));
+    }
+
+    fn check_corrupt_teardown_falls_back_without_panicking(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let _older = crate::event::create(&session, 0).unwrap();
+        let head = crate::event::create(&session, 0).unwrap();
+        broker
+            .references
+            .write()
+            .get_mut(&head)
+            .unwrap()
+            .next_reference_handle = Some(ObjectHandle(u64::MAX));
+
+        drop(session);
+
+        assert!(broker.references.read().is_empty());
     }
 
     fn check_pair_handle_exhaustion(broker: &BrokerCore) {
