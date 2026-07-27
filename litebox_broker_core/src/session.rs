@@ -95,25 +95,13 @@ impl BrokerSession {
             return Err(BrokerError::ResourceExhausted);
         }
         let handle = self.core.allocate_reference_handle()?;
-        let next_reference_handle = *reference_list_head;
-        if let Some(next_handle) = next_reference_handle {
-            let next_reference = references
-                .get_mut(&next_handle)
-                .expect("the session reference list must name a live reference");
-            debug_assert_eq!(next_reference.session_id, self.session_id);
-            next_reference.previous_reference_handle = Some(handle);
-        }
-        references.insert(
+        self.insert_object_reference(
+            &mut references,
+            &mut reference_list_head,
             handle,
-            ObjectReference {
-                object: Arc::new(RwLock::new(object)),
-                session_id: self.session_id,
-                rights,
-                previous_reference_handle: None,
-                next_reference_handle,
-            },
+            object,
+            rights,
         );
-        *reference_list_head = Some(handle);
 
         Ok(handle)
     }
@@ -138,27 +126,44 @@ impl BrokerSession {
         }
         let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
         for (handle, object) in [(first_handle, first), (second_handle, second)] {
-            let next_reference_handle = *reference_list_head;
-            if let Some(next_handle) = next_reference_handle {
-                let next_reference = references
-                    .get_mut(&next_handle)
-                    .expect("the session reference list must name a live reference");
-                debug_assert_eq!(next_reference.session_id, self.session_id);
-                next_reference.previous_reference_handle = Some(handle);
-            }
-            references.insert(
+            self.insert_object_reference(
+                &mut references,
+                &mut reference_list_head,
                 handle,
-                ObjectReference {
-                    object: Arc::new(RwLock::new(object)),
-                    session_id: self.session_id,
-                    rights,
-                    previous_reference_handle: None,
-                    next_reference_handle,
-                },
+                object,
+                rights,
             );
-            *reference_list_head = Some(handle);
         }
         Ok((first_handle, second_handle))
+    }
+
+    fn insert_object_reference(
+        &self,
+        references: &mut HashMap<ObjectHandle, ObjectReference>,
+        reference_list_head: &mut Option<ObjectHandle>,
+        handle: ObjectHandle,
+        object: ObjectEntry,
+        rights: ObjectRights,
+    ) {
+        let next_reference_handle = *reference_list_head;
+        if let Some(next_handle) = next_reference_handle {
+            let next_reference = references
+                .get_mut(&next_handle)
+                .expect("the session reference list must name a live reference");
+            debug_assert_eq!(next_reference.session_id, self.session_id);
+            next_reference.previous_reference_handle = Some(handle);
+        }
+        references.insert(
+            handle,
+            ObjectReference {
+                object: Arc::new(RwLock::new(object)),
+                session_id: self.session_id,
+                rights,
+                previous_reference_handle: None,
+                next_reference_handle,
+            },
+        );
+        *reference_list_head = Some(handle);
     }
 
     pub(crate) fn with_authorized_object<T>(
@@ -261,7 +266,7 @@ impl BrokerSession {
         Ok(reference)
     }
 
-    fn take_one_object_reference(&self) -> Option<ObjectReference> {
+    fn remove_head_object_reference(&self) -> Option<ObjectReference> {
         let handle = (*self.reference_list_head.read())?;
         Some(
             self.remove_object_reference(handle)
@@ -272,7 +277,7 @@ impl BrokerSession {
 
 impl Drop for BrokerSession {
     fn drop(&mut self) {
-        while let Some(reference) = self.take_one_object_reference() {
+        while let Some(reference) = self.remove_head_object_reference() {
             // Object destruction may release platform resources and must never
             // run while either reference index spin lock is held.
             drop(reference);
