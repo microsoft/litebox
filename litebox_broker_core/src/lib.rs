@@ -75,8 +75,8 @@ impl BrokerCoreLimits {
         }
     }
 
-    /// Creates a broker core limit set with explicit socket limits.
-    pub const fn new_with_socket_limits(
+    /// Creates a broker core limit set with every limit specified explicitly.
+    pub const fn new_with_all_limits(
         max_references: usize,
         max_total_pipe_capacity: usize,
         max_sockets: usize,

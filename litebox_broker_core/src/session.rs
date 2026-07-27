@@ -530,7 +530,7 @@ mod tests {
         let broker = BrokerCore::new_with_limits_and_socket_provider(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
-            BrokerCoreLimits::new_with_socket_limits(2, 4, 2, 1),
+            BrokerCoreLimits::new_with_all_limits(2, 4, 2, 1),
             socket_provider.clone(),
         )
         .unwrap();
