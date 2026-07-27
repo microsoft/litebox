@@ -157,17 +157,21 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
     let windows_shared_section =
         crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base);
 
+    let process = Arc::new(Process::default(None, windows_shared_section));
+    let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new());
+    assert!(process.attach_thread(crate::syscalls::process::INITIAL_THREAD_ID, &thread_object));
+
     Task {
         global,
-        process: Arc::new(Process::default(None, windows_shared_section)),
+        process,
         fs,
-        wait_state: litebox::event::wait::WaitState::new(platform),
+        wait_state: crate::wait::WaitState::new(platform),
         entry_point: 0,
         stack_top: 0,
         context: 0,
         teb_address: 0,
-        initial_context: None,
-        thread_object: None,
+        thread_id: crate::syscalls::process::INITIAL_THREAD_ID,
+        thread_object,
     }
 }
 
@@ -195,9 +199,10 @@ fn nt_query_information_thread_reports_process_thread_count() {
     assert_eq!(is_last_thread, 1);
     assert_eq!(return_length as usize, size_of::<u32>());
 
-    task.process
-        .active_thread_count
-        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    assert!(task.process.attach_thread(
+        crate::syscalls::process::INITIAL_THREAD_ID + 1,
+        &Arc::new(crate::syscalls::thread::ThreadObject::new()),
+    ));
     assert_eq!(
         task.sys_nt_query_information_thread(
             crate::syscalls::ThreadHandle::CURRENT,

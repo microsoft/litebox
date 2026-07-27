@@ -59,6 +59,7 @@ use crate::syscalls::{SyscallRequest, ThreadHandle, mm};
 mod loader;
 mod nt_types;
 mod syscalls;
+mod wait;
 
 #[cfg(test)]
 mod tests;
@@ -533,19 +534,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         process.rtl_user_thread_start = load_info.rtl_user_thread_start;
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
+        let thread_object = Arc::new(syscalls::thread::ThreadObject::new());
+        let attached = process.attach_thread(syscalls::process::INITIAL_THREAD_ID, &thread_object);
+        debug_assert!(attached, "a freshly created process cannot be exiting");
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
                 task: Task {
                     global: self.0.clone(),
                     process: process.clone(),
                     fs,
-                    wait_state: litebox::event::wait::WaitState::new(self.0.platform),
+                    wait_state: wait::WaitState::new(self.0.platform),
                     entry_point: load_info.entry_point,
                     stack_top: load_info.stack_top,
                     teb_address: load_info.environment.teb,
                     context: load_info.environment.context,
-                    initial_context: None,
-                    thread_object: None,
+                    thread_id: syscalls::process::INITIAL_THREAD_ID,
+                    thread_object,
                 },
                 _not_send: PhantomData,
             },
@@ -591,10 +595,46 @@ pub struct Process<Platform: ShimPlatform> {
     cookie: u32,
     exit_code: AtomicI32,
     next_thread_id: AtomicUsize,
-    active_thread_count: AtomicUsize,
+    threads: litebox::sync::RwLock<Platform, ProcessThreads<Platform>>,
+}
+
+/// The live threads of a process, and whether the process is tearing down.
+struct ProcessThreads<Platform: ShimPlatform> {
+    /// Set once the process has started exiting. No further threads may be
+    /// created, and the exit code is frozen.
+    group_exit: bool,
+    /// The thread objects of every thread that has not yet completed, keyed by
+    /// thread ID.
+    threads: BTreeMap<usize, Arc<syscalls::thread::ThreadObject<Platform>>>,
 }
 
 impl<Platform: ShimPlatform> Process<Platform> {
+    /// Registers a newly created thread, returning `false` if the process is
+    /// already exiting and the thread must not start.
+    fn attach_thread(
+        &self,
+        thread_id: usize,
+        thread: &Arc<syscalls::thread::ThreadObject<Platform>>,
+    ) -> bool {
+        let mut threads = self.threads.write();
+        if threads.group_exit {
+            return false;
+        }
+        let previous = threads.threads.insert(thread_id, thread.clone());
+        debug_assert!(previous.is_none(), "thread ID {thread_id} already exists");
+        true
+    }
+
+    /// Unregisters a thread that failed to start or has completed.
+    fn detach_thread(&self, thread_id: usize) {
+        self.threads.write().threads.remove(&thread_id);
+    }
+
+    /// Returns the number of threads that have not yet completed.
+    fn live_thread_count(&self) -> usize {
+        self.threads.read().threads.len()
+    }
+
     /// Wait for the process to exit, returning its exit code.
     ///
     /// Currently a placeholder that returns a fixed exit code immediately.
@@ -641,7 +681,10 @@ impl<Platform: ShimPlatform> Process<Platform> {
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
             next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
-            active_thread_count: AtomicUsize::new(1),
+            threads: litebox::sync::RwLock::new(ProcessThreads {
+                group_exit: false,
+                threads: BTreeMap::new(),
+            }),
         }
     }
 }
@@ -650,65 +693,81 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     global: Arc<GlobalState<Platform, FS>>,
     process: Arc<Process<Platform>>,
     fs: Arc<FS>,
-    wait_state: litebox::event::wait::WaitState<Platform>,
+    wait_state: wait::WaitState<Platform>,
     entry_point: usize,
     stack_top: usize,
     context: usize,
     teb_address: usize,
-    initial_context: Option<nt_types::X64Context>,
-    thread_object: Option<Arc<syscalls::thread::ThreadObject<Platform>>>,
+    /// The NT thread ID of this task, used as its key in [`ProcessThreads`].
+    thread_id: usize,
+    /// The NT thread object backing this task.
+    thread_object: Arc<syscalls::thread::ThreadObject<Platform>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    fn complete_current_thread(&self, exit_status: i32) {
-        if let Some(thread) = &self.thread_object {
-            thread.complete(exit_status, || {
-                let previous = self
-                    .process
-                    .active_thread_count
-                    .fetch_sub(1, Ordering::AcqRel);
-                debug_assert!(previous > 1);
-            });
+    fn complete_current_thread(&self) {
+        self.thread_object.complete(|| {
+            self.process.detach_thread(self.thread_id);
+        });
+    }
+
+    /// Marks the current thread as exiting with `exit_status`.
+    fn exit_thread(&self, exit_status: i32) {
+        self.thread_object.exit_thread(exit_status);
+    }
+
+    /// Starts a process-wide exit: records the exit code and asks every thread
+    /// in the process, including this one, to stop running guest code.
+    fn exit_process(&self, exit_status: i32) {
+        let mut threads = self.process.threads.write();
+        if threads.group_exit {
+            return;
+        }
+        threads.group_exit = true;
+        self.process.exit_code.store(exit_status, Ordering::Relaxed);
+        // Interrupting the caller is a no-op, because it is running in the
+        // host, so this does not need to single it out.
+        for thread in threads.threads.values() {
+            thread.begin_exit(exit_status);
         }
     }
 
-    fn finish_thread_operation(
-        &self,
-        operation: ContinueOperation,
-        abnormal_exit_status: i32,
-    ) -> ContinueOperation {
-        if operation == ContinueOperation::Terminate {
-            self.complete_current_thread(abnormal_exit_status);
+    /// Asks every thread in the process except this one to stop running guest
+    /// code, leaving the caller running and the process exit code untouched.
+    fn exit_other_threads(&self, exit_status: i32) {
+        let threads = self.process.threads.read();
+        for (thread_id, thread) in &threads.threads {
+            if *thread_id != self.thread_id {
+                thread.begin_exit(exit_status);
+            }
         }
-        operation
     }
 
-    fn init(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+    fn init(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        // Publish the handle used to interrupt this thread. This must happen on
+        // the thread itself, because the handle captures the current platform
+        // thread.
+        self.publish_thread_handle();
         if !set_guest_teb(self.global.platform, self.teb_address) {
-            return ContinueOperation::Terminate;
+            self.exit_thread(NtStatus::ACCESS_VIOLATION.as_raw());
+            return;
         }
 
-        if let Some(initial_context) = &self.initial_context {
-            initial_context.apply_to_regs(ctx);
-        } else {
-            ctx.rip = self.entry_point;
-            debug_assert_eq!(self.stack_top % 16, core::mem::size_of::<usize>());
-            ctx.rsp = self.stack_top;
-            ctx.eflags = 0x202;
-            ctx.rcx = self.context;
-            ctx.rdx = self
-                .process
-                .ntdll_mapping
-                .as_ref()
-                .map_or(0, |mapping| mapping.base_addr);
-        }
+        ctx.rip = self.entry_point;
+        debug_assert_eq!(self.stack_top % 16, core::mem::size_of::<usize>());
+        ctx.rsp = self.stack_top;
+        ctx.eflags = 0x202;
+        ctx.rcx = self.context;
+        ctx.rdx = self
+            .process
+            .ntdll_mapping
+            .as_ref()
+            .map_or(0, |mapping| mapping.base_addr);
         litebox_util_log::debug!(
             entry_point:% = format_args!("{:#x}", self.entry_point),
             stack_top:% = format_args!("{:#x}", self.stack_top);
             "Starting initial Windows guest thread"
         );
-
-        ContinueOperation::Resume
     }
 
     fn typed_handle_entry<Subsystem>(
@@ -865,7 +924,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
     }
 
-    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
                 .read_at_offset(0)
@@ -880,17 +939,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 arg3:% = format_args!("{:#x}", ctx.r9);
                 "Unsupported Windows syscall; terminating Windows guest"
             );
-            return ContinueOperation::Terminate;
+            self.exit_thread(NtStatus::NOT_SUPPORTED.as_raw());
+            return;
         };
         litebox_util_log::debug!(
             syscall:? = NtSysno::from_raw(ctx.orig_rax);
             "Handling Windows syscall"
         );
-        let (result, op) = match req {
-            SyscallRequest::NtClose { handle } => {
-                let status = self.sys_nt_close(handle);
-                (status, ContinueOperation::Resume)
-            }
+        let result = match req {
+            SyscallRequest::NtClose { handle } => self.sys_nt_close(handle),
             SyscallRequest::NtDuplicateObject {
                 source_process_handle,
                 source_handle,
@@ -899,85 +956,66 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 desired_access,
                 handle_attributes,
                 options,
-            } => {
-                let status = self.sys_nt_duplicate_object(
-                    source_process_handle,
-                    source_handle,
-                    target_process_handle,
-                    target_handle,
-                    desired_access,
-                    handle_attributes,
-                    options,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_duplicate_object(
+                source_process_handle,
+                source_handle,
+                target_process_handle,
+                target_handle,
+                desired_access,
+                handle_attributes,
+                options,
+            ),
             SyscallRequest::NtCreateEvent {
                 event_handle,
                 desired_access,
                 object_attributes,
                 event_type,
                 initial_state,
-            } => {
-                let status = self.sys_nt_create_event(
-                    event_handle,
-                    desired_access,
-                    object_attributes,
-                    event_type,
-                    initial_state,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_event(
+                event_handle,
+                desired_access,
+                object_attributes,
+                event_type,
+                initial_state,
+            ),
             SyscallRequest::NtCreateDirectoryObject {
                 directory_handle,
                 desired_access,
                 object_attributes,
-            } => {
-                let status = self.sys_nt_create_directory_object(
-                    directory_handle,
-                    desired_access,
-                    object_attributes,
-                    syscalls::Handle::default(),
-                    0,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_directory_object(
+                directory_handle,
+                desired_access,
+                object_attributes,
+                syscalls::Handle::default(),
+                0,
+            ),
             SyscallRequest::NtCreateDirectoryObjectEx {
                 directory_handle,
                 desired_access,
                 object_attributes,
                 shadow_directory_handle,
                 flags,
-            } => {
-                let status = self.sys_nt_create_directory_object(
-                    directory_handle,
-                    desired_access,
-                    object_attributes,
-                    shadow_directory_handle,
-                    flags,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_directory_object(
+                directory_handle,
+                desired_access,
+                object_attributes,
+                shadow_directory_handle,
+                flags,
+            ),
             SyscallRequest::NtOpenDirectoryObject {
                 directory_handle,
                 desired_access,
                 object_attributes,
-            } => {
-                let status = self.sys_nt_open_directory_object(
-                    directory_handle,
-                    desired_access,
-                    object_attributes,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_open_directory_object(
+                directory_handle,
+                desired_access,
+                object_attributes,
+            ),
             SyscallRequest::NtOpenSection {
                 section_handle,
                 desired_access,
                 object_attributes,
-            } => {
-                let status =
-                    self.sys_nt_open_section(section_handle, desired_access, object_attributes);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_open_section(section_handle, desired_access, object_attributes),
             SyscallRequest::NtQueryDirectoryObject {
                 directory_handle,
                 buffer,
@@ -986,72 +1024,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 restart_scan,
                 context,
                 return_length,
-            } => {
-                let status = self.sys_nt_query_directory_object(
-                    syscalls::object_manager::DirectoryQueryParameters {
-                        directory_handle,
-                        buffer,
-                        buffer_length,
-                        return_single_entry,
-                        restart_scan,
-                        context,
-                        return_length,
-                    },
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_directory_object(
+                syscalls::object_manager::DirectoryQueryParameters {
+                    directory_handle,
+                    buffer,
+                    buffer_length,
+                    return_single_entry,
+                    restart_scan,
+                    context,
+                    return_length,
+                },
+            ),
             SyscallRequest::NtCreateSymbolicLinkObject {
                 link_handle,
                 desired_access,
                 object_attributes,
                 link_target,
-            } => {
-                let status = self.sys_nt_create_symbolic_link_object(
-                    link_handle,
-                    desired_access,
-                    object_attributes,
-                    link_target,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_symbolic_link_object(
+                link_handle,
+                desired_access,
+                object_attributes,
+                link_target,
+            ),
             SyscallRequest::NtOpenSymbolicLinkObject {
                 link_handle,
                 desired_access,
                 object_attributes,
-            } => {
-                let status = self.sys_nt_open_symbolic_link_object(
-                    link_handle,
-                    desired_access,
-                    object_attributes,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_open_symbolic_link_object(
+                link_handle,
+                desired_access,
+                object_attributes,
+            ),
             SyscallRequest::NtQuerySymbolicLinkObject {
                 link_handle,
                 link_target,
                 returned_length,
-            } => {
-                let status = self.sys_nt_query_symbolic_link_object(
-                    link_handle,
-                    link_target,
-                    returned_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_symbolic_link_object(link_handle, link_target, returned_length),
             SyscallRequest::NtCreateIoCompletion {
                 io_completion_handle,
                 desired_access,
                 object_attributes,
                 number_of_concurrent_threads,
-            } => {
-                let status = self.sys_nt_create_io_completion(
-                    io_completion_handle,
-                    desired_access,
-                    object_attributes,
-                    number_of_concurrent_threads,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_io_completion(
+                io_completion_handle,
+                desired_access,
+                object_attributes,
+                number_of_concurrent_threads,
+            ),
             SyscallRequest::NtConnectPort {
                 port_handle,
                 port_name,
@@ -1061,24 +1080,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 max_message_length,
                 connection_information,
                 connection_information_length,
-            } => {
-                let status = self.sys_nt_connect_port(syscalls::lpc::ConnectPortParameters {
-                    port_handle,
-                    port_name,
-                    security_qos,
-                    client_view,
-                    server_view,
-                    max_message_length,
-                    connection_information,
-                    connection_information_length,
-                });
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_connect_port(syscalls::lpc::ConnectPortParameters {
+                port_handle,
+                port_name,
+                security_qos,
+                client_view,
+                server_view,
+                max_message_length,
+                connection_information,
+                connection_information_length,
+            }),
             SyscallRequest::NtSecureConnectPort => {
                 litebox_util_log::debug!(
                     "Rejected NtSecureConnectPort; only the CSR NtConnectPort subset is modeled"
                 );
-                (NtStatus::NOT_SUPPORTED, ContinueOperation::Resume)
+                NtStatus::NOT_SUPPORTED
             }
             SyscallRequest::NtCreateSection {
                 section_handle,
@@ -1088,18 +1104,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 section_page_protection,
                 allocation_attributes,
                 file_handle,
-            } => {
-                let status = self.sys_nt_create_section(
-                    section_handle,
-                    desired_access,
-                    object_attributes,
-                    maximum_size,
-                    section_page_protection,
-                    allocation_attributes,
-                    file_handle,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_section(
+                section_handle,
+                desired_access,
+                object_attributes,
+                maximum_size,
+                section_page_protection,
+                allocation_attributes,
+                file_handle,
+            ),
             SyscallRequest::NtCreateSectionEx {
                 section_handle,
                 desired_access,
@@ -1110,32 +1123,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 file_handle,
                 extended_parameters,
                 extended_parameter_count,
-            } => {
-                let status = self.sys_nt_create_section_ex(
-                    section_handle,
-                    desired_access,
-                    object_attributes,
-                    maximum_size,
-                    section_page_protection,
-                    allocation_attributes,
-                    file_handle,
-                    extended_parameters,
-                    extended_parameter_count,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_section_ex(
+                section_handle,
+                desired_access,
+                object_attributes,
+                maximum_size,
+                section_page_protection,
+                allocation_attributes,
+                file_handle,
+                extended_parameters,
+                extended_parameter_count,
+            ),
             SyscallRequest::NtCreateWaitCompletionPacket {
                 wait_completion_packet_handle,
                 desired_access,
                 object_attributes,
-            } => {
-                let status = self.sys_nt_create_wait_completion_packet(
-                    wait_completion_packet_handle,
-                    desired_access,
-                    object_attributes,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_wait_completion_packet(
+                wait_completion_packet_handle,
+                desired_access,
+                object_attributes,
+            ),
             SyscallRequest::NtAssociateWaitCompletionPacket {
                 wait_completion_packet_handle,
                 io_completion_handle,
@@ -1145,31 +1152,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 io_status,
                 io_status_information,
                 already_signaled,
-            } => {
-                let status = self.sys_nt_associate_wait_completion_packet(
-                    WaitCompletionPacketAssociateParameters {
-                        wait_completion_packet_handle,
-                        io_completion_handle,
-                        target_object_handle,
-                        key_context,
-                        apc_context,
-                        io_status,
-                        io_status_information,
-                        already_signaled,
-                    },
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_associate_wait_completion_packet(
+                WaitCompletionPacketAssociateParameters {
+                    wait_completion_packet_handle,
+                    io_completion_handle,
+                    target_object_handle,
+                    key_context,
+                    apc_context,
+                    io_status,
+                    io_status_information,
+                    already_signaled,
+                },
+            ),
             SyscallRequest::NtCancelWaitCompletionPacket {
                 wait_completion_packet_handle,
                 remove_signaled_packet,
-            } => {
-                let status = self.sys_nt_cancel_wait_completion_packet(
-                    wait_completion_packet_handle,
-                    remove_signaled_packet,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_cancel_wait_completion_packet(
+                wait_completion_packet_handle,
+                remove_signaled_packet,
+            ),
             SyscallRequest::NtCreateWorkerFactory {
                 worker_factory_handle,
                 desired_access,
@@ -1181,121 +1182,85 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 max_thread_count,
                 stack_reserve,
                 stack_commit,
-            } => {
-                let status = self.sys_nt_create_worker_factory(WorkerFactoryCreateParameters {
-                    worker_factory_handle,
-                    desired_access,
-                    object_attributes,
-                    completion_port_handle,
-                    worker_process_handle,
-                    start_routine,
-                    start_parameter,
-                    max_thread_count,
-                    stack_reserve,
-                    stack_commit,
-                });
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_worker_factory(WorkerFactoryCreateParameters {
+                worker_factory_handle,
+                desired_access,
+                object_attributes,
+                completion_port_handle,
+                worker_process_handle,
+                start_routine,
+                start_parameter,
+                max_thread_count,
+                stack_reserve,
+                stack_commit,
+            }),
             SyscallRequest::NtSetInformationWorkerFactory {
                 worker_factory_handle,
                 worker_factory_information_class,
                 worker_factory_information,
                 worker_factory_information_length,
-            } => {
-                let status = self.sys_nt_set_information_worker_factory(
-                    worker_factory_handle,
-                    worker_factory_information_class,
-                    worker_factory_information,
-                    worker_factory_information_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_set_information_worker_factory(
+                worker_factory_handle,
+                worker_factory_information_class,
+                worker_factory_information,
+                worker_factory_information_length,
+            ),
             SyscallRequest::NtShutdownWorkerFactory {
                 worker_factory_handle,
                 pending_worker_count,
-            } => {
-                let status = self
-                    .sys_nt_shutdown_worker_factory(worker_factory_handle, pending_worker_count);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_shutdown_worker_factory(worker_factory_handle, pending_worker_count),
             SyscallRequest::NtCreateTimer2 {
                 timer_handle,
                 timer_id,
                 object_attributes,
                 attributes,
                 desired_access,
-            } => {
-                let status = self.sys_nt_create_timer2(TimerCreateParameters {
-                    timer_handle,
-                    timer_id,
-                    object_attributes,
-                    attributes,
-                    desired_access,
-                });
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_timer2(TimerCreateParameters {
+                timer_handle,
+                timer_id,
+                object_attributes,
+                attributes,
+                desired_access,
+            }),
             SyscallRequest::NtSetTimer2 {
                 timer_handle,
                 due_time,
                 period,
                 parameters,
-            } => {
-                let status = self.sys_nt_set_timer2(timer_handle, due_time, period, parameters);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_set_timer2(timer_handle, due_time, period, parameters),
             SyscallRequest::NtOpenEvent {
                 event_handle,
                 desired_access,
                 object_attributes,
-            } => {
-                let status =
-                    self.sys_nt_open_event(event_handle, desired_access, object_attributes);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_open_event(event_handle, desired_access, object_attributes),
             SyscallRequest::NtSetEvent {
                 event_handle,
                 previous_state,
-            } => {
-                let status = self.sys_nt_set_event(event_handle, previous_state);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_set_event(event_handle, previous_state),
             SyscallRequest::NtResetEvent {
                 event_handle,
                 previous_state,
-            } => {
-                let status = self.sys_nt_reset_event(event_handle, previous_state);
-                (status, ContinueOperation::Resume)
-            }
-            SyscallRequest::NtClearEvent { event_handle } => {
-                let status = self.sys_nt_clear_event(event_handle);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_reset_event(event_handle, previous_state),
+            SyscallRequest::NtClearEvent { event_handle } => self.sys_nt_clear_event(event_handle),
             SyscallRequest::NtPulseEvent {
                 event_handle,
                 previous_state,
-            } => {
-                let status = self.sys_nt_pulse_event(event_handle, previous_state);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_pulse_event(event_handle, previous_state),
             SyscallRequest::NtQueryEvent {
                 event_handle,
                 event_information_class,
                 event_information,
                 event_information_length,
                 return_length,
-            } => {
-                let status = self.sys_nt_query_event(
-                    event_handle,
-                    event_information_class,
-                    event_information,
-                    event_information_length,
-                    return_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_event(
+                event_handle,
+                event_information_class,
+                event_information,
+                event_information_length,
+                return_length,
+            ),
             SyscallRequest::NtSetEventBoostPriority { event_handle } => {
-                let status = self.sys_nt_set_event_boost_priority(event_handle);
-                (status, ContinueOperation::Resume)
+                self.sys_nt_set_event_boost_priority(event_handle)
             }
             SyscallRequest::NtOpenFile {
                 file_handle,
@@ -1304,17 +1269,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 io_status_block,
                 share_access,
                 open_options,
-            } => {
-                let status = self.sys_nt_open_file(
-                    file_handle,
-                    desired_access,
-                    object_attributes,
-                    io_status_block,
-                    share_access,
-                    open_options,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_open_file(
+                file_handle,
+                desired_access,
+                object_attributes,
+                io_status_block,
+                share_access,
+                open_options,
+            ),
             SyscallRequest::NtCreateFile {
                 file_handle,
                 desired_access,
@@ -1327,22 +1289,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 create_options,
                 ea_buffer,
                 ea_length,
-            } => {
-                let status = self.sys_nt_create_file(
-                    file_handle,
-                    desired_access,
-                    object_attributes,
-                    io_status_block,
-                    allocation_size,
-                    file_attributes,
-                    share_access,
-                    create_disposition,
-                    create_options,
-                    ea_buffer,
-                    ea_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_file(
+                file_handle,
+                desired_access,
+                object_attributes,
+                io_status_block,
+                allocation_size,
+                file_attributes,
+                share_access,
+                create_disposition,
+                create_options,
+                ea_buffer,
+                ea_length,
+            ),
             SyscallRequest::NtWriteFile {
                 file_handle,
                 event,
@@ -1353,36 +1312,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 length,
                 byte_offset,
                 key,
-            } => {
-                let status = self.sys_nt_write_file(
-                    file_handle,
-                    event,
-                    apc_routine,
-                    apc_context,
-                    io_status_block,
-                    buffer,
-                    length,
-                    byte_offset,
-                    key,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_write_file(
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                buffer,
+                length,
+                byte_offset,
+                key,
+            ),
             SyscallRequest::NtQueryVolumeInformationFile {
                 file_handle,
                 io_status_block,
                 fs_information,
                 length,
                 fs_information_class,
-            } => {
-                let status = self.sys_nt_query_volume_information_file(
-                    file_handle,
-                    io_status_block,
-                    fs_information,
-                    length,
-                    fs_information_class,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_volume_information_file(
+                file_handle,
+                io_status_block,
+                fs_information,
+                length,
+                fs_information_class,
+            ),
             SyscallRequest::NtDeviceIoControlFile {
                 file_handle,
                 event,
@@ -1394,39 +1347,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 input_buffer_length,
                 output_buffer,
                 output_buffer_length,
-            } => {
-                let status = self.sys_nt_device_io_control_file(
-                    file_handle,
-                    event,
-                    apc_routine,
-                    apc_context,
-                    io_status_block,
-                    io_control_code,
-                    input_buffer,
-                    input_buffer_length,
-                    output_buffer,
-                    output_buffer_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_device_io_control_file(
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                io_control_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+            ),
             SyscallRequest::NtApphelpCacheControl {
                 service_class,
                 service_data,
-            } => {
-                let status = syscalls::apphelp::sys_nt_apphelp_cache_control::<Platform>(
-                    service_class,
-                    service_data,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => syscalls::apphelp::sys_nt_apphelp_cache_control::<Platform>(
+                service_class,
+                service_data,
+            ),
             SyscallRequest::NtOpenKey {
                 key_handle,
                 desired_access,
                 object_attributes,
-            } => {
-                let status = self.sys_nt_open_key(key_handle, desired_access, object_attributes);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_open_key(key_handle, desired_access, object_attributes),
             SyscallRequest::NtQueryValueKey {
                 key_handle,
                 value_name,
@@ -1434,99 +1378,68 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 key_value_information,
                 length,
                 result_length,
-            } => {
-                let status = self.sys_nt_query_value_key(
-                    key_handle,
-                    value_name,
-                    key_value_information_class,
-                    key_value_information,
-                    length,
-                    result_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_value_key(
+                key_handle,
+                value_name,
+                key_value_information_class,
+                key_value_information,
+                length,
+                result_length,
+            ),
             SyscallRequest::NtGetNlsSectionPtr {
                 section_type,
                 section_data,
                 context_data,
                 section_pointer,
                 section_size,
-            } => {
-                let status = self.sys_nt_get_nls_section_ptr(
-                    section_type,
-                    section_data,
-                    context_data,
-                    section_pointer,
-                    section_size,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_get_nls_section_ptr(
+                section_type,
+                section_data,
+                context_data,
+                section_pointer,
+                section_size,
+            ),
             SyscallRequest::NtInitializeNlsFiles {
                 base_address,
                 default_locale_id,
                 default_casing_table_size,
-            } => {
-                let status = self.sys_nt_initialize_nls_files(
-                    base_address,
-                    default_locale_id,
-                    default_casing_table_size,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_initialize_nls_files(
+                base_address,
+                default_locale_id,
+                default_casing_table_size,
+            ),
             SyscallRequest::NtQueryDefaultLocale {
                 user_profile,
                 default_locale_id,
-            } => {
-                let status = self.sys_nt_query_default_locale(user_profile, default_locale_id);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_default_locale(user_profile, default_locale_id),
             SyscallRequest::NtSetDefaultLocale {
                 user_profile,
                 default_locale_id,
-            } => {
-                let status = self.sys_nt_set_default_locale(user_profile, default_locale_id);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_set_default_locale(user_profile, default_locale_id),
             SyscallRequest::NtQueryDefaultUILanguage {
                 default_ui_language,
-            } => {
-                let status = self.sys_nt_query_default_ui_language(default_ui_language);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_default_ui_language(default_ui_language),
             SyscallRequest::NtSetDefaultUILanguage {
                 default_ui_language,
-            } => {
-                let status = self.sys_nt_set_default_ui_language(default_ui_language);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_set_default_ui_language(default_ui_language),
             SyscallRequest::NtQueryInstallUILanguage {
                 install_ui_language,
-            } => {
-                let status = self.sys_nt_query_install_ui_language(install_ui_language);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_install_ui_language(install_ui_language),
             SyscallRequest::NtQueryPerformanceCounter {
                 performance_counter,
                 performance_frequency,
-            } => {
-                let status = self
-                    .sys_nt_query_performance_counter(performance_counter, performance_frequency);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_performance_counter(performance_counter, performance_frequency),
             SyscallRequest::NtQuerySystemInformation {
                 system_information_class,
                 system_information,
                 system_information_length,
                 return_length,
-            } => {
-                let status = Self::sys_nt_query_system_information(
-                    system_information_class,
-                    system_information,
-                    system_information_length,
-                    return_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => Self::sys_nt_query_system_information(
+                system_information_class,
+                system_information,
+                system_information_length,
+                return_length,
+            ),
             SyscallRequest::NtQuerySystemInformationEx {
                 system_information_class,
                 input_buffer,
@@ -1534,17 +1447,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 system_information,
                 system_information_length,
                 return_length,
-            } => {
-                let status = Self::sys_nt_query_system_information_ex(
-                    system_information_class,
-                    input_buffer,
-                    input_buffer_length,
-                    system_information,
-                    system_information_length,
-                    return_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => Self::sys_nt_query_system_information_ex(
+                system_information_class,
+                input_buffer,
+                input_buffer_length,
+                system_information,
+                system_information_length,
+                return_length,
+            ),
             SyscallRequest::NtQueryWnfStateData {
                 state_name,
                 type_id,
@@ -1552,17 +1462,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 change_stamp,
                 buffer,
                 buffer_size,
-            } => {
-                let status = self.sys_nt_query_wnf_state_data(
-                    state_name,
-                    type_id,
-                    explicit_scope,
-                    change_stamp,
-                    buffer,
-                    buffer_size,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_wnf_state_data(
+                state_name,
+                type_id,
+                explicit_scope,
+                change_stamp,
+                buffer,
+                buffer_size,
+            ),
             SyscallRequest::NtCreateWnfStateName {
                 state_name,
                 name_lifetime,
@@ -1571,20 +1478,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 type_id,
                 maximum_state_size,
                 security_descriptor,
-            } => {
-                let status = self.sys_nt_create_wnf_state_name(
-                    syscalls::wnf::WnfCreateStateNameParameters {
-                        state_name,
-                        name_lifetime,
-                        data_scope,
-                        persist_data,
-                        type_id,
-                        maximum_state_size,
-                        security_descriptor,
-                    },
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_wnf_state_name(syscalls::wnf::WnfCreateStateNameParameters {
+                state_name,
+                name_lifetime,
+                data_scope,
+                persist_data,
+                type_id,
+                maximum_state_size,
+                security_descriptor,
+            }),
             SyscallRequest::NtUpdateWnfStateData {
                 state_name,
                 buffer,
@@ -1593,30 +1495,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 explicit_scope,
                 matching_change_stamp,
                 check_stamp,
-            } => {
-                let status = self.sys_nt_update_wnf_state_data(
-                    syscalls::wnf::WnfUpdateStateDataParameters {
-                        state_name,
-                        buffer,
-                        buffer_size,
-                        type_id,
-                        explicit_scope,
-                        matching_change_stamp,
-                        check_stamp,
-                    },
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_update_wnf_state_data(syscalls::wnf::WnfUpdateStateDataParameters {
+                state_name,
+                buffer,
+                buffer_size,
+                type_id,
+                explicit_scope,
+                matching_change_stamp,
+                check_stamp,
+            }),
             SyscallRequest::NtDeleteWnfStateData {
                 state_name,
                 explicit_scope,
-            } => {
-                let status = self.sys_nt_delete_wnf_state_data(state_name, explicit_scope);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_delete_wnf_state_data(state_name, explicit_scope),
             SyscallRequest::NtDeleteWnfStateName { state_name } => {
-                let status = self.sys_nt_delete_wnf_state_name(state_name);
-                (status, ContinueOperation::Resume)
+                self.sys_nt_delete_wnf_state_name(state_name)
             }
             SyscallRequest::NtQueryWnfStateNameInformation {
                 state_name,
@@ -1624,92 +1517,74 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 explicit_scope,
                 buffer,
                 buffer_size,
-            } => {
-                let status = self.sys_nt_query_wnf_state_name_information(
-                    state_name,
-                    name_information_class,
-                    explicit_scope,
-                    buffer,
-                    buffer_size,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_wnf_state_name_information(
+                state_name,
+                name_information_class,
+                explicit_scope,
+                buffer,
+                buffer_size,
+            ),
             SyscallRequest::NtQuerySection {
                 section_handle,
                 section_information_class,
                 section_information,
                 section_information_length,
                 return_length,
-            } => {
-                let status = self.sys_nt_query_section(
-                    section_handle,
-                    section_information_class,
-                    section_information,
-                    section_information_length,
-                    return_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_section(
+                section_handle,
+                section_information_class,
+                section_information,
+                section_information_length,
+                return_length,
+            ),
             SyscallRequest::NtQueryInformationProcess {
                 process_handle,
                 process_information_class,
                 process_information,
                 process_information_length,
                 return_length,
-            } => {
-                let status = self.sys_nt_query_information_process(
-                    process_handle,
-                    process_information_class,
-                    process_information,
-                    process_information_length,
-                    return_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_information_process(
+                process_handle,
+                process_information_class,
+                process_information,
+                process_information_length,
+                return_length,
+            ),
             SyscallRequest::NtSetInformationProcess {
                 process_handle,
                 process_information_class,
                 process_information,
                 process_information_length,
-            } => {
-                let status = self.sys_nt_set_information_process(
-                    process_handle,
-                    process_information_class,
-                    process_information,
-                    process_information_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_set_information_process(
+                process_handle,
+                process_information_class,
+                process_information,
+                process_information_length,
+            ),
             SyscallRequest::NtSetInformationThread {
                 thread_handle,
                 thread_information_class,
                 thread_information,
                 thread_information_length,
-            } => {
-                let status = Self::sys_nt_set_information_thread(
-                    thread_handle,
-                    thread_information_class,
-                    thread_information,
-                    thread_information_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => Self::sys_nt_set_information_thread(
+                thread_handle,
+                thread_information_class,
+                thread_information,
+                thread_information_length,
+            ),
             SyscallRequest::NtQueryInformationThread {
                 thread_handle,
                 thread_information_class,
                 thread_information,
                 thread_information_length,
                 return_length,
-            } => {
-                let status = self.sys_nt_query_information_thread(
-                    thread_handle,
-                    thread_information_class,
-                    thread_information,
-                    thread_information_length,
-                    return_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_information_thread(
+                thread_handle,
+                thread_information_class,
+                thread_information,
+                thread_information_length,
+                return_length,
+            ),
             SyscallRequest::NtCreateThreadEx {
                 thread_handle,
                 desired_access,
@@ -1722,100 +1597,78 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 stack_size,
                 maximum_stack_size,
                 attribute_list,
-            } => {
-                let status = self.sys_nt_create_thread_ex(
-                    ctx,
-                    thread_handle,
-                    desired_access,
-                    object_attributes,
-                    process_handle,
-                    start_routine,
-                    argument,
-                    create_flags,
-                    zero_bits,
-                    stack_size,
-                    maximum_stack_size,
-                    attribute_list,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_create_thread_ex(
+                ctx,
+                thread_handle,
+                desired_access,
+                object_attributes,
+                process_handle,
+                start_routine,
+                argument,
+                create_flags,
+                zero_bits,
+                stack_size,
+                maximum_stack_size,
+                attribute_list,
+            ),
             SyscallRequest::NtWaitForSingleObject {
                 handle,
                 alertable,
                 timeout,
-            } => {
-                let status = self.sys_nt_wait_for_single_object(handle, alertable, timeout);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_wait_for_single_object(handle, alertable, timeout),
             SyscallRequest::NtOpenThreadToken {
                 thread_handle,
                 desired_access,
                 open_as_self,
                 token_handle,
-            } => {
-                let status = Self::sys_nt_open_thread_token(
-                    thread_handle,
-                    desired_access,
-                    open_as_self,
-                    token_handle,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => Self::sys_nt_open_thread_token(
+                thread_handle,
+                desired_access,
+                open_as_self,
+                token_handle,
+            ),
             SyscallRequest::NtOpenThreadTokenEx {
                 thread_handle,
                 desired_access,
                 open_as_self,
                 handle_attributes,
                 token_handle,
-            } => {
-                let status = Self::sys_nt_open_thread_token_ex(
-                    thread_handle,
-                    desired_access,
-                    open_as_self,
-                    handle_attributes,
-                    token_handle,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => Self::sys_nt_open_thread_token_ex(
+                thread_handle,
+                desired_access,
+                open_as_self,
+                handle_attributes,
+                token_handle,
+            ),
             SyscallRequest::NtOpenProcessToken {
                 process_handle,
                 desired_access,
                 token_handle,
-            } => {
-                let status =
-                    self.sys_nt_open_process_token(process_handle, desired_access, token_handle);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_open_process_token(process_handle, desired_access, token_handle),
             SyscallRequest::NtOpenProcessTokenEx {
                 process_handle,
                 desired_access,
                 handle_attributes,
                 token_handle,
-            } => {
-                let status = self.sys_nt_open_process_token_ex(
-                    process_handle,
-                    desired_access,
-                    handle_attributes,
-                    token_handle,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_open_process_token_ex(
+                process_handle,
+                desired_access,
+                handle_attributes,
+                token_handle,
+            ),
             SyscallRequest::NtQueryInformationToken {
                 token_handle,
                 token_information_class,
                 token_information,
                 token_information_length,
                 return_length,
-            } => {
-                let status = self.sys_nt_query_information_token(
-                    token_handle,
-                    token_information_class,
-                    token_information,
-                    token_information_length,
-                    return_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_information_token(
+                token_handle,
+                token_information_class,
+                token_information,
+                token_information_length,
+                return_length,
+            ),
             SyscallRequest::NtQuerySecurityAttributesToken {
                 token_handle,
                 attributes,
@@ -1823,31 +1676,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 buffer,
                 length,
                 return_length,
-            } => {
-                let status = self.sys_nt_query_security_attributes_token(
-                    token_handle,
-                    attributes,
-                    number_of_attributes,
-                    buffer,
-                    length,
-                    return_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_security_attributes_token(
+                token_handle,
+                attributes,
+                number_of_attributes,
+                buffer,
+                length,
+                return_length,
+            ),
             SyscallRequest::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
                 flag,
                 source,
                 destination,
                 conversion_error,
-            } => {
-                let status = Self::sys_nt_convert_between_auxiliary_counter_and_performance_counter(
-                    flag,
-                    source,
-                    destination,
-                    conversion_error,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => Self::sys_nt_convert_between_auxiliary_counter_and_performance_counter(
+                flag,
+                source,
+                destination,
+                conversion_error,
+            ),
             SyscallRequest::NtAllocateVirtualMemory {
                 process_handle,
                 base_address,
@@ -1855,17 +1702,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 region_size,
                 allocation_type,
                 protect,
-            } => {
-                let status = self.sys_nt_allocate_virtual_memory(
-                    process_handle,
-                    base_address,
-                    zero_bits,
-                    region_size,
-                    allocation_type,
-                    protect,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_allocate_virtual_memory(
+                process_handle,
+                base_address,
+                zero_bits,
+                region_size,
+                allocation_type,
+                protect,
+            ),
             SyscallRequest::NtAllocateVirtualMemoryEx {
                 process_handle,
                 base_address,
@@ -1874,50 +1718,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 protect,
                 extended_parameters,
                 extended_parameter_count,
-            } => {
-                let status = self.sys_nt_allocate_virtual_memory_ex(
-                    process_handle,
-                    base_address,
-                    region_size,
-                    allocation_type,
-                    protect,
-                    mm::MemoryExtendedParameters {
-                        parameters: extended_parameters,
-                        count: extended_parameter_count,
-                    },
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_allocate_virtual_memory_ex(
+                process_handle,
+                base_address,
+                region_size,
+                allocation_type,
+                protect,
+                mm::MemoryExtendedParameters {
+                    parameters: extended_parameters,
+                    count: extended_parameter_count,
+                },
+            ),
             SyscallRequest::NtFreeVirtualMemory {
                 process_handle,
                 base_address,
                 region_size,
                 free_type,
-            } => {
-                let status = self.sys_nt_free_virtual_memory(
-                    process_handle,
-                    base_address,
-                    region_size,
-                    free_type,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_free_virtual_memory(
+                process_handle,
+                base_address,
+                region_size,
+                free_type,
+            ),
             SyscallRequest::NtProtectVirtualMemory {
                 process_handle,
                 base_address,
                 region_size,
                 new_protect,
                 old_protect,
-            } => {
-                let status = self.sys_nt_protect_virtual_memory(
-                    process_handle,
-                    base_address,
-                    region_size,
-                    new_protect,
-                    old_protect,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_protect_virtual_memory(
+                process_handle,
+                base_address,
+                region_size,
+                new_protect,
+                old_protect,
+            ),
             SyscallRequest::NtQueryVirtualMemory {
                 process_handle,
                 base_address,
@@ -1925,17 +1760,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 memory_information,
                 memory_information_length,
                 return_length,
-            } => {
-                let status = self.sys_nt_query_virtual_memory(
-                    process_handle,
-                    base_address,
-                    memory_information_class,
-                    memory_information,
-                    memory_information_length,
-                    return_length,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_query_virtual_memory(
+                process_handle,
+                base_address,
+                memory_information_class,
+                memory_information,
+                memory_information_length,
+                return_length,
+            ),
             SyscallRequest::NtMapViewOfSection {
                 section_handle,
                 process_handle,
@@ -1947,21 +1779,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 inherit_disposition,
                 allocation_type,
                 page_protection,
-            } => {
-                let status = self.sys_nt_map_view_of_section(MapViewOfSectionParameters {
-                    section_handle,
-                    process_handle,
-                    base_address,
-                    zero_bits,
-                    commit_size,
-                    section_offset,
-                    view_size,
-                    inherit_disposition,
-                    allocation_type,
-                    page_protection,
-                });
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle,
+                process_handle,
+                base_address,
+                zero_bits,
+                commit_size,
+                section_offset,
+                view_size,
+                inherit_disposition,
+                allocation_type,
+                page_protection,
+            }),
             SyscallRequest::NtMapViewOfSectionEx {
                 section_handle,
                 process_handle,
@@ -1975,70 +1804,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 page_protection,
                 extended_parameters,
                 extended_parameter_count,
-            } => {
-                let status = self.sys_nt_map_view_of_section_ex(
-                    MapViewOfSectionParameters {
-                        section_handle,
-                        process_handle,
-                        base_address,
-                        zero_bits,
-                        commit_size,
-                        section_offset,
-                        view_size,
-                        inherit_disposition,
-                        allocation_type,
-                        page_protection,
-                    },
-                    extended_parameters,
-                    extended_parameter_count,
-                );
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_map_view_of_section_ex(
+                MapViewOfSectionParameters {
+                    section_handle,
+                    process_handle,
+                    base_address,
+                    zero_bits,
+                    commit_size,
+                    section_offset,
+                    view_size,
+                    inherit_disposition,
+                    allocation_type,
+                    page_protection,
+                },
+                extended_parameters,
+                extended_parameter_count,
+            ),
             SyscallRequest::NtUnmapViewOfSection {
                 process_handle,
                 base_address,
-            } => {
-                let status = self.sys_nt_unmap_view_of_section(process_handle, base_address);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_unmap_view_of_section(process_handle, base_address),
             SyscallRequest::NtUnmapViewOfSectionEx {
                 process_handle,
                 base_address,
                 flags,
-            } => {
-                let status =
-                    self.sys_nt_unmap_view_of_section_ex(process_handle, base_address, flags);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_unmap_view_of_section_ex(process_handle, base_address, flags),
             SyscallRequest::NtContinue {
                 context,
                 test_alert,
             } => match Self::sys_nt_continue(ctx, context, test_alert) {
-                Ok(()) => return ContinueOperation::Resume,
-                Err(status) => (status, ContinueOperation::Resume),
+                Ok(()) => return,
+                Err(status) => status,
             },
             SyscallRequest::NtTraceEvent {
                 trace_handle,
                 flags,
                 field_size,
                 fields,
-            } => {
-                let status = self.sys_nt_trace_event(trace_handle, flags, field_size, fields);
-                (status, ContinueOperation::Resume)
-            }
+            } => self.sys_nt_trace_event(trace_handle, flags, field_size, fields),
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,
             } => {
-                if !process_handle.is_null() && !process_handle.is_current() {
+                if process_handle.is_null() {
+                    // A null handle terminates every other thread in the
+                    // current process but spares the caller.
+                    self.exit_other_threads(exit_status);
+                    NtStatus::SUCCESS
+                } else if process_handle.is_current() {
+                    self.exit_process(exit_status);
+                    NtStatus::SUCCESS
+                } else {
                     // TODO: allow terminating other processes
                     litebox_util_log::error!("Terminating other processes is not yet supported");
-                    (NtStatus::INVALID_HANDLE, ContinueOperation::Resume)
-                } else {
-                    // TODO: Terminate all threads except the calling one if process_handle is zero.
-                    self.process.exit_code.store(exit_status, Ordering::Relaxed);
-                    self.complete_current_thread(exit_status);
-                    (NtStatus::SUCCESS, ContinueOperation::Terminate)
+                    NtStatus::INVALID_HANDLE
                 }
             }
             SyscallRequest::NtTerminateThread {
@@ -2046,23 +1865,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 exit_status,
             } => {
                 if !thread_handle.is_null() && thread_handle != ThreadHandle::CURRENT {
-                    (NtStatus::NOT_SUPPORTED, ContinueOperation::Resume)
+                    NtStatus::NOT_SUPPORTED
                 } else {
-                    self.complete_current_thread(exit_status);
-                    (NtStatus::SUCCESS, ContinueOperation::Terminate)
+                    self.exit_thread(exit_status);
+                    NtStatus::SUCCESS
                 }
             }
             SyscallRequest::NtTestAlert => {
                 Self::test_alert();
-                (NtStatus::SUCCESS, ContinueOperation::Resume)
+                NtStatus::SUCCESS
             }
-            SyscallRequest::NtManageHotPatch => {
-                (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
-            }
+            SyscallRequest::NtManageHotPatch => NtStatus::NOT_IMPLEMENTED,
         };
 
         ctx.rax = result.as_raw().cast_unsigned() as usize;
-        op
     }
 
     fn sys_nt_continue(
@@ -2405,15 +2221,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Some(NtStatus::SUCCESS)
     }
 
-    fn handle_interrupt_request(
-        &self,
-        _ctx: &mut litebox_common_linux::PtRegs,
-    ) -> ContinueOperation {
+    fn handle_interrupt_request(&self, _ctx: &mut litebox_common_linux::PtRegs) {
         litebox_util_log::debug!(
             stack_top:% = format_args!("{:#x}", self.stack_top);
             "Windows guest interrupt"
         );
-        ContinueOperation::Resume
+    }
+
+    fn handle_exception_request(
+        &self,
+        ctx: &mut litebox_common_linux::PtRegs,
+        info: &ExceptionInfo,
+    ) {
+        litebox_util_log::debug!(
+            exception:? = info.exception,
+            rip:% = format_args!("{:#x}", ctx.rip),
+            cr2:% = format_args!("{:#x}", info.cr2);
+            "Windows guest exception"
+        );
+        // TODO: Translate hardware exceptions into Windows SEH where appropriate.
+        self.exit_thread(NtStatus::UNSUCCESSFUL.as_raw());
     }
 }
 
@@ -2521,22 +2348,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Pl
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.task
-            .finish_thread_operation(self.task.init(ctx), NtStatus::ACCESS_VIOLATION.as_raw())
-    }
-
-    fn reenter(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.task.finish_thread_operation(
-            ContinueOperation::Terminate,
-            NtStatus::NOT_SUPPORTED.as_raw(),
-        )
+        self.enter_shim(true, ctx, Task::init)
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.task.finish_thread_operation(
-            self.task.handle_syscall_request(ctx),
-            NtStatus::NOT_SUPPORTED.as_raw(),
-        )
+        self.enter_shim(false, ctx, Task::handle_syscall_request)
     }
 
     fn exception(
@@ -2544,21 +2360,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Pl
         ctx: &mut Self::ExecutionContext,
         info: &ExceptionInfo,
     ) -> ContinueOperation {
-        litebox_util_log::debug!(
-            exception:? = info.exception,
-            rip:% = format_args!("{:#x}", ctx.rip),
-            cr2:% = format_args!("{:#x}", info.cr2);
-            "Windows guest exception"
-        );
-        // TODO: Translate hardware exceptions into Windows SEH where appropriate.
-        self.task.finish_thread_operation(
-            ContinueOperation::Terminate,
-            NtStatus::UNSUCCESSFUL.as_raw(),
-        )
+        self.enter_shim(false, ctx, |task, ctx| {
+            task.handle_exception_request(ctx, info);
+        })
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.task.handle_interrupt_request(ctx)
+        self.enter_shim(false, ctx, Task::handle_interrupt_request)
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> WindowsShimEntrypoints<Platform, FS> {
+    /// Runs a shim handler with the wait-state bookkeeping needed to keep the
+    /// thread interruptible while it runs guest code.
+    fn enter_shim(
+        &self,
+        is_init: bool,
+        ctx: &mut litebox_common_linux::PtRegs,
+        f: impl FnOnce(&Task<Platform, FS>, &mut litebox_common_linux::PtRegs),
+    ) -> ContinueOperation {
+        if !is_init {
+            self.task.enter_from_guest();
+        }
+        f(&self.task, ctx);
+        if self.task.prepare_to_run_guest(ctx) {
+            ContinueOperation::Resume
+        } else {
+            self.task.complete_current_thread();
+            ContinueOperation::Terminate
+        }
     }
 }
 
