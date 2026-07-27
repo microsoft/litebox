@@ -404,7 +404,7 @@ mod tests {
         let _handle = crate::event::create(&session, 0).unwrap();
 
         let reference = broker
-            .take_one_session_reference(session.session_id)
+            .remove_one_reference_for_session(session.session_id)
             .unwrap();
         assert!(broker.references.try_write().is_some());
         drop(reference);
