@@ -222,12 +222,12 @@ impl BrokerSession {
     /// Destruction happens after releasing the process-wide reference-table
     /// lock, so an object may safely release platform resources.
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
-        let reference = self.take_object_reference(handle)?;
+        let reference = self.remove_object_reference(handle)?;
         drop(reference);
         Ok(())
     }
 
-    fn take_object_reference(&self, handle: ObjectHandle) -> Result<ObjectReference> {
+    fn remove_object_reference(&self, handle: ObjectHandle) -> Result<ObjectReference> {
         let mut reference_list_head = self.reference_list_head.write();
         let mut references = self.core.references.write();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
@@ -264,7 +264,7 @@ impl BrokerSession {
     fn take_one_object_reference(&self) -> Option<ObjectReference> {
         let handle = (*self.reference_list_head.read())?;
         Some(
-            self.take_object_reference(handle)
+            self.remove_object_reference(handle)
                 .expect("the session reference list must name a live owned reference"),
         )
     }
