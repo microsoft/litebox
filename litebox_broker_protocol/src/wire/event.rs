@@ -17,9 +17,9 @@ const EVENT_REQUEST_TAG_CREATE: u8 = 0;
 const EVENT_REQUEST_TAG_ADD: u8 = 1;
 const EVENT_REQUEST_TAG_CONSUME: u8 = 2;
 
-const EVENT_RESPONSE_TAG_CREATED: u8 = 0;
-const EVENT_RESPONSE_TAG_ADDED: u8 = 1;
-const EVENT_RESPONSE_TAG_CONSUMED: u8 = 2;
+const EVENT_RESPONSE_TAG_CREATE: u8 = 0;
+const EVENT_RESPONSE_TAG_ADD: u8 = 1;
+const EVENT_RESPONSE_TAG_CONSUME: u8 = 2;
 
 const EVENT_CONSUME_MODE_TAG_ALL: u8 = 1;
 const EVENT_CONSUME_MODE_TAG_ONE: u8 = 2;
@@ -65,15 +65,15 @@ pub(super) fn decode_event_request(decoder: &mut Decoder<'_>) -> Result<EventReq
 pub(super) fn encode_event_response(encoder: &mut Encoder, response: EventResponse) {
     match response {
         EventResponse::Create(response) => {
-            encoder.u8(EVENT_RESPONSE_TAG_CREATED);
+            encoder.u8(EVENT_RESPONSE_TAG_CREATE);
             encoder.handle(response.handle);
         }
         EventResponse::Add(response) => {
-            encoder.u8(EVENT_RESPONSE_TAG_ADDED);
+            encoder.u8(EVENT_RESPONSE_TAG_ADD);
             encoder.u32(response.readiness.0);
         }
         EventResponse::Consume(response) => {
-            encoder.u8(EVENT_RESPONSE_TAG_CONSUMED);
+            encoder.u8(EVENT_RESPONSE_TAG_CONSUME);
             encoder.u64(response.value);
             encoder.u32(response.readiness.0);
         }
@@ -82,13 +82,13 @@ pub(super) fn encode_event_response(encoder: &mut Encoder, response: EventRespon
 
 pub(super) fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<EventResponse, WireError> {
     let response = match decoder.u8()? {
-        EVENT_RESPONSE_TAG_CREATED => EventResponse::Create(CreateEventResponse {
+        EVENT_RESPONSE_TAG_CREATE => EventResponse::Create(CreateEventResponse {
             handle: decoder.handle()?,
         }),
-        EVENT_RESPONSE_TAG_ADDED => EventResponse::Add(AddEventResponse {
+        EVENT_RESPONSE_TAG_ADD => EventResponse::Add(AddEventResponse {
             readiness: ReadinessFlags(decoder.u32()?),
         }),
-        EVENT_RESPONSE_TAG_CONSUMED => EventResponse::Consume(EventConsumption {
+        EVENT_RESPONSE_TAG_CONSUME => EventResponse::Consume(EventConsumption {
             value: decoder.u64()?,
             readiness: ReadinessFlags(decoder.u32()?),
         }),

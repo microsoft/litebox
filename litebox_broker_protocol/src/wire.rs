@@ -613,6 +613,9 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 })),
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResult::Socket(SocketResponse::Create(CreateSocketResponse { handle })),
+            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+            })),
             BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
                 status: SocketConnectionStatus::Connecting,
             })),
@@ -623,9 +626,9 @@ mod tests {
                 status: SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
             })),
             BrokerResult::Socket(SocketResponse::Send(SendSocketResponse { sent: 3 })),
-            BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse {
-                received: 3,
-            })),
+            BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(3))),
+            BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(0))),
+            BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::EndOfStream)),
             BrokerResult::Socket(SocketResponse::Shutdown),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connecting,
@@ -872,17 +875,20 @@ mod tests {
         *unknown_status.last_mut().unwrap() = 0xff;
         assert_eq!(decode_response(&unknown_status), Err(WireError::InvalidTag));
 
-        let mut unknown_socket_error = encode_response(BrokerResponse {
+        let socket_error = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Socket(SocketResponse::Failed(SocketError::TimedOut)),
         });
-        *unknown_socket_error.last_mut().unwrap() = 0xff;
+        for raw in [0, 11, u8::MAX] {
+            let mut unknown_socket_error = socket_error.clone();
+            *unknown_socket_error.last_mut().unwrap() = raw;
+            assert_eq!(
+                decode_response(&unknown_socket_error),
+                Err(WireError::InvalidTag)
+            );
+        }
         assert_eq!(
-            decode_response(&unknown_socket_error),
-            Err(WireError::InvalidTag)
-        );
-        assert_eq!(
-            decode_response(&unknown_socket_error[..unknown_socket_error.len() - 1]),
+            decode_response(&socket_error[..socket_error.len() - 1]),
             Err(WireError::TruncatedFrame)
         );
 
@@ -899,13 +905,25 @@ mod tests {
 
         let received = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse {
-                received: 4096,
-            })),
+            result: BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(
+                4096,
+            ))),
         });
         assert_eq!(
             decode_response(&received[..received.len() - 1]),
             Err(WireError::TruncatedFrame)
+        );
+
+        let mut unknown_receive_result = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Socket(SocketResponse::Receive(
+                ReceiveSocketResponse::EndOfStream,
+            )),
+        });
+        *unknown_receive_result.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_response(&unknown_receive_result),
+            Err(WireError::InvalidTag)
         );
     }
 
@@ -1072,7 +1090,7 @@ mod tests {
                 request_id: RequestId(13),
                 result: BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset,)),
             }),
-            [8, 13, 0, 0, 0, 0, 0, 0, 0, 6, 1]
+            [8, 13, 0, 0, 0, 0, 0, 0, 0, 6, 2]
         );
     }
 

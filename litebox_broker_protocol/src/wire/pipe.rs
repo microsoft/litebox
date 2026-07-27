@@ -15,9 +15,9 @@ const PIPE_REQUEST_TAG_CREATE: u8 = 0;
 const PIPE_REQUEST_TAG_READ: u8 = 1;
 const PIPE_REQUEST_TAG_WRITE: u8 = 2;
 
-const PIPE_RESPONSE_TAG_CREATED: u8 = 0;
+const PIPE_RESPONSE_TAG_CREATE: u8 = 0;
 const PIPE_RESPONSE_TAG_READ: u8 = 1;
-const PIPE_RESPONSE_TAG_WRITTEN: u8 = 2;
+const PIPE_RESPONSE_TAG_WRITE: u8 = 2;
 
 pub(super) fn encode_pipe_request(encoder: &mut Encoder, request: PipeRequest) {
     match request {
@@ -74,7 +74,7 @@ fn decode_shared_buffer_descriptor(
 pub(super) fn encode_pipe_response(encoder: &mut Encoder, response: PipeResponse) {
     match response {
         PipeResponse::Create(response) => {
-            encoder.u8(PIPE_RESPONSE_TAG_CREATED);
+            encoder.u8(PIPE_RESPONSE_TAG_CREATE);
             encoder.handle(response.read_handle);
             encoder.handle(response.write_handle);
         }
@@ -83,7 +83,7 @@ pub(super) fn encode_pipe_response(encoder: &mut Encoder, response: PipeResponse
             encoder.u32(response.read);
         }
         PipeResponse::Write(response) => {
-            encoder.u8(PIPE_RESPONSE_TAG_WRITTEN);
+            encoder.u8(PIPE_RESPONSE_TAG_WRITE);
             encoder.u32(response.written);
         }
     }
@@ -91,14 +91,14 @@ pub(super) fn encode_pipe_response(encoder: &mut Encoder, response: PipeResponse
 
 pub(super) fn decode_pipe_response(decoder: &mut Decoder<'_>) -> Result<PipeResponse, WireError> {
     match decoder.u8()? {
-        PIPE_RESPONSE_TAG_CREATED => Ok(PipeResponse::Create(CreatePipeResponse {
+        PIPE_RESPONSE_TAG_CREATE => Ok(PipeResponse::Create(CreatePipeResponse {
             read_handle: decoder.handle()?,
             write_handle: decoder.handle()?,
         })),
         PIPE_RESPONSE_TAG_READ => Ok(PipeResponse::Read(ReadPipeResponse {
             read: decoder.u32()?,
         })),
-        PIPE_RESPONSE_TAG_WRITTEN => Ok(PipeResponse::Write(WritePipeResponse {
+        PIPE_RESPONSE_TAG_WRITE => Ok(PipeResponse::Write(WritePipeResponse {
             written: decoder.u32()?,
         })),
         _ => Err(WireError::InvalidTag),

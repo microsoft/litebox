@@ -90,7 +90,12 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             | BrokerOperation::CheckReadiness(_)
             | BrokerOperation::Event(_)
             | BrokerOperation::Pipe(PipeRequest::Create(_))
-            | BrokerOperation::Socket(_) => None,
+            | BrokerOperation::Socket(
+                SocketRequest::Create(_)
+                | SocketRequest::Connect(_)
+                | SocketRequest::Shutdown(_)
+                | SocketRequest::Status(_),
+            ) => None,
         };
 
         {

@@ -21,10 +21,10 @@ const SOCKET_REQUEST_TAG_RECEIVE: u8 = 3;
 const SOCKET_REQUEST_TAG_SHUTDOWN: u8 = 4;
 const SOCKET_REQUEST_TAG_STATUS: u8 = 5;
 
-const SOCKET_RESPONSE_TAG_CREATED: u8 = 0;
+const SOCKET_RESPONSE_TAG_CREATE: u8 = 0;
 const SOCKET_RESPONSE_TAG_CONNECT: u8 = 1;
-const SOCKET_RESPONSE_TAG_SENT: u8 = 2;
-const SOCKET_RESPONSE_TAG_RECEIVED: u8 = 3;
+const SOCKET_RESPONSE_TAG_SEND: u8 = 2;
+const SOCKET_RESPONSE_TAG_RECEIVE: u8 = 3;
 const SOCKET_RESPONSE_TAG_SHUTDOWN: u8 = 4;
 const SOCKET_RESPONSE_TAG_STATUS: u8 = 5;
 const SOCKET_RESPONSE_TAG_FAILED: u8 = 6;
@@ -39,20 +39,13 @@ const SHUTDOWN_TAG_READ: u8 = 0;
 const SHUTDOWN_TAG_WRITE: u8 = 1;
 const SHUTDOWN_TAG_BOTH: u8 = 2;
 
-const CONNECTION_STATUS_TAG_CONNECTING: u8 = 0;
-const CONNECTION_STATUS_TAG_CONNECTED: u8 = 1;
-const CONNECTION_STATUS_TAG_FAILED: u8 = 2;
+const CONNECTION_STATUS_TAG_UNCONNECTED: u8 = 0;
+const CONNECTION_STATUS_TAG_CONNECTING: u8 = 1;
+const CONNECTION_STATUS_TAG_CONNECTED: u8 = 2;
+const CONNECTION_STATUS_TAG_FAILED: u8 = 3;
 
-const SOCKET_ERROR_TAG_CONNECTION_REFUSED: u8 = 0;
-const SOCKET_ERROR_TAG_CONNECTION_RESET: u8 = 1;
-const SOCKET_ERROR_TAG_CONNECTION_ABORTED: u8 = 2;
-const SOCKET_ERROR_TAG_NETWORK_UNREACHABLE: u8 = 3;
-const SOCKET_ERROR_TAG_HOST_UNREACHABLE: u8 = 4;
-const SOCKET_ERROR_TAG_TIMED_OUT: u8 = 5;
-const SOCKET_ERROR_TAG_ADDRESS_IN_USE: u8 = 6;
-const SOCKET_ERROR_TAG_ADDRESS_NOT_AVAILABLE: u8 = 7;
-const SOCKET_ERROR_TAG_POLICY_DENIED: u8 = 8;
-const SOCKET_ERROR_TAG_OTHER: u8 = 9;
+const RECEIVE_RESPONSE_TAG_RECEIVED: u8 = 0;
+const RECEIVE_RESPONSE_TAG_END_OF_STREAM: u8 = 1;
 
 pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketRequest) {
     match request {
@@ -150,7 +143,7 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
 pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResponse) {
     match response {
         SocketResponse::Create(response) => {
-            encoder.u8(SOCKET_RESPONSE_TAG_CREATED);
+            encoder.u8(SOCKET_RESPONSE_TAG_CREATE);
             encoder.handle(response.handle);
         }
         SocketResponse::Connect(response) => {
@@ -158,12 +151,20 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
             encode_connection_status(encoder, response.status);
         }
         SocketResponse::Send(response) => {
-            encoder.u8(SOCKET_RESPONSE_TAG_SENT);
+            encoder.u8(SOCKET_RESPONSE_TAG_SEND);
             encoder.u32(response.sent);
         }
         SocketResponse::Receive(response) => {
-            encoder.u8(SOCKET_RESPONSE_TAG_RECEIVED);
-            encoder.u32(response.received);
+            encoder.u8(SOCKET_RESPONSE_TAG_RECEIVE);
+            match response {
+                ReceiveSocketResponse::Received(received) => {
+                    encoder.u8(RECEIVE_RESPONSE_TAG_RECEIVED);
+                    encoder.u32(received);
+                }
+                ReceiveSocketResponse::EndOfStream => {
+                    encoder.u8(RECEIVE_RESPONSE_TAG_END_OF_STREAM);
+                }
+            }
         }
         SocketResponse::Shutdown => encoder.u8(SOCKET_RESPONSE_TAG_SHUTDOWN),
         SocketResponse::Status(response) => {
@@ -181,17 +182,19 @@ pub(super) fn decode_socket_response(
     decoder: &mut Decoder<'_>,
 ) -> Result<SocketResponse, WireError> {
     match decoder.u8()? {
-        SOCKET_RESPONSE_TAG_CREATED => Ok(SocketResponse::Create(CreateSocketResponse {
+        SOCKET_RESPONSE_TAG_CREATE => Ok(SocketResponse::Create(CreateSocketResponse {
             handle: decoder.handle()?,
         })),
         SOCKET_RESPONSE_TAG_CONNECT => Ok(SocketResponse::Connect(ConnectSocketResponse {
             status: decode_connection_status(decoder)?,
         })),
-        SOCKET_RESPONSE_TAG_SENT => Ok(SocketResponse::Send(SendSocketResponse {
+        SOCKET_RESPONSE_TAG_SEND => Ok(SocketResponse::Send(SendSocketResponse {
             sent: decoder.u32()?,
         })),
-        SOCKET_RESPONSE_TAG_RECEIVED => Ok(SocketResponse::Receive(ReceiveSocketResponse {
-            received: decoder.u32()?,
+        SOCKET_RESPONSE_TAG_RECEIVE => Ok(SocketResponse::Receive(match decoder.u8()? {
+            RECEIVE_RESPONSE_TAG_RECEIVED => ReceiveSocketResponse::Received(decoder.u32()?),
+            RECEIVE_RESPONSE_TAG_END_OF_STREAM => ReceiveSocketResponse::EndOfStream,
+            _ => return Err(WireError::InvalidTag),
         })),
         SOCKET_RESPONSE_TAG_SHUTDOWN => Ok(SocketResponse::Shutdown),
         SOCKET_RESPONSE_TAG_STATUS => Ok(SocketResponse::Status(SocketStatusResponse {
@@ -204,6 +207,7 @@ pub(super) fn decode_socket_response(
 
 fn encode_connection_status(encoder: &mut Encoder, status: SocketConnectionStatus) {
     match status {
+        SocketConnectionStatus::Unconnected => encoder.u8(CONNECTION_STATUS_TAG_UNCONNECTED),
         SocketConnectionStatus::Connecting => encoder.u8(CONNECTION_STATUS_TAG_CONNECTING),
         SocketConnectionStatus::Connected => encoder.u8(CONNECTION_STATUS_TAG_CONNECTED),
         SocketConnectionStatus::Failed(error) => {
@@ -217,6 +221,7 @@ fn decode_connection_status(
     decoder: &mut Decoder<'_>,
 ) -> Result<SocketConnectionStatus, WireError> {
     match decoder.u8()? {
+        CONNECTION_STATUS_TAG_UNCONNECTED => Ok(SocketConnectionStatus::Unconnected),
         CONNECTION_STATUS_TAG_CONNECTING => Ok(SocketConnectionStatus::Connecting),
         CONNECTION_STATUS_TAG_CONNECTED => Ok(SocketConnectionStatus::Connected),
         CONNECTION_STATUS_TAG_FAILED => Ok(SocketConnectionStatus::Failed(decode_socket_error(
@@ -227,34 +232,11 @@ fn decode_connection_status(
 }
 
 fn encode_socket_error(encoder: &mut Encoder, error: SocketError) {
-    encoder.u8(match error {
-        SocketError::ConnectionRefused => SOCKET_ERROR_TAG_CONNECTION_REFUSED,
-        SocketError::ConnectionReset => SOCKET_ERROR_TAG_CONNECTION_RESET,
-        SocketError::ConnectionAborted => SOCKET_ERROR_TAG_CONNECTION_ABORTED,
-        SocketError::NetworkUnreachable => SOCKET_ERROR_TAG_NETWORK_UNREACHABLE,
-        SocketError::HostUnreachable => SOCKET_ERROR_TAG_HOST_UNREACHABLE,
-        SocketError::TimedOut => SOCKET_ERROR_TAG_TIMED_OUT,
-        SocketError::AddressInUse => SOCKET_ERROR_TAG_ADDRESS_IN_USE,
-        SocketError::AddressNotAvailable => SOCKET_ERROR_TAG_ADDRESS_NOT_AVAILABLE,
-        SocketError::PolicyDenied => SOCKET_ERROR_TAG_POLICY_DENIED,
-        SocketError::Other => SOCKET_ERROR_TAG_OTHER,
-    });
+    encoder.u8(error.as_raw());
 }
 
 fn decode_socket_error(decoder: &mut Decoder<'_>) -> Result<SocketError, WireError> {
-    match decoder.u8()? {
-        SOCKET_ERROR_TAG_CONNECTION_REFUSED => Ok(SocketError::ConnectionRefused),
-        SOCKET_ERROR_TAG_CONNECTION_RESET => Ok(SocketError::ConnectionReset),
-        SOCKET_ERROR_TAG_CONNECTION_ABORTED => Ok(SocketError::ConnectionAborted),
-        SOCKET_ERROR_TAG_NETWORK_UNREACHABLE => Ok(SocketError::NetworkUnreachable),
-        SOCKET_ERROR_TAG_HOST_UNREACHABLE => Ok(SocketError::HostUnreachable),
-        SOCKET_ERROR_TAG_TIMED_OUT => Ok(SocketError::TimedOut),
-        SOCKET_ERROR_TAG_ADDRESS_IN_USE => Ok(SocketError::AddressInUse),
-        SOCKET_ERROR_TAG_ADDRESS_NOT_AVAILABLE => Ok(SocketError::AddressNotAvailable),
-        SOCKET_ERROR_TAG_POLICY_DENIED => Ok(SocketError::PolicyDenied),
-        SOCKET_ERROR_TAG_OTHER => Ok(SocketError::Other),
-        _ => Err(WireError::InvalidTag),
-    }
+    SocketError::from_raw(decoder.u8()?).ok_or(WireError::InvalidTag)
 }
 
 fn encode_address(encoder: &mut Encoder, address: SocketAddressV4) {
