@@ -151,23 +151,4 @@ impl BrokerCore {
             caller_credential,
         ))
     }
-
-    pub(crate) fn close_session(&self, session_id: session::SessionId) {
-        while let Some(reference) = self.remove_one_reference_for_session(session_id) {
-            // Object destruction may release platform resources and must never
-            // run while the process-wide reference-table spin lock is held.
-            drop(reference);
-        }
-    }
-
-    fn remove_one_reference_for_session(
-        &self,
-        session_id: session::SessionId,
-    ) -> Option<ObjectReference> {
-        let mut references = self.references.write();
-        let handle = references.iter().find_map(|(handle, reference)| {
-            (reference.session_id == session_id).then_some(*handle)
-        })?;
-        references.remove(&handle)
-    }
 }
