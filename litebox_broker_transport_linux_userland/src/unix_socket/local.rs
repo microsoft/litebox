@@ -38,11 +38,11 @@ use litebox_broker_transport::control_ring::{
     ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
 };
 
+use crate::memfd::MemfdSharedMemory;
 use crate::setup::{
     copy_io_error, invalid_data, read_setup_frame, ring_error, shutdown_socket, wire_error,
     write_setup_frame,
 };
-use crate::shared_memory::MemfdSharedMemory;
 use crate::unix_io::io_timeout_for_deadline;
 
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -120,7 +120,7 @@ impl UnixStreamLocalSetupChannel {
         expected_len: usize,
         deadline: Option<Instant>,
     ) -> IoResult<MemfdSharedMemory> {
-        crate::shared_memory::receive_memfd(&mut self.stream, expected_len, deadline)
+        crate::memfd::receive_memfd(&mut self.stream, expected_len, deadline)
     }
 
     /// Consumes a negotiated setup channel into independently usable active

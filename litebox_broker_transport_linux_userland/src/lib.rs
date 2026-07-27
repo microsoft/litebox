@@ -21,7 +21,7 @@
 
 mod setup;
 
-pub mod shared_memory;
+pub mod memfd;
 
 mod unix_io;
 

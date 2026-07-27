@@ -19,7 +19,7 @@ use litebox_broker_transport::control_ring::{
     CONTROL_RING_MEMORY_SIZE, CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing,
 };
 use litebox_broker_transport::shared_memory::SharedBufferPool;
-use litebox_broker_transport_linux_userland::shared_memory::MemfdSharedMemory;
+use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingHostNotificationChannel, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
 };

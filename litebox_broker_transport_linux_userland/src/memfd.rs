@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux memfd-backed association shared memory.
+//! Linux memfd-backed broker association memory.
 //!
 //! One sealed memfd mapping backs an association shared-buffer pool or a shared
 //! control ring. The mapping implements the portable shared-memory interfaces in

@@ -217,7 +217,7 @@ mod tests {
     use litebox_broker_transport::channel::{
         HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
     };
-    use litebox_broker_transport_linux_userland::shared_memory::MemfdSharedMemory;
+    use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
     use litebox_broker_transport_linux_userland::unix_socket::{
         UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
         UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,

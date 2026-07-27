@@ -22,7 +22,7 @@ use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER
 use litebox_broker_transport::channel::HostReceive;
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
-use litebox_broker_transport_linux_userland::shared_memory::MemfdSharedMemory;
+use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
     UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,

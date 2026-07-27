@@ -362,7 +362,7 @@ fn spawn_test_broker(
                     .accept()
                     .expect("failed to accept broker local control connection");
                 let shared_memory =
-                    litebox_broker_transport_linux_userland::shared_memory::MemfdSharedMemory::create(
+                    litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create(
                         litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
                     )
                     .expect("failed to create broker test shared memory");
@@ -373,7 +373,7 @@ fn spawn_test_broker(
                     )
                     .expect("failed to attach broker test shared-buffer layout");
                 let control_memory =
-                    litebox_broker_transport_linux_userland::shared_memory::MemfdSharedMemory::create(
+                    litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create(
                         litebox_broker_transport::control_ring::CONTROL_RING_MEMORY_SIZE,
                     )
                     .expect("failed to create broker test control ring");

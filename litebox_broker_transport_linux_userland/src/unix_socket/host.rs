@@ -31,11 +31,11 @@ use litebox_broker_transport::control_ring::{
     ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
 };
 
+use crate::memfd::MemfdSharedMemory;
 use crate::setup::{
     copy_io_error, invalid_data, read_setup_frame, ring_error, shutdown_socket, wire_error,
     write_setup_frame,
 };
-use crate::shared_memory::MemfdSharedMemory;
 
 /// Validates that a connected Unix socket belongs to `expected_process_id`.
 pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> IoResult<()> {
@@ -167,7 +167,7 @@ impl UnixStreamHostSetupChannel {
         shared_memory: &MemfdSharedMemory,
         deadline: Option<Instant>,
     ) -> IoResult<()> {
-        crate::shared_memory::send_memfd(&mut self.stream, shared_memory, deadline)
+        crate::memfd::send_memfd(&mut self.stream, shared_memory, deadline)
     }
 
     /// Consumes a negotiated setup channel into independently usable active
