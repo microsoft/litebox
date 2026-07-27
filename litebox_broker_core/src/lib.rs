@@ -153,7 +153,21 @@ impl BrokerCore {
     }
 
     pub(crate) fn close_session(&self, session_id: session::SessionId) {
-        let mut references = self.references.write();
-        references.retain(|_, reference| reference.session_id != session_id);
+        loop {
+            let reference = {
+                let mut references = self.references.write();
+                let handle = references.iter().find_map(|(handle, reference)| {
+                    (reference.session_id == session_id).then_some(*handle)
+                });
+                handle.and_then(|handle| references.remove(&handle))
+            };
+            let Some(reference) = reference else {
+                break;
+            };
+
+            // Object destruction may release platform resources and must never
+            // run while the process-wide reference-table spin lock is held.
+            drop(reference);
+        }
     }
 }

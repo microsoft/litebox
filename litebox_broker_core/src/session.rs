@@ -2,6 +2,10 @@
 // Licensed under the MIT license.
 
 use alloc::sync::Arc;
+#[cfg(test)]
+use alloc::sync::Weak;
+#[cfg(test)]
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
@@ -45,6 +49,26 @@ pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
     pub(crate) session_id: SessionId,
     pub(crate) rights: ObjectRights,
+    #[cfg(test)]
+    drop_probe: Option<ReferenceDropProbe>,
+}
+
+#[cfg(test)]
+struct ReferenceDropProbe {
+    references: Weak<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
+    dropped_outside_lock: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl Drop for ReferenceDropProbe {
+    fn drop(&mut self) {
+        let references = self
+            .references
+            .upgrade()
+            .expect("broker core must outlive its object references");
+        self.dropped_outside_lock
+            .store(references.try_write().is_some(), Ordering::Relaxed);
+    }
 }
 
 pub(crate) enum ObjectEntry {
@@ -95,6 +119,8 @@ impl BrokerSession {
                 object: Arc::new(RwLock::new(object)),
                 session_id: self.session_id,
                 rights,
+                #[cfg(test)]
+                drop_probe: None,
             },
         );
 
@@ -126,6 +152,8 @@ impl BrokerSession {
                     object: Arc::new(RwLock::new(object)),
                     session_id: self.session_id,
                     rights,
+                    #[cfg(test)]
+                    drop_probe: None,
                 },
             );
         }
@@ -190,13 +218,22 @@ impl BrokerSession {
     /// Closes one object reference owned by this session.
     ///
     /// The underlying object is released when this was the last live reference.
+    /// Destruction happens after releasing the process-wide reference-table
+    /// lock, so an object may safely release platform resources.
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
-        let mut references = self.core.references.write();
-        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.session_id != self.session_id {
-            return Err(BrokerError::UnknownObject);
-        }
-        references.remove(&handle);
+        let reference = {
+            let mut references = self.core.references.write();
+            let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
+            if reference.session_id != self.session_id {
+                return Err(BrokerError::UnknownObject);
+            }
+            let Some(reference) = references.remove(&handle) else {
+                return Err(BrokerError::UnknownObject);
+            };
+            reference
+        };
+
+        drop(reference);
         Ok(())
     }
 }
@@ -209,7 +246,9 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::Ordering;
+    use super::ReferenceDropProbe;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
@@ -230,6 +269,8 @@ mod tests {
         check_session_drop_releases_references(&broker);
         check_pipe_lifecycle(&broker);
         check_pipe_reader_closure(&broker);
+        check_explicit_close_drops_reference_outside_lock(&broker);
+        check_session_close_drops_references_outside_lock(&broker);
         check_pair_handle_exhaustion(&broker);
 
         assert!(broker.references.read().is_empty());
@@ -375,6 +416,47 @@ mod tests {
         );
         assert_eq!(session.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+    }
+
+    fn install_reference_drop_probe(broker: &BrokerCore, handle: ObjectHandle) -> Arc<AtomicBool> {
+        let dropped_outside_lock = Arc::new(AtomicBool::new(false));
+        let probe = ReferenceDropProbe {
+            references: Arc::downgrade(&broker.references),
+            dropped_outside_lock: Arc::clone(&dropped_outside_lock),
+        };
+        broker
+            .references
+            .write()
+            .get_mut(&handle)
+            .expect("test object reference must exist")
+            .drop_probe = Some(probe);
+        dropped_outside_lock
+    }
+
+    fn check_explicit_close_drops_reference_outside_lock(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = crate::event::create(&session, 0).unwrap();
+        let dropped_outside_lock = install_reference_drop_probe(broker, handle);
+
+        assert_eq!(session.close_object_reference(handle), Ok(()));
+        assert!(dropped_outside_lock.load(Ordering::Relaxed));
+    }
+
+    fn check_session_close_drops_references_outside_lock(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let first = crate::event::create(&session, 0).unwrap();
+        let second = crate::event::create(&session, 0).unwrap();
+        let first_dropped_outside_lock = install_reference_drop_probe(broker, first);
+        let second_dropped_outside_lock = install_reference_drop_probe(broker, second);
+
+        drop(session);
+
+        assert!(first_dropped_outside_lock.load(Ordering::Relaxed));
+        assert!(second_dropped_outside_lock.load(Ordering::Relaxed));
     }
 
     fn check_pair_handle_exhaustion(broker: &BrokerCore) {
