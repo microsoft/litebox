@@ -7,6 +7,11 @@ use litebox_broker_protocol::socket::{
 };
 
 /// Network access available to broker-owned sockets.
+///
+/// This is separate from [`PolicyProfile`] because that profile grants generic
+/// object rights shared by events, pipes, and sockets. Granting those rights
+/// must not implicitly grant network access, so socket creation and destination
+/// restrictions are configured as an independent, default-deny policy axis.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SocketPolicy {
