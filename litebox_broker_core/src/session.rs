@@ -29,19 +29,7 @@ pub enum CallerCredential {
 /// Broker-assigned session identity.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SessionId(u64);
-
-impl SessionId {
-    pub(crate) const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the broker-assigned numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
+pub struct SessionId(pub u64);
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
