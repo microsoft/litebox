@@ -660,6 +660,29 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    fn complete_current_thread(&self, exit_status: i32) {
+        if let Some(thread) = &self.thread_object {
+            thread.complete(exit_status, || {
+                let previous = self
+                    .process
+                    .active_thread_count
+                    .fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(previous > 1);
+            });
+        }
+    }
+
+    fn finish_thread_operation(
+        &self,
+        operation: ContinueOperation,
+        abnormal_exit_status: i32,
+    ) -> ContinueOperation {
+        if operation == ContinueOperation::Terminate {
+            self.complete_current_thread(abnormal_exit_status);
+        }
+        operation
+    }
+
     fn init(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         if !set_guest_teb(self.global.platform, self.teb_address) {
             return ContinueOperation::Terminate;
@@ -2014,6 +2037,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 } else {
                     // TODO: Terminate all threads except the calling one if process_handle is zero.
                     self.process.exit_code.store(exit_status, Ordering::Relaxed);
+                    self.complete_current_thread(exit_status);
                     (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
             }
@@ -2024,13 +2048,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if !thread_handle.is_null() && thread_handle != ThreadHandle::CURRENT {
                     (NtStatus::NOT_SUPPORTED, ContinueOperation::Resume)
                 } else {
-                    let Some(thread) = &self.thread_object else {
-                        return ContinueOperation::Terminate;
-                    };
-                    thread.complete(exit_status);
-                    self.process
-                        .active_thread_count
-                        .fetch_sub(1, Ordering::AcqRel);
+                    self.complete_current_thread(exit_status);
                     (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
             }
@@ -2503,11 +2521,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Pl
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.task.init(ctx)
+        self.task
+            .finish_thread_operation(self.task.init(ctx), NtStatus::ACCESS_VIOLATION.as_raw())
+    }
+
+    fn reenter(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.task.finish_thread_operation(
+            ContinueOperation::Terminate,
+            NtStatus::NOT_SUPPORTED.as_raw(),
+        )
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.task.handle_syscall_request(ctx)
+        self.task.finish_thread_operation(
+            self.task.handle_syscall_request(ctx),
+            NtStatus::NOT_SUPPORTED.as_raw(),
+        )
     }
 
     fn exception(
@@ -2522,7 +2551,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Pl
             "Windows guest exception"
         );
         // TODO: Translate hardware exceptions into Windows SEH where appropriate.
-        ContinueOperation::Terminate
+        self.task.finish_thread_operation(
+            ContinueOperation::Terminate,
+            NtStatus::UNSUCCESSFUL.as_raw(),
+        )
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {

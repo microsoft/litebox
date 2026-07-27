@@ -4,7 +4,7 @@
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use int_enum::IntEnum;
 use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
@@ -104,24 +104,43 @@ pub(crate) struct ThreadHandleObject<Platform: ShimPlatform> {
 }
 
 pub(crate) struct ThreadObject<Platform: ShimPlatform> {
-    signaled: AtomicBool,
+    completion_state: AtomicU8,
     exit_status: core::sync::atomic::AtomicI32,
     pollee: Pollee<Platform>,
 }
 
 impl<Platform: ShimPlatform> ThreadObject<Platform> {
+    const RUNNING: u8 = 0;
+    const COMPLETING: u8 = 1;
+    const COMPLETE: u8 = 2;
+
     fn new() -> Self {
         Self {
-            signaled: AtomicBool::new(false),
+            completion_state: AtomicU8::new(Self::RUNNING),
             exit_status: core::sync::atomic::AtomicI32::new(0),
             pollee: Pollee::new(),
         }
     }
 
-    pub(crate) fn complete(&self, exit_status: i32) {
+    pub(crate) fn complete(&self, exit_status: i32, before_publish: impl FnOnce()) -> bool {
+        if self
+            .completion_state
+            .compare_exchange(
+                Self::RUNNING,
+                Self::COMPLETING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
         self.exit_status.store(exit_status, Ordering::Relaxed);
-        self.signaled.store(true, Ordering::Release);
+        before_publish();
+        self.completion_state
+            .store(Self::COMPLETE, Ordering::Release);
         self.pollee.notify_observers(Events::IN);
+        true
     }
 }
 
@@ -131,7 +150,7 @@ impl<Platform: ShimPlatform> IOPollable for ThreadObject<Platform> {
     }
 
     fn check_io_events(&self) -> Events {
-        if self.signaled.load(Ordering::Acquire) {
+        if self.completion_state.load(Ordering::Acquire) == Self::COMPLETE {
             Events::IN
         } else {
             Events::empty()
@@ -348,7 +367,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let wait_cx = self.wait_state.context().with_timeout(timeout);
         match thread.pollee.wait(&wait_cx, false, Events::IN, || {
-            if thread.signaled.load(Ordering::Acquire) {
+            if thread.completion_state.load(Ordering::Acquire) == ThreadObject::<Platform>::COMPLETE
+            {
                 Ok(())
             } else {
                 Err(TryOpError::<NtStatus>::TryAgain)
@@ -542,8 +562,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::null_const_ptr;
+    use crate::tests::{mut_byte_ptr, mut_ptr, null_const_ptr};
     use litebox::platform::ThreadProvider;
+    use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 
     type TestPlatform = crate::tests::TestPlatform;
     type TestTask = Task<TestPlatform, crate::tests::TestFS>;
@@ -555,6 +576,78 @@ mod tests {
 
     fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    }
+
+    #[test]
+    fn child_exception_completes_wait_before_last_thread_is_observed() {
+        run_with_test_platform_pointers(|| {
+            let parent = crate::tests::test_task();
+            let thread = Arc::new(ThreadObject::new());
+            let handle = parent
+                .insert_typed_handle::<ThreadSubsystem<TestPlatform>>(
+                    ThreadHandleObject {
+                        thread: Arc::clone(&thread),
+                    },
+                    AccessMask::SYNCHRONIZE.bits(),
+                    drop,
+                )
+                .expect("thread handle insertion should succeed");
+            parent
+                .process
+                .active_thread_count
+                .fetch_add(1, Ordering::AcqRel);
+            let child = WindowsShimEntrypoints {
+                task: Task {
+                    global: Arc::clone(&parent.global),
+                    process: Arc::clone(&parent.process),
+                    fs: Arc::clone(&parent.fs),
+                    wait_state: litebox::event::wait::WaitState::new(parent.global.platform),
+                    entry_point: 0,
+                    stack_top: 0,
+                    context: 0,
+                    teb_address: 0,
+                    initial_context: None,
+                    thread_object: Some(thread),
+                },
+                _not_send: PhantomData,
+            };
+            let mut ctx = litebox_common_linux::PtRegs::default();
+
+            assert_eq!(
+                child.exception(
+                    &mut ctx,
+                    &ExceptionInfo {
+                        exception: Exception::PAGE_FAULT,
+                        error_code: 0,
+                        cr2: 0,
+                        kernel_mode: false,
+                    },
+                ),
+                ContinueOperation::Terminate
+            );
+            assert_eq!(
+                parent.sys_nt_wait_for_single_object(handle, false, None),
+                NtStatus::SUCCESS
+            );
+            let mut is_last_thread = u32::MAX;
+            let mut return_length = 0;
+            assert_eq!(
+                parent.sys_nt_query_information_thread(
+                    ThreadHandle::CURRENT,
+                    12,
+                    mut_byte_ptr(&mut is_last_thread),
+                    size_of::<u32>().trunc(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(is_last_thread, 1);
+            assert_eq!(return_length as usize, size_of::<u32>());
+            assert_eq!(
+                parent.process.active_thread_count.load(Ordering::Acquire),
+                1
+            );
+        });
     }
 
     #[test]
