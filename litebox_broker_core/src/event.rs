@@ -26,8 +26,6 @@ pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<
     session.with_authorized_object_mut(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => event.add(value),
         ObjectEntry::Pipe(_) => Err(BrokerError::InvalidRights),
-        #[cfg(test)]
-        ObjectEntry::DropProbe { .. } => Err(BrokerError::InvalidRights),
     })
 }
 
@@ -41,8 +39,6 @@ pub fn consume(
     session.with_authorized_object_mut(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => event.consume(mode),
         ObjectEntry::Pipe(_) => Err(BrokerError::InvalidRights),
-        #[cfg(test)]
-        ObjectEntry::DropProbe { .. } => Err(BrokerError::InvalidRights),
     })
 }
 

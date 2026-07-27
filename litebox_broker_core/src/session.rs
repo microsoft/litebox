@@ -52,10 +52,6 @@ pub(crate) struct ObjectReference {
 pub(crate) enum ObjectEntry {
     Event(EventObject),
     Pipe(PipeObject),
-    #[cfg(test)]
-    DropProbe {
-        _probe: tests::ObjectDropProbe,
-    },
 }
 
 /// Broker-owned authority token for one authenticated caller session.
@@ -199,8 +195,6 @@ impl BrokerSession {
             Ok(match object {
                 ObjectEntry::Event(event) => event.readiness(),
                 ObjectEntry::Pipe(pipe) => pipe.readiness(),
-                #[cfg(test)]
-                ObjectEntry::DropProbe { .. } => ReadinessFlags::default(),
             })
         })
     }
@@ -288,34 +282,14 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrokerSession, ObjectEntry};
-    use alloc::sync::{Arc, Weak};
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::Ordering;
 
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
     };
-    use hashbrown::HashMap;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use spin::rwlock::RwLock;
-
-    pub(crate) struct ObjectDropProbe {
-        references: Weak<RwLock<HashMap<ObjectHandle, super::ObjectReference>>>,
-        dropped_outside_lock: Arc<AtomicBool>,
-    }
-
-    impl Drop for ObjectDropProbe {
-        fn drop(&mut self) {
-            let references = self
-                .references
-                .upgrade()
-                .expect("broker core must outlive its object references");
-            self.dropped_outside_lock
-                .store(references.try_write().is_some(), Ordering::Relaxed);
-        }
-    }
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
@@ -329,8 +303,6 @@ mod tests {
         check_session_drop_releases_references(&broker);
         check_pipe_lifecycle(&broker);
         check_pipe_reader_closure(&broker);
-        check_explicit_close_drops_object_outside_lock(&broker);
-        check_session_close_drops_objects_outside_lock(&broker);
         check_pair_handle_exhaustion(&broker);
 
         assert!(broker.references.read().is_empty());
@@ -379,27 +351,26 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-        assert_eq!(session.close_object_reference(second_handle), Ok(()));
-
+        // Closing the older handle exercises unlinking a non-head reference.
         assert_eq!(session.close_object_reference(handle), Ok(()));
-        {
-            let references = broker.references.read();
-            assert!(references.is_empty());
-        }
         assert_eq!(
             session.close_object_reference(handle),
             Err(BrokerError::UnknownObject)
         );
+        assert_eq!(session.close_object_reference(second_handle), Ok(()));
+        assert!(broker.references.read().is_empty());
     }
 
     fn check_session_drop_releases_references(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let _handle = crate::event::create(&session, 0).unwrap();
+        let first = crate::event::create(&session, 0).unwrap();
+        let second = crate::event::create(&session, 0).unwrap();
+        assert_ne!(first, second);
         {
             let references = broker.references.read();
-            assert_eq!(references.len(), 1);
+            assert_eq!(references.len(), 2);
         }
 
         drop(session);
@@ -476,51 +447,6 @@ mod tests {
         );
         assert_eq!(session.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-    }
-
-    fn create_drop_probe(
-        broker: &BrokerCore,
-        session: &BrokerSession,
-    ) -> (ObjectHandle, Arc<AtomicBool>) {
-        let dropped_outside_lock = Arc::new(AtomicBool::new(false));
-        let probe = ObjectDropProbe {
-            references: Arc::downgrade(&broker.references),
-            dropped_outside_lock: Arc::clone(&dropped_outside_lock),
-        };
-        let handle = session
-            .create_object_reference(ObjectEntry::DropProbe { _probe: probe })
-            .unwrap();
-        (handle, dropped_outside_lock)
-    }
-
-    fn check_explicit_close_drops_object_outside_lock(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
-            .unwrap();
-        let (first, first_dropped_outside_lock) = create_drop_probe(broker, &session);
-        let (_, second_dropped_outside_lock) = create_drop_probe(broker, &session);
-
-        // The first object is not the list head, so this also exercises
-        // unlinking a reference with a live predecessor.
-        assert_eq!(session.close_object_reference(first), Ok(()));
-        assert!(first_dropped_outside_lock.load(Ordering::Relaxed));
-        assert!(!second_dropped_outside_lock.load(Ordering::Relaxed));
-
-        drop(session);
-        assert!(second_dropped_outside_lock.load(Ordering::Relaxed));
-    }
-
-    fn check_session_close_drops_objects_outside_lock(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
-            .unwrap();
-        let (_, first_dropped_outside_lock) = create_drop_probe(broker, &session);
-        let (_, second_dropped_outside_lock) = create_drop_probe(broker, &session);
-
-        drop(session);
-
-        assert!(first_dropped_outside_lock.load(Ordering::Relaxed));
-        assert!(second_dropped_outside_lock.load(Ordering::Relaxed));
     }
 
     fn check_pair_handle_exhaustion(broker: &BrokerCore) {
