@@ -22,11 +22,12 @@ pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandl
 
 /// Adds readiness credits to a broker-owned event object.
 pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<ReadinessFlags> {
-    let required_rights = ObjectRights::WRITE;
-    session.with_authorized_object_mut(handle, required_rights, |object| match object {
+    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let mut object = object.write();
+    match &mut *object {
         ObjectEntry::Event(event) => event.add(value),
         ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
-    })
+    }
 }
 
 /// Consumes readiness credits from a broker-owned event object.
@@ -35,11 +36,12 @@ pub fn consume(
     handle: ObjectHandle,
     mode: EventConsumeMode,
 ) -> Result<EventConsumption> {
-    let required_rights = ObjectRights::WAIT;
-    session.with_authorized_object_mut(handle, required_rights, |object| match object {
+    let object = session.authorized_object(handle, ObjectRights::WAIT)?;
+    let mut object = object.write();
+    match &mut *object {
         ObjectEntry::Event(event) => event.consume(mode),
         ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
-    })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

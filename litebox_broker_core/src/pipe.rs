@@ -58,10 +58,12 @@ pub fn read(session: &BrokerSession, handle: ObjectHandle, length: u32) -> Resul
     if length > MAX_PIPE_TRANSFER_SIZE {
         return Err(BrokerError::ResourceExhausted);
     }
-    session.with_authorized_object(handle, ObjectRights::WAIT, |object| match object {
+    let object = session.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = object.read();
+    match &*object {
         ObjectEntry::Pipe(pipe) => pipe.read(length as usize),
         ObjectEntry::Event(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
-    })
+    }
 }
 
 /// Writes bytes to a broker-owned pipe.
@@ -69,10 +71,12 @@ pub fn write(session: &BrokerSession, handle: ObjectHandle, data: &[u8]) -> Resu
     if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    session.with_authorized_object(handle, ObjectRights::WRITE, |object| match object {
+    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = object.read();
+    match &*object {
         ObjectEntry::Pipe(pipe) => pipe.write(data),
         ObjectEntry::Event(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
-    })
+    }
 }
 
 pub(crate) struct PipeObject {

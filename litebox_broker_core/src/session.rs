@@ -290,25 +290,12 @@ impl BrokerSession {
         reference_handles.push(handle);
     }
 
-    pub(crate) fn with_authorized_object<T>(
-        &self,
-        handle: ObjectHandle,
-        required_rights: ObjectRights,
-        f: impl FnOnce(&ObjectEntry) -> Result<T>,
-    ) -> Result<T> {
-        let object = {
-            let references = self.core.references.read();
-            self.authorize_use_object(&references, handle, required_rights)?
-        };
-        let object = object.read();
-        f(&object)
-    }
-
     /// Returns an authorized object lease without holding the reference-table lock.
     ///
-    /// Socket operations use this to release all broker locks before calling an
-    /// external platform implementation, then reacquire only the object lock if
-    /// they need to update broker-owned state.
+    /// Callers explicitly choose the object-lock lifetime. Socket operations use
+    /// that control to release all broker locks before calling an external
+    /// platform implementation, then reacquire only the object lock if they need
+    /// to update broker-owned state.
     pub(crate) fn authorized_object(
         &self,
         handle: ObjectHandle,
@@ -316,20 +303,6 @@ impl BrokerSession {
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
         let references = self.core.references.read();
         self.authorize_use_object(&references, handle, required_rights)
-    }
-
-    pub(crate) fn with_authorized_object_mut<T>(
-        &self,
-        handle: ObjectHandle,
-        required_rights: ObjectRights,
-        f: impl FnOnce(&mut ObjectEntry) -> Result<T>,
-    ) -> Result<T> {
-        let object = {
-            let references = self.core.references.read();
-            self.authorize_use_object(&references, handle, required_rights)?
-        };
-        let mut object = object.write();
-        f(&mut object)
     }
 
     /// Returns the current readiness of a broker-owned object.
