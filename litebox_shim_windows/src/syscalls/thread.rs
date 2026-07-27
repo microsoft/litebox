@@ -141,13 +141,13 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
     /// Returns true if the thread has been asked to exit and must not re-enter
     /// guest code.
     pub(crate) fn is_exiting(&self) -> bool {
-        self.is_exiting.load(Ordering::Relaxed)
+        self.is_exiting.load(Ordering::Acquire)
     }
 
     /// Records `exit_status` and marks the thread as exiting.
     pub(crate) fn exit_thread(&self, exit_status: i32) {
         self.exit_status.store(exit_status, Ordering::Relaxed);
-        self.is_exiting.store(true, Ordering::Relaxed);
+        self.is_exiting.store(true, Ordering::Release);
     }
 
     /// Asks another thread to exit: records `exit_status`, marks the thread as
@@ -665,6 +665,88 @@ mod tests {
                     },
                 ),
                 ContinueOperation::Terminate
+            );
+            assert_eq!(
+                parent.sys_nt_wait_for_single_object(handle, false, None),
+                NtStatus::SUCCESS
+            );
+            let mut is_last_thread = u32::MAX;
+            let mut return_length = 0;
+            assert_eq!(
+                parent.sys_nt_query_information_thread(
+                    ThreadHandle::CURRENT,
+                    12,
+                    mut_byte_ptr(&mut is_last_thread),
+                    size_of::<u32>().trunc(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(is_last_thread, 1);
+            assert_eq!(return_length as usize, size_of::<u32>());
+            assert_eq!(parent.process.live_thread_count(), 1);
+        });
+    }
+
+    #[test]
+    fn unsupported_reentry_completes_thread_wait_and_detaches_thread() {
+        struct FlagOnNotify(Arc<AtomicBool>);
+
+        impl Observer<Events> for FlagOnNotify {
+            fn on_events(&self, _events: &Events) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        run_with_test_platform_pointers(|| {
+            let parent = crate::tests::test_task();
+            let thread = Arc::new(ThreadObject::new());
+            let handle = parent
+                .insert_typed_handle::<ThreadSubsystem<TestPlatform>>(
+                    ThreadHandleObject {
+                        thread: Arc::clone(&thread),
+                    },
+                    AccessMask::SYNCHRONIZE.bits(),
+                    drop,
+                )
+                .expect("thread handle insertion should succeed");
+            let child_thread_id = crate::syscalls::process::INITIAL_THREAD_ID + 1;
+            assert!(parent.process.attach_thread(child_thread_id, &thread));
+            let child = WindowsShimEntrypoints {
+                task: Task {
+                    global: Arc::clone(&parent.global),
+                    process: Arc::clone(&parent.process),
+                    fs: Arc::clone(&parent.fs),
+                    wait_state: crate::wait::WaitState::new(parent.global.platform),
+                    entry_point: 0,
+                    stack_top: 0,
+                    context: 0,
+                    teb_address: 0,
+                    thread_id: child_thread_id,
+                    thread_object: thread,
+                },
+                _not_send: PhantomData,
+            };
+            let mut ctx = litebox_common_linux::PtRegs::default();
+            let notified = Arc::new(AtomicBool::new(false));
+            let observer = Arc::new(FlagOnNotify(Arc::clone(&notified)));
+            child.task.thread_object.register_observer(
+                Arc::downgrade(&observer) as Weak<dyn Observer<Events>>,
+                Events::IN,
+            );
+
+            assert_eq!(child.reenter(&mut ctx), ContinueOperation::Terminate);
+            assert!(
+                notified.load(Ordering::Acquire),
+                "reenter must publish completion and notify pollee observers"
+            );
+            assert_eq!(
+                child
+                    .task
+                    .thread_object
+                    .completion_state
+                    .load(Ordering::Acquire),
+                ThreadObject::<TestPlatform>::COMPLETE
             );
             assert_eq!(
                 parent.sys_nt_wait_for_single_object(handle, false, None),

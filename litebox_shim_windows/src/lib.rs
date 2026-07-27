@@ -2351,6 +2351,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Pl
         self.enter_shim(true, ctx, Task::init)
     }
 
+    fn reenter(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.enter_shim(true, ctx, |task, _| {
+            task.exit_thread(NtStatus::NOT_SUPPORTED.as_raw());
+        })
+    }
+
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         self.enter_shim(false, ctx, Task::handle_syscall_request)
     }

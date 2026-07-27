@@ -91,15 +91,16 @@ fn run_multithreaded_pe() {
         stdout,
         stderr
     );
-    let child_position = stdout.find("child thread\n");
+    let child_one_position = stdout.find("child one\n");
+    let child_two_position = stdout.find("child two\n");
     let joined_position = stdout.find("main joined\n");
     assert!(
-        child_position.is_some() && joined_position.is_some(),
+        child_one_position.is_some() && child_two_position.is_some() && joined_position.is_some(),
         "guest thread output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        child_position < joined_position,
-        "main reported joining before the child ran\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        child_one_position < joined_position && child_two_position < joined_position,
+        "main reported joining before both children ran\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
@@ -139,6 +140,8 @@ fn build_kernel32_import_pe(
             "opt-level=1",
             "-l",
             "dylib=kernel32",
+            "-l",
+            "dylib=ntdll",
             "-C",
             "link-arg=/ENTRY:mainCRTStartup",
             "-C",
@@ -214,9 +217,11 @@ const KERNEL32_MULTITHREAD_PE_SOURCE: &str = r#"
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-static CHILD_MAY_EXIT: AtomicBool = AtomicBool::new(false);
+static CHILDREN_STARTED: AtomicU32 = AtomicU32::new(0);
+static CHILDREN_MAY_EXIT: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -240,6 +245,17 @@ unsafe extern "system" {
     fn ExitProcess(exit_code: u32) -> !;
 }
 
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationThread(
+        thread_handle: usize,
+        thread_information_class: u32,
+        thread_information: *mut u32,
+        thread_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
 unsafe fn write_stdout(message: &[u8]) -> bool {
     unsafe {
         let stdout = GetStdHandle(0xffff_fff5);
@@ -255,29 +271,71 @@ unsafe fn write_stdout(message: &[u8]) -> bool {
     }
 }
 
-unsafe extern "system" fn child_thread(_parameter: *mut u8) -> u32 {
-    while !CHILD_MAY_EXIT.load(Ordering::Acquire) {
+unsafe extern "system" fn child_thread(parameter: *mut u8) -> u32 {
+    CHILDREN_STARTED.fetch_add(1, Ordering::Release);
+    while !CHILDREN_MAY_EXIT.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
-    u32::from(!unsafe { write_stdout(b"child thread\n") })
+    let message: &[u8] = if parameter as usize == 1 {
+        b"child one\n"
+    } else {
+        b"child two\n"
+    };
+    u32::from(!unsafe { write_stdout(message) })
+}
+
+unsafe fn am_i_last_thread() -> Option<bool> {
+    let mut is_last_thread = u32::MAX;
+    let mut return_length = 0;
+    let status = unsafe {
+        NtQueryInformationThread(
+            usize::MAX - 1,
+            12,
+            &raw mut is_last_thread,
+            size_of::<u32>() as u32,
+            &raw mut return_length,
+        )
+    };
+    (status == 0 && return_length as usize == size_of::<u32>())
+        .then_some(is_last_thread != 0)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn mainCRTStartup() -> ! {
     unsafe {
-        let thread = CreateThread(
+        let thread_one = CreateThread(
             core::ptr::null(),
             0,
             child_thread,
-            core::ptr::null_mut(),
+            1usize as *mut u8,
             0,
             core::ptr::null_mut(),
         );
-        if thread == 0 || WaitForSingleObject(thread, 0) != 258 {
+        let thread_two = CreateThread(
+            core::ptr::null(),
+            0,
+            child_thread,
+            2usize as *mut u8,
+            0,
+            core::ptr::null_mut(),
+        );
+        if thread_one == 0 || thread_two == 0 {
             ExitProcess(1);
         }
-        CHILD_MAY_EXIT.store(true, Ordering::Release);
-        if WaitForSingleObject(thread, u32::MAX) != 0 {
+        while CHILDREN_STARTED.load(Ordering::Acquire) != 2 {
+            core::hint::spin_loop();
+        }
+        if am_i_last_thread() != Some(false)
+            || WaitForSingleObject(thread_one, 0) != 258
+            || WaitForSingleObject(thread_two, 0) != 258
+        {
+            ExitProcess(1);
+        }
+        CHILDREN_MAY_EXIT.store(true, Ordering::Release);
+        if WaitForSingleObject(thread_one, u32::MAX) != 0
+            || WaitForSingleObject(thread_two, u32::MAX) != 0
+            || am_i_last_thread() != Some(true)
+        {
             ExitProcess(1);
         }
         ExitProcess(u32::from(!write_stdout(b"main joined\n")));
