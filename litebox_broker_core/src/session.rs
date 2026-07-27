@@ -2,10 +2,6 @@
 // Licensed under the MIT license.
 
 use alloc::sync::Arc;
-#[cfg(test)]
-use alloc::sync::Weak;
-#[cfg(test)]
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
@@ -50,25 +46,7 @@ pub(crate) struct ObjectReference {
     pub(crate) session_id: SessionId,
     pub(crate) rights: ObjectRights,
     #[cfg(test)]
-    drop_probe: Option<ReferenceDropProbe>,
-}
-
-#[cfg(test)]
-struct ReferenceDropProbe {
-    references: Weak<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
-    dropped_outside_lock: Arc<AtomicBool>,
-}
-
-#[cfg(test)]
-impl Drop for ReferenceDropProbe {
-    fn drop(&mut self) {
-        let references = self
-            .references
-            .upgrade()
-            .expect("broker core must outlive its object references");
-        self.dropped_outside_lock
-            .store(references.try_write().is_some(), Ordering::Relaxed);
-    }
+    drop_probe: Option<tests::ReferenceDropProbe>,
 }
 
 pub(crate) enum ObjectEntry {
@@ -246,16 +224,33 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
-    use super::ReferenceDropProbe;
-    use alloc::sync::Arc;
+    use alloc::sync::{Arc, Weak};
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
     };
+    use hashbrown::HashMap;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::readiness::ReadinessFlags;
+    use spin::rwlock::RwLock;
+
+    pub(super) struct ReferenceDropProbe {
+        references: Weak<RwLock<HashMap<ObjectHandle, super::ObjectReference>>>,
+        dropped_outside_lock: Arc<AtomicBool>,
+    }
+
+    impl Drop for ReferenceDropProbe {
+        fn drop(&mut self) {
+            let references = self
+                .references
+                .upgrade()
+                .expect("broker core must outlive its object references");
+            self.dropped_outside_lock
+                .store(references.try_write().is_some(), Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
