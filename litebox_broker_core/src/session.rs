@@ -302,7 +302,14 @@ impl BrokerSession {
         required_rights: ObjectRights,
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
         let references = self.core.references.read();
-        self.authorize_use_object(&references, handle, required_rights)
+        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
+        if reference.session_id != self.session_id {
+            return Err(BrokerError::UnknownObject);
+        }
+        if !reference.rights.contains(required_rights) {
+            return Err(BrokerError::InvalidRights);
+        }
+        Ok(Arc::clone(&reference.object))
     }
 
     /// Returns the current readiness of a broker-owned object.
@@ -317,23 +324,6 @@ impl BrokerSession {
             }
         };
         Ok(socket.readiness())
-    }
-
-    fn authorize_use_object(
-        &self,
-        references: &HashMap<ObjectHandle, ObjectReference>,
-        handle: ObjectHandle,
-        required_rights: ObjectRights,
-    ) -> Result<Arc<RwLock<ObjectEntry>>> {
-        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.session_id != self.session_id {
-            return Err(BrokerError::UnknownObject);
-        }
-        if !reference.rights.contains(required_rights) {
-            return Err(BrokerError::InvalidRights);
-        }
-        let object = Arc::clone(&reference.object);
-        Ok(object)
     }
 
     /// Closes one object reference owned by this session.
