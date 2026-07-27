@@ -13,8 +13,6 @@ use core::mem::size_of;
 use core::ops::Range;
 use core::sync::atomic::{Ordering, fence};
 
-#[cfg(test)]
-use crate::shared_memory::SharedMemory;
 use crate::shared_memory::{ControlRingMemory, SharedMemoryError};
 
 /// Size of one shared control-ring slot.
@@ -803,6 +801,7 @@ impl<Memory: WaitableSharedMemory> ControlRingConsumer<Memory> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared_memory::SharedMemory;
     use core::mem::align_of;
     use litebox_broker_protocol::RequestId;
     use litebox_broker_protocol::message::{
