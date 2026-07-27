@@ -424,10 +424,7 @@ impl LinuxUserland {
     )]
     /// Installs the runner seccomp filter.
     ///
-    /// Positional reads and writes are allowed only for the supplied
-    /// descriptors. Socket shutdown is allowed only for the supplied
-    /// descriptors and only in both directions. All other positional I/O and
-    /// socket shutdown calls remain blocked.
+    /// Broker transport exceptions are restricted to the supplied descriptors.
     pub fn enable_seccomp_filter(
         positional_io_fds: &[std::os::fd::RawFd],
         shutdown_fds: &[std::os::fd::RawFd],
@@ -525,6 +522,7 @@ impl LinuxUserland {
             (libc::SYS_close, vec![]),
         ];
         if !positional_io_fds.is_empty() {
+            // Broker shared memory uses positional descriptor I/O.
             let fd_rules = || {
                 positional_io_fds
                     .iter()
@@ -549,6 +547,8 @@ impl LinuxUserland {
             rules.push((libc::SYS_pwrite64, fd_rules()));
         }
         if !shutdown_fds.is_empty() {
+            // Association failure shuts down the control socket in both
+            // directions to interrupt local and peer liveness waits.
             let shutdown_rules = shutdown_fds
                 .iter()
                 .map(|fd| {

@@ -58,6 +58,10 @@ struct MappedRegion {
     length: usize,
 }
 
+/// Restricts each memfd to one non-overlapping portable access model.
+///
+/// Shared-buffer memfds permit only byte copies. Control-ring memfds permit
+/// byte and typed-word operations only at offsets defined by the ring ABI.
 #[derive(Clone, Copy)]
 enum MemoryAccessPolicy {
     Bytes,
@@ -103,14 +107,17 @@ unsafe impl Send for MappedRegion {}
 // derived from the mapping and passed to the kernel.
 unsafe impl Sync for MappedRegion {}
 
-fn u64_offset(memory: &MemfdSharedMemory, offset: usize) -> Result<(), SharedMemoryError> {
+fn validate_u64_offset(memory: &MemfdSharedMemory, offset: usize) -> Result<(), SharedMemoryError> {
     if !memory.policy.permits_u64(offset) {
         return Err(SharedMemoryError::InvalidRange);
     }
     checked_range(&memory.mapping, offset, size_of::<u64>(), align_of::<u64>())
 }
 
-fn u32_address(memory: &MemfdSharedMemory, offset: usize) -> Result<*mut u32, SharedMemoryError> {
+fn checked_u32_address(
+    memory: &MemfdSharedMemory,
+    offset: usize,
+) -> Result<*mut u32, SharedMemoryError> {
     if !memory.policy.permits_u32(offset) {
         return Err(SharedMemoryError::InvalidRange);
     }
@@ -361,7 +368,7 @@ impl WaitableSharedMemory for MemfdSharedMemory {
     /// trusted cancellation state if a hostile peer restores the sampled shared
     /// value after cancellation. The caller must recheck its wait condition.
     fn wait_while_equal(&self, offset: usize, expected: u32) -> IoResult<()> {
-        let address = u32_address(self, offset).map_err(Self::wait_access_error)?;
+        let address = checked_u32_address(self, offset).map_err(Self::wait_access_error)?;
         match futex_wait(address, expected) {
             Ok(()) => Ok(()),
             Err(error)
@@ -378,7 +385,7 @@ impl WaitableSharedMemory for MemfdSharedMemory {
 
     /// Wakes one waiter blocked on a shared `u32`.
     fn wake_one(&self, offset: usize) -> IoResult<()> {
-        let address = u32_address(self, offset).map_err(Self::wait_access_error)?;
+        let address = checked_u32_address(self, offset).map_err(Self::wait_access_error)?;
         futex_wake_one(address)
     }
 }
@@ -413,26 +420,26 @@ impl SharedMemory for MemfdSharedMemory {
 
 impl ControlRingMemory for MemfdSharedMemory {
     fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
-        u32_address(self, offset)?;
+        checked_u32_address(self, offset)?;
         let mut bytes = [0; size_of::<u32>()];
         read_exact_at(self, offset, &mut bytes)?;
         Ok(u32::from_ne_bytes(bytes))
     }
 
     fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
-        let address = u32_address(self, offset)?;
+        let address = checked_u32_address(self, offset)?;
         futex_increment(address).map_err(|_| SharedMemoryError::AccessFailed)
     }
 
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
-        u64_offset(self, offset)?;
+        validate_u64_offset(self, offset)?;
         let mut bytes = [0; size_of::<u64>()];
         read_exact_at(self, offset, &mut bytes)?;
         Ok(u64::from_ne_bytes(bytes))
     }
 
     fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
-        u64_offset(self, offset)?;
+        validate_u64_offset(self, offset)?;
         write_all_at(self, offset, &value.to_ne_bytes())
     }
 
@@ -443,8 +450,8 @@ impl ControlRingMemory for MemfdSharedMemory {
         increment_offset: usize,
     ) -> Result<(), SharedMemoryError> {
         validate_nonoverlapping_word_ranges(store_offset, increment_offset)?;
-        u64_offset(self, store_offset)?;
-        let increment_address = u32_address(self, increment_offset)?;
+        validate_u64_offset(self, store_offset)?;
+        let increment_address = checked_u32_address(self, increment_offset)?;
         write_all_at(self, store_offset, &value.to_ne_bytes())?;
         futex_increment(increment_address).map_err(|_| SharedMemoryError::AccessFailed)
     }

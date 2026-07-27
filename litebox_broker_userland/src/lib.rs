@@ -1,12 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux-userland broker host deployment support.
+//! Support for the Linux-userland broker process.
 //!
-//! The broker host binary in this crate owns process, socket, and thread
-//! policy, binding `litebox_broker_core` and `litebox_broker_host` to the
-//! concrete host endpoints in `litebox_broker_transport_linux_userland`. This
-//! library holds the deployment pieces that are useful outside `main`, so
-//! integration tests can drive the same code the binary runs.
+//! The broker executable composes `litebox_broker_core` and
+//! `litebox_broker_host` with the Linux host endpoints from
+//! `litebox_broker_transport_linux_userland`. It owns runner process lifecycle,
+//! socket setup, and worker threads. This library exposes components shared by
+//! the executable and its integration tests, currently readiness publication.
 
 pub mod readiness;
