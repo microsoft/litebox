@@ -57,7 +57,7 @@ pub(crate) enum ObjectEntry {
 
 struct SessionReferences {
     handles: Vec<ObjectHandle>,
-    pending: usize,
+    pending_references: usize,
 }
 
 /// Broker-owned authority token for one authenticated caller session.
@@ -73,6 +73,7 @@ pub struct BrokerSession {
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this session.
     references: Mutex<SessionReferences>,
+    /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<core::sync::atomic::AtomicUsize>,
 }
 
@@ -89,7 +90,7 @@ impl BrokerSession {
             caller_credential,
             references: Mutex::new(SessionReferences {
                 handles: Vec::new(),
-                pending: 0,
+                pending_references: 0,
             }),
             reserved_sockets: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
         }
@@ -102,7 +103,7 @@ impl BrokerSession {
             .principal_object_rights(self.caller_credential)?;
         let mut session_references = self.references.lock();
         let additional = session_references
-            .pending
+            .pending_references
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         if session_references.handles.try_reserve(additional).is_err() {
@@ -164,7 +165,7 @@ impl BrokerSession {
             .principal_object_rights(self.caller_credential)?;
         let mut session_references = self.references.lock();
         let additional = session_references
-            .pending
+            .pending_references
             .checked_add(2)
             .ok_or(BrokerError::ResourceExhausted)?;
         if session_references.handles.try_reserve(additional).is_err() {
@@ -226,7 +227,7 @@ impl BrokerSession {
     ) -> Result<PendingObjectReference<'_>> {
         let mut session_references = self.references.lock();
         let next_session_pending = session_references
-            .pending
+            .pending_references
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         session_references
@@ -259,7 +260,7 @@ impl BrokerSession {
         self.core
             .pending_references
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        session_references.pending = next_session_pending;
+        session_references.pending_references = next_session_pending;
         Ok(PendingObjectReference {
             session: self,
             handle,
@@ -448,7 +449,7 @@ impl PendingObjectReference<'_> {
             object,
             self.rights,
         );
-        session_references.pending -= 1;
+        session_references.pending_references -= 1;
         self.session
             .core
             .pending_references
@@ -461,7 +462,7 @@ impl PendingObjectReference<'_> {
 impl Drop for PendingObjectReference<'_> {
     fn drop(&mut self) {
         if self.active {
-            self.session.references.lock().pending -= 1;
+            self.session.references.lock().pending_references -= 1;
             self.session
                 .core
                 .pending_references
