@@ -650,8 +650,8 @@ mod control_ring_tests {
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, mpsc};
 
     type Producer = ControlRingProducer<MemfdSharedMemory>;
     type Consumer = ControlRingConsumer<MemfdSharedMemory>;
@@ -930,9 +930,11 @@ mod control_ring_tests {
         for payload_kind in 0..3 {
             let failures = Arc::new(AtomicUsize::new(0));
             let callback_failures = Arc::clone(&failures);
+            let (failure_reported, wait_for_failure) = mpsc::channel();
             let (channel, _shutdown, mut responses, mut requests, _peer) =
                 activate_local(move || {
                     callback_failures.fetch_add(1, Ordering::SeqCst);
+                    failure_reported.send(()).unwrap();
                 });
             let channel = Arc::new(channel);
             let calls = [1, 2].map(|id| {
@@ -955,6 +957,9 @@ mod control_ring_tests {
             let results = calls.map(|call| call.join().unwrap());
             let error_count = results.iter().filter(|result| result.is_err()).count();
             assert_eq!(error_count, if payload_kind == 1 { 1 } else { 2 });
+            wait_for_failure
+                .recv_timeout(Duration::from_secs(1))
+                .expect("failure callback was not invoked");
             assert_eq!(failures.load(Ordering::SeqCst), 1);
         }
     }
