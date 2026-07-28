@@ -1035,6 +1035,43 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-service-private-l1-1-2", "sechost.dll"),
     ("api-ms-win-service-private-l1-1-3", "sechost.dll"),
     ("api-ms-win-service-winsvc-l1-1-0", "sechost.dll"),
+    ("api-ms-win-core-interlocked-l1-2-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-kernel32-legacy-ansi-l1-1-0",
+        "kernel32.dll",
+    ),
+    ("api-ms-win-core-kernel32-legacy-l1-1-6", "kernel32.dll"),
+    ("api-ms-win-core-kernel32-private-l1-1-2", "kernel32.dll"),
+    ("api-ms-win-core-kernel32-private-l1-2-0", "kernel32.dll"),
+    ("api-ms-win-core-localization-ansi-l1-1-0", "kernel32.dll"),
+    ("api-ms-win-core-privateprofile-l1-1-1", "kernel32.dll"),
+    (
+        "api-ms-win-core-processenvironment-ansi-l1-1-0",
+        "kernel32.dll",
+    ),
+    ("api-ms-win-core-psm-key-l1-1-3", "kernelbase.dll"),
+    ("api-ms-win-core-quirks-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-registry-l2-1-0", "advapi32.dll"),
+    ("api-ms-win-core-registry-l2-2-0", "advapi32.dll"),
+    ("api-ms-win-core-registry-l2-3-0", "advapi32.dll"),
+    ("api-ms-win-core-shlwapi-legacy-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-string-obsolete-l1-1-1", "kernel32.dll"),
+    ("api-ms-win-core-stringansi-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-crt-locale-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-math-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-private-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-runtime-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-string-l1-1-0", "ucrtbase.dll"),
+    (
+        "api-ms-win-eventing-classicprovider-l1-1-0",
+        "kernelbase.dll",
+    ),
+    ("api-ms-win-gdi-internal-uap-l1-1-0", "gdi32full.dll"),
+    ("api-ms-win-service-private-l1-2-2", "sechost.dll"),
+    (
+        "api-ms-win-stateseparation-helpers-l1-1-1",
+        "kernelbase.dll",
+    ),
     ("ext-ms-win-appcompat-apphelp-l1-1-2", "apphelp.dll"),
     ("ext-ms-win-authz-context-l1-1-0", "authz.dll"),
     ("ext-ms-win-core-winrt-remote-l1-1-0", ""),
@@ -2141,7 +2178,10 @@ mod tests {
         for (contract, expected_host) in [
             ("api-ms-win-core-rtlsupport-l1-1-0", "ntdll.dll"),
             ("api-ms-win-core-file-l1-2-3", "kernelbase.dll"),
+            ("api-ms-win-core-registry-l2-1-0", "advapi32.dll"),
+            ("api-ms-win-crt-string-l1-1-0", "ucrtbase.dll"),
             ("api-ms-win-eventing-consumer-l1-1-0", "sechost.dll"),
+            ("api-ms-win-gdi-internal-uap-l1-1-0", "gdi32full.dll"),
         ] {
             assert_eq!(
                 api_set_default_value(&synthetic_bytes, contract).as_deref(),
@@ -2149,6 +2189,20 @@ mod tests {
                 "synthetic mapping for {contract}"
             );
         }
+    }
+
+    #[test]
+    fn api_set_mappings_have_no_duplicate_contracts() {
+        // The namespace builder does no dedup (`count = mappings.len()`), so a duplicate
+        // contract would silently emit phantom namespace slots. Guard against that class of bug.
+        let mut seen = alloc::collections::BTreeSet::new();
+        for (contract, _) in API_SET_MAPPINGS {
+            assert!(
+                seen.insert(*contract),
+                "duplicate API-set contract: {contract}"
+            );
+        }
+        assert_eq!(seen.len(), API_SET_MAPPINGS.len());
     }
 
     #[test]
