@@ -680,7 +680,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             affinity_mask: GUEST_PROCESS_AFFINITY_MASK,
             base_priority: NORMAL_PROCESS_BASE_PRIORITY,
             _padding1: 0,
-            unique_process_id: INITIAL_PROCESS_ID,
+            unique_process_id: self.process.id,
             inherited_from_unique_process_id: GUEST_PARENT_PROCESS_ID,
         }
     }

@@ -86,6 +86,7 @@ impl NtStatus {
             0x00000003 => {
                 "STATUS_WAIT_3: Caller specified WaitAny and one of the dispatcher objects was set"
             }
+            0x00000101 => "STATUS_ALERTED: The delay completed because the thread was alerted",
             0x00000102 => "STATUS_TIMEOUT: The given timeout interval expired",
             0x00000103 => "STATUS_PENDING: The operation that was requested is pending completion",
             0x00000105 => "STATUS_MORE_ENTRIES: More entries are available",
@@ -234,6 +235,9 @@ impl NtStatus {
 
     /// STATUS_WAIT_3
     pub const WAIT_3: Self = Self::from_raw(0x00000003);
+
+    /// STATUS_ALERTED
+    pub const ALERTED: Self = Self::from_raw(0x00000101);
 
     /// STATUS_TIMEOUT
     pub const TIMEOUT: Self = Self::from_raw(0x00000102);

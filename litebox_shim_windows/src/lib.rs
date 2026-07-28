@@ -30,7 +30,7 @@ use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::RawSyncPrimitivesProvider;
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::NtSysno;
-use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
+use litebox_common_windows::loader::PAGE_SIZE;
 
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
@@ -529,9 +529,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         );
         let mut process =
             Process::default(Some(load_info.virtual_allocations), windows_shared_section);
-        process.ntdll_mapping = load_info.ntdll_mapping;
-        process.ldr_initialize_thunk = load_info.ldr_initialize_thunk;
-        process.rtl_user_thread_start = load_info.rtl_user_thread_start;
+        process.ntdll = load_info.ntdll;
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
         let thread_object = Arc::new(syscalls::thread::ThreadObject::new());
@@ -571,9 +569,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
 
 /// Per-process Windows state shared by every thread in the process.
 pub struct Process<Platform: ShimPlatform> {
-    ntdll_mapping: Option<MappingInfo>,
-    ldr_initialize_thunk: Option<usize>,
-    rtl_user_thread_start: Option<usize>,
+    /// The NT process ID reported to the guest.
+    id: usize,
+    /// The ntdll image loaded into this process, if any.
+    ntdll: Option<loader::NtDllInfo>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
     token: Arc<TokenObject>,
@@ -609,6 +608,14 @@ struct ProcessThreads<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> Process<Platform> {
+    /// Allocates the NT thread ID for a newly created thread.
+    ///
+    /// TODO: IDs are never reused, so a thread ID that has been observed by the guest
+    /// can never name a different thread later.
+    fn allocate_thread_id(&self) -> usize {
+        self.next_thread_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Registers a newly created thread, returning `false` if the process is
     /// already exiting and the thread must not start.
     fn attach_thread(
@@ -659,9 +666,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
             "seeded Windows shared section must have seeded ancestors: {status:?}"
         );
         Process {
-            ntdll_mapping: None,
-            ldr_initialize_thunk: None,
-            rtl_user_thread_start: None,
+            id: syscalls::process::INITIAL_PROCESS_ID,
+            ntdll: None,
             peb_address: 0,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
             token: Arc::new(TokenObject::primary()),
@@ -760,9 +766,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ctx.rcx = self.context;
         ctx.rdx = self
             .process
-            .ntdll_mapping
+            .ntdll
             .as_ref()
-            .map_or(0, |mapping| mapping.base_addr);
+            .map_or(0, |ntdll| ntdll.mapping.base_addr);
         litebox_util_log::debug!(
             entry_point:% = format_args!("{:#x}", self.entry_point),
             stack_top:% = format_args!("{:#x}", self.stack_top);

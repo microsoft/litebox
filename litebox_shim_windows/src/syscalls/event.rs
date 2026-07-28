@@ -85,7 +85,7 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for EventSubsy
 }
 
 pub(crate) struct EventHandleObject<Platform: crate::ShimPlatform> {
-    event: Arc<EventObject<Platform>>,
+    pub(crate) event: Arc<EventObject<Platform>>,
 }
 
 pub(crate) struct EventObject<Platform: crate::ShimPlatform> {
@@ -142,6 +142,20 @@ impl<Platform: crate::ShimPlatform> EventObject<Platform> {
 
     pub(crate) fn is_signaled(&self) -> bool {
         *self.signaled.lock()
+    }
+
+    /// Attempts to satisfy a wait on this event. A synchronization event is
+    /// reset by the wait that it satisfies; a notification event stays
+    /// signaled until it is reset explicitly.
+    pub(crate) fn try_acquire(&self) -> bool {
+        let mut signaled = self.signaled.lock();
+        if !*signaled {
+            return false;
+        }
+        if self.event_type == EventType::Synchronization {
+            *signaled = false;
+        }
+        true
     }
 
     fn replace_state(&self, next: bool) -> i32 {

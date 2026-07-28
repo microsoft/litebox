@@ -113,20 +113,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::NOT_SUPPORTED;
         }
 
-        let Some(ntdll_mapping) = self.process.ntdll_mapping else {
+        let Some(ntdll) = self.process.ntdll else {
             return NtStatus::INVALID_PARAMETER;
         };
         let trace_handle = trace_handle.as_raw();
-        let Some(ntdll_end) = ntdll_mapping
+        let Some(ntdll_end) = ntdll
+            .mapping
             .base_addr
-            .checked_add(ntdll_mapping.image_size)
+            .checked_add(ntdll.mapping.image_size)
         else {
             return NtStatus::INVALID_PARAMETER;
         };
         let Some(provider_end) = trace_handle.checked_add(size_of::<Guid>()) else {
             return NtStatus::INVALID_PARAMETER;
         };
-        if trace_handle < ntdll_mapping.base_addr || provider_end > ntdll_end {
+        if trace_handle < ntdll.mapping.base_addr || provider_end > ntdll_end {
             return NtStatus::INVALID_PARAMETER;
         }
         let Some(provider_id) =
@@ -220,11 +221,15 @@ mod tests {
             let mut task = crate::tests::test_task();
             Arc::get_mut(&mut task.process)
                 .expect("test task has unique process")
-                .ntdll_mapping = Some(litebox_common_windows::loader::MappingInfo {
-                base_addr: base,
-                image_size: size_of::<ProviderIds>(),
-                mapping_size: size_of::<ProviderIds>(),
-                entry_point: 0,
+                .ntdll = Some(crate::loader::NtDllInfo {
+                mapping: litebox_common_windows::loader::MappingInfo {
+                    base_addr: base,
+                    image_size: size_of::<ProviderIds>(),
+                    mapping_size: size_of::<ProviderIds>(),
+                    entry_point: 0,
+                },
+                ldr_initialize_thunk: 0,
+                rtl_user_thread_start: 0,
             });
             let header = event_header();
             let field_size = u32::try_from(size_of::<EventHeader>()).unwrap();

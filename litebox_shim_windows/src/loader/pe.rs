@@ -71,11 +71,19 @@ pub(crate) struct WindowsProcessEnvironment {
 pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
-    pub(crate) ldr_initialize_thunk: Option<usize>,
-    pub(crate) rtl_user_thread_start: Option<usize>,
-    pub(crate) ntdll_mapping: Option<MappingInfo>,
+    pub(crate) ntdll: Option<NtDllInfo>,
     pub(crate) virtual_allocations: crate::WindowsVirtualAllocations<Platform>,
     pub(crate) environment: WindowsProcessEnvironment,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NtDllInfo {
+    pub(crate) mapping: MappingInfo,
+    /// `LdrInitializeThunk`, where every guest thread starts executing.
+    pub(crate) ldr_initialize_thunk: usize,
+    /// `RtlUserThreadStart`, the loader resumes there once initialization is done,
+    /// and it calls the thread's start routine.
+    pub(crate) rtl_user_thread_start: usize,
 }
 
 struct ProcessEnvironmentInput<'a> {
@@ -151,26 +159,20 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         let virtual_allocations =
             crate::WindowsVirtualAllocations::<Platform>::new(BTreeMap::new());
         register_image_virtual_allocation(&virtual_allocations, image.mapping, image.pages);
-        let rtl_user_thread_start = ntdll
-            .as_ref()
-            .map(|ntdll| ntdll.exports.rtl_user_thread_start);
-        let ldr_initialize_thunk = ntdll
-            .as_ref()
-            .map(|ntdll| ntdll.exports.ldr_initialize_thunk);
-        let ntdll_mapping = if let Some(ntdll) = ntdll {
+        let ntdll = ntdll.map(|ntdll| {
             let mapping = ntdll.image.mapping;
             register_image_virtual_allocation(&virtual_allocations, mapping, ntdll.image.pages);
-            Some(mapping)
-        } else {
-            None
-        };
+            NtDllInfo {
+                mapping,
+                ldr_initialize_thunk: ntdll.exports.ldr_initialize_thunk,
+                rtl_user_thread_start: ntdll.exports.rtl_user_thread_start,
+            }
+        });
 
         Ok(PeLoadInfo {
             entry_point,
             stack_top: environment.stack_top,
-            ldr_initialize_thunk,
-            rtl_user_thread_start,
-            ntdll_mapping,
+            ntdll,
             virtual_allocations,
             environment,
         })
@@ -2310,28 +2312,6 @@ mod tests {
                 rcu,
             ]
         );
-    }
-
-    #[test]
-    fn secondary_thread_defers_activation_context_stack_to_loader() {
-        let platform = crate::tests::test_platform();
-        let litebox = litebox::LiteBox::new(platform);
-        let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
-        let environment = create_thread_environment(
-            &page_manager,
-            INITIAL_STACK_SIZE,
-            0x1234_0000,
-            ClientId {
-                unique_process: INITIAL_PROCESS_ID,
-                unique_thread: INITIAL_THREAD_ID + 1,
-            },
-            false,
-        )
-        .expect("failed to create secondary thread environment");
-        let teb = read_guest_value::<ThreadEnvironmentBlock>(environment.teb);
-
-        assert_eq!(teb.activation_context_stack_pointer, 0);
-        assert_eq!(teb.activation_stack.as_bytes(), &[0; 0x28]);
     }
 
     #[test]

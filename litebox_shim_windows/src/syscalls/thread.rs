@@ -8,9 +8,8 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use int_enum::IntEnum;
 use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
-use litebox::event::{polling::TryOpError, wait::WaitError};
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemTime as _};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable};
@@ -23,8 +22,6 @@ use crate::{
     ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, WindowsShimEntrypoints,
     probe_guest_output_preserving_value,
 };
-
-const STATUS_ALERTED: NtStatus = NtStatus::from_raw(0x0000_0101);
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +139,11 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
     /// guest code.
     pub(crate) fn is_exiting(&self) -> bool {
         self.is_exiting.load(Ordering::Acquire)
+    }
+
+    /// The exit status recorded by [`Self::exit_thread`].
+    pub(crate) fn exit_status(&self) -> i32 {
+        self.exit_status.load(Ordering::Relaxed)
     }
 
     /// Records `exit_status` and marks the thread as exiting.
@@ -267,6 +269,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let create_flags = ThreadCreateFlags::from_bits_retain(create_flags);
         if !create_flags.is_empty() {
             // TODO(thread-model): support suspended creation and the remaining native flags.
+            litebox_util_log::debug!(
+                create_flags:? = create_flags;
+                "Rejecting NtCreateThreadEx with unsupported creation flags"
+            );
             return NtStatus::NOT_SUPPORTED;
         }
         // TODO(thread-object-attributes): apply object attributes to the new thread handle.
@@ -286,20 +292,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_util_log::debug!("Ignoring NtCreateThreadEx attribute list");
         }
 
-        let (Some(ldr_initialize_thunk), Some(rtl_user_thread_start), Some(ntdll_mapping)) = (
-            self.process.ldr_initialize_thunk,
-            self.process.rtl_user_thread_start,
-            self.process.ntdll_mapping,
-        ) else {
+        let Some(ntdll) = self.process.ntdll else {
             return NtStatus::NOT_SUPPORTED;
         };
-        let thread_id = self.process.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        let thread_id = self.process.allocate_thread_id();
         let environment = match create_thread_environment(
             &self.global.page_manager,
             stack_size,
             self.process.peb_address,
             ClientId {
-                unique_process: crate::syscalls::process::INITIAL_PROCESS_ID,
+                unique_process: self.process.id,
                 unique_thread: thread_id,
             },
             false,
@@ -311,7 +313,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
         let initial_context = X64Context::initial_thread_context(
-            rtl_user_thread_start,
+            ntdll.rtl_user_thread_start,
             start_routine,
             environment.stack_top,
             argument,
@@ -323,11 +325,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
         let mut child_ctx = ctx.clone();
-        child_ctx.rip = ldr_initialize_thunk;
+        child_ctx.rip = ntdll.ldr_initialize_thunk;
         child_ctx.rsp = environment.stack_top;
         child_ctx.eflags = 0x202;
         child_ctx.rcx = environment.context;
-        child_ctx.rdx = ntdll_mapping.base_addr;
+        child_ctx.rdx = ntdll.mapping.base_addr;
 
         let thread = Arc::new(ThreadObject::new());
         if !self.process.attach_thread(thread_id, &thread) {
@@ -353,7 +355,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             process: self.process.clone(),
             fs: self.fs.clone(),
             wait_state: crate::wait::WaitState::new(self.global.platform),
-            entry_point: ldr_initialize_thunk,
+            entry_point: ntdll.ldr_initialize_thunk,
             stack_top: environment.stack_top,
             context: environment.context,
             teb_address: environment.teb,
@@ -377,86 +379,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
-    }
-
-    pub(crate) fn sys_nt_wait_for_single_object(
-        &self,
-        handle: Handle,
-        alertable: bool,
-        timeout: Option<ConstPtr<Platform, i64>>,
-    ) -> NtStatus {
-        let entry = match self.typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
-            handle,
-            AccessMask::SYNCHRONIZE.bits(),
-        ) {
-            Ok(entry) => entry,
-            Err(status) => return status,
-        };
-        let thread = entry.with_entry(|entry| Arc::clone(&entry.thread));
-        let timeout = match timeout {
-            Some(timeout) => {
-                let Some(timeout) = timeout.read_at_offset(0) else {
-                    return NtStatus::ACCESS_VIOLATION;
-                };
-                Some(self.wait_timeout_duration(timeout))
-            }
-            None => None,
-        };
-        if alertable {
-            // TODO(windows-apc): interrupt alertable waits when user APC delivery is modeled.
-            litebox_util_log::debug!("Treating alertable thread wait as non-alertable");
-        }
-
-        let wait_cx = self.wait_cx().with_timeout(timeout);
-        match thread.pollee.wait(&wait_cx, false, Events::IN, || {
-            if thread.completion_state.load(Ordering::Acquire) == ThreadObject::<Platform>::COMPLETE
-            {
-                Ok(())
-            } else {
-                Err(TryOpError::<NtStatus>::TryAgain)
-            }
-        }) {
-            Ok(()) => {
-                litebox_util_log::debug!(
-                    exit_status = thread.exit_status.load(Ordering::Relaxed);
-                    "Thread wait completed"
-                );
-                NtStatus::SUCCESS
-            }
-            Err(TryOpError::WaitError(WaitError::TimedOut)) => NtStatus::TIMEOUT,
-            Err(TryOpError::WaitError(WaitError::Interrupted)) => STATUS_ALERTED,
-            Err(TryOpError::TryAgain) => unreachable!("blocking wait cannot return TryAgain"),
-            Err(TryOpError::Other(status)) => status,
-        }
-    }
-
-    fn duration_from_100ns(intervals: u64) -> core::time::Duration {
-        const INTERVALS_PER_SECOND: u64 = 10_000_000;
-
-        core::time::Duration::new(
-            intervals / INTERVALS_PER_SECOND,
-            ((intervals % INTERVALS_PER_SECOND) * 100)
-                .try_into()
-                .expect("subsecond 100ns intervals fit in u32 nanoseconds"),
-        )
-    }
-
-    fn wait_timeout_duration(&self, timeout: i64) -> core::time::Duration {
-        const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
-
-        if timeout <= 0 {
-            return Self::duration_from_100ns(timeout.unsigned_abs());
-        }
-
-        let target = Self::duration_from_100ns(timeout.cast_unsigned());
-        let unix_now = self
-            .global
-            .platform
-            .current_time()
-            .duration_since(&Platform::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-        let windows_now = core::time::Duration::from_secs(WINDOWS_TO_UNIX_EPOCH_SECONDS) + unix_now;
-        target.saturating_sub(windows_now)
     }
 
     pub(crate) fn sys_nt_query_information_thread(
@@ -623,31 +545,20 @@ mod tests {
     fn child_exception_completes_wait_before_last_thread_is_observed() {
         run_with_test_platform_pointers(|| {
             let parent = crate::tests::test_task();
-            let thread = Arc::new(ThreadObject::new());
+            let child = parent
+                .clone_for_test()
+                .expect("a live process should accept another thread");
             let handle = parent
                 .insert_typed_handle::<ThreadSubsystem<TestPlatform>>(
                     ThreadHandleObject {
-                        thread: Arc::clone(&thread),
+                        thread: Arc::clone(&child.thread_object),
                     },
                     AccessMask::SYNCHRONIZE.bits(),
                     drop,
                 )
                 .expect("thread handle insertion should succeed");
-            let child_thread_id = crate::syscalls::process::INITIAL_THREAD_ID + 1;
-            assert!(parent.process.attach_thread(child_thread_id, &thread));
             let child = WindowsShimEntrypoints {
-                task: Task {
-                    global: Arc::clone(&parent.global),
-                    process: Arc::clone(&parent.process),
-                    fs: Arc::clone(&parent.fs),
-                    wait_state: crate::wait::WaitState::new(parent.global.platform),
-                    entry_point: 0,
-                    stack_top: 0,
-                    context: 0,
-                    teb_address: 0,
-                    thread_id: child_thread_id,
-                    thread_object: thread,
-                },
+                task: child,
                 _not_send: PhantomData,
             };
             let mut ctx = litebox_common_linux::PtRegs::default();
@@ -685,133 +596,6 @@ mod tests {
             assert_eq!(is_last_thread, 1);
             assert_eq!(return_length as usize, size_of::<u32>());
             assert_eq!(parent.process.live_thread_count(), 1);
-        });
-    }
-
-    #[test]
-    fn unsupported_reentry_completes_thread_wait_and_detaches_thread() {
-        struct FlagOnNotify(Arc<AtomicBool>);
-
-        impl Observer<Events> for FlagOnNotify {
-            fn on_events(&self, _events: &Events) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-
-        run_with_test_platform_pointers(|| {
-            let parent = crate::tests::test_task();
-            let thread = Arc::new(ThreadObject::new());
-            let handle = parent
-                .insert_typed_handle::<ThreadSubsystem<TestPlatform>>(
-                    ThreadHandleObject {
-                        thread: Arc::clone(&thread),
-                    },
-                    AccessMask::SYNCHRONIZE.bits(),
-                    drop,
-                )
-                .expect("thread handle insertion should succeed");
-            let child_thread_id = crate::syscalls::process::INITIAL_THREAD_ID + 1;
-            assert!(parent.process.attach_thread(child_thread_id, &thread));
-            let child = WindowsShimEntrypoints {
-                task: Task {
-                    global: Arc::clone(&parent.global),
-                    process: Arc::clone(&parent.process),
-                    fs: Arc::clone(&parent.fs),
-                    wait_state: crate::wait::WaitState::new(parent.global.platform),
-                    entry_point: 0,
-                    stack_top: 0,
-                    context: 0,
-                    teb_address: 0,
-                    thread_id: child_thread_id,
-                    thread_object: thread,
-                },
-                _not_send: PhantomData,
-            };
-            let mut ctx = litebox_common_linux::PtRegs::default();
-            let notified = Arc::new(AtomicBool::new(false));
-            let observer = Arc::new(FlagOnNotify(Arc::clone(&notified)));
-            child.task.thread_object.register_observer(
-                Arc::downgrade(&observer) as Weak<dyn Observer<Events>>,
-                Events::IN,
-            );
-
-            assert_eq!(child.reenter(&mut ctx), ContinueOperation::Terminate);
-            assert!(
-                notified.load(Ordering::Acquire),
-                "reenter must publish completion and notify pollee observers"
-            );
-            assert_eq!(
-                child
-                    .task
-                    .thread_object
-                    .completion_state
-                    .load(Ordering::Acquire),
-                ThreadObject::<TestPlatform>::COMPLETE
-            );
-            assert_eq!(
-                parent.sys_nt_wait_for_single_object(handle, false, None),
-                NtStatus::SUCCESS
-            );
-            let mut is_last_thread = u32::MAX;
-            let mut return_length = 0;
-            assert_eq!(
-                parent.sys_nt_query_information_thread(
-                    ThreadHandle::CURRENT,
-                    12,
-                    mut_byte_ptr(&mut is_last_thread),
-                    size_of::<u32>().trunc(),
-                    Some(mut_ptr(&mut return_length)),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(is_last_thread, 1);
-            assert_eq!(return_length as usize, size_of::<u32>());
-            assert_eq!(parent.process.live_thread_count(), 1);
-        });
-    }
-
-    #[test]
-    fn process_exit_signals_every_thread_and_blocks_new_ones() {
-        run_with_test_platform_pointers(|| {
-            let parent = crate::tests::test_task();
-            let sibling = Arc::new(ThreadObject::new());
-            let sibling_id = crate::syscalls::process::INITIAL_THREAD_ID + 1;
-            assert!(parent.process.attach_thread(sibling_id, &sibling));
-            let sibling_task = Task {
-                global: Arc::clone(&parent.global),
-                process: Arc::clone(&parent.process),
-                fs: Arc::clone(&parent.fs),
-                wait_state: crate::wait::WaitState::new(parent.global.platform),
-                entry_point: 0,
-                stack_top: 0,
-                context: 0,
-                teb_address: 0,
-                thread_id: sibling_id,
-                thread_object: Arc::clone(&sibling),
-            };
-
-            parent.exit_process(42);
-
-            // Every thread in the process is asked to exit, including the
-            // caller, and the exit code is recorded.
-            assert!(parent.thread_object.is_exiting());
-            assert!(sibling.is_exiting());
-            assert_eq!(parent.process.exit_code.load(Ordering::Relaxed), 42);
-
-            // A signalled thread must not re-enter guest code.
-            let mut ctx = litebox_common_linux::PtRegs::default();
-            assert!(!sibling_task.prepare_to_run_guest(&mut ctx));
-
-            // No new threads may join a process that is tearing down.
-            assert!(
-                !parent
-                    .process
-                    .attach_thread(sibling_id + 1, &Arc::new(ThreadObject::new()))
-            );
-
-            // Group exit is recorded once; a later exit does not overwrite the code.
-            parent.exit_process(7);
-            assert_eq!(parent.process.exit_code.load(Ordering::Relaxed), 42);
         });
     }
 

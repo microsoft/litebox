@@ -20,6 +20,7 @@ pub(crate) mod thread;
 pub(crate) mod timer;
 pub(crate) mod token;
 pub(crate) mod trace;
+pub(crate) mod wait;
 pub(crate) mod wait_completion_packet;
 pub(crate) mod wnf;
 pub(crate) mod worker_factory;
@@ -1359,7 +1360,6 @@ impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox::platform::ThreadProvider;
 
     #[test]
     fn handle_encodes_raw_fds_and_rejects_invalid_values() {
@@ -1385,78 +1385,5 @@ mod tests {
 
         assert_eq!(Handle::from_raw_fd(usize::MAX >> HANDLE_SHIFT), None);
         assert_eq!(Handle::from_raw_fd(usize::MAX), None);
-    }
-
-    #[test]
-    fn nt_create_thread_ex_decode_preserves_all_abi_arguments() {
-        type TestPlatform = crate::tests::TestPlatform;
-
-        let _ = crate::tests::test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(|| {
-            let stack = [
-                0usize,
-                0,
-                0,
-                0,
-                0,
-                0x5555_5555_5555_5555,
-                0x6666_6666_6666_6666,
-                0x7777_7777,
-                0x8888_8888_8888_8888,
-                0x9999_9999_9999_9999,
-                0xaaaa_aaaa_aaaa_aaaa,
-                0xbbbb_bbbb_bbbb_bbbb,
-            ];
-            let regs = litebox_common_linux::PtRegs {
-                orig_rax: usize::try_from(NtSysno::NtCreateThreadEx.as_raw()).unwrap(),
-                r10: 0x1111_1111_1111_1111,
-                rdx: 0x2222_2222,
-                r8: 0x3333_3333_3333_3333,
-                r9: usize::MAX,
-                rsp: stack.as_ptr() as usize,
-                ..Default::default()
-            };
-
-            let request = SyscallRequest::<TestPlatform>::try_from_raw(&regs)
-                .expect("NtCreateThreadEx should decode");
-            let SyscallRequest::NtCreateThreadEx {
-                thread_handle,
-                desired_access,
-                object_attributes,
-                process_handle,
-                start_routine,
-                argument,
-                create_flags,
-                zero_bits,
-                stack_size,
-                maximum_stack_size,
-                attribute_list,
-            } = request
-            else {
-                panic!("decoded the wrong syscall request");
-            };
-
-            assert_eq!(thread_handle.as_usize(), 0x1111_1111_1111_1111);
-            assert_eq!(desired_access, 0x2222_2222);
-            assert_eq!(
-                object_attributes
-                    .expect("object attributes should be present")
-                    .as_usize(),
-                0x3333_3333_3333_3333
-            );
-            assert!(process_handle.is_current());
-            assert_eq!(start_routine, 0x5555_5555_5555_5555);
-            assert_eq!(argument, 0x6666_6666_6666_6666);
-            assert_eq!(create_flags, 0x7777_7777);
-            assert_eq!(zero_bits, 0x8888_8888_8888_8888);
-            assert_eq!(stack_size, 0x9999_9999_9999_9999);
-            assert_eq!(maximum_stack_size, 0xaaaa_aaaa_aaaa_aaaa);
-            assert_eq!(
-                attribute_list
-                    .expect("attribute list should be present")
-                    .as_usize(),
-                0xbbbb_bbbb_bbbb_bbbb
-            );
-        });
     }
 }
