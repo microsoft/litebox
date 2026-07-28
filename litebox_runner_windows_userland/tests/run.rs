@@ -9,7 +9,8 @@ fn run_hello_world_pe() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import");
     let _ = std::fs::remove_dir_all(&test_dir);
     std::fs::create_dir_all(&test_dir).unwrap();
-    let pe_path = build_kernel32_import_pe(&test_dir, "kernel32_import", KERNEL32_IMPORT_PE_SOURCE);
+    let pe_path =
+        build_kernel32_import_pe(&test_dir, "kernel32_import", KERNEL32_IMPORT_PE_SOURCE, &[]);
     println!(
         "Built rewritten kernel32-import PE fixture at `{}`",
         pe_path.display()
@@ -59,6 +60,7 @@ fn run_multithreaded_pe() {
         &test_dir,
         "kernel32_multithread",
         KERNEL32_MULTITHREAD_PE_SOURCE,
+        &[],
     );
     println!(
         "Built rewritten multithreaded PE fixture at `{}`",
@@ -104,9 +106,65 @@ fn run_multithreaded_pe() {
     );
 }
 
+/// Runs a guest PE that imports the C runtime (ucrtbase via the CRT api-set
+/// contracts), forcing ucrtbase to load and initialize. This exercises the
+/// api-set forwards to `ucrtbase.dll` plus the `NtQueryLicenseValue` syscall
+/// that ucrtbase's startup invokes, and is the repeatable oracle for further
+/// CRT-path blockers.
+#[test]
+fn run_crt_locale_pe() {
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("crt_locale");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+    let pe_path =
+        build_kernel32_import_pe(&test_dir, "crt_locale", CRT_LOCALE_PE_SOURCE, &["ucrt"]);
+    println!(
+        "Built rewritten crt-locale PE fixture at `{}`",
+        pe_path.display()
+    );
+    stage_system_fixtures(&test_dir);
+    let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("crt_locale.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let mut command =
+        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    command.env("LITEBOX_LOG", "debug");
+    command.args([
+        "--initial-files",
+        tar_path.to_str().unwrap(),
+        "/crt_locale.exe",
+    ]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "runner failed to run crt-locale PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("crt ok\n"),
+        "guest crt output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 /// Stages the guest system DLLs and locale tables the PE fixture needs.
 fn stage_system_fixtures(test_dir: &std::path::Path) {
-    for dll_name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
+    for dll_name in [
+        "ntdll.dll",
+        "kernel32.dll",
+        "kernelbase.dll",
+        "ucrtbase.dll",
+        "advapi32.dll",
+        "gdi32full.dll",
+        "sechost.dll",
+    ] {
         let dll_path = build_rewritten_system_dll(test_dir, dll_name);
         println!(
             "Built rewritten {dll_name} fixture at `{}`",
@@ -123,6 +181,7 @@ fn build_kernel32_import_pe(
     test_dir: &std::path::Path,
     fixture_name: &str,
     source: &str,
+    extra_libs: &[&str],
 ) -> std::path::PathBuf {
     let source_path = test_dir.join(format!("{fixture_name}.rs"));
     let raw_exe_path = test_dir.join(format!("{fixture_name}.raw.exe"));
@@ -130,27 +189,33 @@ fn build_kernel32_import_pe(
     std::fs::write(&source_path, source).unwrap();
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let output = std::process::Command::new(rustc)
-        .args([
-            "--edition=2024",
-            source_path.to_str().unwrap(),
-            "-C",
-            "panic=abort",
-            "-C",
-            "opt-level=1",
-            "-l",
-            "dylib=kernel32",
-            "-l",
-            "dylib=ntdll",
-            "-C",
-            "link-arg=/ENTRY:mainCRTStartup",
-            "-C",
-            "link-arg=/SUBSYSTEM:CONSOLE",
-            "-C",
-            "link-arg=/NODEFAULTLIB",
-            "-o",
-            raw_exe_path.to_str().unwrap(),
-        ])
+    let mut command = std::process::Command::new(rustc);
+    command.args([
+        "--edition=2024",
+        source_path.to_str().unwrap(),
+        "-C",
+        "panic=abort",
+        "-C",
+        "opt-level=1",
+        "-l",
+        "dylib=kernel32",
+        "-l",
+        "dylib=ntdll",
+    ]);
+    for lib in extra_libs {
+        command.args(["-l", &format!("dylib={lib}")]);
+    }
+    command.args([
+        "-C",
+        "link-arg=/ENTRY:mainCRTStartup",
+        "-C",
+        "link-arg=/SUBSYSTEM:CONSOLE",
+        "-C",
+        "link-arg=/NODEFAULTLIB",
+        "-o",
+        raw_exe_path.to_str().unwrap(),
+    ]);
+    let output = command
         .output()
         .expect("failed to run rustc for the kernel32-import Windows PE fixture");
 
@@ -192,6 +257,63 @@ unsafe extern "system" {
 pub unsafe extern "system" fn mainCRTStartup() -> ! {
     unsafe {
         let MESSAGE: &[u8] = b"hello world\n";
+        let stdout = GetStdHandle(0xffff_fff5);
+        let mut written = 0u32;
+        let ok = WriteFile(
+            stdout,
+            MESSAGE.as_ptr(),
+            MESSAGE.len() as u32,
+            &raw mut written,
+            0,
+        );
+        ExitProcess(u32::from(ok == 0 || written as usize != MESSAGE.len()));
+    }
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+"#;
+
+const CRT_LOCALE_PE_SOURCE: &str = r#"
+#![no_std]
+#![no_main]
+
+// Imported from the C runtime; these resolve through the `api-ms-win-crt-*`
+// api-set contracts to `ucrtbase.dll`, forcing it to load and initialize.
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+    fn setlocale(category: i32, locale: *const u8) -> *mut u8;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(std_handle: u32) -> usize;
+    fn WriteFile(
+        file: usize,
+        buffer: *const u8,
+        length: u32,
+        written: *mut u32,
+        overlapped: usize,
+    ) -> i32;
+    fn ExitProcess(exit_code: u32) -> !;
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn mainCRTStartup() -> ! {
+    unsafe {
+        let block = malloc(16);
+        if block.is_null() {
+            ExitProcess(2);
+        }
+        free(block);
+        let _ = setlocale(0, b"C\0".as_ptr());
+
+        let MESSAGE: &[u8] = b"crt ok\n";
         let stdout = GetStdHandle(0xffff_fff5);
         let mut written = 0u32;
         let ok = WriteFile(
