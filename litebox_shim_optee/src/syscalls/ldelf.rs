@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::syscalls::Cleanup;
-use crate::{Platform, Task, UserMutPtr};
+use crate::{Task, UserMutPtr};
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::page_mgmt::PageManagementProvider;
 use litebox::platform::{RawConstPointer, RawMutPointer};
@@ -22,14 +22,14 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// and ownership of the mapping has been transferred to the caller, call
 /// `disarm()` to suppress the unmap.
 #[must_use = "MmapGuard unmaps on drop unless disarm() is called; bind it"]
-struct MmapGuard<'a> {
-    task: &'a Task,
-    addr: UserMutPtr<u8>,
+struct MmapGuard<'a, Platform: crate::OpteeShimPlatform> {
+    task: &'a Task<Platform>,
+    addr: UserMutPtr<Platform, u8>,
     len: usize,
 }
 
-impl<'a> MmapGuard<'a> {
-    fn new(task: &'a Task, addr: UserMutPtr<u8>, len: usize) -> Self {
+impl<'a, Platform: crate::OpteeShimPlatform> MmapGuard<'a, Platform> {
+    fn new(task: &'a Task<Platform>, addr: UserMutPtr<Platform, u8>, len: usize) -> Self {
         Self { task, addr, len }
     }
 
@@ -38,13 +38,13 @@ impl<'a> MmapGuard<'a> {
     }
 }
 
-impl Drop for MmapGuard<'_> {
+impl<Platform: crate::OpteeShimPlatform> Drop for MmapGuard<'_, Platform> {
     fn drop(&mut self) {
         let _ = self.task.sys_munmap(self.addr, self.len);
     }
 }
 
-impl Task {
+impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     #[inline]
     fn checked_map_len(
         num_bytes: usize,
@@ -230,7 +230,7 @@ impl Task {
             .ok_or(TeeResult::BadParameters)?;
         if pad_end_start_addr < map_end_addr {
             let _ = self.sys_munmap(
-                UserMutPtr::from_usize(pad_end_start_addr),
+                UserMutPtr::<Platform, _>::from_usize(pad_end_start_addr),
                 map_end_addr - pad_end_start_addr,
             );
         }
@@ -244,7 +244,11 @@ impl Task {
     }
 
     /// OP-TEE's syscall to open a TA binary.
-    pub fn sys_open_bin(&self, ta_uuid: TeeUuid, handle: UserMutPtr<u32>) -> Result<(), TeeResult> {
+    pub fn sys_open_bin(
+        &self,
+        ta_uuid: TeeUuid,
+        handle: UserMutPtr<Platform, u32>,
+    ) -> Result<(), TeeResult> {
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(
             ta_uuid:? = ta_uuid,
@@ -278,7 +282,7 @@ impl Task {
     #[allow(clippy::too_many_arguments)]
     pub fn sys_map_bin(
         &self,
-        va: UserMutPtr<usize>,
+        va: UserMutPtr<Platform, usize>,
         num_bytes: usize,
         handle: u32,
         offs: usize,
@@ -424,7 +428,7 @@ impl Task {
         if self
             .read_ta_bin(
                 handle,
-                UserMutPtr::from_usize(usable_start_addr),
+                UserMutPtr::<Platform, _>::from_usize(usable_start_addr),
                 offs,
                 num_bytes,
             )
@@ -447,7 +451,11 @@ impl Task {
             .and_then(|len| len.checked_next_multiple_of(PAGE_SIZE))
             .ok_or(TeeResult::BadParameters)?;
         if self
-            .sys_mprotect(UserMutPtr::from_usize(prot_start_addr), prot_len, prot)
+            .sys_mprotect(
+                UserMutPtr::<Platform, _>::from_usize(prot_start_addr),
+                prot_len,
+                prot,
+            )
             .is_err()
         {
             return Err(TeeResult::AccessDenied);
@@ -485,8 +493,10 @@ impl Task {
                 to_release.remove(range.clone());
             }
             for range in to_release.iter() {
-                let _ =
-                    self.sys_munmap(UserMutPtr::from_usize(range.start), range.end - range.start);
+                let _ = self.sys_munmap(
+                    UserMutPtr::<Platform, _>::from_usize(range.start),
+                    range.end - range.start,
+                );
             }
         }
 
@@ -518,8 +528,13 @@ impl Task {
             "sys_cp_from_bin"
         );
 
-        self.read_ta_bin(handle, UserMutPtr::from_usize(dst), offs, num_bytes)
-            .ok_or(TeeResult::ShortBuffer)?;
+        self.read_ta_bin(
+            handle,
+            UserMutPtr::<Platform, _>::from_usize(dst),
+            offs,
+            num_bytes,
+        )
+        .ok_or(TeeResult::ShortBuffer)?;
 
         Ok(())
     }
@@ -529,7 +544,7 @@ impl Task {
     fn read_ta_bin(
         &self,
         handle: u32,
-        dst: UserMutPtr<u8>,
+        dst: UserMutPtr<Platform, u8>,
         offset: usize,
         count: usize,
     ) -> Option<()> {

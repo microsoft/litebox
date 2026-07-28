@@ -10,7 +10,7 @@ use litebox::{
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 use zerocopy::IntoBytes;
 
-use crate::{Platform, TaMemrefAddresses, UserMutPtr, msg_handler::ShmInfo};
+use crate::{TaMemrefAddresses, UserMutPtr, msg_handler::ShmInfo};
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -49,9 +49,9 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// - rcx: command ID
 ///
 /// NOTE: The above layout diagram is for 64-bit processes.
-pub struct TaStack {
+pub struct TaStack<Platform: crate::OpteeShimPlatform> {
     /// The top of the stack (base address)
-    stack_top: UserMutPtr<u8>,
+    stack_top: UserMutPtr<Platform, u8>,
     /// The length of the stack
     len: usize,
     /// The current position of the stack pointer
@@ -64,14 +64,14 @@ pub struct TaStack {
     ldelf_arg_pos: Option<usize>,
 }
 
-impl TaStack {
+impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
     /// Stack alignment required by libc ABI (not for TAs but for compatibility)
     const STACK_ALIGNMENT: usize = 16;
 
     /// Create a new stack for the user process.
     ///
     /// `stack_top` and `len` must be aligned to [`Self::STACK_ALIGNMENT`]
-    pub(super) fn new(stack_top: UserMutPtr<u8>, len: usize) -> Option<Self> {
+    pub(super) fn new(stack_top: UserMutPtr<Platform, u8>, len: usize) -> Option<Self> {
         if !stack_top.as_usize().is_multiple_of(Self::STACK_ALIGNMENT)
             || !len.is_multiple_of(Self::STACK_ALIGNMENT)
         {
@@ -211,13 +211,21 @@ impl TaStack {
 
     fn push_param_memref_from_shm<const ALIGN: usize>(
         &mut self,
+        platform: &Platform,
         param_type: TeeParamType,
         shm_info: &ShmInfo<ALIGN>,
         len: usize,
-    ) -> Option<usize> {
+    ) -> Option<usize>
+    where
+        Platform: litebox_common_linux::vmap::VmapManager<ALIGN>,
+    {
         let address = self.push_param_memref(param_type, None, len)?;
         shm_info
-            .copy_to_user(UserMutPtr::from_usize(address), len)
+            .copy_to_user(
+                platform,
+                UserMutPtr::<Platform, u8>::from_usize(address),
+                len,
+            )
             .ok()?;
         Some(address)
     }
@@ -235,7 +243,10 @@ impl TaStack {
         platform: &Platform,
         params: &[UteeParamOwned],
         shm_info: &[Option<ShmInfo<ALIGN>>],
-    ) -> Option<TaMemrefAddresses> {
+    ) -> Option<TaMemrefAddresses>
+    where
+        Platform: litebox_common_linux::vmap::VmapManager<ALIGN>,
+    {
         if params.len() > UteeParams::TEE_NUM_PARAMS {
             return None;
         }
@@ -257,7 +268,12 @@ impl TaStack {
                 UteeParamOwned::MemrefInput { data } => {
                     if let Some(shm_info) = shm_info.get(index).and_then(Option::as_ref) {
                         let len = shm_info.len();
-                        self.push_param_memref_from_shm(TeeParamType::MemrefInput, shm_info, len)?;
+                        self.push_param_memref_from_shm(
+                            platform,
+                            TeeParamType::MemrefInput,
+                            shm_info,
+                            len,
+                        )?;
                     } else {
                         let data = data.as_deref()?;
                         self.push_param_memref(TeeParamType::MemrefInput, Some(data), data.len())?;
@@ -267,6 +283,7 @@ impl TaStack {
                     let address =
                         if let Some(shm_info) = shm_info.get(index).and_then(Option::as_ref) {
                             self.push_param_memref_from_shm(
+                                platform,
                                 TeeParamType::MemrefInout,
                                 shm_info,
                                 *buffer_size,
@@ -326,9 +343,12 @@ impl TaStack {
 /// # Safety
 /// The caller must ensure that `sp` is a valid stack pointer and is not currently used.
 /// Normally, `sp` should be the return value of this function's previous call (with `None`).
-pub(crate) fn allocate_stack(task: &crate::Task, stack_base: Option<usize>) -> Option<TaStack> {
+pub(crate) fn allocate_stack<Platform: crate::OpteeShimPlatform>(
+    task: &crate::Task<Platform>,
+    stack_base: Option<usize>,
+) -> Option<TaStack<Platform>> {
     let sp = if let Some(stack_base) = stack_base {
-        UserMutPtr::from_usize(stack_base)
+        UserMutPtr::<Platform, _>::from_usize(stack_base)
     } else {
         let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");

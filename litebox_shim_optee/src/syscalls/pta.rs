@@ -10,9 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
 use litebox::mm::linux::PAGE_SIZE;
-use litebox::platform::{
-    DerivedKeyError, DerivedKeyProvider, KDFParams, RawConstPointer as _, RawMutPointer as _,
-};
+use litebox::platform::{DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{
     HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, TaFlags, TeeParamType, TeeResult, TeeUuid,
@@ -47,9 +45,9 @@ impl PseudoTa {
         }
     }
 
-    pub(crate) fn invoke_command(
+    pub(crate) fn invoke_command<Platform: crate::OpteeShimPlatform>(
         self,
-        task: &Task,
+        task: &Task<Platform>,
         cmd_id: u32,
         params: &mut UteeParams,
     ) -> Result<Cleanup, TeeResult> {
@@ -59,7 +57,11 @@ impl PseudoTa {
         }
     }
 
-    fn close_session(self, task: &Task, session_id: u32) {
+    fn close_session<Platform: crate::OpteeShimPlatform>(
+        self,
+        task: &Task<Platform>,
+        session_id: u32,
+    ) {
         match self {
             Self::System => SystemPta::close_session(task, session_id),
         }
@@ -78,12 +80,12 @@ const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
 
 const MAX_PTA_SESSIONS_PER_TASK: usize = 100;
 
-struct PtaBusyGuard<'a> {
-    task: &'a Task,
+struct PtaBusyGuard<'a, Platform: crate::OpteeShimPlatform> {
+    task: &'a Task<Platform>,
     pta: PseudoTa,
 }
 
-impl Drop for PtaBusyGuard<'_> {
+impl<Platform: crate::OpteeShimPlatform> Drop for PtaBusyGuard<'_, Platform> {
     fn drop(&mut self) {
         self.task.global.pta_busy.lock().remove(&self.pta);
     }
@@ -133,14 +135,14 @@ enum PtaSystemCommandId {
 
 type HmacSha256 = Hmac<Sha256>;
 
-impl Task {
+impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     /// Try to mark a non-concurrent PTA as busy, returning a guard that clears
     /// the busy state on drop. This gates both session opening and command
     /// invocation.
     ///
     /// Returns `Ok(None)` for PTAs flagged `TaFlags::CONCURRENT` (no gating).
     /// For a non-concurrent PTA that is busy, returns `Err(Busy)` immediately.
-    fn try_set_busy(&self, pta: PseudoTa) -> Result<Option<PtaBusyGuard<'_>>, TeeResult> {
+    fn try_set_busy(&self, pta: PseudoTa) -> Result<Option<PtaBusyGuard<'_, Platform>>, TeeResult> {
         if pta.flags().contains(TaFlags::CONCURRENT) {
             return Ok(None);
         }
@@ -233,15 +235,15 @@ impl SystemPta {
         crate::SessionIdPool::allocate().ok_or(TeeResult::Busy)
     }
 
-    fn close_session(_task: &Task, _session_id: u32) {
+    fn close_session<Platform: crate::OpteeShimPlatform>(_task: &Task<Platform>, _session_id: u32) {
         // System PTA has no per-session state
     }
 
     /// Handle a command of the system PTA.
     ///
     /// See `Cleanup` for the returned rollback; most commands have no cleanup.
-    fn invoke_command(
-        task: &Task,
+    fn invoke_command<Platform: crate::OpteeShimPlatform>(
+        task: &Task<Platform>,
         cmd_id: u32,
         params: &mut UteeParams,
     ) -> Result<Cleanup, TeeResult> {
@@ -264,7 +266,10 @@ impl SystemPta {
     ///
     /// This follows the OP-TEE `system_derive_ta_unique_key` implementation from
     /// `core/pta/system.c`.
-    fn derive_ta_unique_key(task: &Task, params: &UteeParams) -> Result<(), TeeResult> {
+    fn derive_ta_unique_key<Platform: crate::OpteeShimPlatform>(
+        task: &Task<Platform>,
+        params: &UteeParams,
+    ) -> Result<(), TeeResult> {
         use TeeParamType::{MemrefInput, MemrefOutput, None};
 
         if !params.has_types([MemrefInput, MemrefOutput, None, None]) {
@@ -294,7 +299,7 @@ impl SystemPta {
         let extra_data = if extra_data_size == 0 {
             Vec::new().into_boxed_slice()
         } else {
-            let extra_data_ptr = UserConstPtr::<u8>::from_usize(extra_data_addr.trunc());
+            let extra_data_ptr = UserConstPtr::<Platform, u8>::from_usize(extra_data_addr.trunc());
             extra_data_ptr
                 .to_owned_slice(extra_data_size)
                 .ok_or(TeeResult::BadParameters)?
@@ -303,7 +308,7 @@ impl SystemPta {
         // Unlike OP-TEE OS, `UserMutPtr` (and `UserConstPtr`) in LiteBox ensure this
         // pointer can never be used to access normal-world memory. That is, we don't
         // need extra security check for detecting key leakage here.
-        let subkey_ptr = UserMutPtr::<u8>::from_usize(subkey_addr.trunc());
+        let subkey_ptr = UserMutPtr::<Platform, u8>::from_usize(subkey_addr.trunc());
 
         // subkey = KDF(huk, usage || ta_uuid || extra_data)
         let ta_uuid_bytes = task.ta_app_id.to_le_bytes();
@@ -324,8 +329,8 @@ impl SystemPta {
     /// Derive a subkey using HUK and constant data.
     ///
     /// This follows the OP-TEE `huk_subkey_derive` interface from `core/kernel/huk_subkey.c`.
-    fn huk_subkey_derive(
-        task: &Task,
+    fn huk_subkey_derive<Platform: crate::OpteeShimPlatform>(
+        task: &Task<Platform>,
         usage: HukSubkeyUsage,
         const_data: &[&[u8]],
         subkey: &mut [u8],
@@ -359,7 +364,10 @@ impl SystemPta {
         Ok(())
     }
 
-    fn map_zi(task: &Task, params: &mut UteeParams) -> Result<Cleanup, TeeResult> {
+    fn map_zi<Platform: crate::OpteeShimPlatform>(
+        task: &Task<Platform>,
+        params: &mut UteeParams,
+    ) -> Result<Cleanup, TeeResult> {
         use TeeParamType::{None, ValueInout, ValueInput};
 
         if !params.has_types([ValueInput, ValueInout, ValueInput, None]) {
@@ -402,7 +410,10 @@ impl SystemPta {
         Ok(cleanup)
     }
 
-    fn unmap(task: &Task, params: &UteeParams) -> Result<(), TeeResult> {
+    fn unmap<Platform: crate::OpteeShimPlatform>(
+        task: &Task<Platform>,
+        params: &UteeParams,
+    ) -> Result<(), TeeResult> {
         use TeeParamType::{None, ValueInput};
 
         if !params.has_types([ValueInput, ValueInput, None, None]) {
@@ -430,7 +441,7 @@ impl SystemPta {
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(TeeResult::BadParameters)?;
 
-        task.sys_munmap(UserMutPtr::<u8>::from_usize(addr), size)
+        task.sys_munmap(UserMutPtr::<Platform, u8>::from_usize(addr), size)
             .map_err(|_| TeeResult::BadParameters)
     }
 }
