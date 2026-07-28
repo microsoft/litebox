@@ -1307,6 +1307,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 share_access,
                 open_options,
             ),
+            SyscallRequest::NtQueryAttributesFile {
+                object_attributes,
+                file_information,
+            } => self.sys_nt_query_attributes_file(object_attributes, file_information),
             SyscallRequest::NtCreateFile {
                 file_handle,
                 desired_access,

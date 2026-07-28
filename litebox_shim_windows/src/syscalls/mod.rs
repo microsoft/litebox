@@ -345,6 +345,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         share_access: u32,
         open_options: u32,
     },
+    NtQueryAttributesFile {
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        file_information: Platform::RawMutPointer<file::FileBasicInformation>,
+    },
     NtCreateFile {
         file_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -923,6 +927,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 io_status_block:*,
                 share_access,
                 open_options,
+            })),
+            NtSysno::NtQueryAttributesFile => Some(sys_req!(NtQueryAttributesFile {
+                object_attributes:*,
+                file_information:*,
             })),
             NtSysno::NtCreateFile => Some(sys_req!(NtCreateFile {
                 file_handle:*,
