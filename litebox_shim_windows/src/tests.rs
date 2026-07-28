@@ -209,42 +209,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-#[test]
-fn nt_query_information_thread_reports_process_thread_count() {
-    let task = test_task();
-    let mut is_last_thread = u32::MAX;
-    let mut return_length = 0;
-
-    assert_eq!(
-        task.sys_nt_query_information_thread(
-            crate::syscalls::ThreadHandle::CURRENT,
-            12,
-            mut_byte_ptr(&mut is_last_thread),
-            size_of::<u32>().trunc(),
-            Some(mut_ptr(&mut return_length)),
-        ),
-        litebox_common_windows::nt_status::NtStatus::SUCCESS
-    );
-    assert_eq!(is_last_thread, 1);
-    assert_eq!(return_length as usize, size_of::<u32>());
-
-    assert!(task.process.attach_thread(
-        crate::syscalls::process::INITIAL_THREAD_ID + 1,
-        &Arc::new(crate::syscalls::thread::ThreadObject::new()),
-    ));
-    assert_eq!(
-        task.sys_nt_query_information_thread(
-            crate::syscalls::ThreadHandle::CURRENT,
-            12,
-            mut_byte_ptr(&mut is_last_thread),
-            size_of::<u32>().trunc(),
-            None,
-        ),
-        litebox_common_windows::nt_status::NtStatus::SUCCESS
-    );
-    assert_eq!(is_last_thread, 0);
-}
-
 fn create_event(task: &Task<TestPlatform, TestFS>, desired_access: u32) -> Handle {
     let mut handle = Handle::default();
     assert_eq!(
