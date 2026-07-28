@@ -32,7 +32,7 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
-impl Task {
+impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     /// A system call to return to the kernel. A TA calls this function when
     /// it finishes its job delivered through a TA command invocation.
     #[allow(clippy::unused_self)]
@@ -75,11 +75,11 @@ impl Task {
         &self,
         prop_set: TeePropSet,
         index: u32,
-        name_buf: Option<UserMutPtr<u8>>,
-        name_len: Option<UserMutPtr<u32>>,
+        name_buf: Option<UserMutPtr<Platform, u8>>,
+        name_len: Option<UserMutPtr<Platform, u32>>,
         prop_buf: &mut [u8],
-        prop_len: UserMutPtr<u32>,
-        prop_type: UserMutPtr<u32>,
+        prop_len: UserMutPtr<Platform, u32>,
+        prop_type: UserMutPtr<Platform, u32>,
     ) -> Result<(), TeeResult> {
         if name_buf.is_some() || name_len.is_some() {
             #[cfg(debug_assertions)]
@@ -158,7 +158,7 @@ impl Task {
     pub fn sys_get_property_name_to_index(
         prop_set: TeePropSet,
         name: &[u8],
-        index: UserMutPtr<u32>,
+        index: UserMutPtr<Platform, u32>,
     ) -> Result<(), TeeResult> {
         let name_str =
             core::ffi::CStr::from_bytes_with_nul(name).map_err(|_| TeeResult::BadParameters)?;
@@ -206,8 +206,8 @@ impl Task {
         ta_uuid: TeeUuid,
         _cancel_req_to: u32,
         usr_params: UteeParams,
-        ta_sess_id: UserMutPtr<u32>,
-        ret_orig: UserMutPtr<TeeOrigin>,
+        ta_sess_id: UserMutPtr<Platform, u32>,
+        ret_orig: UserMutPtr<Platform, TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
         if let Some(pta) = PseudoTa::from_uuid(&ta_uuid) {
@@ -257,7 +257,7 @@ impl Task {
         _cancel_req_to: u32,
         cmd_id: u32,
         params: &mut UteeParams,
-        ret_orig: UserMutPtr<TeeOrigin>,
+        ret_orig: UserMutPtr<Platform, TeeOrigin>,
     ) -> Result<Cleanup, TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
         if let Some(pta) = self.pta_for_session(ta_sess_id) {
@@ -278,7 +278,7 @@ impl Task {
     pub fn sys_check_access_rights(
         &self,
         flags: TeeMemoryAccessRights,
-        buf: UserConstPtr<u8>,
+        buf: UserConstPtr<Platform, u8>,
         len: usize,
     ) -> Result<(), TeeResult> {
         // Ignore the unknown bits of `TeeMemoryAccessRights` for now.
@@ -337,7 +337,7 @@ impl Task {
     pub fn sys_get_time(
         &self,
         cat: TeeTimeCategory,
-        time: UserMutPtr<TeeTime>,
+        time: UserMutPtr<Platform, TeeTime>,
     ) -> Result<(), TeeResult> {
         let tee_time = match cat {
             TeeTimeCategory::System => {

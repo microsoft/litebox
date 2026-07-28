@@ -9,8 +9,9 @@ use thiserror::Error;
 /// `ALIGN`: The page frame size.
 ///
 /// This provider exists to service [`crate::physical_pointers::PhysMutPtr`] and
-/// [`crate::physical_pointers::PhysConstPtr`]. It can benefit other modules which need
-/// Linux kernel's `vmap()` and `vunmap()` functionalities (e.g., HVCI/HEKI, drivers).
+/// [`crate::physical_pointers::PhysConstPtr`], which borrow an implementor. It
+/// can benefit other modules which need Linux kernel's `vmap()` and `vunmap()`
+/// functionalities (e.g., HVCI/HEKI, drivers).
 ///
 /// # Safety
 ///
@@ -113,22 +114,6 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError>;
-}
-
-/// A type-level handle to a platform-global [`VmapManager`].
-///
-/// `PhysMutPtr` and `PhysConstPtr` carry their provider as a type parameter
-/// (`PhantomData<P>`), so they cannot hold a live `&VmapManager`. This trait
-/// is the minimum surface that lets such a `PhantomData`-only carrier reach
-/// the live manager: each platform implements this on a small unit struct
-/// (e.g., `Vmap`) and points `manager()` at its global
-/// platform singleton.
-pub trait GlobalVmapManager<const ALIGN: usize>: 'static {
-    /// The concrete `VmapManager` this marker resolves to.
-    type Manager: VmapManager<ALIGN> + 'static;
-
-    /// Return the global manager instance for this platform.
-    fn manager() -> &'static Self::Manager;
 }
 
 /// Data structure representing a physical address with page alignment.

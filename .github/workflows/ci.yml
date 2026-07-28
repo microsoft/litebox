@@ -254,12 +254,6 @@ jobs:
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
-          # - `litebox_platform_multiplex` is allowed to have `std` access (in
-          #   its default feature set) because `litebox_platform_linux_userland`
-          #   has access, and this is just a multiplexer. Ideally, we'd do a
-          #   more precise check, but as long as we are tracking the underlying
-          #   platforms, we are unlikely to hit any significant issues here.
-          #
           # - `litebox_runner_linux_on_windows_userland` is allowed to have `std`
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
@@ -303,7 +297,6 @@ jobs:
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
-            -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \

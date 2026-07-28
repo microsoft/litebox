@@ -236,13 +236,8 @@ impl VtlState {
 
 /// Initialize VTL switch for the current CPU.
 ///
-/// This function sets the platform reference for the current CPU.
 /// It should be called once before entering the VTL switch loop.
-pub fn vtl_switch_init(platform: Option<&'static crate::Platform>) {
-    if let Some(platform) = platform {
-        crate::set_platform_low(platform);
-    }
-
+pub fn vtl_switch_init() {
     // The VP is already in VTL1 when the runner calls this; register it
     // in the mask so TLB flushes during the first VTL call dispatch
     // target this VP.

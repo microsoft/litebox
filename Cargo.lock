@@ -1647,19 +1647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "litebox_platform_multiplex"
-version = "0.1.0"
-dependencies = [
- "cfg-if",
- "litebox",
- "litebox_platform_linux_kernel",
- "litebox_platform_linux_userland",
- "litebox_platform_lvbs",
- "litebox_platform_windows_userland",
- "once_cell",
-]
-
-[[package]]
 name = "litebox_platform_windows_userland"
 version = "0.1.0"
 dependencies = [
@@ -1714,11 +1701,11 @@ dependencies = [
  "litebox_common_lvbs",
  "litebox_common_optee",
  "litebox_platform_lvbs",
- "litebox_platform_multiplex",
  "litebox_service_heki",
  "litebox_shim_optee",
  "litebox_util_log",
  "log",
+ "once_cell",
  "spin 0.10.0",
  "x86_64",
 ]
@@ -1728,14 +1715,12 @@ name = "litebox_runner_optee_on_linux_userland"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arrayvec",
  "base64",
  "clap",
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
  "litebox_platform_linux_userland",
- "litebox_platform_multiplex",
  "litebox_shim_optee",
  "litebox_syscall_rewriter",
  "litebox_util_log",
@@ -1813,7 +1798,6 @@ name = "litebox_shim_optee"
 version = "0.1.0"
 dependencies = [
  "aes",
- "arrayvec",
  "ctr",
  "elf",
  "hashbrown",
@@ -1821,7 +1805,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
- "litebox_platform_multiplex",
+ "litebox_platform_linux_userland",
  "litebox_util_log",
  "num_enum",
  "once_cell",

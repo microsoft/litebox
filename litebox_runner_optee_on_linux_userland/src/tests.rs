@@ -10,14 +10,14 @@ use litebox::utils::TruncateExt;
 use litebox_common_optee::{
     TeeIdentity, TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
 };
-use litebox_shim_optee::session::session_manager;
+use litebox_platform_linux_userland::LinuxUserland as Platform;
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Run the loaded TA with a sequence of test commands
 pub fn run_ta_with_test_commands(
-    shim: &litebox_shim_optee::OpteeShim,
+    shim: &litebox_shim_optee::OpteeShim<Platform>,
     ldelf_bin: &[u8],
     ta_bin: &[u8],
     _prog_name: &str,
@@ -30,7 +30,7 @@ pub fn run_ta_with_test_commands(
     let ta_head =
         litebox_common_optee::parse_ta_head(ta_bin).expect("Failed to parse TA header from ta_bin");
     assert!(shim.store_ta_bin(&ta_head.uuid, ta_bin));
-    let mut ta_info: Option<LoadedProgram> = None;
+    let mut ta_info: Option<LoadedProgram<Platform>> = None;
     // The active session id for the TA. Set at OpenSession and reused for the
     // subsequent InvokeCommand entries on the same persistent session.
     let mut session_id: Option<u32> = None;
@@ -55,7 +55,10 @@ pub fn run_ta_with_test_commands(
             continue;
         }
         if func_id == UteeEntryFunc::OpenSession {
-            let mut session_token = session_manager().try_acquire_open_session_token().unwrap();
+            let mut session_token = shim
+                .session_manager()
+                .try_acquire_open_session_token()
+                .unwrap();
             let open_session_id = session_token.session_id().unwrap();
             session_id = Some(open_session_id);
             // Emulate the client identity a real REE client would present.
@@ -66,7 +69,8 @@ pub fn run_ta_with_test_commands(
                 },
                 ClientIdentityJson::to_tee_identity,
             );
-            session_manager().set_session_client_identity(open_session_id, Some(client_identity));
+            shim.session_manager()
+                .set_session_client_identity(open_session_id, Some(client_identity));
             let loaded = shim
                 .load_ldelf(ldelf_bin, ta_head.uuid)
                 .map_err(|_| {
@@ -126,7 +130,7 @@ pub fn run_ta_with_test_commands(
             );
             // TA stores results in the `UteeParams` structure and/or buffers it refers to.
             if let Some(params_address) = info.params_address {
-                let ptr = UserConstPtr::<UteeParams>::from_usize(params_address);
+                let ptr = UserConstPtr::<Platform, UteeParams>::from_usize(params_address);
                 let params = ptr.read_at_offset(0).expect("Failed to read UteeParams");
                 handle_ta_command_output(&params);
             }
@@ -153,7 +157,8 @@ fn handle_ta_command_output(params: &UteeParams) {
             TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
                 if let Ok(Some((addr, len))) = params.get_values(idx) {
                     let len: usize = len.trunc();
-                    let ptr: UserConstPtr<u8> = UserConstPtr::from_ptr(addr as *const u8);
+                    let ptr: UserConstPtr<Platform, u8> =
+                        UserConstPtr::<Platform, u8>::from_ptr(addr as *const u8);
                     let slice = ptr.to_owned_slice(len).unwrap_or_default();
                     if slice.is_empty() {
                         litebox_util_log::info!(
