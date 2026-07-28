@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
@@ -74,7 +75,7 @@ pub struct BrokerSession {
     /// Handles of the live object references owned by this session.
     references: Mutex<SessionReferences>,
     /// Socket quota held by pending, live, and closing in-flight resources.
-    pub(crate) reserved_sockets: Arc<core::sync::atomic::AtomicUsize>,
+    pub(crate) reserved_sockets: Arc<AtomicUsize>,
 }
 
 impl BrokerSession {
@@ -92,7 +93,7 @@ impl BrokerSession {
                 handles: Vec::new(),
                 pending_handles: 0,
             }),
-            reserved_sockets: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
+            reserved_sockets: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -111,10 +112,7 @@ impl BrokerSession {
         }
         let mut references = self.core.references.write();
         let preparation = (|| {
-            let pending = self
-                .core
-                .pending_references
-                .load(core::sync::atomic::Ordering::Relaxed);
+            let pending = self.core.pending_references.load(Ordering::Relaxed);
             if references
                 .len()
                 .checked_add(pending)
@@ -173,10 +171,7 @@ impl BrokerSession {
         }
         let mut references = self.core.references.write();
         let preparation = (|| {
-            let pending = self
-                .core
-                .pending_references
-                .load(core::sync::atomic::Ordering::Relaxed);
+            let pending = self.core.pending_references.load(Ordering::Relaxed);
             if references
                 .len()
                 .checked_add(pending)
@@ -235,10 +230,7 @@ impl BrokerSession {
             .try_reserve(next_session_pending)
             .map_err(|_| BrokerError::OutOfMemory)?;
         let mut references = self.core.references.write();
-        let pending_references = self
-            .core
-            .pending_references
-            .load(core::sync::atomic::Ordering::Relaxed);
+        let pending_references = self.core.pending_references.load(Ordering::Relaxed);
         if references
             .len()
             .checked_add(pending_references)
@@ -259,7 +251,10 @@ impl BrokerSession {
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
             .pending_references
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                pending.checked_add(1)
+            })
+            .map_err(|_| BrokerError::ResourceExhausted)?;
         session_references.pending_handles = next_session_pending;
         Ok(PendingObjectReference {
             session: self,
@@ -410,6 +405,16 @@ impl PendingObjectReference<'_> {
             drop(session_references);
             return Err(BrokerError::Internal);
         }
+        if !release_pending_reference(
+            &self.session.core.pending_references,
+            &mut session_references,
+        ) {
+            self.active = false;
+            drop(references);
+            drop(session_references);
+            return Err(BrokerError::Internal);
+        }
+        self.active = false;
         self.session.insert_object_reference(
             &mut references,
             &mut session_references.handles,
@@ -417,12 +422,6 @@ impl PendingObjectReference<'_> {
             object,
             self.rights,
         );
-        session_references.pending_handles -= 1;
-        self.session
-            .core
-            .pending_references
-            .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        self.active = false;
         Ok(self.handle)
     }
 }
@@ -430,13 +429,34 @@ impl PendingObjectReference<'_> {
 impl Drop for PendingObjectReference<'_> {
     fn drop(&mut self) {
         if self.active {
-            self.session.references.lock().pending_handles -= 1;
-            self.session
-                .core
-                .pending_references
-                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            let mut session_references = self.session.references.lock();
+            let released = release_pending_reference(
+                &self.session.core.pending_references,
+                &mut session_references,
+            );
+            self.active = false;
+            assert!(
+                released,
+                "pending object reference counters are inconsistent"
+            );
         }
     }
+}
+
+fn release_pending_reference(
+    core_pending_references: &AtomicUsize,
+    session_references: &mut SessionReferences,
+) -> bool {
+    let next_pending_handles = session_references.pending_handles.checked_sub(1);
+    let core_released = core_pending_references
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+            pending.checked_sub(1)
+        })
+        .is_ok();
+    if let Some(next_pending_handles) = next_pending_handles {
+        session_references.pending_handles = next_pending_handles;
+    }
+    next_pending_handles.is_some() && core_released
 }
 
 impl Drop for BrokerSession {
@@ -470,8 +490,9 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::{SessionReferences, release_pending_reference};
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -479,7 +500,29 @@ mod tests {
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use std::sync::Arc;
+    use std::{sync::Arc, vec::Vec};
+
+    #[test]
+    fn pending_reference_release_checks_both_counters() {
+        let core_pending_references = AtomicUsize::new(1);
+        let mut session_references = SessionReferences {
+            handles: Vec::new(),
+            pending_handles: 1,
+        };
+        assert!(release_pending_reference(
+            &core_pending_references,
+            &mut session_references
+        ));
+        assert_eq!(core_pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(session_references.pending_handles, 0);
+
+        assert!(!release_pending_reference(
+            &core_pending_references,
+            &mut session_references
+        ));
+        assert_eq!(core_pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(session_references.pending_handles, 0);
+    }
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
@@ -512,7 +555,7 @@ mod tests {
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = crate::event::create(&session, 0).unwrap();
-        let unknown_handle = ObjectHandle(handle.0 + 1);
+        let unknown_handle = ObjectHandle(handle.0.checked_add(1).unwrap());
 
         assert_ne!(unknown_handle, handle);
         assert_eq!(
