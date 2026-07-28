@@ -7,6 +7,7 @@ pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod file_path;
 pub(crate) mod iocp;
+pub(crate) mod license;
 pub(crate) mod lpc;
 pub(crate) mod mm;
 pub(crate) mod nls;
@@ -488,6 +489,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtQueryPerformanceCounter {
         performance_counter: Platform::RawMutPointer<i64>,
         performance_frequency: Option<Platform::RawMutPointer<i64>>,
+    },
+    NtQueryLicenseValue {
+        value_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+        value_type: Platform::RawMutPointer<u32>,
+        data: Platform::RawMutPointer<u8>,
+        data_size: u32,
+        result_data_size: Platform::RawMutPointer<u32>,
     },
     NtQuerySystemInformation {
         system_information_class: u32,
@@ -1118,6 +1126,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtQueryPerformanceCounter => Some(sys_req!(NtQueryPerformanceCounter {
                 performance_counter:*,
                 performance_frequency:*,
+            })),
+            NtSysno::NtQueryLicenseValue => Some(sys_req!(NtQueryLicenseValue {
+                value_name:*,
+                value_type:*,
+                data:*,
+                data_size,
+                result_data_size:*,
             })),
             NtSysno::NtQuerySystemInformation => Some(sys_req!(NtQuerySystemInformation {
                 system_information_class,

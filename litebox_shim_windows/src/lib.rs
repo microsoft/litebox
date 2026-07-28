@@ -1573,6 +1573,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 performance_counter,
                 performance_frequency,
             } => self.sys_nt_query_performance_counter(performance_counter, performance_frequency),
+            SyscallRequest::NtQueryLicenseValue {
+                value_name,
+                value_type,
+                data,
+                data_size,
+                result_data_size,
+            } => Self::sys_nt_query_license_value(
+                value_name,
+                value_type,
+                data,
+                data_size,
+                result_data_size,
+            ),
             SyscallRequest::NtQuerySystemInformation {
                 system_information_class,
                 system_information,
