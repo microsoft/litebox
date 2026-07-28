@@ -19,8 +19,8 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
-        WalkStopReason, WalkingDirHandle,
+        DirHandle, FileHandle, Handle, HandleRef, PermissionCheck, PermissionInfo, SeekBehavior,
+        WalkOutcome, WalkStopReason, WalkingDirHandle,
     },
 };
 
@@ -50,6 +50,38 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             litebox: litebox.clone(),
             backend,
         }
+    }
+
+    /// Direct access to the backend, for the legacy [`super::FileSystem`] wrappers that still
+    /// expose backend-specific initialization APIs.
+    ///
+    /// TODO(jayb): transitionary `pub(super)` accessors; these should go away once all file systems
+    /// have migrated over to the backend-based system.
+    pub(super) fn backend(&self) -> &Backend {
+        &self.backend
+    }
+
+    /// Mutable counterpart to [`Self::backend`], for the legacy wrappers that mutate
+    /// backend-owned state (such as the acting user).
+    ///
+    /// TODO(jayb): transitionary `pub(super)` accessors; these should go away once all file systems
+    /// have migrated over to the backend-based system.
+    pub(super) fn backend_mut(&mut self) -> &mut Backend {
+        &mut self.backend
+    }
+
+    /// The backend file handle behind `fd`, if `fd` is an open file.
+    ///
+    /// TODO(jayb): transitionary `pub(super)` accessor; this should go away once all file systems
+    /// have migrated over to the backend-based system.
+    pub(super) fn file_handle(&self, fd: &TypedFd<Self>) -> Option<FileHandle> {
+        self.litebox
+            .descriptor_table()
+            .entry_handle(fd)?
+            .with_entry(|entry| match &entry.entry.handle {
+                Handle::File(file) => Some(file.clone()),
+                Handle::Dir(_) => None,
+            })
     }
 }
 
