@@ -3,7 +3,7 @@
 
 //! RingBuffer implementation and functions
 
-use super::PrivilegedVtl0PhysMutPtr;
+use super::{PrivilegedVmap, PrivilegedVtl0PhysMutPtr};
 use core::fmt;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::utils::TruncateExt;
@@ -12,6 +12,7 @@ use spin::{Mutex, Once};
 use x86_64::PhysAddr;
 
 pub struct RingBuffer {
+    pvmap: PrivilegedVmap<'static, crate::host::LvbsLinuxKernel>,
     rb_pa: PhysAddr,
     write_offset: usize,
     size: usize,
@@ -23,12 +24,17 @@ pub struct RingBuffer {
 }
 
 impl RingBuffer {
-    pub fn new(phys_addr: PhysAddr, requested_size: usize) -> Self {
+    pub fn new(
+        platform: &'static crate::host::LvbsLinuxKernel,
+        phys_addr: PhysAddr,
+        requested_size: usize,
+    ) -> Self {
         let pa: usize = phys_addr.as_u64().trunc();
         let fast_path_eligible = requested_size > 0
             && requested_size.is_multiple_of(PAGE_SIZE)
             && pa.is_multiple_of(PAGE_SIZE);
         RingBuffer {
+            pvmap: PrivilegedVmap::mint(platform),
             rb_pa: phys_addr,
             write_offset: 0,
             size: requested_size,
@@ -41,9 +47,9 @@ impl RingBuffer {
             return;
         }
         self.write_offset = if self.fast_path_eligible {
-            write_fast(self.rb_pa, self.size, self.write_offset, buf)
+            write_fast(&self.pvmap, self.rb_pa, self.size, self.write_offset, buf)
         } else {
-            write_slow(self.rb_pa, self.size, self.write_offset, buf)
+            write_slow(&self.pvmap, self.rb_pa, self.size, self.write_offset, buf)
         };
     }
 }
@@ -61,7 +67,13 @@ fn advance_offset(size: usize, write_offset: usize, len: usize) -> usize {
 /// single virtually-contiguous, physically non-contiguous mapping by emitting
 /// the wrap span as `[rb_pa + (start_page + i) % page_count * PAGE_SIZE]`.
 /// Returns the new write offset after attempting the write.
-fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> usize {
+fn write_fast(
+    pvmap: &PrivilegedVmap<'static, crate::host::LvbsLinuxKernel>,
+    rb_pa: PhysAddr,
+    size: usize,
+    write_offset: usize,
+    buf: &[u8],
+) -> usize {
     const MAX_SPAN_PAGES: usize = 16;
 
     // Inputs longer than the buffer overwrite the whole ring with the trailing bytes.
@@ -79,7 +91,7 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
     //   would map the same physical page twice and vmap rejects the duplicate.
     // `span_pages > MAX_SPAN_PAGES`: the span is too long for `span` below.
     if span_pages > page_count || span_pages > MAX_SPAN_PAGES {
-        return write_slow(rb_pa, size, write_offset, buf);
+        return write_slow(pvmap, rb_pa, size, write_offset, buf);
     }
     let rb_pa: usize = rb_pa.as_u64().trunc();
     let mut span: arrayvec::ArrayVec<PhysPageAddr<PAGE_SIZE>, MAX_SPAN_PAGES> =
@@ -96,7 +108,8 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
         span.push(addr);
     }
 
-    let Ok(ptr) = PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::new(&span, in_page_offset) else {
+    let Ok(ptr) = PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::new(pvmap, &span, in_page_offset)
+    else {
         return advance_offset(size, write_offset, buf.len());
     };
     let _ = ptr.write_slice_at_offset(0, buf);
@@ -106,9 +119,16 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
 /// Slow path used when `rb_pa` or `size` is not page-aligned/page-multiple.
 /// Wraparound issues two map/unmap cycles. Returns the new write offset
 /// after attempting the write.
-fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> usize {
+fn write_slow(
+    pvmap: &PrivilegedVmap<'static, crate::host::LvbsLinuxKernel>,
+    rb_pa: PhysAddr,
+    size: usize,
+    write_offset: usize,
+    buf: &[u8],
+) -> usize {
     let write_slice = |pa: PhysAddr, slice: &[u8]| -> bool {
         PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+            pvmap,
             pa.as_u64().trunc(),
             slice.len(),
         )
@@ -135,9 +155,13 @@ fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
 }
 
 static RINGBUFFER_ONCE: Once<Mutex<RingBuffer>> = Once::new();
-pub(crate) fn set_ringbuffer(pa: PhysAddr, size: usize) -> &'static Mutex<RingBuffer> {
+pub(crate) fn set_ringbuffer(
+    platform: &'static crate::host::LvbsLinuxKernel,
+    pa: PhysAddr,
+    size: usize,
+) -> &'static Mutex<RingBuffer> {
     RINGBUFFER_ONCE.call_once(|| {
-        let ring_buffer = RingBuffer::new(pa, size);
+        let ring_buffer = RingBuffer::new(platform, pa, size);
         Mutex::new(ring_buffer)
     })
 }

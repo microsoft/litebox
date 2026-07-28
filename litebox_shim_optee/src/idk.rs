@@ -40,8 +40,12 @@ enum EcdsaCurve {
     P521 = 0x03,
 }
 
-pub fn generate_identity_signing_key(public_key_pa: u64, key_alg: u64) -> i64 {
-    match generate_identity_signing_key_inner(public_key_pa, key_alg) {
+pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
+    platform: &'static Platform,
+    public_key_pa: u64,
+    key_alg: u64,
+) -> i64 {
+    match generate_identity_signing_key_inner(platform, public_key_pa, key_alg) {
         Ok(res) => res,
         Err(e) => e.as_neg().into(),
     }
@@ -61,16 +65,21 @@ pub fn generate_identity_signing_key(public_key_pa: u64, key_alg: u64) -> i64 {
 /// This function assumes that the caller prepares a buffer at the given physical
 /// address (in a single or contiguous physical memory page(s)) whose length is equal to
 /// or greater than `IDENTITY_SIGNING_PUBLIC_KEY_LEN`.
-fn generate_identity_signing_key_inner(public_key_pa: u64, key_alg: u64) -> Result<i64, Errno> {
+fn generate_identity_signing_key_inner<Platform: crate::OpteeShimPlatform>(
+    platform: &'static Platform,
+    public_key_pa: u64,
+    key_alg: u64,
+) -> Result<i64, Errno> {
     validate_key_algorithm(key_alg)?;
 
     let pubkey_ptr =
-        NormalWorldMutPtr::<[u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], PAGE_SIZE>::with_usize(
+        NormalWorldMutPtr::<Platform, [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], PAGE_SIZE>::with_usize(
+            platform,
             public_key_pa.trunc(),
         )
         .map_err(|_| Errno::EINVAL)?;
 
-    let key_pair = get_identity_signing_key_pair()?;
+    let key_pair = get_identity_signing_key_pair(platform)?;
     pubkey_ptr
         .write_at_offset(0, key_pair.public_key)
         .map_err(|_| Errno::EFAULT)?;
@@ -100,9 +109,11 @@ fn validate_key_algorithm(key_alg: u64) -> Result<(), Errno> {
     }
 }
 
-fn get_identity_signing_key_pair() -> Result<&'static IdentitySigningKeyPair, Errno> {
+fn get_identity_signing_key_pair<Platform: crate::OpteeShimPlatform>(
+    platform: &'static Platform,
+) -> Result<&'static IdentitySigningKeyPair, Errno> {
     IDENTITY_SIGNING_KEY_PAIR.try_call_once(|| {
-        let private_key = generate_identity_signing_private_key()?;
+        let private_key = generate_identity_signing_private_key(platform)?;
         let public_key = identity_signing_public_key_from_private_key(&private_key)?;
         Ok(IdentitySigningKeyPair {
             private_key,
@@ -111,12 +122,13 @@ fn get_identity_signing_key_pair() -> Result<&'static IdentitySigningKeyPair, Er
     })
 }
 
-fn generate_identity_signing_private_key()
--> Result<Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]>, Errno> {
+fn generate_identity_signing_private_key<Platform: crate::OpteeShimPlatform>(
+    platform: &'static Platform,
+) -> Result<Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]>, Errno> {
     let mut private_key_bytes = Zeroizing::new([0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]);
 
     for _ in 0..MAX_KEYGEN_ATTEMPT {
-        LiteBox::new(litebox_platform_multiplex::platform())
+        LiteBox::new(platform)
             .fill_random(&mut private_key_bytes[..])
             .map_err(|_| Errno::EIO)?;
         if is_valid_identity_signing_private_key(&private_key_bytes) {
@@ -162,8 +174,8 @@ mod tests {
         let message = b"IDK_S signing test message";
 
         let _task = init_platform();
-        // XXX: Use a fixed valid scalar so this unit test only exercises signing and
-        // verification; key generation requires the broker-backed platform RNG.
+        // Use a fixed valid scalar so this unit test only exercises signing and
+        // verification; key generation requires a broker-backed random source.
         let mut private_key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
         private_key[IDENTITY_SIGNING_PRIVATE_KEY_LEN - 1] = 1;
         assert!(is_valid_identity_signing_private_key(&private_key));

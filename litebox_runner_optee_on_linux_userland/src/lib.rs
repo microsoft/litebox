@@ -5,8 +5,8 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
 use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
-use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::session::session_manager;
+use litebox_platform_linux_userland::LinuxUserland as Platform;
+use litebox_shim_optee::session::SessionManager;
 use std::path::PathBuf;
 
 mod tests;
@@ -92,7 +92,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new();
-    litebox_platform_multiplex::set_platform(platform);
+    // One registry per `run`, minted beside the platform it is paired with, so
+    // `OpteeShimBuilder::new`'s "one registry per image" invariant holds by
+    // construction. Leaked because the shim stores it as `&'static`.
+    let session_manager: &'static SessionManager<Platform> =
+        Box::leak(Box::new(SessionManager::new()));
     let broker::BrokerConnection {
         local,
         notifications,
@@ -106,7 +110,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         coordinator,
         litebox.broker_notification_dispatcher(),
     )?;
-    let shim = litebox_shim_optee::OpteeShimBuilder::new_with_litebox(platform, litebox).build();
+    let shim = litebox_shim_optee::OpteeShimBuilder::new_with_litebox(
+        platform,
+        session_manager,
+        litebox,
+    )
+    .build();
 
     platform.initialize_boot_specific_kdf_support();
 
@@ -128,7 +137,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 /// it can be loaded and run. Note that an OP-TEE TA does nothing without
 /// a client invoking commands on it.
 fn run_ta_with_default_commands(
-    shim: &litebox_shim_optee::OpteeShim,
+    shim: &litebox_shim_optee::OpteeShim<Platform>,
     ldelf_bin: &[u8],
     ta_bin: &[u8],
 ) {
@@ -140,7 +149,10 @@ fn run_ta_with_default_commands(
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
         if func_id == UteeEntryFunc::OpenSession {
-            let session_token = session_manager().try_acquire_open_session_token().unwrap();
+            let session_token = shim
+                .session_manager()
+                .try_acquire_open_session_token()
+                .unwrap();
             let session_id = session_token.session_id().unwrap();
             let loaded_program = shim
                 .load_ldelf(ldelf_bin, ta_uuid)
