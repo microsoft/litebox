@@ -43,6 +43,7 @@ use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
 };
+use crate::syscalls::semaphore::{SemaphoreHandleObject, SemaphoreSubsystem};
 use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
 use crate::syscalls::thread::{ThreadHandleObject, ThreadSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
@@ -984,6 +985,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 event_type,
                 initial_state,
             ),
+            SyscallRequest::NtCreateSemaphore {
+                semaphore_handle,
+                desired_access,
+                object_attributes,
+                initial_count,
+                maximum_count,
+            } => self.sys_nt_create_semaphore(
+                semaphore_handle,
+                desired_access,
+                object_attributes,
+                initial_count,
+                maximum_count,
+            ),
             SyscallRequest::NtCreateDirectoryObject {
                 directory_handle,
                 desired_access,
@@ -1239,6 +1253,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 desired_access,
                 object_attributes,
             } => self.sys_nt_open_event(event_handle, desired_access, object_attributes),
+            SyscallRequest::NtOpenSemaphore {
+                semaphore_handle,
+                desired_access,
+                object_attributes,
+            } => self.sys_nt_open_semaphore(semaphore_handle, desired_access, object_attributes),
+            SyscallRequest::NtReleaseSemaphore {
+                semaphore_handle,
+                release_count,
+                previous_count,
+            } => self.sys_nt_release_semaphore(semaphore_handle, release_count, previous_count),
             SyscallRequest::NtSetEvent {
                 event_handle,
                 previous_state,
@@ -2067,6 +2091,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_duplicate!(FileObjectSubsystem<FS>);
         try_duplicate!(RegistryKeySubsystem<Platform>);
         try_duplicate!(EventSubsystem<Platform>);
+        try_duplicate!(SemaphoreSubsystem<Platform>);
         try_duplicate!(DirectoryObjectSubsystem<Platform>);
         try_duplicate!(SymbolicLinkSubsystem<Platform>);
         try_duplicate!(IoCompletionSubsystem<Platform>);
@@ -2175,6 +2200,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_close!(FileObjectSubsystem<FS>, file);
         try_close!(RegistryKeySubsystem<Platform>, registry_key);
         try_close!(EventSubsystem<Platform>, event);
+        try_close!(SemaphoreSubsystem<Platform>, semaphore);
         try_close!(DirectoryObjectSubsystem<Platform>, directory);
         try_close!(SymbolicLinkSubsystem<Platform>, symbolic_link);
         try_close!(IoCompletionSubsystem<Platform>, io_completion);
@@ -2257,6 +2283,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn event(&self, event: EventHandleObject<Platform>);
 
+    fn semaphore(&self, semaphore: SemaphoreHandleObject<Platform>);
+
     fn directory(&self, directory: DirectoryHandleObject<Platform>);
 
     fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>);
@@ -2298,6 +2326,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn event(&self, event: EventHandleObject<Platform>) {
         Task::<Platform, FS>::close_event(event);
+    }
+
+    fn semaphore(&self, semaphore: SemaphoreHandleObject<Platform>) {
+        Task::<Platform, FS>::close_semaphore(semaphore);
     }
 
     fn directory(&self, directory: DirectoryHandleObject<Platform>) {

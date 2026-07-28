@@ -14,6 +14,7 @@ pub(crate) mod object_manager;
 pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod section;
+pub(crate) mod semaphore;
 pub(crate) mod symlink;
 pub(crate) mod sysinfo;
 pub(crate) mod thread;
@@ -148,6 +149,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         event_type: u32,
         initial_state: u8,
+    },
+    NtCreateSemaphore {
+        semaphore_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        initial_count: i32,
+        maximum_count: i32,
     },
     NtCreateDirectoryObject {
         directory_handle: Platform::RawMutPointer<Handle>,
@@ -293,6 +301,16 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         event_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtOpenSemaphore {
+        semaphore_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtReleaseSemaphore {
+        semaphore_handle: Handle,
+        release_count: i32,
+        previous_count: Option<Platform::RawMutPointer<i32>>,
     },
     NtSetEvent {
         event_handle: Handle,
@@ -707,6 +725,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 event_type,
                 initial_state,
             })),
+            NtSysno::NtCreateSemaphore => Some(sys_req!(NtCreateSemaphore {
+                semaphore_handle:*,
+                desired_access,
+                object_attributes:*,
+                initial_count,
+                maximum_count,
+            })),
             NtSysno::NtCreateDirectoryObject => Some(sys_req!(NtCreateDirectoryObject {
                 directory_handle:*,
                 desired_access,
@@ -855,6 +880,16 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 event_handle:*,
                 desired_access,
                 object_attributes:*,
+            })),
+            NtSysno::NtOpenSemaphore => Some(sys_req!(NtOpenSemaphore {
+                semaphore_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtReleaseSemaphore => Some(sys_req!(NtReleaseSemaphore {
+                semaphore_handle:{Handle::from_raw},
+                release_count,
+                previous_count:*,
             })),
             NtSysno::NtSetEvent => Some(sys_req!(NtSetEvent {
                 event_handle:{Handle::from_raw},

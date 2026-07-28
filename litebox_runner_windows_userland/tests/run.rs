@@ -104,6 +104,50 @@ fn run_multithreaded_pe() {
     );
 }
 
+/// Runs a guest PE that blocks a child on an NT semaphore, releases it, and
+/// verifies that the count was consumed.
+#[test]
+fn run_semaphore_pe() {
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nt_semaphore");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+    let pe_path = build_kernel32_import_pe(&test_dir, "nt_semaphore", NT_SEMAPHORE_PE_SOURCE);
+    println!(
+        "Built rewritten semaphore PE fixture at `{}`",
+        pe_path.display()
+    );
+    stage_system_fixtures(&test_dir);
+    let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nt_semaphore.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let mut command =
+        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    command.env("LITEBOX_LOG", "debug");
+    command.args([
+        "--initial-files",
+        tar_path.to_str().unwrap(),
+        "/nt_semaphore.exe",
+    ]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "runner failed to run semaphore PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("semaphore ok\n"),
+        "guest semaphore output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 /// Stages the guest system DLLs and locale tables the PE fixture needs.
 fn stage_system_fixtures(test_dir: &std::path::Path) {
     for dll_name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
@@ -339,6 +383,131 @@ pub unsafe extern "system" fn mainCRTStartup() -> ! {
             ExitProcess(1);
         }
         ExitProcess(u32::from(!write_stdout(b"main joined\n")));
+    }
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+"#;
+
+const NT_SEMAPHORE_PE_SOURCE: &str = r#"
+#![no_std]
+#![no_main]
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static WAITER_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(std_handle: u32) -> usize;
+    fn WriteFile(
+        file: usize,
+        buffer: *const u8,
+        length: u32,
+        written: *mut u32,
+        overlapped: usize,
+    ) -> i32;
+    fn CreateThread(
+        thread_attributes: *const u8,
+        stack_size: usize,
+        start_routine: unsafe extern "system" fn(*mut u8) -> u32,
+        parameter: *mut u8,
+        creation_flags: u32,
+        thread_id: *mut u32,
+    ) -> usize;
+    fn WaitForSingleObject(handle: usize, milliseconds: u32) -> u32;
+    fn ExitProcess(exit_code: u32) -> !;
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtClose(handle: usize) -> i32;
+    fn NtCreateSemaphore(
+        semaphore_handle: *mut usize,
+        desired_access: u32,
+        object_attributes: usize,
+        initial_count: i32,
+        maximum_count: i32,
+    ) -> i32;
+    fn NtReleaseSemaphore(
+        semaphore_handle: usize,
+        release_count: i32,
+        previous_count: *mut i32,
+    ) -> i32;
+    fn NtWaitForSingleObject(handle: usize, alertable: u8, timeout: *const i64) -> i32;
+}
+
+unsafe extern "system" fn waiter(parameter: *mut u8) -> u32 {
+    let semaphore = parameter as usize;
+    let zero = 0i64;
+    if unsafe { NtWaitForSingleObject(semaphore, 0, &raw const zero) } != 0x102 {
+        return 1;
+    }
+    WAITER_STARTED.store(true, Ordering::Release);
+    u32::from(unsafe { NtWaitForSingleObject(semaphore, 0, core::ptr::null()) } != 0)
+}
+
+unsafe fn write_stdout(message: &[u8]) -> bool {
+    unsafe {
+        let stdout = GetStdHandle(0xffff_fff5);
+        let mut written = 0u32;
+        WriteFile(
+            stdout,
+            message.as_ptr(),
+            message.len() as u32,
+            &raw mut written,
+            0,
+        ) != 0
+            && written as usize == message.len()
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn mainCRTStartup() -> ! {
+    unsafe {
+        let mut semaphore = 0usize;
+        if NtCreateSemaphore(&raw mut semaphore, 0x001f_0003, 0, 0, 1) != 0 {
+            ExitProcess(1);
+        }
+        let thread = CreateThread(
+            core::ptr::null(),
+            0,
+            waiter,
+            semaphore as *mut u8,
+            0,
+            core::ptr::null_mut(),
+        );
+        if thread == 0 {
+            ExitProcess(1);
+        }
+        while !WAITER_STARTED.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        // Give the child enough execution time to register its semaphore observer
+        // so this fixture exercises the blocked-wait wakeup rather than a pre-release.
+        for _ in 0..1_000_000 {
+            core::hint::spin_loop();
+        }
+
+        let mut previous = -1;
+        if NtReleaseSemaphore(semaphore, 1, &raw mut previous) != 0
+            || previous != 0
+            || WaitForSingleObject(thread, u32::MAX) != 0
+        {
+            ExitProcess(1);
+        }
+        let zero = 0i64;
+        if NtWaitForSingleObject(semaphore, 0, &raw const zero) != 0x102 {
+            ExitProcess(1);
+        }
+        NtClose(thread);
+        NtClose(semaphore);
+        ExitProcess(u32::from(!write_stdout(b"semaphore ok\n")));
     }
 }
 

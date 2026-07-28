@@ -25,6 +25,7 @@ use crate::syscalls::event::EventObject;
 use crate::syscalls::section::{
     SectionObject, WINDOWS_SESSION_SHARED_SECTION_OBJECT, WINDOWS_SHARED_SECTION_OBJECT,
 };
+use crate::syscalls::semaphore::SemaphoreObject;
 use crate::{
     ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
 };
@@ -157,6 +158,9 @@ enum NamedObject<Platform: crate::ShimPlatform> {
     },
     Event {
         event: Weak<EventObject<Platform>>,
+    },
+    Semaphore {
+        semaphore: Weak<SemaphoreObject<Platform>>,
     },
     Section {
         section: Weak<SectionObject<Platform>>,
@@ -332,6 +336,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         new_directory() => NamedObject::Directory { children: BTreeMap::new() };
         new_symlink(target: String) => NamedObject::Symlink { target };
         new_event(event: Weak<EventObject<Platform>>) => NamedObject::Event { event };
+        new_semaphore(semaphore: Weak<SemaphoreObject<Platform>>) => NamedObject::Semaphore { semaphore };
         new_section(section: Weak<SectionObject<Platform>>) => NamedObject::Section { section };
         new_file_device(device: FileDeviceObject) => NamedObject::FileDevice { device };
         new_port() => NamedObject::Port;
@@ -377,6 +382,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         directory_object, ObjectLeafLookup<()>, NamedObject::Directory { .. } => ObjectLeafLookup::Live(());
         pub(super) symlink_target, ObjectLeafLookup<String>, NamedObject::Symlink { target } => ObjectLeafLookup::Live(target.clone());
         event_object, ObjectLeafLookup<Arc<EventObject<Platform>>>, NamedObject::Event { event } => ObjectLeafLookup::from_weak(event);
+        semaphore_object, ObjectLeafLookup<Arc<SemaphoreObject<Platform>>>, NamedObject::Semaphore { semaphore } => ObjectLeafLookup::from_weak(semaphore);
         section_object, ObjectLeafLookup<Arc<SectionObject<Platform>>>, NamedObject::Section { section } => ObjectLeafLookup::from_weak(section);
         file_device_object, ObjectLeafLookup<FileDeviceObject>, NamedObject::FileDevice { device } => ObjectLeafLookup::Live(device.clone());
         port_object, ObjectLeafLookup<()>, NamedObject::Port => ObjectLeafLookup::Live(());
@@ -387,6 +393,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
             NamedObject::Directory { .. } => Some("Directory"),
             NamedObject::Symlink { .. } => Some("SymbolicLink"),
             NamedObject::Event { event } => event.upgrade().map(|_| "Event"),
+            NamedObject::Semaphore { semaphore } => semaphore.upgrade().map(|_| "Semaphore"),
             NamedObject::Section { section } => section.upgrade().map(|_| "Section"),
             NamedObject::FileDevice { .. } => Some("Device"),
             NamedObject::Port => Some("Port"),
@@ -478,6 +485,24 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
             path,
             |node| node.event_object(),
             |path, parent, name| ObjectNode::new_event(path, parent, name, event),
+            NtStatus::OBJECT_TYPE_MISMATCH,
+            on_exists,
+            |_| on_created(),
+        )
+    }
+
+    pub(super) fn create_semaphore(
+        &self,
+        path: &str,
+        semaphore: &Arc<SemaphoreObject<Platform>>,
+        on_exists: impl FnOnce(Arc<SemaphoreObject<Platform>>) -> NtStatus,
+        on_created: impl FnOnce() -> NtStatus,
+    ) -> NtStatus {
+        let semaphore = Arc::downgrade(semaphore);
+        self.create_child(
+            path,
+            |node| node.semaphore_object(),
+            |path, parent, name| ObjectNode::new_semaphore(path, parent, name, semaphore),
             NtStatus::OBJECT_TYPE_MISMATCH,
             on_exists,
             |_| on_created(),
@@ -611,6 +636,13 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
 
     pub(super) fn resolve_event(&self, path: &str) -> Result<Arc<EventObject<Platform>>, NtStatus> {
         self.resolve_object_leaf(path, false, |node| node.event_object())
+    }
+
+    pub(super) fn resolve_semaphore(
+        &self,
+        path: &str,
+    ) -> Result<Arc<SemaphoreObject<Platform>>, NtStatus> {
+        self.resolve_object_leaf(path, false, |node| node.semaphore_object())
     }
 
     pub(super) fn resolve_section(

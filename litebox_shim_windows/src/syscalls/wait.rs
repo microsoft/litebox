@@ -15,6 +15,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use crate::nt_types::AccessMask;
 use crate::syscalls::Handle;
 use crate::syscalls::event::{EventObject, EventSubsystem};
+use crate::syscalls::semaphore::{SemaphoreObject, SemaphoreSubsystem};
 use crate::syscalls::thread::{ThreadObject, ThreadSubsystem};
 use crate::{ConstPtr, ShimFS, ShimPlatform, Task};
 
@@ -22,6 +23,7 @@ use crate::{ConstPtr, ShimFS, ShimPlatform, Task};
 enum WaitableObject<Platform: ShimPlatform> {
     Thread(Arc<ThreadObject<Platform>>),
     Event(Arc<EventObject<Platform>>),
+    Semaphore(Arc<SemaphoreObject<Platform>>),
 }
 
 impl<Platform: ShimPlatform> WaitableObject<Platform> {
@@ -30,6 +32,7 @@ impl<Platform: ShimPlatform> WaitableObject<Platform> {
         match self {
             Self::Thread(thread) => thread.register_observer(observer, mask),
             Self::Event(event) => event.register_observer(observer, mask),
+            Self::Semaphore(semaphore) => semaphore.register_observer(observer, mask),
         }
     }
 
@@ -40,6 +43,7 @@ impl<Platform: ShimPlatform> WaitableObject<Platform> {
             // Thread completion is terminal, so readiness is enough.
             Self::Thread(thread) => thread.check_io_events().contains(Events::IN),
             Self::Event(event) => event.try_acquire(),
+            Self::Semaphore(semaphore) => semaphore.try_acquire(),
         }
     }
 }
@@ -68,8 +72,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         try_wait!(ThreadSubsystem<Platform>, Thread, thread);
         try_wait!(EventSubsystem<Platform>, Event, event);
+        try_wait!(SemaphoreSubsystem<Platform>, Semaphore, semaphore);
 
-        // TODO(waitable-objects): timers, mutants, semaphores, processes and
+        // TODO(waitable-objects): timers, mutants, processes and
         // I/O completion ports are waitable on the host but not yet modeled.
         litebox_util_log::debug!(
             handle:? = handle;
@@ -125,6 +130,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         "Thread wait completed"
                     ),
                     WaitableObject::Event(_) => litebox_util_log::debug!("Event wait completed"),
+                    WaitableObject::Semaphore(_) => {
+                        litebox_util_log::debug!("Semaphore wait completed");
+                    }
                 }
                 NtStatus::SUCCESS
             }
