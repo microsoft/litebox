@@ -25,9 +25,6 @@ use super::{
 };
 
 /// The north-facing filesystem entry point, generic over a [`Backend`](super::backend::Backend).
-///
-/// The resolver _itself_ maintains no state; all state is maintained either by the backend or the
-/// [`Context`]. The user may choose to store the [`Context`] as they wish.
 // NOTE(jayb): the `Context` separation is in preparation for multi-process support; specifically,
 // each guest process would have their own `Context` but would share the resolver. Currently, since
 // we are using the `FileSystem` trait for migration, the interfaces do not show the full actual
@@ -38,6 +35,8 @@ pub struct Resolver<
 > {
     litebox: LiteBox<Platform>,
     backend: Backend,
+    /// Stand-in for the per-caller context, until callers own their own. See the note above.
+    migration_context: Context,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
@@ -49,7 +48,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Self {
             litebox: litebox.clone(),
             backend,
+            migration_context: Context::new(),
         }
+    }
+
+    /// Set the acting user for all subsequent operations, returning the previous one.
+    ///
+    /// TODO(jayb): transitionary `pub(super)` accessor; this should go away once callers own their
+    /// own [`Context`], at which point they can set the acting user directly.
+    pub(super) fn swap_acting_user(&mut self, user: UserInfo) -> UserInfo {
+        core::mem::replace(&mut self.migration_context.user_info, user)
     }
 
     /// Direct access to the backend, for the legacy [`super::FileSystem`] wrappers that still
@@ -377,10 +385,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 }
 
-/// This exists purely as a migration feature, until we have completely separated contexts. See
-/// comment on `Resolver`.
-fn default_context_pre_context_management_changes() -> Context {
-    Context::new()
+// NOTE(jayb): purely as a migration feature, until we have completely separated contexts. See
+// comment on [`Resolver`].
+impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    Resolver<Platform, Backend>
+{
+    fn context_pre_context_management_changes(&self) -> &Context {
+        &self.migration_context
+    }
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
@@ -406,7 +418,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         }
         let path_only = flags.contains(OFlags::PATH);
 
-        let context = default_context_pre_context_management_changes();
+        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
@@ -437,7 +449,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         let walk = self.walk_path(
-            &context,
+            context,
             self.backend.root(),
             &components,
             #[cfg(debug_assertions)]
@@ -485,7 +497,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 };
                 let parent = self
                     .walk_to_directory(
-                        &context,
+                        context,
                         self.backend.root(),
                         &parent_components,
                         #[cfg(debug_assertions)]
@@ -680,10 +692,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let handle = self
-            .path_handle(&context, &path)
+            .path_handle(context, &path)
             .map_err(|error| match error {
                 WalkError::Io => ChmodError::Io,
                 WalkError::PathError(error) => error.into(),
@@ -697,10 +709,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let handle = self
-            .path_handle(&context, &path)
+            .path_handle(context, &path)
             .map_err(|error| match error {
                 WalkError::Io => ChownError::Io,
                 WalkError::PathError(error) => error.into(),
@@ -709,10 +721,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
-            self.parent_dir_and_name(&context, &path)
+            self.parent_dir_and_name(context, &path)
                 .map_err(|error| match error {
                     WalkError::Io => UnlinkError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -728,10 +740,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
-            self.parent_dir_and_name(&context, &path)
+            self.parent_dir_and_name(context, &path)
                 .map_err(|error| match error {
                     WalkError::Io => MkdirError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -747,10 +759,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
-            self.parent_dir_and_name(&context, &path)
+            self.parent_dir_and_name(context, &path)
                 .map_err(|error| match error {
                     WalkError::Io => RmdirError::Io,
                     WalkError::PathError(error) => error.into(),

@@ -28,11 +28,9 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
     root: DirNode<Platform>,
-    // TODO(jayb): This duplicates the resolver's `Context::user_info`, and the two can disagree.
-    // The resolver should own the acting user and pass it down: it needs to (a) supply the owner
-    // for newly created files/dirs, (b) check write permission on the parent before
-    // create/mkdir/unlink/rmdir, and (c) perform the root-or-owner check for chmod/chown. Once it
-    // does, this field (and `with_root_privileges`/`with_user`) can go away.
+    // TODO(jayb): This duplicates the resolver's `Context::user_info`, which is supposed to own
+    // this. This exists as a transition until we update callers to either manage the perm checks or
+    // pass down the UserInfo.
     current_user: UserInfo,
     inode_allocator: InodeAllocator,
 }
@@ -56,22 +54,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                 group: 1000,
             },
             inode_allocator,
-        }
-    }
-
-    /// Execute `f` with superuser/root privileges.
-    ///
-    /// This function primarily exists to initialize files. Most regular interaction with the file
-    /// system should be done without this function.
-    pub fn with_root_privileges<F>(&mut self, f: F)
-    where
-        F: FnOnce(&mut Self),
-    {
-        let original_user = core::mem::replace(&mut self.current_user, UserInfo::ROOT);
-        f(self);
-        let root_again = core::mem::replace(&mut self.current_user, original_user);
-        if root_again.user != UserInfo::ROOT.user || root_again.group != UserInfo::ROOT.group {
-            unreachable!()
         }
     }
 
@@ -99,21 +81,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             "must only be used on empty files during initialization"
         );
         file.data = data;
-    }
-
-    /// Execute `f` as a specific user (for testing purposes).
-    #[cfg(test)]
-    pub fn with_user<F>(&mut self, user: u16, group: u16, f: F)
-    where
-        F: FnOnce(&mut Self),
-    {
-        let test_user = UserInfo { user, group };
-        let original_user = core::mem::replace(&mut self.current_user, test_user);
-        f(self);
-        let test_user_again = core::mem::replace(&mut self.current_user, original_user);
-        if test_user_again.user != test_user.user || test_user_again.group != test_user.group {
-            unreachable!()
-        }
     }
 }
 
@@ -606,13 +573,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     where
         F: FnOnce(&mut Self),
     {
-        let original_user = core::mem::replace(
-            &mut self.resolver.backend_mut().current_user,
-            UserInfo::ROOT,
-        );
+        let original_user = self.resolver.swap_acting_user(UserInfo::ROOT);
+        self.resolver.backend_mut().current_user = UserInfo::ROOT;
         f(self);
-        let root_again =
-            core::mem::replace(&mut self.resolver.backend_mut().current_user, original_user);
+        let root_again = self.resolver.swap_acting_user(original_user);
+        self.resolver.backend_mut().current_user = original_user;
         if root_again.user != UserInfo::ROOT.user || root_again.group != UserInfo::ROOT.group {
             unreachable!()
         }
@@ -658,11 +623,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         F: FnOnce(&mut Self),
     {
         let test_user = UserInfo { user, group };
-        let original_user =
-            core::mem::replace(&mut self.resolver.backend_mut().current_user, test_user);
+        let original_user = self.resolver.swap_acting_user(test_user);
+        self.resolver.backend_mut().current_user = test_user;
         f(self);
-        let test_user_again =
-            core::mem::replace(&mut self.resolver.backend_mut().current_user, original_user);
+        let test_user_again = self.resolver.swap_acting_user(original_user);
+        self.resolver.backend_mut().current_user = original_user;
         if test_user_again.user != test_user.user || test_user_again.group != test_user.group {
             unreachable!()
         }
