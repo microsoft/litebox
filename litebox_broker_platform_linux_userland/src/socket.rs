@@ -660,7 +660,7 @@ fn connect_socket(
                 break SocketConnectionStatus::Connecting;
             }
             Err(error) => {
-                break SocketConnectionStatus::Failed(socket_error(error));
+                break SocketConnectionStatus::Failed(socket_error_from_errno(error));
             }
         }
     };
@@ -687,7 +687,7 @@ fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutc
             }
             Err(error) => {
                 set_error_readiness(socket)?;
-                return Ok(SocketOutcome::Failed(socket_error(error)));
+                return Ok(SocketOutcome::Failed(socket_error_from_errno(error)));
             }
         }
     }
@@ -720,7 +720,9 @@ fn receive_socket(
             }
             Err(error) => {
                 set_error_readiness(socket)?;
-                return Ok(ReactorReceiveOutcome::Failed(socket_error(error)));
+                return Ok(ReactorReceiveOutcome::Failed(socket_error_from_errno(
+                    error,
+                )));
             }
         }
     }
@@ -766,7 +768,7 @@ fn shutdown_socket(
             Err(Errno::INTR) => {}
             Err(error) => {
                 set_error_readiness(socket)?;
-                return Ok(SocketOutcome::Failed(socket_error(error)));
+                return Ok(SocketOutcome::Failed(socket_error_from_errno(error)));
             }
         }
     }
@@ -796,7 +798,7 @@ fn complete_connect(socket: &mut SocketEntry, events: epoll::EventFlags) -> Brok
             Ok(None) | Err(Errno::NOTCONN) => SocketConnectionStatus::Connecting,
             Err(error) => return Err(create_socket_error(error)),
         },
-        Err(error) => SocketConnectionStatus::Failed(socket_error(error)),
+        Err(error) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
     };
     let readiness = match status {
         SocketConnectionStatus::Connected => {
@@ -889,7 +891,7 @@ fn set_error_readiness(socket: &SocketEntry) -> BrokerResult<()> {
     add_readiness(socket, ReadinessFlags::ERROR)
 }
 
-const fn socket_error(error: Errno) -> SocketError {
+const fn socket_error_from_errno(error: Errno) -> SocketError {
     match error {
         Errno::CONNREFUSED => SocketError::ConnectionRefused,
         Errno::CONNRESET | Errno::PIPE => SocketError::ConnectionReset,
