@@ -4,6 +4,7 @@
 //! Implementation of pseudo TAs (PTAs) which export system services as
 //! the functions of built-in TAs.
 
+use crate::keystack::KeyStackPta;
 use crate::syscalls::Cleanup;
 use crate::{Task, UserConstPtr, UserMutPtr};
 use alloc::vec;
@@ -30,12 +31,14 @@ struct SystemPta;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum PseudoTa {
     System,
+    KeyStack,
 }
 
 impl PseudoTa {
     pub(crate) fn from_uuid(uuid: &TeeUuid) -> Option<Self> {
         match *uuid {
             SystemPta::UUID => Some(Self::System),
+            KeyStackPta::UUID => Some(Self::KeyStack),
             _ => None,
         }
     }
@@ -44,6 +47,7 @@ impl PseudoTa {
     fn open_session(self, params: &UteeParams) -> Result<u32, TeeResult> {
         match self {
             Self::System => SystemPta::open_session(params),
+            Self::KeyStack => KeyStackPta::open_session(params),
         }
     }
 
@@ -56,27 +60,45 @@ impl PseudoTa {
         let _busy = task.try_set_busy(self)?;
         match self {
             Self::System => SystemPta::invoke_command(task, cmd_id, params),
+            Self::KeyStack => KeyStackPta::invoke_command(task, cmd_id, params),
         }
     }
 
     fn close_session(self, task: &Task, session_id: u32) {
         match self {
             Self::System => SystemPta::close_session(task, session_id),
+            Self::KeyStack => KeyStackPta::close_session(task, session_id),
         }
     }
 
     fn flags(self) -> TaFlags {
         match self {
             Self::System => SystemPta::FLAGS,
+            Self::KeyStack => KeyStackPta::FLAGS,
         }
     }
 }
 
-const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
+pub(crate) const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
     .union(TaFlags::MULTI_SESSION)
     .union(TaFlags::INSTANCE_KEEP_ALIVE);
 
 const MAX_PTA_SESSIONS_PER_TASK: usize = 100;
+
+/// Open a session to a PTA that carries no per-session state and takes no
+/// parameters at session-open time.
+pub(crate) fn open_default_pta_session(params: &UteeParams) -> Result<u32, TeeResult> {
+    if !params.has_types([
+        TeeParamType::None,
+        TeeParamType::None,
+        TeeParamType::None,
+        TeeParamType::None,
+    ]) {
+        return Err(TeeResult::BadParameters);
+    }
+
+    crate::SessionIdPool::allocate().ok_or(TeeResult::Busy)
+}
 
 struct PtaBusyGuard<'a> {
     task: &'a Task,
@@ -105,11 +127,11 @@ const PTA_SYSTEM_GET_TPM_EVENT_LOG: u32 = 12;
 const PTA_SYSTEM_SUPP_PLUGIN_INVOKE: u32 = 13;
 
 /// Minimum size of a derived key in bytes.
-const TA_DERIVED_KEY_MIN_SIZE: usize = 16;
+pub(crate) const TA_DERIVED_KEY_MIN_SIZE: usize = 16;
 /// Maximum size of a derived key in bytes.
-const TA_DERIVED_KEY_MAX_SIZE: usize = 32;
+pub(crate) const TA_DERIVED_KEY_MAX_SIZE: usize = 32;
 /// Maximum size of extra data for key derivation in bytes.
-const TA_DERIVED_EXTRA_DATA_MAX_SIZE: usize = 1024;
+pub(crate) const TA_DERIVED_EXTRA_DATA_MAX_SIZE: usize = 1024;
 
 /// `PTA_SYSTEM_*` command ID from `optee_os/lib/libutee/include/pta_system.h`
 #[derive(Clone, Copy, TryFromPrimitive)]
@@ -131,7 +153,7 @@ enum PtaSystemCommandId {
     SuppPluginInvoke = PTA_SYSTEM_SUPP_PLUGIN_INVOKE,
 }
 
-type HmacSha256 = Hmac<Sha256>;
+pub(crate) type HmacSha256 = Hmac<Sha256>;
 
 impl Task {
     /// Try to mark a non-concurrent PTA as busy, returning a guard that clears
@@ -221,16 +243,7 @@ impl SystemPta {
     };
 
     fn open_session(params: &UteeParams) -> Result<u32, TeeResult> {
-        if !params.has_types([
-            TeeParamType::None,
-            TeeParamType::None,
-            TeeParamType::None,
-            TeeParamType::None,
-        ]) {
-            return Err(TeeResult::BadParameters);
-        }
-
-        crate::SessionIdPool::allocate().ok_or(TeeResult::Busy)
+        open_default_pta_session(params)
     }
 
     fn close_session(_task: &Task, _session_id: u32) {
@@ -308,7 +321,7 @@ impl SystemPta {
         // subkey = KDF(huk, usage || ta_uuid || extra_data)
         let ta_uuid_bytes = task.ta_app_id.to_le_bytes();
         let mut subkey_buf = Zeroizing::new(vec![0u8; subkey_size]);
-        Self::huk_subkey_derive(
+        huk_subkey_derive(
             task,
             HukSubkeyUsage::UniqueTa,
             &[&ta_uuid_bytes, &extra_data],
@@ -319,44 +332,6 @@ impl SystemPta {
                 .copy_from_slice(0, &subkey_buf)
                 .ok_or(TeeResult::AccessDenied)
         })
-    }
-
-    /// Derive a subkey using HUK and constant data.
-    ///
-    /// This follows the OP-TEE `huk_subkey_derive` interface from `core/kernel/huk_subkey.c`.
-    fn huk_subkey_derive(
-        task: &Task,
-        usage: HukSubkeyUsage,
-        const_data: &[&[u8]],
-        subkey: &mut [u8],
-    ) -> Result<(), TeeResult> {
-        let subkey_len = subkey.len();
-        if subkey_len > HUK_SUBKEY_MAX_LEN {
-            return Err(TeeResult::BadParameters);
-        }
-
-        let kdf_context_len =
-            core::mem::size_of::<u32>() + const_data.iter().map(|chunk| chunk.len()).sum::<usize>();
-        let mut kdf_context = Zeroizing::new(Vec::with_capacity(kdf_context_len));
-        kdf_context.extend_from_slice(&(usage as u32).to_le_bytes());
-        for chunk in const_data {
-            kdf_context.extend_from_slice(chunk);
-        }
-        let kdf_params = KDFParams {
-            context: kdf_context.as_slice(),
-            output: subkey,
-        };
-
-        task.global
-            .platform
-            .derive_key(Some(huk_subkey_derive_inner), kdf_params)
-            .map_err(|err| match err {
-                DerivedKeyError::ShimKDFRequired
-                | DerivedKeyError::UnsupportedRebootPersistentKey => TeeResult::NotSupported,
-                DerivedKeyError::ShimKDFError(err) => err,
-            })?;
-
-        Ok(())
     }
 
     fn map_zi(task: &Task, params: &mut UteeParams) -> Result<Cleanup, TeeResult> {
@@ -433,6 +408,45 @@ impl SystemPta {
         task.sys_munmap(UserMutPtr::<u8>::from_usize(addr), size)
             .map_err(|_| TeeResult::BadParameters)
     }
+}
+
+/// Derive a subkey using HUK and constant data.
+///
+/// This follows the OP-TEE `huk_subkey_derive` interface from `core/kernel/huk_subkey.c`.
+pub(crate) fn huk_subkey_derive(
+    task: &Task,
+    usage: HukSubkeyUsage,
+    const_data: &[&[u8]],
+    subkey: &mut [u8],
+) -> Result<(), TeeResult> {
+    let subkey_len = subkey.len();
+    if subkey_len > HUK_SUBKEY_MAX_LEN {
+        return Err(TeeResult::BadParameters);
+    }
+
+    let kdf_context_len =
+        core::mem::size_of::<u32>() + const_data.iter().map(|chunk| chunk.len()).sum::<usize>();
+    let mut kdf_context = Zeroizing::new(Vec::with_capacity(kdf_context_len));
+    kdf_context.extend_from_slice(&(usage as u32).to_le_bytes());
+    for chunk in const_data {
+        kdf_context.extend_from_slice(chunk);
+    }
+    let kdf_params = KDFParams {
+        context: kdf_context.as_slice(),
+        output: subkey,
+    };
+
+    task.global
+        .platform
+        .derive_key(Some(huk_subkey_derive_inner), kdf_params)
+        .map_err(|err| match err {
+            DerivedKeyError::ShimKDFRequired | DerivedKeyError::UnsupportedRebootPersistentKey => {
+                TeeResult::NotSupported
+            }
+            DerivedKeyError::ShimKDFError(err) => err,
+        })?;
+
+    Ok(())
 }
 
 /// A KDF callback that derives a subkey from `huk` and `params.context` to be passed to
