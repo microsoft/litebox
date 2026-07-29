@@ -542,7 +542,8 @@ impl From<BrokerObjectError> for TryOpError<PipeError> {
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::ResourceExhausted
             | BrokerObjectError::PermissionDenied
-            | BrokerObjectError::OutOfMemory => TryOpError::Other(PipeError::Io),
+            | BrokerObjectError::OutOfMemory
+            | BrokerObjectError::UnsupportedOperation => TryOpError::Other(PipeError::Io),
         }
     }
 }
@@ -556,7 +557,8 @@ impl From<BrokerObjectError> for errors::CreateError {
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::WouldBlock
-            | BrokerObjectError::PeerClosed => Self::Io,
+            | BrokerObjectError::PeerClosed
+            | BrokerObjectError::UnsupportedOperation => Self::Io,
         }
     }
 }

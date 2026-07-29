@@ -36,6 +36,8 @@ pub(crate) enum BrokerObjectError {
     PermissionDenied,
     #[error("broker memory allocation failed")]
     OutOfMemory,
+    #[error("broker object operation is unsupported")]
+    UnsupportedOperation,
 }
 
 impl From<BrokerControlError> for BrokerObjectError {
@@ -56,10 +58,10 @@ impl From<ErrorCode> for BrokerObjectError {
             ErrorCode::ResourceExhausted => Self::ResourceExhausted,
             ErrorCode::PolicyDenied => Self::PermissionDenied,
             ErrorCode::OutOfMemory => Self::OutOfMemory,
+            ErrorCode::UnsupportedOperation => Self::UnsupportedOperation,
             ErrorCode::UnsupportedVersion
             | ErrorCode::MalformedRequest
             | ErrorCode::ProtocolState
-            | ErrorCode::UnsupportedOperation
             | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
             _ => panic!("broker returned unsupported error: {error}"),
         }
@@ -97,7 +99,8 @@ impl From<BrokerObjectError> for EventCounterError {
             BrokerObjectError::PermissionDenied => Self::PermissionDenied,
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
-            | BrokerObjectError::PeerClosed => Self::Io,
+            | BrokerObjectError::PeerClosed
+            | BrokerObjectError::UnsupportedOperation => Self::Io,
         }
     }
 }

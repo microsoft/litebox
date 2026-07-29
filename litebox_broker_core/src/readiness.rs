@@ -30,7 +30,16 @@ pub struct ReadinessRegistration {
 }
 
 impl ReadinessRegistration {
-    pub(crate) fn new(handle: ObjectHandle, sink: Arc<dyn ReadinessSink>) -> Self {
+    pub(crate) fn new_with_retirement_guard<Guard>(
+        handle: ObjectHandle,
+        sink: Arc<dyn ReadinessSink>,
+        retirement_guard: Arc<Guard>,
+    ) -> Self
+    where
+        Guard: Send + Sync + 'static,
+    {
+        // The guard keeps capacity charged until a deferred sink retirement
+        // has actually been delivered.
         Self {
             inner: Arc::new(ReadinessRegistrationInner {
                 handle,
@@ -39,6 +48,7 @@ impl ReadinessRegistration {
                     retired: false,
                     active_publishers: 0,
                     retirement_sent: false,
+                    retirement_guard: Some(retirement_guard),
                 }),
             }),
         }
@@ -77,19 +87,24 @@ struct ReadinessRegistrationState {
     retired: bool,
     active_publishers: usize,
     retirement_sent: bool,
+    retirement_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl ReadinessRegistrationInner {
     fn retire(&self) {
-        let should_retire = {
+        let (should_retire, retirement_guard) = {
             let mut state = self.state.lock();
             state.retired = true;
             let should_retire = state.active_publishers == 0 && !state.retirement_sent;
             state.retirement_sent |= should_retire;
-            should_retire
+            let retirement_guard = should_retire
+                .then(|| state.retirement_guard.take())
+                .flatten();
+            (should_retire, retirement_guard)
         };
         if should_retire {
             self.sink.retire(self.handle);
+            drop(retirement_guard);
         }
     }
 }
@@ -106,16 +121,20 @@ struct ReadinessPublishGuard<'registration> {
 
 impl Drop for ReadinessPublishGuard<'_> {
     fn drop(&mut self) {
-        let should_retire = {
+        let (should_retire, retirement_guard) = {
             let mut state = self.inner.state.lock();
             state.active_publishers -= 1;
             let should_retire =
                 state.retired && state.active_publishers == 0 && !state.retirement_sent;
             state.retirement_sent |= should_retire;
-            should_retire
+            let retirement_guard = should_retire
+                .then(|| state.retirement_guard.take())
+                .flatten();
+            (should_retire, retirement_guard)
         };
         if should_retire {
             self.inner.sink.retire(self.inner.handle);
+            drop(retirement_guard);
         }
     }
 }
@@ -150,7 +169,11 @@ pub(crate) mod tests {
     #[test]
     fn retired_registration_discards_updates_from_retained_clones() {
         let sink = Arc::new(TestReadinessSink::default());
-        let registration = ReadinessRegistration::new(ObjectHandle(99), sink.clone());
+        let registration = ReadinessRegistration::new_with_retirement_guard(
+            ObjectHandle(99),
+            sink.clone(),
+            Arc::new(()),
+        );
         let retained = registration.clone();
 
         registration.retire();

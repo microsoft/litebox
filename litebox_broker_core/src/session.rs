@@ -51,6 +51,7 @@ pub(crate) struct ObjectReference {
 }
 
 pub(crate) enum ObjectEntry {
+    Reserved,
     Event(EventObject),
     Pipe(PipeObject),
     Socket(SocketObject),
@@ -102,6 +103,7 @@ impl BrokerSession {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
+        let object = Arc::new(RwLock::new(object));
         let mut session_references = self.references.lock();
         let additional = session_references
             .pending_handles
@@ -161,6 +163,8 @@ impl BrokerSession {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
+        let first = Arc::new(RwLock::new(first));
+        let second = Arc::new(RwLock::new(second));
         let mut session_references = self.references.lock();
         let additional = session_references
             .pending_handles
@@ -220,6 +224,7 @@ impl BrokerSession {
         &self,
         rights: ObjectRights,
     ) -> Result<PendingObjectReference<'_>> {
+        let object = Arc::new(RwLock::new(ObjectEntry::Reserved));
         let mut session_references = self.references.lock();
         let next_session_pending = session_references
             .pending_handles
@@ -260,6 +265,7 @@ impl BrokerSession {
             session: self,
             handle,
             rights,
+            object,
             active: true,
         })
     }
@@ -269,14 +275,14 @@ impl BrokerSession {
         references: &mut HashMap<ObjectHandle, ObjectReference>,
         reference_handles: &mut Vec<ObjectHandle>,
         handle: ObjectHandle,
-        object: ObjectEntry,
+        object: Arc<RwLock<ObjectEntry>>,
         rights: ObjectRights,
     ) {
         let session_reference_index = reference_handles.len();
         references.insert(
             handle,
             ObjectReference {
-                object: Arc::new(RwLock::new(object)),
+                object,
                 session_id: self.session_id,
                 rights,
                 session_reference_index,
@@ -316,6 +322,7 @@ impl BrokerSession {
                 ObjectEntry::Event(event) => return Ok(event.readiness()),
                 ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
                 ObjectEntry::Socket(socket) => socket.resource(),
+                ObjectEntry::Reserved => return Err(BrokerError::Internal),
             }
         };
         Ok(socket.readiness())
@@ -389,6 +396,7 @@ pub(crate) struct PendingObjectReference<'session> {
     session: &'session BrokerSession,
     handle: ObjectHandle,
     rights: ObjectRights,
+    object: Arc<RwLock<ObjectEntry>>,
     active: bool,
 }
 
@@ -398,6 +406,9 @@ impl PendingObjectReference<'_> {
     }
 
     pub(crate) fn commit(mut self, object: ObjectEntry) -> Result<ObjectHandle> {
+        if !matches!(&*self.object.read(), ObjectEntry::Reserved) {
+            return Err(BrokerError::Internal);
+        }
         let mut session_references = self.session.references.lock();
         let mut references = self.session.core.references.write();
         if references.contains_key(&self.handle) {
@@ -415,11 +426,12 @@ impl PendingObjectReference<'_> {
             return Err(BrokerError::Internal);
         }
         self.active = false;
+        *self.object.write() = object;
         self.session.insert_object_reference(
             &mut references,
             &mut session_references.handles,
             self.handle,
-            object,
+            Arc::clone(&self.object),
             self.rights,
         );
         Ok(self.handle)

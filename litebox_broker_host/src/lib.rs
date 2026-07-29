@@ -244,6 +244,18 @@ enum RequestFailure {
     Abort(ErrorCode),
 }
 
+impl From<litebox_broker_core::BrokerError> for RequestFailure {
+    fn from(error: litebox_broker_core::BrokerError) -> Self {
+        match error {
+            litebox_broker_core::BrokerError::Internal
+            | litebox_broker_core::BrokerError::BrokerCoreAlreadyExists => {
+                Self::Abort(ErrorCode::Internal)
+            }
+            error => Self::Respond(error.into()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SharedBufferSlotState {
     Unused,
@@ -319,11 +331,11 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::CloseObject(handle) => session
             .close_object_reference(handle)
             .map(|()| BrokerResult::ObjectClosed)
-            .map_err(|error| RequestFailure::Respond(error.into())),
+            .map_err(RequestFailure::from),
         BrokerOperation::CheckReadiness(handle) => session
             .check_readiness(handle)
             .map(BrokerResult::Readiness)
-            .map_err(|error| RequestFailure::Respond(error.into())),
+            .map_err(RequestFailure::from),
         BrokerOperation::Event(request) => {
             handle_event_request(session, request).map(BrokerResult::Event)
         }
@@ -347,12 +359,12 @@ fn handle_socket_request<Memory: SharedMemory>(
         SocketRequest::Create(request) => {
             let handle =
                 litebox_broker_core::socket::create(session, request, Arc::clone(readiness_sink))
-                    .map_err(socket_request_failure)?;
+                    .map_err(RequestFailure::from)?;
             Ok(SocketResponse::Create(CreateSocketResponse { handle }))
         }
         SocketRequest::Connect(request) => {
             match litebox_broker_core::socket::connect(session, request.handle, request.address)
-                .map_err(socket_request_failure)?
+                .map_err(RequestFailure::from)?
             {
                 SocketOutcome::Completed(status) => {
                     Ok(SocketResponse::Connect(ConnectSocketResponse { status }))
@@ -361,7 +373,9 @@ fn handle_socket_request<Memory: SharedMemory>(
             }
         }
         SocketRequest::Send(request) => {
-            if request.buffer.length > MAX_SOCKET_TRANSFER_SIZE {
+            if request.flags.has_unsupported_bits()
+                || request.buffer.length > MAX_SOCKET_TRANSFER_SIZE
+            {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             let length = request.buffer.length as usize;
@@ -374,7 +388,7 @@ fn handle_socket_request<Memory: SharedMemory>(
                 .read(request.buffer.slot_index, &mut data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
             match litebox_broker_core::socket::send(session, request.handle, &data, request.flags)
-                .map_err(socket_request_failure)?
+                .map_err(RequestFailure::from)?
             {
                 SocketOutcome::Completed(sent) => {
                     let sent = sent
@@ -386,7 +400,9 @@ fn handle_socket_request<Memory: SharedMemory>(
             }
         }
         SocketRequest::Receive(request) => {
-            if request.buffer.length > MAX_SOCKET_TRANSFER_SIZE {
+            if request.flags.has_unsupported_bits()
+                || request.buffer.length > MAX_SOCKET_TRANSFER_SIZE
+            {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             let length = request.buffer.length as usize;
@@ -401,7 +417,7 @@ fn handle_socket_request<Memory: SharedMemory>(
                 &mut data,
                 request.flags,
             )
-            .map_err(socket_request_failure)?
+            .map_err(RequestFailure::from)?
             {
                 SocketOutcome::Completed(response) => {
                     if let ReceiveSocketResponse::Received(received) = response {
@@ -416,7 +432,7 @@ fn handle_socket_request<Memory: SharedMemory>(
         }
         SocketRequest::Shutdown(request) => {
             match litebox_broker_core::socket::shutdown(session, request.handle, request.mode)
-                .map_err(socket_request_failure)?
+                .map_err(RequestFailure::from)?
             {
                 SocketOutcome::Completed(()) => Ok(SocketResponse::Shutdown),
                 SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
@@ -425,16 +441,8 @@ fn handle_socket_request<Memory: SharedMemory>(
         SocketRequest::Status(request) => {
             litebox_broker_core::socket::status(session, request.handle)
                 .map(|status| SocketResponse::Status(SocketStatusResponse { status }))
-                .map_err(socket_request_failure)
+                .map_err(RequestFailure::from)
         }
-    }
-}
-
-fn socket_request_failure(error: litebox_broker_core::BrokerError) -> RequestFailure {
-    if error == litebox_broker_core::BrokerError::UnsupportedOperation {
-        RequestFailure::Abort(ErrorCode::MalformedRequest)
-    } else {
-        RequestFailure::Respond(error.into())
     }
 }
 
@@ -452,7 +460,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
                         write_handle,
                     })
                 })
-                .map_err(|error| RequestFailure::Respond(error.into()))
+                .map_err(RequestFailure::from)
         }
         PipeRequest::Read(request) => {
             if request.buffer.length > MAX_PIPE_TRANSFER_SIZE {
@@ -460,7 +468,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
             }
             let data =
                 litebox_broker_core::pipe::read(session, request.handle, request.buffer.length)
-                    .map_err(|error| RequestFailure::Respond(error.into()))?;
+                    .map_err(RequestFailure::from)?;
             shared_buffers
                 .write(request.buffer.slot_index, &data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
@@ -485,7 +493,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
                 .read(request.buffer.slot_index, &mut data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
             litebox_broker_core::pipe::write(session, request.handle, &data)
-                .map_err(|error| RequestFailure::Respond(error.into()))
+                .map_err(RequestFailure::from)
                 .and_then(|written| {
                     Ok(PipeResponse::Write(WritePipeResponse {
                         written: written
@@ -505,17 +513,17 @@ fn handle_event_request(
         EventRequest::Create(request) => {
             litebox_broker_core::event::create(session, request.initial_count)
                 .map(|handle| EventResponse::Create(CreateEventResponse { handle }))
-                .map_err(|error| RequestFailure::Respond(error.into()))
+                .map_err(RequestFailure::from)
         }
         EventRequest::Add(request) => {
             litebox_broker_core::event::add(session, request.handle, request.value)
                 .map(|readiness| EventResponse::Add(AddEventResponse { readiness }))
-                .map_err(|error| RequestFailure::Respond(error.into()))
+                .map_err(RequestFailure::from)
         }
         EventRequest::Consume(request) => {
             litebox_broker_core::event::consume(session, request.handle, request.mode)
                 .map(EventResponse::Consume)
-                .map_err(|error| RequestFailure::Respond(error.into()))
+                .map_err(RequestFailure::from)
         }
     }
 }
@@ -1174,6 +1182,27 @@ mod tests {
                 &test_readiness_sink(),
             )),
             Err(ErrorCode::MalformedRequest)
+        );
+        assert_eq!(
+            complete_request(handle_request(
+                &session,
+                BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+                    handle: response.handle,
+                    buffer: descriptor(2, 0),
+                    flags: ReceiveFlags(ReceiveFlags::SUPPORTED.0 | 2),
+                })),
+                &shared_buffers,
+                &test_readiness_sink(),
+            )),
+            Err(ErrorCode::MalformedRequest)
+        );
+        assert_eq!(
+            RequestFailure::from(litebox_broker_core::BrokerError::UnsupportedOperation),
+            RequestFailure::Respond(ErrorCode::UnsupportedOperation)
+        );
+        assert_eq!(
+            RequestFailure::from(litebox_broker_core::BrokerError::Internal),
+            RequestFailure::Abort(ErrorCode::Internal)
         );
         session.close_object_reference(response.handle).unwrap();
     }

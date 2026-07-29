@@ -170,11 +170,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 | ErrorCode::ResourceExhausted
                 | ErrorCode::WouldBlock
                 | ErrorCode::PeerClosed
-                | ErrorCode::OutOfMemory => Err(BrokerLocalError::Broker(error)),
+                | ErrorCode::OutOfMemory
+                | ErrorCode::UnsupportedOperation => Err(BrokerLocalError::Broker(error)),
                 ErrorCode::UnsupportedVersion
                 | ErrorCode::MalformedRequest
                 | ErrorCode::ProtocolState
-                | ErrorCode::UnsupportedOperation
                 | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
                 _ => panic!("broker returned unsupported error: {error}"),
             },
@@ -396,19 +396,20 @@ mod tests {
     }
 
     #[test]
-    fn active_request_returns_recoverable_broker_error() {
-        let channel =
-            FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::WouldBlock)));
-        let local = BrokerLocal {
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
+    fn active_request_returns_recoverable_broker_errors() {
+        for error in [ErrorCode::WouldBlock, ErrorCode::UnsupportedOperation] {
+            let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(error)));
+            let local = BrokerLocal {
+                channel,
+                shared_buffers: noop_shared_buffers(),
+                next_request_id: AtomicU64::new(0),
+            };
 
-        assert!(matches!(
-            local.create_event_with_count(0),
-            Err(BrokerLocalError::Broker(ErrorCode::WouldBlock))
-        ));
+            assert!(matches!(
+                local.create_event_with_count(0),
+                Err(BrokerLocalError::Broker(actual)) if actual == error
+            ));
+        }
     }
 
     #[test]

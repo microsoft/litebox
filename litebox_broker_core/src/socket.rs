@@ -12,6 +12,7 @@ use litebox_broker_protocol::socket::{
     CreateSocketRequest, ReceiveFlags, ReceiveSocketResponse, SendFlags, ShutdownMode,
     SocketAddressV4, SocketConnectionStatus, SocketError,
 };
+use spin::Once;
 
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::session::{ObjectEntry, ObjectRights};
@@ -118,29 +119,34 @@ pub fn create(
         .core
         .policy
         .authorize_socket_create(session.caller_credential, request)?;
-    let quota = SocketQuotaReservation::new(session)?;
+    let quota = Arc::new(SocketQuotaReservation::new(session)?);
     let reference = session.reserve_object_reference(rights)?;
-    let readiness = ReadinessRegistration::new(reference.handle(), readiness_sink);
-    let platform_socket =
-        match session
-            .core
-            .socket_provider
-            .create(session.session_id, request, readiness.clone())
-        {
-            Ok(socket) => socket,
-            Err(error) => {
-                // The provider may have retained its registration before
-                // failing, so retirement cannot rely on the local clone being
-                // the last one.
-                readiness.retire();
-                return Err(error);
-            }
-        };
-    let handle = reference.commit(ObjectEntry::Socket(SocketObject::new(
-        platform_socket,
+    let readiness = ReadinessRegistration::new_with_retirement_guard(
+        reference.handle(),
+        readiness_sink,
+        Arc::clone(&quota),
+    );
+    let resource = Arc::new(SocketResource {
+        platform_socket: Once::new(),
         readiness,
-        quota,
-    )))?;
+        _quota: quota,
+    });
+    let platform_socket = match session.core.socket_provider.create(
+        session.session_id,
+        request,
+        resource.readiness.clone(),
+    ) {
+        Ok(socket) => socket,
+        Err(error) => {
+            // The provider may have retained its registration before
+            // failing, so retirement cannot rely on the local clone being
+            // the last one.
+            resource.readiness.retire();
+            return Err(error);
+        }
+    };
+    resource.platform_socket.call_once(|| platform_socket);
+    let handle = reference.commit(ObjectEntry::Socket(SocketObject::new(resource)))?;
     Ok(handle)
 }
 
@@ -322,17 +328,9 @@ pub(crate) struct SocketObject {
 }
 
 impl SocketObject {
-    fn new(
-        platform_socket: Arc<dyn PlatformSocket>,
-        readiness: ReadinessRegistration,
-        quota: SocketQuotaReservation,
-    ) -> Self {
+    fn new(resource: Arc<SocketResource>) -> Self {
         Self {
-            resource: Arc::new(SocketResource {
-                platform_socket,
-                readiness,
-                _quota: quota,
-            }),
+            resource,
             connection_status: SocketConnectionStatus::Unconnected,
             connect_in_flight: false,
         }
@@ -344,18 +342,25 @@ impl SocketObject {
 }
 
 pub(crate) struct SocketResource {
-    platform_socket: Arc<dyn PlatformSocket>,
+    platform_socket: Once<Arc<dyn PlatformSocket>>,
     readiness: ReadinessRegistration,
-    _quota: SocketQuotaReservation,
+    _quota: Arc<SocketQuotaReservation>,
 }
 
 impl SocketResource {
+    fn platform_socket(&self) -> &dyn PlatformSocket {
+        self.platform_socket
+            .get()
+            .expect("committed socket resources are initialized")
+            .as_ref()
+    }
+
     fn connect(&self, address: SocketAddressV4) -> Result<SocketConnectionStatus> {
-        self.platform_socket.connect(address)
+        self.platform_socket().connect(address)
     }
 
     fn send(&self, data: &[u8], flags: SendFlags) -> Result<SocketOutcome<usize>> {
-        self.platform_socket.send(data, flags)
+        self.platform_socket().send(data, flags)
     }
 
     fn receive(
@@ -363,19 +368,19 @@ impl SocketResource {
         data: &mut [u8],
         flags: ReceiveFlags,
     ) -> Result<SocketOutcome<ReceiveSocketResponse>> {
-        self.platform_socket.receive(data, flags)
+        self.platform_socket().receive(data, flags)
     }
 
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>> {
-        self.platform_socket.shutdown(mode)
+        self.platform_socket().shutdown(mode)
     }
 
     fn status(&self) -> Result<SocketConnectionStatus> {
-        self.platform_socket.status()
+        self.platform_socket().status()
     }
 
     pub(crate) fn readiness(&self) -> ReadinessFlags {
-        self.platform_socket.readiness()
+        self.platform_socket().readiness()
     }
 }
 
@@ -439,7 +444,8 @@ pub(crate) mod tests {
     use litebox_broker_protocol::socket::{
         AddressFamily, IpProtocol, Ipv4Address, Port, SocketType,
     };
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Mutex as StdMutex, mpsc};
+    use std::time::Duration;
 
     #[derive(Clone, Default)]
     pub(crate) struct TestSocketProvider {
@@ -458,6 +464,7 @@ pub(crate) mod tests {
         fail_create: core::sync::atomic::AtomicBool,
         fail_connect: core::sync::atomic::AtomicBool,
         failed_readiness: StdMutex<Option<ReadinessRegistration>>,
+        live_readiness: StdMutex<Option<ReadinessRegistration>>,
     }
 
     impl TestSocketProvider {
@@ -486,6 +493,7 @@ pub(crate) mod tests {
                 *self.state.failed_readiness.lock().unwrap() = Some(readiness);
                 return Err(BrokerError::OutOfMemory);
             }
+            *self.state.live_readiness.lock().unwrap() = Some(readiness.clone());
             Ok(Arc::new(TestPlatformSocket {
                 state: Arc::clone(&self.state),
                 readiness,
@@ -554,6 +562,7 @@ pub(crate) mod tests {
         check_failed_create_rolls_back(broker, provider);
         check_socket_operations_and_policy(broker, provider);
         check_connect_error_is_terminal(broker, provider);
+        check_quota_waits_for_deferred_retirement(broker, provider);
         check_socket_quotas(broker);
     }
 
@@ -716,6 +725,72 @@ pub(crate) mod tests {
         first.close_object_reference(first_handle).unwrap();
         second.close_object_reference(second_handle).unwrap();
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+    }
+
+    struct BlockingReadinessSink {
+        started: StdMutex<Option<mpsc::Sender<()>>>,
+        release: StdMutex<mpsc::Receiver<()>>,
+        retired: AtomicUsize,
+    }
+
+    impl ReadinessSink for BlockingReadinessSink {
+        fn max_tracked_objects(&self) -> usize {
+            usize::MAX
+        }
+
+        fn publish(&self, _handle: ObjectHandle, _readiness: ReadinessFlags) -> Result<()> {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                started.send(()).map_err(|_| BrokerError::Internal)?;
+            }
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| BrokerError::Internal)
+        }
+
+        fn retire(&self, _handle: ObjectHandle) {
+            self.retired.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn check_quota_waits_for_deferred_retirement(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let readiness = Arc::new(BlockingReadinessSink {
+            started: StdMutex::new(Some(started_tx)),
+            release: StdMutex::new(release_rx),
+            retired: AtomicUsize::new(0),
+        });
+        let handle = create(&session, create_request(), readiness.clone()).unwrap();
+        let registration = provider
+            .state
+            .live_readiness
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        let publisher = std::thread::spawn(move || registration.publish(ReadinessFlags::READ));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        session.close_object_reference(handle).unwrap();
+        assert_eq!(readiness.retired.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+        assert_eq!(session.reserved_sockets.load(Ordering::Relaxed), 1);
+
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap().unwrap();
+        assert_eq!(readiness.retired.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+        assert_eq!(session.reserved_sockets.load(Ordering::Relaxed), 0);
+        *provider.state.live_readiness.lock().unwrap() = None;
     }
 
     fn check_connect_error_is_terminal(broker: &BrokerCore, provider: &TestSocketProvider) {
