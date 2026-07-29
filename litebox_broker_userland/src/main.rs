@@ -15,8 +15,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-#[cfg(test)]
-use litebox_broker_core::socket::UnsupportedSocketProvider;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine, SocketPolicy};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
@@ -454,6 +452,7 @@ fn accept_runner_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_broker_core::socket::UnsupportedSocketProvider;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::message::BrokerHandshakeResponse;
     use litebox_broker_transport::channel::{HostSetupChannel, LocalSetupChannel};
