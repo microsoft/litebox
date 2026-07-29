@@ -409,6 +409,7 @@ struct SocketEntry {
     socket: OwnedFd,
     readiness: ReadinessRegistration,
     snapshot: Arc<Mutex<SocketSnapshot>>,
+    read_shutdown: bool,
     write_shutdown: bool,
 }
 
@@ -464,18 +465,24 @@ impl Reactor {
                 Err(error) => return Err(ReactorFailure::Io(error)),
             }
 
+            // Apply readiness observed by this wait before commands. A command
+            // that then reaches EAGAIN records the newer authoritative state.
+            let mut wake = false;
             for event in events.drain(..) {
                 let id = event.data.u64();
                 if id == WAKE_TOKEN {
-                    self.drain_wake()?;
-                    if self.process_commands() {
-                        return Ok(());
-                    }
+                    wake = true;
                 } else if let Some(socket) = self.sockets.get_mut(&id) {
                     handle_socket_event(socket, event.flags).map_err(ReactorFailure::Broker)?;
                 }
             }
             self.events = events;
+            if wake {
+                self.drain_wake()?;
+                if self.process_commands() {
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -614,6 +621,7 @@ impl Reactor {
                 socket,
                 readiness,
                 snapshot,
+                read_shutdown: false,
                 write_shutdown: false,
             },
         );
@@ -644,13 +652,19 @@ fn connect_socket(
     socket: &mut SocketEntry,
     address: SocketAddressV4,
 ) -> BrokerResult<SocketConnectionStatus> {
-    epoll::modify(
+    if let Err(error) = epoll::modify(
         epoll_fd,
         &socket.socket,
         epoll::EventData::new_u64(id),
         active_epoll_events(),
-    )
-    .map_err(broker_error_from_errno)?;
+    ) {
+        update_snapshot(
+            socket,
+            Some(SocketConnectionStatus::Failed(SocketError::Other)),
+            ReadinessFlags::ERROR,
+        )?;
+        return Err(broker_error_from_errno(error));
+    }
     let address = SocketAddrV4::new(Ipv4Addr::from(address.address.0), address.port.0);
     let status = loop {
         match connect(&socket.socket, &address) {
@@ -660,7 +674,18 @@ fn connect_socket(
                 break SocketConnectionStatus::Connecting;
             }
             Err(error) => {
-                break SocketConnectionStatus::Failed(socket_error_from_errno(error));
+                let error = match socket_operation_error_from_errno(error) {
+                    Ok(error) => error,
+                    Err(error) => {
+                        update_snapshot(
+                            socket,
+                            Some(SocketConnectionStatus::Failed(SocketError::Other)),
+                            ReadinessFlags::ERROR,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                break SocketConnectionStatus::Failed(error);
             }
         }
     };
@@ -677,6 +702,9 @@ fn connect_socket(
 }
 
 fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutcome<usize>> {
+    if socket.write_shutdown {
+        return Ok(SocketOutcome::Failed(SocketError::Other));
+    }
     loop {
         match send(&socket.socket, data, LinuxSendFlags::NOSIGNAL) {
             Ok(sent) => return Ok(SocketOutcome::Completed(sent)),
@@ -686,8 +714,9 @@ fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutc
                 return Err(BrokerError::WouldBlock);
             }
             Err(error) => {
+                let error = socket_operation_error_from_errno(error)?;
                 set_error_readiness(socket)?;
-                return Ok(SocketOutcome::Failed(socket_error_from_errno(error)));
+                return Ok(SocketOutcome::Failed(error));
             }
         }
     }
@@ -706,7 +735,12 @@ fn receive_socket(
     loop {
         match recv(&socket.socket, data.as_mut_slice(), flags) {
             Ok((_buffer, 0)) => {
-                add_readiness(socket, ReadinessFlags::READ | ReadinessFlags::HANGUP)?;
+                let readiness = if socket.read_shutdown {
+                    ReadinessFlags::READ
+                } else {
+                    ReadinessFlags::READ | ReadinessFlags::HANGUP
+                };
+                add_readiness(socket, readiness)?;
                 return Ok(ReactorReceiveOutcome::EndOfStream);
             }
             Ok((_buffer, received)) => {
@@ -719,10 +753,9 @@ fn receive_socket(
                 return Err(BrokerError::WouldBlock);
             }
             Err(error) => {
+                let error = socket_operation_error_from_errno(error)?;
                 set_error_readiness(socket)?;
-                return Ok(ReactorReceiveOutcome::Failed(socket_error_from_errno(
-                    error,
-                )));
+                return Ok(ReactorReceiveOutcome::Failed(error));
             }
         }
     }
@@ -732,17 +765,19 @@ fn shutdown_socket(
     socket: &mut SocketEntry,
     mode: ShutdownMode,
 ) -> BrokerResult<SocketOutcome<()>> {
-    let (mode, add, clear, shuts_down_write) = match mode {
+    let (mode, add, clear, shuts_down_read, shuts_down_write) = match mode {
         ShutdownMode::Read => (
             LinuxShutdown::Read,
             ReadinessFlags::READ,
             ReadinessFlags::default(),
+            true,
             false,
         ),
         ShutdownMode::Write => (
             LinuxShutdown::Write,
             ReadinessFlags::default(),
             ReadinessFlags::WRITE,
+            false,
             true,
         ),
         ShutdownMode::Both => (
@@ -750,12 +785,14 @@ fn shutdown_socket(
             ReadinessFlags::READ,
             ReadinessFlags::WRITE,
             true,
+            true,
         ),
         _ => return Err(BrokerError::UnsupportedOperation),
     };
     loop {
         match shutdown(&socket.socket, mode) {
             Ok(()) => {
+                socket.read_shutdown |= shuts_down_read;
                 socket.write_shutdown |= shuts_down_write;
                 if clear.0 != 0 {
                     clear_readiness(socket, clear)?;
@@ -766,9 +803,16 @@ fn shutdown_socket(
                 return Ok(SocketOutcome::Completed(()));
             }
             Err(Errno::INTR) => {}
+            Err(Errno::NOTCONN) => {
+                return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+            }
+            Err(Errno::INVAL) => {
+                return Ok(SocketOutcome::Failed(SocketError::Other));
+            }
             Err(error) => {
+                let error = socket_operation_error_from_errno(error)?;
                 set_error_readiness(socket)?;
-                return Ok(SocketOutcome::Failed(socket_error_from_errno(error)));
+                return Ok(SocketOutcome::Failed(error));
             }
         }
     }
@@ -792,13 +836,15 @@ fn handle_socket_event(socket: &mut SocketEntry, events: epoll::EventFlags) -> B
 }
 
 fn complete_connect(socket: &mut SocketEntry, events: epoll::EventFlags) -> BrokerResult<()> {
-    let status = match sockopt::socket_error(&socket.socket).map_err(broker_error_from_errno)? {
-        Ok(()) => match getpeername(&socket.socket) {
+    let status = match sockopt::socket_error(&socket.socket) {
+        Ok(Ok(())) => match getpeername(&socket.socket) {
             Ok(Some(_)) => SocketConnectionStatus::Connected,
             Ok(None) | Err(Errno::NOTCONN) => SocketConnectionStatus::Connecting,
-            Err(error) => return Err(broker_error_from_errno(error)),
+            Err(error) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
         },
-        Err(error) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
+        Ok(Err(error)) | Err(error) => {
+            SocketConnectionStatus::Failed(socket_error_from_errno(error))
+        }
     };
     let readiness = match status {
         SocketConnectionStatus::Connected => {
@@ -819,7 +865,8 @@ fn readiness_from_epoll(socket: &SocketEntry, events: epoll::EventFlags) -> Read
     if events.contains(epoll::EventFlags::OUT) && !socket.write_shutdown {
         readiness = readiness | ReadinessFlags::WRITE;
     }
-    if events.intersects(epoll::EventFlags::RDHUP | epoll::EventFlags::HUP) {
+    if !socket.read_shutdown && events.intersects(epoll::EventFlags::RDHUP | epoll::EventFlags::HUP)
+    {
         readiness = readiness | ReadinessFlags::READ | ReadinessFlags::HANGUP;
     }
     if events.contains(epoll::EventFlags::ERR) {
@@ -906,13 +953,27 @@ const fn socket_error_from_errno(error: Errno) -> SocketError {
     }
 }
 
+const fn socket_operation_error_from_errno(error: Errno) -> BrokerResult<SocketError> {
+    match broker_resource_error_from_errno(error) {
+        Some(error) => Err(error),
+        None => Ok(socket_error_from_errno(error)),
+    }
+}
+
 const fn broker_error_from_errno(error: Errno) -> BrokerError {
+    match broker_resource_error_from_errno(error) {
+        Some(error) => error,
+        None => BrokerError::Internal,
+    }
+}
+
+const fn broker_resource_error_from_errno(error: Errno) -> Option<BrokerError> {
     match error {
-        Errno::NOMEM => BrokerError::OutOfMemory,
+        Errno::NOMEM => Some(BrokerError::OutOfMemory),
         Errno::MFILE | Errno::NFILE | Errno::NOBUFS | Errno::NOSPC => {
-            BrokerError::ResourceExhausted
+            Some(BrokerError::ResourceExhausted)
         }
-        _ => BrokerError::Internal,
+        _ => None,
     }
 }
 
@@ -957,6 +1018,15 @@ mod tests {
 
     #[test]
     fn reactor_drives_a_loopback_tcp_socket() {
+        assert_eq!(
+            socket_operation_error_from_errno(Errno::NOMEM),
+            Err(BrokerError::OutOfMemory)
+        );
+        assert_eq!(
+            socket_operation_error_from_errno(Errno::NOBUFS),
+            Err(BrokerError::ResourceExhausted)
+        );
+
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (allow_response, response_allowed) = channel();
@@ -972,6 +1042,15 @@ mod tests {
             stream.write_all(b"pong").unwrap();
             end_of_stream_allowed.recv_timeout(TEST_TIMEOUT).unwrap();
             stream.shutdown(Shutdown::Write).unwrap();
+        });
+        let read_shutdown_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let read_shutdown_address = read_shutdown_listener.local_addr().unwrap();
+        let (release_read_shutdown_server, read_shutdown_server_released) = channel();
+        let read_shutdown_server = thread::spawn(move || {
+            let (_stream, _) = read_shutdown_listener.accept().unwrap();
+            read_shutdown_server_released
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap();
         });
 
         let provider = Arc::new(LinuxSocketProvider::new(8).unwrap());
@@ -1024,14 +1103,15 @@ mod tests {
             litebox_broker_core::socket::shutdown(&session, handle, ShutdownMode::Write),
             Ok(SocketOutcome::Completed(()))
         );
+        assert_eq!(
+            litebox_broker_core::socket::send(&session, handle, b"after shutdown", SendFlags::NONE),
+            Ok(SocketOutcome::Failed(SocketError::Other))
+        );
         allow_response.send(()).unwrap();
         wait_for_readiness(&publications, handle, ReadinessFlags::READ);
-        assert!(
-            !session
-                .check_readiness(handle)
-                .unwrap()
-                .contains(ReadinessFlags::WRITE)
-        );
+        let current_readiness = session.check_readiness(handle).unwrap();
+        assert!(!current_readiness.contains(ReadinessFlags::WRITE));
+        assert!(!current_readiness.contains(ReadinessFlags::ERROR));
 
         let mut first = [0_u8; 1];
         assert_eq!(
@@ -1080,6 +1160,57 @@ mod tests {
         allow_end_of_stream.send(()).unwrap();
         wait_for_end_of_stream(&session, handle, &publications);
 
+        let read_shutdown_handle = create_socket(&session, readiness.clone());
+        let read_shutdown_connect = litebox_broker_core::socket::connect(
+            &session,
+            read_shutdown_handle,
+            SocketAddressV4 {
+                address: Ipv4Address([127, 0, 0, 1]),
+                port: Port(read_shutdown_address.port()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_shutdown_connect,
+            SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            )
+        ));
+        wait_until_connected(&session, read_shutdown_handle, &publications);
+        assert_eq!(
+            litebox_broker_core::socket::shutdown(
+                &session,
+                read_shutdown_handle,
+                ShutdownMode::Read,
+            ),
+            Ok(SocketOutcome::Completed(()))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::receive(
+                &session,
+                read_shutdown_handle,
+                &mut unavailable,
+                ReceiveFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+        );
+        let read_shutdown_readiness = session.check_readiness(read_shutdown_handle).unwrap();
+        assert!(read_shutdown_readiness.contains(ReadinessFlags::READ));
+        assert!(!read_shutdown_readiness.contains(ReadinessFlags::HANGUP));
+        assert!(!read_shutdown_readiness.contains(ReadinessFlags::ERROR));
+
+        let unconnected_handle = create_socket(&session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::shutdown(&session, unconnected_handle, ShutdownMode::Both,),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+        assert!(
+            !session
+                .check_readiness(unconnected_handle)
+                .unwrap()
+                .contains(ReadinessFlags::ERROR)
+        );
+
         let refused_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let refused_address = refused_listener.local_addr().unwrap();
         drop(refused_listener);
@@ -1112,11 +1243,25 @@ mod tests {
 
         session.close_object_reference(handle).unwrap();
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
+        session
+            .close_object_reference(read_shutdown_handle)
+            .unwrap();
+        assert_eq!(
+            retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
+            read_shutdown_handle
+        );
+        session.close_object_reference(unconnected_handle).unwrap();
+        assert_eq!(
+            retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
+            unconnected_handle
+        );
         session.close_object_reference(refused_handle).unwrap();
         assert_eq!(
             retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
             refused_handle
         );
+        release_read_shutdown_server.send(()).unwrap();
+        read_shutdown_server.join().unwrap();
         server.join().unwrap();
     }
 
