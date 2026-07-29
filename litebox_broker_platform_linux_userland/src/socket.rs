@@ -32,6 +32,7 @@ use rustix::net::{
 
 use litebox_broker_core::readiness::ReadinessRegistration;
 
+/// Epoll token reserved for the eventfd that wakes the reactor for commands.
 const WAKE_TOKEN: u64 = 0;
 const MAX_QUEUED_SOCKET_COMMANDS: usize = 64;
 const MAX_EPOLL_EVENTS: usize = 64;
