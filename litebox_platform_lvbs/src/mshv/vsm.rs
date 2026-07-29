@@ -287,12 +287,6 @@ pub(crate) struct FrameReservation {
     committed: bool,
 }
 
-impl Default for FrameReservation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl FrameReservation {
     pub(crate) fn new() -> Self {
         Self {
