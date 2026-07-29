@@ -126,11 +126,8 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Describe seek behavior for an open file handle.
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
 
-    /// Status of an open file handle.
-    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError>;
-
-    /// Status of an open directory handle.
-    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError>;
+    /// Status of an open file or directory handle.
+    fn status(&self, h: &Handle) -> Result<FileStatus, FileStatusError>;
 
     /// Create a new file at `parent` with the given `name` and `mode`.
     fn create_file_at(
@@ -194,6 +191,15 @@ pub struct FileHandle {
 #[derive(Clone)]
 pub struct DirHandle {
     raw: Box<dyn AnyCloneSendSync>,
+}
+
+/// An owned handle to an open file or directory.
+#[derive(Clone)]
+pub enum Handle {
+    /// A handle to an open file
+    File(FileHandle),
+    /// A handle to an open directory
+    Dir(DirHandle),
 }
 
 trait ErasedWalkingDirHandle {

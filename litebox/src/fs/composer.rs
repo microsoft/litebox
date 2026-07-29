@@ -10,8 +10,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, PermissionCheck, Permissioned, SeekBehavior,
-    WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    Backend, BackendHandles, DirHandle, FileHandle, Handle, PermissionCheck, Permissioned,
+    SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -668,20 +668,24 @@ impl Backend for Composer {
         self.mounts[h.mount_index].backend.seek_behavior(&h.handle)
     }
 
-    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
-        let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index].backend.file_status(&h.handle)
-    }
-
-    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
-        let h = h.get_typed::<Self>();
-        match &h.inner {
-            ComposerDirHandleInner::Virtual { path } => Ok(self.virtual_dir_status(path)),
-            ComposerDirHandleInner::Mounted {
-                mount_index,
-                handle,
-                ..
-            } => self.mounts[*mount_index].backend.dir_status(handle),
+    fn status(&self, h: &Handle) -> Result<FileStatus, FileStatusError> {
+        match h {
+            Handle::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.mounts[h.mount_index]
+                    .backend
+                    .status(&Handle::File(h.handle.clone()))
+            }
+            Handle::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { path } => Ok(self.virtual_dir_status(path)),
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self.mounts[*mount_index]
+                    .backend
+                    .status(&Handle::Dir(handle.clone())),
+            },
         }
     }
 

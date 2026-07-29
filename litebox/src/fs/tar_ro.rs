@@ -33,7 +33,7 @@ use crate::fs::{DirEntry, FileType};
 
 use super::{
     Mode, NodeInfo, OFlags, UserInfo,
-    backend::{DirHandle, FileHandle, WalkingDirHandle},
+    backend::{DirHandle, FileHandle, Handle, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
         RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -225,34 +225,31 @@ impl super::backend::Backend for TarRo {
         super::backend::SeekBehavior::PositionBased
     }
 
-    fn file_status(
-        &self,
-        h: &FileHandle,
-    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let file = &self.tar_index.files[h.get_typed::<Self>().idx];
-        Ok(super::FileStatus {
-            file_type: FileType::RegularFile,
-            mode: file.mode,
-            size: file.data_range.len(),
-            owner: file.owner,
-            node_info: file.node_info.clone(),
-            blksize: BLOCK_SIZE,
-        })
-    }
-
-    fn dir_status(
-        &self,
-        h: &DirHandle,
-    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
-        Ok(super::FileStatus {
-            file_type: FileType::Directory,
-            mode: DEFAULT_DIR_MODE,
-            size: super::DEFAULT_DIRECTORY_SIZE,
-            owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-            node_info: dir.node_info.clone(),
-            blksize: BLOCK_SIZE,
-        })
+    fn status(&self, h: &Handle) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        match h {
+            Handle::File(h) => {
+                let file = &self.tar_index.files[h.get_typed::<Self>().idx];
+                Ok(super::FileStatus {
+                    file_type: FileType::RegularFile,
+                    mode: file.mode,
+                    size: file.data_range.len(),
+                    owner: file.owner,
+                    node_info: file.node_info.clone(),
+                    blksize: BLOCK_SIZE,
+                })
+            }
+            Handle::Dir(h) => {
+                let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
+                Ok(super::FileStatus {
+                    file_type: FileType::Directory,
+                    mode: DEFAULT_DIR_MODE,
+                    size: super::DEFAULT_DIRECTORY_SIZE,
+                    owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
+                    node_info: dir.node_info.clone(),
+                    blksize: BLOCK_SIZE,
+                })
+            }
+        }
     }
 
     fn create_file_at(

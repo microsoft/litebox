@@ -19,7 +19,7 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        DirHandle, FileHandle, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
+        DirHandle, FileHandle, Handle, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
         WalkStopReason, WalkingDirHandle,
     },
 };
@@ -511,7 +511,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased if entry.entry.append_mode && offset.is_none() => {
                 self.backend
-                    .file_status(file)
+                    .status(&Handle::File(file.clone()))
                     .map_err(|_| WriteError::Io)?
                     .size
             }
@@ -551,7 +551,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             SeekBehavior::PositionBased => {
                 let file_len = self
                     .backend
-                    .file_status(file)
+                    .status(&Handle::File(file.clone()))
                     .map_err(|_| SeekError::Io)?
                     .size;
                 let base = match whence {
@@ -763,8 +763,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .ok_or(FileStatusError::ClosedFd)?;
         let entry = entry.get_entry();
         match &entry.entry.handle {
-            OwnedHandle::File(file) => self.backend.file_status(file),
-            OwnedHandle::Dir(dir) => self.backend.dir_status(dir),
+            OwnedHandle::File(file) => self.backend.status(&Handle::File(file.clone())),
+            OwnedHandle::Dir(dir) => self.backend.status(&Handle::Dir(dir.clone())),
         }
     }
 
