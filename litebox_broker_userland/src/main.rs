@@ -15,9 +15,11 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+#[cfg(test)]
 use litebox_broker_core::socket::UnsupportedSocketProvider;
-use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine, SocketPolicy};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
+use litebox_broker_platform_linux_userland::LinuxSocketProvider;
 use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_transport::channel::HostReceive;
@@ -54,9 +56,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let control_socket_path = socket_dir.path().join("broker.sock");
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
-    let broker = BrokerCore::new(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
-        Arc::new(UnsupportedSocketProvider),
+    let limits = BrokerCoreLimits::DEFAULT;
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
+        limits,
+        Arc::new(LinuxSocketProvider::new(limits.max_sockets)?),
     )?;
 
     let mut runner_command = Command::new(&args.runner);
