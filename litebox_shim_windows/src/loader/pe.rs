@@ -926,6 +926,10 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-core-localization-l1-2-4", "kernelbase.dll"),
     ("api-ms-win-core-localization-l2-1-0", "kernelbase.dll"),
     (
+        "api-ms-win-core-localization-obsolete-l1-2-0",
+        "kernelbase.dll",
+    ),
+    (
         "api-ms-win-core-localization-private-l1-1-0",
         "kernelbase.dll",
     ),
@@ -992,6 +996,7 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ),
     ("api-ms-win-core-timezone-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-util-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-version-l1-1-1", "kernelbase.dll"),
     (
         "api-ms-win-core-windowserrorreporting-l1-1-0",
         "kernelbase.dll",
