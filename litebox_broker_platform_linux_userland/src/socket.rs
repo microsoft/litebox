@@ -98,6 +98,10 @@ impl SocketProvider for LinuxSocketProvider {
     fn close_session(&self, _session_id: SessionId) {}
 }
 
+/// Broker-core-facing handle for a reactor-owned socket.
+///
+/// It submits operations by socket ID and reads cached state, but never owns or
+/// accesses the host socket descriptor.
 struct LinuxSocket {
     id: u64,
     reactor: Arc<ReactorClient>,
@@ -191,6 +195,7 @@ impl Drop for LinuxSocket {
     }
 }
 
+/// Thread-safe command, wake, and lifecycle handle for the socket reactor.
 struct ReactorClient {
     commands: SyncSender<Command>,
     wake: Arc<OwnedFd>,
@@ -334,6 +339,7 @@ impl Drop for ReactorClient {
     }
 }
 
+/// Bounded operations submitted to the thread that exclusively owns socket descriptors.
 enum Command {
     Create {
         id: u64,
@@ -373,12 +379,14 @@ enum Command {
     },
 }
 
+/// Owned receive result returned across the reactor thread boundary.
 enum ReactorReceiveOutcome {
     Received(Vec<u8>),
     EndOfStream,
     Failed(SocketError),
 }
 
+/// State owned and accessed exclusively by the socket reactor thread.
 struct Reactor {
     epoll: OwnedFd,
     wake: Arc<OwnedFd>,
@@ -388,6 +396,7 @@ struct Reactor {
     events: Vec<epoll::Event>,
 }
 
+/// Reactor-owned descriptor and its broker-facing readiness state.
 struct SocketEntry {
     socket: OwnedFd,
     readiness: ReadinessRegistration,
@@ -395,6 +404,11 @@ struct SocketEntry {
     write_shutdown: bool,
 }
 
+/// Cached connection and readiness state shared with the broker-facing handle.
+///
+/// The reactor updates this snapshot whenever kernel state changes, allowing
+/// status and readiness queries without transferring descriptor authority or
+/// submitting another reactor command.
 #[derive(Clone, Copy)]
 struct SocketSnapshot {
     status: SocketConnectionStatus,
@@ -410,6 +424,7 @@ impl Default for SocketSnapshot {
     }
 }
 
+/// Fatal failure that terminates the socket reactor.
 #[derive(Debug)]
 enum ReactorFailure {
     Io(Errno),
