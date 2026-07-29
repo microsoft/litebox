@@ -401,6 +401,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
     },
+    NtOpenKeyEx {
+        key_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        open_options: u32,
+    },
     NtQueryValueKey {
         key_handle: Handle,
         value_name: Platform::RawConstPointer<nt_types::UnicodeString>,
@@ -983,6 +989,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 key_handle:*,
                 desired_access,
                 object_attributes:*,
+            })),
+            NtSysno::NtOpenKeyEx => Some(sys_req!(NtOpenKeyEx {
+                key_handle:*,
+                desired_access,
+                object_attributes:*,
+                open_options,
             })),
             NtSysno::NtQueryValueKey => Some(sys_req!(NtQueryValueKey {
                 key_handle:{Handle::from_raw},

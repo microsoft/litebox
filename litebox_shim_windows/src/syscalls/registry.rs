@@ -139,6 +139,15 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RegistryOpenOptions: u32 {
+        const BACKUP_RESTORE = 0x0000_0004;
+        const OPEN_LINK = 0x0000_0008;
+        const DONT_VIRTUALIZE = 0x0000_0010;
+    }
+}
+
 impl RegistryKeyAccess {
     fn from_desired_access(desired_access: u32) -> Self {
         Self::from_bits_retain(AccessMask::expand_generic_access(
@@ -406,6 +415,28 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         desired_access: u32,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
     ) -> NtStatus {
+        self.sys_nt_open_key_ex(key_handle, desired_access, object_attributes, 0)
+    }
+
+    pub(crate) fn sys_nt_open_key_ex(
+        &self,
+        key_handle: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        open_options: u32,
+    ) -> NtStatus {
+        let Some(open_options) = RegistryOpenOptions::from_bits(open_options) else {
+            return NtStatus::INVALID_PARAMETER_4;
+        };
+        // TODO(registry-symlink): Honor OPEN_LINK once registry symbolic links are modeled.
+        // TODO(registry-backup): Apply backup/restore privileges once the security model exists.
+        // TODO(registry-virtualization): Honor DONT_VIRTUALIZE once registry virtualization exists.
+        if !open_options.is_empty() {
+            litebox_util_log::debug!(
+                open_options:? = open_options;
+                "NtOpenKeyEx options have no effect in the current registry model"
+            );
+        }
         let Some(object_attributes) = object_attributes else {
             return NtStatus::INVALID_PARAMETER;
         };
@@ -914,6 +945,19 @@ mod tests {
         fn RegDeleteTreeW(hKey: *mut core::ffi::c_void, lpSubKey: *const u16) -> i32;
     }
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[allow(non_snake_case)]
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtOpenKeyEx(
+            key_handle: *mut Handle,
+            desired_access: u32,
+            object_attributes: *const ObjectAttributes,
+            open_options: u32,
+        ) -> i32;
+        fn NtClose(handle: *mut core::ffi::c_void) -> i32;
+    }
+
     fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
         let litebox = LiteBox::new(test_platform());
         let registry = RegistryStore::new(&litebox);
@@ -925,6 +969,21 @@ mod tests {
         object_attributes: ObjectAttributes,
     ) -> Result<Handle, NtStatus> {
         task.do_nt_open_key(RegistryKeyAccess::READ.bits(), object_attributes)
+    }
+
+    fn open_key_ex(
+        task: &Task<TestPlatform, TestFS>,
+        object_attributes: &ObjectAttributes,
+        open_options: u32,
+    ) -> (NtStatus, Handle) {
+        let mut handle = Handle::default();
+        let status = task.sys_nt_open_key_ex(
+            mut_ptr(&mut handle),
+            RegistryKeyAccess::READ.bits(),
+            Some(const_ptr(object_attributes)),
+            open_options,
+        );
+        (status, handle)
     }
 
     fn open_code_page_key(task: &Task<TestPlatform, TestFS>) -> Handle {
@@ -1172,6 +1231,85 @@ mod tests {
             open_key(&task, object_attributes).unwrap_err(),
             NtStatus::OBJECT_NAME_NOT_FOUND
         );
+    }
+
+    #[test]
+    fn nt_open_key_ex_opens_existing_key_with_supported_options() {
+        let task = crate::tests::test_task();
+
+        for open_options in [RegistryOpenOptions::empty(), RegistryOpenOptions::OPEN_LINK] {
+            let name = utf16(DEFAULT_CODE_PAGE_KEY);
+            let name = unicode_string(&name);
+            let object_attributes = object_attributes(&name, 0);
+            let (status, handle) = open_key_ex(&task, &object_attributes, open_options.bits());
+
+            assert_eq!(status, NtStatus::SUCCESS, "{open_options:?}");
+            assert_ne!(handle, Handle::default(), "{open_options:?}");
+            task.close_registry_key_handle(handle);
+        }
+    }
+
+    #[test]
+    fn nt_open_key_ex_reports_missing_key_and_invalid_options() {
+        let task = crate::tests::test_task();
+        let name = utf16("\\Registry\\Machine\\Software\\Missing");
+        let name = unicode_string(&name);
+        let missing_attributes = object_attributes(&name, 0);
+        assert_eq!(
+            open_key_ex(&task, &missing_attributes, 0).0,
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+
+        let name = utf16(DEFAULT_CODE_PAGE_KEY);
+        let name = unicode_string(&name);
+        let existing_attributes = object_attributes(&name, 0);
+        assert_eq!(
+            open_key_ex(&task, &existing_attributes, 0x8000_0000).0,
+            NtStatus::INVALID_PARAMETER_4
+        );
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn nt_open_key_ex_options_match_host() {
+        let task = crate::tests::test_task();
+
+        for open_options in [
+            0,
+            RegistryOpenOptions::OPEN_LINK.bits(),
+            RegistryOpenOptions::DONT_VIRTUALIZE.bits(),
+            0x8000_0000,
+        ] {
+            let name = utf16(DEFAULT_CODE_PAGE_KEY);
+            let name = unicode_string(&name);
+            let object_attributes = object_attributes(&name, 0);
+            let (shim_status, shim_handle) = open_key_ex(&task, &object_attributes, open_options);
+            if shim_status == NtStatus::SUCCESS {
+                task.close_registry_key_handle(shim_handle);
+            }
+
+            let mut host_handle = Handle::default();
+            // SAFETY: All pointers reference live ABI-compatible objects for the duration
+            // of the call, and a successful handle is closed below.
+            let host_status = unsafe {
+                NtOpenKeyEx(
+                    &raw mut host_handle,
+                    RegistryKeyAccess::READ.bits(),
+                    &raw const object_attributes,
+                    open_options,
+                )
+            };
+            let host_status = NtStatus::from_raw(u32::from_ne_bytes(host_status.to_ne_bytes()));
+            if host_status == NtStatus::SUCCESS {
+                // SAFETY: `host_handle` was returned successfully by `NtOpenKeyEx`.
+                assert_eq!(
+                    unsafe { NtClose(host_handle.as_raw() as *mut core::ffi::c_void) },
+                    0
+                );
+            }
+
+            assert_eq!(shim_status, host_status, "{open_options:#x}");
+        }
     }
 
     #[test]
