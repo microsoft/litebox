@@ -600,14 +600,14 @@ impl Reactor {
             LinuxSocketFlags::CLOEXEC | LinuxSocketFlags::NONBLOCK,
             Some(ipproto::TCP),
         )
-        .map_err(create_socket_error)?;
+        .map_err(broker_error_from_errno)?;
         epoll::add(
             &self.epoll,
             &socket,
             epoll::EventData::new_u64(id),
             idle_epoll_events(),
         )
-        .map_err(create_socket_error)?;
+        .map_err(broker_error_from_errno)?;
         self.sockets.insert(
             id,
             SocketEntry {
@@ -650,7 +650,7 @@ fn connect_socket(
         epoll::EventData::new_u64(id),
         active_epoll_events(),
     )
-    .map_err(create_socket_error)?;
+    .map_err(broker_error_from_errno)?;
     let address = SocketAddrV4::new(Ipv4Addr::from(address.address.0), address.port.0);
     let status = loop {
         match connect(&socket.socket, &address) {
@@ -792,11 +792,11 @@ fn handle_socket_event(socket: &mut SocketEntry, events: epoll::EventFlags) -> B
 }
 
 fn complete_connect(socket: &mut SocketEntry, events: epoll::EventFlags) -> BrokerResult<()> {
-    let status = match sockopt::socket_error(&socket.socket).map_err(create_socket_error)? {
+    let status = match sockopt::socket_error(&socket.socket).map_err(broker_error_from_errno)? {
         Ok(()) => match getpeername(&socket.socket) {
             Ok(Some(_)) => SocketConnectionStatus::Connected,
             Ok(None) | Err(Errno::NOTCONN) => SocketConnectionStatus::Connecting,
-            Err(error) => return Err(create_socket_error(error)),
+            Err(error) => return Err(broker_error_from_errno(error)),
         },
         Err(error) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
     };
@@ -906,7 +906,7 @@ const fn socket_error_from_errno(error: Errno) -> SocketError {
     }
 }
 
-const fn create_socket_error(error: Errno) -> BrokerError {
+const fn broker_error_from_errno(error: Errno) -> BrokerError {
     match error {
         Errno::NOMEM => BrokerError::OutOfMemory,
         Errno::MFILE | Errno::NFILE | Errno::NOBUFS | Errno::NOSPC => {
