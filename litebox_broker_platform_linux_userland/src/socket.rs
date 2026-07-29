@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-owned Linux TCP sockets driven by one epoll reactor.
+//! Broker-owned Linux sockets driven by one epoll reactor.
 
 use std::collections::HashMap;
 use std::fmt;
