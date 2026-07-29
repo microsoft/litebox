@@ -774,6 +774,53 @@ impl Backend for Composer {
         }
     }
 
+    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
+        match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.mounts[h.mount_index]
+                    .backend
+                    .chmod(HandleRef::File(&h.handle), mode)
+            }
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self.mounts[*mount_index]
+                    .backend
+                    .chmod(HandleRef::Dir(handle), mode),
+            },
+        }
+    }
+
+    fn chown(
+        &self,
+        h: HandleRef<'_>,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.mounts[h.mount_index]
+                    .backend
+                    .chown(HandleRef::File(&h.handle), user, group)
+            }
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { .. } => Err(ChownError::ReadOnlyFileSystem),
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self.mounts[*mount_index]
+                    .backend
+                    .chown(HandleRef::Dir(handle), user, group),
+            },
+        }
+    }
+
     fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {

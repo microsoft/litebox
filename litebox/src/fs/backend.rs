@@ -150,6 +150,17 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Update the permissions for the file/dir `name` at `parent`.
     fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError>;
 
+    /// Update the permissions for the file/dir `h` refers to.
+    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError>;
+
+    /// Update the owner/group for the file/dir `h` refers to.
+    fn chown(
+        &self,
+        h: HandleRef<'_>,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError>;
+
     /// Update the owner/group for the file/dir `name` at `parent`.
     fn chown_at(
         &self,

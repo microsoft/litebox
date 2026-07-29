@@ -295,6 +295,19 @@ impl super::backend::Backend for TarRo {
         }
     }
 
+    fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown(
+        &self,
+        _h: HandleRef<'_>,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
     fn chown_at(
         &self,
         dir: DirHandle,
