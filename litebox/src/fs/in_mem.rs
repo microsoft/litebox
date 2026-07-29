@@ -8,15 +8,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use crate::LiteBox;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
+    ReadError, RmdirError, TruncateError, UnlinkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
 ///
@@ -661,249 +660,6 @@ fn assert_supported_oflags(flags: super::OFlags) {
 // TODO(jayb): Determine appropriate block size
 const BLOCK_SIZE: usize = 0;
 
-/// A backing implementation for [`FileSystem`](super::FileSystem) storing all files in-memory.
-///
-/// # Warning
-///
-/// This has no physical backing store, thus any files in memory are erased as soon as this object
-/// is dropped.
-pub struct FileSystem<Platform: sync::RawSyncPrimitivesProvider> {
-    litebox: LiteBox<Platform>,
-    resolver: super::resolver::Resolver<Platform, InMem<Platform>>,
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
-    /// Construct a new `FileSystem` instance
-    ///
-    /// This function is expected to only be invoked once per platform, as an initialiation step,
-    /// and the created `FileSystem` handle is expected to be shared across all usage over the
-    /// system.
-    #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        Self {
-            litebox: litebox.clone(),
-            resolver: super::resolver::Resolver::new(
-                litebox,
-                InMem::new(InodeAllocator::standalone()),
-            ),
-        }
-    }
-
-    /// Execute `f` with superuser/root privileges.
-    ///
-    /// This function primarily exists to initialize files. Most regular interaction with the file
-    /// system should be done without this function.
-    pub fn with_root_privileges<F>(&mut self, f: F)
-    where
-        F: FnOnce(&mut Self),
-    {
-        let original_user = self.resolver.swap_acting_user(UserInfo::ROOT);
-        self.resolver.backend_mut().current_user = UserInfo::ROOT;
-        f(self);
-        let root_again = self.resolver.swap_acting_user(original_user);
-        self.resolver.backend_mut().current_user = original_user;
-        if root_again.user != UserInfo::ROOT.user || root_again.group != UserInfo::ROOT.group {
-            unreachable!()
-        }
-    }
-
-    /// Initialize a primarily read-heavy file with static data.
-    ///
-    /// While this function could technically work with write-heavy files, it has performance
-    /// benefits _particularly_ for files that are read-only, compared to doing open+write
-    /// operations.
-    ///
-    /// The file is initialized with clone-on-write semantics for the data, meaning that the first
-    /// time a write occurs on the file, it suffers the penalty of the entire data being cloned into
-    /// memory, which is why this is intended primarily for read-only files (such as executables).
-    ///
-    /// # Panics
-    ///
-    /// Panics if used on
-    /// - a closed FD
-    /// - a non-file FD
-    /// - a file that already contains data
-    pub fn initialize_primarily_read_heavy_file(
-        &self,
-        fd: &FileFd<Platform>,
-        data: alloc::borrow::Cow<'static, [u8]>,
-    ) {
-        let handle = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .expect("must only be used on open files")
-            .with_entry(|descriptor| self.resolver.file_handle(&descriptor.entry.fd))
-            .expect("must only be used on files, not directories");
-        self.resolver
-            .backend()
-            .initialize_primarily_read_heavy_file(&handle, data);
-    }
-
-    /// Execute `f` as a specific user (for testing purposes).
-    #[cfg(test)]
-    pub fn with_user<F>(&mut self, user: u16, group: u16, f: F)
-    where
-        F: FnOnce(&mut Self),
-    {
-        let test_user = UserInfo { user, group };
-        let original_user = self.resolver.swap_acting_user(test_user);
-        self.resolver.backend_mut().current_user = test_user;
-        f(self);
-        let test_user_again = self.resolver.swap_acting_user(original_user);
-        self.resolver.backend_mut().current_user = original_user;
-        if test_user_again.user != test_user.user || test_user_again.group != test_user.group {
-            unreachable!()
-        }
-    }
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
-
-impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
-    fn open(
-        &self,
-        path: impl crate::path::Arg,
-        flags: super::OFlags,
-        mode: super::Mode,
-    ) -> Result<FileFd<Platform>, OpenError> {
-        let fd = super::FileSystem::open(&self.resolver, path, flags, mode)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert(Descriptor { fd }))
-    }
-
-    fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
-        let Some(descriptor) = self.litebox.descriptor_table_mut().remove(fd) else {
-            return Ok(());
-        };
-        super::FileSystem::close(&self.resolver, &descriptor.entry.fd)
-    }
-
-    fn read(
-        &self,
-        fd: &FileFd<Platform>,
-        buf: &mut [u8],
-        offset: Option<usize>,
-    ) -> Result<usize, ReadError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(ReadError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::read(&self.resolver, &descriptor.entry.fd, buf, offset)
-        })
-    }
-
-    fn write(
-        &self,
-        fd: &FileFd<Platform>,
-        buf: &[u8],
-        offset: Option<usize>,
-    ) -> Result<usize, WriteError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(WriteError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::write(&self.resolver, &descriptor.entry.fd, buf, offset)
-        })
-    }
-
-    fn seek(
-        &self,
-        fd: &FileFd<Platform>,
-        offset: isize,
-        whence: SeekWhence,
-    ) -> Result<usize, SeekError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(SeekError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::seek(&self.resolver, &descriptor.entry.fd, offset, whence)
-        })
-    }
-
-    fn truncate(
-        &self,
-        fd: &FileFd<Platform>,
-        length: usize,
-        reset_offset: bool,
-    ) -> Result<(), TruncateError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(TruncateError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::truncate(&self.resolver, &descriptor.entry.fd, length, reset_offset)
-        })
-    }
-
-    fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {
-        super::FileSystem::chmod(&self.resolver, path, mode)
-    }
-
-    fn chown(
-        &self,
-        path: impl crate::path::Arg,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        super::FileSystem::chown(&self.resolver, path, user, group)
-    }
-
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
-        super::FileSystem::unlink(&self.resolver, path)
-    }
-
-    fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
-        super::FileSystem::mkdir(&self.resolver, path, mode)
-    }
-
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
-        super::FileSystem::rmdir(&self.resolver, path)
-    }
-
-    fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(ReadDirError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::read_dir(&self.resolver, &descriptor.entry.fd)
-        })
-    }
-
-    fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
-        super::FileSystem::file_status(&self.resolver, path)
-    }
-
-    fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(FileStatusError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::fd_file_status(&self.resolver, &descriptor.entry.fd)
-        })
-    }
-
-    fn get_static_backing_data(&self, fd: &FileFd<Platform>) -> Option<&'static [u8]> {
-        let descriptor = self.litebox.descriptor_table().entry_handle(fd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::get_static_backing_data(&self.resolver, &descriptor.entry.fd)
-        })
-    }
-}
-
 enum Node<Platform: sync::RawSyncPrimitivesProvider> {
     File(FileNode<Platform>),
     Dir(DirNode<Platform>),
@@ -935,19 +691,6 @@ struct FileData {
 struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
-}
-
-// TODO(jayb): migrate away from these as soon as the wrapper is cleaned up
-struct Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
-    fd: super::resolver::ResolverFd<Platform, InMem<Platform>>,
-}
-
-crate::fd::enable_fds_for_subsystem! {
-    @ Platform: { sync::RawSyncPrimitivesProvider };
-    FileSystem<Platform>;
-    @ Platform: { sync::RawSyncPrimitivesProvider };
-    Descriptor<Platform>;
-    -> FileFd<Platform>;
 }
 
 /// Run `f` with the acting user set to root.

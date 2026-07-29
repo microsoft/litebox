@@ -19,8 +19,8 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        DirHandle, FileHandle, Handle, HandleRef, PermissionCheck, PermissionInfo, SeekBehavior,
-        WalkOutcome, WalkStopReason, WalkingDirHandle,
+        DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
+        WalkStopReason, WalkingDirHandle,
     },
 };
 
@@ -54,42 +54,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     /// Set the acting user for all subsequent operations, returning the previous one.
     ///
+    /// Non-test callers set up whatever needs a different user while constructing the backend;
+    /// this exists so that the tests can exercise operations that depend on the acting user.
+    ///
     /// TODO(jayb): transitionary `pub(super)` accessor; this should go away once callers own their
     /// own [`Context`], at which point they can set the acting user directly.
+    #[cfg(test)]
     pub(super) fn swap_acting_user(&mut self, user: UserInfo) -> UserInfo {
         core::mem::replace(&mut self.migration_context.user_info, user)
     }
 
-    /// Direct access to the backend, for the legacy [`super::FileSystem`] wrappers that still
-    /// expose backend-specific initialization APIs.
+    /// Direct access to the backend, so that the tests can reach backend-owned state (namely its
+    /// own copy of the acting user).
     ///
-    /// TODO(jayb): transitionary `pub(super)` accessors; these should go away once all file systems
-    /// have migrated over to the backend-based system.
-    pub(super) fn backend(&self) -> &Backend {
-        &self.backend
-    }
-
-    /// Mutable counterpart to [`Self::backend`], for the legacy wrappers that mutate
-    /// backend-owned state (such as the acting user).
-    ///
-    /// TODO(jayb): transitionary `pub(super)` accessors; these should go away once all file systems
-    /// have migrated over to the backend-based system.
+    /// TODO(jayb): transitionary `pub(super)` accessor; this should go away along with the
+    /// backend's copy of the acting user.
+    #[cfg(test)]
     pub(super) fn backend_mut(&mut self) -> &mut Backend {
         &mut self.backend
-    }
-
-    /// The backend file handle behind `fd`, if `fd` is an open file.
-    ///
-    /// TODO(jayb): transitionary `pub(super)` accessor; this should go away once all file systems
-    /// have migrated over to the backend-based system.
-    pub(super) fn file_handle(&self, fd: &TypedFd<Self>) -> Option<FileHandle> {
-        self.litebox
-            .descriptor_table()
-            .entry_handle(fd)?
-            .with_entry(|entry| match &entry.entry.handle {
-                Handle::File(file) => Some(file.clone()),
-                Handle::Dir(_) => None,
-            })
     }
 }
 
