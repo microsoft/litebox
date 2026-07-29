@@ -19,8 +19,8 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        DirHandle, FileHandle, HandleRef, PermissionCheck, PermissionInfo, SeekBehavior,
-        WalkOutcome, WalkStopReason, WalkingDirHandle,
+        DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
+        WalkStopReason, WalkingDirHandle,
     },
 };
 
@@ -355,7 +355,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 return Err(OpenError::AlreadyExists);
             }
             return Ok(insert(
-                OwnedHandle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
+                Handle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
                 SeekBehavior::NonSeekable,
             ));
         }
@@ -374,7 +374,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(OpenError::AlreadyExists);
                 }
                 Ok(insert(
-                    OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
+                    Handle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
                     SeekBehavior::NonSeekable,
                 ))
             }
@@ -396,7 +396,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(OpenError::AccessNotAllowed);
                 }
                 let seek_behavior = self.backend.seek_behavior(&file.item);
-                Ok(insert(OwnedHandle::File(file.item), seek_behavior))
+                Ok(insert(Handle::File(file.item), seek_behavior))
             }
             Ok(_) => {
                 // `walk_path` validates stop reasons before returning.
@@ -426,7 +426,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 })?;
                 let file = self.backend.create_file_at(parent, name, mode)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(insert(OwnedHandle::File(file), seek_behavior))
+                Ok(insert(Handle::File(file), seek_behavior))
             }
             Err(error) => match error {
                 WalkError::Io => Err(OpenError::Io),
@@ -456,8 +456,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
         let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(ReadError::NotAFile),
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(ReadError::NotAFile),
         };
         let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.read_allowed {
@@ -495,8 +495,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
         let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(WriteError::NotAFile),
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(WriteError::NotAFile),
         };
         let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.write_allowed {
@@ -537,8 +537,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .ok_or(SeekError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
         let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(SeekError::NotAFile),
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(SeekError::NotAFile),
         };
         if entry.entry.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
@@ -586,8 +586,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .ok_or(TruncateError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
         let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(TruncateError::IsDirectory),
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(TruncateError::IsDirectory),
         };
         if !entry.entry.write_allowed {
             return Err(TruncateError::NotForWriting);
@@ -718,8 +718,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             unimplemented!("read_dir on O_PATH fd")
         }
         let dir = match &entry.entry.handle {
-            OwnedHandle::File(_) => return Err(ReadDirError::NotADirectory),
-            OwnedHandle::Dir(dir) => dir,
+            Handle::File(_) => return Err(ReadDirError::NotADirectory),
+            Handle::Dir(dir) => dir,
         };
 
         let mut entries = Vec::new();
@@ -762,26 +762,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(FileStatusError::ClosedFd)?;
         let entry = entry.get_entry();
-        match &entry.entry.handle {
-            OwnedHandle::File(file) => self.backend.status(HandleRef::File(file)),
-            OwnedHandle::Dir(dir) => self.backend.status(HandleRef::Dir(dir)),
-        }
+        self.backend.status(entry.entry.handle.as_ref())
     }
 
     fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
         let entry = self.litebox.descriptor_table().entry_handle(fd)?;
         let entry = entry.get_entry();
         match &entry.entry.handle {
-            OwnedHandle::File(file) => self.backend.get_static_backing_data(file),
-            OwnedHandle::Dir(_) => None,
+            Handle::File(file) => self.backend.get_static_backing_data(file),
+            Handle::Dir(_) => None,
         }
     }
-}
-
-/// A file or a directory handle
-enum OwnedHandle {
-    File(FileHandle),
-    Dir(DirHandle),
 }
 
 #[expect(
@@ -789,7 +780,7 @@ enum OwnedHandle {
     reason = "resolver fd entries carry independent descriptor flags"
 )]
 struct ResolverEntry<Backend: super::backend::Backend> {
-    handle: OwnedHandle,
+    handle: Handle,
     _backend: core::marker::PhantomData<Backend>,
     read_allowed: bool,
     write_allowed: bool,
