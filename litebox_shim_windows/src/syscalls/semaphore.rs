@@ -8,14 +8,13 @@ use core::marker::PhantomData;
 
 use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
+use litebox::platform::RawMutPointer as _;
 use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 
-use crate::nt_types::{
-    AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString, read_object_attributes,
-};
+use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
 use crate::syscalls::Handle;
+use crate::syscalls::object_manager::read_dispatcher_object_attributes;
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
@@ -124,64 +123,6 @@ impl<Platform: crate::ShimPlatform> IOPollable for SemaphoreObject<Platform> {
     }
 }
 
-struct SemaphoreName {
-    original_path: alloc::string::String,
-}
-
-fn read_semaphore_name<Platform: RawPointerProvider>(
-    object_name: usize,
-    object_attributes: &ObjectAttributes,
-) -> Result<Option<SemaphoreName>, NtStatus> {
-    if object_name == 0 {
-        if !object_attributes.root_directory.is_null() {
-            return Err(NtStatus::OBJECT_NAME_INVALID);
-        }
-        return Ok(None);
-    }
-    if !object_attributes.root_directory.is_null() {
-        return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
-    }
-
-    let unicode_string = ConstPtr::<Platform, UnicodeString>::from_usize(object_name)
-        .read_at_offset(0)
-        .ok_or(NtStatus::ACCESS_VIOLATION)?;
-    if unicode_string.length == 0 || !unicode_string.length.is_multiple_of(2) {
-        return Err(NtStatus::OBJECT_NAME_INVALID);
-    }
-    if unicode_string.buffer == 0 {
-        return Err(NtStatus::ACCESS_VIOLATION);
-    }
-    let original_path = unicode_string.read_string::<Platform>()?;
-    if original_path.is_empty() {
-        return Err(NtStatus::OBJECT_NAME_INVALID);
-    }
-    Ok(Some(SemaphoreName { original_path }))
-}
-
-fn read_semaphore_object_attributes<Platform: RawPointerProvider>(
-    object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
-    require_name: bool,
-) -> Result<(Option<ObjectAttributes>, Option<SemaphoreName>), NtStatus> {
-    let Some(object_attributes_ptr) = object_attributes else {
-        if require_name {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        return Ok((None, None));
-    };
-    let object_attributes = read_object_attributes::<Platform>(object_attributes_ptr)?;
-    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-        .contains(ObjectAttributesFlags::OPENLINK)
-    {
-        return Err(NtStatus::INVALID_PARAMETER);
-    }
-    let semaphore_name =
-        read_semaphore_name::<Platform>(object_attributes.object_name, &object_attributes)?;
-    if require_name && semaphore_name.is_none() {
-        return Err(NtStatus::OBJECT_NAME_INVALID);
-    }
-    Ok((Some(object_attributes), semaphore_name))
-}
-
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn insert_semaphore_handle(
         &self,
@@ -219,7 +160,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let (object_attributes, semaphore_name) =
-            match read_semaphore_object_attributes::<Platform>(object_attributes, false) {
+            match read_dispatcher_object_attributes::<Platform>(object_attributes, false) {
                 Ok(value) => value,
                 Err(status) => return status,
             };
@@ -228,7 +169,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(semaphore_name) = semaphore_name {
             let semaphore = Arc::new(SemaphoreObject::new(initial_count, maximum_count));
             return self.process.object_manager.create_semaphore(
-                &semaphore_name.original_path,
+                &semaphore_name,
                 &semaphore,
                 |semaphore| {
                     let Some(object_attributes) = object_attributes else {
@@ -284,7 +225,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
         let semaphore_name =
-            match read_semaphore_object_attributes::<Platform>(object_attributes, true) {
+            match read_dispatcher_object_attributes::<Platform>(object_attributes, true) {
                 Ok((_, Some(semaphore_name))) => semaphore_name,
                 Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
                 Err(status) => return status,
@@ -292,7 +233,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let semaphore = match self
             .process
             .object_manager
-            .resolve_semaphore(&semaphore_name.original_path)
+            .resolve_semaphore(&semaphore_name)
         {
             Ok(semaphore) => semaphore,
             Err(status) => return status,

@@ -875,6 +875,46 @@ fn read_directory_name_string<Platform: RawPointerProvider>(
     Ok(Some(unicode_string.read_string::<Platform>()?))
 }
 
+pub(super) fn read_dispatcher_object_attributes<Platform: RawPointerProvider>(
+    object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+    require_name: bool,
+) -> Result<(Option<ObjectAttributes>, Option<String>), NtStatus> {
+    let Some(object_attributes_ptr) = object_attributes else {
+        if require_name {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        return Ok((None, None));
+    };
+    let object_attributes = read_object_attributes::<Platform>(object_attributes_ptr)?;
+    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+        .contains(ObjectAttributesFlags::OPENLINK)
+    {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    if object_attributes.object_name == 0 {
+        if !object_attributes.root_directory.is_null() {
+            return Err(NtStatus::OBJECT_NAME_INVALID);
+        }
+        if require_name {
+            return Err(NtStatus::OBJECT_NAME_INVALID);
+        }
+        return Ok((Some(object_attributes), None));
+    }
+    if !object_attributes.root_directory.is_null() {
+        return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
+    }
+
+    let Some(original_path) =
+        read_directory_name_string::<Platform>(object_attributes.object_name)?
+    else {
+        return Err(NtStatus::OBJECT_NAME_INVALID);
+    };
+    if original_path.is_empty() {
+        return Err(NtStatus::OBJECT_NAME_INVALID);
+    }
+    Ok((Some(object_attributes), Some(original_path)))
+}
+
 fn utf16_byte_len(value: &str) -> Result<usize, NtStatus> {
     let len = value
         .encode_utf16()
