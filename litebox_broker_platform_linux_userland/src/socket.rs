@@ -37,7 +37,7 @@ const WAKE_TOKEN: u64 = 0;
 const MAX_QUEUED_SOCKET_COMMANDS: usize = 64;
 const MAX_EPOLL_EVENTS: usize = 64;
 
-/// Linux-userland IPv4 TCP provider.
+/// Linux-userland socket provider.
 ///
 /// One reactor thread owns every socket descriptor and all epoll state.
 /// Broker request workers submit bounded commands and wait only for one
@@ -217,7 +217,7 @@ impl ReactorClient {
         let (started, startup) = sync_channel(1);
         let reactor_wake = Arc::clone(&wake);
         let reactor_thread = thread::Builder::new()
-            .name("litebox-broker-tcp-reactor".into())
+            .name("litebox-broker-socket-reactor".into())
             .spawn(move || {
                 let mut events = Vec::new();
                 if events.try_reserve_exact(MAX_EPOLL_EVENTS).is_err() {
@@ -237,7 +237,7 @@ impl ReactorClient {
                 }
                 if let Err(error) = reactor.run() {
                     reactor.fail_all_sockets();
-                    std::eprintln!("broker TCP reactor failed: {error}");
+                    std::eprintln!("broker socket reactor failed: {error}");
                 }
             })?;
         match startup.recv() {
@@ -251,7 +251,7 @@ impl ReactorClient {
             }
             Err(_) => {
                 let _ = reactor_thread.join();
-                return Err(Error::other("TCP reactor failed during startup"));
+                return Err(Error::other("socket reactor failed during startup"));
             }
         }
 
@@ -326,10 +326,10 @@ impl Drop for ReactorClient {
         let thread = self
             .thread
             .lock()
-            .expect("TCP reactor thread mutex poisoned")
+            .expect("socket reactor thread mutex poisoned")
             .take();
         if thread.is_some_and(|thread| thread.join().is_err()) {
-            std::eprintln!("broker TCP reactor panicked");
+            std::eprintln!("broker socket reactor panicked");
         }
     }
 }
