@@ -127,7 +127,7 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
 
     /// Status of an open file or directory handle.
-    fn status(&self, h: &Handle) -> Result<FileStatus, FileStatusError>;
+    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
     /// Create a new file at `parent` with the given `name` and `mode`.
     fn create_file_at(
@@ -200,6 +200,26 @@ pub enum Handle {
     File(FileHandle),
     /// A handle to an open directory
     Dir(DirHandle),
+}
+
+impl Handle {
+    /// Borrow this handle, for passing to the object-addressed [`Backend`] operations.
+    #[must_use]
+    pub fn as_ref(&self) -> HandleRef<'_> {
+        match self {
+            Handle::File(handle) => HandleRef::File(handle),
+            Handle::Dir(handle) => HandleRef::Dir(handle),
+        }
+    }
+}
+
+/// A borrowed handle to an open file or directory.
+#[derive(Clone, Copy)]
+pub enum HandleRef<'a> {
+    /// A handle to an open file
+    File(&'a FileHandle),
+    /// A handle to an open directory
+    Dir(&'a DirHandle),
 }
 
 trait ErasedWalkingDirHandle {

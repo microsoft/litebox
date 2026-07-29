@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, Handle, PermissionCheck, Permissioned,
+    Backend, BackendHandles, DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned,
     SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
@@ -668,15 +668,15 @@ impl Backend for Composer {
         self.mounts[h.mount_index].backend.seek_behavior(&h.handle)
     }
 
-    fn status(&self, h: &Handle) -> Result<FileStatus, FileStatusError> {
+    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
-            Handle::File(h) => {
+            HandleRef::File(h) => {
                 let h = h.get_typed::<Self>();
                 self.mounts[h.mount_index]
                     .backend
-                    .status(&Handle::File(h.handle.clone()))
+                    .status(HandleRef::File(&h.handle))
             }
-            Handle::Dir(h) => match &h.get_typed::<Self>().inner {
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
                 ComposerDirHandleInner::Virtual { path } => Ok(self.virtual_dir_status(path)),
                 ComposerDirHandleInner::Mounted {
                     mount_index,
@@ -684,7 +684,7 @@ impl Backend for Composer {
                     ..
                 } => self.mounts[*mount_index]
                     .backend
-                    .status(&Handle::Dir(handle.clone())),
+                    .status(HandleRef::Dir(handle)),
             },
         }
     }

@@ -33,7 +33,7 @@ use crate::fs::{DirEntry, FileType};
 
 use super::{
     Mode, NodeInfo, OFlags, UserInfo,
-    backend::{DirHandle, FileHandle, Handle, WalkingDirHandle},
+    backend::{DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
         RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -225,9 +225,12 @@ impl super::backend::Backend for TarRo {
         super::backend::SeekBehavior::PositionBased
     }
 
-    fn status(&self, h: &Handle) -> Result<super::FileStatus, super::errors::FileStatusError> {
+    fn status(
+        &self,
+        h: HandleRef<'_>,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         match h {
-            Handle::File(h) => {
+            HandleRef::File(h) => {
                 let file = &self.tar_index.files[h.get_typed::<Self>().idx];
                 Ok(super::FileStatus {
                     file_type: FileType::RegularFile,
@@ -238,7 +241,7 @@ impl super::backend::Backend for TarRo {
                     blksize: BLOCK_SIZE,
                 })
             }
-            Handle::Dir(h) => {
+            HandleRef::Dir(h) => {
                 let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
                 Ok(super::FileStatus {
                     file_type: FileType::Directory,

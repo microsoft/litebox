@@ -13,7 +13,7 @@ use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, Handle, PermissionCheck, Permissioned,
+    Backend, BackendHandles, DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned,
     SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
 use super::errors::{
@@ -338,10 +338,10 @@ where
         }
     }
 
-    fn status(&self, h: &Handle) -> Result<FileStatus, FileStatusError> {
+    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
-            Handle::File(h) => Ok(h.get_typed::<Self>().device.file_status()),
-            Handle::Dir(h) => {
+            HandleRef::File(h) => Ok(h.get_typed::<Self>().device.file_status()),
+            HandleRef::Dir(h) => {
                 let _h = h.get_typed::<Self>();
                 Ok(FileStatus {
                     file_type: FileType::Directory,
