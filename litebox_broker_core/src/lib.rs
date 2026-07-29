@@ -119,12 +119,12 @@ pub struct BrokerCore {
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
-    /// Creates the broker core with a platform socket provider.
+    /// Creates the broker core with a broker-wide platform socket provider.
     pub fn new(policy: PolicyEngine, socket_provider: Arc<dyn SocketProvider>) -> Result<Self> {
         Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT, socket_provider)
     }
 
-    /// Creates the broker core with explicit limits and a platform socket provider.
+    /// Creates the broker core with explicit limits and a socket provider.
     pub fn new_with_limits(
         policy: PolicyEngine,
         limits: BrokerCoreLimits,

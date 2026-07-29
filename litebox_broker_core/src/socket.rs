@@ -27,9 +27,13 @@ pub enum SocketOutcome<T> {
     Failed(SocketError),
 }
 
-/// Deployment-provided factory for platform socket resources.
+/// Broker-wide socket provider supplied by the host platform.
+///
+/// The provider creates per-socket [`PlatformSocket`] resources and owns any
+/// bookkeeping shared across the sockets of a broker session. Operations on an
+/// individual socket belong to [`PlatformSocket`], not this shared provider.
 pub trait SocketProvider: Send + Sync {
-    /// Creates one nonblocking platform socket for an authenticated session.
+    /// Creates one nonblocking socket resource for an authenticated session.
     ///
     /// The returned socket must not retain authority beyond its `Arc` lifetime.
     fn create(
@@ -43,7 +47,11 @@ pub trait SocketProvider: Send + Sync {
     fn close_session(&self, session_id: SessionId);
 }
 
-/// One nonblocking platform socket resource.
+/// One nonblocking socket resource created by [`SocketProvider`].
+///
+/// The broker retains this resource in an `Arc`, allowing an operation already
+/// in flight to finish after its object handle closes. Dropping the final `Arc`
+/// releases the platform socket.
 pub trait PlatformSocket: Send + Sync {
     /// Starts a connection attempt.
     ///
@@ -84,7 +92,7 @@ pub trait PlatformSocket: Send + Sync {
     fn readiness(&self) -> ReadinessFlags;
 }
 
-/// Placeholder provider for deployments that deliberately disable sockets.
+/// Placeholder provider for broker configurations that deliberately disable sockets.
 pub struct UnsupportedSocketProvider;
 
 impl SocketProvider for UnsupportedSocketProvider {

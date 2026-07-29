@@ -167,8 +167,8 @@ where
         return Err(BrokerHostError::SharedBufferLayoutMismatch);
     }
     let limits = core.limits();
-    // Sockets are currently the only provider-backed objects. Add future
-    // provider-object limits here so every live registration fits in the
+    // Sockets are currently the only externally backed objects. Add future
+    // resource limits here so every live registration fits in the
     // association's shared readiness sink.
     let max_live_readiness_registrations = limits
         .max_references
