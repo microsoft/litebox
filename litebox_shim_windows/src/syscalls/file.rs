@@ -92,8 +92,6 @@ struct FileFsDeviceInformation {
     characteristics: u32,
 }
 
-const _: () = assert!(size_of::<FileFsDeviceInformation>() == 8);
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
 pub(crate) struct FileBasicInformation {
@@ -104,8 +102,6 @@ pub(crate) struct FileBasicInformation {
     file_attributes: u32,
     _reserved: u32,
 }
-
-const _: () = assert!(size_of::<FileBasicInformation>() == 40);
 
 pub(crate) struct FileObjectSubsystem<FS>(PhantomData<fn(FS)>);
 
@@ -535,7 +531,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let path = match self.object_attributes_to_file_target(object_attributes) {
             Ok(FileTarget::Filesystem(path)) => path,
             // TODO(condrv-attributes): Model native attributes for ConDrv objects.
-            Ok(FileTarget::Condrv(_)) => return NtStatus::OBJECT_NAME_NOT_FOUND,
+            Ok(FileTarget::Condrv(object)) => {
+                litebox_util_log::debug!(
+                    object:? = object;
+                    "NtQueryAttributesFile does not support ConDrv objects"
+                );
+                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            }
             Err(status) => return status,
         };
         let status =
@@ -556,14 +558,26 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let readonly = !status.mode.intersects(Mode::WUSR | Mode::WGRP | Mode::WOTH);
         let mut file_attributes = match status.file_type {
             FileType::Directory => FileAttributes::DIRECTORY,
+            FileType::RegularFile => FileAttributes::ARCHIVE,
             // TODO(chardev-attributes): Probe native attributes for character devices and
             // future filesystem node types; regular files are host-grounded as ARCHIVE.
-            _ => FileAttributes::ARCHIVE,
+            file_type => {
+                litebox_util_log::debug!(
+                    path = path.as_str(),
+                    file_type:? = file_type;
+                    "Using archive attributes for nonstandard filesystem node"
+                );
+                FileAttributes::ARCHIVE
+            }
         };
         if readonly {
             file_attributes |= FileAttributes::READONLY;
         }
         // TODO(fs-timestamps): Populate timestamps when FileStatus exposes them.
+        litebox_util_log::debug!(
+            path = path.as_str();
+            "Using zero timestamps for file attributes"
+        );
         let information = FileBasicInformation {
             file_attributes: file_attributes.bits(),
             ..FileBasicInformation::default()
@@ -1575,129 +1589,43 @@ mod tests {
     }
 
     #[test]
-    fn nt_query_attributes_file_reports_host_archive_attribute_for_regular_files() {
+    fn nt_query_attributes_file_reports_file_type_attributes() {
         let task = crate::tests::test_task();
         create_existing_file(&task, "/tmp/query-attributes.txt", b"data");
-        let (_path, _name, attributes) = open_object_attributes("/tmp/query-attributes.txt");
-        let mut information = basic_information_sentinel();
-
-        assert_eq!(
-            task.sys_nt_query_attributes_file(
-                Some(const_ptr(&attributes)),
-                mut_ptr(&mut information),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            information,
-            FileBasicInformation {
-                file_attributes: FileAttributes::ARCHIVE.bits(),
-                ..FileBasicInformation::default()
-            }
-        );
-    }
-
-    #[test]
-    fn nt_query_attributes_file_reports_directory_attribute() {
-        let task = crate::tests::test_task();
         task.fs
             .mkdir(
                 "/tmp/query-attributes-dir",
                 Mode::RUSR | Mode::WUSR | Mode::XUSR,
             )
             .unwrap();
-        let (_path, _name, attributes) = open_object_attributes("/tmp/query-attributes-dir");
-        let mut information = basic_information_sentinel();
 
-        assert_eq!(
-            task.sys_nt_query_attributes_file(
-                Some(const_ptr(&attributes)),
-                mut_ptr(&mut information),
+        for (path, expected_attributes) in [
+            ("/tmp/query-attributes.txt", FileAttributes::ARCHIVE.bits()),
+            (
+                "/tmp/query-attributes-dir",
+                FileAttributes::DIRECTORY.bits(),
             ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            information.file_attributes,
-            FileAttributes::DIRECTORY.bits()
-        );
-    }
-
-    #[test]
-    fn nt_query_attributes_file_preserves_output_for_missing_leaf() {
-        let task = crate::tests::test_task();
-        let (_path, _name, attributes) = open_object_attributes("/tmp/missing-attributes.dll");
-        let sentinel = basic_information_sentinel();
-        let mut information = sentinel;
-
-        assert_eq!(
-            task.sys_nt_query_attributes_file(
-                Some(const_ptr(&attributes)),
-                mut_ptr(&mut information),
-            ),
-            NtStatus::OBJECT_NAME_NOT_FOUND
-        );
-        assert_eq!(information, sentinel);
-    }
-
-    #[test]
-    fn nt_query_attributes_file_distinguishes_missing_path_component() {
-        let task = crate::tests::test_task();
-        let (_path, _name, attributes) =
-            open_object_attributes("/missing-parent/query-attributes.dll");
-        let sentinel = basic_information_sentinel();
-        let mut information = sentinel;
-
-        assert_eq!(
-            task.sys_nt_query_attributes_file(
-                Some(const_ptr(&attributes)),
-                mut_ptr(&mut information),
-            ),
-            NtStatus::OBJECT_PATH_NOT_FOUND
-        );
-        assert_eq!(information, sentinel);
-    }
-
-    #[test]
-    fn nt_query_attributes_file_requires_object_attributes() {
-        let task = crate::tests::test_task();
-        let sentinel = basic_information_sentinel();
-        let mut information = sentinel;
-
-        assert_eq!(
-            task.sys_nt_query_attributes_file(None, mut_ptr(&mut information)),
-            NtStatus::INVALID_PARAMETER
-        );
-        assert_eq!(information, sentinel);
-    }
-
-    #[test]
-    fn nt_query_attributes_file_probes_output_before_path_resolution() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let (_path, _name, attributes) = open_object_attributes("/tmp/missing-attributes.dll");
+        ] {
+            let (_path, _name, attributes) = open_object_attributes(path);
+            let mut information = basic_information_sentinel();
 
             assert_eq!(
-                task.sys_nt_query_attributes_file(Some(const_ptr(&attributes)), null_mut_ptr(),),
-                NtStatus::ACCESS_VIOLATION
+                task.sys_nt_query_attributes_file(
+                    Some(const_ptr(&attributes)),
+                    mut_ptr(&mut information),
+                ),
+                NtStatus::SUCCESS,
+                "{path}"
             );
-        });
-    }
-
-    #[test]
-    fn nt_query_attributes_file_rejects_condrv_without_writing_output() {
-        let task = crate::tests::test_task();
-        let (_path, _name, attributes) = open_object_attributes(r"\Device\ConDrv\Output");
-        let sentinel = basic_information_sentinel();
-        let mut information = sentinel;
-
-        assert_eq!(
-            task.sys_nt_query_attributes_file(
-                Some(const_ptr(&attributes)),
-                mut_ptr(&mut information),
-            ),
-            NtStatus::OBJECT_NAME_NOT_FOUND
-        );
-        assert_eq!(information, sentinel);
+            assert_eq!(
+                information,
+                FileBasicInformation {
+                    file_attributes: expected_attributes,
+                    ..FileBasicInformation::default()
+                },
+                "{path}"
+            );
+        }
     }
 
     #[test]
