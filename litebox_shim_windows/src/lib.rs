@@ -1413,6 +1413,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => {
                 self.sys_nt_open_key_ex(key_handle, desired_access, object_attributes, open_options)
             }
+            SyscallRequest::NtQueryKey {
+                key_handle,
+                key_information_class,
+                key_information,
+                length,
+                result_length,
+            } => self.sys_nt_query_key(
+                key_handle,
+                key_information_class,
+                key_information,
+                length,
+                result_length,
+            ),
             SyscallRequest::NtQueryValueKey {
                 key_handle,
                 value_name,

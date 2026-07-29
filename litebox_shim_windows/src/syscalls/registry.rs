@@ -27,6 +27,7 @@
 use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -35,7 +36,7 @@ use int_enum::IntEnum;
 use litebox::LiteBox;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
 use litebox::fs::errors::{
-    FileStatusError, MkdirError, OpenError, PathError, ReadError, WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
 };
 use litebox::fs::{FileSystem as _, FileType, Mode, OFlags};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
@@ -150,13 +151,24 @@ bitflags::bitflags! {
 
 impl RegistryKeyAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        Self::from_bits_retain(AccessMask::expand_generic_access(
-            desired_access,
+        // MAXIMUM_ALLOWED requests every right the (unrestricted) key grants, so
+        // expand it to ALL_ACCESS — mirroring the token/file/handle subsystems.
+        // Without this a MAXIMUM_ALLOWED open (e.g. 7za's) would grant no usable
+        // rights and later NtQueryKey access checks would spuriously fail.
+        let maximum_allowed = desired_access & AccessMask::MAXIMUM_ALLOWED.bits() != 0;
+        let explicit_access = desired_access & !AccessMask::MAXIMUM_ALLOWED.bits();
+        let normalized = AccessMask::expand_generic_access(
+            explicit_access,
             Self::READ.bits(),
             Self::WRITE.bits(),
             Self::EXECUTE.bits(),
             Self::ALL_ACCESS.bits(),
-        ))
+        );
+        Self::from_bits_retain(if maximum_allowed {
+            normalized | Self::ALL_ACCESS.bits()
+        } else {
+            normalized
+        })
     }
 }
 
@@ -210,6 +222,94 @@ enum KeyValueInformationClass {
     Basic = 0,
     Full = 1,
     Partial = 2,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum KeyInformationClass {
+    Basic = 0,
+    Node = 1,
+    Full = 2,
+    Name = 3,
+    Cached = 4,
+    Flags = 5,
+    Virtualization = 6,
+    HandleTags = 7,
+    Trust = 8,
+    Layer = 9,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyBasicInformation {
+    last_write_time: [u8; 8],
+    title_index: u32,
+    name_length: u32,
+    name: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyNodeInformation {
+    last_write_time: [u8; 8],
+    title_index: u32,
+    class_offset: u32,
+    class_length: u32,
+    name_length: u32,
+    name: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyFullInformation {
+    last_write_time: [u8; 8],
+    title_index: u32,
+    class_offset: u32,
+    class_length: u32,
+    sub_keys: u32,
+    max_name_len: u32,
+    max_class_len: u32,
+    values: u32,
+    max_value_name_len: u32,
+    max_value_data_len: u32,
+    class: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyNameInformation {
+    name_length: u32,
+    name: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyCachedInformation {
+    last_write_time: [u8; 8],
+    title_index: u32,
+    sub_keys: u32,
+    max_name_len: u32,
+    values: u32,
+    max_value_name_len: u32,
+    max_value_data_len: u32,
+    name_length: u32,
+    // LARGE_INTEGER gives the Windows structure 8-byte alignment and a 40-byte size.
+    padding: [u8; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyHandleTagsInformation {
+    handle_tags: u32,
+}
+
+#[derive(Default)]
+struct KeySummary {
+    sub_keys: usize,
+    max_name_len: usize,
+    values: usize,
+    max_value_name_len: usize,
+    max_value_data_len: usize,
 }
 
 /// The `KEY_VALUE_BASIC_INFORMATION` structure defines a subset of the full
@@ -369,6 +469,52 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         data.drain(..REGISTRY_VALUE_TYPE_SIZE);
 
         Ok(RegistryValue { value_type, data })
+    }
+
+    fn key_summary(&self, key: &RegistryKeyObject<Platform>) -> Result<KeySummary, NtStatus> {
+        let mut summary = KeySummary::default();
+        for entry in self.fs.read_dir(&key.fd).map_err(map_read_dir_error)? {
+            if entry.file_type == FileType::Directory
+                && entry.name != "."
+                && entry.name != ".."
+                && entry.name != VALUES_DIR_NAME
+            {
+                summary.sub_keys += 1;
+                summary.max_name_len = summary.max_name_len.max(utf16le(&entry.name).len());
+            }
+        }
+
+        let values_path = format!("{}/{}", key.path.trim_end_matches('/'), VALUES_DIR_NAME);
+        let values_fd = self
+            .fs
+            .open(
+                &*values_path,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .map_err(map_open_error)?;
+        let values = self.fs.read_dir(&values_fd).map_err(map_read_dir_error);
+        let _ = self.fs.close(&values_fd);
+        for entry in values? {
+            if entry.file_type != FileType::RegularFile {
+                continue;
+            }
+            summary.values += 1;
+            summary.max_value_name_len = summary.max_value_name_len.max(utf16le(&entry.name).len());
+            let path = format!("{values_path}/{}", entry.name);
+            let size = self
+                .fs
+                .file_status(&*path)
+                .map_err(map_file_status_error)?
+                .size;
+            if size < REGISTRY_VALUE_TYPE_SIZE {
+                return Err(NtStatus::UNSUCCESSFUL);
+            }
+            summary.max_value_data_len = summary
+                .max_value_data_len
+                .max(size - REGISTRY_VALUE_TYPE_SIZE);
+        }
+        Ok(summary)
     }
 }
 
@@ -534,6 +680,230 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    pub(crate) fn sys_nt_query_key(
+        &self,
+        key_handle: Handle,
+        key_information_class: u32,
+        key_information: MutPtr<Platform, u8>,
+        length: u32,
+        result_length: MutPtr<Platform, u32>,
+    ) -> NtStatus {
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", key_handle.as_raw()),
+            key_information_class = key_information_class,
+            length = length;
+            "Handling NtQueryKey syscall"
+        );
+        let Ok(key_information_class) = KeyInformationClass::try_from(key_information_class) else {
+            litebox_util_log::debug!(
+                key_information_class = key_information_class;
+                "Unsupported NtQueryKey class"
+            );
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+        if matches!(
+            key_information_class,
+            KeyInformationClass::Flags
+                | KeyInformationClass::Virtualization
+                | KeyInformationClass::Trust
+                | KeyInformationClass::Layer
+        ) {
+            // TODO(registry-key-info): Model the extended key information classes.
+            return NtStatus::INVALID_INFO_CLASS;
+        }
+
+        match self.do_nt_query_key(
+            key_handle,
+            key_information_class,
+            key_information,
+            length,
+            result_length,
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
+    }
+
+    fn do_nt_query_key(
+        &self,
+        key_handle: Handle,
+        key_information_class: KeyInformationClass,
+        key_information: MutPtr<Platform, u8>,
+        length: u32,
+        result_length: MutPtr<Platform, u32>,
+    ) -> Result<(), NtStatus> {
+        // NtQueryKey requires KEY_QUERY_VALUE for every class we serve; callers
+        // opening with MAXIMUM_ALLOWED are granted it via from_desired_access.
+        // TODO(registry-access): ReactOS exempts KeyNameInformation, requiring
+        // only a single granted-access bit rather than KEY_QUERY_VALUE.
+        let key = self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+            key_handle,
+            RegistryKeyAccess::QUERY_VALUE.bits(),
+        )?;
+        let path = key.with_entry(|key| key.path.clone());
+        let summary = if matches!(
+            key_information_class,
+            KeyInformationClass::Full | KeyInformationClass::Cached
+        ) {
+            key.with_entry(|key| self.global.registry.key_summary(key))?
+        } else {
+            KeySummary::default()
+        };
+        let leaf = path.rsplit('/').next().ok_or(NtStatus::UNSUCCESSFUL)?;
+        let leaf_name = utf16le(leaf);
+
+        match key_information_class {
+            KeyInformationClass::Basic => {
+                let header_len = offset_of!(KeyBasicInformation, name);
+                let required_length = header_len
+                    .checked_add(leaf_name.len())
+                    .ok_or(NtStatus::UNSUCCESSFUL)?;
+                let information = KeyBasicInformation {
+                    // TODO(registry-time): Track registry key last-write timestamps.
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    name_length: leaf_name.len().trunc(),
+                    name: [],
+                };
+                write_key_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    header_len,
+                    required_length,
+                    information.as_bytes(),
+                    &[(header_len, leaf_name.as_slice())],
+                )?;
+            }
+            KeyInformationClass::Node => {
+                let header_len = offset_of!(KeyNodeInformation, name);
+                let required_length = header_len
+                    .checked_add(leaf_name.len())
+                    .ok_or(NtStatus::UNSUCCESSFUL)?;
+                let information = KeyNodeInformation {
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    class_offset: u32::MAX,
+                    class_length: 0,
+                    name_length: leaf_name.len().trunc(),
+                    name: [],
+                };
+                write_key_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    header_len,
+                    required_length,
+                    information.as_bytes(),
+                    &[(header_len, leaf_name.as_slice())],
+                )?;
+            }
+            KeyInformationClass::Full => {
+                let required_length = offset_of!(KeyFullInformation, class);
+                let information = KeyFullInformation {
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    class_offset: u32::MAX,
+                    class_length: 0,
+                    sub_keys: summary.sub_keys.trunc(),
+                    max_name_len: summary.max_name_len.trunc(),
+                    max_class_len: 0,
+                    values: summary.values.trunc(),
+                    max_value_name_len: summary.max_value_name_len.trunc(),
+                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    class: [],
+                };
+                write_key_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    required_length,
+                    required_length,
+                    information.as_bytes(),
+                    &[],
+                )?;
+            }
+            KeyInformationClass::Name => {
+                // TODO(registry-case): Preserve original subkey casing in the registry store.
+                let name = utf16le(&format!(
+                    "\\{}",
+                    path.trim_start_matches('/')
+                        .replace('/', "\\")
+                        .to_ascii_uppercase()
+                ));
+                let header_len = offset_of!(KeyNameInformation, name);
+                let required_length = header_len
+                    .checked_add(name.len())
+                    .ok_or(NtStatus::UNSUCCESSFUL)?;
+                let information = KeyNameInformation {
+                    name_length: name.len().trunc(),
+                    name: [],
+                };
+                write_key_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    header_len,
+                    required_length,
+                    information.as_bytes(),
+                    &[(header_len, name.as_slice())],
+                )?;
+            }
+            KeyInformationClass::Cached => {
+                let required_length = size_of::<KeyCachedInformation>();
+                let information = KeyCachedInformation {
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    sub_keys: summary.sub_keys.trunc(),
+                    max_name_len: summary.max_name_len.trunc(),
+                    values: summary.values.trunc(),
+                    max_value_name_len: summary.max_value_name_len.trunc(),
+                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    name_length: leaf_name.len().trunc(),
+                    padding: [0; 4],
+                };
+                write_key_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    required_length,
+                    required_length,
+                    information.as_bytes(),
+                    &[],
+                )?;
+            }
+            KeyInformationClass::HandleTags => {
+                let required_length = size_of::<KeyHandleTagsInformation>();
+                let information = KeyHandleTagsInformation {
+                    // Non-virtualized keys have no tags.
+                    // TODO(registry-virtualization): Reflect tags once virtualization is modeled.
+                    handle_tags: 0,
+                };
+                write_key_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    required_length,
+                    required_length,
+                    information.as_bytes(),
+                    &[],
+                )?;
+            }
+            KeyInformationClass::Flags
+            | KeyInformationClass::Virtualization
+            | KeyInformationClass::Trust
+            | KeyInformationClass::Layer => return Err(NtStatus::INVALID_INFO_CLASS),
+        }
+
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", key_handle.as_raw()),
+            key_information_class:? = key_information_class,
+            length = length;
+            "Handled NtQueryKey syscall"
+        );
+        Ok(())
+    }
+
     fn do_nt_query_value_key(
         &self,
         key_handle: Handle,
@@ -635,6 +1005,35 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         Ok(())
     }
+}
+
+fn write_key_query_information<Platform: litebox::platform::RawPointerProvider>(
+    result_length: MutPtr<Platform, u32>,
+    key_information: MutPtr<Platform, u8>,
+    buffer_length: u32,
+    header_length: usize,
+    required_length: usize,
+    header: &[u8],
+    trailing_slices: &[(usize, &[u8])],
+) -> Result<(), NtStatus> {
+    result_length
+        .write_at_offset(0, required_length.trunc())
+        .ok_or(NtStatus::ACCESS_VIOLATION)?;
+    if (buffer_length as usize) < header_length {
+        return Err(NtStatus::BUFFER_TOO_SMALL);
+    }
+    key_information
+        .write_slice_at_offset(0, header)
+        .ok_or(NtStatus::ACCESS_VIOLATION)?;
+    if (buffer_length as usize) < required_length {
+        return Err(NtStatus::BUFFER_OVERFLOW);
+    }
+    for &(offset, bytes) in trailing_slices {
+        key_information
+            .write_slice_at_offset(offset.cast_signed(), bytes)
+            .ok_or(NtStatus::ACCESS_VIOLATION)?;
+    }
+    Ok(())
 }
 
 fn write_query_result_length<Platform: litebox::platform::RawPointerProvider>(
@@ -870,6 +1269,13 @@ fn map_read_error(error: ReadError) -> NtStatus {
     match error {
         ReadError::NotForReading => NtStatus::ACCESS_DENIED,
         ReadError::NotAFile => NtStatus::OBJECT_TYPE_MISMATCH,
+        _ => NtStatus::UNSUCCESSFUL,
+    }
+}
+
+fn map_read_dir_error(error: ReadDirError) -> NtStatus {
+    match error {
+        ReadDirError::NotADirectory => NtStatus::NOT_A_DIRECTORY,
         _ => NtStatus::UNSUCCESSFUL,
     }
 }
@@ -1577,5 +1983,217 @@ mod tests {
             NtStatus::BUFFER_OVERFLOW
         );
         assert_eq!(result_length, 22);
+    }
+
+    #[test]
+    fn nt_query_key_reports_basic_name_and_node_information() {
+        let task = crate::tests::test_task();
+        let key_handle = open_code_page_key(&task);
+        let leaf_name = utf16le("codepage");
+        let full_name =
+            utf16le("\\REGISTRY\\MACHINE\\SYSTEM\\CURRENTCONTROLSET\\CONTROL\\NLS\\CODEPAGE");
+
+        for (class, header_len, expected_name) in [
+            (
+                KeyInformationClass::Basic,
+                offset_of!(KeyBasicInformation, name),
+                leaf_name.as_slice(),
+            ),
+            (
+                KeyInformationClass::Node,
+                offset_of!(KeyNodeInformation, name),
+                leaf_name.as_slice(),
+            ),
+            (
+                KeyInformationClass::Name,
+                offset_of!(KeyNameInformation, name),
+                full_name.as_slice(),
+            ),
+        ] {
+            let mut information = [0u8; 160];
+            let mut result_length = 0;
+            assert!(
+                task.do_nt_query_key(
+                    key_handle,
+                    class,
+                    mut_byte_ptr(&mut information),
+                    information.len().trunc(),
+                    mut_ptr(&mut result_length),
+                )
+                .is_ok(),
+                "{class:?}"
+            );
+            assert_eq!(
+                result_length as usize,
+                header_len + expected_name.len(),
+                "{class:?}"
+            );
+            assert_eq!(
+                &information[header_len..result_length as usize],
+                expected_name,
+                "{class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nt_query_key_reports_full_and_cached_information() {
+        let task = crate::tests::test_task();
+        let key_handle = open_code_page_key(&task);
+
+        let mut full_bytes = [0u8; 64];
+        let mut result_length = 0;
+        assert!(
+            task.do_nt_query_key(
+                key_handle,
+                KeyInformationClass::Full,
+                mut_byte_ptr(&mut full_bytes),
+                full_bytes.len().trunc(),
+                mut_ptr(&mut result_length),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            result_length as usize,
+            offset_of!(KeyFullInformation, class)
+        );
+        let full = KeyFullInformation::read_from_prefix(&full_bytes).unwrap().0;
+        assert_eq!(full.sub_keys, 0);
+        assert_eq!(full.max_name_len, 0);
+        assert_eq!(full.values, 3);
+        assert_eq!(full.max_value_name_len, utf16le("oemcp").len().trunc());
+        assert_eq!(full.max_value_data_len, DEFAULT_MACCP_VALUE.len().trunc());
+        assert_eq!(full.class_offset, u32::MAX);
+        assert_eq!(full.class_length, 0);
+
+        let mut cached_bytes = [0u8; size_of::<KeyCachedInformation>()];
+        assert!(
+            task.do_nt_query_key(
+                key_handle,
+                KeyInformationClass::Cached,
+                mut_byte_ptr(&mut cached_bytes),
+                cached_bytes.len().trunc(),
+                mut_ptr(&mut result_length),
+            )
+            .is_ok()
+        );
+        let cached = KeyCachedInformation::read_from_bytes(&cached_bytes).unwrap();
+        assert_eq!(cached.values, full.values);
+        assert_eq!(cached.max_value_name_len, full.max_value_name_len);
+        assert_eq!(cached.max_value_data_len, full.max_value_data_len);
+        assert_eq!(cached.name_length, utf16le("codepage").len().trunc());
+    }
+
+    #[test]
+    fn nt_query_key_distinguishes_short_header_and_short_tail() {
+        let task = crate::tests::test_task();
+        let key_handle = open_code_page_key(&task);
+        let header_len = offset_of!(KeyBasicInformation, name);
+        let required_len = header_len + utf16le("codepage").len();
+        let mut information = [0xa5; 64];
+        let mut result_length = 0;
+
+        assert_eq!(
+            task.do_nt_query_key(
+                key_handle,
+                KeyInformationClass::Basic,
+                mut_byte_ptr(&mut information),
+                0,
+                mut_ptr(&mut result_length),
+            ),
+            Err(NtStatus::BUFFER_TOO_SMALL)
+        );
+        assert_eq!(result_length as usize, required_len);
+        assert_eq!(information, [0xa5; 64]);
+
+        assert_eq!(
+            task.do_nt_query_key(
+                key_handle,
+                KeyInformationClass::Basic,
+                mut_byte_ptr(&mut information),
+                header_len.trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            Err(NtStatus::BUFFER_OVERFLOW)
+        );
+        let header = KeyBasicInformation::read_from_prefix(&information)
+            .unwrap()
+            .0;
+        assert_eq!(header.name_length as usize, utf16le("codepage").len());
+        assert_eq!(information[header_len], 0xa5);
+
+        assert_eq!(
+            task.sys_nt_query_key(
+                key_handle,
+                0xffff,
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::INVALID_INFO_CLASS
+        );
+        assert_eq!(
+            task.do_nt_query_key(
+                Handle::from_raw(0x1234),
+                KeyInformationClass::Basic,
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            Err(NtStatus::INVALID_HANDLE)
+        );
+    }
+
+    #[test]
+    fn nt_query_key_reports_handle_tags_and_required_length() {
+        let task = crate::tests::test_task();
+        let code_page_name = utf16(DEFAULT_CODE_PAGE_KEY);
+        let code_page_name = unicode_string(&code_page_name);
+        let object_attributes = object_attributes(&code_page_name, 0);
+        // MAXIMUM_ALLOWED must expand to the full grantable rights (incl.
+        // KEY_QUERY_VALUE) so the subsequent handle-tag query is authorized;
+        // this is the access pattern 7za uses.
+        let key_handle = task
+            .do_nt_open_key(AccessMask::MAXIMUM_ALLOWED.bits(), object_attributes)
+            .expect("MAXIMUM_ALLOWED open should grant query access");
+        let mut information = [0xa5; size_of::<KeyHandleTagsInformation>()];
+        let mut result_length = 0;
+
+        assert_eq!(
+            task.do_nt_query_key(
+                key_handle,
+                KeyInformationClass::HandleTags,
+                mut_byte_ptr(&mut information),
+                0,
+                mut_ptr(&mut result_length),
+            ),
+            Err(NtStatus::BUFFER_TOO_SMALL)
+        );
+        assert_eq!(
+            result_length as usize,
+            size_of::<KeyHandleTagsInformation>()
+        );
+        assert_eq!(information, [0xa5; size_of::<KeyHandleTagsInformation>()]);
+
+        assert!(
+            task.do_nt_query_key(
+                key_handle,
+                KeyInformationClass::HandleTags,
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            result_length as usize,
+            size_of::<KeyHandleTagsInformation>()
+        );
+        assert_eq!(
+            KeyHandleTagsInformation::read_from_bytes(&information)
+                .unwrap()
+                .handle_tags,
+            0
+        );
     }
 }
