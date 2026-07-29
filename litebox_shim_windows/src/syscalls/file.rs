@@ -1326,7 +1326,7 @@ mod tests {
     use super::*;
     use crate::tests::{
         TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, null_mut_ptr, object_attributes,
-        unicode_string, utf16_units as utf16,
+        run_with_test_platform_pointers, unicode_string, utf16_units as utf16,
     };
     use litebox::fs::FileSystem as _;
 
@@ -1347,11 +1347,6 @@ mod tests {
     const FILE_OPEN: u32 = 2;
     const FILE_CREATE: u32 = 1;
     const FILE_OVERWRITE: u32 = 4;
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = crate::tests::test_platform();
-        <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(f)
-    }
 
     fn open_object_attributes(
         path: &str,

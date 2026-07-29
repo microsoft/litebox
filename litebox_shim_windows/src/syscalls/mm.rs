@@ -1560,18 +1560,12 @@ fn private_page_state_and_protect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{mut_byte_ptr, mut_ptr};
-    use litebox::platform::ThreadProvider;
+    use crate::tests::{mut_byte_ptr, mut_ptr, run_with_test_platform_pointers};
 
     extern crate std;
 
     type TestPlatform = crate::tests::TestPlatform;
     type TestTask = Task<TestPlatform, crate::tests::TestFS>;
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = crate::tests::test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
-    }
 
     fn allocate_committed_rw(task: &TestTask, size: usize) -> (usize, usize) {
         let mut base = 0usize;

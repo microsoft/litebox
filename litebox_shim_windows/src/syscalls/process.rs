@@ -694,17 +694,9 @@ pub(crate) const fn default_process_cookie() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{mut_byte_ptr, mut_ptr, null_mut_ptr};
-    use litebox::platform::ThreadProvider;
+    use crate::tests::{mut_byte_ptr, mut_ptr, null_mut_ptr, run_with_test_platform_pointers};
 
     const RETURN_LENGTH_SENTINEL: u32 = 0xaaaa_aaaa;
-
-    type TestPlatform = crate::tests::TestPlatform;
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = crate::tests::test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
-    }
 
     #[test]
     fn nt_query_information_process_validates_arguments() {

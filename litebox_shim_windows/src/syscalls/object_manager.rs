@@ -1382,7 +1382,6 @@ mod tests {
     use alloc::sync::Arc;
     use core::mem::size_of;
 
-    use litebox::platform::ThreadProvider;
     use litebox::utils::TruncateExt as _;
     use litebox_common_windows::nt_status::NtStatus;
 
@@ -1393,8 +1392,8 @@ mod tests {
         load_time_windows_shared_section,
     };
     use crate::tests::{
-        TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes, test_task,
-        unicode_string, utf16_units,
+        TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes,
+        run_with_test_platform_pointers, test_task, unicode_string, utf16_units,
     };
 
     const DIRECTORY_QUERY: u32 = 0x0000_0001;
@@ -1405,11 +1404,6 @@ mod tests {
     struct ParsedDirectoryInformation {
         name: String,
         type_name: String,
-    }
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = crate::tests::test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
     }
 
     fn read_u16(buffer: &[u8], offset: usize) -> u16 {

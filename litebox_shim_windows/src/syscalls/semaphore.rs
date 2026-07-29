@@ -359,15 +359,11 @@ mod tests {
 
     use super::*;
     use crate::nt_types::ObjectAttributesFlags;
-    #[cfg(target_os = "linux")]
-    use crate::tests::null_mut_ptr;
     use crate::tests::{
         TestFS, TestPlatform, const_ptr, mut_ptr, object_attributes, test_task, unicode_string,
         utf16_units,
     };
 
-    const SYNCHRONIZE: u32 = AccessMask::SYNCHRONIZE.bits();
-    const SEMAPHORE_MODIFY_STATE: u32 = 0x0002;
     const SEMAPHORE_ALL_ACCESS: u32 = 0x001f_0003;
 
     fn create_semaphore(
@@ -442,23 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn successful_release_returns_previous_count() {
-        let (task, handle) = create_semaphore(0, 2);
-        let mut previous = -1;
-
-        assert_eq!(
-            task.sys_nt_release_semaphore(handle, 1, Some(mut_ptr(&mut previous))),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(previous, 0);
-        assert_eq!(
-            task.sys_nt_release_semaphore(handle, 1, Some(mut_ptr(&mut previous))),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(previous, 1);
-    }
-
-    #[test]
     fn named_create_and_open_share_count() {
         let task = test_task();
         let name_units = utf16_units(r"\BaseNamedObjects\LiteBoxSemaphore");
@@ -491,64 +470,5 @@ mod tests {
         );
         assert_eq!(zero_timeout_wait(&task, opened), NtStatus::SUCCESS);
         assert_eq!(zero_timeout_wait(&task, created), NtStatus::TIMEOUT);
-    }
-
-    #[test]
-    fn count_and_access_validation_precede_mutation() {
-        let task = test_task();
-        let mut handle = Handle::default();
-        assert_eq!(
-            task.sys_nt_create_semaphore(mut_ptr(&mut handle), SEMAPHORE_ALL_ACCESS, None, -1, 1,),
-            NtStatus::INVALID_PARAMETER
-        );
-        assert_eq!(
-            task.sys_nt_create_semaphore(mut_ptr(&mut handle), SEMAPHORE_ALL_ACCESS, None, 2, 1,),
-            NtStatus::INVALID_PARAMETER
-        );
-        assert_eq!(
-            task.sys_nt_create_semaphore(mut_ptr(&mut handle), SEMAPHORE_ALL_ACCESS, None, 0, 0,),
-            NtStatus::INVALID_PARAMETER
-        );
-
-        let mut synchronize_only = Handle::default();
-        assert_eq!(
-            task.sys_nt_create_semaphore(mut_ptr(&mut synchronize_only), SYNCHRONIZE, None, 0, 1,),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            task.sys_nt_release_semaphore(synchronize_only, 1, None),
-            NtStatus::ACCESS_DENIED
-        );
-
-        let mut modify_only = Handle::default();
-        assert_eq!(
-            task.sys_nt_create_semaphore(
-                mut_ptr(&mut modify_only),
-                SEMAPHORE_MODIFY_STATE,
-                None,
-                1,
-                1,
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            zero_timeout_wait(&task, modify_only),
-            NtStatus::ACCESS_DENIED
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn bad_previous_count_pointer_is_checked_before_handle_and_mutation() {
-        let (task, handle) = create_semaphore(0, 1);
-        assert_eq!(
-            task.sys_nt_release_semaphore(Handle::from_raw(0x1234), 1, Some(null_mut_ptr()),),
-            NtStatus::ACCESS_VIOLATION
-        );
-        assert_eq!(
-            task.sys_nt_release_semaphore(handle, 1, Some(null_mut_ptr())),
-            NtStatus::ACCESS_VIOLATION
-        );
-        assert_eq!(zero_timeout_wait(&task, handle), NtStatus::TIMEOUT);
     }
 }

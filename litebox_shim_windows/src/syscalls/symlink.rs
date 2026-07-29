@@ -321,25 +321,19 @@ fn read_symbolic_link_target<Platform: RawPointerProvider>(
 mod tests {
     use core::mem::size_of_val;
 
-    use litebox::platform::ThreadProvider;
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
     use crate::nt_types::{ObjectAttributes, ObjectAttributesFlags, UnicodeString};
     use crate::tests::{
-        TestPlatform, const_ptr, mut_ptr, object_attributes, test_task, unicode_string,
-        utf16_units as test_utf16_units,
+        TestPlatform, const_ptr, mut_ptr, object_attributes, run_with_test_platform_pointers,
+        test_task, unicode_string, utf16_units as test_utf16_units,
     };
 
     const SYMBOLIC_LINK_QUERY: u32 = 0x0000_0001;
     const SYMBOLIC_LINK_ALL_ACCESS: u32 = 0x000f_0001;
     const DIRECTORY_QUERY: u32 = 0x0000_0001;
     const DIRECTORY_ALL_ACCESS: u32 = 0x000f_000f;
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = crate::tests::test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
-    }
 
     fn link_target(value: &str) -> (Vec<u16>, UnicodeString) {
         let units = test_utf16_units(value);

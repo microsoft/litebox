@@ -357,13 +357,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     use core::mem::size_of;
 
-    use litebox::platform::ThreadProvider;
     use litebox::utils::TruncateExt as _;
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
     use crate::nt_types::ObjectAttributes;
-    use crate::tests::{TestFS, TestPlatform, mut_ptr, null_mut_ptr, test_platform, test_task};
+    use crate::tests::{
+        TestFS, TestPlatform, mut_ptr, null_mut_ptr, run_with_test_platform_pointers, test_task,
+    };
 
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
     const IO_COMPLETION_QUERY_STATE: u32 = 0x0000_0001;
@@ -372,11 +373,6 @@ mod tests {
     const WORKER_FACTORY_QUERY_INFORMATION: u32 = 0x0008;
     const WORKER_FACTORY_SHUTDOWN: u32 = 0x0020;
     const START_ROUTINE: usize = 0x1234_5678;
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
-    }
 
     fn create_io_completion_handle(task: &Task<TestPlatform, TestFS>) -> Handle {
         create_io_completion_handle_with_access(task, IO_COMPLETION_ALL_ACCESS)

@@ -374,12 +374,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     use core::mem::size_of;
 
-    use litebox::platform::{RawConstPointer as _, ThreadProvider};
+    use litebox::platform::RawConstPointer as _;
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
     use crate::nt_types::ObjectAttributes;
-    use crate::tests::{TestPlatform, const_ptr, mut_ptr, test_platform, test_task};
+    use crate::tests::{
+        TestPlatform, const_ptr, mut_ptr, run_with_test_platform_pointers, test_task,
+    };
 
     const WAIT_COMPLETION_PACKET_SET_STATE: u32 = 0x0000_0001;
     const WAIT_COMPLETION_PACKET_ALL_ACCESS: u32 = 0x000f_0001;
@@ -391,11 +393,6 @@ mod tests {
 
     fn object_attributes_size() -> u32 {
         u32::try_from(size_of::<ObjectAttributes>()).expect("OBJECT_ATTRIBUTES fits in ULONG")
-    }
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
     }
 
     fn create_wait_completion_packet(

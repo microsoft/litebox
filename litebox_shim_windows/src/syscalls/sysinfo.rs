@@ -770,9 +770,11 @@ fn duration_as_qpc_ticks(duration: core::time::Duration) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr};
+    use crate::tests::{
+        const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr,
+        run_with_test_platform_pointers,
+    };
     use core::time::Duration;
-    use litebox::platform::ThreadProvider;
 
     extern crate std;
 
@@ -814,11 +816,6 @@ mod tests {
             destination: *mut u64,
             conversion_error: *mut u64,
         ) -> i32;
-    }
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = crate::tests::test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

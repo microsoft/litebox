@@ -82,6 +82,11 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
     })
 }
 
+pub(crate) fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
+    let _ = test_platform();
+    <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(f)
+}
+
 fn map_csr_server_shared_memory(
     page_manager: &crate::WindowsPageManager<TestPlatform>,
 ) -> Option<usize> {

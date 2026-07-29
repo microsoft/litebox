@@ -525,17 +525,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{mut_byte_ptr, mut_ptr, null_const_ptr};
-    use litebox::platform::ThreadProvider;
+    use crate::tests::{mut_byte_ptr, mut_ptr, null_const_ptr, run_with_test_platform_pointers};
     use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 
     type TestPlatform = crate::tests::TestPlatform;
     type TestTask = Task<TestPlatform, crate::tests::TestFS>;
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = crate::tests::test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
-    }
 
     fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
