@@ -10,7 +10,25 @@ extern crate alloc;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland;
-use std::path::PathBuf;
+use memmap2::Mmap;
+use std::path::{Path, PathBuf};
+
+fn mmapped_file(path: impl AsRef<Path>) -> Result<&'static [u8]> {
+    let path = path.as_ref();
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Could not open tar file at {}", path.display()))?;
+    let data = {
+        // SAFETY: The runner maps the input read-only and does not modify it. The caller must ensure
+        // the tar file is not modified externally while the guest is running.
+        //
+        // Leak the mapping so the borrowed tar data remains valid for the process-lifetime file
+        // system.
+        Box::leak(Box::new(unsafe { Mmap::map(&file) }.with_context(
+            || format!("Could not map tar file at {}", path.display()),
+        )?))
+    };
+    Ok(data)
+}
 
 /// Run Windows PE programs with LiteBox on unmodified Windows.
 ///
@@ -64,8 +82,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
         anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
     }
-    let tar_data = std::fs::read(tar_file)
-        .with_context(|| format!("Could not read tar file at {}", tar_file.display()))?;
+    let tar_data = mmapped_file(tar_file)?;
 
     let platform = WindowsUserland::new();
     let shim_builder = litebox_shim_windows::WindowsShimBuilder::new(platform);
