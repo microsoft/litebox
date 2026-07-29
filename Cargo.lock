@@ -1753,6 +1753,7 @@ dependencies = [
  "litebox_syscall_rewriter",
  "litebox_util_log",
  "memmap2",
+ "object",
  "tar",
  "tracing-subscriber",
 ]
