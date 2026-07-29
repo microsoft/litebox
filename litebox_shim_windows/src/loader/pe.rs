@@ -499,6 +499,7 @@ fn initialize_static_server_data<Platform: RawPointerProvider>(
     shared_heap: &mut GuestMemoryAllocator,
     base_static_server_data: MutPtr<Platform, BaseStaticServerData>,
 ) -> Result<(), PeImageAccessError> {
+    let block_base = base_static_server_data.as_usize();
     let windows_directory = allocate_guest_unicode_string_from_str::<Platform>(
         shared_heap,
         crate::syscalls::sysinfo::WINDOWS_DIRECTORY,
@@ -548,14 +549,16 @@ fn initialize_static_server_data<Platform: RawPointerProvider>(
         crate::syscalls::sysinfo::WINDOWS_OS_BUILD_NUMBER,
     )?;
 
-    let ini_file_mapping = shared_heap
-        .allocate::<Platform, IniFileMapping>()?
-        .as_usize();
-    write_static_server_data_field!(
-        Platform,
+    write_static_server_data_field!(Platform, base_static_server_data, ini_file_mapping, 0,)?;
+    // Seed the server-base rebase anchor kernelbase reads at block+0x9e8. Leaving it zero
+    // (the pre-fix state) made BaseDllInitialize rebase `client_block + (buffer - 0)` with
+    // an absolute buffer, faulting at rip=0x180165852; writing our own block base makes the
+    // rebase delta zero so the absolute UNICODE_STRING buffers resolve unchanged.
+    write_guest_field_at_offset::<Platform, _, _>(
         base_static_server_data,
-        ini_file_mapping,
-        ini_file_mapping,
+        core::mem::offset_of!(BaseStaticServerData, nls_user_info)
+            + core::mem::offset_of!(NlsUserInfo, server_base_static_server_data),
+        block_base,
     )?;
     write_static_server_data_field!(
         Platform,
@@ -731,17 +734,6 @@ struct BaseStaticServerData {
     termsrv_client_time_zone_change_num: u32,
 }
 
-#[allow(clippy::struct_field_names)]
-#[repr(C)]
-#[derive(FromBytes, IntoBytes)]
-struct IniFileMapping {
-    file_names: usize,
-    default_file_name_mapping: usize,
-    win_ini_file_mapping: usize,
-    reserved: u32,
-    padding: [u8; 4],
-}
-
 #[repr(C)]
 #[derive(FromBytes, IntoBytes)]
 struct SystemBasicInformation {
@@ -788,7 +780,23 @@ struct NlsUserInfo {
     i_l_zero: [u16; 80],
     i_neg_number: [u16; 80],
     s_native_digits: [u16; 80],
-    num_shape: [u16; 80],
+    // Modern kernelbase overlays a self-referential anchor at block offset 0x9e8
+    // (host-verified) holding the server-view address of this BASESRV block. It rebases
+    // each absolute UNICODE_STRING buffer below into the client mapping via:
+    //   client_buffer = server_buffer + (server_block - anchor)
+    //                                 - server_section_base + client_section_base
+    // Correctness of storing plain absolute client pointers rests on TWO zero-terms:
+    //   1. we write this anchor = our block base, zeroing (server_block - anchor);
+    //   2. our PEB aliases client and CSRSS section bases (see TODO(csr-shared-section)
+    //      at process construction), zeroing (client_section_base - server_section_base).
+    // If that aliasing is ever removed, this must switch to storing server-view buffers.
+    // The surrounding num_shape split is an approximation of the modern NLS_USER_INFO
+    // layout to land this field at the correct offset.
+    // TODO(nls-user-info): model the modern NLS_USER_INFO layout precisely instead of
+    // carving the anchor out of num_shape.
+    num_shape_prefix: [u16; 8],
+    server_base_static_server_data: usize,
+    num_shape_suffix: [u16; 68],
     s_currency: [u16; 80],
     s_mon_dec_sep: [u16; 80],
     s_mon_thou_sep: [u16; 80],
@@ -2464,6 +2472,133 @@ mod tests {
             ),
             utf16_environment_units(&["a=one", "B=two", "c=three"])
         );
+    }
+
+    #[test]
+    fn static_server_data_pointers_match_host_and_resolve_to_guest_strings() {
+        let created = created_process_environment_snapshot();
+        let base_static_server_data = read_guest_value::<usize>(
+            created.peb.read_only_static_server_data + BASESRV_SERVERDLL_INDEX * size_of::<usize>(),
+        );
+        assert_eq!(
+            usize::try_from(created.peb.csr_server_read_only_shared_memory_base)
+                .expect("guest CSRSS shared memory base fits usize"),
+            created.peb.read_only_shared_memory_base
+        );
+        let host_peb = host_peb_snapshot();
+        let host_base_static_server_data_pointer = host_peb
+            .read_only_static_server_data
+            .checked_add(BASESRV_SERVERDLL_INDEX * size_of::<usize>())
+            .expect("host static server data pointer address overflow");
+        // SAFETY: The current process's PEB points to a live static server data pointer table.
+        let host_server_base_static_server_data =
+            unsafe { read_host_value(host_base_static_server_data_pointer as *const usize) };
+        let host_server_shared_memory_base =
+            usize::try_from(host_peb.csr_server_read_only_shared_memory_base)
+                .expect("host CSRSS shared memory base fits usize");
+        let host_base_static_server_data_offset = host_server_base_static_server_data
+            .checked_sub(host_server_shared_memory_base)
+            .expect("host BASESRV data is within the server shared section");
+        assert!(host_base_static_server_data_offset < WINDOWS_SHARED_SECTION_SIZE);
+        let host_base_static_server_data = host_peb
+            .read_only_shared_memory_base
+            .checked_add(host_base_static_server_data_offset)
+            .expect("host client BASESRV data address overflow");
+        let server_base_static_server_data_offset =
+            core::mem::offset_of!(BaseStaticServerData, nls_user_info)
+                + core::mem::offset_of!(NlsUserInfo, server_base_static_server_data);
+        assert_eq!(server_base_static_server_data_offset, 0x9e8);
+        // SAFETY: The translated host BASESRV block covers the typed anchor field.
+        let host_server_base_static_server_data_anchor = unsafe {
+            read_host_value(
+                (host_base_static_server_data + server_base_static_server_data_offset)
+                    as *const usize,
+            )
+        };
+        assert_eq!(
+            host_server_base_static_server_data_anchor,
+            host_server_base_static_server_data
+        );
+        assert_eq!(
+            read_guest_value::<usize>(
+                base_static_server_data + server_base_static_server_data_offset
+            ),
+            base_static_server_data
+        );
+        std::println!(
+            "host BASESRV data: server={host_server_base_static_server_data:#x}, section offset={host_base_static_server_data_offset:#x}, client={host_base_static_server_data:#x}"
+        );
+
+        for (field_name, field_offset, expected) in [
+            (
+                "windows_directory",
+                core::mem::offset_of!(BaseStaticServerData, windows_directory),
+                crate::syscalls::sysinfo::WINDOWS_DIRECTORY,
+            ),
+            (
+                "windows_system_directory",
+                core::mem::offset_of!(BaseStaticServerData, windows_system_directory),
+                crate::syscalls::sysinfo::WINDOWS_SYSTEM_DIRECTORY,
+            ),
+            (
+                "named_object_directory",
+                core::mem::offset_of!(BaseStaticServerData, named_object_directory),
+                crate::syscalls::sysinfo::WINDOWS_NAMED_OBJECT_DIRECTORY,
+            ),
+        ] {
+            let host_field_address = host_base_static_server_data
+                .checked_add(field_offset)
+                .expect("host static server data field address overflow");
+            // SAFETY: The BASESRV entry in the current process's live static server data
+            // table points to a BaseStaticServerData block containing this field.
+            let host_string =
+                unsafe { read_host_value(host_field_address as *const UnicodeString) };
+            assert_ne!(host_string.buffer, 0);
+            let host_string_offset = host_string
+                .buffer
+                .checked_sub(host_server_shared_memory_base)
+                .expect("host BASESRV string is within the server shared section");
+            assert!(host_string_offset < WINDOWS_SHARED_SECTION_SIZE);
+            let mut resolved_host_string = host_string;
+            resolved_host_string.buffer = host_peb
+                .read_only_shared_memory_base
+                .checked_add(host_string_offset)
+                .expect("host static server string address overflow");
+            std::println!(
+                "  {field_name}: raw buffer={:#x}, section offset={host_string_offset:#x}, client buffer={:#x}, value={:?}",
+                host_string.buffer,
+                resolved_host_string.buffer,
+                decode_host_unicode_string(resolved_host_string)
+            );
+
+            let string = read_guest_value::<UnicodeString>(base_static_server_data + field_offset);
+            assert_ne!(string.buffer, 0);
+            assert!(string.buffer >= created.environment.windows_shared_section);
+            assert!(
+                string.buffer
+                    < created.environment.windows_shared_section + WINDOWS_SHARED_SECTION_SIZE
+            );
+            assert_eq!(decode_guest_unicode_string(string), expected);
+        }
+
+        let windows_sys32_x86_directory = read_guest_value::<UnicodeString>(
+            base_static_server_data
+                + core::mem::offset_of!(BaseStaticServerData, windows_sys32_x86_directory),
+        );
+        assert_eq!(windows_sys32_x86_directory.buffer, 0);
+        // SAFETY: The translated host BASESRV block covers the typed INI mapping field.
+        let host_ini_file_mapping = unsafe {
+            read_host_value(
+                (host_base_static_server_data
+                    + core::mem::offset_of!(BaseStaticServerData, ini_file_mapping))
+                    as *const usize,
+            )
+        };
+        let ini_file_mapping = read_guest_value::<usize>(
+            base_static_server_data + core::mem::offset_of!(BaseStaticServerData, ini_file_mapping),
+        );
+        assert_eq!(host_ini_file_mapping, 0);
+        assert_eq!(ini_file_mapping, host_ini_file_mapping);
     }
 
     #[test]
