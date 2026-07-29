@@ -84,7 +84,7 @@ impl SocketProvider for LinuxSocketProvider {
             snapshot: Arc::clone(&snapshot),
             active: Arc::clone(&active),
         });
-        self.reactor.request(|response| Command::Create {
+        self.reactor.request(|response| ReactorCommand::Create {
             id,
             request,
             readiness,
@@ -111,7 +111,7 @@ struct LinuxSocket {
 
 impl PlatformSocket for LinuxSocket {
     fn connect(&self, address: SocketAddressV4) -> BrokerResult<SocketConnectionStatus> {
-        self.reactor.request(|response| Command::Connect {
+        self.reactor.request(|response| ReactorCommand::Connect {
             id: self.id,
             address,
             response,
@@ -124,7 +124,7 @@ impl PlatformSocket for LinuxSocket {
             .try_reserve_exact(data.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         owned.extend_from_slice(data);
-        self.reactor.request(|response| Command::Send {
+        self.reactor.request(|response| ReactorCommand::Send {
             id: self.id,
             data: owned,
             response,
@@ -141,7 +141,7 @@ impl PlatformSocket for LinuxSocket {
             .try_reserve_exact(data.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         owned.resize(data.len(), 0);
-        match self.reactor.request(|response| Command::Receive {
+        match self.reactor.request(|response| ReactorCommand::Receive {
             id: self.id,
             data: owned,
             flags,
@@ -164,7 +164,7 @@ impl PlatformSocket for LinuxSocket {
     }
 
     fn shutdown(&self, mode: ShutdownMode) -> BrokerResult<SocketOutcome<()>> {
-        self.reactor.request(|response| Command::Shutdown {
+        self.reactor.request(|response| ReactorCommand::Shutdown {
             id: self.id,
             mode,
             response,
@@ -197,7 +197,7 @@ impl Drop for LinuxSocket {
 
 /// Thread-safe command, wake, and lifecycle handle for the socket reactor.
 struct ReactorClient {
-    commands: SyncSender<Command>,
+    commands: SyncSender<ReactorCommand>,
     wake: Arc<OwnedFd>,
     next_socket_id: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -276,7 +276,7 @@ impl ReactorClient {
 
     fn request<T>(
         &self,
-        make_command: impl FnOnce(SyncSender<BrokerResult<T>>) -> Command,
+        make_command: impl FnOnce(SyncSender<BrokerResult<T>>) -> ReactorCommand,
     ) -> BrokerResult<T> {
         let (response, receive) = sync_channel(1);
         let command = make_command(response);
@@ -291,7 +291,11 @@ impl ReactorClient {
 
     fn close_socket(&self, id: u64) {
         let (response, receive) = sync_channel(1);
-        if self.commands.send(Command::Close { id, response }).is_err() {
+        if self
+            .commands
+            .send(ReactorCommand::Close { id, response })
+            .is_err()
+        {
             return;
         }
         // Do not release the core's socket quota until the reactor has dropped
@@ -324,7 +328,11 @@ impl ReactorClient {
 impl Drop for ReactorClient {
     fn drop(&mut self) {
         let (response, receive) = sync_channel(1);
-        if self.commands.send(Command::Stop { response }).is_ok() {
+        if self
+            .commands
+            .send(ReactorCommand::Stop { response })
+            .is_ok()
+        {
             let _ = self.signal();
             let _ = receive.recv();
         }
@@ -340,7 +348,7 @@ impl Drop for ReactorClient {
 }
 
 /// Bounded operations submitted to the thread that exclusively owns socket descriptors.
-enum Command {
+enum ReactorCommand {
     Create {
         id: u64,
         request: CreateSocketRequest,
@@ -390,7 +398,7 @@ enum ReactorReceiveOutcome {
 struct Reactor {
     epoll: OwnedFd,
     wake: Arc<OwnedFd>,
-    commands: Receiver<Command>,
+    commands: Receiver<ReactorCommand>,
     sockets: HashMap<u64, SocketEntry>,
     max_sockets: usize,
     events: Vec<epoll::Event>,
@@ -492,7 +500,7 @@ impl Reactor {
                 Err(TryRecvError::Disconnected) => return true,
             };
             match command {
-                Command::Create {
+                ReactorCommand::Create {
                     id,
                     request,
                     readiness,
@@ -509,7 +517,7 @@ impl Reactor {
                         self.sockets.remove(&id);
                     }
                 }
-                Command::Connect {
+                ReactorCommand::Connect {
                     id,
                     address,
                     response,
@@ -521,7 +529,7 @@ impl Reactor {
                         .and_then(|socket| connect_socket(&self.epoll, id, socket, address));
                     let _ = response.send(outcome);
                 }
-                Command::Send { id, data, response } => {
+                ReactorCommand::Send { id, data, response } => {
                     let outcome = self
                         .sockets
                         .get_mut(&id)
@@ -529,7 +537,7 @@ impl Reactor {
                         .and_then(|socket| send_socket(socket, &data));
                     let _ = response.send(outcome);
                 }
-                Command::Receive {
+                ReactorCommand::Receive {
                     id,
                     data,
                     flags,
@@ -542,7 +550,7 @@ impl Reactor {
                         .and_then(|socket| receive_socket(socket, data, flags));
                     let _ = response.send(outcome);
                 }
-                Command::Shutdown { id, mode, response } => {
+                ReactorCommand::Shutdown { id, mode, response } => {
                     let outcome = self
                         .sockets
                         .get_mut(&id)
@@ -550,11 +558,11 @@ impl Reactor {
                         .and_then(|socket| shutdown_socket(socket, mode));
                     let _ = response.send(outcome);
                 }
-                Command::Close { id, response } => {
+                ReactorCommand::Close { id, response } => {
                     self.sockets.remove(&id);
                     let _ = response.send(());
                 }
-                Command::Stop { response } => {
+                ReactorCommand::Stop { response } => {
                     self.sockets.clear();
                     let _ = response.send(());
                     return true;
