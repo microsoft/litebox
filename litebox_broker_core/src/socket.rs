@@ -169,6 +169,9 @@ pub fn connect(
         .policy
         .authorize_socket_connect(session.caller_credential, address)
     {
+        // Only a definitive authorization denial is a terminal socket outcome.
+        // Any other error means the broker could not evaluate or serve policy
+        // and must not be cached as if it were a network failure.
         if error != BrokerError::PolicyDenied {
             return Err(error);
         }
