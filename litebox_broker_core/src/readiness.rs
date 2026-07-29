@@ -119,3 +119,44 @@ impl Drop for ReadinessPublishGuard<'_> {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct TestReadinessSink {
+        pub(crate) published: Mutex<std::vec::Vec<(ObjectHandle, ReadinessFlags)>>,
+        pub(crate) retired: Mutex<std::vec::Vec<ObjectHandle>>,
+    }
+
+    impl ReadinessSink for TestReadinessSink {
+        fn max_tracked_objects(&self) -> usize {
+            usize::MAX
+        }
+
+        fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+            self.published.lock().unwrap().push((handle, readiness));
+            Ok(())
+        }
+
+        fn retire(&self, handle: ObjectHandle) {
+            self.retired.lock().unwrap().push(handle);
+        }
+    }
+
+    #[test]
+    fn retired_registration_discards_updates_from_retained_clones() {
+        let sink = Arc::new(TestReadinessSink::default());
+        let registration = ReadinessRegistration::new(ObjectHandle(99), sink.clone());
+        let retained = registration.clone();
+
+        registration.retire();
+        retained.publish(ReadinessFlags::READ).unwrap();
+
+        assert!(sink.published.lock().unwrap().is_empty());
+        assert_eq!(sink.retired.lock().unwrap().as_slice(), [ObjectHandle(99)]);
+    }
+}

@@ -434,6 +434,7 @@ fn reserve_socket(counter: &AtomicUsize, limit: usize) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::readiness::tests::TestReadinessSink;
     use crate::{BrokerCore, CallerCredential};
     use litebox_broker_protocol::socket::{
         AddressFamily, IpProtocol, Ipv4Address, Port, SocketType,
@@ -549,43 +550,11 @@ pub(crate) mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TestReadinessSink {
-        published: StdMutex<std::vec::Vec<(ObjectHandle, ReadinessFlags)>>,
-        retired: StdMutex<std::vec::Vec<ObjectHandle>>,
-    }
-
-    impl ReadinessSink for TestReadinessSink {
-        fn max_tracked_objects(&self) -> usize {
-            usize::MAX
-        }
-
-        fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
-            self.published.lock().unwrap().push((handle, readiness));
-            Ok(())
-        }
-
-        fn retire(&self, handle: ObjectHandle) {
-            self.retired.lock().unwrap().push(handle);
-        }
-    }
-
     pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
         check_failed_create_rolls_back(broker, provider);
-        check_retired_registration_discards_updates();
         check_socket_operations_and_policy(broker, provider);
         check_connect_error_is_terminal(broker, provider);
         check_socket_quotas(broker);
-    }
-
-    fn check_retired_registration_discards_updates() {
-        let sink = Arc::new(TestReadinessSink::default());
-        let registration = ReadinessRegistration::new(ObjectHandle(99), sink.clone());
-        let delayed = registration.clone();
-        registration.retire();
-        delayed.publish(ReadinessFlags::READ).unwrap();
-        assert!(sink.published.lock().unwrap().is_empty());
-        assert_eq!(sink.retired.lock().unwrap().as_slice(), [ObjectHandle(99)]);
     }
 
     fn check_failed_create_rolls_back(broker: &BrokerCore, provider: &TestSocketProvider) {
