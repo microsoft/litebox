@@ -3,7 +3,7 @@
 
 use crate::{BrokerError, CallerCredential, ObjectRights};
 use litebox_broker_protocol::socket::{
-    AddressFamily, CreateSocketRequest, IpProtocol, SocketAddressV4, SocketError, SocketType,
+    AddressFamily, CreateSocketRequest, IpProtocol, SocketAddressV4, SocketType,
 };
 
 /// Network access available to broker-owned sockets.
@@ -121,14 +121,13 @@ impl PolicyEngine {
         &self,
         caller_credential: CallerCredential,
         address: SocketAddressV4,
-    ) -> Result<(), SocketError> {
-        self.principal_object_rights(caller_credential)
-            .map_err(|_| SocketError::PolicyDenied)?;
+    ) -> Result<(), BrokerError> {
+        self.principal_object_rights(caller_credential)?;
         match self.socket_policy {
             // The initial loopback profile intentionally permits every port.
             // Destination-port rules belong to the later Layer 3/4 policy.
             SocketPolicy::Ipv4LoopbackTcp if address.address.0[0] == 127 => Ok(()),
-            SocketPolicy::Deny | SocketPolicy::Ipv4LoopbackTcp => Err(SocketError::PolicyDenied),
+            SocketPolicy::Deny | SocketPolicy::Ipv4LoopbackTcp => Err(BrokerError::PolicyDenied),
         }
     }
 }
@@ -226,7 +225,7 @@ mod tests {
                     port: Port(80),
                 },
             ),
-            Err(SocketError::PolicyDenied)
+            Err(BrokerError::PolicyDenied)
         );
     }
 }

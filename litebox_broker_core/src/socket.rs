@@ -169,6 +169,9 @@ pub fn connect(
         .policy
         .authorize_socket_connect(session.caller_credential, address)
     {
+        if error != BrokerError::PolicyDenied {
+            return Err(error);
+        }
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
@@ -177,7 +180,7 @@ pub fn connect(
             return Ok(SocketConnectionStatus::Connecting);
         }
         if socket.connection_status == SocketConnectionStatus::Unconnected {
-            socket.connection_status = SocketConnectionStatus::Failed(error);
+            socket.connection_status = SocketConnectionStatus::Failed(SocketError::PolicyDenied);
         }
         return Ok(socket.connection_status);
     }
