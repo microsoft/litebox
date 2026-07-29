@@ -23,7 +23,8 @@ extern crate std;
 
 use alloc::{sync::Arc, vec::Vec};
 
-use litebox_broker_core::socket::{SocketOutcome, SocketReadinessSink};
+use litebox_broker_core::readiness::ReadinessSink;
+use litebox_broker_core::socket::SocketOutcome;
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
@@ -63,7 +64,7 @@ pub type ConnectionSetup<'a, Memory> =
 pub struct BrokerHostAssociation<'a, Memory: SharedMemory> {
     session: BrokerSession,
     shared_buffers: &'a SharedBufferPool<Memory>,
-    socket_readiness: Arc<dyn SocketReadinessSink>,
+    readiness_sink: Arc<dyn ReadinessSink>,
     state: SpinMutex<AssociationState>,
 }
 
@@ -125,7 +126,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             &self.session,
             operation,
             self.shared_buffers,
-            &self.socket_readiness,
+            &self.readiness_sink,
         )) {
             Ok(result) => result,
             Err(error) => {
@@ -155,7 +156,7 @@ pub fn setup_connection<'a, SetupChannel, Memory, ChannelError>(
     core: &BrokerCore,
     setup_channel: &mut SetupChannel,
     shared_buffers: &'a SharedBufferPool<Memory>,
-    socket_readiness: Arc<dyn SocketReadinessSink>,
+    readiness_sink: Arc<dyn ReadinessSink>,
     send_shared_memory: impl FnOnce(&mut SetupChannel) -> core::result::Result<(), ChannelError>,
 ) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
 where
@@ -166,11 +167,14 @@ where
         return Err(BrokerHostError::SharedBufferLayoutMismatch);
     }
     let limits = core.limits();
-    let max_live_session_sockets = limits
+    // Sockets are currently the only provider-backed objects. Add future
+    // provider-object limits here so every live registration fits in the
+    // association's shared readiness sink.
+    let max_live_readiness_registrations = limits
         .max_references
         .min(limits.max_sockets)
         .min(limits.max_sockets_per_session);
-    if max_live_session_sockets > socket_readiness.max_tracked_sockets() {
+    if max_live_readiness_registrations > readiness_sink.max_tracked_objects() {
         return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
     }
 
@@ -220,7 +224,7 @@ where
             return Ok(Ok(BrokerHostAssociation {
                 session,
                 shared_buffers,
-                socket_readiness,
+                readiness_sink,
                 state: SpinMutex::new(AssociationState {
                     failed: false,
                     shared_buffer_usage: SharedBufferUsage::new(),
@@ -309,7 +313,7 @@ fn handle_request<Memory: SharedMemory>(
     session: &BrokerSession,
     operation: BrokerOperation,
     shared_buffers: &SharedBufferPool<Memory>,
-    socket_readiness: &Arc<dyn SocketReadinessSink>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<BrokerResult> {
     match operation {
         BrokerOperation::CloseObject(handle) => session
@@ -327,7 +331,7 @@ fn handle_request<Memory: SharedMemory>(
             handle_pipe_request(session, request, shared_buffers).map(BrokerResult::Pipe)
         }
         BrokerOperation::Socket(request) => {
-            handle_socket_request(session, request, shared_buffers, socket_readiness)
+            handle_socket_request(session, request, shared_buffers, readiness_sink)
                 .map(BrokerResult::Socket)
         }
     }
@@ -337,12 +341,12 @@ fn handle_socket_request<Memory: SharedMemory>(
     session: &BrokerSession,
     request: SocketRequest,
     shared_buffers: &SharedBufferPool<Memory>,
-    socket_readiness: &Arc<dyn SocketReadinessSink>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<SocketResponse> {
     match request {
         SocketRequest::Create(request) => {
             let handle =
-                litebox_broker_core::socket::create(session, request, Arc::clone(socket_readiness))
+                litebox_broker_core::socket::create(session, request, Arc::clone(readiness_sink))
                     .map_err(socket_request_failure)?;
             Ok(SocketResponse::Create(CreateSocketResponse { handle }))
         }
@@ -525,9 +529,8 @@ pub enum ConnectionTermination {
 mod tests {
     use super::*;
     use core::cell::Cell;
-    use litebox_broker_core::socket::{
-        PlatformSocket, SocketOutcome, SocketProvider, SocketReadinessRegistration,
-    };
+    use litebox_broker_core::readiness::ReadinessRegistration;
+    use litebox_broker_core::socket::{PlatformSocket, SocketOutcome, SocketProvider};
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
@@ -549,10 +552,10 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
-    struct TestSocketReadiness;
+    struct TestReadinessSink;
 
-    impl SocketReadinessSink for TestSocketReadiness {
-        fn max_tracked_sockets(&self) -> usize {
+    impl ReadinessSink for TestReadinessSink {
+        fn max_tracked_objects(&self) -> usize {
             usize::MAX
         }
 
@@ -567,8 +570,8 @@ mod tests {
         fn retire(&self, _handle: ObjectHandle) {}
     }
 
-    fn test_socket_readiness() -> Arc<dyn SocketReadinessSink> {
-        Arc::new(TestSocketReadiness)
+    fn test_readiness_sink() -> Arc<dyn ReadinessSink> {
+        Arc::new(TestReadinessSink)
     }
 
     #[derive(Default)]
@@ -579,7 +582,7 @@ mod tests {
             &self,
             _session_id: SessionId,
             _request: CreateSocketRequest,
-            readiness: SocketReadinessRegistration,
+            readiness: ReadinessRegistration,
         ) -> litebox_broker_core::Result<Arc<dyn PlatformSocket>> {
             Ok(Arc::new(TestPlatformSocket { readiness }))
         }
@@ -588,7 +591,7 @@ mod tests {
     }
 
     struct TestPlatformSocket {
-        readiness: SocketReadinessRegistration,
+        readiness: ReadinessRegistration,
     }
 
     impl PlatformSocket for TestPlatformSocket {
@@ -1149,7 +1152,7 @@ mod tests {
                     flags: SendFlags(1),
                 })),
                 &shared_buffers,
-                &test_socket_readiness(),
+                &test_readiness_sink(),
             )),
             Err(ErrorCode::MalformedRequest)
         );
@@ -1324,7 +1327,7 @@ mod tests {
                 .create_session(CallerCredential::Unauthenticated)
                 .unwrap(),
             shared_buffers,
-            socket_readiness: test_socket_readiness(),
+            readiness_sink: test_readiness_sink(),
             state: SpinMutex::new(AssociationState {
                 failed: false,
                 shared_buffer_usage: SharedBufferUsage::new(),
@@ -1389,7 +1392,7 @@ mod tests {
             session,
             operation,
             shared_buffers,
-            &test_socket_readiness(),
+            &test_readiness_sink(),
         ))
         .unwrap()
     }
@@ -1412,7 +1415,7 @@ mod tests {
             broker,
             control_channel,
             shared_buffers,
-            test_socket_readiness(),
+            test_readiness_sink(),
             send_shared_memory,
         )? {
             Ok(association) => association,

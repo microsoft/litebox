@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 
-use litebox_broker_core::socket::SocketReadinessSink;
+use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{BrokerError, Result as BrokerResult};
 use litebox_broker_host::readiness::{
     PublishOutcome, ReadinessPublishError, ReadinessPublisher, publish_readiness,
@@ -150,8 +150,8 @@ impl ReadinessPublisherRuntime {
     }
 }
 
-impl SocketReadinessSink for ReadinessPublisherRuntime {
-    fn max_tracked_sockets(&self) -> usize {
+impl ReadinessSink for ReadinessPublisherRuntime {
+    fn max_tracked_objects(&self) -> usize {
         litebox_broker_host::readiness::MAX_TRACKED_READINESS_OBJECTS
     }
 

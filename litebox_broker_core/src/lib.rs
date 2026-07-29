@@ -22,6 +22,7 @@ mod error;
 pub mod event;
 pub mod pipe;
 mod policy;
+pub mod readiness;
 mod session;
 pub mod socket;
 

@@ -12,10 +12,10 @@ use std::{
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c"];
 
-struct TestSocketReadiness;
+struct TestReadinessSink;
 
-impl litebox_broker_core::socket::SocketReadinessSink for TestSocketReadiness {
-    fn max_tracked_sockets(&self) -> usize {
+impl litebox_broker_core::readiness::ReadinessSink for TestReadinessSink {
+    fn max_tracked_objects(&self) -> usize {
         usize::MAX
     }
 
@@ -416,7 +416,7 @@ fn spawn_test_broker(
                     &broker,
                     &mut channel,
                     &shared_buffers,
-                    std::sync::Arc::new(TestSocketReadiness),
+                    std::sync::Arc::new(TestReadinessSink),
                     |channel| {
                         channel.send_memfd(shared_buffers.memory(), None)?;
                         channel.send_memfd(control_ring.memory(), None)

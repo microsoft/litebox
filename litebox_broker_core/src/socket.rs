@@ -13,9 +13,9 @@ use litebox_broker_protocol::socket::{
     SocketAddressV4, SocketConnectionStatus, SocketError,
 };
 
+use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result, SessionId};
-use spin::Mutex;
 
 /// Result of a platform socket operation that can fail with a network outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,115 +27,6 @@ pub enum SocketOutcome<T> {
     Failed(SocketError),
 }
 
-/// Per-association destination for asynchronous socket readiness changes.
-pub trait SocketReadinessSink: Send + Sync {
-    /// Maximum number of simultaneously live socket registrations.
-    fn max_tracked_sockets(&self) -> usize;
-
-    /// Records a new authoritative readiness snapshot.
-    fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()>;
-
-    /// Retires all readiness state for a socket that can no longer publish.
-    fn retire(&self, handle: ObjectHandle);
-}
-
-/// Capability for publishing readiness for one broker-assigned socket handle.
-#[derive(Clone)]
-pub struct SocketReadinessRegistration {
-    inner: Arc<SocketReadinessRegistrationInner>,
-}
-
-impl SocketReadinessRegistration {
-    fn new(handle: ObjectHandle, sink: Arc<dyn SocketReadinessSink>) -> Self {
-        Self {
-            inner: Arc::new(SocketReadinessRegistrationInner {
-                handle,
-                sink,
-                state: Mutex::new(SocketReadinessRegistrationState {
-                    retired: false,
-                    active_publishers: 0,
-                    retirement_sent: false,
-                }),
-            }),
-        }
-    }
-
-    /// Publishes the socket's current readiness.
-    ///
-    /// Updates after the broker retires the socket are discarded.
-    pub fn publish(&self, readiness: ReadinessFlags) -> Result<()> {
-        {
-            let mut state = self.inner.state.lock();
-            if state.retired {
-                return Ok(());
-            }
-            state.active_publishers = state
-                .active_publishers
-                .checked_add(1)
-                .ok_or(BrokerError::ResourceExhausted)?;
-        }
-        let _publishing = SocketReadinessPublishGuard { inner: &self.inner };
-        self.inner.sink.publish(self.inner.handle, readiness)
-    }
-
-    fn retire(&self) {
-        self.inner.retire();
-    }
-}
-
-struct SocketReadinessRegistrationInner {
-    handle: ObjectHandle,
-    sink: Arc<dyn SocketReadinessSink>,
-    state: Mutex<SocketReadinessRegistrationState>,
-}
-
-struct SocketReadinessRegistrationState {
-    retired: bool,
-    active_publishers: usize,
-    retirement_sent: bool,
-}
-
-impl SocketReadinessRegistrationInner {
-    fn retire(&self) {
-        let should_retire = {
-            let mut state = self.state.lock();
-            state.retired = true;
-            let should_retire = state.active_publishers == 0 && !state.retirement_sent;
-            state.retirement_sent |= should_retire;
-            should_retire
-        };
-        if should_retire {
-            self.sink.retire(self.handle);
-        }
-    }
-}
-
-impl Drop for SocketReadinessRegistrationInner {
-    fn drop(&mut self) {
-        self.retire();
-    }
-}
-
-struct SocketReadinessPublishGuard<'registration> {
-    inner: &'registration SocketReadinessRegistrationInner,
-}
-
-impl Drop for SocketReadinessPublishGuard<'_> {
-    fn drop(&mut self) {
-        let should_retire = {
-            let mut state = self.inner.state.lock();
-            state.active_publishers -= 1;
-            let should_retire =
-                state.retired && state.active_publishers == 0 && !state.retirement_sent;
-            state.retirement_sent |= should_retire;
-            should_retire
-        };
-        if should_retire {
-            self.inner.sink.retire(self.inner.handle);
-        }
-    }
-}
-
 /// Deployment-provided factory for platform socket resources.
 pub trait SocketProvider: Send + Sync {
     /// Creates one nonblocking platform socket for an authenticated session.
@@ -145,7 +36,7 @@ pub trait SocketProvider: Send + Sync {
         &self,
         session_id: SessionId,
         request: CreateSocketRequest,
-        readiness: SocketReadinessRegistration,
+        readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>>;
 
     /// Releases provider state associated with a session after its references close.
@@ -201,7 +92,7 @@ impl SocketProvider for UnsupportedSocketProvider {
         &self,
         _session_id: SessionId,
         _request: CreateSocketRequest,
-        _readiness: SocketReadinessRegistration,
+        _readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>> {
         Err(BrokerError::UnsupportedOperation)
     }
@@ -213,7 +104,7 @@ impl SocketProvider for UnsupportedSocketProvider {
 pub fn create(
     session: &BrokerSession,
     request: CreateSocketRequest,
-    readiness_sink: Arc<dyn SocketReadinessSink>,
+    readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<ObjectHandle> {
     let rights = session
         .core
@@ -221,7 +112,7 @@ pub fn create(
         .authorize_socket_create(session.caller_credential, request)?;
     let quota = SocketQuotaReservation::new(session)?;
     let reference = session.reserve_object_reference(rights)?;
-    let readiness = SocketReadinessRegistration::new(reference.handle(), readiness_sink);
+    let readiness = ReadinessRegistration::new(reference.handle(), readiness_sink);
     let platform_socket =
         match session
             .core
@@ -431,7 +322,7 @@ pub(crate) struct SocketObject {
 impl SocketObject {
     fn new(
         platform_socket: Arc<dyn PlatformSocket>,
-        readiness: SocketReadinessRegistration,
+        readiness: ReadinessRegistration,
         quota: SocketQuotaReservation,
     ) -> Self {
         Self {
@@ -452,7 +343,7 @@ impl SocketObject {
 
 pub(crate) struct SocketResource {
     platform_socket: Arc<dyn PlatformSocket>,
-    readiness: SocketReadinessRegistration,
+    readiness: ReadinessRegistration,
     _quota: SocketQuotaReservation,
 }
 
@@ -563,7 +454,7 @@ pub(crate) mod tests {
         dropped_sockets: AtomicUsize,
         fail_create: core::sync::atomic::AtomicBool,
         fail_connect: core::sync::atomic::AtomicBool,
-        failed_readiness: StdMutex<Option<SocketReadinessRegistration>>,
+        failed_readiness: StdMutex<Option<ReadinessRegistration>>,
     }
 
     impl TestSocketProvider {
@@ -581,7 +472,7 @@ pub(crate) mod tests {
             &self,
             session_id: SessionId,
             request: CreateSocketRequest,
-            readiness: SocketReadinessRegistration,
+            readiness: ReadinessRegistration,
         ) -> Result<Arc<dyn PlatformSocket>> {
             self.state
                 .creates
@@ -605,7 +496,7 @@ pub(crate) mod tests {
 
     struct TestPlatformSocket {
         state: Arc<TestSocketState>,
-        readiness: SocketReadinessRegistration,
+        readiness: ReadinessRegistration,
     }
 
     impl PlatformSocket for TestPlatformSocket {
@@ -662,8 +553,8 @@ pub(crate) mod tests {
         retired: StdMutex<std::vec::Vec<ObjectHandle>>,
     }
 
-    impl SocketReadinessSink for TestReadinessSink {
-        fn max_tracked_sockets(&self) -> usize {
+    impl ReadinessSink for TestReadinessSink {
+        fn max_tracked_objects(&self) -> usize {
             usize::MAX
         }
 
@@ -687,7 +578,7 @@ pub(crate) mod tests {
 
     fn check_retired_registration_discards_updates() {
         let sink = Arc::new(TestReadinessSink::default());
-        let registration = SocketReadinessRegistration::new(ObjectHandle(99), sink.clone());
+        let registration = ReadinessRegistration::new(ObjectHandle(99), sink.clone());
         let delayed = registration.clone();
         registration.retire();
         delayed.publish(ReadinessFlags::READ).unwrap();
