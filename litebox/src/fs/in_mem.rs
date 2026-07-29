@@ -57,6 +57,107 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         }
     }
 
+    /// Construct an `InMem` backend pre-populated with `entries`.
+    ///
+    /// Entries are inserted in order, bypassing all permission checks, which is what lets a caller
+    /// set up root-owned directories and files without ever acting as root at runtime. Each
+    /// entry's parent must already exist, either as the root or from an earlier entry;
+    /// re-specifying an existing path updates its mode and owner (and, for a file, its contents),
+    /// which is how the root directory's own permissions are set (via the path `/`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an entry's parent does not exist or is not a directory, if an entry changes the
+    /// type of an existing path, or if the root is given as a file.
+    #[must_use]
+    pub fn new_initialized<Path: AsRef<str>>(
+        entries: impl IntoIterator<Item = (Path, InitialNode)>,
+    ) -> Self {
+        let this = Self::new(InodeAllocator::standalone());
+        for (path, node) in entries {
+            this.insert_initial(path.as_ref(), node);
+        }
+        this
+    }
+
+    /// Insert a single [`InitialNode`], as described on [`Self::new_initialized`].
+    fn insert_initial(&self, path: &str, node: InitialNode) {
+        let mut components = path.split('/').filter(|component| {
+            assert!(
+                !matches!(*component, "." | ".."),
+                "initial paths must be normalized, got {path:?}"
+            );
+            !component.is_empty()
+        });
+        let Some(mut name) = components.next() else {
+            // The path is the root itself, which already exists, so only its permissions apply.
+            let InitialNode::Directory { mode, owner } = node else {
+                panic!("the root directory cannot be initialized as a file")
+            };
+            self.root.write().perms = Permissions {
+                mode,
+                userinfo: owner,
+            };
+            return;
+        };
+
+        let mut dir = self.root.clone();
+        for next in components {
+            let child = dir
+                .read()
+                .children
+                .get(name)
+                .unwrap_or_else(|| panic!("missing parent directory for {path:?}"))
+                .clone();
+            let Node::Dir(child) = child else {
+                panic!("parent of {path:?} is not a directory")
+            };
+            dir = child;
+            name = next;
+        }
+
+        let mut dir = dir.write();
+        match (dir.children.get(name), node) {
+            (Some(Node::Dir(existing)), InitialNode::Directory { mode, owner }) => {
+                existing.write().perms = Permissions {
+                    mode,
+                    userinfo: owner,
+                };
+            }
+            (Some(Node::File(existing)), InitialNode::File { mode, owner, data }) => {
+                let mut existing = existing.write();
+                existing.perms = Permissions {
+                    mode,
+                    userinfo: owner,
+                };
+                existing.data = data;
+            }
+            (Some(_), _) => panic!("{path:?} already exists with a different type"),
+            (None, InitialNode::Directory { mode, owner }) => {
+                let child = Arc::new(sync::RwLock::new(DirData {
+                    perms: Permissions {
+                        mode,
+                        userinfo: owner,
+                    },
+                    children: HashMap::default(),
+                    node_info: self.inode_allocator.next(),
+                }));
+                dir.children.insert(name.into(), Node::Dir(child));
+            }
+            (None, InitialNode::File { mode, owner, data }) => {
+                let child = Arc::new(sync::RwLock::new(FileData {
+                    perms: Permissions {
+                        mode,
+                        userinfo: owner,
+                    },
+                    data,
+                    node_info: self.inode_allocator.next(),
+                }));
+                dir.children.insert(name.into(), Node::File(child));
+            }
+        }
+    }
+
     /// Initialize a primarily read-heavy file with static data.
     ///
     /// While this function could technically work with write-heavy files, it has performance
@@ -82,6 +183,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         );
         file.data = data;
     }
+}
+
+/// A node used to pre-populate an [`InMem`] backend, via [`InMem::new_initialized`].
+pub enum InitialNode {
+    /// A directory.
+    Directory {
+        /// Permission bits for the directory.
+        mode: Mode,
+        /// Owning user and group.
+        owner: UserInfo,
+    },
+    /// A regular file, along with its contents.
+    File {
+        /// Permission bits for the file.
+        mode: Mode,
+        /// Owning user and group.
+        owner: UserInfo,
+        /// The file's contents.
+        ///
+        /// Borrowed data is kept borrowed until the first write to the file, which makes this the
+        /// cheap way to set up large read-heavy files (such as executables).
+        data: alloc::borrow::Cow<'static, [u8]>,
+    },
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::private::Sealed
@@ -824,4 +948,33 @@ crate::fd::enable_fds_for_subsystem! {
     @ Platform: { sync::RawSyncPrimitivesProvider };
     Descriptor<Platform>;
     -> FileFd<Platform>;
+}
+
+/// Run `f` with the acting user set to root.
+///
+/// Non-test callers set up root-owned state via [`InMem::new_initialized`] instead; this exists so
+/// that the tests can exercise operations that depend on the acting user.
+#[cfg(test)]
+pub(super) fn with_root_privileges<Platform: sync::RawSyncPrimitivesProvider>(
+    fs: &mut super::resolver::Resolver<Platform, InMem<Platform>>,
+    f: impl FnOnce(&mut super::resolver::Resolver<Platform, InMem<Platform>>),
+) {
+    with_user(fs, UserInfo::ROOT.user, UserInfo::ROOT.group, f);
+}
+
+/// Run `f` with the acting user set to `user`/`group`. See [`with_root_privileges`].
+#[cfg(test)]
+pub(super) fn with_user<Platform: sync::RawSyncPrimitivesProvider>(
+    fs: &mut super::resolver::Resolver<Platform, InMem<Platform>>,
+    user: u16,
+    group: u16,
+    f: impl FnOnce(&mut super::resolver::Resolver<Platform, InMem<Platform>>),
+) {
+    let user = UserInfo { user, group };
+    let original_user = fs.swap_acting_user(user);
+    fs.backend_mut().current_user = user;
+    f(fs);
+    let user_again = fs.swap_acting_user(original_user);
+    fs.backend_mut().current_user = original_user;
+    assert!(user_again.user == user.user && user_again.group == user.group);
 }

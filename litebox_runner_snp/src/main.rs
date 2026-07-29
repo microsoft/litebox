@@ -11,10 +11,7 @@ mod globals;
 extern crate alloc;
 
 use alloc::{borrow::ToOwned, boxed::Box};
-use litebox::{
-    fs::FileSystem as _,
-    utils::{ReinterpretUnsignedExt as _, TruncateExt as _},
-};
+use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
 /// `log` backend that forwards to the GHCB serial console.
@@ -39,7 +36,7 @@ static HOST_LOGGER: HostLogger = HostLogger;
 type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
 type DefaultFS = litebox::fs::layered::FileSystem<
     Platform,
-    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
     litebox::fs::layered::FileSystem<
         Platform,
         litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
@@ -213,13 +210,16 @@ pub extern "C" fn sandbox_process_init(
     #[allow(clippy::missing_panics_doc)]
     let shim = SHIM.get().expect("initialized");
     let litebox = shim.litebox();
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
-    in_mem_fs.with_root_privileges(|fs| {
-        let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
-        if let Err(litebox::fs::errors::MkdirError::AlreadyExists) = fs.mkdir("/tmp", mode) {
-            let _ = fs.chmod("/tmp", mode);
-        }
-    });
+    let in_mem_fs = litebox::fs::resolver::Resolver::new(
+        litebox,
+        litebox::fs::in_mem::InMem::new_initialized([(
+            "/tmp",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+                owner: litebox::fs::UserInfo::ROOT,
+            },
+        )]),
+    );
 
     let socket_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
         core::net::Ipv4Addr::new(10, 0, 0, 1),

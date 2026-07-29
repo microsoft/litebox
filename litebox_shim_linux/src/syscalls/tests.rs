@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox::fs::{FileSystem as _, Mode, OFlags};
+use litebox::fs::{Mode, OFlags};
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
 use zerocopy::FromBytes as _;
 
@@ -46,11 +46,16 @@ pub(crate) fn init_platform(
 
     let shim_builder = crate::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
-    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
-    in_mem_fs.with_root_privileges(|fs| {
-        fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to set permissions on root");
-    });
+    let in_mem_fs = litebox::fs::resolver::Resolver::new(
+        litebox,
+        litebox::fs::in_mem::InMem::new_initialized([(
+            "/",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: litebox::fs::UserInfo::ROOT,
+            },
+        )]),
+    );
     let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, TEST_TAR_FILE.into()));
     let task = shim_builder.build().0.new_test_task(fs);
 
