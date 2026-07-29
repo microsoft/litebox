@@ -145,23 +145,21 @@ pub fn create(
 }
 
 /// Starts a nonblocking connection attempt.
+///
+/// Policy denial is returned as a per-request [`SocketOutcome::Failed`] and
+/// leaves the socket unconnected, so a later authorized destination may still
+/// be attempted.
 pub fn connect(
     session: &BrokerSession,
     handle: ObjectHandle,
     address: SocketAddressV4,
-) -> Result<SocketConnectionStatus> {
+) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let object = session.authorized_object(handle, ObjectRights::WRITE)?;
     {
         let object = object.read();
-        let ObjectEntry::Socket(socket) = &*object else {
+        let ObjectEntry::Socket(_) = &*object else {
             return Err(BrokerError::InvalidRights);
         };
-        if socket.connect_in_flight {
-            return Ok(SocketConnectionStatus::Connecting);
-        }
-        if socket.connection_status != SocketConnectionStatus::Unconnected {
-            return Ok(socket.connection_status);
-        }
     }
 
     if let Err(error) = session
@@ -169,23 +167,13 @@ pub fn connect(
         .policy
         .authorize_socket_connect(session.caller_credential, address)
     {
-        // Only a definitive authorization denial is a terminal socket outcome.
+        // Only a definitive authorization denial is a per-request socket outcome.
         // Any other error means the broker could not evaluate or serve policy
         // and must not be cached as if it were a network failure.
         if error != BrokerError::PolicyDenied {
             return Err(error);
         }
-        let mut object = object.write();
-        let ObjectEntry::Socket(socket) = &mut *object else {
-            return Err(BrokerError::InvalidRights);
-        };
-        if socket.connect_in_flight {
-            return Ok(SocketConnectionStatus::Connecting);
-        }
-        if socket.connection_status == SocketConnectionStatus::Unconnected {
-            socket.connection_status = SocketConnectionStatus::Failed(SocketError::PolicyDenied);
-        }
-        return Ok(socket.connection_status);
+        return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
     }
 
     let resource = {
@@ -194,10 +182,10 @@ pub fn connect(
             return Err(BrokerError::InvalidRights);
         };
         if socket.connect_in_flight {
-            return Ok(SocketConnectionStatus::Connecting);
+            return Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting));
         }
         if socket.connection_status != SocketConnectionStatus::Unconnected {
-            return Ok(socket.connection_status);
+            return Ok(SocketOutcome::Completed(socket.connection_status));
         }
         socket.connect_in_flight = true;
         Arc::clone(&socket.resource)
@@ -214,7 +202,7 @@ pub fn connect(
         }
     };
     finish_connect(&object, status);
-    Ok(status)
+    Ok(SocketOutcome::Completed(status))
 }
 
 /// Sends bytes without waiting for readiness.
@@ -634,37 +622,32 @@ pub(crate) mod tests {
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let readiness = Arc::new(TestReadinessSink::default());
-        let denied_handle = create(&session, create_request(), readiness.clone()).unwrap();
+        let handle = create(&session, create_request(), readiness.clone()).unwrap();
         assert_eq!(
             provider.state.creates.lock().unwrap().last(),
             Some(&(session.session_id, create_request()))
         );
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
         assert_eq!(session.reserved_sockets.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            status(&other, denied_handle),
-            Err(BrokerError::UnknownObject)
-        );
+        assert_eq!(status(&other, handle), Err(BrokerError::UnknownObject));
         assert_eq!(
             connect(
                 &session,
-                denied_handle,
+                handle,
                 SocketAddressV4 {
                     address: Ipv4Address([10, 0, 0, 1]),
                     port: Port(80),
                 },
             ),
-            Ok(SocketConnectionStatus::Failed(SocketError::PolicyDenied))
+            Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
         );
         assert_eq!(
-            status(&session, denied_handle),
-            Ok(SocketConnectionStatus::Failed(SocketError::PolicyDenied))
+            status(&session, handle),
+            Ok(SocketConnectionStatus::Unconnected)
         );
-        session.close_object_reference(denied_handle).unwrap();
-        let handle = create(&session, create_request(), readiness.clone()).unwrap();
         assert_eq!(
             connect(&session, handle, loopback_address()),
-            Ok(SocketConnectionStatus::Connecting)
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
         );
         assert_eq!(
             readiness.published.lock().unwrap().as_slice(),
@@ -699,16 +682,10 @@ pub(crate) mod tests {
         let in_flight = socket_resource(&session, handle, ObjectRights::WAIT).unwrap();
         assert_eq!(session.close_object_reference(handle), Ok(()));
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            readiness.retired.lock().unwrap().as_slice(),
-            [denied_handle]
-        );
+        assert_eq!(readiness.retired.lock().unwrap().as_slice(), []);
         drop(in_flight);
-        assert_eq!(
-            readiness.retired.lock().unwrap().as_slice(),
-            [denied_handle, handle]
-        );
-        assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 2);
+        assert_eq!(readiness.retired.lock().unwrap().as_slice(), [handle]);
+        assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 1);
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
         assert_eq!(session.reserved_sockets.load(Ordering::Relaxed), 0);
         assert_eq!(provider.state.sent.lock().unwrap().as_slice(), [1, 2, 3]);
@@ -790,7 +767,9 @@ pub(crate) mod tests {
         );
         assert_eq!(
             connect(&session, handle, loopback_address()),
-            Ok(SocketConnectionStatus::Failed(SocketError::Other))
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
+                SocketError::Other
+            )))
         );
         assert_eq!(
             status(&session, handle),

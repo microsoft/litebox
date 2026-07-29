@@ -351,9 +351,14 @@ fn handle_socket_request<Memory: SharedMemory>(
             Ok(SocketResponse::Create(CreateSocketResponse { handle }))
         }
         SocketRequest::Connect(request) => {
-            litebox_broker_core::socket::connect(session, request.handle, request.address)
-                .map(|status| SocketResponse::Connect(ConnectSocketResponse { status }))
-                .map_err(socket_request_failure)
+            match litebox_broker_core::socket::connect(session, request.handle, request.address)
+                .map_err(socket_request_failure)?
+            {
+                SocketOutcome::Completed(status) => {
+                    Ok(SocketResponse::Connect(ConnectSocketResponse { status }))
+                }
+                SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
+            }
         }
         SocketRequest::Send(request) => {
             if request.buffer.length > MAX_SOCKET_TRANSFER_SIZE {
@@ -544,8 +549,8 @@ mod tests {
     use litebox_broker_protocol::socket::{
         AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, Ipv4Address, Port,
         ReceiveFlags, ReceiveSocketRequest, SendFlags, SendSocketRequest, ShutdownMode,
-        ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketStatusRequest,
-        SocketType,
+        ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
+        SocketStatusRequest, SocketType,
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
@@ -1070,6 +1075,20 @@ mod tests {
             panic!("expected successful socket creation");
         };
 
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
+                    handle: response.handle,
+                    address: SocketAddressV4 {
+                        address: Ipv4Address([10, 0, 0, 1]),
+                        port: Port(8080),
+                    },
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Socket(SocketResponse::Failed(SocketError::PolicyDenied))
+        );
         assert_eq!(
             handle_test_request_with_buffers(
                 &session,
