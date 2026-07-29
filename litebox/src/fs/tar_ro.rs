@@ -286,15 +286,6 @@ impl super::backend::Backend for TarRo {
         }
     }
 
-    fn chmod_at(&self, dir: DirHandle, name: &str, _mode: Mode) -> Result<(), ChmodError> {
-        let dir = dir.into_typed::<Self>();
-        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
-            Err(ChmodError::ReadOnlyFileSystem)
-        } else {
-            Err(PathError::NoSuchFileOrDirectory.into())
-        }
-    }
-
     fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
@@ -306,21 +297,6 @@ impl super::backend::Backend for TarRo {
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         Err(ChownError::ReadOnlyFileSystem)
-    }
-
-    fn chown_at(
-        &self,
-        dir: DirHandle,
-        name: &str,
-        _user: Option<u16>,
-        _group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        let dir = dir.into_typed::<Self>();
-        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
-            Err(ChownError::ReadOnlyFileSystem)
-        } else {
-            Err(PathError::NoSuchFileOrDirectory.into())
-        }
     }
 }
 

@@ -820,44 +820,4 @@ impl Backend for Composer {
             },
         }
     }
-
-    fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError> {
-        let dir = dir.into_typed::<Self>();
-        match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
-            ComposerDirHandleInner::Mounted {
-                path,
-                mount_index,
-                handle,
-            } => {
-                self.checked_child_path(path, name, ChmodError::ReadOnlyFileSystem)?;
-                self.mounts[mount_index]
-                    .backend
-                    .chmod_at(handle, name, mode)
-            }
-        }
-    }
-
-    fn chown_at(
-        &self,
-        dir: DirHandle,
-        name: &str,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        let dir = dir.into_typed::<Self>();
-        match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(ChownError::ReadOnlyFileSystem),
-            ComposerDirHandleInner::Mounted {
-                path,
-                mount_index,
-                handle,
-            } => {
-                self.checked_child_path(path, name, ChownError::ReadOnlyFileSystem)?;
-                self.mounts[mount_index]
-                    .backend
-                    .chown_at(handle, name, user, group)
-            }
-        }
-    }
 }

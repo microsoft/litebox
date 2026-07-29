@@ -191,6 +191,49 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             })
     }
 
+    /// Resolve `path` to an owned handle on the file or directory it names.
+    ///
+    /// The handle is taken with [`OFlags::PATH`], as it addresses the object for operations that
+    /// do not read or write its contents, and thus needs no access permissions on it.
+    fn path_handle(&self, context: &Context, path: &ResolvedPath) -> Result<Handle, WalkError> {
+        let map_open_error = |error| match error {
+            OpenError::PathError(error) => WalkError::PathError(error),
+            _ => WalkError::Io,
+        };
+        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
+        if components.is_empty() {
+            let root = self
+                .backend
+                .owned_dir_at(self.backend.root(), OFlags::PATH)
+                .map_err(map_open_error)?;
+            return Ok(Handle::Dir(root));
+        }
+        let (outcome, walked) = self.walk_path(
+            context,
+            self.backend.root(),
+            &components,
+            #[cfg(debug_assertions)]
+            &components,
+        )?;
+        match outcome.stop_reason {
+            WalkStopReason::CompleteDirectory => Ok(Handle::Dir(
+                self.backend
+                    .owned_dir_at(outcome.last, OFlags::PATH)
+                    .map_err(map_open_error)?,
+            )),
+            WalkStopReason::StoppedAtNonDirectory => Ok(Handle::File(
+                self.backend
+                    .open_file_at(outcome.last, components[walked], OFlags::PATH)
+                    .map_err(map_open_error)?
+                    .item,
+            )),
+            WalkStopReason::Continue => {
+                // `walk_path` validates stop reasons before returning.
+                unreachable!()
+            }
+        }
+    }
+
     fn walk_to_directory<'a>(
         &'a self,
         context: &Context,
@@ -607,21 +650,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         let context = default_context_pre_context_management_changes();
         let path = context.resolve(path)?;
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, &path)
-                .map_err(|error| match error {
-                    WalkError::Io => ChmodError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
-        else {
-            // TODO(jayb): Add backend support for mutating the root directory itself.
-            unimplemented!("chmod root directory")
-        };
-        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-            WalkError::Io => ChmodError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?;
-        self.backend.chmod_at(parent, name, mode)
+        let handle = self
+            .path_handle(&context, &path)
+            .map_err(|error| match error {
+                WalkError::Io => ChmodError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
+        self.backend.chmod(handle.as_ref(), mode)
     }
 
     fn chown(
@@ -632,21 +667,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     ) -> Result<(), ChownError> {
         let context = default_context_pre_context_management_changes();
         let path = context.resolve(path)?;
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, &path)
-                .map_err(|error| match error {
-                    WalkError::Io => ChownError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
-        else {
-            // TODO(jayb): Add backend support for mutating the root directory itself.
-            unimplemented!("chown root directory")
-        };
-        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-            WalkError::Io => ChownError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?;
-        self.backend.chown_at(parent, name, user, group)
+        let handle = self
+            .path_handle(&context, &path)
+            .map_err(|error| match error {
+                WalkError::Io => ChownError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
+        self.backend.chown(handle.as_ref(), user, group)
     }
 
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {

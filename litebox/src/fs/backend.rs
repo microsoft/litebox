@@ -147,9 +147,6 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     // XXX(jayb): I don't like that unlink and rmdir exist separately, we should probably merge them.
     fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError>;
 
-    /// Update the permissions for the file/dir `name` at `parent`.
-    fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError>;
-
     /// Update the permissions for the file/dir `h` refers to.
     fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError>;
 
@@ -157,15 +154,6 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     fn chown(
         &self,
         h: HandleRef<'_>,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError>;
-
-    /// Update the owner/group for the file/dir `name` at `parent`.
-    fn chown_at(
-        &self,
-        dir: DirHandle,
-        name: &str,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;

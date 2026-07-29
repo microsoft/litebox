@@ -376,10 +376,6 @@ where
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
-    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
-        Err(ChmodError::ReadOnlyFileSystem)
-    }
-
     fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
@@ -387,16 +383,6 @@ where
     fn chown(
         &self,
         _h: HandleRef<'_>,
-        _user: Option<u16>,
-        _group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        Err(ChownError::ReadOnlyFileSystem)
-    }
-
-    fn chown_at(
-        &self,
-        _dir: DirHandle,
-        _name: &str,
         _user: Option<u16>,
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
