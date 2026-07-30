@@ -45,9 +45,13 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::Handle;
-use crate::{ConstPtr, MutPtr, ShimFS, Task, raw_handle_entry};
+use crate::{
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
+};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
+use crate::nt_types::{
+    AccessMask, IoStatusBlock, ObjectAttributes, UnicodeString, read_object_attributes,
+};
 
 type RegistryFileSystem<Platform> = litebox::fs::layered::FileSystem<
     Platform,
@@ -158,6 +162,31 @@ bitflags::bitflags! {
         const OPEN_LINK = 0x0000_0008;
         const DONT_VIRTUALIZE = 0x0000_0010;
     }
+}
+
+bitflags::bitflags! {
+    /// Changes accepted by `NtNotifyChangeKey`.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RegistryNotifyFilter: u32 {
+        const NAME = 0x0000_0001;
+        const ATTRIBUTES = 0x0000_0002;
+        const LAST_SET = 0x0000_0004;
+        const SECURITY = 0x0000_0008;
+        const THREAD_AGNOSTIC = 0x1000_0000;
+    }
+}
+
+pub(crate) struct NtNotifyChangeKeyRequest<Platform: litebox::platform::RawPointerProvider> {
+    pub(crate) key_handle: Handle,
+    pub(crate) event: Handle,
+    pub(crate) apc_routine: Option<ConstPtr<Platform, u8>>,
+    pub(crate) apc_context: Option<ConstPtr<Platform, u8>>,
+    pub(crate) io_status_block: MutPtr<Platform, IoStatusBlock>,
+    pub(crate) completion_filter: u32,
+    pub(crate) watch_tree: bool,
+    pub(crate) buffer: Option<MutPtr<Platform, u8>>,
+    pub(crate) buffer_size: u32,
+    pub(crate) asynchronous: bool,
 }
 
 impl RegistryKeyAccess {
@@ -868,6 +897,72 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(()) => NtStatus::SUCCESS,
             Err(status) => status,
         }
+    }
+
+    pub(crate) fn sys_nt_notify_change_key(
+        &self,
+        params: NtNotifyChangeKeyRequest<Platform>,
+    ) -> NtStatus {
+        if let Err(status) = self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+            params.key_handle,
+            RegistryKeyAccess::NOTIFY.bits(),
+        ) {
+            return status;
+        }
+        let Some(completion_filter) = RegistryNotifyFilter::from_bits(params.completion_filter)
+        else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(params.io_status_block)
+            .is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if !params.asynchronous {
+            // TODO(registry-notify): Block until a matching registry mutation completes the request.
+            return NtStatus::NOT_IMPLEMENTED;
+        }
+        if !params.event.is_null()
+            && let Err(status) = self.check_event_modify_access(params.event)
+        {
+            return status;
+        }
+        if !params.event.is_null()
+            && let Err(status) = self.clear_event(params.event)
+        {
+            return status;
+        }
+        if params
+            .io_status_block
+            .write_at_offset(0, IoStatusBlock::new(NtStatus::PENDING, 0))
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        if params.apc_routine.is_some()
+            || params.apc_context.is_some()
+            || params.buffer.is_some()
+            || params.buffer_size != 0
+        {
+            litebox_util_log::warn!(
+                key_handle = params.key_handle.as_raw(),
+                apc_routine = params.apc_routine.is_some(),
+                apc_context = params.apc_context.is_some(),
+                buffer = params.buffer.is_some(),
+                buffer_size = params.buffer_size;
+                "NtNotifyChangeKey completion data cannot be delivered without registry change subscriptions"
+            );
+        }
+        litebox_util_log::debug!(
+            key_handle = params.key_handle.as_raw(),
+            completion_filter = completion_filter.bits(),
+            watch_tree = params.watch_tree,
+            asynchronous = params.asynchronous;
+            "Registered pending NtNotifyChangeKey request without a change subscription"
+        );
+        // TODO(registry-notify): Retain the request and complete it when a matching key changes.
+        NtStatus::PENDING
     }
 
     pub(crate) fn sys_nt_query_key(
@@ -1879,6 +1974,26 @@ mod tests {
         );
     }
 
+    fn notify_params(
+        key_handle: Handle,
+        io_status_block: &mut IoStatusBlock,
+        completion_filter: u32,
+        asynchronous: bool,
+    ) -> NtNotifyChangeKeyRequest<TestPlatform> {
+        NtNotifyChangeKeyRequest {
+            key_handle,
+            event: Handle::default(),
+            apc_routine: None,
+            apc_context: None,
+            io_status_block: mut_ptr(io_status_block),
+            completion_filter,
+            watch_tree: false,
+            buffer: None,
+            buffer_size: 0,
+            asynchronous,
+        }
+    }
+
     #[test]
     fn nt_set_value_key_replaces_and_round_trips_raw_types_and_empty_data() {
         let task = crate::tests::test_task();
@@ -2040,6 +2155,138 @@ mod tests {
         assert_eq!(
             open_key(&task, object_attributes).unwrap_err(),
             NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn nt_notify_change_key_registers_pending_without_false_completion() {
+        let task = crate::tests::test_task();
+        let key_name_utf16 = utf16(r"\Registry\Machine\Software\LiteBoxNotifyChangeKey");
+        let key_name = unicode_string(&key_name_utf16);
+        let object_attributes = object_attributes(&key_name, 0);
+        let mut key = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut key),
+                (RegistryKeyAccess::NOTIFY | RegistryKeyAccess::SET_VALUE).bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0,
+                None,
+            ),
+            NtStatus::SUCCESS
+        );
+        let mut event = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_event(
+                mut_ptr(&mut event),
+                AccessMask::GENERIC_ALL.bits(),
+                None,
+                0,
+                1,
+            ),
+            NtStatus::SUCCESS
+        );
+        let mut io_status = IoStatusBlock::default();
+        let notify_params = NtNotifyChangeKeyRequest {
+            key_handle: key,
+            event,
+            apc_routine: None,
+            apc_context: None,
+            io_status_block: mut_ptr(&mut io_status),
+            completion_filter: (RegistryNotifyFilter::LAST_SET
+                | RegistryNotifyFilter::THREAD_AGNOSTIC)
+                .bits(),
+            watch_tree: true,
+            buffer: None,
+            buffer_size: 0,
+            asynchronous: true,
+        };
+        assert_eq!(
+            task.sys_nt_notify_change_key(notify_params),
+            NtStatus::PENDING
+        );
+        assert_eq!(io_status.status, NtStatus::PENDING.as_raw());
+        let zero_timeout = 0i64;
+        assert_eq!(
+            task.sys_nt_wait_for_single_object(event, false, Some(const_ptr(&zero_timeout)),),
+            NtStatus::TIMEOUT
+        );
+
+        let value_name_utf16 = utf16("Changed");
+        let value_name = unicode_string(&value_name_utf16);
+        let value = 1u32;
+        assert_eq!(
+            task.sys_nt_set_value_key(
+                key,
+                const_ptr(&value_name),
+                0,
+                u32::from(RegistryValueType::Dword),
+                Some(const_byte_ptr(&value)),
+                size_of::<u32>().trunc(),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_wait_for_single_object(event, false, Some(const_ptr(&zero_timeout)),),
+            NtStatus::TIMEOUT,
+            "writes must not falsely complete an unretained notification"
+        );
+        assert_eq!(io_status.status, NtStatus::PENDING.as_raw());
+    }
+
+    #[test]
+    fn nt_notify_change_key_validates_access_filters_and_synchronous_mode() {
+        let task = crate::tests::test_task();
+        let key_name_utf16 = utf16(r"\Registry\Machine\Software\LiteBoxNotifyValidation");
+        let key_name = unicode_string(&key_name_utf16);
+        let object_attributes = object_attributes(&key_name, 0);
+        let mut notify_key = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut notify_key),
+                RegistryKeyAccess::NOTIFY.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0,
+                None,
+            ),
+            NtStatus::SUCCESS
+        );
+        let mut query_key = Handle::default();
+        assert_eq!(
+            task.sys_nt_open_key(
+                mut_ptr(&mut query_key),
+                RegistryKeyAccess::QUERY_VALUE.bits(),
+                Some(const_ptr(&object_attributes)),
+            ),
+            NtStatus::SUCCESS
+        );
+        let mut io_status = IoStatusBlock::default();
+
+        assert_eq!(
+            task.sys_nt_notify_change_key(notify_params(
+                query_key,
+                &mut io_status,
+                RegistryNotifyFilter::NAME.bits(),
+                true,
+            )),
+            NtStatus::ACCESS_DENIED
+        );
+        assert_eq!(
+            task.sys_nt_notify_change_key(notify_params(notify_key, &mut io_status, 0x10, true)),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(
+            task.sys_nt_notify_change_key(notify_params(
+                notify_key,
+                &mut io_status,
+                RegistryNotifyFilter::SECURITY.bits(),
+                false,
+            )),
+            NtStatus::NOT_IMPLEMENTED
         );
     }
 

@@ -39,7 +39,9 @@ use crate::syscalls::lpc::{LpcPortHandleObject, LpcPortSubsystem};
 use crate::syscalls::object_manager::{
     DirectoryHandleObject, DirectoryObjectSubsystem, ObjectManager,
 };
-use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::registry::{
+    NtNotifyChangeKeyRequest, RegistryKeyObject, RegistryKeySubsystem,
+};
 use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
 };
@@ -1473,6 +1475,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 data,
                 data_size,
             ),
+            SyscallRequest::NtNotifyChangeKey {
+                key_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                completion_filter,
+                watch_tree,
+                buffer,
+                buffer_size,
+                asynchronous,
+            } => self.sys_nt_notify_change_key(NtNotifyChangeKeyRequest {
+                key_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                completion_filter,
+                watch_tree,
+                buffer,
+                buffer_size,
+                asynchronous,
+            }),
             SyscallRequest::NtGetNlsSectionPtr {
                 section_type,
                 section_data,
