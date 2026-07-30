@@ -10,6 +10,7 @@ use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroPageSize};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::loader::PAGE_SIZE;
 use litebox_common_windows::nt_status::NtStatus;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::nt_types::ProcessEnvironmentBlock;
 use crate::{MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value, write_value};
@@ -24,6 +25,255 @@ const NLS_SECTION_SORTKEYS: u32 = 9;
 const NLS_SECTION_CASEMAP: u32 = 10;
 const NLS_SECTION_CODEPAGE: u32 = 11;
 const NLS_SECTION_NORMALIZE: u32 = 12;
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct MuiRegistryInfoFlags: u32 {
+        const QUERY = 0x1;
+        const CLEAR = 0x2;
+        const COMMIT = 0x8;
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+struct MuiRegistryInfo {
+    owned: u32,
+    install_language_fallback: [u16; 4],
+    generation: u32,
+    process_generation: u32,
+    padding_14: [u8; 4],
+    installed_offset: u64,
+    strings_offset: u64,
+    machine_config_offset: u64,
+    user_config_offset: u64,
+    machine_preferred_offset: u64,
+    user_preferred_offset: u64,
+    process_preferred_offset: u64,
+    merged_user_offset: u64,
+    merged_machine_offset: u64,
+    merged_fallback_offset: u64,
+    previous_registry_info_offset: u64,
+    locked: u32,
+    secure_environment: u32,
+    number_allowed: u32,
+    padding_7c: [u8; 4],
+    allowed_language_offset: u64,
+    installed_sku_offset: u64,
+    installed_sku_size: u32,
+    allowed_language_size: u32,
+    disallowed_language_offset: u64,
+    disallowed_language_size: u32,
+    padding_a4: [u8; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+struct MuiLanguages {
+    total_size: u32,
+    max_languages: u16,
+    languages: u16,
+    installed_languages: u16,
+    padding_a: [u8; 6],
+    language_info_offset: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+struct MuiLanguageInfo {
+    flags: u16,
+    reserved: u16,
+    language_id: u16,
+    language_name_index: i16,
+    fallback_types: u16,
+    neutral_language_index: i16,
+    fallback_indices: [i16; 4],
+    alternate_code_pages: [i16; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+struct MuiStringPool {
+    total_size: u32,
+    max_strings: u16,
+    strings: u16,
+    max_characters: u16,
+    characters: u16,
+    padding_c: [u8; 4],
+    string_indices_offset: u64,
+    pool_offset: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+struct MuiLanguageConfigList {
+    total_size: u32,
+    languages: u16,
+    max_languages: u16,
+    language_configs_offset: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+struct MuiLanguageConfigNode {
+    language_index: i16,
+    fallback_types: u16,
+    reserved: u16,
+    fallback_indices: [i16; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+pub(crate) struct MuiRegistryData {
+    registry_info: MuiRegistryInfo,
+    installed: MuiLanguages,
+    language_info: [MuiLanguageInfo; 4],
+    strings: MuiStringPool,
+    string_indices: [i16; 4],
+    string_pool: [u16; 40],
+    machine_config: MuiLanguageConfigList,
+    language_config: MuiLanguageConfigNode,
+    padding_1c4: [u8; 4],
+    installed_sku: [u16; 387],
+    padding_4ce: [u8; 2],
+}
+
+const MUI_REGISTRY_DATA_SIZE: u32 = 1232;
+const MUI_INSTALLED_SIZE: u32 = 0x88;
+const MUI_STRING_POOL_SIZE: u32 = 0x78;
+const MUI_MACHINE_CONFIG_SIZE: u32 = 0x1c;
+const MUI_INSTALLED_SKU_SIZE: u32 = 0x306;
+const MUI_INSTALLED_OFFSET: u64 = core::mem::offset_of!(MuiRegistryData, installed) as u64;
+const MUI_STRINGS_OFFSET: u64 = core::mem::offset_of!(MuiRegistryData, strings) as u64;
+const MUI_MACHINE_CONFIG_OFFSET: u64 =
+    core::mem::offset_of!(MuiRegistryData, machine_config) as u64;
+const MUI_INSTALLED_SKU_OFFSET: u64 = core::mem::offset_of!(MuiRegistryData, installed_sku) as u64;
+const EMPTY_MUI_LANGUAGE_INFO: MuiLanguageInfo = MuiLanguageInfo {
+    flags: 0,
+    reserved: 0,
+    language_id: 0,
+    language_name_index: 0,
+    fallback_types: 0,
+    neutral_language_index: 0,
+    fallback_indices: [0; 4],
+    alternate_code_pages: [0; 4],
+};
+
+const INSTALLED_SKU_BYTES: &[u8] = b"en-US\0en-AU\0en-CA\0en-GB\0en-HK\0en-IE\0en-NZ\0en-SG\0\
+ar-SA\0pt-BR\0zh-TW\0zh-CN\0zh-HK\0zh-SG\0cs-CZ\0da-DK\0el-GR\0es-AR\0es-CL\0\
+es-CO\0es-ES\0es-MX\0es-US\0fi-FI\0fr-BE\0fr-CA\0fr-CH\0fr-FR\0de-AT\0de-CH\0\
+de-DE\0he-IL\0hu-HU\0it-IT\0ja-JP\0ko-KR\0nl-BE\0nl-NL\0nb-NO\0pl-PL\0pt-PT\0\
+ru-RU\0sv-SE\0tr-TR\0bg-BG\0hr-HR\0et-EE\0lv-LV\0lt-LT\0ro-RO\0sr-Latn-CS\0\
+sr-Latn-RS\0sk-SK\0sl-SI\0th-TH\0uk-UA\0fy-NL\0qps-ploc\0qps-plocm\0\
+qps-Latn-x-sh\0\0\0";
+const _: () = assert!(core::mem::size_of::<MuiRegistryData>() == 1232);
+const _: () = assert!(core::mem::size_of::<[u16; 387]>() == 774);
+
+const fn utf16_from_ascii<const N: usize>(bytes: &[u8]) -> [u16; N] {
+    assert!(bytes.len() == N);
+    let mut output = [0; N];
+    let mut index = 0;
+    while index < bytes.len() {
+        output[index] = bytes[index] as u16;
+        index += 1;
+    }
+    output
+}
+
+// TODO(mui-registry-info): Build these records from the guest registry when installed-language
+// configuration becomes mutable. This host-captured en-US layout matches the shim's fixed locale
+// and keeps every serialized offset backed by its complete native structure.
+fn mui_registry_data(generation: u32) -> MuiRegistryData {
+    MuiRegistryData {
+        registry_info: MuiRegistryInfo {
+            owned: 0x400,
+            install_language_fallback: [0x0409, 0, 0, 0],
+            generation,
+            process_generation: 0,
+            padding_14: [0; 4],
+            installed_offset: MUI_INSTALLED_OFFSET,
+            strings_offset: MUI_STRINGS_OFFSET,
+            machine_config_offset: MUI_MACHINE_CONFIG_OFFSET,
+            user_config_offset: 0,
+            machine_preferred_offset: 0,
+            user_preferred_offset: 0,
+            process_preferred_offset: 0,
+            merged_user_offset: 0,
+            merged_machine_offset: 0,
+            merged_fallback_offset: 0,
+            previous_registry_info_offset: 0,
+            locked: 0,
+            secure_environment: 0,
+            number_allowed: 1000,
+            padding_7c: [0; 4],
+            allowed_language_offset: 0,
+            installed_sku_offset: MUI_INSTALLED_SKU_OFFSET,
+            installed_sku_size: MUI_INSTALLED_SKU_SIZE,
+            allowed_language_size: 0,
+            disallowed_language_offset: 0,
+            disallowed_language_size: 0,
+            padding_a4: [0; 4],
+        },
+        installed: MuiLanguages {
+            total_size: MUI_INSTALLED_SIZE,
+            max_languages: 4,
+            languages: 1,
+            installed_languages: 0,
+            padding_a: [0; 6],
+            language_info_offset: 0,
+        },
+        language_info: [
+            MuiLanguageInfo {
+                flags: 0x0931,
+                reserved: 0,
+                language_id: 0x0409,
+                language_name_index: 1,
+                fallback_types: 0,
+                neutral_language_index: 0,
+                fallback_indices: [0; 4],
+                alternate_code_pages: [0; 4],
+            },
+            EMPTY_MUI_LANGUAGE_INFO,
+            EMPTY_MUI_LANGUAGE_INFO,
+            EMPTY_MUI_LANGUAGE_INFO,
+        ],
+        strings: MuiStringPool {
+            total_size: MUI_STRING_POOL_SIZE,
+            max_strings: 4,
+            strings: 2,
+            max_characters: 40,
+            characters: 8,
+            padding_c: [0; 4],
+            string_indices_offset: 0,
+            pool_offset: 0,
+        },
+        string_indices: [0, 1, 0, 0],
+        string_pool: {
+            let mut pool = [0; 40];
+            pool[1] = u16::from(b'e');
+            pool[2] = u16::from(b'n');
+            pool[3] = u16::from(b'-');
+            pool[4] = u16::from(b'U');
+            pool[5] = u16::from(b'S');
+            pool
+        },
+        machine_config: MuiLanguageConfigList {
+            total_size: MUI_MACHINE_CONFIG_SIZE,
+            languages: 0,
+            max_languages: 1,
+            language_configs_offset: 0,
+        },
+        language_config: MuiLanguageConfigNode {
+            language_index: 0,
+            fallback_types: 0,
+            reserved: 0,
+            fallback_indices: [0; 3],
+        },
+        padding_1c4: [0; 4],
+        installed_sku: utf16_from_ascii(INSTALLED_SKU_BYTES),
+        padding_4ce: [0; 2],
+    }
+}
 
 struct NlsSectionRequest<Platform: RawPointerProvider> {
     section_type: u32,
@@ -53,6 +303,93 @@ struct NlsSectionFile<FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn sys_nt_get_mui_registry_info(
+        &self,
+        flags: u32,
+        data_size: Option<MutPtr<Platform, u32>>,
+        data: Option<MutPtr<Platform, MuiRegistryData>>,
+    ) -> NtStatus {
+        let flags = if flags == 0 {
+            MuiRegistryInfoFlags::QUERY
+        } else {
+            let Some(flags) = MuiRegistryInfoFlags::from_bits(flags) else {
+                return NtStatus::INVALID_PARAMETER;
+            };
+            flags
+        };
+
+        let supplied_size = match data_size {
+            Some(data_size) => match data_size.read_at_offset(0) {
+                Some(size) => size,
+                None => return NtStatus::ACCESS_VIOLATION,
+            },
+            None if flags
+                .intersects(MuiRegistryInfoFlags::CLEAR | MuiRegistryInfoFlags::COMMIT) =>
+            {
+                0
+            }
+            None => return NtStatus::INVALID_PARAMETER,
+        };
+
+        if (supplied_size == 0 && data.is_some()) || (supplied_size != 0 && data.is_none()) {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        if !flags.contains(MuiRegistryInfoFlags::QUERY) {
+            if flags.contains(MuiRegistryInfoFlags::COMMIT) {
+                self.global
+                    .mui_generation
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            return NtStatus::SUCCESS;
+        }
+
+        let Some(data_size) = data_size else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if supplied_size == 0 {
+            return write_required_output::<Platform, u32>(data_size, MUI_REGISTRY_DATA_SIZE);
+        }
+        if supplied_size < MUI_REGISTRY_DATA_SIZE {
+            return if data_size
+                .write_at_offset(0, MUI_REGISTRY_DATA_SIZE)
+                .is_some()
+            {
+                NtStatus::BUFFER_TOO_SMALL
+            } else {
+                NtStatus::ACCESS_VIOLATION
+            };
+        }
+
+        if data_size
+            .write_at_offset(0, MUI_REGISTRY_DATA_SIZE)
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let Some(data) = data else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let generation = self
+            .global
+            .mui_generation
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if data
+            .write_at_offset(0, mui_registry_data(generation))
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            flags:? = flags,
+            data_size = MUI_REGISTRY_DATA_SIZE,
+            generation;
+            "Handled NtGetMUIRegistryInfo syscall"
+        );
+        NtStatus::SUCCESS
+    }
+
     pub(crate) fn sys_nt_get_nls_section_ptr(
         &self,
         section_type: u32,
@@ -573,6 +910,8 @@ mod tests {
             default_casing_table_size: *mut i64,
         ) -> i32;
 
+        fn NtGetMUIRegistryInfo(flags: u32, data_size: *mut u32, data: *mut u8) -> i32;
+
         fn NtQueryDefaultLocale(user_profile: u8, default_locale_id: *mut u32) -> i32;
 
         fn NtQueryDefaultUILanguage(default_ui_language: *mut u16) -> i32;
@@ -596,6 +935,128 @@ mod tests {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     fn host_status(status: i32) -> NtStatus {
         NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
+    }
+
+    #[test]
+    fn nt_get_mui_registry_info_queries_and_fills_host_shaped_data() {
+        let task = crate::tests::test_task();
+        let mut data_size = 0u32;
+
+        assert_eq!(
+            task.sys_nt_get_mui_registry_info(0, Some(mut_ptr(&mut data_size)), None,),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(data_size, 1232);
+
+        let mut data = mui_registry_data(0);
+        assert_eq!(
+            task.sys_nt_get_mui_registry_info(
+                MuiRegistryInfoFlags::QUERY.bits(),
+                Some(mut_ptr(&mut data_size)),
+                Some(mut_ptr(&mut data)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(data.registry_info.install_language_fallback[0], 0x0409);
+        assert_eq!(data.registry_info.installed_offset, 0xa8);
+        assert_eq!(data.registry_info.strings_offset, 0x130);
+        assert_eq!(data.registry_info.machine_config_offset, 0x1a8);
+        assert_eq!(data.registry_info.installed_sku_offset, 0x1c8);
+        assert_eq!(data.installed.total_size, 0x88);
+        assert_eq!(data.language_info[0].language_id, 0x0409);
+        assert_eq!(
+            &data.string_pool[1..7],
+            &[
+                u16::from(b'e'),
+                u16::from(b'n'),
+                u16::from(b'-'),
+                u16::from(b'U'),
+                u16::from(b'S'),
+                0
+            ]
+        );
+    }
+
+    #[test]
+    fn nt_get_mui_registry_info_reports_required_size_without_touching_short_buffer() {
+        let task = crate::tests::test_task();
+        let mut data_size = MUI_REGISTRY_DATA_SIZE - 1;
+        let mut data = mui_registry_data(0xfeed_beef);
+        let before = data;
+
+        assert_eq!(
+            task.sys_nt_get_mui_registry_info(
+                MuiRegistryInfoFlags::QUERY.bits(),
+                Some(mut_ptr(&mut data_size)),
+                Some(mut_ptr(&mut data)),
+            ),
+            NtStatus::BUFFER_TOO_SMALL
+        );
+        assert_eq!(data_size, MUI_REGISTRY_DATA_SIZE);
+        assert_eq!(data, before);
+    }
+
+    #[test]
+    fn nt_get_mui_registry_info_rejects_invalid_flags_and_buffer_shapes() {
+        let task = crate::tests::test_task();
+        let mut data_size = 0u32;
+        let mut data = mui_registry_data(0);
+
+        assert_eq!(
+            task.sys_nt_get_mui_registry_info(0x4, Some(mut_ptr(&mut data_size)), None,),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(
+            task.sys_nt_get_mui_registry_info(
+                0,
+                Some(mut_ptr(&mut data_size)),
+                Some(mut_ptr(&mut data)),
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
+        data_size = MUI_REGISTRY_DATA_SIZE;
+        assert_eq!(
+            task.sys_nt_get_mui_registry_info(0, Some(mut_ptr(&mut data_size)), None,),
+            NtStatus::INVALID_PARAMETER
+        );
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn nt_get_mui_registry_info_matches_host_query_contract_and_layout() {
+        let mut host_size = 0u32;
+        // SAFETY: This is the host's documented size-query shape: a writable size pointer and a
+        // null data buffer.
+        let status = unsafe {
+            NtGetMUIRegistryInfo(0, core::ptr::addr_of_mut!(host_size), core::ptr::null_mut())
+        };
+        assert_eq!(host_status(status), NtStatus::SUCCESS);
+        assert_eq!(host_size, MUI_REGISTRY_DATA_SIZE);
+
+        let mut host_data = mui_registry_data(0);
+        // SAFETY: `host_data` is a writable buffer of the size returned by the host query.
+        let status = unsafe {
+            NtGetMUIRegistryInfo(
+                0,
+                core::ptr::addr_of_mut!(host_size),
+                core::ptr::addr_of_mut!(host_data).cast(),
+            )
+        };
+        assert_eq!(host_status(status), NtStatus::SUCCESS);
+        assert_eq!(
+            host_data.registry_info.installed_offset,
+            MUI_INSTALLED_OFFSET
+        );
+        assert_eq!(host_data.registry_info.strings_offset, MUI_STRINGS_OFFSET);
+        assert_eq!(
+            host_data.registry_info.machine_config_offset,
+            MUI_MACHINE_CONFIG_OFFSET
+        );
+        assert_eq!(
+            host_data.registry_info.installed_sku_offset,
+            MUI_INSTALLED_SKU_OFFSET
+        );
+        assert_eq!(host_data.language_info[0].language_id, 0x0409);
     }
 
     #[test]

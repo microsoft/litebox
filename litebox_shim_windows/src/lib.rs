@@ -447,6 +447,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
             wnf_states: syscalls::wnf::WnfStateStore::new(
                 syscalls::wnf::WnfStateStoreData::default(),
             ),
+            mui_generation: AtomicU32::new(1),
             qpc_boot_instant: TimeProvider::now(self.platform),
             litebox: self.litebox,
             _fs: PhantomData,
@@ -565,6 +566,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     page_manager: WindowsPageManager<Platform>,
     registry: syscalls::registry::RegistryStore<Platform>,
     wnf_states: syscalls::wnf::WnfStateStore<Platform>,
+    mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
     litebox: LiteBox<Platform>,
     _fs: PhantomData<FS>,
@@ -1523,6 +1525,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 buffer_size,
                 asynchronous,
             }),
+            SyscallRequest::NtGetMUIRegistryInfo {
+                flags,
+                data_size,
+                data,
+            } => self.sys_nt_get_mui_registry_info(flags, data_size, data),
             SyscallRequest::NtGetNlsSectionPtr {
                 section_type,
                 section_data,

@@ -451,6 +451,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         buffer_size: u32,
         asynchronous: bool,
     },
+    NtGetMUIRegistryInfo {
+        flags: u32,
+        data_size: Option<Platform::RawMutPointer<u32>>,
+        data: Option<Platform::RawMutPointer<nls::MuiRegistryData>>,
+    },
     NtGetNlsSectionPtr {
         section_type: u32,
         section_data: u32,
@@ -1075,6 +1080,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 buffer:*,
                 buffer_size,
                 asynchronous:{|value: u8| value != 0},
+            })),
+            NtSysno::NtGetMUIRegistryInfo => Some(sys_req!(NtGetMUIRegistryInfo {
+                flags,
+                data_size:*,
+                data:*,
             })),
             NtSysno::NtGetNlsSectionPtr => Some(sys_req!(NtGetNlsSectionPtr {
                 section_type,
