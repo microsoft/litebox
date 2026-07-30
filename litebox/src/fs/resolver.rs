@@ -172,6 +172,13 @@ impl ResolvedPath {
     }
 }
 
+/// A directory reached by a walk, plus the permission metadata to check against it.
+struct WalkedDir<'a> {
+    handle: WalkingDirHandle<'a>,
+    /// `None` when the walk ended at the backend root, which reports no permission metadata.
+    permissions: Option<PermissionCheck>,
+}
+
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     super::private::Sealed for Resolver<Platform, Backend>
 {
@@ -184,7 +191,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         &self,
         context: &Context,
         path: &'a ResolvedPath,
-    ) -> Result<Option<(WalkingDirHandle<'_>, &'a str)>, WalkError> {
+    ) -> Result<Option<(WalkedDir<'_>, &'a str)>, WalkError> {
         // Return the walking handle rather than an owned directory handle so backends can keep any
         // locks acquired during path resolution held across the final operation. This lets e.g.
         // "walk parent + mutate child" stay atomic.
@@ -199,6 +206,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             &parent_components,
         )?;
         Ok(Some((parent, name)))
+    }
+
+    /// Whether `context` may add or remove entries in `dir`.
+    ///
+    /// A `dir` without permission metadata is the backend root, which the backend does not report
+    /// permissions for; such directories are currently left unchecked.
+    // TODO(jayb): Check write permission on the root directory too. That needs the backend to
+    // report permissions for [`super::backend::Backend::root`].
+    // TODO(jayb): Prioritize `EROFS` before this permission check runs; currently not an issue due
+    // to 0777 from read-only backends, but needs an update then.
+    fn can_change_entries_in_dir(context: &Context, dir: &WalkedDir<'_>) -> bool {
+        match &dir.permissions {
+            None | Some(PermissionCheck::ByBackend) => true,
+            Some(PermissionCheck::ByResolver(permissions)) => context.can_write(permissions),
+        }
     }
 
     fn owned_parent_dir(&self, dir: WalkingDirHandle<'_>) -> Result<DirHandle, WalkError> {
@@ -262,10 +284,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         from: WalkingDirHandle<'a>,
         components: &[&str],
         #[cfg(debug_assertions)] absolute_components: &[&str],
-    ) -> Result<WalkingDirHandle<'a>, WalkError> {
+    ) -> Result<WalkedDir<'a>, WalkError> {
         if components.is_empty() {
             // TODO(jayb): Decide whether empty walks from a non-root handle need permission checks.
-            return Ok(from);
+            return Ok(WalkedDir {
+                handle: from,
+                permissions: None,
+            });
         }
 
         let outcome =
@@ -287,7 +312,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         match outcome.stop_reason {
             WalkStopReason::CompleteDirectory => {
                 assert_eq!(outcome.components.len(), components.len());
-                Ok(outcome.last)
+                let permissions = outcome
+                    .components
+                    .last()
+                    .map(|component| component.permissions.clone());
+                Ok(WalkedDir {
+                    handle: outcome.last,
+                    permissions,
+                })
             }
             WalkStopReason::StoppedAtNonDirectory => {
                 Err(WalkError::PathError(PathError::ComponentNotADirectory))
@@ -489,10 +521,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         WalkError::Io => OpenError::Io,
                         WalkError::PathError(error) => error.into(),
                     })?;
-                let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-                    WalkError::Io => OpenError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?;
+                if !Self::can_change_entries_in_dir(context, &parent) {
+                    return Err(OpenError::NoWritePerms);
+                }
+                let parent = self
+                    .owned_parent_dir(parent.handle)
+                    .map_err(|error| match error {
+                        WalkError::Io => OpenError::Io,
+                        WalkError::PathError(error) => error.into(),
+                    })?;
                 let file = self.backend.create_file_at(parent, name, mode)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
                 Ok(insert(Handle::File(file), seek_behavior))
@@ -714,10 +751,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(UnlinkError::IsADirectory);
         };
-        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-            WalkError::Io => UnlinkError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?;
+        if !Self::can_change_entries_in_dir(context, &parent) {
+            return Err(UnlinkError::NoWritePerms);
+        }
+        let parent = self
+            .owned_parent_dir(parent.handle)
+            .map_err(|error| match error {
+                WalkError::Io => UnlinkError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
         self.backend.unlink_at(parent, name)
     }
 
@@ -733,10 +775,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(MkdirError::AlreadyExists);
         };
-        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-            WalkError::Io => MkdirError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?;
+        if !Self::can_change_entries_in_dir(context, &parent) {
+            return Err(MkdirError::NoWritePerms);
+        }
+        let parent = self
+            .owned_parent_dir(parent.handle)
+            .map_err(|error| match error {
+                WalkError::Io => MkdirError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
         self.backend.mkdir_at(parent, name, mode).map(|_| ())
     }
 
@@ -752,10 +799,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(RmdirError::Busy);
         };
-        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-            WalkError::Io => RmdirError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?;
+        if !Self::can_change_entries_in_dir(context, &parent) {
+            return Err(RmdirError::NoWritePerms);
+        }
+        let parent = self
+            .owned_parent_dir(parent.handle)
+            .map_err(|error| match error {
+                WalkError::Io => RmdirError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
         self.backend.rmdir_at(parent, name)
     }
 

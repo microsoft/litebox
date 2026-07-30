@@ -357,6 +357,61 @@ mod in_mem {
     }
 
     #[test]
+    fn parent_dir_write_permissions_are_enforced() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = super::in_mem_fs(&litebox);
+
+        in_mem::with_root_privileges(&mut fs, |fs| {
+            // A root-owned 0755 directory, holding a file and a directory to try to remove.
+            fs.mkdir(
+                "/rootdir",
+                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            )
+            .expect("Failed to create directory");
+            let fd = fs
+                .open("/rootdir/file", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.close(&fd).expect("Failed to close file");
+            fs.mkdir("/rootdir/sub", Mode::RWXU)
+                .expect("Failed to create subdirectory");
+
+            // A world-writable directory, for the positive case.
+            fs.mkdir("/opendir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to create directory");
+        });
+
+        in_mem::with_user(&mut fs, 1000, 1000, |fs| {
+            assert!(matches!(
+                fs.open("/rootdir/new", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU),
+                Err(crate::fs::errors::OpenError::NoWritePerms)
+            ));
+            assert!(matches!(
+                fs.mkdir("/rootdir/newdir", Mode::RWXU),
+                Err(crate::fs::errors::MkdirError::NoWritePerms)
+            ));
+            assert!(matches!(
+                fs.unlink("/rootdir/file"),
+                Err(crate::fs::errors::UnlinkError::NoWritePerms)
+            ));
+            assert!(matches!(
+                fs.rmdir("/rootdir/sub"),
+                Err(crate::fs::errors::RmdirError::NoWritePerms)
+            ));
+
+            // The same operations succeed in a directory the user may write.
+            let fd = fs
+                .open("/opendir/new", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.close(&fd).expect("Failed to close file");
+            fs.mkdir("/opendir/newdir", Mode::RWXU)
+                .expect("Failed to create directory");
+            fs.unlink("/opendir/new").expect("Failed to unlink file");
+            fs.rmdir("/opendir/newdir")
+                .expect("Failed to remove directory");
+        });
+    }
+
+    #[test]
     fn chown_test() {
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
