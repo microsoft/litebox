@@ -10,23 +10,13 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     CreateSocketRequest, ReceiveFlags, ReceiveSocketResponse, SendFlags, ShutdownMode,
-    SocketAddressV4, SocketConnectionStatus, SocketError, SocketStatusResponse,
+    SocketAddressV4, SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse,
 };
 use spin::Once;
 
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result, SessionId};
-
-/// Result of a platform socket operation that can fail with a network outcome.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[must_use]
-pub enum SocketOutcome<T> {
-    /// The operation completed successfully.
-    Completed(T),
-    /// The platform reported an ordinary network failure.
-    Failed(SocketError),
-}
 
 /// Broker-wide socket provider supplied by the host platform.
 ///

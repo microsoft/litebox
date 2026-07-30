@@ -14,13 +14,13 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_cha
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use litebox_broker_core::socket::{PlatformSocket, SocketOutcome, SocketProvider};
+use litebox_broker_core::socket::{PlatformSocket, SocketProvider};
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, ReceiveFlags, ReceiveSocketResponse, SendFlags,
-    ShutdownMode, SocketAddressV4, SocketConnectionStatus, SocketError, SocketStatusResponse,
-    SocketType,
+    ShutdownMode, SocketAddressV4, SocketConnectionStatus, SocketError, SocketOutcome,
+    SocketStatusResponse, SocketType,
 };
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, epoll, eventfd};

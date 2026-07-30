@@ -12,7 +12,7 @@ use litebox_broker_protocol::socket::{
     Ipv4Address, MAX_SOCKET_TRANSFER_SIZE, Port, ReceiveFlags as BrokerReceiveFlags,
     ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
     SocketAddressV4 as BrokerSocketAddressV4, SocketConnectionStatus,
-    SocketError as BrokerSocketError, SocketStatusResponse,
+    SocketError as BrokerSocketError, SocketOutcome, SocketStatusResponse,
 };
 
 use super::{
@@ -21,10 +21,7 @@ use super::{
     socket_channel::{ChannelReadError, ChannelWriteError, SocketState},
 };
 use crate::{
-    broker::{
-        BrokerControl, BrokerPollableRegistry, BrokerSocketOutcome, error::BrokerObjectError,
-        readiness_events,
-    },
+    broker::{BrokerControl, BrokerPollableRegistry, error::BrokerObjectError, readiness_events},
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
@@ -111,8 +108,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             )
             .map_err(|error| ConnectError::Socket(socket_error_from_control(error.into())))?;
         let status = match outcome {
-            BrokerSocketOutcome::Completed(status) => status,
-            BrokerSocketOutcome::Failed(error) => {
+            SocketOutcome::Completed(status) => status,
+            SocketOutcome::Failed(error) => {
                 let error = socket_error(error);
                 self.consume_synchronous_error();
                 return Err(ConnectError::Socket(error));
@@ -148,7 +145,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             .shutdown_socket(self.handle, mode)
             .map_err(|error| socket_error_from_control(error.into()))?
         {
-            BrokerSocketOutcome::Completed(()) => {
+            SocketOutcome::Completed(()) => {
                 if matches!(mode, ShutdownMode::Read | ShutdownMode::Both) {
                     self.read_shutdown.store(true, Ordering::Release);
                 }
@@ -158,7 +155,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 }
                 Ok(())
             }
-            BrokerSocketOutcome::Failed(error) => {
+            SocketOutcome::Failed(error) => {
                 let error = socket_error(error);
                 self.consume_synchronous_error();
                 Err(error)
@@ -258,18 +255,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 }
             };
         match outcome {
-            BrokerSocketOutcome::Completed(ReceiveSocketResponse::Received(received)) => {
+            SocketOutcome::Completed(ReceiveSocketResponse::Received(received)) => {
                 let received = usize::try_from(received)
                     .map_err(|_| ChannelReadError::Socket(SocketAsyncError::Other))?;
                 Ok(received)
             }
-            BrokerSocketOutcome::Completed(ReceiveSocketResponse::EndOfStream) => {
+            SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream) => {
                 Err(ChannelReadError::ConnectionClosed)
             }
-            BrokerSocketOutcome::Completed(_) => {
-                Err(ChannelReadError::Socket(SocketAsyncError::Other))
-            }
-            BrokerSocketOutcome::Failed(error) => {
+            SocketOutcome::Completed(_) => Err(ChannelReadError::Socket(SocketAsyncError::Other)),
+            SocketOutcome::Failed(error) => {
                 let error = socket_error(error);
                 self.consume_synchronous_error();
                 Err(ChannelReadError::Socket(error))
@@ -290,8 +285,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             .send_socket(self.handle, &buffer[..length], BrokerSendFlags::NONE)
             .map_err(|error| write_error_from_control(error.into()))?;
         match outcome {
-            BrokerSocketOutcome::Completed(sent) => Ok(sent),
-            BrokerSocketOutcome::Failed(error) => {
+            SocketOutcome::Completed(sent) => Ok(sent),
+            SocketOutcome::Failed(error) => {
                 let error = socket_error(error);
                 self.consume_synchronous_error();
                 Err(ChannelWriteError::Socket(error))

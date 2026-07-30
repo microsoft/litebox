@@ -24,7 +24,6 @@ extern crate std;
 use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::socket::SocketOutcome;
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
@@ -40,7 +39,7 @@ use litebox_broker_protocol::shared_buffer::{
 };
 use litebox_broker_protocol::socket::{
     ConnectSocketResponse, CreateSocketResponse, MAX_SOCKET_TRANSFER_SIZE, ReceiveSocketResponse,
-    SendSocketResponse,
+    SendSocketResponse, SocketOutcome,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -543,7 +542,7 @@ mod tests {
     use super::*;
     use core::cell::Cell;
     use litebox_broker_core::readiness::ReadinessRegistration;
-    use litebox_broker_core::socket::{PlatformSocket, SocketOutcome, SocketProvider};
+    use litebox_broker_core::socket::{PlatformSocket, SocketProvider};
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,

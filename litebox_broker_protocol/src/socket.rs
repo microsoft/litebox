@@ -223,6 +223,16 @@ impl SocketError {
     }
 }
 
+/// Result of a socket operation that can fail with an ordinary network outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum SocketOutcome<T> {
+    /// The operation completed successfully.
+    Completed(T),
+    /// The host network stack reported an ordinary socket failure.
+    Failed(SocketError),
+}
+
 /// Request to create a broker-owned socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateSocketRequest {

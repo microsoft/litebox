@@ -16,7 +16,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags as BrokerReceiveFlags, ReceiveSocketResponse,
     SendFlags as BrokerSendFlags, ShutdownMode, SocketAddressV4, SocketConnectionStatus,
-    SocketError as BrokerSocketError, SocketStatusResponse,
+    SocketOutcome, SocketStatusResponse,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -45,7 +45,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
         address: SocketAddressV4,
-    ) -> core::result::Result<BrokerSocketOutcome<SocketConnectionStatus>, BrokerControlError>;
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError>;
 
     fn socket_status(
         &self,
@@ -57,7 +57,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         data: &[u8],
         flags: BrokerSendFlags,
-    ) -> core::result::Result<BrokerSocketOutcome<usize>, BrokerControlError>;
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
 
     fn receive_socket(
         &self,
@@ -65,13 +65,13 @@ pub(crate) trait BrokerControl: Send + Sync {
         data: &mut [u8],
         flags: BrokerReceiveFlags,
         discard: bool,
-    ) -> core::result::Result<BrokerSocketOutcome<ReceiveSocketResponse>, BrokerControlError>;
+    ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError>;
 
     fn shutdown_socket(
         &self,
         handle: ObjectHandle,
         mode: ShutdownMode,
-    ) -> core::result::Result<BrokerSocketOutcome<()>, BrokerControlError>;
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError>;
 
     fn create_event_with_count(
         &self,
@@ -116,11 +116,6 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 
     fn fail_connection(&self);
-}
-
-pub(crate) enum BrokerSocketOutcome<T> {
-    Completed(T),
-    Failed(BrokerSocketError),
 }
 
 pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
@@ -263,11 +258,11 @@ where
         &self,
         handle: ObjectHandle,
         address: SocketAddressV4,
-    ) -> core::result::Result<BrokerSocketOutcome<SocketConnectionStatus>, BrokerControlError> {
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError> {
         self.request(|local| local.connect_socket(handle, address))
             .map(|result| match result {
-                Ok(status) => BrokerSocketOutcome::Completed(status),
-                Err(error) => BrokerSocketOutcome::Failed(error),
+                Ok(status) => SocketOutcome::Completed(status),
+                Err(error) => SocketOutcome::Failed(error),
             })
     }
 
@@ -283,7 +278,7 @@ where
         handle: ObjectHandle,
         data: &[u8],
         flags: BrokerSendFlags,
-    ) -> core::result::Result<BrokerSocketOutcome<usize>, BrokerControlError> {
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -292,8 +287,8 @@ where
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.send_socket(handle, lease.descriptor(), data, flags))
             .map(|result| match result {
-                Ok(sent) => BrokerSocketOutcome::Completed(sent),
-                Err(error) => BrokerSocketOutcome::Failed(error),
+                Ok(sent) => SocketOutcome::Completed(sent),
+                Err(error) => SocketOutcome::Failed(error),
             })
     }
 
@@ -303,7 +298,7 @@ where
         data: &mut [u8],
         flags: BrokerReceiveFlags,
         discard: bool,
-    ) -> core::result::Result<BrokerSocketOutcome<ReceiveSocketResponse>, BrokerControlError> {
+    ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError> {
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -314,8 +309,8 @@ where
             local.receive_socket(handle, lease.descriptor(), data, flags, !discard)
         })
         .map(|result| match result {
-            Ok(received) => BrokerSocketOutcome::Completed(received),
-            Err(error) => BrokerSocketOutcome::Failed(error),
+            Ok(received) => SocketOutcome::Completed(received),
+            Err(error) => SocketOutcome::Failed(error),
         })
     }
 
@@ -323,11 +318,11 @@ where
         &self,
         handle: ObjectHandle,
         mode: ShutdownMode,
-    ) -> core::result::Result<BrokerSocketOutcome<()>, BrokerControlError> {
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError> {
         self.request(|local| local.shutdown_socket(handle, mode))
             .map(|result| match result {
-                Ok(()) => BrokerSocketOutcome::Completed(()),
-                Err(error) => BrokerSocketOutcome::Failed(error),
+                Ok(()) => SocketOutcome::Completed(()),
+                Err(error) => SocketOutcome::Failed(error),
             })
     }
 
