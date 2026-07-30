@@ -396,6 +396,15 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         service_class: u32,
         service_data: Option<Platform::RawMutPointer<nt_types::AhcServiceData>>,
     },
+    NtCreateKey {
+        key_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        title_index: u32,
+        class: Option<Platform::RawConstPointer<nt_types::UnicodeString>>,
+        create_options: u32,
+        disposition: Option<Platform::RawMutPointer<u32>>,
+    },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -991,6 +1000,15 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtApphelpCacheControl => Some(sys_req!(NtApphelpCacheControl {
                 service_class,
                 service_data:*,
+            })),
+            NtSysno::NtCreateKey => Some(sys_req!(NtCreateKey {
+                key_handle:*,
+                desired_access,
+                object_attributes:*,
+                title_index,
+                class:*,
+                create_options,
+                disposition:*,
             })),
             NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
                 key_handle:*,

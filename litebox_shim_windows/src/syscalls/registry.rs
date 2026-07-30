@@ -149,6 +149,17 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RegistryCreateOptions: u32 {
+        const VOLATILE = 0x0000_0001;
+        const CREATE_LINK = 0x0000_0002;
+        const BACKUP_RESTORE = 0x0000_0004;
+        const OPEN_LINK = 0x0000_0008;
+        const DONT_VIRTUALIZE = 0x0000_0010;
+    }
+}
+
 impl RegistryKeyAccess {
     fn from_desired_access(desired_access: u32) -> Self {
         // MAXIMUM_ALLOWED requests every right the (unrestricted) key grants, so
@@ -237,6 +248,13 @@ enum KeyInformationClass {
     HandleTags = 7,
     Trust = 8,
     Layer = 9,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum RegistryKeyDisposition {
+    CreatedNewKey = 1,
+    OpenedExistingKey = 2,
 }
 
 #[repr(C)]
@@ -603,11 +621,138 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preserves the seven-argument NtCreateKey ABI"
+    )]
+    pub(crate) fn sys_nt_create_key(
+        &self,
+        key_handle: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        title_index: u32,
+        class: Option<ConstPtr<Platform, UnicodeString>>,
+        create_options: u32,
+        disposition: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        let Some(create_options) = RegistryCreateOptions::from_bits(create_options) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if create_options
+            .intersects(RegistryCreateOptions::VOLATILE | RegistryCreateOptions::CREATE_LINK)
+        {
+            // TODO(registry-volatile): Model volatile key lifetime and symbolic-link keys.
+            return NtStatus::NOT_SUPPORTED;
+        }
+        if create_options.contains(RegistryCreateOptions::BACKUP_RESTORE) {
+            // TODO(registry-backup): Apply backup/restore privileges to access checks.
+            return NtStatus::NOT_SUPPORTED;
+        }
+
+        let Some(object_attributes) = object_attributes else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let object_attributes = match read_object_attributes::<Platform>(object_attributes) {
+            Ok(object_attributes) => object_attributes,
+            Err(status) => return status,
+        };
+        if let Some(class) = class {
+            let Some(class) = class.read_at_offset(0) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            if let Err(status) = class.read_string::<Platform>() {
+                return status;
+            }
+            // TODO(registry-class): Persist key class metadata for NtQueryKey.
+        }
+        if title_index != 0
+            || create_options.intersects(
+                RegistryCreateOptions::OPEN_LINK | RegistryCreateOptions::DONT_VIRTUALIZE,
+            )
+        {
+            // TODO(registry-metadata): Preserve title indices and virtualization/open-link options.
+            litebox_util_log::debug!(
+                title_index,
+                create_options:? = create_options;
+                "NtCreateKey metadata has no effect in the current registry model"
+            );
+        }
+
+        match self.do_nt_create_key(desired_access, object_attributes) {
+            Ok((handle, key_disposition)) => {
+                if let Some(disposition) = disposition
+                    && disposition
+                        .write_at_offset(0, u32::from(key_disposition))
+                        .is_none()
+                {
+                    self.close_registry_key_handle(handle);
+                    return NtStatus::ACCESS_VIOLATION;
+                }
+                if key_handle.write_at_offset(0, handle).is_none() {
+                    self.close_registry_key_handle(handle);
+                    return NtStatus::ACCESS_VIOLATION;
+                }
+                NtStatus::SUCCESS
+            }
+            Err(status) => status,
+        }
+    }
+
+    fn do_nt_create_key(
+        &self,
+        desired_access: u32,
+        object_attributes: ObjectAttributes,
+    ) -> Result<(Handle, RegistryKeyDisposition), NtStatus> {
+        let path = self.registry_key_path(object_attributes)?;
+        let disposition = match self.global.registry.fs.file_status(&path) {
+            Ok(status) if status.file_type == FileType::Directory => {
+                RegistryKeyDisposition::OpenedExistingKey
+            }
+            Ok(_) => return Err(NtStatus::OBJECT_TYPE_MISMATCH),
+            Err(FileStatusError::PathError(
+                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+            )) => {
+                create_key_path_in_fs(&self.global.registry.fs, &path)?;
+                RegistryKeyDisposition::CreatedNewKey
+            }
+            Err(FileStatusError::PathError(error)) => {
+                return Err(map_path_error(error, NtStatus::OBJECT_NAME_NOT_FOUND));
+            }
+            Err(_) => return Err(NtStatus::UNSUCCESSFUL),
+        };
+
+        let desired_access = RegistryKeyAccess::from_desired_access(desired_access);
+        let fd = self.global.registry.open_key(&path, desired_access)?;
+        let handle =
+            self.insert_registry_key_handle(RegistryKeyObject { path, fd }, desired_access)?;
+        Ok((handle, disposition))
+    }
+
     fn do_nt_open_key(
         &self,
         desired_access: u32,
         object_attributes: ObjectAttributes,
     ) -> Result<Handle, NtStatus> {
+        let path = self.registry_key_path(object_attributes)?;
+        let desired_access = RegistryKeyAccess::from_desired_access(desired_access);
+        let fd = self
+            .global
+            .registry
+            .open_key(&path, desired_access)
+            .inspect_err(|status| {
+                if *status != NtStatus::OBJECT_NAME_NOT_FOUND {
+                    litebox_util_log::debug!(
+                        desired_access:? = desired_access,
+                        path:% = path,
+                        status:? = status;
+                        "NtOpenKey failed"
+                    );
+                }
+            })?;
+        self.insert_registry_key_handle(RegistryKeyObject { path, fd }, desired_access)
+    }
+
+    fn registry_key_path(&self, object_attributes: ObjectAttributes) -> Result<String, NtStatus> {
         if object_attributes.object_name == 0 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
@@ -625,25 +770,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             root_key
                 .with_entry(|root_key| relative_nt_key_name_to_fs_path(&root_key.path, &key_name))?
         };
-
-        let desired_access = RegistryKeyAccess::from_desired_access(desired_access);
-        let fd = self
-            .global
-            .registry
-            .open_key(&path, desired_access)
-            .inspect_err(|status| {
-                if *status != NtStatus::OBJECT_NAME_NOT_FOUND {
-                    litebox_util_log::debug!(
-                        desired_access:? = desired_access,
-                        root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
-                        name:% = key_name,
-                        path:% = path,
-                        status:? = status;
-                        "NtOpenKey failed"
-                    );
-                }
-            })?;
-        self.insert_registry_key_handle(RegistryKeyObject { path, fd }, desired_access)
+        Ok(path)
     }
 
     pub(crate) fn sys_nt_query_value_key(
@@ -1571,6 +1698,111 @@ mod tests {
             "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage\\.values",
         );
         assert_eq!(values_dir, Err(NtStatus::INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn nt_create_key_reports_disposition_and_created_key_is_queryable() {
+        let task = crate::tests::test_task();
+        let key_name = r"\Registry\Machine\Software\LiteBoxCreatedKey";
+        let key_name_utf16 = utf16(key_name);
+        let key_name = unicode_string(&key_name_utf16);
+        let object_attributes = object_attributes(&key_name, 0);
+        let mut handle = Handle::default();
+        let mut disposition = 0;
+
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0,
+                Some(mut_ptr(&mut disposition)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            disposition,
+            u32::from(RegistryKeyDisposition::CreatedNewKey)
+        );
+
+        let mut information = [0u8; 128];
+        let mut result_length = 0;
+        assert_eq!(
+            task.sys_nt_query_key(
+                handle,
+                u32::from(KeyInformationClass::Name),
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::SUCCESS
+        );
+        let expected_name = utf16le(r"\REGISTRY\MACHINE\SOFTWARE\LITEBOXCREATEDKEY");
+        let header_len = offset_of!(KeyNameInformation, name);
+        assert_eq!(
+            &information[header_len..header_len + expected_name.len()],
+            expected_name.as_slice()
+        );
+        task.close_registry_key_handle(handle);
+
+        let mut second_handle = Handle::default();
+        disposition = 0;
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut second_handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0,
+                Some(mut_ptr(&mut disposition)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            disposition,
+            u32::from(RegistryKeyDisposition::OpenedExistingKey)
+        );
+        task.close_registry_key_handle(second_handle);
+
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0x20,
+                None,
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                RegistryCreateOptions::VOLATILE.bits(),
+                None,
+            ),
+            NtStatus::NOT_SUPPORTED
+        );
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                RegistryCreateOptions::CREATE_LINK.bits(),
+                None,
+            ),
+            NtStatus::NOT_SUPPORTED
+        );
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

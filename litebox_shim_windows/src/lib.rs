@@ -1400,6 +1400,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 service_class,
                 service_data,
             ),
+            SyscallRequest::NtCreateKey {
+                key_handle,
+                desired_access,
+                object_attributes,
+                title_index,
+                class,
+                create_options,
+                disposition,
+            } => self.sys_nt_create_key(
+                key_handle,
+                desired_access,
+                object_attributes,
+                title_index,
+                class,
+                create_options,
+                disposition,
+            ),
             SyscallRequest::NtOpenKey {
                 key_handle,
                 desired_access,
