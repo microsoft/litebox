@@ -33,7 +33,7 @@ use crate::fs::{DirEntry, FileType};
 
 use super::{
     Mode, NodeInfo, OFlags, UserInfo,
-    backend::{DirHandle, FileHandle, WalkingDirHandle},
+    backend::{DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
         RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -225,34 +225,34 @@ impl super::backend::Backend for TarRo {
         super::backend::SeekBehavior::PositionBased
     }
 
-    fn file_status(
+    fn status(
         &self,
-        h: &FileHandle,
+        h: HandleRef<'_>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let file = &self.tar_index.files[h.get_typed::<Self>().idx];
-        Ok(super::FileStatus {
-            file_type: FileType::RegularFile,
-            mode: file.mode,
-            size: file.data_range.len(),
-            owner: file.owner,
-            node_info: file.node_info.clone(),
-            blksize: BLOCK_SIZE,
-        })
-    }
-
-    fn dir_status(
-        &self,
-        h: &DirHandle,
-    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
-        Ok(super::FileStatus {
-            file_type: FileType::Directory,
-            mode: DEFAULT_DIR_MODE,
-            size: super::DEFAULT_DIRECTORY_SIZE,
-            owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-            node_info: dir.node_info.clone(),
-            blksize: BLOCK_SIZE,
-        })
+        match h {
+            HandleRef::File(h) => {
+                let file = &self.tar_index.files[h.get_typed::<Self>().idx];
+                Ok(super::FileStatus {
+                    file_type: FileType::RegularFile,
+                    mode: file.mode,
+                    size: file.data_range.len(),
+                    owner: file.owner,
+                    node_info: file.node_info.clone(),
+                    blksize: BLOCK_SIZE,
+                })
+            }
+            HandleRef::Dir(h) => {
+                let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
+                Ok(super::FileStatus {
+                    file_type: FileType::Directory,
+                    mode: DEFAULT_DIR_MODE,
+                    size: super::DEFAULT_DIRECTORY_SIZE,
+                    owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
+                    node_info: dir.node_info.clone(),
+                    blksize: BLOCK_SIZE,
+                })
+            }
+        }
     }
 
     fn create_file_at(
@@ -286,28 +286,17 @@ impl super::backend::Backend for TarRo {
         }
     }
 
-    fn chmod_at(&self, dir: DirHandle, name: &str, _mode: Mode) -> Result<(), ChmodError> {
-        let dir = dir.into_typed::<Self>();
-        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
-            Err(ChmodError::ReadOnlyFileSystem)
-        } else {
-            Err(PathError::NoSuchFileOrDirectory.into())
-        }
+    fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
     }
 
-    fn chown_at(
+    fn chown(
         &self,
-        dir: DirHandle,
-        name: &str,
+        _h: HandleRef<'_>,
         _user: Option<u16>,
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let dir = dir.into_typed::<Self>();
-        if self.tar_index.dirs[dir.idx].children.contains_key(name) {
-            Err(ChownError::ReadOnlyFileSystem)
-        } else {
-            Err(PathError::NoSuchFileOrDirectory.into())
-        }
+        Err(ChownError::ReadOnlyFileSystem)
     }
 }
 

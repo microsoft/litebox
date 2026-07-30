@@ -126,11 +126,8 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Describe seek behavior for an open file handle.
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
 
-    /// Status of an open file handle.
-    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError>;
-
-    /// Status of an open directory handle.
-    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError>;
+    /// Status of an open file or directory handle.
+    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
     /// Create a new file at `parent` with the given `name` and `mode`.
     fn create_file_at(
@@ -150,14 +147,13 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     // XXX(jayb): I don't like that unlink and rmdir exist separately, we should probably merge them.
     fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError>;
 
-    /// Update the permissions for the file/dir `name` at `parent`.
-    fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError>;
+    /// Update the permissions for the file/dir `h` refers to.
+    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError>;
 
-    /// Update the owner/group for the file/dir `name` at `parent`.
-    fn chown_at(
+    /// Update the owner/group for the file/dir `h` refers to.
+    fn chown(
         &self,
-        dir: DirHandle,
-        name: &str,
+        h: HandleRef<'_>,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
@@ -194,6 +190,35 @@ pub struct FileHandle {
 #[derive(Clone)]
 pub struct DirHandle {
     raw: Box<dyn AnyCloneSendSync>,
+}
+
+/// An owned handle to an open file or directory.
+#[derive(Clone)]
+pub enum Handle {
+    /// A handle to an open file
+    File(FileHandle),
+    /// A handle to an open directory
+    Dir(DirHandle),
+}
+
+impl Handle {
+    /// Borrow this handle, for passing to the object-addressed [`Backend`] operations.
+    #[must_use]
+    pub fn as_ref(&self) -> HandleRef<'_> {
+        match self {
+            Handle::File(handle) => HandleRef::File(handle),
+            Handle::Dir(handle) => HandleRef::Dir(handle),
+        }
+    }
+}
+
+/// A borrowed handle to an open file or directory.
+#[derive(Clone, Copy)]
+pub enum HandleRef<'a> {
+    /// A handle to an open file
+    File(&'a FileHandle),
+    /// A handle to an open directory
+    Dir(&'a DirHandle),
 }
 
 trait ErasedWalkingDirHandle {
