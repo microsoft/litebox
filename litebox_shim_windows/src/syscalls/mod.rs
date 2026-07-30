@@ -431,6 +431,14 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         length: u32,
         result_length: Platform::RawMutPointer<u32>,
     },
+    NtSetValueKey {
+        key_handle: Handle,
+        value_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+        title_index: u32,
+        value_type: u32,
+        data: Option<Platform::RawConstPointer<u8>>,
+        data_size: u32,
+    },
     NtGetNlsSectionPtr {
         section_type: u32,
         section_data: u32,
@@ -1035,6 +1043,14 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 key_value_information:*,
                 length,
                 result_length:*,
+            })),
+            NtSysno::NtSetValueKey => Some(sys_req!(NtSetValueKey {
+                key_handle:{Handle::from_raw},
+                value_name:*,
+                title_index,
+                value_type,
+                data:*,
+                data_size,
             })),
             NtSysno::NtGetNlsSectionPtr => Some(sys_req!(NtGetNlsSectionPtr {
                 section_type,

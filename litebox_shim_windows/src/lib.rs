@@ -1458,6 +1458,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 length,
                 result_length,
             ),
+            SyscallRequest::NtSetValueKey {
+                key_handle,
+                value_name,
+                title_index,
+                value_type,
+                data,
+                data_size,
+            } => self.sys_nt_set_value_key(
+                key_handle,
+                value_name,
+                title_index,
+                value_type,
+                data,
+                data_size,
+            ),
             SyscallRequest::NtGetNlsSectionPtr {
                 section_type,
                 section_data,

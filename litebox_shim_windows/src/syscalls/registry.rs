@@ -382,7 +382,7 @@ struct KeyValuePartialInformation {
 }
 
 struct RegistryValue {
-    value_type: RegistryValueType,
+    value_type: u32,
     data: Vec<u8>,
 }
 
@@ -478,15 +478,24 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             return Err(NtStatus::UNSUCCESSFUL);
         }
 
-        let value_type = RegistryValueType::try_from(u32::from_le_bytes(
+        let value_type = u32::from_le_bytes(
             data[..REGISTRY_VALUE_TYPE_SIZE]
                 .try_into()
                 .map_err(|_| NtStatus::UNSUCCESSFUL)?,
-        ))
-        .map_err(|_| NtStatus::UNSUCCESSFUL)?;
+        );
         data.drain(..REGISTRY_VALUE_TYPE_SIZE);
 
         Ok(RegistryValue { value_type, data })
+    }
+
+    fn write_value_at_path(
+        &self,
+        key_path: &str,
+        value_name: &str,
+        value_type: u32,
+        value: &[u8],
+    ) -> Result<(), NtStatus> {
+        write_value_at_path(&self.fs, key_path, value_name, value_type, value)
     }
 
     fn key_summary(&self, key: &RegistryKeyObject<Platform>) -> Result<KeySummary, NtStatus> {
@@ -807,6 +816,60 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    pub(crate) fn sys_nt_set_value_key(
+        &self,
+        key_handle: Handle,
+        value_name: ConstPtr<Platform, UnicodeString>,
+        title_index: u32,
+        value_type: u32,
+        data: Option<ConstPtr<Platform, u8>>,
+        data_size: u32,
+    ) -> NtStatus {
+        let key = match self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+            key_handle,
+            RegistryKeyAccess::SET_VALUE.bits(),
+        ) {
+            Ok(key) => key,
+            Err(status) => return status,
+        };
+        let Some(value_name) = value_name.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let value_name = match value_name.read_string::<Platform>() {
+            Ok(value_name) => value_name,
+            Err(status) => return status,
+        };
+        let data = match (data, data_size) {
+            (None, 0) => alloc::borrow::Cow::Borrowed(&[][..]),
+            (Some(data), data_size) => {
+                let Some(data) = data.to_owned_slice(data_size as usize) else {
+                    return NtStatus::ACCESS_VIOLATION;
+                };
+                alloc::borrow::Cow::Owned(data.into_vec())
+            }
+            (None, _) => return NtStatus::ACCESS_VIOLATION,
+        };
+
+        if title_index != 0 {
+            // TODO(registry-metadata): Persist value title indices.
+            litebox_util_log::debug!(
+                title_index;
+                "NtSetValueKey title index has no effect in the current registry model"
+            );
+        }
+        match key.with_entry(|key| {
+            self.global.registry.write_value_at_path(
+                &key.path,
+                &value_name,
+                value_type,
+                data.as_ref(),
+            )
+        }) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
+    }
+
     pub(crate) fn sys_nt_query_key(
         &self,
         key_handle: Handle,
@@ -1059,7 +1122,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(NtStatus::UNSUCCESSFUL)?;
                 let information = KeyValueBasicInformation {
                     title_index: 0,
-                    value_type: value.value_type.into(),
+                    value_type: value.value_type,
                     name_length: name.len().trunc(),
                     name: [0u8; 0],
                 };
@@ -1083,7 +1146,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 write_query_result_length::<Platform>(result_length, length, required_length)?;
                 let information = KeyValueFullInformation {
                     title_index: 0,
-                    value_type: value.value_type.into(),
+                    value_type: value.value_type,
                     data_offset: data_offset.trunc(),
                     data_length: value.data.len().trunc(),
                     name_length: name.len().trunc(),
@@ -1106,7 +1169,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 write_query_result_length::<Platform>(result_length, length, required_length)?;
                 let information = KeyValuePartialInformation {
                     title_index: 0,
-                    value_type: value.value_type.into(),
+                    value_type: value.value_type,
                     data_length: value.data.len().trunc(),
                     data: [0u8; 0],
                 };
@@ -1251,7 +1314,17 @@ fn write_value_in_fs<FS: litebox::fs::FileSystem>(
     value: &[u8],
 ) -> Result<(), NtStatus> {
     let key_path = create_key_in_fs(fs, key_nt_path)?;
-    let value_path = value_path(&key_path, value_name)?;
+    write_value_at_path(fs, &key_path, value_name, value_type.into(), value)
+}
+
+fn write_value_at_path<FS: litebox::fs::FileSystem>(
+    fs: &FS,
+    key_path: &str,
+    value_name: &str,
+    value_type: u32,
+    value: &[u8],
+) -> Result<(), NtStatus> {
+    let value_path = value_path(key_path, value_name)?;
     let fd = fs
         .open(
             &*value_path,
@@ -1260,7 +1333,7 @@ fn write_value_in_fs<FS: litebox::fs::FileSystem>(
         )
         .map_err(map_open_error)?;
     let written = fs
-        .write(&fd, &u32::from(value_type).to_le_bytes(), Some(0))
+        .write(&fd, &value_type.to_le_bytes(), Some(0))
         .map_err(map_write_error)?;
     if written != REGISTRY_VALUE_TYPE_SIZE {
         return Err(NtStatus::DISK_FULL);
@@ -1519,6 +1592,10 @@ mod tests {
         (status, handle)
     }
 
+    fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
+        ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    }
+
     fn open_code_page_key(task: &Task<TestPlatform, TestFS>) -> Handle {
         let code_page_name = utf16(DEFAULT_CODE_PAGE_KEY);
         let code_page_name = unicode_string(&code_page_name);
@@ -1587,10 +1664,7 @@ mod tests {
         let status = unsafe { RegCloseKey(key) };
         assert_eq!(status, ERROR_SUCCESS, "failed to close host registry key");
 
-        RegistryValue {
-            value_type: RegistryValueType::try_from(value_type).expect("known registry value type"),
-            data,
-        }
+        RegistryValue { value_type, data }
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -1691,7 +1765,7 @@ mod tests {
             REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()
         );
         let value = registry.read_value_at_path(&key_path, "ACP").unwrap();
-        assert_eq!(value.value_type, RegistryValueType::Sz);
+        assert_eq!(value.value_type, u32::from(RegistryValueType::Sz));
         assert_eq!(value.data, DEFAULT_ACP_VALUE);
 
         let values_dir = absolute_nt_key_name_to_fs_path(
@@ -1805,6 +1879,104 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nt_set_value_key_replaces_and_round_trips_raw_types_and_empty_data() {
+        let task = crate::tests::test_task();
+        let key_name_utf16 = utf16(r"\Registry\Machine\Software\LiteBoxSetValueKey");
+        let key_name = unicode_string(&key_name_utf16);
+        let object_attributes = object_attributes(&key_name, 0);
+        let mut handle = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                (RegistryKeyAccess::QUERY_VALUE | RegistryKeyAccess::SET_VALUE).bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0,
+                None,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let value_name_utf16 = utf16("Value");
+        let value_name = unicode_string(&value_name_utf16);
+        let initial_data = [1u8, 2, 3, 4, 5];
+        assert_eq!(
+            task.sys_nt_set_value_key(
+                handle,
+                const_ptr(&value_name),
+                0,
+                u32::from(RegistryValueType::Binary),
+                Some(const_byte_ptr(&initial_data)),
+                initial_data.len().trunc(),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let replacement_data = [9u8, 8];
+        let custom_type = 0xfeed_beefu32;
+        assert_eq!(
+            task.sys_nt_set_value_key(
+                handle,
+                const_ptr(&value_name),
+                0,
+                custom_type,
+                Some(const_byte_ptr(&replacement_data)),
+                replacement_data.len().trunc(),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut information = [0u8; 64];
+        let mut result_length = 0;
+        assert_eq!(
+            task.sys_nt_query_value_key(
+                handle,
+                const_ptr(&value_name),
+                u32::from(KeyValueInformationClass::Partial),
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::SUCCESS
+        );
+        let (information, data) =
+            KeyValuePartialInformation::read_from_prefix(&information[..result_length as usize])
+                .unwrap();
+        assert_eq!(information.value_type, custom_type);
+        assert_eq!(data, replacement_data);
+
+        let empty_name_utf16 = utf16("Empty");
+        let empty_name = unicode_string(&empty_name_utf16);
+        assert_eq!(
+            task.sys_nt_set_value_key(handle, const_ptr(&empty_name), 0, custom_type, None, 0,),
+            NtStatus::SUCCESS
+        );
+        let empty_value = task
+            .global
+            .registry
+            .read_value_at_path("/registry/machine/software/liteboxsetvaluekey", "Empty")
+            .unwrap();
+        assert_eq!(empty_value.value_type, custom_type);
+        assert!(empty_value.data.is_empty());
+
+        task.close_registry_key_handle(handle);
+        let read_only_handle = open_key(&task, object_attributes).unwrap();
+        assert_eq!(
+            task.sys_nt_set_value_key(
+                read_only_handle,
+                const_ptr(&value_name),
+                0,
+                custom_type,
+                None,
+                0,
+            ),
+            NtStatus::ACCESS_DENIED
+        );
+        task.close_registry_key_handle(read_only_handle);
+    }
+
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     #[test]
     fn registry_default_code_page_values_match_host() {
@@ -1834,8 +2006,8 @@ mod tests {
             let (information, data) =
                 KeyValuePartialInformation::read_from_prefix(information).unwrap();
 
-            assert_eq!(host_value.value_type, RegistryValueType::Sz);
-            assert_eq!(information.value_type, host_value.value_type.into());
+            assert_eq!(host_value.value_type, u32::from(RegistryValueType::Sz));
+            assert_eq!(information.value_type, host_value.value_type);
             assert_eq!(information.data_length as usize, host_value.data.len());
             assert_eq!(data, host_value.data.as_slice());
         }
