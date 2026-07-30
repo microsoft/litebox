@@ -179,6 +179,19 @@ struct WalkedDir<'a> {
     permissions: Option<PermissionCheck>,
 }
 
+/// Which directories along a walk must grant search (execute) permission.
+#[derive(Clone, Copy)]
+enum SearchScope {
+    /// Every walked directory, including a final directory component, must be searchable.
+    AllComponents,
+    /// The directories leading to the object the path names must be searchable; target is not
+    /// checked.
+    ParentsOnly,
+    /// Like [`SearchScope::ParentsOnly`], but the final directory component is checked to be
+    /// readable.
+    AndReadableTarget,
+}
+
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     super::private::Sealed for Resolver<Platform, Backend>
 {
@@ -258,6 +271,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             &components,
             #[cfg(debug_assertions)]
             &components,
+            SearchScope::ParentsOnly,
         )?;
         match outcome.stop_reason {
             WalkStopReason::CompleteDirectory => Ok(Handle::Dir(
@@ -307,6 +321,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             #[cfg(debug_assertions)]
             absolute_components,
             &outcome,
+            SearchScope::AllComponents,
         )?;
 
         match outcome.stop_reason {
@@ -338,6 +353,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         from: WalkingDirHandle<'a>,
         components: &[&str],
         #[cfg(debug_assertions)] absolute_components: &[&str],
+        scope: SearchScope,
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
         assert!(!components.is_empty());
         let outcome = self.backend.walk_directories(from, components)?;
@@ -346,6 +362,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             #[cfg(debug_assertions)]
             absolute_components,
             &outcome,
+            scope,
         )?;
 
         let walked = outcome.components.len();
@@ -372,27 +389,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         context: &Context,
         #[cfg(debug_assertions)] absolute_components: &[&str],
         outcome: &WalkOutcome<WalkingDirHandle<'_>>,
+        scope: SearchScope,
     ) -> Result<(), PathError> {
         for (idx, walked) in outcome.components.iter().enumerate() {
-            match &walked.permissions {
-                PermissionCheck::ByBackend => {}
-                PermissionCheck::ByResolver(permissions) => {
-                    if !context.can_execute(permissions) {
-                        return Err(PathError::NoSearchPerms {
-                            #[cfg(debug_assertions)]
-                            dir: {
-                                let mut path = String::new();
-                                for component in &absolute_components[..=idx] {
-                                    path.push('/');
-                                    path.push_str(component);
-                                }
-                                path
-                            },
-                            #[cfg(debug_assertions)]
-                            perms: permissions.mode,
-                        });
-                    }
-                }
+            let PermissionCheck::ByResolver(permissions) = &walked.permissions else {
+                continue;
+            };
+            let is_target_dir = idx + 1 == outcome.components.len()
+                && matches!(outcome.stop_reason, WalkStopReason::CompleteDirectory);
+            let allowed = match (is_target_dir, scope) {
+                (true, SearchScope::ParentsOnly) => continue,
+                (true, SearchScope::AndReadableTarget) => context.can_read(permissions),
+                _ => context.can_execute(permissions),
+            };
+            if !allowed {
+                // TODO(jayb): a [`SearchScope::AndReadableTarget`] target denying *read* permission
+                // reports `NoSearchPerms` too. Clean up during filesystem errors overhaul.
+                return Err(PathError::NoSearchPerms {
+                    #[cfg(debug_assertions)]
+                    dir: {
+                        let mut path = String::new();
+                        for component in &absolute_components[..=idx] {
+                            path.push('/');
+                            path.push_str(component);
+                        }
+                        path
+                    },
+                    #[cfg(debug_assertions)]
+                    perms: permissions.mode,
+                });
             }
         }
         Ok(())
@@ -412,7 +437,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     super::FileSystem for Resolver<Platform, Backend>
 {
-    fn open(&self, path: impl Arg, flags: OFlags, mode: Mode) -> Result<TypedFd<Self>, OpenError> {
+    fn open(
+        &self,
+        path: impl Arg,
+        mut flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<Self>, OpenError> {
         const CURRENTLY_SUPPORTED_OFLAGS: OFlags = OFlags::CREAT
             .union(OFlags::RDONLY)
             .union(OFlags::WRONLY)
@@ -431,6 +461,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             unimplemented!("{flags:?}")
         }
         let path_only = flags.contains(OFlags::PATH);
+        if path_only {
+            // For `PATH`, we restrict what other flags are allowed, so a missing path cannot lead
+            // to a creation, etc.
+            flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        }
 
         let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
@@ -468,6 +503,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             &components,
             #[cfg(debug_assertions)]
             &components,
+            if path_only {
+                SearchScope::ParentsOnly
+            } else {
+                SearchScope::AndReadableTarget
+            },
         );
         match walk {
             Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
