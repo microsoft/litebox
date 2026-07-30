@@ -1154,6 +1154,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 connection_information,
                 connection_information_length,
             }),
+            SyscallRequest::NtAlpcSendWaitReceivePort {
+                port_handle,
+                flags,
+                send_message,
+                send_message_attributes,
+                receive_message,
+                buffer_length,
+                receive_message_attributes,
+                timeout,
+            } => self.sys_nt_alpc_send_wait_receive_port(
+                port_handle,
+                flags,
+                send_message,
+                send_message_attributes,
+                receive_message,
+                buffer_length,
+                receive_message_attributes,
+                timeout,
+            ),
             SyscallRequest::NtSecureConnectPort => {
                 litebox_util_log::debug!(
                     "Rejected NtSecureConnectPort; only the CSR NtConnectPort subset is modeled"

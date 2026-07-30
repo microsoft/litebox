@@ -6,7 +6,7 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -17,8 +17,34 @@ use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_pre
 
 const CSR_MAX_MESSAGE_LENGTH: u32 = 0x148;
 const CSR_SERVER_PROCESS_ID: usize = 1;
+const CSR_API_MESSAGE_LENGTH: u16 = 0x58;
+const CSR_API_DATA_LENGTH: u16 = 0x30;
+const USERSRV_SERVER_DLL_INDEX: u32 = 3;
+const USER_CONNECT_VERSION: u64 = 0x0e41_05d9;
+const USER_CONNECT_TRAILING_VALUE: u64 = 0x6658;
+const USER_HANDLE_ENTRY_SIZE: u32 = 0x20;
+const USERSRV_BACKING_SIZE: usize = crate::PAGE_SIZE;
+const USERSRV_BACKING_ALIGNMENT: usize = 0x20;
 // TODO(csr-server-dll-names): report names once the CSR connect contract models them.
 const CSR_NUMBER_OF_SERVER_DLL_NAMES: u32 = 0;
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct AlpcMessageFlags: u32 {
+        const REPLY_MESSAGE = 0x0000_0001;
+        const LPC_MODE = 0x0000_0002;
+        const RELEASE_MESSAGE = 0x0001_0000;
+        const SYNC_REQUEST = 0x0002_0000;
+        const TRACK_PORT_REFERENCES = 0x0004_0000;
+        const WAIT_USER_MODE = 0x0010_0000;
+        const WAIT_ALERTABLE = 0x0020_0000;
+        const SIGNAL_ALERTABLE = 0x0040_0000;
+        const INTERNAL_REJECT = 0x0100_0000;
+        const WOW64_CALL = 0x8000_0000;
+
+        const _ = !0;
+    }
+}
 
 pub(crate) struct LpcPortSubsystem<Platform>(PhantomData<fn(Platform)>);
 
@@ -43,6 +69,7 @@ impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for LpcPortSubsystem<
 
 pub(crate) struct LpcPortHandleObject {
     _port_name: String,
+    usersrv_backing_base: usize,
 }
 
 #[repr(C)]
@@ -88,6 +115,91 @@ struct CsrApiConnectInfo {
     number_of_server_dll_names: u32,
     server_process_id: usize,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+pub(crate) struct PortMessage {
+    data_length: u16,
+    total_length: u16,
+    message_type: u16,
+    data_info_offset: u16,
+    client_id: [usize; 2],
+    message_id: u32,
+    padding: u32,
+    client_view_size: usize,
+}
+
+const _: () = assert!(size_of::<PortMessage>() == 0x28);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct CsrClientConnect {
+    server_dll_index: u32,
+    padding: u32,
+    connection_info: usize,
+    connection_info_size: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+pub(crate) struct CsrApiMessage {
+    header: PortMessage,
+    capture_data: usize,
+    api_number: u32,
+    status: i32,
+    reserved: u32,
+    padding: u32,
+    client_connect: CsrClientConnect,
+}
+
+const _: () = assert!(size_of::<CsrApiMessage>() == CSR_API_MESSAGE_LENGTH as usize);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct UserWindowMessage {
+    max_messages: usize,
+    message_bits: usize,
+}
+
+impl UserWindowMessage {
+    const fn new(max_messages: usize, message_bits: usize) -> Self {
+        Self {
+            max_messages,
+            message_bits,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct UserSharedInfo {
+    server_info: usize,
+    handle_entries: usize,
+    handle_entry_size: u32,
+    padding: u32,
+    display_info: usize,
+    shared_data: usize,
+    reserved_message_0: UserWindowMessage,
+    reserved: [u8; 0x10],
+    reserved_message_1: UserWindowMessage,
+    reserved_message_2: UserWindowMessage,
+    padding_2: [u8; 0x30],
+    control_messages: [UserWindowMessage; 24],
+    default_window_messages: UserWindowMessage,
+    default_window_spec_messages: UserWindowMessage,
+}
+
+const _: () = assert!(size_of::<UserSharedInfo>() == 0x238);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct UserConnect {
+    version: u64,
+    shared_info: UserSharedInfo,
+    trailing_value: u64,
+}
+
+const _: () = assert!(size_of::<UserConnect>() == 0x248);
 
 pub(crate) struct ConnectPortParameters<Platform: ShimPlatform> {
     pub(crate) port_handle: MutPtr<Platform, Handle>,
@@ -176,8 +288,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(mapped_view) => mapped_view,
             Err(status) => return status,
         };
+        let Some(client_view_size) = mapped_view.view_size.checked_sub(USERSRV_BACKING_SIZE) else {
+            self.rollback_pagefile_section_view(mapped_view.base);
+            return NtStatus::INVALID_VIEW_SIZE;
+        };
+        if client_view_size == 0 {
+            self.rollback_pagefile_section_view(mapped_view.base);
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        let usersrv_backing_base = mapped_view.base + client_view_size;
+        if let Err(status) = zero_guest_usersrv_backing::<Platform>(usersrv_backing_base) {
+            self.rollback_pagefile_section_view(mapped_view.base);
+            return status;
+        }
         let port = LpcPortHandleObject {
             _port_name: port_name.clone(),
+            usersrv_backing_base,
         };
         let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(port, 0, drop) {
             Ok(handle) => handle,
@@ -188,7 +314,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         let mut written_client_view = client_view_value;
-        written_client_view.view_size = mapped_view.view_size;
+        written_client_view.view_size = client_view_size;
         written_client_view.view_base = mapped_view.base;
         written_client_view.view_remote_base = mapped_view.base;
 
@@ -227,9 +353,92 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             port_name:% = port_name,
             handle:% = format_args!("{:#x}", handle.as_raw()),
             client_view_base:% = format_args!("{:#x}", mapped_view.base),
-            client_view_size = mapped_view.view_size;
+            client_view_size;
             "Handled NtConnectPort for CSR API port"
         );
+        NtStatus::SUCCESS
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sys_nt_alpc_send_wait_receive_port(
+        &self,
+        port_handle: Handle,
+        flags: AlpcMessageFlags,
+        send_message: MutPtr<Platform, CsrApiMessage>,
+        send_message_attributes: Option<ConstPtr<Platform, u8>>,
+        receive_message: MutPtr<Platform, CsrApiMessage>,
+        buffer_length: MutPtr<Platform, usize>,
+        receive_message_attributes: Option<MutPtr<Platform, u8>>,
+        timeout: Option<ConstPtr<Platform, i64>>,
+    ) -> NtStatus {
+        if !flags.contains(AlpcMessageFlags::SYNC_REQUEST)
+            || flags
+                .intersects(AlpcMessageFlags::RELEASE_MESSAGE | AlpcMessageFlags::INTERNAL_REJECT)
+            || send_message_attributes.is_some()
+            || receive_message_attributes.is_some()
+            || timeout.is_some()
+            || send_message.as_usize() != receive_message.as_usize()
+        {
+            // TODO(alpc-async): model independent send/receive and attribute paths.
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        let port = match self
+            .typed_handle_entry_with_access::<LpcPortSubsystem<Platform>>(port_handle, 0)
+        {
+            Ok(entry) => entry.with_entry(|entry| entry.usersrv_backing_base),
+            Err(status) => return status,
+        };
+        let Some(mut message) = send_message.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Some(receive_capacity) = buffer_length.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if receive_capacity < size_of::<CsrApiMessage>() {
+            return NtStatus::BUFFER_TOO_SMALL;
+        }
+        if message.header.data_length != CSR_API_DATA_LENGTH
+            || message.header.total_length != CSR_API_MESSAGE_LENGTH
+            || message.header.message_type != 0
+            || message.header.data_info_offset != 0
+            || message.api_number != 0
+            || message.client_connect.server_dll_index != USERSRV_SERVER_DLL_INDEX
+            || message.client_connect.connection_info_size != size_of::<UserConnect>()
+        {
+            // TODO(csr-api-dispatch): dispatch other CSR APIs and server DLLs.
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        if probe_guest_output_preserving_value::<Platform, CsrApiMessage>(receive_message).is_err()
+            || probe_guest_output_preserving_value::<Platform, usize>(buffer_length).is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let connection_info =
+            MutPtr::<Platform, UserConnect>::from_usize(message.client_connect.connection_info);
+        if probe_guest_output_preserving_value::<Platform, UserConnect>(connection_info).is_err() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        let Some(user_connect) = build_user_connect(port) else {
+            return NtStatus::INVALID_VIEW_SIZE;
+        };
+        // TODO(usersrv-shared-content): populate real win32k shared data when USER APIs need it.
+        // TODO(usersrv-ro-section): move this backing to a read-only shared mapping.
+        if connection_info.write_at_offset(0, user_connect).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        message.header.message_type = 2;
+        message.status = NtStatus::SUCCESS.as_raw();
+        if receive_message.write_at_offset(0, message).is_none()
+            || buffer_length
+                .write_at_offset(0, size_of::<CsrApiMessage>())
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
         NtStatus::SUCCESS
     }
 
@@ -261,6 +470,83 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             server_process_id: CSR_SERVER_PROCESS_ID,
         })
     }
+}
+
+fn zero_guest_usersrv_backing<Platform: RawPointerProvider>(
+    backing_base: usize,
+) -> Result<(), NtStatus> {
+    let zeros = [0u8; 0x100];
+    let backing = MutPtr::<Platform, u8>::from_usize(backing_base);
+    for offset in (0..USERSRV_BACKING_SIZE).step_by(zeros.len()) {
+        backing
+            .write_slice_at_offset(
+                offset.try_into().map_err(|_| NtStatus::INVALID_PARAMETER)?,
+                &zeros,
+            )
+            .ok_or(NtStatus::ACCESS_VIOLATION)?;
+    }
+    Ok(())
+}
+
+fn build_user_connect(backing_base: usize) -> Option<UserConnect> {
+    let mut backing_offset = 0usize;
+    let mut allocate = |size: usize| {
+        let size = size.checked_next_multiple_of(USERSRV_BACKING_ALIGNMENT)?;
+        let next_offset = backing_offset.checked_add(size)?;
+        if next_offset > USERSRV_BACKING_SIZE {
+            return None;
+        }
+        let pointer = backing_base.checked_add(backing_offset)?;
+        backing_offset = next_offset;
+        Some(pointer)
+    };
+    let server_info = allocate(USERSRV_BACKING_ALIGNMENT)?;
+    let handle_entries = allocate(USERSRV_BACKING_ALIGNMENT)?;
+    let display_info = allocate(USERSRV_BACKING_ALIGNMENT)?;
+    let shared_data = allocate(USERSRV_BACKING_ALIGNMENT)?;
+    let mut window_message = |max_messages: usize| {
+        Some(UserWindowMessage::new(
+            max_messages,
+            if max_messages == 0 {
+                0
+            } else {
+                allocate(max_messages.div_ceil(8))?
+            },
+        ))
+    };
+    let reserved_message_0 = window_message(0x318)?;
+    let reserved_message_1 = window_message(0x318)?;
+    let reserved_message_2 = window_message(0x14)?;
+    let mut control_messages = [UserWindowMessage::new(0, 0); 24];
+    for (index, max_messages) in [
+        0x318usize, 0x318, 0x318, 0x402, 0x318, 0x318, 0, 0x318, 0x288, 0x82,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        control_messages[index] = window_message(max_messages)?;
+    }
+
+    Some(UserConnect {
+        version: USER_CONNECT_VERSION,
+        shared_info: UserSharedInfo {
+            server_info,
+            handle_entries,
+            handle_entry_size: USER_HANDLE_ENTRY_SIZE,
+            padding: 0,
+            display_info,
+            shared_data,
+            reserved_message_0,
+            reserved: [0; 0x10],
+            reserved_message_1,
+            reserved_message_2,
+            padding_2: [0; 0x30],
+            control_messages,
+            default_window_messages: window_message(0x33f)?,
+            default_window_spec_messages: window_message(0x349)?,
+        },
+        trailing_value: USER_CONNECT_TRAILING_VALUE,
+    })
 }
 
 fn probe_lpc_outputs<Platform: ShimPlatform>(
@@ -356,7 +642,7 @@ mod tests {
 
     fn create_client_section(task: &Task<TestPlatform, TestFS>, access: u32) -> Handle {
         let mut handle = Handle::default();
-        let size = i64::try_from(crate::PAGE_SIZE).expect("test section size fits in i64");
+        let size = i64::try_from(crate::PAGE_SIZE * 2).expect("test section size fits in i64");
         assert_eq!(
             task.sys_nt_create_section(
                 mut_ptr(&mut handle),
@@ -373,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn nt_connect_port_fills_csr_info_and_maps_client_section() {
+    fn nt_connect_port_and_usersrv_alpc_reply_match_guest_contract() {
         let mut peb = ProcessEnvironmentBlock::new_zeroed();
         peb.read_only_shared_memory_base = 0x7000_0000;
         peb.read_only_static_server_data = 0x7000_1000;
@@ -388,7 +674,7 @@ mod tests {
             padding: 0,
             section_handle,
             section_offset: 0,
-            view_size: crate::PAGE_SIZE,
+            view_size: crate::PAGE_SIZE * 2,
             view_base: 0,
             view_remote_base: 0,
         };
@@ -434,5 +720,60 @@ mod tests {
             connection_info.size_of_teb_data,
             size_of::<ThreadEnvironmentBlock>().trunc()
         );
+
+        let mut usersrv_info = UserConnect::new_zeroed();
+        let mut message = CsrApiMessage::new_zeroed();
+        message.header.data_length = CSR_API_DATA_LENGTH;
+        message.header.total_length = CSR_API_MESSAGE_LENGTH;
+        message.client_connect.server_dll_index = USERSRV_SERVER_DLL_INDEX;
+        message.client_connect.connection_info = core::ptr::from_mut(&mut usersrv_info) as usize;
+        message.client_connect.connection_info_size = size_of::<UserConnect>();
+        let mut receive_capacity = 0x3b8usize;
+
+        assert_eq!(
+            task.sys_nt_alpc_send_wait_receive_port(
+                handle,
+                AlpcMessageFlags::SYNC_REQUEST,
+                mut_ptr(&mut message),
+                None,
+                mut_ptr(&mut message),
+                mut_ptr(&mut receive_capacity),
+                None,
+                None,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(message.header.message_type, 2);
+        assert_eq!(message.status, NtStatus::SUCCESS.as_raw());
+        assert_eq!(receive_capacity, size_of::<CsrApiMessage>());
+        assert_eq!(usersrv_info.version, USER_CONNECT_VERSION);
+        assert_eq!(
+            usersrv_info.shared_info.handle_entry_size,
+            USER_HANDLE_ENTRY_SIZE
+        );
+        assert_eq!(
+            usersrv_info.shared_info.control_messages[3].max_messages,
+            0x402
+        );
+        assert_eq!(
+            usersrv_info
+                .shared_info
+                .default_window_messages
+                .max_messages,
+            0x33f
+        );
+        assert_eq!(usersrv_info.trailing_value, USER_CONNECT_TRAILING_VALUE);
+        for pointer in [
+            usersrv_info.shared_info.server_info,
+            usersrv_info.shared_info.handle_entries,
+            usersrv_info.shared_info.display_info,
+            usersrv_info.shared_info.shared_data,
+        ] {
+            assert_ne!(pointer, 0);
+            assert_eq!(
+                ConstPtr::<TestPlatform, u8>::from_usize(pointer).read_at_offset(0),
+                Some(0)
+            );
+        }
     }
 }

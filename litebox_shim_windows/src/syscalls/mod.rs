@@ -222,6 +222,16 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         connection_information: Option<Platform::RawMutPointer<u8>>,
         connection_information_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtAlpcSendWaitReceivePort {
+        port_handle: Handle,
+        flags: lpc::AlpcMessageFlags,
+        send_message: Platform::RawMutPointer<lpc::CsrApiMessage>,
+        send_message_attributes: Option<Platform::RawConstPointer<u8>>,
+        receive_message: Platform::RawMutPointer<lpc::CsrApiMessage>,
+        buffer_length: Platform::RawMutPointer<usize>,
+        receive_message_attributes: Option<Platform::RawMutPointer<u8>>,
+        timeout: Option<Platform::RawConstPointer<i64>>,
+    },
     /// `NtSecureConnectPort` carries SID and server-view semantics that are
     /// deliberately outside the current CSR `NtConnectPort` subset.
     NtSecureConnectPort,
@@ -924,6 +934,16 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 max_message_length:*,
                 connection_information:*,
                 connection_information_length:*,
+            })),
+            NtSysno::NtAlpcSendWaitReceivePort => Some(sys_req!(NtAlpcSendWaitReceivePort {
+                port_handle:{ Handle::from_raw },
+                flags:{ lpc::AlpcMessageFlags::from_bits_retain },
+                send_message:*,
+                send_message_attributes:*,
+                receive_message:*,
+                buffer_length:*,
+                receive_message_attributes:*,
+                timeout:*,
             })),
             NtSysno::NtSecureConnectPort => Some(SyscallRequest::NtSecureConnectPort),
             NtSysno::NtCreateSection => Some(sys_req!(NtCreateSection {
