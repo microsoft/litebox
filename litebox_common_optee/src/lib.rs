@@ -1153,6 +1153,7 @@ impl From<Errno> for TeeResult {
             Errno::EINVAL | Errno::EFAULT => Self::BadParameters,
             Errno::EPERM | Errno::EACCES => Self::AccessDenied,
             Errno::ENOMEM => Self::OutOfMemory,
+            Errno::EEXIST => Self::AccessConflict,
             Errno::EOVERFLOW => Self::Overflow,
             Errno::EBUSY => Self::Busy,
             _ => Self::GenericError,

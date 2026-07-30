@@ -68,6 +68,42 @@ impl Task {
             .ok_or(TeeResult::BadParameters)
     }
 
+    /// `ldelf` keeps `pad_end` free for the segments that follow. We map only
+    /// the segment, so check that room is still free.
+    ///
+    /// The check stops at the end of the image reservation. `ldelf` rounds a
+    /// segment and its `pad_end` separately, so the two together can reach a
+    /// page past the image, onto memory we never placed.
+    ///
+    /// It only reports a collision sooner: the mapping itself is `NOREPLACE`, so
+    /// a segment cannot overwrite anything whether or not the check ran.
+    fn check_room_is_free(&self, start: usize, pad_end: usize) -> Result<(), TeeResult> {
+        let mut end = start.checked_add(pad_end).ok_or(TeeResult::BadParameters)?;
+        match self.ta_reserved_end.get() {
+            // We hold no reservation, so there is nothing of ours to check.
+            0 => return Ok(()),
+            reserved_end => end = end.min(reserved_end),
+        }
+        let Some(len) = end.checked_sub(start).filter(|l| *l != 0) else {
+            return Ok(());
+        };
+        match self.sys_mmap(
+            start,
+            len,
+            ProtFlags::PROT_NONE,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        ) {
+            // Leaving the probe mapped would make the next segment collide with it.
+            Ok(p) => {
+                debug_assert_eq!(p.as_usize(), start);
+                self.sys_munmap(p, len).map_err(TeeResult::from)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// OP-TEE's syscall to map zero-initialized memory with padding.
     ///
     /// Maps `pad_begin + num_bytes + pad_end` bytes (rounded up to a page) and
@@ -91,6 +127,8 @@ impl Task {
         litebox_util_log::debug!(
             va:% = format_args!("{:#x}", va),
             num_bytes:% = num_bytes,
+            pad_begin:% = pad_begin,
+            pad_end:% = pad_end,
             flags:% = format_args!("{:#x}", flags);
             "sys_map_zi"
         );
@@ -113,22 +151,33 @@ impl Task {
         if va.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
+        let seg_size = Self::checked_map_size(num_bytes, 0, 0)?;
+
         // `sys_map_zi` always creates read/writeable mapping.
         //
         // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE.
         let mut flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
-        if va != 0 {
-            flags |= MapFlags::MAP_FIXED;
-        }
+        // The padding is not part of this mapping, see `sys_map_bin`.
+        let (region_size, region_pad_begin) = if va == 0 {
+            (total_size, pad_begin)
+        } else {
+            if pad_begin != 0 {
+                return Err(TeeResult::BadParameters);
+            }
+            let start = va.checked_add(seg_size).ok_or(TeeResult::BadParameters)?;
+            self.check_room_is_free(start, pad_end)?;
+            flags |= MapFlags::MAP_FIXED_NOREPLACE;
+            (seg_size, 0)
+        };
 
         let addr = self
-            .sys_mmap(va, total_size, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
-            .map_err(|_| TeeResult::OutOfMemory)?;
-        let guard = MmapGuard::new(self, addr, total_size);
+            .sys_mmap(va, region_size, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
+            .map_err(TeeResult::from)?;
+        let guard = MmapGuard::new(self, addr, region_size);
 
         let padded_start = addr
             .as_usize()
-            .checked_add(pad_begin)
+            .checked_add(region_pad_begin)
             .ok_or(TeeResult::BadParameters)?;
 
         // Unmap the padding regions to free physical memory.
@@ -142,7 +191,7 @@ impl Task {
         let pad_end_start = Self::get_aligned_start_of_pad_end(padded_start, num_bytes)?;
         let region_end = addr
             .as_usize()
-            .checked_add(total_size)
+            .checked_add(region_size)
             .ok_or(TeeResult::BadParameters)?;
         if pad_end_start < region_end {
             let _ = self.sys_munmap(
@@ -152,6 +201,12 @@ impl Task {
         }
 
         guard.disarm();
+        // This call reserves the range the later segments map into. Remember
+        // where it ends, to bound their room checks. Record after the mapping
+        // commits, so a rolled back one is not.
+        if va == 0 && pad_end != 0 {
+            self.ta_reserved_end.set(region_end);
+        }
         let cleanup = Cleanup::Unmap {
             addr: padded_start,
             len: pad_end_start - padded_start,
@@ -253,42 +308,65 @@ impl Task {
         if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
+        let seg_size = Self::checked_map_size(num_bytes, 0, 0)?;
+
         // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE as
         // explained in `sys_map_zi`.
         let mut flags_internal = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
-        if addr != 0 {
-            flags_internal |= MapFlags::MAP_FIXED;
-        }
         // TODO: on Arm, check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` to control cache behaviors
 
-        // Avoiding TA trampoline address conflict based on heuristics.
-        // Grow the underlying mmap by one page but keep trimming based on
-        // the original total_size so the extra page survives unseen by
-        // ldelf. ldelf reserves the address space for TA ELF via the main
-        // `sys_map_bin` call: addr=0 (PM picks the base), at least one of
-        // pad_begin/pad_end > 0 (reservation room around the first
-        // segment; ASLR-enabled builds put it in pad_begin, ASLR-disabled
-        // may put it entirely in pad_end), and LDELF_MAP_FLAG_EXECUTABLE
-        // (the first segment is .text). Skip on kernel-mode platforms
-        // which don't use a syscall trampoline.
+        // `ldelf` either lets us place the region (`addr == 0`) or names the
+        // address itself.
         //
-        // TODO: consider a reliable solution.
-        let should_extend_ta_reservation = addr == 0
-            && (pad_begin > 0 || pad_end > 0)
-            && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
-            && self.global.platform.get_syscall_entry_point() != 0;
+        // `pad_begin` is a random offset `ldelf` puts before the image for ASLR,
+        // `pad_end` reserves room for the segments that follow (`get_pad_begin()`
+        // and `populate_segments()` in `ldelf/ta_elf.c`). Neither is part of this
+        // mapping: OP-TEE only inserts `ROUNDUP(num_bytes)` into the region list
+        // (`umap_add_region()` in `core/mm/vm.c`). The reservations are not
+        // disjoint and each one covers the rest of the image.
+        let (region_size, region_pad_begin, should_extend_ta_reservation) = if addr == 0 {
+            // Map the room as well, so the allocator finds a gap wide enough for
+            // the whole image.
+            //
+            // Reserve a page past the image for the LiteBox trampoline, which
+            // `ldelf` does not account for. Recognize the call that reserves the
+            // TA's address space by heuristics: it asks for room around the
+            // first segment, which is `.text` and so executable. Kernel-mode
+            // platforms report no syscall entry point and need no trampoline.
+            //
+            // TODO: consider a reliable solution.
+            let extend = (pad_begin > 0 || pad_end > 0)
+                && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
+                && self.global.platform.get_syscall_entry_point() != 0;
+            (total_size, pad_begin, extend)
+        } else {
+            // The slot is already chosen, so map the segment alone and check the
+            // room is still free instead.
+            if pad_begin != 0 {
+                // `ldelf` pads the start only when it lets us pick the address.
+                return Err(TeeResult::BadParameters);
+            }
+            let start = addr.checked_add(seg_size).ok_or(TeeResult::BadParameters)?;
+            self.check_room_is_free(start, pad_end)?;
+            // `NOREPLACE` so a segment cannot silently replace an existing
+            // mapping: nothing holds the room for us any more.
+            flags_internal |= MapFlags::MAP_FIXED_NOREPLACE;
+            (seg_size, 0, false)
+        };
         let mmap_size = if should_extend_ta_reservation {
-            // The size of OP-TEE TA trampoline is 0x3f8, so one page is enough.
-            total_size
+            // The OP-TEE TA trampoline is 0x3f8 bytes, so one page is enough.
+            // Everything below keeps trimming by `region_size`, leaving the
+            // extra page mapped and unseen by `ldelf`.
+            region_size
                 .checked_add(PAGE_SIZE)
                 .ok_or(TeeResult::OutOfMemory)?
         } else {
-            total_size
+            region_size
         };
 
         // Currently, we do not support TA binary mapping. So, we create an anonymous mapping and copy
         // the content of the TA binary into it.
-        let addr = self
+        let base = self
             .sys_mmap(
                 addr,
                 mmap_size,
@@ -297,12 +375,12 @@ impl Task {
                 -1,
                 0,
             )
-            .map_err(|_| TeeResult::OutOfMemory)?;
-        let guard = MmapGuard::new(self, addr, mmap_size);
+            .map_err(TeeResult::from)?;
+        let guard = MmapGuard::new(self, base, mmap_size);
 
-        let padded_start = addr
+        let padded_start = base
             .as_usize()
-            .checked_add(pad_begin)
+            .checked_add(region_pad_begin)
             .ok_or(TeeResult::BadParameters)?;
         if padded_start == 0 {
             return Err(TeeResult::BadFormat);
@@ -342,16 +420,16 @@ impl Task {
 
         // Unmap the padding regions to free physical memory.
         // Using munmap instead of mprotect(PROT_NONE) actually deallocates the frames.
-        // pad_begin region: [addr, align_down(padded_start, PAGE_SIZE))
+        // pad_begin region: [base, align_down(padded_start, PAGE_SIZE))
         let pad_begin_end = align_down(padded_start, PAGE_SIZE);
-        if addr.as_usize() < pad_begin_end {
-            let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
+        if base.as_usize() < pad_begin_end {
+            let _ = self.sys_munmap(base, pad_begin_end - base.as_usize());
         }
-        // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
+        // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), base + region_size)
         let pad_end_start = Self::get_aligned_start_of_pad_end(padded_start, num_bytes)?;
-        let region_end = addr
+        let region_end = base
             .as_usize()
-            .checked_add(total_size)
+            .checked_add(region_size)
             .ok_or(TeeResult::BadParameters)?;
         if pad_end_start < region_end {
             let _ = self.sys_munmap(
@@ -362,6 +440,12 @@ impl Task {
 
         let _ = va.write_at_offset(0, padded_start);
         guard.disarm();
+        // This call reserves the range the later segments map into. Remember
+        // where it ends, to bound their room checks. Record after the mapping
+        // commits, so a rolled back one is not.
+        if addr == 0 && pad_end != 0 {
+            self.ta_reserved_end.set(region_end);
+        }
 
         Ok(())
     }

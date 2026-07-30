@@ -272,6 +272,7 @@ impl OpteeShim {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                ta_reserved_end: Cell::new(0),
                 #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             },
@@ -1390,6 +1391,8 @@ struct Task {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
+    /// End of the range we reserved for the TA image being loaded, 0 if none
+    ta_reserved_end: Cell<usize>,
     /// TLS base address for x86_64 (stored to restore FS before each TA entry)
     #[cfg(target_arch = "x86_64")]
     tls_base_addr: Cell<usize>,
@@ -1557,6 +1560,7 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                ta_reserved_end: Cell::new(0),
                 #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             }
