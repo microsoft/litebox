@@ -57,6 +57,13 @@ macro_rules! convert_flags {
 
 pub(crate) type SocketFd<Platform> = litebox::net::SocketFd<Platform>;
 
+fn socket_io_errno(error: TryOpError<Errno>) -> Errno {
+    match error {
+        TryOpError::WaitError(WaitError::TimedOut) => Errno::EAGAIN,
+        error => error.into(),
+    }
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
     ///
@@ -213,23 +220,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         assert!(old.is_none());
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
+        drop(dt);
 
-        let proxy = match sock_type {
-            SockType::Stream => {
-                let proxy = litebox::net::socket_channel::StreamSocketChannel::new();
-                NetworkProxy::Stream(proxy)
-            }
-            SockType::Datagram => {
-                let proxy = litebox::net::socket_channel::DatagramSocketChannel::new();
-                NetworkProxy::Datagram(proxy)
-            }
-            SockType::Raw => NetworkProxy::Raw,
-            _ => unimplemented!(),
-        };
+        let proxy = self
+            .net
+            .lock()
+            .new_socket_proxy(fd)
+            .expect("newly-created socket must have a proxy");
         // Save the proxy in both the descriptor table and the network subsystem so that the shim layer
         // can access it without holding the network lock and the network subsystem can access it without
         // involving the descriptor table (for both performance and convenience).
         let proxy = Arc::new(proxy);
+        let mut dt = self.litebox.descriptor_table_mut();
         let old = dt.set_entry_metadata(fd, SocketProxy(proxy.clone()));
         assert!(old.is_none());
         drop(dt);
@@ -329,6 +331,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         optlen: usize,
     ) -> Result<(), Errno> {
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
+            if matches!(
+                (so, &value),
+                (SocketOption::LINGER, SocketOptionValue::Timeout(Some(_)))
+            ) && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+            {
+                return Err(Errno::EOPNOTSUPP);
+            }
             // Collect any TCP option that needs to be applied via Network after
             // releasing the descriptor table write lock, to avoid a deadlock:
             // `with_socket_options_mut` holds a write lock on descriptors, while
@@ -782,7 +791,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
-        let is_empty_stream = buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::Stream(_));
+        let is_empty_stream = buf.is_empty()
+            && matches!(
+                proxy.as_ref(),
+                NetworkProxy::Stream(_) | NetworkProxy::BrokerStream(_)
+            );
 
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -797,10 +810,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
                     Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
+                    Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
-            .map_err(Errno::from)
+            .map_err(socket_io_errno)
     }
 
     /// Receive data via socket channel (lock-free path).
@@ -818,6 +832,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
         let is_nonblock = self.get_status(fd).contains(OFlags::NONBLOCK)
             || flags.contains(ReceiveFlags::DONTWAIT);
+        if buf.is_empty()
+            && matches!(
+                self.get_proxy(fd)?.as_ref(),
+                NetworkProxy::Stream(_) | NetworkProxy::BrokerStream(_)
+            )
+        {
+            return Ok(0);
+        }
 
         let mut new_flags = convert_flags!(
             flags,
@@ -860,9 +882,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         None => Ok(0),
                     },
                     Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
+                    Err(ChannelReadError::Socket(error)) => Err(TryOpError::Other(error.into())),
                 },
             )
-            .map_err(Errno::from)
+            .map_err(socket_io_errno)
     }
 
     fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
@@ -1585,7 +1608,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut source_addr = None;
         let mut buffer = [0u8; MAX_LEN];
         let recv_buf = &mut buffer[..MAX_LEN.min(len)];
-        let size = self.do_recvfrom(
+        let (size, copy_received) = self.do_recvfrom_with_copy(
             sockfd,
             recv_buf,
             flags,
@@ -1596,8 +1619,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
         )?;
         let capped_size = size.min(recv_buf.len());
-        buf.copy_from_slice::<Platform>(0, &recv_buf[..capped_size])
-            .ok_or(Errno::EFAULT)?;
+        if copy_received {
+            buf.copy_from_slice::<Platform>(0, &recv_buf[..capped_size])
+                .ok_or(Errno::EFAULT)?;
+        }
         if let Some(src_addr) = source_addr
             && let Some(sock_ptr) = addr
         {
@@ -1618,6 +1643,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// On success, returns the number of bytes received. Note that for datagram sockets,
     /// this may be larger than the provided buffer length as the excessive data will be truncated.
+    #[cfg(test)]
     fn do_recvfrom(
         &self,
         sockfd: u32,
@@ -1625,10 +1651,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
+        self.do_recvfrom_with_copy(sockfd, buf, flags, source_addr)
+            .map(|(size, _)| size)
+    }
+
+    fn do_recvfrom_with_copy(
+        &self,
+        sockfd: u32,
+        buf: &mut [u8],
+        flags: ReceiveFlags,
+        source_addr: Option<&mut Option<SocketAddress>>,
+    ) -> Result<(usize, bool), Errno> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
-        let (size, addr) = {
+        let (size, addr, copy_received) = {
             // We need to do this cell dance because otherwise Rust can't recognize that the two
             // closures are mutually exclusive.
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
@@ -1645,7 +1682,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Inet);
-                    Ok((size, src_addr))
+                    let copy_received = !(flags.contains(ReceiveFlags::TRUNC)
+                        && matches!(self.global.get_socket_type(fd)?, SockType::Stream));
+                    Ok((size, src_addr, copy_received))
                 },
                 |entry| {
                     let mut addr = None;
@@ -1656,7 +1695,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Unix);
-                    Ok((size, src_addr))
+                    Ok((size, src_addr, true))
                 },
             )?
         };
@@ -1664,7 +1703,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
             *source_addr = Some(addr);
         }
-        Ok(size)
+        Ok((size, copy_received))
     }
 
     /// Handle syscall `recvmsg`
@@ -1727,7 +1766,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(|_| Errno::ENOMEM)?;
         buffer.resize(total_iov_capacity, 0);
         let recv_buf = &mut buffer[..];
-        let size = self.do_recvfrom(
+        let (size, copy_received) = self.do_recvfrom_with_copy(
             sockfd,
             recv_buf,
             flags,
@@ -1745,18 +1784,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Scatter the received data across iovecs sequentially.
         let data_to_copy = size.min(total_iov_capacity);
         let mut offset = 0usize;
-        for iov in &iovs {
-            if offset >= data_to_copy {
-                break;
+        if copy_received {
+            for iov in &iovs {
+                if offset >= data_to_copy {
+                    break;
+                }
+                if iov.iov_len == 0 {
+                    continue;
+                }
+                let chunk = (data_to_copy - offset).min(iov.iov_len);
+                iov.iov_base
+                    .copy_from_slice::<Platform>(0, &recv_buf[offset..offset + chunk])
+                    .ok_or(Errno::EFAULT)?;
+                offset += chunk;
             }
-            if iov.iov_len == 0 {
-                continue;
-            }
-            let chunk = (data_to_copy - offset).min(iov.iov_len);
-            iov.iov_base
-                .copy_from_slice::<Platform>(0, &recv_buf[offset..offset + chunk])
-                .ok_or(Errno::EFAULT)?;
-            offset += chunk;
         }
 
         let total_received = if flags.contains(ReceiveFlags::TRUNC) {
@@ -2068,10 +2109,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |_fd| {
-                ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
-                log_unsupported!("shutdown on inet socket");
-                Err(Errno::EOPNOTSUPP)
+            |fd| {
+                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                let direction = match how {
+                    ShutdownHow::Read => litebox::net::ShutdownDirection::Read,
+                    ShutdownHow::Write => litebox::net::ShutdownDirection::Write,
+                    ShutdownHow::Both => litebox::net::ShutdownDirection::Both,
+                };
+                self.global
+                    .net
+                    .lock()
+                    .shutdown(fd, direction)
+                    .map_err(Errno::from)
             },
             |file| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;

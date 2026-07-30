@@ -10,7 +10,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     CreateSocketRequest, ReceiveFlags, ReceiveSocketResponse, SendFlags, ShutdownMode,
-    SocketAddressV4, SocketConnectionStatus, SocketError,
+    SocketAddressV4, SocketConnectionStatus, SocketError, SocketStatusResponse,
 };
 use spin::Once;
 
@@ -87,7 +87,7 @@ pub trait PlatformSocket: Send + Sync {
     ///
     /// Once a connection attempt starts this returns `Connecting`, `Connected`,
     /// or `Failed`, never `Unconnected`.
-    fn status(&self) -> Result<SocketConnectionStatus>;
+    fn status(&self) -> Result<SocketStatusResponse>;
 
     /// Returns the current readiness snapshot.
     fn readiness(&self) -> ReadinessFlags;
@@ -263,8 +263,8 @@ pub fn shutdown(
     socket_resource(session, handle, ObjectRights::WRITE)?.shutdown(mode)
 }
 
-/// Returns the broker-authoritative connection status.
-pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketConnectionStatus> {
+/// Returns broker-authoritative socket status and consumes its pending asynchronous error.
+pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketStatusResponse> {
     let object = session.authorized_object(handle, ObjectRights::WAIT)?;
     let (resource, status, connect_in_flight) = {
         let object = object.read();
@@ -278,26 +278,38 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketCon
         )
     };
     if connect_in_flight {
-        return Ok(SocketConnectionStatus::Connecting);
+        return Ok(SocketStatusResponse {
+            status: SocketConnectionStatus::Connecting,
+            local_address: None,
+            pending_error: None,
+        });
     }
-    if status != SocketConnectionStatus::Connecting {
-        return Ok(status);
+    if matches!(
+        status,
+        SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_)
+    ) {
+        return Ok(SocketStatusResponse {
+            status,
+            local_address: None,
+            pending_error: None,
+        });
     }
-    let status = resource.status()?;
-    if status == SocketConnectionStatus::Unconnected {
+    let mut response = resource.status()?;
+    if status == SocketConnectionStatus::Connected {
+        response.status = status;
+        return Ok(response);
+    }
+    if response.status == SocketConnectionStatus::Unconnected {
         return Err(BrokerError::Internal);
     }
     let mut object = object.write();
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
     };
-    let status = if socket.connection_status == SocketConnectionStatus::Connecting {
-        socket.connection_status = status;
-        status
-    } else {
-        socket.connection_status
-    };
-    Ok(status)
+    if socket.connection_status == SocketConnectionStatus::Connecting {
+        socket.connection_status = response.status;
+    }
+    Ok(response)
 }
 
 fn socket_resource(
@@ -375,7 +387,7 @@ impl SocketResource {
         self.platform_socket().shutdown(mode)
     }
 
-    fn status(&self) -> Result<SocketConnectionStatus> {
+    fn status(&self) -> Result<SocketStatusResponse> {
         self.platform_socket().status()
     }
 
@@ -542,9 +554,13 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(()))
         }
 
-        fn status(&self) -> Result<SocketConnectionStatus> {
+        fn status(&self) -> Result<SocketStatusResponse> {
             self.state.status_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(SocketConnectionStatus::Connected)
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: None,
+                pending_error: None,
+            })
         }
 
         fn readiness(&self) -> ReadinessFlags {
@@ -621,7 +637,11 @@ pub(crate) mod tests {
         );
         assert_eq!(
             status(&session, handle),
-            Ok(SocketConnectionStatus::Unconnected)
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: None,
+                pending_error: None,
+            })
         );
         assert_eq!(
             connect(&session, handle, loopback_address()),
@@ -633,7 +653,11 @@ pub(crate) mod tests {
         );
         assert_eq!(
             status(&session, handle),
-            Ok(SocketConnectionStatus::Connected)
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: None,
+                pending_error: None,
+            })
         );
         assert_eq!(
             session.check_readiness(handle),
@@ -817,7 +841,11 @@ pub(crate) mod tests {
         );
         assert_eq!(
             status(&session, handle),
-            Ok(SocketConnectionStatus::Failed(SocketError::Other))
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::Other),
+                local_address: None,
+                pending_error: None,
+            })
         );
         assert_eq!(
             provider.state.connect_calls.load(Ordering::Relaxed),

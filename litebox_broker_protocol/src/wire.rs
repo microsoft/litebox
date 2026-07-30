@@ -361,6 +361,14 @@ mod tests {
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 
+    const fn socket_status(status: SocketConnectionStatus) -> SocketStatusResponse {
+        SocketStatusResponse {
+            status,
+            local_address: None,
+            pending_error: None,
+        }
+    }
+
     #[test]
     fn handshake_request_codec_round_trips_all_variants() {
         let requests = [BrokerHandshakeRequest {
@@ -541,9 +549,7 @@ mod tests {
                 SocketResponse::Connect(ConnectSocketResponse {
                     status: SocketConnectionStatus::Failed(error),
                 }),
-                SocketResponse::Status(SocketStatusResponse {
-                    status: SocketConnectionStatus::Failed(error),
-                }),
+                SocketResponse::Status(socket_status(SocketConnectionStatus::Failed(error))),
             ] {
                 let response = BrokerResponse {
                     request_id: TEST_REQUEST_ID,
@@ -614,9 +620,9 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 })),
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResult::Socket(SocketResponse::Create(CreateSocketResponse { handle })),
-            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                status: SocketConnectionStatus::Unconnected,
-            })),
+            BrokerResult::Socket(SocketResponse::Status(socket_status(
+                SocketConnectionStatus::Unconnected,
+            ))),
             BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
                 status: SocketConnectionStatus::Connecting,
             })),
@@ -631,15 +637,23 @@ mod tests {
             BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(0))),
             BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::EndOfStream)),
             BrokerResult::Socket(SocketResponse::Shutdown),
-            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                status: SocketConnectionStatus::Connecting,
-            })),
+            BrokerResult::Socket(SocketResponse::Status(socket_status(
+                SocketConnectionStatus::Connecting,
+            ))),
+            BrokerResult::Socket(SocketResponse::Status(socket_status(
+                SocketConnectionStatus::Connected,
+            ))),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
+                local_address: Some(SocketAddressV4 {
+                    address: Ipv4Address([127, 0, 0, 1]),
+                    port: Port(49152),
+                }),
+                pending_error: Some(SocketError::ConnectionReset),
             })),
-            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                status: SocketConnectionStatus::Failed(SocketError::TimedOut),
-            })),
+            BrokerResult::Socket(SocketResponse::Status(socket_status(
+                SocketConnectionStatus::Failed(SocketError::TimedOut),
+            ))),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
@@ -871,6 +885,8 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
+                local_address: None,
+                pending_error: None,
             })),
         });
         *unknown_status.last_mut().unwrap() = 0xff;

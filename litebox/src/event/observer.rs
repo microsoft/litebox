@@ -147,6 +147,21 @@ impl<E, F: EventsFilter<E>, Platform: RawSyncPrimitivesProvider> Subject<E, F, P
             }
         }
     }
+
+    /// Notify every registered observer without applying its event filter.
+    pub(crate) fn notify_all_observers(&self, events: E) {
+        if self.nums.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+
+        let mut observers = self.observers.lock();
+        self.prune_dead_observers(&mut observers);
+        for observer in observers.keys() {
+            if let Some(observer) = observer.upgrade() {
+                observer.on_events(&events);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -198,5 +213,7 @@ mod tests {
         subject.notify_observers(Events::OUT);
 
         assert_eq!(fresh.notifications.load(Ordering::Relaxed), 1);
+        subject.notify_all_observers(Events::empty());
+        assert_eq!(fresh.notifications.load(Ordering::Relaxed), 2);
     }
 }

@@ -17,10 +17,13 @@ use crate::{LiteBox, platform, sync};
 use bitflags::bitflags;
 use smoltcp::socket::{icmp, raw, tcp, udp};
 
+mod broker_socket;
 pub mod errors;
 pub mod local_ports;
 mod phy;
 pub mod socket_channel;
+
+pub use broker_socket::BrokerTcpSocket;
 
 #[cfg(test)]
 mod tests;
@@ -30,6 +33,19 @@ use errors::{
     RemoteAddrError, SendError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
+
+fn socket_error_from_broker(error: crate::broker::error::BrokerObjectError) -> SocketError {
+    match error {
+        crate::broker::error::BrokerObjectError::ResourceExhausted
+        | crate::broker::error::BrokerObjectError::OutOfMemory => SocketError::ResourceExhausted,
+        crate::broker::error::BrokerObjectError::PermissionDenied => SocketError::PermissionDenied,
+        crate::broker::error::BrokerObjectError::Control
+        | crate::broker::error::BrokerObjectError::InvalidObject
+        | crate::broker::error::BrokerObjectError::WouldBlock
+        | crate::broker::error::BrokerObjectError::PeerClosed
+        | crate::broker::error::BrokerObjectError::UnsupportedOperation => SocketError::Io,
+    }
+}
 
 /// IP address for LiteBox interface
 // TODO: Make this configurable
@@ -41,6 +57,17 @@ const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// Maximum size of rx/tx buffers for sockets
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
+
+/// Directions of a socket to shut down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownDirection {
+    /// Stop receiving.
+    Read,
+    /// Stop sending.
+    Write,
+    /// Stop receiving and sending.
+    Both,
+}
 
 /// Limits maximum number of packets in a buffer
 const MAX_PACKET_COUNT: usize = 32;
@@ -133,8 +160,10 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     /// Whether this socket handle is going away soon (i.e., `close` has been invoked upon it but
     /// it lingers for a bit to allow pending data to be sent).
     consider_closed: bool,
-    /// The handle into the `socket_set`
-    handle: smoltcp::iface::SocketHandle,
+    /// The handle into the `socket_set`, absent for broker-owned sockets.
+    handle: Option<smoltcp::iface::SocketHandle>,
+    /// Broker-owned TCP state, absent for locally implemented sockets.
+    broker_socket: Option<alloc::sync::Arc<BrokerTcpSocket<Platform>>>,
     // Protocol-specific data
     specific: ProtocolSpecific,
     /// The proxy associated with this socket to enable lock-free data transfer
@@ -143,6 +172,11 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
+    fn smoltcp_handle(&self) -> smoltcp::iface::SocketHandle {
+        self.handle
+            .expect("broker-owned socket must not enter the smoltcp path")
+    }
+
     /// Convenience function to perform an operation depending on the socket type
     fn with_socket<TCP, UDP, R>(
         &self,
@@ -156,11 +190,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
     {
         match self.protocol() {
             crate::net::Protocol::Tcp => {
-                let tcp_socket = socket_set.get::<tcp::Socket>(self.handle);
+                let tcp_socket = socket_set.get::<tcp::Socket>(self.smoltcp_handle());
                 tcp(tcp_socket)
             }
             crate::net::Protocol::Udp => {
-                let udp_socket = socket_set.get::<udp::Socket>(self.handle);
+                let udp_socket = socket_set.get::<udp::Socket>(self.smoltcp_handle());
                 udp(udp_socket)
             }
             crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => {
@@ -182,11 +216,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
     {
         match self.protocol() {
             crate::net::Protocol::Tcp => {
-                let tcp_socket = socket_set.get_mut::<tcp::Socket>(self.handle);
+                let tcp_socket = socket_set.get_mut::<tcp::Socket>(self.smoltcp_handle());
                 tcp(tcp_socket)
             }
             crate::net::Protocol::Udp => {
-                let udp_socket = socket_set.get_mut::<udp::Socket>(self.handle);
+                let udp_socket = socket_set.get_mut::<udp::Socket>(self.smoltcp_handle());
                 udp(udp_socket)
             }
             crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => {
@@ -522,6 +556,10 @@ where
         for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
             if socket_handle.consider_closed {
+                if socket_handle.broker_socket.is_some() {
+                    socket_handle.consider_closed = false;
+                    continue;
+                }
                 // check if there is pending data to be sent
                 if let Some(proxy) = &socket_handle.proxy
                     && proxy.has_pending_tx()
@@ -573,13 +611,16 @@ where
         socket_handle: &SocketHandle<Platform>,
         now: smoltcp::time::Instant,
     ) {
+        if socket_handle.broker_socket.is_some() {
+            return;
+        }
         let proxy = match &socket_handle.proxy {
             Some(proxy) => proxy.as_ref(),
             None => return,
         };
         match (socket_handle.protocol(), proxy) {
             (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
-                let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.smoltcp_handle());
 
                 // Drain TX buffer: from ring buffer directly to smoltcp
                 while tcp_socket.can_send() {
@@ -648,7 +689,7 @@ where
                 }
             }
             (Protocol::Udp, NetworkProxy::Datagram(udp_proxy)) => {
-                let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
+                let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.smoltcp_handle());
                 let remote_endpoint = socket_handle.udp().remote_endpoint;
 
                 // Drain TX queue: try to send datagrams, consume only on success
@@ -693,6 +734,7 @@ where
             (Protocol::Icmp | Protocol::Raw { .. }, _) => {
                 unimplemented!()
             }
+            (Protocol::Tcp, NetworkProxy::BrokerStream(_)) => unreachable!(),
             _ => panic!("Mismatched protocol and proxy type"),
         }
     }
@@ -726,12 +768,24 @@ where
     /// By default, the created socket has no associated proxy; to set a proxy, use
     /// [`set_socket_proxy`](Self::set_socket_proxy).
     pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
+        let broker_socket = if matches!(protocol, Protocol::Tcp) {
+            self.litebox
+                .broker_control()
+                .map(|broker| {
+                    BrokerTcpSocket::new(broker, self.litebox.broker_pollable_registry())
+                        .map_err(socket_error_from_broker)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let handle = match protocol {
-            Protocol::Tcp => self.socket_set.add(tcp::Socket::new(
+            Protocol::Tcp if broker_socket.is_some() => None,
+            Protocol::Tcp => Some(self.socket_set.add(tcp::Socket::new(
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
-            )),
-            Protocol::Udp => self.socket_set.add(udp::Socket::new(
+            ))),
+            Protocol::Udp => Some(self.socket_set.add(udp::Socket::new(
                 smoltcp::storage::PacketBuffer::new(
                     vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
                     vec![0u8; SOCKET_BUFFER_SIZE],
@@ -740,8 +794,8 @@ where
                     vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
                     vec![0u8; SOCKET_BUFFER_SIZE],
                 ),
-            )),
-            Protocol::Icmp => self.socket_set.add(icmp::Socket::new(
+            ))),
+            Protocol::Icmp => Some(self.socket_set.add(icmp::Socket::new(
                 smoltcp::storage::PacketBuffer::new(
                     vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
                     vec![0u8; SOCKET_BUFFER_SIZE],
@@ -750,7 +804,7 @@ where
                     vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
                     vec![0u8; SOCKET_BUFFER_SIZE],
                 ),
-            )),
+            ))),
             Protocol::Raw { protocol } => {
                 // TODO: Should we maintain a specific allow-list of protocols for raw sockets?
                 // Should we allow everything except TCP/UDP/ICMP? Should we allow everything? These
@@ -761,7 +815,7 @@ where
                     unreachable_code,
                     reason = "currently raw is just directly disallowed; we might bring this code back in the future"
                 )]
-                self.socket_set.add(raw::Socket::new(
+                Some(self.socket_set.add(raw::Socket::new(
                     smoltcp::wire::IpVersion::Ipv4,
                     smoltcp::wire::IpProtocol::from(protocol),
                     smoltcp::storage::PacketBuffer::new(
@@ -772,13 +826,14 @@ where
                         vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
                         vec![0u8; SOCKET_BUFFER_SIZE],
                     ),
-                ))
+                )))
             }
         };
 
         Ok(self.new_socket_fd_for(SocketHandle {
             consider_closed: false,
             handle,
+            broker_socket,
             specific: match protocol {
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
                     local_port: None,
@@ -799,6 +854,21 @@ where
     /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
     fn new_socket_fd_for(&mut self, socket_handle: SocketHandle<Platform>) -> SocketFd<Platform> {
         self.litebox.descriptor_table_mut().insert(socket_handle)
+    }
+
+    /// Creates the userspace I/O proxy matching the backend of `fd`.
+    pub fn new_socket_proxy(&self, fd: &SocketFd<Platform>) -> Option<NetworkProxy<Platform>> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(fd)?;
+        if let Some(socket) = &entry.entry.broker_socket {
+            return Some(NetworkProxy::BrokerStream(alloc::sync::Arc::clone(socket)));
+        }
+        Some(match entry.entry.protocol() {
+            Protocol::Tcp => NetworkProxy::Stream(socket_channel::StreamSocketChannel::new()),
+            Protocol::Udp => NetworkProxy::Datagram(socket_channel::DatagramSocketChannel::new()),
+            Protocol::Raw { .. } => NetworkProxy::Raw,
+            Protocol::Icmp => return None,
+        })
     }
 
     /// Set the network proxy for the socket at `fd`
@@ -856,6 +926,9 @@ where
                 {
                     return false;
                 }
+                if socket_handle.broker_socket.is_some() {
+                    return true;
+                }
                 !socket_handle.with_socket(
                     &self.socket_set,
                     |tcp_socket| tcp_socket.may_send() && tcp_socket.send_queue() > 0,
@@ -910,9 +983,17 @@ where
         let SocketHandle {
             consider_closed: _,
             handle,
+            broker_socket,
             mut specific,
             proxy,
         } = socket_handle;
+        if broker_socket.is_some() {
+            if let Some(proxy) = proxy {
+                proxy.set_state(socket_channel::SocketState::Closed);
+            }
+            return;
+        }
+        let handle = handle.expect("local socket must have a smoltcp handle");
         match specific.protocol() {
             Protocol::Raw { .. } | Protocol::Icmp => {
                 // There is no close/abort for raw and icmp sockets
@@ -975,43 +1056,49 @@ where
         let now = self.now();
         let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
-                let check_state = |state: tcp::State| -> Result<(), ConnectError> {
-                    match state {
-                        tcp::State::Established => {
-                            // already connected
-                            Ok(())
-                        }
-                        tcp::State::Closed | tcp::State::TimeWait => {
-                            Err(ConnectError::InvalidState)
-                        }
-                        tcp::State::SynSent => Err(ConnectError::InProgress),
-                        s => unimplemented!("state: {:?}", s),
-                    }
-                };
-
-                let socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                if check_progress {
-                    check_state(socket.state())
+                if let Some(socket) = &socket_handle.broker_socket {
+                    socket.connect(*addr, check_progress)
                 } else {
-                    let local_port = self.local_port_allocator.ephemeral_port()?;
-                    let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
-                    let addr: smoltcp::wire::IpEndpoint = (*addr).into();
-                    match socket.connect(self.interface.context(), addr, local_endpoint) {
-                        Ok(()) => {
-                            socket.set_timeout(Some(TCP_CONNECT_TIMEOUT));
-                            let tcp_specific = socket_handle.tcp_mut();
-                            tcp_specific.connect_initiated_at_us = Some(now);
-                            let old_port = tcp_specific.local_port.replace(local_port);
-                            if old_port.is_some() {
-                                // Need to think about how to handle this situation
-                                unimplemented!()
+                    let check_state = |state: tcp::State| -> Result<(), ConnectError> {
+                        match state {
+                            tcp::State::Established => {
+                                // already connected
+                                Ok(())
                             }
-                            check_state(socket.state())
+                            tcp::State::Closed | tcp::State::TimeWait => {
+                                Err(ConnectError::InvalidState)
+                            }
+                            tcp::State::SynSent => Err(ConnectError::InProgress),
+                            s => unimplemented!("state: {:?}", s),
                         }
-                        Err(tcp::ConnectError::InvalidState) => unreachable!(),
-                        Err(tcp::ConnectError::Unaddressable) => {
-                            self.local_port_allocator.deallocate(local_port);
-                            Err(ConnectError::Unaddressable)
+                    };
+
+                    let socket: &mut tcp::Socket =
+                        self.socket_set.get_mut(socket_handle.smoltcp_handle());
+                    if check_progress {
+                        check_state(socket.state())
+                    } else {
+                        let local_port = self.local_port_allocator.ephemeral_port()?;
+                        let local_endpoint: smoltcp::wire::IpListenEndpoint =
+                            local_port.port().into();
+                        let addr: smoltcp::wire::IpEndpoint = (*addr).into();
+                        match socket.connect(self.interface.context(), addr, local_endpoint) {
+                            Ok(()) => {
+                                socket.set_timeout(Some(TCP_CONNECT_TIMEOUT));
+                                let tcp_specific = socket_handle.tcp_mut();
+                                tcp_specific.connect_initiated_at_us = Some(now);
+                                let old_port = tcp_specific.local_port.replace(local_port);
+                                if old_port.is_some() {
+                                    // Need to think about how to handle this situation
+                                    unimplemented!()
+                                }
+                                check_state(socket.state())
+                            }
+                            Err(tcp::ConnectError::InvalidState) => unreachable!(),
+                            Err(tcp::ConnectError::Unaddressable) => {
+                                self.local_port_allocator.deallocate(local_port);
+                                Err(ConnectError::Unaddressable)
+                            }
                         }
                     }
                 }
@@ -1020,7 +1107,8 @@ where
                 if addr.port() == 0 {
                     return Err(ConnectError::Unaddressable);
                 }
-                let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                let socket: &mut udp::Socket =
+                    self.socket_set.get_mut(socket_handle.smoltcp_handle());
                 if !socket.is_open() {
                     let local_port = self.local_port_allocator.ephemeral_port()?;
                     let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
@@ -1076,7 +1164,10 @@ where
 
         match socket_handle.protocol() {
             Protocol::Tcp => {
-                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
+                if let Some(socket) = &socket_handle.broker_socket {
+                    return Ok(socket.local_addr());
+                }
+                let socket: &tcp::Socket = self.socket_set.get(socket_handle.smoltcp_handle());
                 match socket.local_endpoint() {
                     Some(endpoint) => match endpoint.addr {
                         smoltcp::wire::IpAddress::Ipv4(ipv4) => {
@@ -1087,7 +1178,7 @@ where
                 }
             }
             Protocol::Udp => {
-                let socket: &udp::Socket = self.socket_set.get(socket_handle.handle);
+                let socket: &udp::Socket = self.socket_set.get(socket_handle.smoltcp_handle());
                 let local_endpoint = socket.endpoint();
                 match local_endpoint.addr {
                     Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => {
@@ -1114,15 +1205,41 @@ where
         self.get_remote_addr_for_handle(socket_handle)
     }
 
+    /// Shuts down one or both directions of a broker-owned socket.
+    pub fn shutdown(
+        &self,
+        fd: &SocketFd<Platform>,
+        direction: ShutdownDirection,
+    ) -> Result<(), errors::ShutdownError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table
+            .get_entry(fd)
+            .ok_or(errors::ShutdownError::InvalidFd)?;
+        let socket = entry
+            .entry
+            .broker_socket
+            .as_ref()
+            .ok_or(errors::ShutdownError::UnsupportedOperation)?;
+        let mode = match direction {
+            ShutdownDirection::Read => litebox_broker_protocol::socket::ShutdownMode::Read,
+            ShutdownDirection::Write => litebox_broker_protocol::socket::ShutdownMode::Write,
+            ShutdownDirection::Both => litebox_broker_protocol::socket::ShutdownMode::Both,
+        };
+        socket.shutdown(mode).map_err(errors::ShutdownError::Socket)
+    }
+
     /// Get the remote address and port a `SocketHandle` is connected to, if any.
     fn get_remote_addr_for_handle(
         &self,
         socket_handle: &SocketHandle<Platform>,
     ) -> Result<SocketAddr, RemoteAddrError> {
+        if let Some(socket) = &socket_handle.broker_socket {
+            return socket.remote_addr();
+        }
         let endpoint = match socket_handle.protocol() {
             Protocol::Tcp => self
                 .socket_set
-                .get::<tcp::Socket>(socket_handle.handle)
+                .get::<tcp::Socket>(socket_handle.smoltcp_handle())
                 .remote_endpoint()
                 .ok_or(RemoteAddrError::NotConnected)?,
             Protocol::Udp => socket_handle
@@ -1154,6 +1271,9 @@ where
             .get_entry_mut(fd)
             .ok_or(BindError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.broker_socket.is_some() {
+            return Err(BindError::UnsupportedOperation);
+        }
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 if socket_handle.tcp().server_socket.is_some() {
@@ -1191,7 +1311,8 @@ where
                     addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
                     port: lp.port(),
                 };
-                let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                let socket: &mut udp::Socket =
+                    self.socket_set.get_mut(socket_handle.smoltcp_handle());
                 if let Err(e) = socket.bind(local_endpoint) {
                     self.local_port_allocator.deallocate(lp);
                     return Err(match e {
@@ -1223,6 +1344,9 @@ where
             .get_entry_mut(fd)
             .ok_or(ListenError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.broker_socket.is_some() {
+            return Err(ListenError::UnsupportedOperation);
+        }
         if backlog == 0 {
             // What should actually happen here?
             unimplemented!()
@@ -1317,6 +1441,9 @@ where
             .get_entry_mut(fd)
             .ok_or(AcceptError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.broker_socket.is_some() {
+            return Err(AcceptError::UnsupportedOperation);
+        }
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {
                 let Some(server_socket) = &mut handle.server_socket else {
@@ -1362,7 +1489,8 @@ where
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
                     consider_closed: false,
-                    handle: ready_handle,
+                    handle: Some(ready_handle),
+                    broker_socket: None,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,
                         server_socket: None,
@@ -1401,6 +1529,9 @@ where
             .get_entry_mut(fd)
             .ok_or(SendError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.broker_socket.is_some() {
+            return Err(SendError::SocketInInvalidState);
+        }
         if !flags.is_empty() {
             unimplemented!()
         }
@@ -1412,7 +1543,7 @@ where
                     return Err(SendError::UnnecessaryDestinationAddress);
                 }
                 self.socket_set
-                    .get_mut::<tcp::Socket>(socket_handle.handle)
+                    .get_mut::<tcp::Socket>(socket_handle.smoltcp_handle())
                     .send_slice(buf)
                     .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState)
             }
@@ -1426,7 +1557,8 @@ where
                 let Some(remote_endpoint) = destination else {
                     return Err(SendError::DestinationAddressRequired);
                 };
-                let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                let udp_socket: &mut udp::Socket =
+                    self.socket_set.get_mut(socket_handle.smoltcp_handle());
                 if !udp_socket.is_open() {
                     let local_port = self
                         .local_port_allocator
@@ -1482,6 +1614,9 @@ where
             .get_entry_mut(fd)
             .ok_or(ReceiveError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if socket_handle.broker_socket.is_some() {
+            return Err(ReceiveError::SocketInInvalidState);
+        }
         if flags.intersects(
             (ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::DISCARD).complement(),
         ) {
@@ -1494,7 +1629,9 @@ where
                     // TCP is connection-oriented, so no need to provide a source address
                     *source_addr = None;
                 }
-                let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                let tcp_socket = self
+                    .socket_set
+                    .get_mut::<tcp::Socket>(socket_handle.smoltcp_handle());
                 if flags.contains(ReceiveFlags::TRUNC) {
                     unimplemented!("TRUNC flag for tcp");
                 }
@@ -1518,7 +1655,9 @@ where
                 })
             }
             Protocol::Udp => {
-                let udp_socket = self.socket_set.get_mut::<udp::Socket>(socket_handle.handle);
+                let udp_socket = self
+                    .socket_set
+                    .get_mut::<udp::Socket>(socket_handle.smoltcp_handle());
                 match udp_socket.recv() {
                     Ok((data, meta)) => {
                         if let Some(source_addr) = source_addr {
@@ -1570,9 +1709,15 @@ where
             .get_entry_mut(fd)
             .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if let Some(socket) = &socket_handle.broker_socket {
+            socket.set_tcp_option(data);
+            return Ok(());
+        }
         match socket_handle.protocol() {
             Protocol::Tcp => {
-                let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                let tcp_socket = self
+                    .socket_set
+                    .get_mut::<tcp::Socket>(socket_handle.smoltcp_handle());
                 match data {
                     TcpOptionData::NODELAY(nodelay) => {
                         tcp_socket.set_nagle_enabled(!nodelay);
@@ -1605,9 +1750,14 @@ where
             .get_entry_mut(fd)
             .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        if let Some(socket) = &socket_handle.broker_socket {
+            return Ok(socket.get_tcp_option(name));
+        }
         match socket_handle.protocol() {
             Protocol::Tcp => {
-                let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);
+                let tcp_socket = self
+                    .socket_set
+                    .get::<tcp::Socket>(socket_handle.smoltcp_handle());
                 match name {
                     TcpOptionName::NODELAY => {
                         Ok(TcpOptionData::NODELAY(!tcp_socket.nagle_enabled()))

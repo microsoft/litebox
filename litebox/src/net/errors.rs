@@ -21,6 +21,12 @@ use thiserror::Error;
 pub enum SocketError {
     #[error("Unsupported protocol {0}")]
     UnsupportedProtocol(u8),
+    #[error("Socket resources are exhausted")]
+    ResourceExhausted,
+    #[error("Socket creation was denied")]
+    PermissionDenied,
+    #[error("Socket creation failed")]
+    Io,
 }
 
 /// Possible errors from [`Network::close`]
@@ -31,6 +37,18 @@ pub enum CloseError {
     InvalidFd,
     #[error("Socket closed with data still pending transmission")]
     DataPending,
+}
+
+/// Possible errors from [`Network::shutdown`]
+#[non_exhaustive]
+#[derive(Error, Clone, Copy, Debug)]
+pub enum ShutdownError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("Shutdown is unsupported for this socket")]
+    UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    Socket(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::connect`]
@@ -51,6 +69,8 @@ pub enum ConnectError {
     InvalidState,
     #[error("Connection timed out")]
     TimedOut,
+    #[error("Socket operation failed: {0:?}")]
+    Socket(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::get_local_addr`]
@@ -83,6 +103,8 @@ pub enum BindError {
     PortAlreadyInUse(u16),
     #[error("Already bound to an address")]
     AlreadyBound,
+    #[error("Binding is unsupported for this socket")]
+    UnsupportedOperation,
 }
 
 /// Possible errors from [`Network::listen`]
@@ -97,6 +119,8 @@ pub enum ListenError {
     InvalidState,
     #[error("No available free ephemeral ports")]
     NoAvailableFreeEphemeralPorts,
+    #[error("Listening is unsupported for this socket")]
+    UnsupportedOperation,
 }
 
 /// Possible errors from [`Network::accept`]
@@ -109,6 +133,8 @@ pub enum AcceptError {
     NotListening,
     #[error("No connections ready to be accepted")]
     NoConnectionsReady,
+    #[error("Accepting connections is unsupported for this socket")]
+    UnsupportedOperation,
 }
 
 /// Possible errors from [`Network::send`]
@@ -154,6 +180,26 @@ crate::utilities::macros::repr_enum! {
         ConnectionReset = 2,
         /// Connection timed out (e.g., SYN retransmission timeout expired without response).
         TimedOut = 3,
+        /// The connection was aborted before it completed.
+        ConnectionAborted = 4,
+        /// No route to the network exists.
+        NetworkUnreachable = 5,
+        /// No route to the host exists.
+        HostUnreachable = 6,
+        /// The requested address is already in use.
+        AddressInUse = 7,
+        /// The requested address is unavailable.
+        AddressNotAvailable = 8,
+        /// The socket is not connected.
+        NotConnected = 9,
+        /// Policy denied the socket operation.
+        PolicyDenied = 10,
+        /// Socket resources are exhausted.
+        ResourceExhausted = 11,
+        /// The socket operation is unsupported.
+        UnsupportedOperation = 12,
+        /// The broker association or host socket failed.
+        Other = 13,
     }
 }
 

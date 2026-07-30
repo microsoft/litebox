@@ -23,6 +23,7 @@ extern crate std;
 mod error;
 mod event;
 mod pipe;
+mod socket;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};

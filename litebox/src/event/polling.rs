@@ -141,6 +141,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     pub fn notify_observers(&self, events: Events) {
         self.subject.notify_observers(events);
     }
+
+    /// Wake every observer so it rechecks authoritative state.
+    pub(crate) fn wake_observers(&self) {
+        self.subject.notify_all_observers(Events::empty());
+    }
 }
 
 /// Private observer, used solely to help implement [`WaitContext::wait_on_events`].

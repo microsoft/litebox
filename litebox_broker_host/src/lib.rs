@@ -40,7 +40,7 @@ use litebox_broker_protocol::shared_buffer::{
 };
 use litebox_broker_protocol::socket::{
     ConnectSocketResponse, CreateSocketResponse, MAX_SOCKET_TRANSFER_SIZE, ReceiveSocketResponse,
-    SendSocketResponse, SocketStatusResponse,
+    SendSocketResponse,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -440,7 +440,7 @@ fn handle_socket_request<Memory: SharedMemory>(
         }
         SocketRequest::Status(request) => {
             litebox_broker_core::socket::status(session, request.handle)
-                .map(|status| SocketResponse::Status(SocketStatusResponse { status }))
+                .map(SocketResponse::Status)
                 .map_err(RequestFailure::from)
         }
     }
@@ -558,7 +558,7 @@ mod tests {
         AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, Ipv4Address, Port,
         ReceiveFlags, ReceiveSocketRequest, SendFlags, SendSocketRequest, ShutdownMode,
         ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
-        SocketStatusRequest, SocketType,
+        SocketStatusRequest, SocketStatusResponse, SocketType,
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
@@ -641,8 +641,12 @@ mod tests {
             Ok(SocketOutcome::Completed(()))
         }
 
-        fn status(&self) -> litebox_broker_core::Result<SocketConnectionStatus> {
-            Ok(SocketConnectionStatus::Connected)
+        fn status(&self) -> litebox_broker_core::Result<SocketStatusResponse> {
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: None,
+                pending_error: None,
+            })
         }
 
         fn readiness(&self) -> litebox_broker_protocol::readiness::ReadinessFlags {
@@ -1123,6 +1127,8 @@ mod tests {
             ),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
+                local_address: None,
+                pending_error: None,
             }))
         );
 

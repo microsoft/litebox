@@ -140,6 +140,8 @@ pub enum ChannelReadError {
     NotConnected,
     /// The stream is closed.
     ConnectionClosed,
+    /// The host network operation failed.
+    Socket(super::errors::SocketAsyncError),
 }
 
 /// Possible errors from [`NetworkProxy::try_write`].
@@ -157,6 +159,8 @@ pub enum ChannelWriteError {
     BufferFull,
     /// A destination address is required but was not provided.
     DestinationAddressRequired,
+    /// The host network operation failed.
+    Socket(super::errors::SocketAsyncError),
 }
 
 impl From<u32> for SocketState {
@@ -184,6 +188,8 @@ pub enum NetworkProxy<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Datagram(DatagramSocketChannel<Platform>),
     /// Raw socket proxy (not yet implemented)
     Raw,
+    /// Broker-owned TCP stream proxy.
+    BrokerStream(alloc::sync::Arc<super::BrokerTcpSocket<Platform>>),
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> {
@@ -199,6 +205,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
                 channel.set_connected(state == SocketState::Connected);
             }
             NetworkProxy::Raw => {}
+            NetworkProxy::BrokerStream(socket) => socket.set_state(state),
         }
     }
 
@@ -208,6 +215,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Stream(channel) => channel.set_async_error(error),
             NetworkProxy::Datagram(channel) => channel.set_async_error(error),
             NetworkProxy::Raw => {}
+            NetworkProxy::BrokerStream(socket) => socket.set_async_error(error),
         }
     }
 
@@ -217,6 +225,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Stream(channel) => channel.get_async_error(clear),
             NetworkProxy::Datagram(channel) => channel.get_async_error(clear),
             NetworkProxy::Raw => None,
+            NetworkProxy::BrokerStream(socket) => socket.get_async_error(clear),
         }
     }
 
@@ -234,6 +243,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Stream(channel) => channel.try_read(buf, flags, source_addr),
             NetworkProxy::Datagram(channel) => channel.try_read(buf, flags, source_addr),
             NetworkProxy::Raw => unimplemented!(),
+            NetworkProxy::BrokerStream(socket) => socket.try_read(buf, flags, source_addr),
         }
     }
 
@@ -259,6 +269,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Stream(channel) => channel.try_write(buf),
             NetworkProxy::Datagram(channel) => channel.send_to(buf, destination),
             NetworkProxy::Raw => unimplemented!(),
+            NetworkProxy::BrokerStream(socket) => socket.try_write(buf),
         }
     }
 }
@@ -268,6 +279,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkP
             NetworkProxy::Stream(channel) => channel.register_observer(observer, mask),
             NetworkProxy::Datagram(channel) => channel.register_observer(observer, mask),
             NetworkProxy::Raw => {}
+            NetworkProxy::BrokerStream(socket) => socket.register_observer(observer, mask),
         }
     }
 
@@ -276,6 +288,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkP
             NetworkProxy::Stream(channel) => channel.check_io_events(),
             NetworkProxy::Datagram(channel) => channel.check_io_events(),
             NetworkProxy::Raw => unimplemented!(),
+            NetworkProxy::BrokerStream(socket) => socket.check_io_events(),
         }
     }
 }
@@ -288,7 +301,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         match self {
             NetworkProxy::Stream(channel) => channel.set_readable(readable),
             NetworkProxy::Datagram(channel) => channel.set_readable(readable),
-            NetworkProxy::Raw => {}
+            NetworkProxy::Raw | NetworkProxy::BrokerStream(_) => {}
         }
     }
 
@@ -297,7 +310,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         match self {
             NetworkProxy::Stream(channel) => channel.has_pending_tx(),
             NetworkProxy::Datagram(channel) => channel.has_pending_tx(),
-            NetworkProxy::Raw => false,
+            NetworkProxy::Raw | NetworkProxy::BrokerStream(_) => false,
         }
     }
 }

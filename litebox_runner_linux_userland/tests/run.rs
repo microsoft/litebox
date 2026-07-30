@@ -10,25 +10,7 @@ use std::{
 };
 
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c"];
-
-struct TestReadinessSink;
-
-impl litebox_broker_core::readiness::ReadinessSink for TestReadinessSink {
-    fn max_tracked_objects(&self) -> usize {
-        usize::MAX
-    }
-
-    fn publish(
-        &self,
-        _handle: litebox_broker_protocol::ObjectHandle,
-        _readiness: litebox_broker_protocol::readiness::ReadinessFlags,
-    ) -> litebox_broker_core::Result<()> {
-        Ok(())
-    }
-
-    fn retire(&self, _handle: litebox_broker_protocol::ObjectHandle) {}
-}
+const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c", "tcp_broker.c"];
 
 #[must_use]
 struct Runner {
@@ -371,9 +353,16 @@ fn spawn_test_broker(
             let control_listener =
                 std::os::unix::net::UnixListener::bind(&server_control_socket_path)
                     .expect("failed to bind broker test control socket");
-            let broker = litebox_broker_core::BrokerCore::new(
+            let limits = litebox_broker_core::BrokerCoreLimits::DEFAULT;
+            let broker = litebox_broker_core::BrokerCore::new_with_limits(
                 policy,
-                std::sync::Arc::new(litebox_broker_core::socket::UnsupportedSocketProvider),
+                limits,
+                std::sync::Arc::new(
+                    litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
+                        limits.max_sockets,
+                    )
+                    .expect("failed to create broker test socket provider"),
+                ),
             )
             .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
@@ -412,11 +401,14 @@ fn spawn_test_broker(
                         control_stream,
                         std::time::Instant::now() + BROKER_HELPER_TIMEOUT,
                     );
+                let readiness = std::sync::Arc::new(
+                    litebox_broker_userland::readiness::ReadinessPublisherRuntime::new(),
+                );
                 let association = litebox_broker_host::setup_connection(
                     &broker,
                     &mut channel,
                     &shared_buffers,
-                    std::sync::Arc::new(TestReadinessSink),
+                    readiness.clone(),
                     |channel| {
                         channel.send_memfd(shared_buffers.memory(), None)?;
                         channel.send_memfd(control_ring.memory(), None)
@@ -424,9 +416,12 @@ fn spawn_test_broker(
                 )
                 .expect("broker host setup failed")
                 .expect("broker setup terminated before activation");
-                let (mut request_source, response_sink, _notifications, _shutdown) = channel
+                let (mut request_source, response_sink, mut notifications, _shutdown) = channel
                     .into_active(control_ring)
                     .expect("failed to activate broker test control ring");
+                let publisher_readiness = readiness.clone();
+                let publisher =
+                    std::thread::spawn(move || publisher_readiness.run(&mut notifications));
                 let mut close_object_count = 0;
                 let termination = loop {
                     match request_source
@@ -458,6 +453,11 @@ fn spawn_test_broker(
                     termination,
                     litebox_broker_host::ConnectionTermination::PeerClosed
                 );
+                readiness.close();
+                publisher
+                    .join()
+                    .expect("broker readiness publisher panicked")
+                    .expect("broker readiness publication failed");
                 close_object_count_tx
                     .send(close_object_count)
                     .expect("failed to report broker close-object count");
@@ -536,6 +536,85 @@ console.log(content);
     assert!(broker_thread.next_close_object_count() > 0);
 
     broker_thread.join();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_broker_tcp_client_with_rewriter() {
+    use std::io::{Read as _, Write as _};
+    use std::net::{Ipv4Addr, TcpListener};
+
+    const REQUEST_SIZE: usize = 65_536;
+    const RESPONSE_SIZE: usize = 40_000;
+    const BACKPRESSURE_SIZE: usize = 8 * 1024 * 1024;
+
+    let target = common::compile(
+        "./tests/tcp_broker.c",
+        "broker_tcp_client_rewriter",
+        false,
+        false,
+    );
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = vec![0; REQUEST_SIZE];
+        stream.read_exact(&mut request).unwrap();
+        assert!(request.iter().all(|byte| *byte == 0x5a));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stream.write_all(&[0x11; 16]).unwrap();
+        stream.write_all(&vec![0xa5; RESPONSE_SIZE]).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut backpressure = vec![0; BACKPRESSURE_SIZE];
+        stream.read_exact(&mut backpressure).unwrap();
+        assert!(backpressure.iter().all(|byte| *byte == 0x3c));
+        let mut eof = [0; 1];
+        assert_eq!(stream.read(&mut eof).unwrap(), 0);
+
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        for _ in 0..2 {
+            let (reset_stream, _) = listener.accept().unwrap();
+            // SAFETY: `reset_stream` owns a live socket and `linger` is valid for the supplied length.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        std::os::fd::AsRawFd::as_raw_fd(&reset_stream),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        std::ptr::from_ref(&linger).cast(),
+                        libc::socklen_t::try_from(std::mem::size_of_val(&linger)).unwrap(),
+                    )
+                },
+                0
+            );
+            drop(reset_stream);
+        }
+    });
+
+    let refused_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let refused_port = refused_listener.local_addr().unwrap().port();
+    drop(refused_listener);
+    let control_socket_path = unique_test_socket_path("runner-broker-tcp-control");
+    let broker = spawn_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4LoopbackTcp),
+        1,
+    );
+    Runner::new(&target, "broker_tcp_client_rewriter")
+        .arg(port.to_string())
+        .arg(refused_port.to_string())
+        .broker_socket(&control_socket_path)
+        .run();
+    assert_eq!(broker.next_close_object_count(), 5);
+    broker.join();
+    server.join().unwrap();
 }
 
 #[cfg(target_arch = "x86_64")]

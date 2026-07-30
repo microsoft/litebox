@@ -344,4 +344,8 @@ pub struct SocketStatusRequest {
 pub struct SocketStatusResponse {
     /// Current connection state.
     pub status: SocketConnectionStatus,
+    /// Local endpoint assigned by the host network stack, if any.
+    pub local_address: Option<SocketAddressV4>,
+    /// Pending asynchronous socket error, consumed by this status query.
+    pub pending_error: Option<SocketError>,
 }

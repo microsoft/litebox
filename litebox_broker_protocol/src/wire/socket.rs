@@ -170,6 +170,8 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
         SocketResponse::Status(response) => {
             encoder.u8(SOCKET_RESPONSE_TAG_STATUS);
             encode_connection_status(encoder, response.status);
+            encode_optional_address(encoder, response.local_address);
+            encode_optional_socket_error(encoder, response.pending_error);
         }
         SocketResponse::Failed(error) => {
             encoder.u8(SOCKET_RESPONSE_TAG_FAILED);
@@ -199,6 +201,8 @@ pub(super) fn decode_socket_response(
         SOCKET_RESPONSE_TAG_SHUTDOWN => Ok(SocketResponse::Shutdown),
         SOCKET_RESPONSE_TAG_STATUS => Ok(SocketResponse::Status(SocketStatusResponse {
             status: decode_connection_status(decoder)?,
+            local_address: decode_optional_address(decoder)?,
+            pending_error: decode_optional_socket_error(decoder)?,
         })),
         SOCKET_RESPONSE_TAG_FAILED => Ok(SocketResponse::Failed(decode_socket_error(decoder)?)),
         _ => Err(WireError::InvalidTag),
@@ -255,6 +259,40 @@ fn decode_address(decoder: &mut Decoder<'_>) -> Result<SocketAddressV4, WireErro
         address: Ipv4Address(octets),
         port: Port(decoder.u16()?),
     })
+}
+
+fn encode_optional_address(encoder: &mut Encoder, address: Option<SocketAddressV4>) {
+    encoder.u8(u8::from(address.is_some()));
+    if let Some(address) = address {
+        encode_address(encoder, address);
+    }
+}
+
+fn decode_optional_address(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<SocketAddressV4>, WireError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => decode_address(decoder).map(Some),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_optional_socket_error(encoder: &mut Encoder, error: Option<SocketError>) {
+    encoder.u8(u8::from(error.is_some()));
+    if let Some(error) = error {
+        encode_socket_error(encoder, error);
+    }
+}
+
+fn decode_optional_socket_error(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<SocketError>, WireError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => decode_socket_error(decoder).map(Some),
+        _ => Err(WireError::InvalidTag),
+    }
 }
 
 fn encode_shared_buffer_descriptor(encoder: &mut Encoder, descriptor: SharedBufferDescriptor) {
