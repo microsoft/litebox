@@ -30,18 +30,31 @@ fn objdump(objdump_cmd: &str, binary: &[u8]) -> String {
     lines.join("\n")
 }
 
-/// Return the first objdump-like command that exists on the host from
-/// `candidates`, or `None` if none are available.
-fn find_objdump(candidates: &[&str]) -> Option<String> {
+/// Whether `cmd` can actually disassemble `arch_token`.
+///
+/// Existence is not enough: a native GNU `objdump` disassembles only the
+/// architectures its BFD was built for, so on an AArch64 host `objdump` runs
+/// happily but reports no `i386:x86-64` support. `--info` lists them.
+/// `llvm-objdump` carries every target, and has no comparable `--info`.
+fn objdump_supports(cmd: &str, arch_token: &str) -> bool {
     use std::process::Command;
+    if cmd.contains("llvm-objdump") {
+        return Command::new(cmd)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+    }
+    Command::new(cmd).arg("--info").output().is_ok_and(|o| {
+        o.status.success() && String::from_utf8_lossy(&o.stdout).contains(arch_token)
+    })
+}
+
+/// Return the first command from `candidates` that can disassemble
+/// `arch_token`, or `None` if the host has none.
+fn find_objdump(candidates: &[&str], arch_token: &str) -> Option<String> {
     candidates
         .iter()
-        .find(|cmd| {
-            Command::new(cmd)
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| o.status.success())
-        })
+        .find(|cmd| objdump_supports(cmd, arch_token))
         .map(|cmd| (*cmd).to_owned())
 }
 
@@ -142,7 +155,20 @@ fn run_snapshot_test(objdump_cmd: &str, input: &[u8], snapshot: &str) {
 
 #[test]
 fn snapshot_test_hello_world_x86_64() {
-    run_snapshot_test("objdump", HELLO_INPUT_64, "hello-diff");
+    // Only GNU objdumps are candidates: the stored snapshot records their
+    // output format, so falling back to `llvm-objdump` would report a diff
+    // that is purely a change of disassembler. Skip (rather than fail) when
+    // the host has none, so an AArch64 dev environment still passes -- the
+    // mirror of what the AArch64 test does on an x86-only host.
+    let Some(objdump_cmd) = find_objdump(&["x86_64-linux-gnu-objdump", "objdump"], "i386:x86-64")
+    else {
+        eprintln!(
+            "skipping snapshot_test_hello_world_x86_64: no x86-64-capable GNU objdump \
+             (install binutils-x86-64-linux-gnu)"
+        );
+        return;
+    };
+    run_snapshot_test(&objdump_cmd, HELLO_INPUT_64, "hello-diff");
 }
 
 #[test]
@@ -157,7 +183,8 @@ fn snapshot_test_hello_world_aarch64() {
     // The host objdump usually cannot disassemble AArch64; prefer a cross or
     // LLVM objdump. Skip (rather than fail) when no capable tool is installed,
     // so x86-only dev environments still pass.
-    let Some(objdump_cmd) = find_objdump(&["aarch64-linux-gnu-objdump", "llvm-objdump"]) else {
+    let Some(objdump_cmd) = find_objdump(&["aarch64-linux-gnu-objdump", "llvm-objdump"], "aarch64")
+    else {
         eprintln!(
             "skipping snapshot_test_hello_world_aarch64: no AArch64-capable objdump \
              (install binutils-aarch64-linux-gnu or llvm)"

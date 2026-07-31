@@ -25,7 +25,14 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-mod arm64;
+// Only the runtime entry points dispatch on `target_arch`; the ahead-of-time
+// ones select the architecture from the input object and build anywhere.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!(
+    "litebox_syscall_rewriter's runtime patching entry points support only x86-64 and AArch64 hosts"
+);
+
+pub mod arm64;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -35,9 +42,8 @@ use alloc::vec::Vec;
 
 use litebox_common_windows::NtSysno;
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
-use object::read::elf::{ElfFile, ProgramHeader as _};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
-use object::read::{Object as _, ObjectSection as _};
+use object::read::{Object as _, ObjectSection as _, ObjectSegment as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -55,6 +61,10 @@ pub enum Error {
     AddressOverflow(String),
     #[error("unpatchable syscall instruction(s): {0}")]
     UnpatchableSyscalls(String),
+    #[error("failed to patch trampoline: {0}")]
+    TrampolinePatchFailure(String),
+    #[error("trampoline needs {needed:#x} bytes but only {available:#x} are available")]
+    TrampolineTooLarge { needed: u64, available: u64 },
 }
 
 /// Internal-only error variants used for control flow within the crate.
@@ -79,6 +89,16 @@ impl From<Error> for InternalError {
 }
 
 type Result<T> = core::result::Result<T, Error>;
+
+/// Offset of `e_ident[EI_DATA]`, the byte selecting the header's endianness.
+///
+/// `e_ident` and `e_type` are laid out identically in ELF32 and ELF64, so the
+/// ELF64 header's offsets locate these fields in either.
+const ELF_EI_DATA_OFFSET: usize = core::mem::offset_of!(object::elf::Ident, data);
+
+/// Offset of `e_machine`.
+const ELF_E_MACHINE_OFFSET: usize =
+    core::mem::offset_of!(object::elf::FileHeader64<object::LittleEndian>, e_machine);
 
 const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 
@@ -175,6 +195,19 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         ));
     }
 
+    // The AArch64 emitter reads and writes instruction words in little-endian
+    // order, so reject a big-endian AArch64 object before parsing or mutating it.
+    let data = input_binary.get(ELF_EI_DATA_OFFSET);
+    let machine = input_binary
+        .get(ELF_E_MACHINE_OFFSET..ELF_E_MACHINE_OFFSET + size_of::<u16>())
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map(u16::from_be_bytes);
+    if data == Some(&object::elf::ELFDATA2MSB) && machine == Some(object::elf::EM_AARCH64) {
+        return Err(Error::UnsupportedExecutable(
+            "big-endian AArch64 ELF".into(),
+        ));
+    }
+
     // Relocatable object files (.o) must not be patched: they are linker
     // input, not executable code. Rewriting instructions or appending
     // trampoline data would corrupt the object file for the linker.
@@ -207,7 +240,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, text_sections, trampoline_base_addr) = {
+    let (arch, text_sections, placement) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -230,9 +263,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             return Ok(input_binary.to_vec());
         }
 
-        let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
+        let placement = find_addr_for_trampoline_code(&file)?;
 
-        (arch, text_sections, trampoline_base_addr)
+        (arch, text_sections, placement)
     };
 
     // AArch64 uses a fully separate rewriting strategy (single-instruction
@@ -244,11 +277,12 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             input_binary,
             buf,
             &text_sections,
-            trampoline_base_addr,
+            placement,
             trampoline.unwrap_or(0),
         );
     }
 
+    let trampoline_base_addr = placement.addr();
     let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
     let mut trampoline_data = Vec::from(trampoline.unwrap_or(0).to_le_bytes());
     let patch_result = patch_syscalls_in_sections(
@@ -762,22 +796,73 @@ fn append_trampoline_footer(
     out.extend_from_slice(header.as_bytes());
 }
 
-/// Rewrite an AArch64 ELF, appending the trampoline and trailing header.
+/// Rewrites an AArch64 ELF, honoring `placement`.
+///
+/// The address is baked into every rewritten site, so it has to be chosen
+/// before the trampoline's size is known. The rewrite therefore runs at the
+/// preferred address and, if the trampoline outgrew the object's inter-segment
+/// hole, runs again at the unreserved fallback address.
+fn hook_aarch64_elf(
+    input_binary: &[u8],
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+    placement: TrampolinePlacement,
+    callback: u64,
+) -> Result<Vec<u8>> {
+    if let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement {
+        let mut attempt = buf.to_vec();
+        let out = hook_aarch64_elf_at(
+            input_binary,
+            &mut attempt,
+            text_sections,
+            addr,
+            Some(limit),
+            callback,
+        );
+        // A gap that is too small, or too far from the text for a gate's
+        // branch to reach back, is a property of this address rather than of
+        // the binary, so both are worth retrying elsewhere.
+        if !matches!(
+            out,
+            Err(Error::TrampolineTooLarge { .. } | Error::UnpatchableSyscalls(_))
+        ) {
+            buf.copy_from_slice(&attempt);
+            return out;
+        }
+        // Fall through to retry at the fallback address. `buf` is still
+        // pristine: only `attempt` was patched, and a rescan of already-patched
+        // bytes would find no sites.
+    }
+    hook_aarch64_elf_at(
+        input_binary,
+        buf,
+        text_sections,
+        placement.fallback_addr(),
+        None,
+        callback,
+    )
+}
+
+/// Rewrites an AArch64 ELF at a fixed trampoline address, appending the
+/// trampoline and trailing header.
 ///
 /// `input_binary` is the original, unmodified ELF; `buf` is the mutable copy
 /// (patched in place by the arm64 module). `callback` is the absolute address
 /// stored in the trampoline's callback slot (0 when the loader fills it in
-/// later).
+/// later). `trampoline_limit` bounds how many bytes the trampoline may occupy,
+/// or is `None` where nothing bounds it; overshooting a bound is reported as
+/// [`Error::TrampolineTooLarge`].
 ///
 /// Like the x86-64 path, a binary with no patch sites is emitted as the
 /// original bytes followed by a size-0 trampoline sentinel header (the arm64
 /// module signals this by returning `None`). Otherwise the output layout is
 /// `[patched ELF][padding to page boundary][trampoline code][header]`.
-fn hook_aarch64_elf(
+fn hook_aarch64_elf_at(
     input_binary: &[u8],
     buf: &mut [u8],
     text_sections: &[TextSectionInfo],
     trampoline_base_addr: u64,
+    trampoline_limit: Option<u64>,
     callback: u64,
 ) -> Result<Vec<u8>> {
     let Some(outcome) = arm64::hook_syscalls_aarch64(
@@ -803,9 +888,15 @@ fn hook_aarch64_elf(
 
     // Build output: [patched ELF][padding to page boundary][trampoline][header].
     let mut trampoline_data = outcome.trampoline;
-    let mut out = buf.to_vec();
-    append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_addr, false);
-
+    let needed = trampoline_data.len() as u64;
+    if let Some(limit) = trampoline_limit
+        && needed > limit
+    {
+        return Err(Error::TrampolineTooLarge {
+            needed,
+            available: limit,
+        });
+    }
     if !outcome.trapped_sites.is_empty() {
         return Err(Error::UnpatchableSyscalls(format!(
             "{} unpatchable instruction(s) (SVC / MSR / MRS TPIDR_EL0) at {trapped:?}",
@@ -813,6 +904,9 @@ fn hook_aarch64_elf(
             trapped = outcome.trapped_sites,
         )));
     }
+    let mut out = buf.to_vec();
+    append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_addr, false);
+
     Ok(out)
 }
 
@@ -1357,17 +1451,50 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
     Ok(disp.to_le_bytes())
 }
 
-/// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
-/// processing a whole ELF file, it operates on a single already-mapped code
-/// region — the caller is responsible for making the region writable before
-/// calling and restoring permissions afterwards.
+/// Runtime counterpart to [`hook_syscalls_in_elf`], operating on one
+/// already-mapped code region. The caller makes the region writable before
+/// calling and restores permissions afterwards.
+///
+/// The region is rewritten for the architecture this crate is running on, and
+/// `syscall_entry_addr` is interpreted per that architecture's stub ABI.
 ///
 /// # Returns
 ///
-/// `(trampoline_stubs, skipped_addrs)`. The caller must copy the stubs to
-/// `trampoline_write_vaddr`. Returns empty vecs if no syscall instructions
-/// are found in `code`.
+/// `(trampoline_stubs, unredirected_addrs)`, both empty if `code` has no
+/// patchable instructions. The caller must copy the stubs to
+/// `trampoline_write_vaddr`. On x86-64 the addresses were left native; on
+/// AArch64 they were overwritten with `BRK`.
+///
+/// # Caller obligations on AArch64
+///
+/// The I-cache is not coherent with the D-cache, so the caller **must**
+/// synchronize the instruction stream over the patched `code` and the written
+/// stubs before either is fetched, and must patch the emitted gates' guest
+/// thread-pointer placeholder. Neither omission fails cleanly. See the
+/// [`arm64`] module docs. x86-64 needs neither.
 pub fn patch_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        patch_x86_64_code_segment(code, code_vaddr, trampoline_write_vaddr, syscall_entry_addr)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        patch_aarch64_code_segment(code, code_vaddr, trampoline_write_vaddr, syscall_entry_addr)
+    }
+}
+
+/// [`patch_code_segment`] for an x86-64 host.
+///
+/// The emitted stubs jump *indirectly* through a shared 8-byte slot the caller
+/// places once per trampoline allocation, so `syscall_entry_addr` is the
+/// address of that slot.
+#[cfg(target_arch = "x86_64")]
+fn patch_x86_64_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
     trampoline_write_vaddr: u64,
@@ -1400,13 +1527,66 @@ pub fn patch_code_segment(
     }
 }
 
-/// Replace all `syscall` instructions in `code` with trap sequences (`ICEBP; HLT`).
+/// [`patch_code_segment`] for an AArch64 host, where `syscall_entry_addr` is
+/// the callback address itself, not a slot holding it.
 ///
-/// This is the fallback when trampoline-based patching cannot be performed
-/// (e.g. trampoline allocation failed or is too far away).
+/// The gates are identical to the ahead-of-time path's and carry the same guest
+/// thread-pointer placeholder, so the caller must run
+/// [`arm64::patch_guest_tpidr_offset`] over the returned stubs and prove with
+/// [`arm64::find_guest_tpidr_placeholder`] that none survives before writing
+/// them anywhere the guest can execute.
+#[cfg(any(test, target_arch = "aarch64"))]
+fn patch_aarch64_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    let section = TextSectionInfo {
+        vaddr: code_vaddr,
+        file_offset: 0,
+        size: code.len() as u64,
+    };
+    let Some(outcome) = arm64::hook_syscalls_aarch64(
+        code,
+        &[section],
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        arm64::Host::Linux,
+    )?
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    Ok((outcome.trampoline, outcome.trapped_sites))
+}
+
+/// Replace every syscall patch site in `code` with a trap instruction, so that
+/// reaching one faults instead of escaping to the host kernel. Returns how many
+/// were trapped.
 ///
-/// Returns the number of syscall instructions that were patched.
+/// The fail-safe when trampoline-based patching cannot be performed (allocation
+/// failed, or the trampoline is out of branch range). It has to cover exactly
+/// the sites the architecture's rewriter would have redirected, or it silently
+/// fails safe on nothing.
+///
+/// On AArch64 the caller must synchronize the instruction stream over `code`
+/// before it is fetched again; see [`patch_code_segment`].
 pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        trap_all_x86_64_syscalls(code, code_vaddr)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        trap_all_aarch64_patch_sites(code, code_vaddr)
+    }
+}
+
+/// [`trap_all_syscalls_in_code`] for an x86-64 host, where `syscall`
+/// instructions become `ICEBP; HLT`.
+#[cfg(target_arch = "x86_64")]
+fn trap_all_x86_64_syscalls(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
     let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
     let mut count = 0;
     for inst in &instructions {
@@ -1418,33 +1598,219 @@ pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usi
     Ok(count)
 }
 
-fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
-    // Find the highest virtual address among all PT_LOAD segments
-    let max_virtual_addr = match file {
-        object::File::Elf64(elf) => max_load_segment_end(elf),
-        _ => unreachable!(),
-    }
-    .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
-
-    // Round up to the nearest page (assume 0x1000 page size)
-    checked_add_u64(max_virtual_addr, 0xFFF, "trampoline base").map(|addr| addr & !0xFFF)
+/// [`trap_all_syscalls_in_code`] for an AArch64 host, where every site the
+/// scanner recognizes — `SVC` and the `MSR`/`MRS TPIDR_EL0` accesses it
+/// virtualizes — becomes `BRK`.
+#[cfg(any(test, target_arch = "aarch64"))]
+fn trap_all_aarch64_patch_sites(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
+    let section = TextSectionInfo {
+        vaddr: code_vaddr,
+        file_offset: 0,
+        size: code.len() as u64,
+    };
+    arm64::trap_all_patch_sites(code, &[section])
 }
 
-/// Returns the highest `p_vaddr + p_memsz` among all `PT_LOAD` segments.
-fn max_load_segment_end<Elf: object::read::elf::FileHeader>(elf: &ElfFile<'_, Elf>) -> Option<u64>
-where
-    Elf::Word: Into<u64>,
-{
-    let endian = elf.endian();
-    elf.elf_program_headers()
+/// The guest page size assumed when laying out the appended trampoline.
+pub(crate) const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
+
+/// The address past the object's last `PT_LOAD` where an appended trampoline
+/// goes. `max_load_end` is the highest `p_vaddr + p_memsz`, `max_align` the
+/// largest `p_align`.
+///
+/// AArch64 objects skip one further `max_align`, because the guest loader
+/// reserves `maplength + p_align` and trims the tail. Every other architecture
+/// keeps the page-granular rule, so its placement cannot move.
+///
+/// **Nothing reserves the returned address**, and glibc packs objects
+/// adjacently, so with several shared objects there may be no free gap here at
+/// all. `trampoline_placement_for` reaches this only after preferring a hole
+/// in the object's own load span; mapping here requires validating the range
+/// first (`litebox_shim_linux`'s `trampoline_range_is_safe_to_map`).
+pub fn trampoline_addr_for(max_load_end: u64, max_align: u64, e_machine: u16) -> Result<u64> {
+    // Guard against a bogus `p_align`: the masking below requires a power of two.
+    // Non-AArch64 objects keep the historical page-granular rule verbatim, so
+    // their placement cannot move.
+    let align = if e_machine == object::elf::EM_AARCH64 && max_align.is_power_of_two() {
+        max_align.max(TRAMPOLINE_PAGE_SIZE)
+    } else {
+        TRAMPOLINE_PAGE_SIZE
+    };
+    let aligned_end = checked_add_u64(max_load_end, align - 1, "trampoline base")? & !(align - 1);
+    if align <= TRAMPOLINE_PAGE_SIZE {
+        Ok(aligned_end)
+    } else {
+        checked_add_u64(aligned_end, align, "trampoline base")
+    }
+}
+
+/// A `PT_LOAD` segment, reduced to the fields trampoline placement needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoadSegment {
+    /// `p_vaddr`.
+    pub vaddr: u64,
+    /// `p_filesz`.
+    pub filesz: u64,
+    /// `p_memsz`.
+    pub memsz: u64,
+    /// `p_align`.
+    pub align: u64,
+}
+
+/// Where an object's appended trampoline goes, and how large it may grow.
+///
+/// TODO: one trampoline per object bounds every gate twice over -- by the hole
+/// it is placed in, and by the callback literal's +-1MiB reach from the single
+/// header. Both hold for `SVC` and thread-pointer sites, which are sparse, and
+/// both fail if a host ever needs a gate per guest `x18` access: those run to
+/// ~2% of instructions, several times the current site count. Placing several
+/// smaller trampolines, each with its own header, near the sites they serve
+/// would lift both limits and fit the page-sized holes real objects leave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrampolinePlacement {
+    /// A hole between two `PT_LOAD` segments, inside the object's own load
+    /// span. The safe case: the loader reserved the whole span for this object,
+    /// so nothing else can be placed there.
+    InsideLoadSpan {
+        /// Page-aligned virtual address (object-relative for `ET_DYN`).
+        addr: u64,
+        /// Maximum number of bytes that may be written at `addr` before the
+        /// trampoline would run into the next segment.
+        limit: u64,
+        /// [`trampoline_addr_for`]'s address past the last segment, used when
+        /// the trampoline outgrows `limit`.
+        fallback_addr: u64,
+    },
+    /// Past the object's last segment, because its segments leave no big enough
+    /// hole. Nothing reserves the range, so the shim validates it before
+    /// mapping.
+    PastLastSegment {
+        /// Page-aligned virtual address (object-relative for `ET_DYN`).
+        addr: u64,
+    },
+}
+
+impl TrampolinePlacement {
+    /// The address the trampoline is placed at, preferring the reserved one.
+    pub(crate) fn addr(self) -> u64 {
+        match self {
+            Self::InsideLoadSpan { addr, .. } | Self::PastLastSegment { addr } => addr,
+        }
+    }
+
+    /// The unreserved address past the last segment, which is the address
+    /// itself once placement has already fallen back to it.
+    pub(crate) fn fallback_addr(self) -> u64 {
+        match self {
+            Self::InsideLoadSpan { fallback_addr, .. } => fallback_addr,
+            Self::PastLastSegment { addr } => addr,
+        }
+    }
+}
+
+/// Chooses where to put the trampoline appended to `segments`' object.
+///
+/// Prefers an inter-segment gap, reported as
+/// [`TrampolinePlacement::InsideLoadSpan`]. No program header covers the
+/// trampoline, so it must land in space the dynamic loader already reserved for
+/// *this* object: glibc reserves the whole first-`mapstart` to last-`allocend`
+/// span, so the gaps AArch64 objects leave (linked for 64 KiB pages, run with a
+/// 4 KiB `AT_PAGESZ`) belong to the object for its lifetime. Addresses past the
+/// last segment are unreserved and routinely owned by a neighboring object. The
+/// gap is exact because LiteBox pins the guest's `AT_PAGESZ` to
+/// [`TRAMPOLINE_PAGE_SIZE`].
+///
+/// An object with no usable gap falls back to [`trampoline_addr_for`], reported
+/// as [`TrampolinePlacement::PastLastSegment`] so the caller knows the address
+/// is unreserved and must be validated before mapping.
+pub(crate) fn trampoline_placement_for(
+    segments: &[LoadSegment],
+    e_machine: u16,
+) -> Result<TrampolinePlacement> {
+    let max_load_end = segments
         .iter()
-        .filter(|ph| ph.p_type(endian) == object::elf::PT_LOAD)
-        .filter_map(|ph| {
-            ph.p_vaddr(endian)
-                .into()
-                .checked_add(ph.p_memsz(endian).into())
-        })
+        .filter_map(|s| s.vaddr.checked_add(s.memsz))
         .max()
+        .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
+    let max_align = segments.iter().map(|s| s.align).max().unwrap_or(0);
+    let fallback_addr = trampoline_addr_for(max_load_end, max_align, e_machine)?;
+    let fallback = TrampolinePlacement::PastLastSegment {
+        addr: fallback_addr,
+    };
+
+    // Only AArch64 objects are placed in a hole: changing x86-64 placement is
+    // held back, as on `trampoline_addr_for`.
+    if e_machine != object::elf::EM_AARCH64 {
+        return Ok(fallback);
+    }
+
+    Ok(
+        largest_inter_segment_hole(segments).map_or(fallback, |(start, end)| {
+            TrampolinePlacement::InsideLoadSpan {
+                addr: start,
+                limit: end - start,
+                fallback_addr,
+            }
+        }),
+    )
+}
+
+/// Returns the largest page-granular gap between consecutive `PT_LOAD`
+/// segments, as `(start, end)`, or `None` when the segments are contiguous.
+///
+/// The bounds mirror glibc's `mapend` / `mapstart`, except that a segment is
+/// treated as occupying `max(p_filesz, p_memsz)` rather than `p_filesz`:
+/// `_dl_map_segments` maps anonymous pages over the difference for any segment
+/// whose `p_memsz` exceeds its `p_filesz`, not only the last one, so counting
+/// only `p_filesz` would open a gap that is actually backed.
+fn largest_inter_segment_hole(segments: &[LoadSegment]) -> Option<(u64, u64)> {
+    let page = TRAMPOLINE_PAGE_SIZE;
+    let mut sorted: Vec<&LoadSegment> = segments.iter().collect();
+    sorted.sort_unstable_by_key(|s| s.vaddr);
+
+    let mut best: Option<(u64, u64)> = None;
+    // `mapend` must account for every earlier segment, not just the previous
+    // one, so that overlapping or out-of-order segments cannot open a fake gap.
+    let mut covered_to = 0u64;
+    for s in sorted {
+        let start = s.vaddr & !(page - 1);
+        // A segment whose memsz exceeds its filesz has anonymous pages mapped
+        // over the difference, so treat the whole memsz as occupied.
+        let end = s
+            .vaddr
+            .checked_add(s.filesz.max(s.memsz))
+            .and_then(|e| e.checked_next_multiple_of(page))?;
+        if start > covered_to
+            && covered_to != 0
+            && best.is_none_or(|(b0, b1)| start - covered_to > b1 - b0)
+        {
+            best = Some((covered_to, start));
+        }
+        covered_to = covered_to.max(end);
+    }
+    best
+}
+
+fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<TrampolinePlacement> {
+    let object::File::Elf64(elf) = file else {
+        unreachable!()
+    };
+    trampoline_placement_for(
+        &elf_load_segments(file),
+        elf.elf_header().e_machine.get(elf.endian()),
+    )
+}
+
+/// Collects the `PT_LOAD` segments of `file` in program-header order.
+fn elf_load_segments(file: &object::File<'_>) -> Vec<LoadSegment> {
+    file.segments()
+        .map(|seg| LoadSegment {
+            vaddr: seg.address(),
+            filesz: seg.file_range().1,
+            memsz: seg.size(),
+            align: seg.align(),
+        })
+        .collect()
 }
 
 fn get_control_transfer_targets(
@@ -1775,6 +2141,416 @@ fn hook_syscall_and_after(
 mod tests {
     use super::*;
 
+    fn seg(vaddr: u64, filesz: u64, memsz: u64, align: u64) -> LoadSegment {
+        LoadSegment {
+            vaddr,
+            filesz,
+            memsz,
+            align,
+        }
+    }
+
+    /// One shared object as the guest's `ld.so` laid it out.
+    struct Obj {
+        name: &'static str,
+        /// Address the object's first `PT_LOAD` was mapped at.
+        base: u64,
+        /// Size of the trampoline the rewriter appended to it.
+        tramp_size: u64,
+        segs: Vec<LoadSegment>,
+    }
+
+    impl Obj {
+        /// The address ranges glibc actually populates for this object: each
+        /// `PT_LOAD` from `align_down(p_vaddr)` to `align_up(p_vaddr + p_memsz)`.
+        fn mapped_ranges(&self) -> Vec<(u64, u64)> {
+            let page = TRAMPOLINE_PAGE_SIZE;
+            self.segs
+                .iter()
+                .map(|s| {
+                    (
+                        self.base + (s.vaddr & !(page - 1)),
+                        self.base + (s.vaddr + s.memsz).next_multiple_of(page),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// The four objects `python3 --version` loads, with the load addresses and
+    /// trampoline sizes captured from a live LiteBox run on aarch64.
+    fn python_objects() -> Vec<Obj> {
+        alloc::vec![
+            Obj {
+                name: "ld-linux-aarch64.so.1",
+                base: 0xfffffff90000,
+                tramp_size: 0x99c,
+                segs: alloc::vec![
+                    seg(0x0, 0x25b64, 0x25b64, 0x10000),
+                    seg(0x3ec18, 0x2588, 0x2730, 0x10000),
+                ],
+            },
+            Obj {
+                name: "libpython3.12.so.1.0",
+                base: 0xfffffef50000,
+                tramp_size: 0x2200,
+                segs: alloc::vec![
+                    seg(0x0, 0x45ae40, 0x45ae40, 0x10000),
+                    seg(0x466f10, 0x1d6170, 0x1d7520, 0x10000),
+                ],
+            },
+            Obj {
+                name: "libc.so.6",
+                base: 0xfffffed40000,
+                tramp_size: 0x9ddc,
+                segs: alloc::vec![
+                    seg(0x0, 0x18215c, 0x18215c, 0x10000),
+                    seg(0x19d2b0, 0x64398, 0x70d20, 0x10000),
+                ],
+            },
+            Obj {
+                name: "libm.so.6",
+                base: 0xfffffec90000,
+                tramp_size: 0xb50,
+                segs: alloc::vec![
+                    seg(0x0, 0x8a136, 0x8a136, 0x10000),
+                    seg(0x9fc80, 0x398, 0x4d0, 0x10000),
+                ],
+            },
+        ]
+    }
+
+    /// No object's trampoline may land on a page another object has mapped.
+    ///
+    /// The shim maps the trampoline with `MAP_FIXED`, which over a fully
+    /// covered range does not fail — it silently replaces the victim's pages,
+    /// and the corruption surfaces much later somewhere unrelated.
+    ///
+    /// The layout is a recording of a real `python3 --version` run, in which
+    /// `libc`'s trampoline overwrote 40 KiB of `libpython`'s text and `libm`'s
+    /// overwrote 4 KiB of `libc`'s.
+    #[test]
+    fn no_trampoline_overlaps_another_objects_mapping() {
+        let objects = python_objects();
+        let mut collisions = Vec::new();
+        for obj in &objects {
+            let placement =
+                trampoline_placement_for(&obj.segs, object::elf::EM_AARCH64).expect("placement");
+            let tramp = (
+                obj.base + placement.addr(),
+                obj.base
+                    + (placement.addr() + obj.tramp_size).next_multiple_of(TRAMPOLINE_PAGE_SIZE),
+            );
+            for victim in &objects {
+                if core::ptr::eq(obj, victim) {
+                    continue;
+                }
+                for (lo, hi) in victim.mapped_ranges() {
+                    let start = tramp.0.max(lo);
+                    let end = tramp.1.min(hi);
+                    if start < end {
+                        collisions.push(format!(
+                            "{}'s trampoline [{:#x},{:#x}) overwrites {:#x} bytes of {} \
+                             [{:#x},{:#x})",
+                            obj.name,
+                            tramp.0,
+                            tramp.1,
+                            end - start,
+                            victim.name,
+                            lo,
+                            hi,
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            collisions.is_empty(),
+            "trampolines silently overwrote other objects:\n  {}",
+            collisions.join("\n  ")
+        );
+    }
+
+    /// Placement must land inside the object's own load span — the only region
+    /// the dynamic loader reserves on its behalf — with room for the trampoline.
+    #[test]
+    fn placement_is_inside_the_objects_own_reservation() {
+        for obj in &python_objects() {
+            let placement =
+                trampoline_placement_for(&obj.segs, object::elf::EM_AARCH64).expect("placement");
+            let span_end = obj
+                .segs
+                .iter()
+                .map(|s| (s.vaddr + s.memsz).next_multiple_of(TRAMPOLINE_PAGE_SIZE))
+                .max()
+                .unwrap();
+            let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement else {
+                panic!(
+                    "{}: placement {:#x} is not reserved by anything",
+                    obj.name,
+                    placement.addr()
+                );
+            };
+            assert!(
+                addr.saturating_add(limit) <= span_end,
+                "{}: placement [{:#x},{:#x}) escapes the load span (ends {span_end:#x})",
+                obj.name,
+                addr,
+                addr.saturating_add(limit),
+            );
+            assert!(
+                limit >= obj.tramp_size,
+                "{}: {:#x}-byte hole cannot hold a {:#x}-byte trampoline",
+                obj.name,
+                limit,
+                obj.tramp_size,
+            );
+        }
+    }
+
+    /// The chosen gap must be one the guest's loader leaves alone: glibc
+    /// `mprotect`s exactly `[first.mapend, last.mapstart)` to `PROT_NONE` and
+    /// never maps over it. These are the ranges observed in the live trace.
+    #[test]
+    fn placement_matches_the_gap_glibc_protects() {
+        let expected = [
+            ("libpython3.12.so.1.0", 0x45b000u64, 0x466000u64),
+            ("libc.so.6", 0x183000, 0x19d000),
+            ("libm.so.6", 0x8b000, 0x9f000),
+        ];
+        for (name, lo, hi) in expected {
+            let obj = python_objects()
+                .into_iter()
+                .find(|o| o.name == name)
+                .unwrap();
+            let placement =
+                trampoline_placement_for(&obj.segs, object::elf::EM_AARCH64).expect("placement");
+            let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement else {
+                panic!("{name}: expected a hole inside the load span");
+            };
+            assert_eq!(
+                (addr, addr.saturating_add(limit)),
+                (lo, hi),
+                "{name}: gap does not match the range glibc leaves PROT_NONE"
+            );
+        }
+    }
+
+    /// An object with no gap has nowhere reserved to go, so placement falls
+    /// back to the address past the last segment and says so, which is what
+    /// makes the shim validate it before mapping.
+    #[test]
+    fn contiguous_segments_fall_back_and_are_marked_unreserved() {
+        let segs = [
+            seg(0x0, 0x1000, 0x1000, 0x10000),
+            seg(0x1000, 0x100, 0x100, 0x10000),
+        ];
+        let placement = trampoline_placement_for(&segs, object::elf::EM_AARCH64).unwrap();
+        assert!(matches!(
+            placement,
+            TrampolinePlacement::PastLastSegment { .. }
+        ));
+    }
+
+    #[test]
+    fn aarch64_fallback_keeps_program_headers_unchanged() {
+        const ELF_HEADER_BYTES: usize = 64;
+        const PROGRAM_HEADER_BYTES: usize = 56;
+        let mut elf = vec![0u8; ELF_HEADER_BYTES + 2 * PROGRAM_HEADER_BYTES];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = object::elf::ELFCLASS64;
+        elf[5] = object::elf::ELFDATA2LSB;
+        elf[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_le_bytes());
+        elf[32..40].copy_from_slice(&(ELF_HEADER_BYTES as u64).to_le_bytes());
+        elf[54..56].copy_from_slice(&u16::try_from(PROGRAM_HEADER_BYTES).unwrap().to_le_bytes());
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+
+        let text = ELF_HEADER_BYTES;
+        elf[text..text + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
+        elf[text + 4..text + 8]
+            .copy_from_slice(&(object::elf::PF_R | object::elf::PF_X).to_le_bytes());
+        elf[text + 32..text + 40].copy_from_slice(&0x180000u64.to_le_bytes());
+        elf[text + 40..text + 48].copy_from_slice(&0x180000u64.to_le_bytes());
+        elf[text + 48..text + 56].copy_from_slice(&0x10000u64.to_le_bytes());
+
+        let data = text + PROGRAM_HEADER_BYTES;
+        elf[data..data + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
+        elf[data + 4..data + 8]
+            .copy_from_slice(&(object::elf::PF_R | object::elf::PF_W).to_le_bytes());
+        elf[data + 8..data + 16].copy_from_slice(&0x18d2b0u64.to_le_bytes());
+        elf[data + 16..data + 24].copy_from_slice(&0x19d2b0u64.to_le_bytes());
+        elf[data + 40..data + 48].copy_from_slice(&0x70d20u64.to_le_bytes());
+        elf[data + 48..data + 56].copy_from_slice(&0x10000u64.to_le_bytes());
+        let phdrs_before = elf[ELF_HEADER_BYTES..].to_vec();
+        let code_offset = elf.len();
+        elf.extend((0..1025).flat_map(|_| 0xD400_0001u32.to_le_bytes()));
+        let input = elf.clone();
+        let section = TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: code_offset as u64,
+            size: (elf.len() - code_offset) as u64,
+        };
+        let out = hook_aarch64_elf_at(&input, &mut elf, &[section], 0x220000, None, 0).unwrap();
+
+        assert_eq!(
+            &out[ELF_HEADER_BYTES..ELF_HEADER_BYTES + phdrs_before.len()],
+            phdrs_before,
+            "fixed slots must not modify program headers"
+        );
+    }
+
+    /// A minimal AArch64 object whose text is a single `SVC #0` at `0x1000`.
+    fn aarch64_elf_with_one_svc() -> Vec<u8> {
+        const ELF_HEADER_BYTES: usize = 64;
+        const PROGRAM_HEADER_BYTES: usize = 56;
+        let mut elf = vec![0u8; ELF_HEADER_BYTES + PROGRAM_HEADER_BYTES];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = object::elf::ELFCLASS64;
+        elf[5] = object::elf::ELFDATA2LSB;
+        elf[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_le_bytes());
+        elf[32..40].copy_from_slice(&(ELF_HEADER_BYTES as u64).to_le_bytes());
+        elf[54..56].copy_from_slice(&u16::try_from(PROGRAM_HEADER_BYTES).unwrap().to_le_bytes());
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+        let text = ELF_HEADER_BYTES;
+        elf[text..text + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
+        elf[text + 4..text + 8]
+            .copy_from_slice(&(object::elf::PF_R | object::elf::PF_X).to_le_bytes());
+        elf[text + 16..text + 24].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[text + 32..text + 40].copy_from_slice(&4u64.to_le_bytes());
+        elf[text + 40..text + 48].copy_from_slice(&4u64.to_le_bytes());
+        elf[text + 48..text + 56].copy_from_slice(&0x10000u64.to_le_bytes());
+
+        elf.extend(0xD400_0001u32.to_le_bytes());
+        elf
+    }
+
+    /// A gap the gates cannot branch back from is retried at the fallback
+    /// address rather than failing the whole binary.
+    #[test]
+    fn an_out_of_branch_range_gap_falls_back_instead_of_rejecting() {
+        /// Comfortably past a `B`'s +-128MiB reach from the text at 0x1000.
+        const UNREACHABLE_GAP: u64 = 0x2000_0000;
+
+        let mut elf = aarch64_elf_with_one_svc();
+        let input = elf.clone();
+        let text_file_offset = (elf.len() - 4) as u64;
+        let section = || TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: text_file_offset,
+            size: 4,
+        };
+
+        // The gap alone cannot work: every site is out of range and trapped.
+        let mut direct = elf.clone();
+        assert!(
+            matches!(
+                hook_aarch64_elf_at(&input, &mut direct, &[section()], UNREACHABLE_GAP, None, 0),
+                Err(Error::UnpatchableSyscalls(_))
+            ),
+            "the gap has to be genuinely unreachable for this test to mean anything"
+        );
+
+        // Offered the same gap plus a reachable fallback, rewriting succeeds.
+        let placement = TrampolinePlacement::InsideLoadSpan {
+            addr: UNREACHABLE_GAP,
+            limit: 0x10000,
+            fallback_addr: 0x20000,
+        };
+        hook_aarch64_elf(&input, &mut elf, &[section()], placement, 0)
+            .expect("the reachable fallback address must be retried");
+    }
+
+    /// x86-64 placement is deliberately unchanged; see `trampoline_addr_for`.
+    #[test]
+    fn placement_leaves_x86_64_alone() {
+        for obj in &python_objects() {
+            let placement =
+                trampoline_placement_for(&obj.segs, object::elf::EM_X86_64).expect("placement");
+            assert!(matches!(
+                placement,
+                TrampolinePlacement::PastLastSegment { .. }
+            ));
+        }
+    }
+
+    /// With page-sized segment alignment (the x86-64 case) the trampoline goes
+    /// in the first page past the last `PT_LOAD`, unchanged from before.
+    #[test]
+    fn trampoline_addr_page_aligned_segments_use_next_page() {
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x1000, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
+        assert_eq!(
+            trampoline_addr_for(0x20e_000, 0x1000, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
+        // A `p_align` below the page size must not pull the address down.
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x1, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
+    }
+
+    /// With 64 KiB segment alignment (the aarch64 case) the trampoline must
+    /// clear the whole `maplength + p_align` region glibc's `_dl_map_segment`
+    /// reserves while mapping the object, otherwise the shim's `MAP_FIXED`
+    /// straddles the reservation boundary and the load fails.
+    #[test]
+    fn trampoline_addr_skips_loader_alignment_slack() {
+        // Real values from aarch64 `libc.so.6`: last PT_LOAD ends at 0x20dfd0.
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x10000, object::elf::EM_AARCH64).unwrap(),
+            0x220_000
+        );
+        // Exactly on an alignment boundary still skips a full unit, because the
+        // loader's reservation runs to `end + p_align`.
+        assert_eq!(
+            trampoline_addr_for(0x210_000, 0x10000, object::elf::EM_AARCH64).unwrap(),
+            0x220_000
+        );
+    }
+
+    /// A non-power-of-two `p_align` is bogus; fall back to the page size rather
+    /// than corrupting the mask arithmetic.
+    #[test]
+    fn trampoline_addr_rejects_non_power_of_two_align() {
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x3000, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
+    }
+
+    /// The slow-path rule is gated on `EM_AARCH64`, not on the host arch. GNU
+    /// ld's default max-page-size on x86-64 is 0x200000, so x86-64 objects
+    /// routinely have a `p_align` above the page size, but their placement must
+    /// not move: any change to this address changes which programs collide.
+    /// This also covers cross-rewriting an x86-64 binary from an aarch64 host,
+    /// where `cfg(target_arch)` would be the wrong test.
+    #[test]
+    fn trampoline_addr_slow_path_rule_is_aarch64_only() {
+        // 2 MiB alignment, the x86-64 default: keeps the old next-page rule.
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x200000, object::elf::EM_X86_64).unwrap(),
+            0x20e_000
+        );
+        // The identical object as aarch64 does skip an alignment unit.
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x200000, object::elf::EM_AARCH64).unwrap(),
+            0x600_000
+        );
+    }
+
+    #[test]
+    fn trampoline_addr_reports_overflow() {
+        assert!(trampoline_addr_for(u64::MAX - 1, 0x10000, object::elf::EM_AARCH64).is_err());
+    }
+
     #[test]
     fn aarch64_out_of_range_site_is_rejected_as_unpatchable() {
         // A trampoline mapped 256MB above the text is outside the site's ±128MB
@@ -1787,11 +2563,167 @@ mod tests {
             file_offset: 0,
             size: buf.len() as u64,
         }];
-        let err = hook_aarch64_elf(&input, &mut buf, &sections, 0x1000_0000, 0).unwrap_err();
+        let placement = TrampolinePlacement::PastLastSegment { addr: 0x1000_0000 };
+        let err = hook_aarch64_elf(&input, &mut buf, &sections, placement, 0).unwrap_err();
         assert!(
             matches!(err, Error::UnpatchableSyscalls(_)),
             "expected UnpatchableSyscalls, got {err:?}"
         );
+    }
+
+    /// The runtime (mmap-time) AArch64 entry point: a bare code region with no
+    /// ELF around it still gets its `SVC` redirected into a gate, and the blob
+    /// is self-describing — its own callback slot at offset 0.
+    #[test]
+    fn aarch64_runtime_patch_redirects_svc_into_an_emitted_gate() {
+        let mut code = 0xD400_0001u32.to_le_bytes().to_vec(); // SVC #0
+        let code_vaddr = 0x1000_0000;
+        let trampoline_vaddr = 0x1000_1000;
+        let syscall_entry_addr = 0x1000_0000_0000;
+
+        let (trampoline, trapped) =
+            patch_aarch64_code_segment(&mut code, code_vaddr, trampoline_vaddr, syscall_entry_addr)
+                .unwrap();
+
+        assert!(
+            trapped.is_empty(),
+            "a nearby trampoline should be reachable"
+        );
+        assert!(!trampoline.is_empty(), "runtime patching emits a blob");
+        assert_eq!(
+            u64::from_le_bytes(trampoline[..8].try_into().unwrap()),
+            syscall_entry_addr,
+            "the blob's callback slot holds the runtime's syscall entry directly"
+        );
+
+        let branch = u32::from_le_bytes(code[..4].try_into().unwrap());
+        assert_eq!(branch & 0xFC00_0000, 0x1400_0000, "the SVC becomes a B");
+        let imm26 = i64::from(branch & 0x03FF_FFFF);
+        let disp = ((imm26 << 38) >> 38) << 2;
+        assert_eq!(
+            code_vaddr.wrapping_add(disp.cast_unsigned()),
+            trampoline_vaddr + 16,
+            "the B targets the first aligned gate slot"
+        );
+    }
+
+    /// A region with no patch sites must not produce a trampoline: the caller
+    /// would otherwise map and charge a page for nothing, and — on the shim's
+    /// runtime path — advance its trampoline cursor past a blob no code
+    /// branches to.
+    #[test]
+    fn aarch64_runtime_patch_of_syscall_free_code_emits_nothing() {
+        let mut code = 0xD503_201Fu32.to_le_bytes().to_vec(); // NOP
+        let before = code.clone();
+        let (trampoline, trapped) =
+            patch_aarch64_code_segment(&mut code, 0x1000, 0x2000, 0x3000).unwrap();
+        assert!(trampoline.is_empty());
+        assert!(trapped.is_empty());
+        assert_eq!(code, before, "syscall-free code is left untouched");
+    }
+
+    /// The runtime path emits the same thread-pointer placeholder the
+    /// ahead-of-time path does, so the shim's loader-side finalization applies
+    /// unchanged. Asserted rather than assumed, because if it stopped holding
+    /// the gates would redirect the guest's thread pointer into host memory
+    /// *without faulting*.
+    #[test]
+    fn aarch64_runtime_gates_carry_the_thread_pointer_placeholder() {
+        // MRS X0, TPIDR_EL0 — a thread-pointer read, which is gated.
+        let mut code = 0xD53B_D040u32.to_le_bytes().to_vec();
+        let (mut trampoline, trapped) =
+            patch_aarch64_code_segment(&mut code, 0x1000, 0x2000, 0x3000).unwrap();
+        assert!(trapped.is_empty());
+        assert!(
+            arm64::find_guest_tpidr_placeholder(&trampoline).is_some(),
+            "a runtime-emitted thread-pointer gate must arrive unpatched"
+        );
+        assert_eq!(
+            arm64::patch_guest_tpidr_offset(&mut trampoline, 96).unwrap(),
+            1
+        );
+        assert!(arm64::find_guest_tpidr_placeholder(&trampoline).is_none());
+    }
+
+    #[test]
+    fn aarch64_runtime_and_aot_emit_identical_slots() {
+        let words = [0xD400_0001, 0xD53B_D040 | 9, 0xD51B_D040 | 5];
+        let mut runtime_code = words
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut aot_code = runtime_code.clone();
+        let code_vaddr = 0x1000;
+        let trampoline_vaddr = 0x400000;
+
+        let (runtime, skipped) =
+            patch_aarch64_code_segment(&mut runtime_code, code_vaddr, trampoline_vaddr, 0x1234)
+                .unwrap();
+        assert!(skipped.is_empty());
+        let section = TextSectionInfo {
+            vaddr: code_vaddr,
+            file_offset: 0,
+            size: aot_code.len() as u64,
+        };
+        let aot = arm64::hook_syscalls_aarch64(
+            &mut aot_code,
+            &[section],
+            trampoline_vaddr,
+            0x1234,
+            arm64::Host::Linux,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(runtime_code, aot_code);
+        assert_eq!(runtime, aot.trampoline);
+
+        // Exercise the compact classifier independently on both products, not
+        // only equality of their bytes. The three sites emit SVC, MRS, then MSR
+        // slots at fixed aligned starts after the 16-byte trampoline header.
+        let boundaries = [
+            (16usize, 12usize), // 9 inbound SVC + 3 outbound-stub instructions.
+            (80, 3),
+            (96, 9),
+        ];
+        let mut classified = 0;
+        for product in [&runtime, &aot.trampoline] {
+            for (slot_offset, count) in boundaries {
+                for instruction in 0..count {
+                    let pc = trampoline_vaddr + (slot_offset + instruction * 4) as u64;
+                    let gate = arm64::classify_gate_pc(product, trampoline_vaddr, pc)
+                        .unwrap_or_else(|| panic!("slot {slot_offset} boundary {instruction}"));
+                    assert_eq!(gate.slot_offset(), slot_offset);
+                    classified += 1;
+                }
+            }
+        }
+        assert_eq!(classified, 48, "24 boundaries in each emission path");
+    }
+
+    /// The fail-safe: when no trampoline can be placed, every site the hooking
+    /// pass would have redirected becomes a `BRK`. A site left native escapes
+    /// directly to the host kernel, so "found nothing, trapped nothing" is not
+    /// an acceptable outcome.
+    #[test]
+    fn aarch64_trap_fallback_traps_every_patch_site() {
+        let mut code = Vec::new();
+        code.extend_from_slice(&0xD400_0001u32.to_le_bytes()); // SVC #0
+        code.extend_from_slice(&0xD503_201Fu32.to_le_bytes()); // NOP
+        code.extend_from_slice(&0xD51B_D040u32.to_le_bytes()); // MSR TPIDR_EL0, X0
+        code.extend_from_slice(&0xD53B_D041u32.to_le_bytes()); // MRS X1, TPIDR_EL0
+
+        let count = trap_all_aarch64_patch_sites(&mut code, 0x1000).unwrap();
+
+        assert_eq!(count, 3, "SVC and both thread-pointer accesses are sites");
+        for (index, word) in code.chunks_exact(4).enumerate() {
+            let insn = u32::from_le_bytes(word.try_into().unwrap());
+            if index == 1 {
+                assert_eq!(insn, 0xD503_201F, "the NOP is not a patch site");
+            } else {
+                assert_eq!(insn & 0xFFE0_001F, 0xD420_0000, "site {index} becomes BRK");
+            }
+        }
     }
 
     const NT_STUB_BUILD_SYSNO: u32 = 0x1234;

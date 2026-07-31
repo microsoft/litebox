@@ -12,7 +12,7 @@
 // Deliberate, range-checked casts on a 64-bit host throughout this test.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use litebox_syscall_rewriter::{TRAMPOLINE_MAGIC, hook_syscalls_in_elf};
+use litebox_syscall_rewriter::{Error, TRAMPOLINE_MAGIC, hook_syscalls_in_elf};
 
 const HELLO_AARCH64: &[u8] = include_bytes!("hello-aarch64");
 
@@ -24,6 +24,18 @@ const SVC_0: u32 = 0xD400_0001;
 const TPIDR_REG_MASK: u32 = 0xFFFF_FFE0;
 const MSR_TPIDR_BITS: u32 = 0xD51B_D040;
 const MRS_TPIDR_BITS: u32 = 0xD53B_D040;
+
+#[test]
+fn big_endian_aarch64_is_rejected() {
+    let mut elf = HELLO_AARCH64.to_vec();
+    elf[5] = object::elf::ELFDATA2MSB;
+    elf[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_be_bytes());
+
+    assert!(matches!(
+        hook_syscalls_in_elf(&elf, Some(0)),
+        Err(Error::UnsupportedExecutable(reason)) if reason.contains("big-endian AArch64")
+    ));
+}
 
 fn read_u16(data: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
@@ -132,13 +144,10 @@ fn aarch64_hello_world_is_hooked() {
     let tramp = &out[file_offset as usize..(file_offset + size) as usize];
     // Offset 0: callback slot holds the value we passed in.
     assert_eq!(read_u64(tramp, 0), callback, "callback slot");
-    // Offset 8: the shared SVC handler — LDR X16,<callback@0>; BR X16.
-    assert_eq!(
-        read_u32(tramp, 8),
-        0x58FF_FFD0,
-        "LDR X16, <callback> (pcrel -8)"
-    );
-    assert_eq!(read_u32(tramp, 12), 0xD61F_0200, "BR X16");
+    // Offset 8: deterministic NOP padding; each SVC slot dispatches through
+    // the single callback pointer directly.
+    assert_eq!(read_u32(tramp, 8), 0xD503_201F, "header NOP padding");
+    assert_eq!(read_u32(tramp, 12), 0xD503_201F, "header NOP padding");
 
     // --- Every SVC became a branch into the trampoline region ---
     let tramp_range = vaddr..(vaddr + size);

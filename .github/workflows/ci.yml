@@ -86,6 +86,15 @@ jobs:
     runs-on: ubuntu-24.04-arm
     env:
       RUSTFLAGS: -Dwarnings
+      # Crates that build and run on AArch64. Linux-on-Linux userland is the
+      # only configuration AArch64 supports, so the other runners (LVBS, SNP)
+      # and shims (Windows, OP-TEE) are left to the x86-64 job. This list grows
+      # as each crate gains AArch64 support, so that the PR adding that support
+      # is the PR this job starts covering it.
+      AARCH64_CRATES: >-
+        -p litebox
+        -p litebox_common_linux
+        -p litebox_syscall_rewriter
     steps:
       - name: Check out repo
         uses: actions/checkout@v6
@@ -102,9 +111,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox -p litebox_common_linux
-          ./.github/tools/github_actions_run_cargo build -p litebox -p litebox_common_linux
-          ./.github/tools/github_actions_run_cargo nextest -p litebox -p litebox_common_linux
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $AARCH64_CRATES
+          ./.github/tools/github_actions_run_cargo build $AARCH64_CRATES
+          ./.github/tools/github_actions_run_cargo nextest $AARCH64_CRATES
 
   build_and_test_lvbs:
     name: Build and Test LVBS

@@ -11,19 +11,19 @@ expression: diff
 -  400110:	d51bd045	msr tpidr_el0,x5
 -  400114:	d53bd049	mrs x9,tpidr_el0
 +  400110:	<trampoline-b+0x10>
-+  400114:	<trampoline-b+0x34>
++  400114:	<trampoline-b+0x40>
    400118:	d2800808	mov x8,#0x40
    40011c:	d2800020	mov x0,#0x1
    400120:	910003e1	mov x1,sp
    400124:	d28001c2	mov x2,#0xe
 -  400128:	d4000001	svc #0x0
-+  400128:	<trampoline-b+0x40>
++  400128:	<trampoline-b+0x50>
    40012c:	d2801588	mov x8,#0xac
 -  400130:	d4000001	svc #0x0
-+  400130:	<trampoline-b+0x58>
++  400130:	<trampoline-b+0x90>
    400134:	d2800ba8	mov x8,#0x5d
    400138:	d2800000	mov x0,#0x0
 -  40013c:	d4000001	svc #0x0
 \ No newline at end of file
-+  40013c:	<trampoline-b+0x70>
++  40013c:	<trampoline-b+0xd0>
 \ No newline at end of file
