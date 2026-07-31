@@ -58,7 +58,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old = self.entries[idx].replace(IndividualEntry::new(Arc::new(RwLock::new(entry))));
+        let old =
+            self.entries[idx].replace(IndividualEntry::new(SharedEntry::new::<Subsystem>(entry)));
         assert!(old.is_none());
         TypedFd {
             _phantom: PhantomData,
@@ -118,7 +119,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         };
         fd.x.mark_as_closed();
         Arc::into_inner(old.x)
-            .map(RwLock::into_inner)
+            .map(|shared| RwLock::into_inner(shared.entry))
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
     }
 
@@ -142,10 +143,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         };
         if Arc::strong_count(&old.x) == 1 {
             // Unique, so we can just return it if allowed.
-            if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
+            if can_close_immediately(old.x.entry.read().as_subsystem::<Subsystem>()) {
                 fd.x.mark_as_closed();
                 let entry = Arc::into_inner(old.x)
-                    .map(RwLock::into_inner)
+                    .map(|shared| RwLock::into_inner(shared.entry))
                     .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
                     .unwrap();
                 Some(CloseResult::Closed(entry))
@@ -189,7 +190,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // Each FD corresponds to an `IndividualEntry`, which has an Arc to a `DescriptorEntry`. If
         // we have the same number of FDs as matching to the strong-count of a descriptor entry,
         // then it must be the case that we have everything needed to close the entries out.
-        let removable_entries: Vec<*const RwLock<_, _>> = {
+        let removable_entries: Vec<*const SharedEntry<Platform>> = {
             let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
             for fd in fds.iter() {
                 let entry = &self.entries[fd.x.as_usize().unwrap()];
@@ -241,17 +242,17 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> impl Iterator<Item = (InternalFd, impl core::ops::Deref<Target = Subsystem::Entry>)> {
         self.entries.iter().enumerate().filter_map(|(i, entry)| {
             entry.as_ref().and_then(|e| {
-                let entry = e.read();
-                if entry.matches_subsystem::<Subsystem>() {
-                    Some((
-                        InternalFd {
-                            raw: i.try_into().unwrap(),
-                        },
-                        crate::sync::RwLockReadGuard::map(entry, |e| e.as_subsystem::<Subsystem>()),
-                    ))
-                } else {
-                    None
+                if !e.x.matches_subsystem::<Subsystem>() {
+                    return None;
                 }
+                let entry = e.read();
+                assert!(entry.matches_subsystem::<Subsystem>());
+                Some((
+                    InternalFd {
+                        raw: i.try_into().unwrap(),
+                    },
+                    crate::sync::RwLockReadGuard::map(entry, |e| e.as_subsystem::<Subsystem>()),
+                ))
             })
         })
     }
@@ -270,7 +271,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     > {
         self.entries.iter().enumerate().filter_map(|(i, entry)| {
             entry.as_ref().and_then(|e| {
-                if !e.read().matches_subsystem::<Subsystem>() {
+                if !e.x.matches_subsystem::<Subsystem>() {
                     return None;
                 }
                 let entry = e.write();
@@ -483,6 +484,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             .as_ref()
             .unwrap()
             .x
+            .entry
             .write()
             .metadata
             .insert(metadata)
@@ -519,7 +521,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 /// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
 /// maintaining access to the descriptor table itself.
 pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
-    Arc<RwLock<Platform, DescriptorEntry>>,
+    Arc<SharedEntry<Platform>>,
     PhantomData<Subsystem>,
 );
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
@@ -532,7 +534,7 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     pub fn get_entry(
         &self,
     ) -> impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
-        crate::sync::RwLockReadGuard::map(self.0.read(), |e| e.as_subsystem::<Subsystem>())
+        crate::sync::RwLockReadGuard::map(self.0.entry.read(), |e| e.as_subsystem::<Subsystem>())
     }
 
     /// Get the entry behind this handle mutably.
@@ -542,15 +544,17 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     pub fn get_entry_mut(
         &self,
     ) -> impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
-        crate::sync::RwLockWriteGuard::map(self.0.write(), |e| e.as_subsystem_mut::<Subsystem>())
+        crate::sync::RwLockWriteGuard::map(self.0.entry.write(), |e| {
+            e.as_subsystem_mut::<Subsystem>()
+        })
     }
 
     pub fn with_entry<R>(&self, f: impl FnOnce(&Subsystem::Entry) -> R) -> R {
-        f(self.0.read().as_subsystem::<Subsystem>())
+        f(self.0.entry.read().as_subsystem::<Subsystem>())
     }
 
     pub fn with_entry_mut<R>(&self, f: impl FnOnce(&mut Subsystem::Entry) -> R) -> R {
-        f(self.0.write().as_subsystem_mut::<Subsystem>())
+        f(self.0.entry.write().as_subsystem_mut::<Subsystem>())
     }
 }
 
@@ -805,21 +809,39 @@ pub enum MetadataError {
 
 /// A module-internal fd-specific individual entry
 struct IndividualEntry<Platform: RawSyncPrimitivesProvider> {
-    x: Arc<RwLock<Platform, DescriptorEntry>>,
+    x: Arc<SharedEntry<Platform>>,
     metadata: AnyMap,
 }
 impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<Platform> {
-    type Target = Arc<RwLock<Platform, DescriptorEntry>>;
+    type Target = RwLock<Platform, DescriptorEntry>;
     fn deref(&self) -> &Self::Target {
-        &self.x
+        &self.x.entry
     }
 }
 impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
-    fn new(x: Arc<RwLock<Platform, DescriptorEntry>>) -> Self {
+    fn new(x: Arc<SharedEntry<Platform>>) -> Self {
         Self {
             x,
             metadata: AnyMap::new(),
         }
+    }
+}
+
+struct SharedEntry<Platform: RawSyncPrimitivesProvider> {
+    subsystem_entry_type: core::any::TypeId,
+    entry: RwLock<Platform, DescriptorEntry>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider> SharedEntry<Platform> {
+    fn new<Subsystem: FdEnabledSubsystem>(entry: DescriptorEntry) -> Arc<Self> {
+        Arc::new(Self {
+            subsystem_entry_type: core::any::TypeId::of::<Subsystem::Entry>(),
+            entry: RwLock::new(entry),
+        })
+    }
+
+    fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
+        self.subsystem_entry_type == core::any::TypeId::of::<Subsystem::Entry>()
     }
 }
 
