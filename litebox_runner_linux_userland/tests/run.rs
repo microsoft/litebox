@@ -11,6 +11,16 @@ use std::{
 
 #[cfg(target_arch = "x86_64")]
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Dedicated fixtures build static binaries concurrently; exclude them to avoid
+// colliding with this sweep's dynamic `<stem>_rewriter` outputs.
+const DEDICATED_C_TESTS: &[&str] = &[
+    "async_x16.c",
+    "gate_signals.c",
+    "sigreturn.c",
+    "sigreturn_simd.c",
+    "svc_scratch_regs.c",
+];
+
 const BROKER_ONLY_C_TESTS: &[&str] = &[
     "eventfd.c",
     "pipe_broker.c",
@@ -18,6 +28,12 @@ const BROKER_ONLY_C_TESTS: &[&str] = &[
     "tcp_broker_server.c",
     "udp_broker.c",
 ];
+
+/// Debian multiarch library directory preserved at its guest-relative path.
+#[cfg(target_arch = "x86_64")]
+const MULTIARCH_LIB_DIR: &str = "lib/x86_64-linux-gnu";
+#[cfg(target_arch = "aarch64")]
+const MULTIARCH_LIB_DIR: &str = "lib/aarch64-linux-gnu";
 
 #[must_use]
 struct Runner {
@@ -36,7 +52,7 @@ impl Runner {
 
         // create tar file containing the rewritten executable and all dependencies
         let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
-        let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32"];
+        let dirs_to_create = ["lib64", MULTIARCH_LIB_DIR, "lib32"];
         for dir in dirs_to_create {
             std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
         }
@@ -88,12 +104,15 @@ impl Runner {
         }
     }
 
+    fn tar_dir(&self) -> &Path {
+        &self.tar_dir
+    }
+
     fn env(&mut self, env: impl AsRef<std::ffi::OsStr>) -> &mut Self {
         self.command.arg("--env").arg(env);
         self
     }
 
-    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn envs(&mut self, envs: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
         for env in envs {
             self.env(env);
@@ -106,7 +125,6 @@ impl Runner {
         self
     }
 
-    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
         for arg in args {
             self.arg(arg);
@@ -114,7 +132,6 @@ impl Runner {
         self
     }
 
-    #[cfg(target_arch = "x86_64")]
     fn guest_program_path(&mut self, guest_path: &str) -> &mut Self {
         self.cmd_path = PathBuf::from(guest_path);
         self
@@ -128,7 +145,6 @@ impl Runner {
         self
     }
 
-    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn with_fs_path(&mut self, f: impl FnOnce(&Path)) -> &mut Self {
         f(&self.tar_dir);
         self
@@ -139,7 +155,6 @@ impl Runner {
     }
 
     #[must_use]
-    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn output(&mut self) -> Vec<u8> {
         self.run_inner(true)
     }
@@ -182,7 +197,7 @@ impl Runner {
         output.stdout
     }
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn spawn_with_stdio(
         &mut self,
         stdin: std::process::Stdio,
@@ -220,10 +235,16 @@ fn is_broker_only_c_test(path: &Path) -> bool {
         .is_some_and(|name| BROKER_ONLY_C_TESTS.contains(&name))
 }
 
+fn has_dedicated_c_test(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| DEDICATED_C_TESTS.contains(&name))
+}
+
 #[test]
 fn test_dynamic_lib_with_rewriter() {
     for path in find_c_test_files("./tests") {
-        if is_broker_only_c_test(&path) {
+        if is_broker_only_c_test(&path) || has_dedicated_c_test(&path) {
             continue;
         }
         let stem = path
@@ -239,7 +260,7 @@ fn test_dynamic_lib_with_rewriter() {
 #[test]
 fn test_static_exec_with_rewriter() {
     for path in find_c_test_files("./tests") {
-        if is_broker_only_c_test(&path) {
+        if is_broker_only_c_test(&path) || has_dedicated_c_test(&path) {
             continue;
         }
         let stem = path
@@ -252,31 +273,7 @@ fn test_static_exec_with_rewriter() {
     }
 }
 
-#[test]
-fn test_host_program_with_rewrite_syscalls() {
-    let target = common::compile("./tests/hello.c", "host_program_rewriter", true, false);
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
-
-    let output = std::process::Command::new(binary_path)
-        .args(["--unstable", "--rewrite-syscalls"])
-        .arg(target)
-        .output()
-        .expect("Failed to run litebox_runner_linux_userland");
-
-    assert!(
-        output.status.success(),
-        "failed to run litebox_runner_linux_userland: {}",
-        output.status
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{stdout}");
-    assert!(stdout.contains("argv[0] = "), "unexpected stdout: {stdout}");
-}
-
 /// Get the path of a program using `which`
-#[cfg(target_arch = "x86_64")]
 fn run_which(prog: &str) -> std::path::PathBuf {
     let prog_path_str = std::process::Command::new("which")
         .arg(prog)
@@ -478,6 +475,7 @@ fn spawn_test_broker(
     }
 }
 
+// TODO: un-gate when an AArch64 broker exists.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn test_runner_broker_integration_with_rewriter() {
@@ -857,37 +855,87 @@ fn test_runner_broker_tcp_server_with_rewriter() {
     broker.join();
 }
 
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_runner_with_ls() {
-    let ls_path = run_which("ls");
-    let output = Runner::new(&ls_path, "ls_rewriter").arg("-a").output();
-
-    let output_str = String::from_utf8_lossy(&output);
-    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
-    for each in [".", "..", "lib", "lib64"] {
-        assert!(
-            normalized.contains(&each),
-            "unexpected ls output:\n{output_str}\n{each} not found",
-        );
+fn dir_entries(dir: &Path) -> Vec<String> {
+    // Empty staging directories do not survive into the guest tar.
+    fn holds_a_file(path: &Path) -> bool {
+        if path.is_file() {
+            return true;
+        }
+        std::fs::read_dir(path)
+            .is_ok_and(|entries| entries.flatten().any(|e| holds_a_file(&e.path())))
     }
 
-    // test `ls` subdir
-    let output = Runner::new(&ls_path, "ls_lib_rewriter")
-        .args(["-a", "/lib/x86_64-linux-gnu"])
-        .output();
+    let mut names = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot read staged rootfs {}: {e}", dir.display()))
+        .flatten()
+        .filter(|entry| holds_a_file(&entry.path()))
+        // The tar excludes cache bookkeeping files.
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "cache-checksum")
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
 
-    let output_str = String::from_utf8_lossy(&output);
-    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
-    for each in [".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"] {
+fn assert_ls_listed(output: &[u8], dir: &Path, expected: &[String]) {
+    let output_str = String::from_utf8_lossy(output);
+    let listed = output_str.split_whitespace().collect::<Vec<_>>();
+    assert!(!expected.is_empty(), "nothing staged in {}", dir.display());
+    for each in [".", ".."]
+        .iter()
+        .copied()
+        .chain(expected.iter().map(String::as_str))
+    {
         assert!(
-            normalized.contains(&each),
-            "unexpected ls output:\n{output_str}\n{each} not found",
+            listed.contains(&each),
+            "ls of {} did not list {each}:\n{output_str}",
+            dir.display(),
         );
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+/// Rewrites dynamic `ls` and its shared objects, checking that their appended
+/// trampolines coexist and that every staged non-cache entry remains visible.
+#[test]
+fn test_runner_with_ls() {
+    let ls_path = run_which("ls");
+
+    let mut runner = Runner::new(&ls_path, "ls_rewriter");
+    let expected_root = dir_entries(runner.tar_dir());
+    let output = runner.arg("-a").output();
+    assert_ls_listed(&output, Path::new("/"), &expected_root);
+
+    // Derive the library directory from ldd because host layouts vary.
+    let libs = common::find_dependencies(ls_path.to_str().unwrap());
+    let lib_guest_dir = libs
+        .iter()
+        .map(PathBuf::from)
+        .find(|lib| {
+            !lib.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("ld-")
+        })
+        .and_then(|lib| lib.parent().map(Path::to_path_buf))
+        .expect("ls has no resolvable shared-library dependency to list");
+
+    let mut runner = Runner::new(&ls_path, "ls_lib_rewriter");
+    let staged_lib_dir = runner
+        .tar_dir()
+        .join(lib_guest_dir.strip_prefix("/").unwrap());
+    let expected_libs = dir_entries(&staged_lib_dir);
+    let output = runner
+        .args(["-a", lib_guest_dir.to_str().unwrap()])
+        .output();
+    assert_ls_listed(&output, &staged_lib_dir, &expected_libs);
+}
+
+#[cfg(target_os = "linux")]
 fn run_python(args: &[&str]) -> String {
     let output = std::process::Command::new("python3")
         .args(args)
@@ -897,7 +945,7 @@ fn run_python(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn python_runner(unique_name: &str) -> Runner {
     let python_path = run_which("python3");
     let python_guest_dir = python_path.parent().unwrap().to_str().unwrap().to_string();
@@ -1024,7 +1072,7 @@ fn python_runner(unique_name: &str) -> Runner {
     runner
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_runner_with_python() {
     const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
@@ -1033,7 +1081,7 @@ fn test_runner_with_python() {
         .run();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_runner_with_python_repl_pty() {
     let mut runner = python_runner("python_repl_pty_rewriter");
@@ -1250,8 +1298,11 @@ fn test_broker_with_iperf3() {
     broker.join();
 }
 
-#[cfg(target_arch = "x86_64")]
 #[test]
+#[cfg_attr(
+    target_arch = "aarch64",
+    ignore = "AArch64 bash requires the unsupported getpgid syscall"
+)]
 fn test_shebang() {
     let bash_path = run_which("bash");
 

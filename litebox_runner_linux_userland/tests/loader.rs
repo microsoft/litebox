@@ -109,7 +109,6 @@ impl TestLauncher {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 #[test]
 fn test_load_exec_dynamic() {
     let path = common::compile("./tests/hello.c", "hello_dylib", false, false);
@@ -130,7 +129,6 @@ fn test_load_exec_dynamic() {
     launcher.test_load_exec_common(executable_path);
 }
 
-#[cfg(target_arch = "x86_64")]
 #[test]
 fn test_load_exec_static() {
     let path = common::compile("./tests/hello.c", "hello_exec", true, false);
@@ -159,7 +157,7 @@ int write(int fd, const char *buf, int length)
         "syscall\n\t"
         "mov %%eax, %0"
         : "=r" (ret)
-        : "i" (1), // #define SYS_write 1
+        : "i" (1), // x86-64 SYS_write
           "r" (fd),
           "r" (buf),
           "r" (length)
@@ -170,13 +168,12 @@ int write(int fd, const char *buf, int length)
 
 _Noreturn void exit_group(int code)
 {
-    /* Infinite for-loop since this function can't return */
     for (;;) {
         asm("mov %0, %%eax\n\t"
             "mov %1, %%edi\n\t"
             "syscall\n\t"
             :
-            : "i" (231), // #define SYS_exit_group 231
+            : "i" (231), // x86-64 SYS_exit_group
               "r" (code)
             : "%eax", "%edi");
     }
@@ -193,7 +190,7 @@ int write(int fd, const char *buf, int length)
         "int $0x80\n\t"
         "mov %%eax, %0"
         : "=r" (ret)
-        : "i" (4), // #define SYS_write 4
+        : "i" (4), // i386 SYS_write
           "g" (fd),
           "g" (buf),
           "g" (length)
@@ -203,15 +200,42 @@ int write(int fd, const char *buf, int length)
 }
 _Noreturn void exit_group(int code)
 {
-    /* Infinite for-loop since this function can't return */
     for (;;) {
         asm("mov %0, %%eax\n\t"
             "mov %1, %%ebx\n\t"
             "int $0x80\n\t"
             :
-            : "i" (252), // #define SYS_exit_group 252
+            : "i" (252), // i386 SYS_exit_group
               "r" (code)
             : "%eax", "%ebx");
+    }
+}
+#elif defined(__aarch64__)
+int write(int fd, const char *buf, int length)
+{
+    register long x8 asm("x8") = 64; // AArch64 SYS_write
+    register long x0 asm("x0") = fd;
+    register long x1 asm("x1") = (long)buf;
+    register long x2 asm("x2") = length;
+
+    asm volatile("svc #0"
+        : "+r" (x0)
+        : "r" (x8), "r" (x1), "r" (x2)
+        : "memory");
+
+    return (int)x0;
+}
+
+_Noreturn void exit_group(int code)
+{
+    for (;;) {
+        register long x8 asm("x8") = 94; // AArch64 SYS_exit_group
+        register long x0 asm("x0") = code;
+
+        asm volatile("svc #0"
+            :
+            : "r" (x8), "r" (x0)
+            : "memory");
     }
 }
 #else
