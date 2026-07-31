@@ -491,6 +491,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<super::backend::FileHandle, OpenError> {
         // TODO(jayb): Nothing checks write permission on the parent directory before creating;
         // the resolver should do so before calling this.
+        let parent = dir.into_typed::<Self>();
+        let mut parent = parent.dir.write();
+        if parent.children.contains_key(name) {
+            return Err(OpenError::AlreadyExists);
+        }
         let file = Arc::new(sync::RwLock::new(FileData {
             perms: Permissions {
                 mode,
@@ -499,10 +504,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             data: Vec::new().into(),
             node_info: self.inode_allocator.next(),
         }));
-        let old = dir
-            .into_typed::<Self>()
-            .dir
-            .write()
+        let old = parent
             .children
             .insert(name.into(), Node::File(file.clone()));
         assert!(old.is_none());
