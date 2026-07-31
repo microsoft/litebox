@@ -802,8 +802,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     where
         Subsystem: WindowsHandleSubsystem,
     {
+        self.typed_handle_entry_with_access_check(handle, |granted_access| {
+            granted_access & required_access == required_access
+        })
+    }
+
+    fn typed_handle_entry_with_any_access<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+    ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        self.typed_handle_entry_with_access_check(handle, |granted_access| granted_access != 0)
+    }
+
+    fn typed_handle_entry_with_access_check<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+        access_check: impl FnOnce(u32) -> bool,
+    ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
         let typed = self.typed_handle::<Subsystem>(handle)?;
-        self.require_typed_handle_access(&typed, required_access)?;
+        if !access_check(self.typed_handle_metadata(&typed)?.granted_access) {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
         self.global
             .litebox
             .descriptor_table()

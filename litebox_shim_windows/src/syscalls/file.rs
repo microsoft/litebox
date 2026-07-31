@@ -14,8 +14,10 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProv
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+#[cfg(test)]
+use crate::nt_types::UnicodeString;
 use crate::nt_types::{
-    AccessMask, IoStatusBlock, ObjectAttributes, UnicodeString, read_object_attributes,
+    AccessMask, IoStatusBlock, ObjectAttributes, read_object_attributes, read_unicode_string_at,
 };
 use crate::syscalls::Handle;
 use crate::syscalls::condrv::{self, CondrvObject, CondrvStreamDirection, CondrvStreamObject};
@@ -1196,12 +1198,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         object_attributes: ObjectAttributes,
     ) -> Result<FileTarget, NtStatus> {
-        let object_name_ptr =
-            ConstPtr::<Platform, UnicodeString>::from_usize(object_attributes.object_name);
-        let object_name = object_name_ptr
-            .read_at_offset(0)
-            .ok_or(NtStatus::ACCESS_VIOLATION)?;
-        let object_name = object_name.read_string::<Platform>()?;
+        let object_name = read_unicode_string_at::<Platform>(object_attributes.object_name)?;
         let resolver = FilePathResolver::new(&self.process.object_manager);
         if object_attributes.root_directory.is_null() {
             return resolver.resolve(FilePathRoot::Namespace, &object_name);

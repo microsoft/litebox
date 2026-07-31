@@ -300,6 +300,15 @@ impl UnicodeString {
     }
 }
 
+pub(crate) fn read_unicode_string_at<Platform: RawPointerProvider>(
+    address: usize,
+) -> Result<String, NtStatus> {
+    ConstPtr::<Platform, UnicodeString>::from_usize(address)
+        .read_at_offset(0)
+        .ok_or(NtStatus::ACCESS_VIOLATION)?
+        .read_string::<Platform>()
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
 pub(crate) struct AhcServiceLookupCdb {
