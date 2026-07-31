@@ -514,6 +514,10 @@ impl ElfParsedFile {
         let trampoline = self.trampoline.as_ref().unwrap();
         let trampoline_start = info.base_addr + trampoline.vaddr;
         let trampoline_end = page_align_up(info.base_addr + trampoline.vaddr + trampoline.size);
+        if M::POPULATES_TRAMPOLINE {
+            info.brk = info.brk.max(trampoline_end);
+            return Ok(());
+        }
         mapper
             .map_file(
                 trampoline_start,
@@ -593,6 +597,10 @@ pub trait ReadAt {
 
 pub trait MapMemory {
     type Error;
+
+    /// When true, trampoline setup occurs outside [`ElfParsedFile::load`]; the
+    /// loader only advances `brk` past the declared range.
+    const POPULATES_TRAMPOLINE: bool = false;
 
     /// Reserve a region of memory with the given length and alignment,
     /// returning the chosen address.

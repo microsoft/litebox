@@ -70,7 +70,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::ReadAt
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.task.sys_fstat(self.fd)?.st_size as u64)
+        #[cfg(target_arch = "x86_64")]
+        {
+            Ok(self.task.sys_fstat(self.fd)?.st_size as u64)
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // The asm-generic ABI uses signed `st_size`; reject negative sizes.
+            u64::try_from(self.task.sys_fstat(self.fd)?.st_size).map_err(|_| Errno::EINVAL)
+        }
     }
 }
 
@@ -78,6 +86,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
     for ElfFile<'_, Platform, FS>
 {
     type Error = Errno;
+
+    // TODO: move AArch64 gate finalization into the common loader, then remove
+    // this architecture-specific trampoline ownership split.
+    const POPULATES_TRAMPOLINE: bool = cfg!(target_arch = "aarch64");
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
@@ -202,13 +214,22 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
             .map_err(ElfLoaderError::ParseError)?;
 
         let syscall_entry_point = task.global.platform.get_syscall_entry_point();
+        #[cfg(target_arch = "aarch64")]
+        let parse_entry_point = {
+            // TODO: split trampoline detection from x86 callback-slot setup in
+            // the common parser. AArch64 has no callback slot to initialize.
+            const AARCH64_UNUSED_ENTRY_POINT: usize = 1;
+            syscall_entry_point.max(AARCH64_UNUSED_ENTRY_POINT)
+        };
+        #[cfg(target_arch = "x86_64")]
+        let parse_entry_point = syscall_entry_point;
 
         // Try to parse an embedded trampoline. For pre-patched binaries this
         // succeeds and load_trampoline() will map it. For unpatched binaries
         // (UnpatchedBinary error), the runtime patching during mmap will patch
         // code segments as they are mapped.
-        if syscall_entry_point != 0 {
-            match parsed.parse_trampoline(&mut &file, syscall_entry_point) {
+        if parse_entry_point != 0 {
+            match parsed.parse_trampoline(&mut &file, parse_entry_point) {
                 Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {
                     // Ok: pre-patched trampoline found, or unpatched binary
                     // that the runtime mmap hook will handle.
@@ -234,8 +255,24 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         } else {
             None
         };
-        let result = self.parsed.load(&mut self.file, &mut &*platform, reserve);
-        Ok(result?)
+        let result = self.parsed.load(&mut self.file, &mut &*platform, reserve)?;
+        #[cfg(target_arch = "aarch64")]
+        if self.parsed.has_trampoline()
+            && !self
+                .file
+                .task
+                .global
+                .elf_patch_cache
+                .lock()
+                .get(&self.file.fd)
+                .is_some_and(crate::syscalls::mm::ElfPatchState::trampoline_is_populated)
+        {
+            litebox_util_log::error!(fd:? = self.file.fd; "AArch64 trampoline was not populated while loading the ELF");
+            return Err(ElfLoaderError::LoadError(
+                litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
+            ));
+        }
+        Ok(result)
     }
 }
 
@@ -367,7 +404,10 @@ mod tests {
     const PROGRAM_HEADER_SIZE_U16: u16 = 56;
     const ET_EXEC: u16 = 2;
     const ET_DYN: u16 = 3;
-    const EM_X86_64: u16 = 62;
+    #[cfg(target_arch = "x86_64")]
+    const EM_HOST: u16 = 62; // EM_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const EM_HOST: u16 = 183; // EM_AARCH64
     const PT_LOAD: u32 = 1;
     const PT_INTERP: u32 = 3;
     const PF_X: u32 = 1;
@@ -404,7 +444,7 @@ mod tests {
         buf.extend_from_slice(&[2, 1, 1, 0]);
         buf.extend_from_slice(&[0; 8]);
         push_u16(buf, elf_type);
-        push_u16(buf, EM_X86_64);
+        push_u16(buf, EM_HOST);
         push_u32(buf, 1);
         push_u64(buf, entry);
         push_u64(buf, u64::from(ELF_HEADER_SIZE_U16));

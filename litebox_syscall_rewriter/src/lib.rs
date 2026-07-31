@@ -20,7 +20,7 @@
 //! (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads): the host owns the hardware `TPIDR_EL0`
 //! anchor and the guest thread pointer is fully virtualized to a host-managed memory slot. This
 //! thread-pointer virtualization is Linux-host-specific; other hosts (Linux-on-Windows,
-//! Linux-on-macOS) must anchor and virtualize TLS differently. See the `arm64` module for details.
+//! Linux-on-macOS) must anchor and virtualize TLS differently. See the `aarch64` module for details.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
@@ -32,7 +32,30 @@ compile_error!(
     "litebox_syscall_rewriter's runtime patching entry points support only x86-64 and AArch64 hosts"
 );
 
-pub mod arm64;
+pub mod aarch64;
+
+/// Callback-slot bytes the caller must populate; zero when emitted inline.
+#[cfg(target_arch = "x86_64")]
+pub const TRAMPOLINE_ENTRY_POINT_BYTES: usize = size_of::<u64>();
+#[cfg(target_arch = "aarch64")]
+pub const TRAMPOLINE_ENTRY_POINT_BYTES: usize = 0;
+
+/// Furthest a trampoline may sit from any byte of the code segment reaching it.
+///
+/// A rewritten site branches to its stub with a single direct branch, so a
+/// trampoline beyond this displacement cannot be reached and the site has to
+/// fall back to a trap. Each architecture's value is its direct-branch range
+/// less a margin for the last stub in the trampoline.
+#[cfg(target_arch = "x86_64")]
+pub const MAX_TRAMPOLINE_DISPLACEMENT: usize = 0x7FFF_0000;
+#[cfg(target_arch = "aarch64")]
+pub const MAX_TRAMPOLINE_DISPLACEMENT: usize = 0x07FF_0000;
+
+/// Alignment every write cursor into a trampoline must satisfy.
+#[cfg(target_arch = "x86_64")]
+pub const TRAMPOLINE_CURSOR_ALIGN: usize = 1;
+#[cfg(target_arch = "aarch64")]
+pub const TRAMPOLINE_CURSOR_ALIGN: usize = aarch64::GATE_ALIGNMENT;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -172,10 +195,10 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 /// loader can distinguish "processed, nothing to patch" from "never processed";
 /// no instructions are rewritten in that case.
 ///
-/// AArch64 differs in one way: it also rewrites guest thread-pointer accesses
+/// For patch-site discovery, AArch64 also rewrites guest thread-pointer accesses
 /// (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads), so a binary containing one
 /// is patched (and gets a non-empty trampoline) even when it has no syscall
-/// (`SVC`) instructions at all. (See the `arm64` module docs.)
+/// (`SVC`) instructions at all. (See the `aarch64` module docs.)
 ///
 /// Returns the rewritten binary. Binaries that cannot or do not need to be
 /// patched (relocatable objects, non-ELF files, already-hooked binaries,
@@ -271,7 +294,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // AArch64 uses a fully separate rewriting strategy (single-instruction
     // branch replacement, no instruction borrowing). Dispatch to it before any
     // x86-only work (iced-x86 decoding would misinterpret AArch64 bytes).
-    // See the `arm64` module docs.
+    // See the `aarch64` module docs.
     if arch == Arch::Aarch64 {
         return hook_aarch64_elf(
             input_binary,
@@ -865,12 +888,12 @@ fn hook_aarch64_elf_at(
     trampoline_limit: Option<u64>,
     callback: u64,
 ) -> Result<Vec<u8>> {
-    let Some(outcome) = arm64::hook_syscalls_aarch64(
+    let Some(outcome) = aarch64::hook_syscalls_aarch64(
         buf,
         text_sections,
         trampoline_base_addr,
         callback,
-        arm64::Host::Linux,
+        aarch64::Host::Linux,
     )?
     else {
         // No patch sites: emit the original binary with a size-0 sentinel
@@ -1455,8 +1478,16 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
 /// already-mapped code region. The caller makes the region writable before
 /// calling and restores permissions afterwards.
 ///
-/// The region is rewritten for the architecture this crate is running on, and
-/// `syscall_entry_addr` is interpreted per that architecture's stub ABI.
+/// The region is rewritten for the architecture this crate is running on.
+/// `syscall_entry_addr` means:
+/// * x86-64: the address of the shared [`TRAMPOLINE_ENTRY_POINT_BYTES`]-sized
+///   slot the caller placed at the trampoline base, which holds the callback.
+/// * AArch64: the callback address itself; the emitter writes its callback slot.
+///
+/// TODO: give both architectures the same meaning -- always the callback
+/// address -- once the x86-64 stubs branch directly rather than through the
+/// slot. Drop this list when `TRAMPOLINE_ENTRY_POINT_BYTES` is zero on every
+/// supported architecture.
 ///
 /// # Returns
 ///
@@ -1469,9 +1500,8 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
 ///
 /// The I-cache is not coherent with the D-cache, so the caller **must**
 /// synchronize the instruction stream over the patched `code` and the written
-/// stubs before either is fetched, and must patch the emitted gates' guest
-/// thread-pointer placeholder. Neither omission fails cleanly. See the
-/// [`arm64`] module docs. x86-64 needs neither.
+/// stubs before either is fetched, and must pass the emitted gates through
+/// [`aarch64::finalize_trampoline_gates`]. Neither omission fails cleanly.
 pub fn patch_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
@@ -1530,11 +1560,8 @@ fn patch_x86_64_code_segment(
 /// [`patch_code_segment`] for an AArch64 host, where `syscall_entry_addr` is
 /// the callback address itself, not a slot holding it.
 ///
-/// The gates are identical to the ahead-of-time path's and carry the same guest
-/// thread-pointer placeholder, so the caller must run
-/// [`arm64::patch_guest_tpidr_offset`] over the returned stubs and prove with
-/// [`arm64::find_guest_tpidr_placeholder`] that none survives before writing
-/// them anywhere the guest can execute.
+/// The caller must pass the returned gates through
+/// [`aarch64::finalize_trampoline_gates`] before making them executable.
 #[cfg(any(test, target_arch = "aarch64"))]
 fn patch_aarch64_code_segment(
     code: &mut [u8],
@@ -1547,12 +1574,12 @@ fn patch_aarch64_code_segment(
         file_offset: 0,
         size: code.len() as u64,
     };
-    let Some(outcome) = arm64::hook_syscalls_aarch64(
+    let Some(outcome) = aarch64::hook_syscalls_aarch64(
         code,
         &[section],
         trampoline_write_vaddr,
         syscall_entry_addr,
-        arm64::Host::Linux,
+        aarch64::Host::Linux,
     )?
     else {
         return Ok((Vec::new(), Vec::new()));
@@ -1608,7 +1635,7 @@ fn trap_all_aarch64_patch_sites(code: &mut [u8], code_vaddr: u64) -> Result<usiz
         file_offset: 0,
         size: code.len() as u64,
     };
-    arm64::trap_all_patch_sites(code, &[section])
+    aarch64::trap_all_patch_sites(code, &[section])
 }
 
 /// The guest page size assumed when laying out the appended trampoline.
@@ -1618,9 +1645,9 @@ pub(crate) const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
 /// goes. `max_load_end` is the highest `p_vaddr + p_memsz`, `max_align` the
 /// largest `p_align`.
 ///
-/// AArch64 objects skip one further `max_align`, because the guest loader
-/// reserves `maplength + p_align` and trims the tail. Every other architecture
-/// keeps the page-granular rule, so its placement cannot move.
+/// For AArch64 objects, where large `p_align` is common, this implementation
+/// skips one further alignment unit. Other architectures retain the existing
+/// page-granular placement.
 ///
 /// **Nothing reserves the returned address**, and glibc packs objects
 /// adjacently, so with several shared objects there may be no free gap here at
@@ -1629,8 +1656,6 @@ pub(crate) const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
 /// first (`litebox_shim_linux`'s `trampoline_range_is_safe_to_map`).
 pub fn trampoline_addr_for(max_load_end: u64, max_align: u64, e_machine: u16) -> Result<u64> {
     // Guard against a bogus `p_align`: the masking below requires a power of two.
-    // Non-AArch64 objects keep the historical page-granular rule verbatim, so
-    // their placement cannot move.
     let align = if e_machine == object::elf::EM_AARCH64 && max_align.is_power_of_two() {
         max_align.max(TRAMPOLINE_PAGE_SIZE)
     } else {
@@ -1738,8 +1763,7 @@ pub(crate) fn trampoline_placement_for(
         addr: fallback_addr,
     };
 
-    // Only AArch64 objects are placed in a hole: changing x86-64 placement is
-    // held back, as on `trampoline_addr_for`.
+    // Compatibility gate: preserve past-last-segment placement off AArch64.
     if e_machine != object::elf::EM_AARCH64 {
         return Ok(fallback);
     }
@@ -2635,14 +2659,14 @@ mod tests {
             patch_aarch64_code_segment(&mut code, 0x1000, 0x2000, 0x3000).unwrap();
         assert!(trapped.is_empty());
         assert!(
-            arm64::find_guest_tpidr_placeholder(&trampoline).is_some(),
+            aarch64::find_guest_tpidr_placeholder(&trampoline).is_some(),
             "a runtime-emitted thread-pointer gate must arrive unpatched"
         );
         assert_eq!(
-            arm64::patch_guest_tpidr_offset(&mut trampoline, 96).unwrap(),
+            aarch64::patch_guest_tpidr_offset(&mut trampoline, 96).unwrap(),
             1
         );
-        assert!(arm64::find_guest_tpidr_placeholder(&trampoline).is_none());
+        assert!(aarch64::find_guest_tpidr_placeholder(&trampoline).is_none());
     }
 
     #[test]
@@ -2665,12 +2689,12 @@ mod tests {
             file_offset: 0,
             size: aot_code.len() as u64,
         };
-        let aot = arm64::hook_syscalls_aarch64(
+        let aot = aarch64::hook_syscalls_aarch64(
             &mut aot_code,
             &[section],
             trampoline_vaddr,
             0x1234,
-            arm64::Host::Linux,
+            aarch64::Host::Linux,
         )
         .unwrap()
         .unwrap();
@@ -2691,7 +2715,7 @@ mod tests {
             for (slot_offset, count) in boundaries {
                 for instruction in 0..count {
                     let pc = trampoline_vaddr + (slot_offset + instruction * 4) as u64;
-                    let gate = arm64::classify_gate_pc(product, trampoline_vaddr, pc)
+                    let gate = aarch64::classify_gate_pc(product, trampoline_vaddr, pc)
                         .unwrap_or_else(|| panic!("slot {slot_offset} boundary {instruction}"));
                     assert_eq!(gate.slot_offset(), slot_offset);
                     classified += 1;

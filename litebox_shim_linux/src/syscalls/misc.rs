@@ -61,6 +61,8 @@ const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     version: to_fixed_size_array::<65>("5.11.0"),
     #[cfg(target_arch = "x86_64")]
     machine: to_fixed_size_array::<65>("x86_64"),
+    #[cfg(target_arch = "aarch64")]
+    machine: to_fixed_size_array::<65>("aarch64"),
     domainname: to_fixed_size_array::<65>(""),
 };
 

@@ -1443,10 +1443,24 @@ pub enum EpollOp {
 }
 
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
-#[repr(C, packed)]
+#[cfg_attr(target_arch = "x86_64", repr(C, packed))]
+#[cfg_attr(target_arch = "aarch64", repr(C))]
 pub struct EpollEvent {
     pub events: u32,
+    #[cfg(target_arch = "aarch64")]
+    pub padding: u32,
     pub data: u64,
+}
+
+impl EpollEvent {
+    pub fn new(events: u32, data: u64) -> Self {
+        Self {
+            events,
+            #[cfg(target_arch = "aarch64")]
+            padding: 0,
+            data,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
@@ -3213,12 +3227,7 @@ pub mod arch {
     /// tell an in-flight syscall from one that never happened.
     pub const NO_SYSCALL: i32 = -1;
 
-    /// Returns whether `base` is a valid AArch64 Linux user thread-pointer
-    /// (`TPIDR_EL0`) value: it must lie below the top of the user address space.
-    ///
-    /// Same rule as x86-64's `is_valid_user_fs_base`, but unlike `wrfsbase`,
-    /// where a non-canonical operand raises #GP, `MSR TPIDR_EL0` accepts any
-    /// value, so this is purely containment.
+    /// Returns whether `base` lies within LiteBox's guest address range.
     #[must_use]
     pub fn is_valid_user_tls_base(base: usize) -> bool {
         base < USER_ADDR_END
