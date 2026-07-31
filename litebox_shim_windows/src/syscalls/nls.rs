@@ -3,6 +3,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use core::mem::size_of;
 use litebox::fd::TypedFd;
 use litebox::fs::errors::{FileStatusError, OpenError, PathError, ReadError};
 use litebox::fs::{FileType, Mode, OFlags};
@@ -18,6 +19,8 @@ use crate::{MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_va
 pub(crate) const DEFAULT_LOCALE_ID: u32 = 0x0409;
 
 const ANSI_CODE_PAGE: u32 = 1252;
+const MUI_LANGUAGE_CAPACITY: usize = 4;
+const MUI_STRING_CAPACITY: usize = 4;
 const OEM_CODE_PAGE: u32 = 437;
 const UNICODE_CASE_TABLE: u32 = 10000;
 const NLS_SECTION_LOCALE: u32 = 2;
@@ -127,9 +130,9 @@ struct MuiLanguageConfigNode {
 pub(crate) struct MuiRegistryData {
     registry_info: MuiRegistryInfo,
     installed: MuiLanguages,
-    language_info: [MuiLanguageInfo; 4],
+    language_info: [MuiLanguageInfo; MUI_LANGUAGE_CAPACITY],
     strings: MuiStringPool,
-    string_indices: [i16; 4],
+    string_indices: [i16; MUI_STRING_CAPACITY],
     string_pool: [u16; 40],
     machine_config: MuiLanguageConfigList,
     language_config: MuiLanguageConfigNode,
@@ -138,11 +141,12 @@ pub(crate) struct MuiRegistryData {
     padding_4ce: [u8; 2],
 }
 
-const MUI_REGISTRY_DATA_SIZE: u32 = 1232;
-const MUI_INSTALLED_SIZE: u32 = 0x88;
-const MUI_STRING_POOL_SIZE: u32 = 0x78;
-const MUI_MACHINE_CONFIG_SIZE: u32 = 0x1c;
-const MUI_INSTALLED_SKU_SIZE: u32 = 0x306;
+const MUI_STRING_POOL_SIZE: u32 = (size_of::<MuiStringPool>()
+    + size_of::<[i16; MUI_STRING_CAPACITY]>()
+    + size_of::<[u16; 40]>()) as u32;
+const MUI_MACHINE_CONFIG_SIZE: u32 =
+    (size_of::<MuiLanguageConfigList>() + size_of::<MuiLanguageConfigNode>()) as u32;
+const MUI_INSTALLED_SKU_SIZE: u32 = size_of::<[u16; 387]>() as u32;
 const MUI_INSTALLED_OFFSET: u64 = core::mem::offset_of!(MuiRegistryData, installed) as u64;
 const MUI_STRINGS_OFFSET: u64 = core::mem::offset_of!(MuiRegistryData, strings) as u64;
 const MUI_MACHINE_CONFIG_OFFSET: u64 =
@@ -215,8 +219,10 @@ fn mui_registry_data(generation: u32) -> MuiRegistryData {
             padding_a4: [0; 4],
         },
         installed: MuiLanguages {
-            total_size: MUI_INSTALLED_SIZE,
-            max_languages: 4,
+            total_size: (size_of::<MuiLanguages>()
+                + size_of::<[MuiLanguageInfo; MUI_LANGUAGE_CAPACITY]>())
+                as u32,
+            max_languages: MUI_LANGUAGE_CAPACITY as u16,
             languages: 1,
             installed_languages: 0,
             padding_a: [0; 6],
@@ -239,7 +245,7 @@ fn mui_registry_data(generation: u32) -> MuiRegistryData {
         ],
         strings: MuiStringPool {
             total_size: MUI_STRING_POOL_SIZE,
-            max_strings: 4,
+            max_strings: MUI_STRING_CAPACITY as u16,
             strings: 2,
             max_characters: 40,
             characters: 8,
@@ -348,11 +354,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER;
         };
         if supplied_size == 0 {
-            return write_required_output::<Platform, u32>(data_size, MUI_REGISTRY_DATA_SIZE);
+            return write_required_output::<Platform, u32>(
+                data_size,
+                size_of::<MuiRegistryData>() as u32,
+            );
         }
-        if supplied_size < MUI_REGISTRY_DATA_SIZE {
+        if supplied_size < size_of::<MuiRegistryData>() as u32 {
             return if data_size
-                .write_at_offset(0, MUI_REGISTRY_DATA_SIZE)
+                .write_at_offset(0, size_of::<MuiRegistryData>() as u32)
                 .is_some()
             {
                 NtStatus::BUFFER_TOO_SMALL
@@ -362,7 +371,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         if data_size
-            .write_at_offset(0, MUI_REGISTRY_DATA_SIZE)
+            .write_at_offset(0, size_of::<MuiRegistryData>() as u32)
             .is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
@@ -383,7 +392,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         litebox_util_log::debug!(
             flags:? = flags,
-            data_size = MUI_REGISTRY_DATA_SIZE,
+            data_size = size_of::<MuiRegistryData>(),
             generation;
             "Handled NtGetMUIRegistryInfo syscall"
         );
@@ -980,7 +989,7 @@ mod tests {
     #[test]
     fn nt_get_mui_registry_info_reports_required_size_without_touching_short_buffer() {
         let task = crate::tests::test_task();
-        let mut data_size = MUI_REGISTRY_DATA_SIZE - 1;
+        let mut data_size = size_of::<MuiRegistryData>() as u32 - 1;
         let mut data = mui_registry_data(0xfeed_beef);
         let before = data;
 
@@ -992,7 +1001,7 @@ mod tests {
             ),
             NtStatus::BUFFER_TOO_SMALL
         );
-        assert_eq!(data_size, MUI_REGISTRY_DATA_SIZE);
+        assert_eq!(data_size, size_of::<MuiRegistryData>() as u32);
         assert_eq!(data, before);
     }
 
@@ -1014,7 +1023,7 @@ mod tests {
             ),
             NtStatus::INVALID_PARAMETER
         );
-        data_size = MUI_REGISTRY_DATA_SIZE;
+        data_size = size_of::<MuiRegistryData>() as u32;
         assert_eq!(
             task.sys_nt_get_mui_registry_info(0, Some(mut_ptr(&mut data_size)), None,),
             NtStatus::INVALID_PARAMETER
@@ -1031,7 +1040,7 @@ mod tests {
             NtGetMUIRegistryInfo(0, core::ptr::addr_of_mut!(host_size), core::ptr::null_mut())
         };
         assert_eq!(host_status(status), NtStatus::SUCCESS);
-        assert_eq!(host_size, MUI_REGISTRY_DATA_SIZE);
+        assert_eq!(host_size, size_of::<MuiRegistryData>() as u32);
 
         let mut host_data = mui_registry_data(0);
         // SAFETY: `host_data` is a writable buffer of the size returned by the host query.
