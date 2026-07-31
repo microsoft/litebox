@@ -3,9 +3,10 @@
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Linux.
 
-// Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
-// Linux, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 use std::cell::Cell;
 use std::io::IsTerminal as _;
@@ -26,7 +27,31 @@ use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
 
 use zerocopy::{FromBytes, IntoBytes};
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
+#[cfg(target_arch = "aarch64")]
+use aarch64::{
+    Aarch64GateSignalResult, assert_tls_block_placement,
+    canonicalize_runtime_aarch64_gate_signal_context, copy_signal_context,
+    fatal_aarch64_gate_runtime_state, guest_thread_pointer_tp_offset, is_guest_thread,
+    load_tls_block_base, run_thread_arch, set_is_guest_thread, set_signal_return,
+    signal_handler_exit_guest, switch_to_guest, sync_instruction_stream, tls_offset,
+};
+
 extern crate alloc;
+
+#[cfg(target_arch = "aarch64")]
+const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
+
+/// The admitted open syscall and its flags index must remain paired.
+#[cfg(target_arch = "x86_64")]
+const OPEN_SYSNO: i64 = libc::SYS_open;
+#[cfg(target_arch = "x86_64")]
+const OPEN_FLAGS_ARG: u8 = 1;
+#[cfg(target_arch = "aarch64")]
+const OPEN_SYSNO: i64 = libc::SYS_openat;
+#[cfg(target_arch = "aarch64")]
+const OPEN_FLAGS_ARG: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
@@ -71,6 +96,7 @@ macro_rules! saved_tls_seg {
 ///
 /// Example: `tls!("pending_host_signals")` expands to
 /// `"fs:pending_host_signals@tpoff"` on x86_64.
+#[cfg(target_arch = "x86_64")]
 macro_rules! tls {
     ($var:literal) => {
         concat!(tls_seg!(), ":", $var, tls_suffix!())
@@ -82,6 +108,7 @@ macro_rules! tls {
 ///
 /// Example: `saved_tls!("in_guest")` expands to
 /// `"gs:in_guest@tpoff"` on x86_64.
+#[cfg(target_arch = "x86_64")]
 macro_rules! saved_tls {
     ($var:literal) => {
         concat!(saved_tls_seg!(), ":", $var, tls_suffix!())
@@ -123,6 +150,9 @@ struct CowRegionInfo {
 impl LinuxUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
     pub fn new() -> &'static Self {
+        #[cfg(target_arch = "aarch64")]
+        assert_tls_block_placement();
+
         register_exception_handlers();
 
         let reserved_pages = Self::read_maps();
@@ -214,9 +244,20 @@ impl LinuxUserland {
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
         let path = c"/proc/self/maps";
+        #[cfg(target_arch = "x86_64")]
         let fd = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::open,
+                path.as_ptr() as usize,
+                OFlags::RDONLY.bits() as usize,
+                0,
+            )
+        };
+        #[cfg(target_arch = "aarch64")]
+        let fd = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::openat,
+                AT_FDCWD,
                 path.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
@@ -289,7 +330,6 @@ impl LinuxUserland {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[allow(
         clippy::missing_panics_doc,
         reason = "the seccomp filter rules are hardcoded and not expected to fail"
@@ -310,7 +350,12 @@ impl LinuxUserland {
             // Terminal and broker I/O
             (libc::SYS_read, vec![]),
             (libc::SYS_write, vec![]),
+            // The AArch64 (asm-generic) syscall table has no `poll`; glibc
+            // implements `poll(3)` there via `ppoll`.
+            #[cfg(target_arch = "x86_64")]
             (libc::SYS_poll, vec![]),
+            #[cfg(target_arch = "aarch64")]
+            (libc::SYS_ppoll, vec![]),
             // memory management
             (libc::SYS_mmap, vec![]),
             (libc::SYS_mprotect, vec![]),
@@ -349,12 +394,14 @@ impl LinuxUserland {
             (libc::SYS_brk, vec![]),
             (libc::SYS_getpid, vec![]),
             // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
+            //
+            // A mismatched syscall and flags index would admit arbitrary flags.
             (
-                libc::SYS_open,
+                OPEN_SYSNO,
                 vec![
                     SeccompRule::new(vec![
                         SeccompCondition::new(
-                            1,
+                            OPEN_FLAGS_ARG,
                             SeccompCmpArgLen::Dword,
                             SeccompCmpOp::Eq,
                             u64::from(OFlags::RDONLY.bits()),
@@ -462,7 +509,11 @@ impl LinuxUserland {
                 SeccompAction::Errno(libc::EINVAL.cast_unsigned())
             },
             SeccompAction::Allow,
-            seccompiler::TargetArch::x86_64,
+            if cfg!(target_arch = "x86_64") {
+                seccompiler::TargetArch::x86_64
+            } else {
+                seccompiler::TargetArch::aarch64
+            },
         )
         .unwrap();
         // TODO: bpf program can be compiled offline
@@ -490,11 +541,33 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
     // Atomically swap the per-thread pending signals with zero.
     // Only the low 32 bits are used (covers traditional signals 1-31).
     let lo: u32;
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
             "xor {tmp:e}, {tmp:e}",
             concat!("xchg DWORD PTR ", tls!("pending_host_signals"), ", {tmp:e}"),
             tmp = out(reg) lo,
+            options(nostack)
+        );
+    }
+    // Atomic against this thread's signal handlers; use the ARMv8.0 baseline
+    // rather than ARMv8.1 LSE.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: reads and clears a naturally aligned `u32` in this thread's own
+    // TLS control block, whose offset from `TPIDR_EL0` is checked by
+    // `assert_tls_block_placement`.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{addr}"),
+            "add {addr}, {addr}, #{off}",
+            "2:",
+            "ldaxr {val:w}, [{addr}]",
+            "stlxr {status:w}, wzr, [{addr}]",
+            "cbnz {status:w}, 2b",
+            addr = out(reg) _,
+            val = out(reg) lo,
+            status = out(reg) _,
+            off = const tls_offset::PENDING_HOST_SIGNALS,
             options(nostack)
         );
     }
@@ -554,6 +627,7 @@ fn run_thread_inner(
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
+    let _guest_thread = GuestThreadMarker::enter();
     ThreadHandle::run_with_handle(|| {
         with_signal_alt_stack(|| unsafe {
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
@@ -615,6 +689,35 @@ fn get_guest_fsbase() -> usize {
         }
     }
     value
+}
+
+/// Tracks the whole guest-thread lifetime on AArch64 and preserves nested-entry
+/// state. On x86-64, `gsbase` provides the marker.
+struct GuestThreadMarker {
+    #[cfg(target_arch = "aarch64")]
+    previous: bool,
+}
+
+impl GuestThreadMarker {
+    fn enter() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self {}
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let previous = is_guest_thread();
+            set_is_guest_thread(true);
+            Self { previous }
+        }
+    }
+}
+
+impl Drop for GuestThreadMarker {
+    fn drop(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        set_is_guest_thread(self.previous);
+    }
 }
 
 /// Runs the guest thread until it terminates.
@@ -964,6 +1067,8 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
             );
         }
 
+        let _guest_thread = GuestThreadMarker::enter();
+
         ThreadHandle::run_with_handle(f)
     }
 }
@@ -1048,10 +1153,33 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
         Self: litebox::sync::RawSyncPrimitivesProvider,
     {
         let mut waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!(
                 concat!("xchg ", tls!("wait_waker_addr"), ", {}"),
                 inout(reg) waker_ptr,
+                options(nostack),
+            );
+        }
+        // Atomic against `record_pending_signal` in this thread's handler.
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: exchanges a naturally aligned `u64` in this thread's own TLS
+        // control block, whose offset from `TPIDR_EL0` is checked by
+        // `assert_tls_block_placement`.
+        unsafe {
+            let new_ptr = waker_ptr;
+            core::arch::asm!(
+                load_tls_block_base!("{addr}"),
+                "add {addr}, {addr}, #{off}",
+                "2:",
+                "ldaxr {old}, [{addr}]",
+                "stlxr {status:w}, {new}, [{addr}]",
+                "cbnz {status:w}, 2b",
+                addr = out(reg) _,
+                old = out(reg) waker_ptr,
+                new = in(reg) new_ptr,
+                status = out(reg) _,
+                off = const tls_offset::WAIT_WAKER_ADDR,
                 options(nostack),
             );
         }
@@ -1145,7 +1273,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         Instant {
-            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+            #[expect(clippy::useless_conversion)]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().trunc(),
@@ -1158,7 +1286,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         SystemTime {
-            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+            #[expect(clippy::useless_conversion)]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().trunc(),
@@ -1294,12 +1422,7 @@ fn futex_timeout(
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
         syscalls::syscall6(
-            {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    syscalls::Sysno::futex
-                }
-            },
+            syscalls::Sysno::futex,
             uaddr as usize,
             usize::try_from(futex_op).unwrap(),
             val as usize,
@@ -1328,12 +1451,7 @@ fn futex_val2(
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
         syscalls::syscall6(
-            {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    syscalls::Sysno::futex
-                }
-            },
+            syscalls::Sysno::futex,
             uaddr as usize,
             usize::try_from(futex_op).unwrap(),
             val as usize,
@@ -1365,10 +1483,29 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     res
 }
 
+#[cfg(target_arch = "aarch64")]
+fn cache_sync_permissions(permissions: MemoryRegionPermissions) -> MemoryRegionPermissions {
+    (permissions | MemoryRegionPermissions::READ) & !MemoryRegionPermissions::EXEC
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    /// Assumes the host kernel is configured for a 48-bit user virtual address
+    /// space. AArch64 Linux is also built with 39, 42 and 47 bits, and on those
+    /// hosts this hands out addresses the kernel then refuses to map.
+    ///
+    /// Naming the smallest configuration instead is not an option today: the
+    /// allocator in `litebox::mm` searches downwards from the highest existing
+    /// mapping, and the runtime's own mappings sit above any limit smaller than
+    /// the host's real one, leaving it unable to place anything at all.
+    ///
+    /// TODO: probe the host's limit -- this is an associated const, so that
+    /// needs `PageManagementProvider` to express a runtime bound -- and teach
+    /// the allocator to place into a region holding no existing mapping.
+    #[cfg(target_arch = "aarch64")]
+    const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000; // (1 << 48) - PAGE_SIZE;
 
     fn allocate_pages(
         &self,
@@ -1397,12 +1534,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             };
         let r = unsafe {
             syscalls::syscall6(
-                {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        syscalls::Sysno::mmap
-                    }
-                },
+                syscalls::Sysno::mmap,
                 suggested_range.start,
                 suggested_range.len(),
                 prot_flags(initial_permissions)
@@ -1461,6 +1593,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::mprotect,
@@ -1470,6 +1603,48 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         }
         .expect("mprotect failed");
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Cache maintenance needs read permission. Keep execute disabled until
+            // the new instructions are visible to the fetch path.
+            //
+            // TODO: only a W->X transition needs this; `update_permissions` is not
+            // told the old permissions, so every transition to X pays for it.
+            // Revisit when the trait passes the old permissions.
+            let syncing = new_permissions.contains(MemoryRegionPermissions::EXEC);
+            let mapped_permissions = if syncing {
+                cache_sync_permissions(new_permissions)
+            } else {
+                new_permissions
+            };
+
+            unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::mprotect,
+                    range.start,
+                    range.len(),
+                    prot_flags(mapped_permissions)
+                        .bits()
+                        .reinterpret_as_unsigned() as usize,
+                )
+            }
+            .expect("mprotect failed");
+            if syncing {
+                sync_instruction_stream(range.clone());
+                if mapped_permissions != new_permissions {
+                    unsafe {
+                        syscalls::syscall3(
+                            syscalls::Sysno::mprotect,
+                            range.start,
+                            range.len(),
+                            prot_flags(new_permissions).bits().reinterpret_as_unsigned() as usize,
+                        )
+                    }
+                    .expect("mprotect failed");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1494,9 +1669,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         let file_path_cstr =
             std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
         // TODO(jb): We should likely be storing pre-opened FDs, right?
+        #[cfg(target_arch = "x86_64")]
         let fd = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::open,
+                file_path_cstr.as_ptr() as usize,
+                OFlags::RDONLY.bits() as usize,
+                0,
+            )
+        };
+        #[cfg(target_arch = "aarch64")]
+        let fd = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::openat,
+                AT_FDCWD,
                 file_path_cstr.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
@@ -1513,23 +1699,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
         let result = unsafe {
             syscalls::syscall6(
-                {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        syscalls::Sysno::mmap
-                    }
-                },
+                syscalls::Sysno::mmap,
                 suggested_start,
                 source_data.len(),
                 prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
                 flags.bits().reinterpret_as_unsigned() as usize,
                 fd,
-                {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        file_offset
-                    }
-                },
+                file_offset,
             )
         };
 
@@ -1591,12 +1767,82 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 }
 
 unsafe extern "C" {
-    // Defined in asm blocks above
     fn syscall_callback() -> isize;
+    #[cfg(target_arch = "aarch64")]
+    fn syscall_callback_in_guest_cleared();
     fn exception_callback();
     fn interrupt_callback();
+    #[cfg(target_arch = "x86_64")]
     fn switch_to_guest_start();
+    #[cfg(target_arch = "x86_64")]
     fn switch_to_guest_end();
+    #[cfg(target_arch = "aarch64")]
+    fn switch_to_guest_via_outbound_stub_start();
+    #[cfg(target_arch = "aarch64")]
+    fn switch_to_guest_via_outbound_stub_end();
+    #[cfg(target_arch = "aarch64")]
+    fn switch_to_guest_via_sigreturn_start();
+    #[cfg(target_arch = "aarch64")]
+    fn switch_to_guest_via_sigreturn_end();
+    #[cfg(all(test, target_arch = "aarch64"))]
+    fn switch_to_guest_stage_x16();
+    #[cfg(all(test, target_arch = "aarch64"))]
+    fn switch_to_guest_stage_x16_fixup();
+}
+
+/// Whether `pc` is inside a sequence switching this thread to guest state.
+///
+/// From the store that sets `in_guest` to the final branch into the guest,
+/// neither the host's nor the guest's register state is self-consistent, so a
+/// signal arriving there must not be attributed to the guest; each caller
+/// decides what to do instead.
+///
+/// AArch64 has two such sequences to x86-64's one, in separate functions, so
+/// this is a union of two ranges: one span would depend on link order.
+fn in_switch_to_guest(pc: usize) -> bool {
+    fn body(start: unsafe extern "C" fn(), end: unsafe extern "C" fn()) -> core::ops::Range<usize> {
+        start as *const () as usize..end as *const () as usize
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        body(switch_to_guest_start, switch_to_guest_end).contains(&pc)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        body(
+            switch_to_guest_via_outbound_stub_start,
+            switch_to_guest_via_outbound_stub_end,
+        )
+        .contains(&pc)
+            || body(
+                switch_to_guest_via_sigreturn_start,
+                switch_to_guest_via_sigreturn_end,
+            )
+            .contains(&pc)
+    }
+}
+
+/// Whether `ip` is inside `syscall_callback`'s prologue, i.e. before the guest
+/// has been fully accounted for but after control has left the guest.
+///
+/// This is `interrupt_signal_handler` case 1. Getting the bound wrong is not a
+/// benign off-by-one: an `ip` past the bound but still before `in_guest` is
+/// cleared falls through to case 4, where `copy_signal_context`
+/// overwrites the guest `PtRegs` with *host* state — a runtime pc, the gate
+/// frame's shifted sp, and `syscallno = NO_SYSCALL` — silently dropping the
+/// in-flight guest syscall.
+fn in_syscall_callback_prologue(ip: usize) -> bool {
+    let start = syscall_callback as *const () as usize;
+    #[cfg(target_arch = "x86_64")]
+    {
+        ip == start
+    }
+    // The label keeps the multi-instruction AArch64 bound tied to the asm.
+    #[cfg(target_arch = "aarch64")]
+    {
+        (start..syscall_callback_in_guest_cleared as *const () as usize).contains(&ip)
+    }
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
@@ -1632,11 +1878,39 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
     let info = litebox::shim::ExceptionInfo {
         exception: litebox::shim::Exception(trapno.try_into().unwrap()),
         error_code: error.try_into().unwrap(),
         cr2,
         kernel_mode: false,
+    };
+    // On AArch64 the hardware trap number and error code are not visible to
+    // userspace, so `exception_signal_handler` passes the signal number in
+    // `trapno` and zero in `error`, and the exception class is recovered from
+    // the signal.
+    #[cfg(target_arch = "aarch64")]
+    let info = {
+        let _ = error;
+        let exception = match i32::try_from(trapno).unwrap_or(0) {
+            libc::SIGILL => litebox::shim::Exception::INSTRUCTION_ABORT_LOWER_EL,
+            libc::SIGTRAP => litebox::shim::Exception::BRK64,
+            // Everything else reaching this handler -- SIGSEGV, SIGBUS and
+            // SIGFPE -- is reported as a data abort. SIGFPE does have a class
+            // of its own, 0x2c, but the shim cannot deliver SIGFPE yet; see
+            // its `handle_exception_request`.
+            _ => litebox::shim::Exception::DATA_ABORT_LOWER_EL,
+        };
+        litebox::shim::ExceptionInfo {
+            exception,
+            fault_address: cr2,
+            // The real ESR_EL1 is not exposed to userspace — the arm64 signal
+            // frame carries no syndrome register — so synthesize one holding
+            // just the exception class in bits 31:26. The instruction-specific
+            // syndrome (ISS) bits 24:0 are unavoidably zero.
+            esr: u64::from(exception.0) << 26,
+            kernel_mode: false,
+        }
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
 }
@@ -1657,9 +1931,21 @@ impl ThreadContext<'_> {
         // Clear the interrupt flag before calling the shim, since we've handled it
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!(
                 concat!("mov BYTE PTR ", tls!("interrupt"), ", 0"),
+                options(nostack, preserves_flags)
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: writes a single byte in this thread's own TLS control block.
+        unsafe {
+            core::arch::asm!(
+                load_tls_block_base!("{tmp}"),
+                "strb wzr, [{tmp}, #{off}]",
+                tmp = out(reg) _,
+                off = const tls_offset::INTERRUPT,
                 options(nostack, preserves_flags)
             );
         }
@@ -1684,6 +1970,11 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
         // TODO: implement VDSO in the shim, don't try to pass through the
         // platform VDSO.
         None
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn guest_thread_pointer_offset(&self) -> Option<usize> {
+        Some(guest_thread_pointer_tp_offset().into())
     }
 }
 
@@ -1764,6 +2055,17 @@ fn register_exception_handlers() {
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();
                 sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+                // `SA_NODEFER`: the gate classifier probes memory around a guest
+                // PC that may be unmapped, and reaching the exception-table
+                // fixup for that probe needs this handler to be re-entrant.
+                // Without it the kernel force-kills on the nested fault, so a
+                // guest jumping to a bad pointer would take the host with it.
+                // Nothing on the x86-64 path probes guest memory, so leaving
+                // the flag off there keeps the kernel's recursion backstop.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    sa.sa_flags |= libc::SA_NODEFER;
+                }
                 sa.sa_sigaction = exception_signal_handler as *const () as usize;
                 // Block the interrupt signal while handling exceptions to avoid
                 // saving the exception signal handler state as guest state.
@@ -1993,20 +2295,31 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    // Return an error code for the syscall and log it in debug mode.
     #[cfg(debug_assertions)]
     if signum == libc::SIGSYS {
         use core::fmt::Write as _;
         #[cfg(target_arch = "x86_64")]
-        let eax_idx = libc::REG_RAX as usize;
-        let sysno = context.uc_mcontext.gregs[eax_idx];
-        context.uc_mcontext.gregs[eax_idx] = i64::from(-libc::EINVAL);
+        let (sysno, arg1) = {
+            let sysno = context.uc_mcontext.gregs[libc::REG_RAX as usize];
+            context.uc_mcontext.gregs[libc::REG_RAX as usize] = i64::from(-libc::EINVAL);
+            (
+                sysno,
+                context.uc_mcontext.gregs[libc::REG_RSI as usize] as *const core::ffi::c_char,
+            )
+        };
+        #[cfg(target_arch = "aarch64")]
+        let (sysno, arg1) = {
+            let sysno = context.uc_mcontext.regs[8].cast_signed();
+            context.uc_mcontext.regs[0] = i64::from(-libc::EINVAL).cast_unsigned();
+            (
+                sysno,
+                context.uc_mcontext.regs[1] as *const core::ffi::c_char,
+            )
+        };
         // Signal-safe: format on the stack via arrayvec (no heap allocation).
         let mut buf = arrayvec::ArrayString::<320>::new();
         if sysno == libc::SYS_openat {
-            #[cfg(target_arch = "x86_64")]
-            let rsi = context.uc_mcontext.gregs[libc::REG_RSI as usize] as *const i8;
-            let c_path = unsafe { core::ffi::CStr::from_ptr(rsi) };
+            let c_path = unsafe { core::ffi::CStr::from_ptr(arg1) };
             // libc may call `openat` for certain files that we can ignore, e.g., /proc/sys/vm/overcommit_memory.
             // Log the paths in case we need to allow some of them in the future.
             let _ = writeln!(buf, "INFO: openat with {c_path:?} is not allowed");
@@ -2024,21 +2337,78 @@ unsafe extern "C" fn exception_signal_handler(
         return;
     }
 
+    // Classify runtime transition faults before guest faults; misclassification
+    // would disclose the live host register file through guest `PtRegs`.
+    #[cfg(target_arch = "aarch64")]
+    let faulting_pc: usize = context.uc_mcontext.pc.trunc();
+
+    // The staging store is inside the `in_guest` bracket and may raise SIGSEGV
+    // or SIGBUS, so its fixup must run before consulting `in_guest`.
+    #[cfg(target_arch = "aarch64")]
+    if matches!(signum, libc::SIGSEGV | libc::SIGBUS)
+        && let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(faulting_pc)
+    {
+        context.uc_mcontext.pc = fixup_addr as u64;
+        return;
+    }
+
+    // Remaining faults inside the transition bracket are runtime faults and
+    // cannot safely resume because `in_guest` and SP may be inconsistent.
+    #[cfg(target_arch = "aarch64")]
+    if in_switch_to_guest(faulting_pc) {
+        return unsafe { next_signal_handler(signum, info, context) };
+    }
+
     let Some(regs) = signal_handler_exit_guest(context, false) else {
         return unsafe { next_signal_handler(signum, info, context) };
     };
+    #[cfg(target_arch = "x86_64")]
     copy_signal_context(unsafe { &mut *regs }, context);
+    #[cfg(target_arch = "aarch64")]
+    match canonicalize_runtime_aarch64_gate_signal_context(context, unsafe { &*regs }) {
+        Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
+        Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
+        Aarch64GateSignalResult::PreserveSavedContext => {
+            // The register values are already the guest's; only the syscall
+            // bookkeeping is stale. The stub runs after `syscall_callback`
+            // recorded a number, so leaving it would tell the shim a syscall is
+            // in flight during an exception or an interrupt -- the same reason
+            // `copy_signal_context` clears it on every other path.
+            unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };
+        }
+        Aarch64GateSignalResult::InvalidRuntimeState => {
+            fatal_aarch64_gate_runtime_state();
+        }
+    }
 
-    // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
     let _ = run_thread_arch as *const () as usize;
 
-    // Jump to exception_callback.
     let sigctx = &context.uc_mcontext;
     #[cfg(target_arch = "x86_64")]
     let (trapno, err, cr2) = (
         sigctx.gregs[libc::REG_TRAPNO as usize].trunc(),
         sigctx.gregs[libc::REG_ERR as usize].trunc(),
         sigctx.gregs[libc::REG_CR2 as usize].trunc(),
+    );
+    // AArch64 exposes no trap number or error code to userspace, so the signal
+    // number stands in for the trap and the error code is always zero;
+    // `exception_handler` recovers an exception class from it. The four-argument
+    // shape is kept so `exception_callback`'s x1/x2/x3 marshalling is shared.
+    //
+    // The fault address comes from `uc_mcontext.fault_address`, not
+    // `siginfo.si_addr`. That field is what the arm64 kernel copies out of
+    // `current->thread.fault_address`, i.e. FAR_EL1 — exactly what
+    // `ExceptionInfo::fault_address` is documented to carry. `si_addr` is a
+    // per-signal derived value and for SIGILL is the faulting *PC*, which
+    // would put a program counter in a field named `fault_address`.
+    #[cfg(target_arch = "aarch64")]
+    let (trapno, err, cr2) = (
+        // Widen infallibly: this runs in a signal handler, where a panic is
+        // not async-signal-safe. `i64::from` is a lossless widening and
+        // `trunc` to `isize` is exact on a 64-bit target.
+        TruncateExt::<isize>::trunc(i64::from(signum)),
+        0isize,
+        TruncateExt::<usize>::trunc(sigctx.fault_address).reinterpret_as_signed(),
     );
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
 }
@@ -2057,12 +2427,20 @@ unsafe fn next_signal_handler(
                     .reinterpret_as_unsigned()
                     .trunc()
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.uc_mcontext.pc.trunc()
+            }
         };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
             #[cfg(target_arch = "x86_64")]
             {
                 context.uc_mcontext.gregs[libc::REG_RIP as usize] =
                     fixup_addr.reinterpret_as_signed() as i64;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.uc_mcontext.pc = fixup_addr as u64;
             }
             return;
         }
@@ -2100,30 +2478,65 @@ unsafe fn next_signal_handler(
     }
 }
 
-/// Records a pending host signal in the `.tbss` bitmask and wakes any condvar
-/// the thread is blocked on.
+/// Records a pending host signal in the TLS bitmask and wakes any condvar the
+/// thread is blocked on.
 ///
 /// # Safety
 ///
-/// Must be called from a signal handler on a guest thread whose saved host TLS
-/// segment register is valid.
+/// Must be called from a signal handler on a guest thread.
+///
+/// On x86-64 that additionally requires the thread's saved host TLS segment
+/// register (`gsbase`) to be valid, since the bitmask is reached through it.
 unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     let mask: u32 = 1u32 << (signal.as_i32() - 1);
+    let waker_addr: usize;
+
+    // SAFETY: the bitmask and waker slot are reached through this thread's own
+    // saved host TLS segment, which the caller guarantees is valid, and both
+    // accesses are naturally aligned.
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
             concat!("lock or DWORD PTR ", saved_tls!("pending_host_signals"), ", {mask:e}"),
             mask = in(reg) mask,
             options(nostack)
         );
-    }
-    let waker_addr: usize;
-    unsafe {
         core::arch::asm!(
             concat!("mov {}, ", saved_tls!("wait_waker_addr")),
             out(reg) waker_addr,
             options(nostack, preserves_flags)
         );
     }
+
+    // Atomic against an interrupted exchange; a plain load/or/store can lose a bit.
+    //
+    // SAFETY: both slots are in this thread's own TLS control block at offsets
+    // checked by `assert_tls_block_placement`, and both accesses are naturally aligned.
+    // The exclusive monitor reservation is opened and closed within the loop.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            "add {addr}, {block}, #{pending_off}",
+            "2:",
+            "ldaxr {old:w}, [{addr}]",
+            "orr {new:w}, {old:w}, {mask:w}",
+            "stlxr {status:w}, {new:w}, [{addr}]",
+            "cbnz {status:w}, 2b",
+            "ldr {waker}, [{block}, #{waker_off}]",
+            block = out(reg) _,
+            addr = out(reg) _,
+            old = out(reg) _,
+            new = out(reg) _,
+            status = out(reg) _,
+            waker = out(reg) waker_addr,
+            mask = in(reg) mask,
+            pending_off = const tls_offset::PENDING_HOST_SIGNALS,
+            waker_off = const tls_offset::WAIT_WAKER_ADDR,
+            options(nostack)
+        );
+    }
+
     if waker_addr == 0 {
         return;
     }
@@ -2178,8 +2591,13 @@ unsafe fn interrupt_signal_handler(
             return;
         };
 
-        // Check whether the saved host TLS segment is valid (i.e. this is a
-        // guest thread). If not, re-raise the signal process-wide.
+        // Check whether this is a guest thread. If not, re-raise the signal
+        // process-wide.
+        //
+        // This is a thread-lifetime property, not `in_guest`: `in_guest` is 0
+        // whenever a guest thread sits in the host, including parked in an
+        // interruptible wait -- the case `record_pending_signal` and
+        // `wait_waker_addr` serve.
         let is_guest_thread;
         #[cfg(target_arch = "x86_64")]
         {
@@ -2187,9 +2605,14 @@ unsafe fn interrupt_signal_handler(
             unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
             is_guest_thread = gsbase != 0;
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            is_guest_thread = self::is_guest_thread();
+        }
 
         if is_guest_thread {
-            // SAFETY: we verified the saved host TLS segment is valid above.
+            // SAFETY: we verified above that this is a guest thread, which is
+            // what `record_pending_signal` requires.
             unsafe { record_pending_signal(signal) };
         } else {
             #[cfg(debug_assertions)]
@@ -2198,18 +2621,6 @@ unsafe fn interrupt_signal_handler(
         }
     }
 
-    // The interrupt signal can arrive in different contexts:
-    // 1. The thread is running in the host at the beginning of the syscall
-    //    handler. Do nothing--the syscall handler will handle the interrupt.
-    // 2. The thread is running in the host, with in_guest = 0. Just record that
-    //    an interrupt is pending; it will be checked next time we switch to the
-    //    guest.
-    // 3. The thread is running in the host, with in_guest = 1, in the middle of
-    //    restoring the guest context. We need to jump to the interrupt handler
-    //    without overwriting the saved guest context.
-    // 4. The thread is running in the guest. We need to save the context and
-    //    jump to the interrupt handler.
-    //
     // Note that this signal can't arrive while in an exception signal handler
     // since we mask the interrupt signal while handling exceptions.
 
@@ -2217,36 +2628,39 @@ unsafe fn interrupt_signal_handler(
     let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize]
         .reinterpret_as_unsigned()
         .trunc();
+    #[cfg(target_arch = "aarch64")]
+    let ip = context.uc_mcontext.pc.trunc();
 
-    // Case 1: at the beginning of the syscall handler.
-    //
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    if ip == syscall_callback as *const () as usize {
-        // No need to clear `in_guest` or set interrupt; the syscall handler will
-        // clear `in_guest` and call into the shim.
+    if in_syscall_callback_prologue(ip) {
         return;
     }
 
-    // Clear `in_guest` and set `interrupt`.
     let Some(regs) = signal_handler_exit_guest(context, true) else {
-        // Case 2: not in guest.
         return;
     };
 
-    // If the interrupt happened while returning to the guest, don't overwrite
-    // the saved context.
-    let in_switch_to_guest = (switch_to_guest_start as *const () as usize
-        ..switch_to_guest_end as *const () as usize)
-        .contains(&ip);
+    let in_switch_to_guest = in_switch_to_guest(ip);
     if in_switch_to_guest {
-        // Case 3: in the middle of restoring guest context. Don't overwrite it.
+        // The saved guest context remains authoritative during restoration.
     } else {
-        // Case 4: in guest. Copy out the context.
+        #[cfg(target_arch = "x86_64")]
         copy_signal_context(unsafe { &mut *regs }, context);
+        #[cfg(target_arch = "aarch64")]
+        match canonicalize_runtime_aarch64_gate_signal_context(context, unsafe { &*regs }) {
+            Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
+            Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
+            Aarch64GateSignalResult::PreserveSavedContext => {
+                // The outbound path preserves registers but leaves stale syscall state.
+                unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };
+            }
+            Aarch64GateSignalResult::InvalidRuntimeState => {
+                fatal_aarch64_gate_runtime_state();
+            }
+        }
     }
-    // Cases 3 and 4: jump to interrupt handler.
     set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
 }
 
@@ -2334,12 +2748,26 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::thread::sleep;
 
-    use litebox::{fs::OFlags, platform::RawMutex};
+    use litebox::fs::OFlags;
+    use litebox::platform::RawMutex;
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;
 
     extern crate std;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn cache_sync_permissions_are_readable_and_non_executable() {
+        use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+        let final_permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC;
+        let sync_permissions = super::cache_sync_permissions(final_permissions);
+
+        assert!(sync_permissions.contains(MemoryRegionPermissions::READ));
+        assert!(!sync_permissions.contains(MemoryRegionPermissions::EXEC));
+        assert!(final_permissions.contains(MemoryRegionPermissions::EXEC));
+    }
 
     #[test]
     fn test_raw_mutex() {
@@ -2439,22 +2867,64 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
 
         let pathname = c"/tmp/test_seccomp";
+        #[cfg(target_arch = "x86_64")]
         let mkdir_res = unsafe {
             syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
+        };
+        #[cfg(target_arch = "aarch64")]
+        let mkdir_res = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::mkdirat,
+                super::AT_FDCWD,
+                pathname.as_ptr() as usize,
+                0o755,
+            )
         };
         assert_eq!(
             mkdir_res.unwrap_err(),
             syscalls::Errno::EINVAL,
-            "mkdir should be blocked by seccomp filter"
+            "mkdir/mkdirat should be blocked by seccomp filter"
         );
 
         let pathname =
             std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
+
+        // Denying RDWR does not on its own show that the rule reads the flags
+        // argument: were it to read the path pointer instead, that too would
+        // compare unequal to `O_RDONLY` and be denied. Only an allowed RDONLY
+        // open pins the argument index `OPEN_FLAGS_ARG`.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let open_rdonly = unsafe {
+                syscalls::syscall4(
+                    syscalls::Sysno::openat,
+                    super::AT_FDCWD,
+                    pathname.as_ptr() as usize,
+                    OFlags::RDONLY.bits() as usize,
+                    0,
+                )
+            };
+            let fd = open_rdonly.expect("openat with RDONLY should be allowed by seccomp filter");
+            // SAFETY: the open above just returned this as a fresh owned descriptor.
+            drop(unsafe { OwnedFd::from_raw_fd(i32::try_from(fd).unwrap()) });
+        }
+
+        #[cfg(target_arch = "x86_64")]
         let open_res = unsafe {
             syscalls::syscall2(
                 syscalls::Sysno::open,
                 pathname.as_ptr() as usize,
                 OFlags::RDWR.bits() as usize,
+            )
+        };
+        #[cfg(target_arch = "aarch64")]
+        let open_res = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::openat,
+                super::AT_FDCWD,
+                pathname.as_ptr() as usize,
+                OFlags::RDWR.bits() as usize,
+                0,
             )
         };
         assert_eq!(

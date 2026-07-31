@@ -39,9 +39,9 @@
 //!
 //! `guest_tpidr_offset` is fixed by the host binary's link and one rewritten
 //! guest must run under any host build, so gates carry a placeholder offset.
-//! **A loader must call [`patch_guest_tpidr_offset`], then prove with
-//! [`find_guest_tpidr_placeholder`] that no placeholder survives, before
-//! mapping the trampoline executable** — an unpatched gate does not fault. See
+//! **A loader must pass staged gates through [`finalize_trampoline_gates`],
+//! which patches the offset and proves no placeholder survives, before mapping
+//! the trampoline executable** — an unpatched gate does not fault. See
 //! `GUEST_TPIDR_OFFSET_PLACEHOLDER`.
 //!
 //! ## Gate scratch storage
@@ -1724,7 +1724,9 @@ fn valid_emitted_tpidr_offset(offset: u32) -> bool {
                 .contains(&offset))
 }
 
-fn decode_branch_target(word: u32, pc: u64) -> Option<u64> {
+/// Decodes an AArch64 unconditional immediate branch at `pc`.
+/// Returns `None` if `word` is not `B` or the target overflows `u64`.
+pub fn decode_branch_target(word: u32, pc: u64) -> Option<u64> {
     if word & OPCODE_TOP6_MASK != Opcode::B.bits() {
         return None;
     }
@@ -1777,6 +1779,32 @@ const LDST_UIMM12_IMM_MASK: u32 = 0x003F_FC00;
 /// Bit position of that immediate field.
 const LDST_UIMM12_IMM_SHIFT: u32 = 10;
 
+/// Patches every gate and fails if any executable placeholder remains.
+///
+/// # Errors
+///
+/// Propagates errors from [`patch_guest_tpidr_offset`] and fails if any
+/// placeholder survives.
+pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<()> {
+    patch_guest_tpidr_offset(trampoline, offset)?;
+    if let Some(at) = find_guest_tpidr_placeholder(trampoline) {
+        return Err(Error::TrampolinePatchFailure(format!(
+            "trampoline byte {at} still holds the guest thread-pointer placeholder after patching \
+             with offset {offset}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a gate can be patched to reach `offset`: a multiple of
+/// [`GUEST_TPIDR_OFFSET_ALIGN`], far enough from the thread pointer that it
+/// cannot land on the host's own per-thread state, and below the value reserved
+/// for the unpatched placeholder.
+pub fn is_patchable_guest_tpidr_offset(offset: u16) -> bool {
+    offset.is_multiple_of(GUEST_TPIDR_OFFSET_ALIGN)
+        && (MIN_GUEST_TPIDR_OFFSET..GUEST_TPIDR_OFFSET_PLACEHOLDER).contains(&offset)
+}
+
 /// Rewrites the guest thread-pointer offset in every gate of one emitted
 /// trampoline, replacing the emitted placeholder with `offset`. The loader must
 /// call this before making the trampoline executable.
@@ -1799,9 +1827,7 @@ const LDST_UIMM12_IMM_SHIFT: u32 = 10;
 /// Panics if a validated slot is shorter than its own metadata word, which the
 /// slot templates make impossible.
 pub fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
-    if !offset.is_multiple_of(GUEST_TPIDR_OFFSET_ALIGN)
-        || !(MIN_GUEST_TPIDR_OFFSET..GUEST_TPIDR_OFFSET_PLACEHOLDER).contains(&offset)
-    {
+    if !is_patchable_guest_tpidr_offset(offset) {
         return Err(Error::TrampolinePatchFailure(format!(
             "guest thread-pointer offset {offset} is not a legitimate gate target: it must be a \
              multiple of {GUEST_TPIDR_OFFSET_ALIGN}, at least {MIN_GUEST_TPIDR_OFFSET} so it \

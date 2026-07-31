@@ -92,6 +92,7 @@ jobs:
         -p litebox
         -p litebox_common_linux
         -p litebox_syscall_rewriter
+        -p litebox_platform_linux_userland
     steps:
       - name: Check out repo
         uses: actions/checkout@v6

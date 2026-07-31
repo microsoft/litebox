@@ -16,6 +16,12 @@ syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false }
 seccompiler = { version = "0.5.0" }
 
+# The signal path recognizes rewriter gates from the bytes at the interrupted
+# PC, so it needs the rewriter's classifier. x86-64 needs no classifier: its
+# gate is a single fixed-length instruction.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
+
 [features]
 default = ["linux_syscall"]
 linux_syscall = []
