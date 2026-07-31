@@ -48,7 +48,9 @@ pub enum ArchSpecificRegister {
 /// Architecture-specific registers for AArch64.
 #[cfg(target_arch = "aarch64")]
 #[non_exhaustive]
-pub enum ArchSpecificRegister {}
+pub enum ArchSpecificRegister {
+    TpidrEl0,
+}
 
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.
 #[non_exhaustive]

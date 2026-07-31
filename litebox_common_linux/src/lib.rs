@@ -101,7 +101,7 @@ pub mod ioctl {
 
 bitflags::bitflags! {
     /// Desired memory protection of a memory mapping.
-    #[derive(PartialEq, Debug)]
+    #[derive(Clone, PartialEq, Debug)]
     pub struct ProtFlags: core::ffi::c_int {
         /// Pages cannot be accessed.
         const PROT_NONE = 0;
@@ -3205,6 +3205,24 @@ pub mod arch {
     pub const PSR_DIT_BIT: u64 = 1 << 24;
     /// PSTATE bits a guest may keep when returning to EL0.
     pub const SAFE_USER_PSTATE: u64 = PSR_NZCV_MASK | PSR_SSBS_BIT | PSR_DIT_BIT;
+
+    /// The arm64 kernel's `pt_regs::syscallno` sentinel for "this context is not
+    /// in a syscall" (`NO_SYSCALL` in `arch/arm64/include/asm/ptrace.h`).
+    ///
+    /// Platforms write this on the exception and interrupt paths so the shim can
+    /// tell an in-flight syscall from one that never happened.
+    pub const NO_SYSCALL: i32 = -1;
+
+    /// Returns whether `base` is a valid AArch64 Linux user thread-pointer
+    /// (`TPIDR_EL0`) value: it must lie below the top of the user address space.
+    ///
+    /// Same rule as x86-64's `is_valid_user_fs_base`, but unlike `wrfsbase`,
+    /// where a non-canonical operand raises #GP, `MSR TPIDR_EL0` accepts any
+    /// value, so this is purely containment.
+    #[must_use]
+    pub fn is_valid_user_tls_base(base: usize) -> bool {
+        base < USER_ADDR_END
+    }
 }
 
 impl PtRegs {
@@ -3284,10 +3302,13 @@ impl PtRegs {
     /// If `idx` is greater than 5, this function will panic.
     #[cfg(target_arch = "aarch64")]
     pub fn syscall_arg(&self, idx: usize) -> usize {
-        if idx < 6 {
-            self.regs[idx]
-        } else {
-            panic!("Invalid syscall argument index: {idx}")
+        match idx {
+            // Not `regs[0]`: the arm64 kernel overwrites it with `-ENOSYS` on
+            // syscall entry and keeps the caller's `x0` in `orig_x0`, which is
+            // what `syscall_get_arguments` reads.
+            0 => self.orig_x0,
+            1..6 => self.regs[idx],
+            _ => panic!("Invalid syscall argument index: {idx}"),
         }
     }
 

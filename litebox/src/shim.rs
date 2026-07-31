@@ -118,7 +118,7 @@ pub struct ExceptionInfo {
 #[cfg(target_arch = "aarch64")]
 #[derive(Copy, Clone, Debug)]
 pub struct ExceptionInfo {
-    /// The aarch64 exception class from ESR_EL1[31:26].
+    /// The aarch64 exception class from `ESR_EL1[31:26]`.
     pub exception: Exception,
     /// The fault address (FAR_EL1).
     pub fault_address: usize,
@@ -148,7 +148,7 @@ impl Exception {
     pub const PAGE_FAULT: Self = Self(14);
 }
 
-/// An aarch64 exception class from ESR_EL1[31:26].
+/// An aarch64 exception class from `ESR_EL1[31:26]`.
 #[cfg(target_arch = "aarch64")]
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

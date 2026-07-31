@@ -522,6 +522,17 @@ pub trait SystemInfoProvider {
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
+
+    /// The byte offset from the host thread-pointer anchor at which this
+    /// platform keeps each thread's *guest* thread pointer.
+    ///
+    /// Which register anchors the thread pointer is a property of the host, not
+    /// of this trait; only the offset from it is reported here. Returns `None`
+    /// when the platform does not virtualize the guest thread pointer, which is
+    /// the default.
+    fn guest_thread_pointer_offset(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A provider for thread-local storage.
