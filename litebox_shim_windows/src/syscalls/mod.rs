@@ -454,7 +454,7 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtGetMUIRegistryInfo {
         flags: u32,
         data_size: Option<Platform::RawMutPointer<u32>>,
-        data: Option<Platform::RawMutPointer<nls::MuiRegistryData>>,
+        data: Option<Platform::RawMutPointer<u8>>,
     },
     NtGetNlsSectionPtr {
         section_type: u32,
