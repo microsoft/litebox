@@ -1062,7 +1062,11 @@ where
         let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
                 if let Some(socket) = &socket_handle.broker_socket {
-                    socket.connect(*addr, check_progress)
+                    if check_progress {
+                        socket.check_connect_progress()
+                    } else {
+                        socket.start_connect(*addr)
+                    }
                 } else {
                     let check_state = |state: tcp::State| -> Result<(), ConnectError> {
                         match state {

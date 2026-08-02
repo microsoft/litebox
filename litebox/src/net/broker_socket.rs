@@ -77,20 +77,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         Ok(socket)
     }
 
-    pub(super) fn connect(
-        &self,
-        address: SocketAddrV4,
-        check_progress: bool,
-    ) -> Result<(), ConnectError> {
-        if check_progress {
-            let response = self
-                .broker
-                .socket_status(self.handle)
-                .map_err(|error| ConnectError::Socket(socket_error_from_control(error.into())))?;
-            let status = response.status;
-            self.apply_status_response(response);
-            return self.update_connection_status(status, None);
-        }
+    pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
         let previous = self.state.lock().connection;
         let outcome = self
             .broker
@@ -112,6 +99,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         };
         let remote_address = (previous == SocketConnectionStatus::Unconnected).then_some(address);
         self.update_connection_status(status, remote_address)
+    }
+
+    pub(super) fn check_connect_progress(&self) -> Result<(), ConnectError> {
+        let response = self
+            .broker
+            .socket_status(self.handle)
+            .map_err(|error| ConnectError::Socket(socket_error_from_control(error.into())))?;
+        let status = response.status;
+        self.apply_status_response(response);
+        self.update_connection_status(status, None)
     }
 
     pub(super) fn remote_addr(&self) -> Result<SocketAddr, RemoteAddrError> {
