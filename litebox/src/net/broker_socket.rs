@@ -98,7 +98,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             }
         };
         let remote_address = (previous == SocketConnectionStatus::Unconnected).then_some(address);
-        self.update_connection_status(status, remote_address)
+        self.handle_connect_status(status, remote_address)
     }
 
     pub(super) fn check_connect_progress(&self) -> Result<(), ConnectError> {
@@ -108,7 +108,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             .map_err(|error| ConnectError::Socket(socket_error_from_control(error.into())))?;
         let status = response.status;
         self.apply_status_response(response);
-        self.update_connection_status(status, None)
+        self.handle_connect_status(status, None)
     }
 
     pub(super) fn remote_addr(&self) -> Result<SocketAddr, RemoteAddrError> {
@@ -300,7 +300,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         }
     }
 
-    fn update_connection_status(
+    fn handle_connect_status(
         &self,
         status: SocketConnectionStatus,
         remote_address: Option<SocketAddrV4>,
