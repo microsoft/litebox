@@ -112,7 +112,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn remote_addr(&self) -> Result<SocketAddr, RemoteAddrError> {
-        self.refresh_status(false);
+        self.refresh_connection_status(false);
         let state = self.state.lock();
         if state.connection != SocketConnectionStatus::Connected {
             return Err(RemoteAddrError::NotConnected);
@@ -124,7 +124,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn local_addr(&self) -> SocketAddr {
-        self.refresh_status(true);
+        self.refresh_connection_status(true);
         self.state.lock().local_address.map_or_else(
             || SocketAddr::V4(SocketAddrV4::new(core::net::Ipv4Addr::UNSPECIFIED, 0)),
             SocketAddr::V4,
@@ -171,7 +171,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn get_async_error(&self, clear: bool) -> Option<SocketAsyncError> {
-        self.refresh_status(true);
+        self.refresh_connection_status(true);
         let mut state = self.state.lock();
         let raw = state.async_error;
         if clear {
@@ -326,7 +326,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         }
     }
 
-    fn refresh_status(&self, include_connected: bool) {
+    fn refresh_connection_status(&self, include_connected: bool) {
         let connection = self.state.lock().connection;
         if connection != SocketConnectionStatus::Connecting
             && !(include_connected && connection == SocketConnectionStatus::Connected)
@@ -365,7 +365,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     fn consume_synchronous_error(&self) {
-        self.refresh_status(true);
+        self.refresh_connection_status(true);
         let mut state = self.state.lock();
         state.async_error = 0;
         let failed = matches!(state.connection, SocketConnectionStatus::Failed(_));
@@ -409,7 +409,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerTc
         if connection == SocketConnectionStatus::Connecting
             || events.intersects(Events::OUT | Events::ERR)
         {
-            self.refresh_status(events.contains(Events::ERR));
+            self.refresh_connection_status(events.contains(Events::ERR));
         }
         let state = self.state.lock();
         let connection = state.connection;
