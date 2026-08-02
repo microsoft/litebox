@@ -42,7 +42,6 @@ pub struct BrokerTcpSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     handle: ObjectHandle,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
-    connect_lock: Mutex<Platform, ()>,
     receive_lock: Mutex<Platform, ()>,
     state: Mutex<Platform, BrokerSocketState>,
     read_shutdown: AtomicBool,
@@ -62,7 +61,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             handle,
             pollable_registry,
             pollee: Arc::new(Pollee::new()),
-            connect_lock: Mutex::new(()),
             receive_lock: Mutex::new(()),
             state: Mutex::new(BrokerSocketState {
                 connection: SocketConnectionStatus::Unconnected,
@@ -84,7 +82,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         address: SocketAddrV4,
         check_progress: bool,
     ) -> Result<(), ConnectError> {
-        let _connect = self.connect_lock.lock();
         if check_progress {
             let response = self
                 .broker
