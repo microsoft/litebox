@@ -75,6 +75,13 @@ int main(int argc, char **argv) {
     assert(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &option, sizeof(option)) == 0);
     option = 30;
     assert(setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &option, sizeof(option)) == 0);
+    char congestion[16];
+    socklen_t congestion_length = sizeof(congestion);
+    assert(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, congestion,
+                      &congestion_length) == -1);
+    assert(errno == EOPNOTSUPP);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "none", 4) == -1);
+    assert(errno == EOPNOTSUPP);
     struct linger linger = {.l_onoff = 1, .l_linger = 0};
     assert(setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger)) == -1);
     assert(errno == EOPNOTSUPP);

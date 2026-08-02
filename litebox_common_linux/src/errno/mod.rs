@@ -544,6 +544,7 @@ impl From<litebox::net::errors::SetTcpOptionError> for Errno {
         match value {
             litebox::net::errors::SetTcpOptionError::InvalidFd => Errno::EBADF,
             litebox::net::errors::SetTcpOptionError::NotTcpSocket => Errno::ENOPROTOOPT,
+            litebox::net::errors::SetTcpOptionError::Unsupported => Errno::EOPNOTSUPP,
             _ => unimplemented!(),
         }
     }
@@ -554,6 +555,7 @@ impl From<litebox::net::errors::GetTcpOptionError> for Errno {
         match value {
             litebox::net::errors::GetTcpOptionError::InvalidFd => Errno::EBADF,
             litebox::net::errors::GetTcpOptionError::NotTcpSocket => Errno::ENOPROTOOPT,
+            litebox::net::errors::GetTcpOptionError::Unsupported => Errno::EOPNOTSUPP,
             _ => unimplemented!(),
         }
     }

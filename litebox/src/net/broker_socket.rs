@@ -17,7 +17,9 @@ use litebox_broker_protocol::socket::{
 
 use super::{
     ReceiveFlags,
-    errors::{ConnectError, RemoteAddrError, SocketAsyncError},
+    errors::{
+        ConnectError, GetTcpOptionError, RemoteAddrError, SetTcpOptionError, SocketAsyncError,
+    },
     socket_channel::{ChannelReadError, ChannelWriteError, SocketState},
 };
 use crate::{
@@ -35,7 +37,6 @@ struct BrokerSocketState {
     remote_address: Option<SocketAddrV4>,
     nodelay: bool,
     keep_alive: Option<core::time::Duration>,
-    congestion: super::CongestionControl,
     async_error: u32,
 }
 
@@ -73,7 +74,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 remote_address: None,
                 nodelay: false,
                 keep_alive: None,
-                congestion: super::CongestionControl::None,
                 async_error: 0,
             }),
             read_shutdown: AtomicBool::new(false),
@@ -167,27 +167,30 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         }
     }
 
-    pub(super) fn set_tcp_option(&self, option: super::TcpOptionData) {
+    pub(super) fn set_tcp_option(
+        &self,
+        option: super::TcpOptionData,
+    ) -> Result<(), SetTcpOptionError> {
         let mut state = self.state.lock();
         match option {
             super::TcpOptionData::NODELAY(nodelay) => state.nodelay = nodelay,
             super::TcpOptionData::KEEPALIVE(keep_alive) => state.keep_alive = keep_alive,
-            super::TcpOptionData::CONGESTION(congestion) => state.congestion = congestion,
+            super::TcpOptionData::CONGESTION(_) => return Err(SetTcpOptionError::Unsupported),
         }
+        Ok(())
     }
 
-    pub(super) fn get_tcp_option(&self, name: super::TcpOptionName) -> super::TcpOptionData {
+    pub(super) fn get_tcp_option(
+        &self,
+        name: super::TcpOptionName,
+    ) -> Result<super::TcpOptionData, GetTcpOptionError> {
         let state = self.state.lock();
         match name {
-            super::TcpOptionName::NODELAY => super::TcpOptionData::NODELAY(state.nodelay),
-            super::TcpOptionName::KEEPALIVE => super::TcpOptionData::KEEPALIVE(state.keep_alive),
-            super::TcpOptionName::CONGESTION => {
-                super::TcpOptionData::CONGESTION(match state.congestion {
-                    super::CongestionControl::None => super::CongestionControl::None,
-                    super::CongestionControl::Reno => super::CongestionControl::Reno,
-                    super::CongestionControl::Cubic => super::CongestionControl::Cubic,
-                })
+            super::TcpOptionName::NODELAY => Ok(super::TcpOptionData::NODELAY(state.nodelay)),
+            super::TcpOptionName::KEEPALIVE => {
+                Ok(super::TcpOptionData::KEEPALIVE(state.keep_alive))
             }
+            super::TcpOptionName::CONGESTION => Err(GetTcpOptionError::Unsupported),
         }
     }
 
