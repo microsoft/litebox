@@ -401,6 +401,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         fd,
                         &mut buf.borrow_mut(),
                         litebox_common_linux::ReceiveFlags::empty(),
+                        super::net::ReceiveContext::new(None, false),
                         None,
                     )
                 },

@@ -634,6 +634,34 @@ where
             .collect()
     }
 
+    /// Returns whether every byte in `range` is mapped with `required` permissions.
+    pub fn range_has_permissions(
+        &self,
+        range: Range<usize>,
+        required: MemoryRegionPermissions,
+    ) -> bool {
+        if range.start > range.end {
+            return false;
+        }
+        if range.is_empty() {
+            return true;
+        }
+        let vmem = self.vmem.read();
+        let mut covered_until = range.start;
+        for (mapped, area) in vmem.overlapping(range.clone()) {
+            if mapped.start > covered_until
+                || !MemoryRegionPermissions::from(area.flags()).contains(required)
+            {
+                return false;
+            }
+            covered_until = covered_until.max(mapped.end);
+            if covered_until >= range.end {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get the memory permissions of a given address range.
     ///
     /// `ptr` specifies the start address of the memory range.

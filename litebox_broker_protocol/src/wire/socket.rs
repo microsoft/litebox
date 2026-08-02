@@ -77,6 +77,8 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
             encoder.handle(request.handle);
             encode_shared_buffer_descriptor(encoder, request.buffer);
             encoder.u32(request.flags.0);
+            encoder.u32(request.peek_offset);
+            encoder.u32(request.peek_length);
         }
         SocketRequest::Shutdown(request) => {
             encoder.u8(SOCKET_REQUEST_TAG_SHUTDOWN);
@@ -123,6 +125,8 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
             handle: decoder.handle()?,
             buffer: decode_shared_buffer_descriptor(decoder)?,
             flags: ReceiveFlags(decoder.u32()?),
+            peek_offset: decoder.u32()?,
+            peek_length: decoder.u32()?,
         })),
         SOCKET_REQUEST_TAG_SHUTDOWN => Ok(SocketRequest::Shutdown(ShutdownSocketRequest {
             handle: decoder.handle()?,

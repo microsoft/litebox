@@ -38,8 +38,8 @@ use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
 use litebox_broker_protocol::socket::{
-    ConnectSocketResponse, CreateSocketResponse, MAX_SOCKET_TRANSFER_SIZE, ReceiveSocketResponse,
-    SendSocketResponse, SocketOutcome,
+    ConnectSocketResponse, CreateSocketResponse, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE,
+    ReceiveFlags, ReceiveSocketResponse, SendSocketResponse, SocketOutcome,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -399,8 +399,20 @@ fn handle_socket_request<Memory: SharedMemory>(
             }
         }
         SocketRequest::Receive(request) => {
+            let peek = request.flags.contains(ReceiveFlags::PEEK);
+            let peek_end = request.peek_offset.checked_add(request.buffer.length);
+            let canonical_peek_length = request
+                .peek_length
+                .checked_sub(request.peek_offset)
+                .map(|remaining| remaining.min(MAX_SOCKET_TRANSFER_SIZE));
             if request.flags.has_unsupported_bits()
                 || request.buffer.length > MAX_SOCKET_TRANSFER_SIZE
+                || (!peek && (request.peek_offset != 0 || request.peek_length != 0))
+                || (peek
+                    && (!request.peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE)
+                        || canonical_peek_length != Some(request.buffer.length)
+                        || peek_end.is_none_or(|end| request.peek_length < end)
+                        || request.peek_length > MAX_SOCKET_PEEK_SIZE))
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
@@ -415,6 +427,8 @@ fn handle_socket_request<Memory: SharedMemory>(
                 request.handle,
                 &mut data,
                 request.flags,
+                request.peek_offset,
+                request.peek_length,
             )
             .map_err(RequestFailure::from)?
             {
@@ -628,6 +642,8 @@ mod tests {
             &self,
             data: &mut [u8],
             _flags: ReceiveFlags,
+            _peek_offset: u32,
+            _peek_length: u32,
         ) -> litebox_broker_core::Result<SocketOutcome<ReceiveSocketResponse>> {
             let received = data.len().min(3);
             data[..received].copy_from_slice(&[4, 5, 6][..received]);
@@ -1153,6 +1169,8 @@ mod tests {
                     handle: response.handle,
                     buffer: descriptor(4, 4),
                     flags: ReceiveFlags::PEEK,
+                    peek_offset: 0,
+                    peek_length: 4,
                 })),
                 &shared_buffers,
             ),
@@ -1194,7 +1212,24 @@ mod tests {
                 BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
                     handle: response.handle,
                     buffer: descriptor(2, 0),
-                    flags: ReceiveFlags(ReceiveFlags::SUPPORTED.0 | 2),
+                    flags: ReceiveFlags(ReceiveFlags::SUPPORTED.0 | (1 << 31)),
+                    peek_offset: 0,
+                    peek_length: 0,
+                })),
+                &shared_buffers,
+                &test_readiness_sink(),
+            )),
+            Err(ErrorCode::MalformedRequest)
+        );
+        assert_eq!(
+            complete_request(handle_request(
+                &session,
+                BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+                    handle: response.handle,
+                    buffer: descriptor(2, 1),
+                    flags: ReceiveFlags::PEEK,
+                    peek_offset: 1,
+                    peek_length: 2,
                 })),
                 &shared_buffers,
                 &test_readiness_sink(),

@@ -12,14 +12,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 enum {
     REQUEST_SIZE = 65536,
-    RESPONSE_SIZE = 40000,
+    RESPONSE_SIZE = 600000,
+    PEEK_SIZE = 35000,
     BACKPRESSURE_SIZE = 8 * 1024 * 1024,
+    FAULT_PREFIX_SIZE = 512 * 1024,
+    FAULT_SUFFIX_SIZE = 4096,
 };
 
 int main(int argc, char **argv) {
@@ -112,12 +116,18 @@ int main(int argc, char **argv) {
         assert(discarded[i] == 0xff);
     }
 
-    size_t received = 0;
-    while (received != sizeof(response)) {
-        ssize_t count = recv(fd, response + received, sizeof(response) - received, 0);
-        assert(count > 0);
-        received += (size_t)count;
+    struct iovec response_iov = {.iov_base = response, .iov_len = PEEK_SIZE};
+    struct msghdr response_message = {
+        .msg_iov = &response_iov,
+        .msg_iovlen = 1,
+    };
+    ssize_t peeked = recvmsg(fd, &response_message, MSG_PEEK | MSG_WAITALL);
+    assert(peeked == PEEK_SIZE);
+    for (ssize_t i = 0; i < peeked; ++i) {
+        assert(response[i] == 0xa5);
     }
+    memset(response, 0, sizeof(response));
+    assert(recv(fd, response, sizeof(response), MSG_WAITALL) == sizeof(response));
     for (size_t i = 0; i < sizeof(response); ++i) {
         assert(response[i] == 0xa5);
     }
@@ -188,6 +198,62 @@ int main(int argc, char **argv) {
     reset_poll.revents = 0;
     assert(poll(&reset_poll, 1, 0) >= 0);
     assert((reset_poll.revents & POLLERR) == 0);
+    assert(close(fd) == 0);
+
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    assert(fd >= 0);
+    assert(connect(fd, (const struct sockaddr *)&address, sizeof(address)) == 0);
+    unsigned char partial_reset[2];
+    assert(recv(fd, partial_reset, sizeof(partial_reset), MSG_WAITALL) == 1);
+    assert(partial_reset[0] == 0x7e);
+    assert(recv(fd, partial_reset, sizeof(partial_reset), 0) == -1);
+    assert(errno == ECONNRESET);
+    assert(close(fd) == 0);
+
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    assert(fd >= 0);
+    assert(connect(fd, (const struct sockaddr *)&address, sizeof(address)) == 0);
+    size_t fault_receive_size = FAULT_PREFIX_SIZE + FAULT_SUFFIX_SIZE;
+    unsigned char *fault_receive =
+        mmap(NULL, fault_receive_size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(fault_receive != MAP_FAILED);
+    assert(mprotect(fault_receive + FAULT_PREFIX_SIZE, FAULT_SUFFIX_SIZE,
+                    PROT_NONE) == 0);
+    struct iovec fault_iov = {
+        .iov_base = fault_receive,
+        .iov_len = fault_receive_size,
+    };
+    unsigned char fault_control;
+    struct msghdr fault_message = {
+        .msg_iov = &fault_iov,
+        .msg_iovlen = 1,
+        .msg_control = &fault_control,
+        .msg_controllen = sizeof(fault_control),
+        .msg_flags = MSG_TRUNC,
+    };
+    assert(recvmsg(fd, &fault_message, MSG_WAITALL) ==
+           FAULT_PREFIX_SIZE);
+    assert(fault_message.msg_controllen == 0);
+    assert(fault_message.msg_flags == 0);
+    assert(mprotect(fault_receive + FAULT_PREFIX_SIZE, FAULT_SUFFIX_SIZE,
+                    PROT_READ | PROT_WRITE) == 0);
+    assert(recv(fd, fault_receive + FAULT_PREFIX_SIZE, FAULT_SUFFIX_SIZE,
+                MSG_WAITALL) == FAULT_SUFFIX_SIZE);
+    for (size_t i = 0; i < fault_receive_size; ++i) {
+        assert(fault_receive[i] == 0x6d);
+    }
+    assert(munmap(fault_receive, fault_receive_size) == 0);
+    assert(close(fd) == 0);
+
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    assert(fd >= 0);
+    timeout.tv_usec = 100000;
+    assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    unsigned char unconnected_byte;
+    assert(recv(fd, &unconnected_byte, sizeof(unconnected_byte),
+                MSG_PEEK | MSG_WAITALL) == -1);
+    assert(errno == ENOTCONN);
     assert(close(fd) == 0);
 
     fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);

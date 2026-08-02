@@ -9,9 +9,9 @@ use core::{
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::socket::{
-    Ipv4Address, MAX_SOCKET_TRANSFER_SIZE, Port, ReceiveFlags as BrokerReceiveFlags,
-    ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
-    SocketAddressV4 as BrokerSocketAddressV4, SocketConnectionStatus,
+    Ipv4Address, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, Port,
+    ReceiveFlags as BrokerReceiveFlags, ReceiveSocketResponse, SendFlags as BrokerSendFlags,
+    ShutdownMode, SocketAddressV4 as BrokerSocketAddressV4, SocketConnectionStatus,
     SocketError as BrokerSocketError, SocketOutcome, SocketStatusResponse,
 };
 
@@ -26,6 +26,8 @@ use crate::{
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
+
+const _: () = assert!(MAX_SOCKET_PEEK_SIZE as usize == super::SOCKET_RECEIVE_OPERATION_SIZE);
 
 struct BrokerSocketState {
     connection: SocketConnectionStatus,
@@ -44,6 +46,7 @@ pub struct BrokerTcpSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
     connect_lock: Mutex<Platform, ()>,
+    receive_lock: Mutex<Platform, ()>,
     state: Mutex<Platform, BrokerSocketState>,
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
@@ -63,6 +66,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             pollable_registry,
             pollee: Arc::new(Pollee::new()),
             connect_lock: Mutex::new(()),
+            receive_lock: Mutex::new(()),
             state: Mutex::new(BrokerSocketState {
                 connection: SocketConnectionStatus::Unconnected,
                 local_address: None,
@@ -233,41 +237,79 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if buffer.is_empty() {
             return Ok(0);
         }
-        let length = buffer.len().min(MAX_SOCKET_TRANSFER_SIZE as usize);
+        let _receive = self.receive_lock.lock();
         let discard = flags.contains(ReceiveFlags::DISCARD);
-        let flags = if flags.contains(ReceiveFlags::PEEK) {
-            BrokerReceiveFlags::PEEK
+        let mut broker_flags = BrokerReceiveFlags::NONE;
+        let peek = flags.contains(ReceiveFlags::PEEK);
+        let wait_all = flags.contains(ReceiveFlags::WAITALL);
+        if peek {
+            broker_flags.0 |= BrokerReceiveFlags::PEEK.0;
+        }
+        if wait_all {
+            broker_flags.0 |= BrokerReceiveFlags::WAITALL.0;
+        }
+        let target = if peek {
+            buffer.len().min(MAX_SOCKET_PEEK_SIZE as usize)
         } else {
-            BrokerReceiveFlags::NONE
+            buffer.len().min(MAX_SOCKET_TRANSFER_SIZE as usize)
         };
-        let outcome =
-            match self
-                .broker
-                .receive_socket(self.handle, &mut buffer[..length], flags, discard)
-            {
+        let mut offset = 0;
+        loop {
+            let length = (target - offset).min(MAX_SOCKET_TRANSFER_SIZE as usize);
+            let outcome = match self.broker.receive_socket(
+                self.handle,
+                &mut buffer[offset..offset + length],
+                broker_flags,
+                u32::try_from(offset)
+                    .map_err(|_| ChannelReadError::Socket(SocketAsyncError::Other))?,
+                if peek {
+                    u32::try_from(target)
+                        .map_err(|_| ChannelReadError::Socket(SocketAsyncError::Other))?
+                } else {
+                    0
+                },
+                discard,
+            ) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     let error = BrokerObjectError::from(error);
                     if error == BrokerObjectError::WouldBlock {
-                        return Ok(0);
+                        if offset != 0 {
+                            return Ok(offset);
+                        }
+                        return Err(ChannelReadError::WouldBlock);
                     }
                     return Err(read_error_from_control(error));
                 }
             };
-        match outcome {
-            SocketOutcome::Completed(ReceiveSocketResponse::Received(received)) => {
-                let received = usize::try_from(received)
-                    .map_err(|_| ChannelReadError::Socket(SocketAsyncError::Other))?;
-                Ok(received)
-            }
-            SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream) => {
-                Err(ChannelReadError::ConnectionClosed)
-            }
-            SocketOutcome::Completed(_) => Err(ChannelReadError::Socket(SocketAsyncError::Other)),
-            SocketOutcome::Failed(error) => {
-                let error = socket_error(error);
-                self.consume_synchronous_error();
-                Err(ChannelReadError::Socket(error))
+            match outcome {
+                SocketOutcome::Completed(ReceiveSocketResponse::Received(received)) => {
+                    let received = usize::try_from(received)
+                        .map_err(|_| ChannelReadError::Socket(SocketAsyncError::Other))?;
+                    offset += received;
+                    if !peek || received < length || offset == target {
+                        return Ok(offset);
+                    }
+                }
+                SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream) => {
+                    return if offset == 0 {
+                        Err(ChannelReadError::ConnectionClosed)
+                    } else {
+                        Ok(offset)
+                    };
+                }
+                SocketOutcome::Completed(_) => {
+                    return Err(ChannelReadError::Socket(SocketAsyncError::Other));
+                }
+                SocketOutcome::Failed(error) => {
+                    let error = socket_error(error);
+                    self.consume_synchronous_error();
+                    if offset != 0 {
+                        self.set_async_error(error);
+                        return Ok(offset);
+                    }
+                    return Err(ChannelReadError::Socket(error));
+                }
             }
         }
     }

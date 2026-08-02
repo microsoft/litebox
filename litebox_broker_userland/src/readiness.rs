@@ -76,6 +76,17 @@ impl ReadinessPublisherRuntime {
         Ok(())
     }
 
+    fn republish(
+        &self,
+        handle: ObjectHandle,
+        readiness: ReadinessFlags,
+    ) -> Result<(), ReadinessPublishError> {
+        if self.publisher.republish(handle, readiness)? == PublishOutcome::Queued {
+            self.signal();
+        }
+        Ok(())
+    }
+
     /// Drops readiness state for an object whose backend resource is retired.
     pub fn retire(&self, handle: ObjectHandle) {
         self.publisher.retire(handle);
@@ -157,6 +168,10 @@ impl ReadinessSink for ReadinessPublisherRuntime {
 
     fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
         Self::publish(self, handle, readiness).map_err(|_| BrokerError::ResourceExhausted)
+    }
+
+    fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
+        Self::republish(self, handle, readiness).map_err(|_| BrokerError::ResourceExhausted)
     }
 
     fn retire(&self, handle: ObjectHandle) {

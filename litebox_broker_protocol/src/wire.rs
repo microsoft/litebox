@@ -52,7 +52,7 @@ const RESPONSE_TAG_SOCKET: u8 = 8;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 30;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 38;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -449,6 +449,8 @@ mod tests {
                     length: 3,
                 },
                 flags: ReceiveFlags::PEEK,
+                peek_offset: 2,
+                peek_length: 5,
             })),
             BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
                 handle,
@@ -507,6 +509,8 @@ mod tests {
                 handle,
                 buffer,
                 flags: ReceiveFlags(unsupported),
+                peek_offset: 0,
+                peek_length: 0,
             })),
         ] {
             let request = BrokerRequest {

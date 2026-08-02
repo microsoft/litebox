@@ -204,13 +204,35 @@ impl ReadinessPublisher {
         handle: ObjectHandle,
         readiness: ReadinessFlags,
     ) -> Result<PublishOutcome, ReadinessPublishError> {
+        self.record(handle, readiness, false)
+    }
+
+    /// Queues the current readiness even when its flags have not changed.
+    ///
+    /// This is used for conditions such as a stream's readable byte count:
+    /// additional bytes can satisfy a waiter without changing level-triggered
+    /// readiness.
+    pub fn republish(
+        &self,
+        handle: ObjectHandle,
+        readiness: ReadinessFlags,
+    ) -> Result<PublishOutcome, ReadinessPublishError> {
+        self.record(handle, readiness, true)
+    }
+
+    fn record(
+        &self,
+        handle: ObjectHandle,
+        readiness: ReadinessFlags,
+        force: bool,
+    ) -> Result<PublishOutcome, ReadinessPublishError> {
         let mut state = self.state.lock();
         if state.closed {
             return Ok(PublishOutcome::Closed);
         }
         let generation = state.next_generation;
         if let Some(entry) = state.entries.get_mut(&handle) {
-            if entry.readiness == readiness {
+            if entry.readiness == readiness && !force {
                 // Either the local endpoint already knows this value or a
                 // claim carrying it is queued or in flight.
                 return Ok(PublishOutcome::Coalesced);
@@ -395,6 +417,25 @@ mod tests {
         );
 
         assert!(publisher.take_pending().is_none());
+    }
+
+    #[test]
+    fn republishing_known_readiness_queues_a_wakeup() {
+        let publisher = ReadinessPublisher::new();
+        publish(&publisher, HANDLE, ReadinessFlags::READ);
+        drain(&publisher);
+
+        assert_eq!(
+            publisher.republish(HANDLE, ReadinessFlags::READ).unwrap(),
+            PublishOutcome::Queued
+        );
+        assert_eq!(
+            drain(&publisher),
+            [ReadinessNotification {
+                handle: HANDLE,
+                readiness: ReadinessFlags::READ,
+            }]
+        );
     }
 
     #[test]

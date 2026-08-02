@@ -64,6 +64,8 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         data: &mut [u8],
         flags: BrokerReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
         discard: bool,
     ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError>;
 
@@ -297,6 +299,8 @@ where
         handle: ObjectHandle,
         data: &mut [u8],
         flags: BrokerReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
         discard: bool,
     ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError> {
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
@@ -306,7 +310,17 @@ where
             .expect("validated shared socket transfer length must fit in u32");
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| {
-            local.receive_socket(handle, lease.descriptor(), data, flags, !discard)
+            local.receive_socket(
+                litebox_broker_protocol::socket::ReceiveSocketRequest {
+                    handle,
+                    buffer: lease.descriptor(),
+                    flags,
+                    peek_offset,
+                    peek_length,
+                },
+                data,
+                !discard,
+            )
         })
         .map(|result| match result {
             Ok(received) => SocketOutcome::Completed(received),

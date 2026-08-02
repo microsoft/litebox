@@ -15,6 +15,8 @@ use thiserror::Error;
 
 /// Maximum socket bytes transferred by one broker request.
 pub const MAX_SOCKET_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE;
+/// Maximum stream prefix addressable by offset-based peek requests.
+pub const MAX_SOCKET_PEEK_SIZE: u32 = 0x80_000;
 
 /// Address family of a broker socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,9 +121,11 @@ impl ReceiveFlags {
     pub const NONE: Self = Self(0);
     /// Return data without consuming it.
     pub const PEEK: Self = Self(1 << 0);
+    /// Wait for the requested amount of peeked data when the operation may block.
+    pub const WAITALL: Self = Self(1 << 1);
 
     /// Every receive flag this protocol version defines.
-    pub const SUPPORTED: Self = Self(Self::PEEK.0);
+    pub const SUPPORTED: Self = Self(Self::PEEK.0 | Self::WAITALL.0);
 
     /// Returns whether any bit outside [`Self::SUPPORTED`] is set.
     #[must_use]
@@ -316,6 +320,10 @@ pub struct ReceiveSocketRequest {
     pub buffer: SharedBufferDescriptor,
     /// Receive flags.
     pub flags: ReceiveFlags,
+    /// Byte offset from the start of the stream for a peek request.
+    pub peek_offset: u32,
+    /// Total stream prefix covered by this logical peek.
+    pub peek_length: u32,
 }
 
 /// Response to a socket receive request.

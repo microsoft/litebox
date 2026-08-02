@@ -136,6 +136,8 @@ pub enum SocketState {
 pub enum ChannelReadError {
     /// The local read side has been shut down.
     ReadShutdown,
+    /// No data is currently available.
+    WouldBlock,
     /// The stream has not reached a connected state.
     NotConnected,
     /// The stream is closed.
@@ -343,6 +345,8 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     write_shutdown: AtomicBool,
     /// Bytes available in RX buffer (for quick poll checks)
     rx_available: AtomicUsize,
+    /// The peer closed its write side.
+    peer_eof: AtomicBool,
     /// Space available in TX buffer (for quick poll checks)
     tx_available: AtomicUsize,
 
@@ -372,6 +376,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
+            peer_eof: AtomicBool::new(false),
             tx_available: AtomicUsize::new(tx_capacity),
 
             socket_error: SocketAsyncErrorState::new(),
@@ -400,10 +405,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Default for StreamSocke
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Platform> {
     /// Create a new stream socket channel with default buffer sizes.
     ///
-    /// The channel is created with default buffer sizes [`super::SOCKET_BUFFER_SIZE`] for both
-    /// RX and TX buffers.
+    /// The receive side can stage one maximum-size receive operation, while
+    /// the transmit side uses [`super::SOCKET_BUFFER_SIZE`].
     pub fn new() -> Self {
-        Self::new_with_capacity(super::SOCKET_BUFFER_SIZE, super::SOCKET_BUFFER_SIZE)
+        Self::new_with_capacity(
+            super::SOCKET_RECEIVE_OPERATION_SIZE,
+            super::SOCKET_BUFFER_SIZE,
+        )
     }
 
     /// Create a new stream socket channel with specified buffer capacities.
@@ -431,16 +439,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         if self.inner.read_shutdown.load(Ordering::Acquire) {
             return Err(ChannelReadError::ReadShutdown);
         }
+        if buf.is_empty() {
+            if let Some(source_addr) = source_addr {
+                *source_addr = None;
+            }
+            return Ok(0);
+        }
 
         let mut rx_cons = self.inner.rx_cons.lock();
-        let n = if flags.contains(super::ReceiveFlags::DISCARD) {
-            rx_cons.clear()
+        let (n, consumed) = if flags.contains(super::ReceiveFlags::PEEK) {
+            (rx_cons.peek_slice(buf), false)
+        } else if flags.contains(super::ReceiveFlags::DISCARD) {
+            (rx_cons.skip(buf.len()), true)
         } else if flags.contains(super::ReceiveFlags::TRUNC) {
             let n1 = rx_cons.pop_slice(buf);
             let n2 = rx_cons.clear();
-            n1 + n2
+            (n1 + n2, true)
         } else {
-            rx_cons.pop_slice(buf)
+            (rx_cons.pop_slice(buf), true)
         };
 
         if let Some(source_addr) = source_addr {
@@ -449,13 +465,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         }
 
         // Update available count
-        self.inner.rx_available.fetch_sub(n, Ordering::Release);
+        if consumed {
+            self.inner.rx_available.fetch_sub(n, Ordering::Release);
+        }
 
         if n > 0 {
             return Ok(n);
         }
         match self.inner.state() {
-            SocketState::Connected => Ok(0),
+            SocketState::Connected if self.inner.peer_eof.load(Ordering::Acquire) => {
+                Err(ChannelReadError::ConnectionClosed)
+            }
+            SocketState::Connected => Err(ChannelReadError::WouldBlock),
             SocketState::Closed | SocketState::Error => Err(ChannelReadError::ConnectionClosed),
             _ => Err(ChannelReadError::NotConnected),
         }
@@ -521,6 +542,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
 
         if self.is_readable() {
             events |= Events::IN;
+        }
+        if self.inner.peer_eof.load(Ordering::Acquire) {
+            events |= Events::IN | Events::RDHUP;
         }
 
         match self.inner.state() {
@@ -696,6 +720,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         }
     }
 
+    /// Record that the peer closed its write side.
+    pub(super) fn set_peer_eof(&self) {
+        if !self.inner.peer_eof.swap(true, Ordering::AcqRel) {
+            self.inner
+                .pollee
+                .notify_observers(Events::IN | Events::RDHUP);
+        }
+    }
+
     /// Get the current socket state.
     pub(super) fn state(&self) -> SocketState {
         self.inner.state()
@@ -837,6 +870,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     ) -> Result<usize, ChannelReadError> {
         let mut rx_cons = self.inner.rx_cons.lock();
 
+        if flags.contains(ReceiveFlags::PEEK) {
+            let (first, second) = rx_cons.as_slices();
+            let Some(msg) = first.first().or_else(|| second.first()) else {
+                return Err(ChannelReadError::WouldBlock);
+            };
+            if let Some(source_addr) = source_addr {
+                *source_addr = msg.addr;
+            }
+            if !flags.contains(ReceiveFlags::DISCARD) {
+                let to_copy = core::cmp::min(buf.len(), msg.data.len());
+                buf[..to_copy].copy_from_slice(&msg.data[..to_copy]);
+            }
+            return Ok(msg.data.len());
+        }
+
         if let Some(msg) = rx_cons.try_pop() {
             let DatagramMessage { data, addr } = msg;
             if let Some(source_addr) = source_addr {
@@ -849,7 +897,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
             self.inner.rx_count.fetch_sub(1, Ordering::Release);
             Ok(data.len())
         } else {
-            Ok(0)
+            Err(ChannelReadError::WouldBlock)
         }
     }
 
@@ -1095,6 +1143,19 @@ mod tests {
     }
 
     #[test]
+    fn stream_channel_empty_read_returns_immediately() {
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
+        channel.set_state(SocketState::Connected);
+
+        assert_eq!(
+            channel
+                .try_read(&mut [], super::super::ReceiveFlags::empty(), None)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn stream_channel_write_and_pop_tx() {
         let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
         channel.set_state(SocketState::Connected);
@@ -1176,6 +1237,34 @@ mod tests {
 
         let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
         assert!(matches!(result, Err(ChannelReadError::ConnectionClosed)));
+    }
+
+    #[test]
+    fn stream_channel_peer_eof_drains_rx_and_reports_rdhup() {
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
+        channel.set_state(SocketState::Connected);
+        channel.push_rx_data_with(|buf| {
+            buf[..4].copy_from_slice(b"data");
+            4
+        });
+        channel.set_peer_eof();
+
+        let events = channel.check_io_events();
+        assert!(events.contains(Events::IN));
+        assert!(events.contains(Events::RDHUP));
+
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            channel
+                .try_read(&mut buf, super::super::ReceiveFlags::empty(), None)
+                .unwrap(),
+            4
+        );
+        assert_eq!(&buf, b"data");
+        assert!(matches!(
+            channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None),
+            Err(ChannelReadError::ConnectionClosed)
+        ));
     }
 
     #[test]
@@ -1356,13 +1445,70 @@ mod tests {
     }
 
     #[test]
+    fn datagram_channel_peek_preserves_the_message() {
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
+        channel
+            .try_recv_datagram_with(|| Some((Box::from(*b"peek"), DUMMY_ADDR)))
+            .unwrap();
+
+        let mut buf = [0u8; 4];
+        let mut source = None;
+        assert_eq!(
+            channel
+                .try_read(
+                    &mut buf,
+                    super::super::ReceiveFlags::PEEK,
+                    Some(&mut source),
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(&buf, b"peek");
+        assert_eq!(source, Some(DUMMY_ADDR));
+        assert!(channel.is_readable());
+        assert_eq!(
+            channel
+                .try_read(&mut buf, super::super::ReceiveFlags::empty(), None)
+                .unwrap(),
+            4
+        );
+        assert!(!channel.is_readable());
+    }
+
+    #[test]
+    fn datagram_channel_peek_preserves_an_empty_message() {
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
+        channel
+            .try_recv_datagram_with(|| {
+                Some((alloc::vec::Vec::new().into_boxed_slice(), DUMMY_ADDR))
+            })
+            .unwrap();
+
+        let mut buf = [];
+        assert_eq!(
+            channel
+                .try_read(&mut buf, super::super::ReceiveFlags::PEEK, None,)
+                .unwrap(),
+            0
+        );
+        assert!(channel.is_readable());
+        assert_eq!(
+            channel
+                .try_read(&mut buf, super::super::ReceiveFlags::empty(), None)
+                .unwrap(),
+            0
+        );
+        assert!(!channel.is_readable());
+    }
+
+    #[test]
     fn datagram_channel_read_empty() {
         let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
 
         // Try to read when empty
         let mut buf = [0u8; 64];
         let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
-        assert!(matches!(result, Ok(0)));
+        assert!(matches!(result, Err(ChannelReadError::WouldBlock)));
     }
 
     #[test]

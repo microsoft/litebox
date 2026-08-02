@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use litebox::fs::nine_p::transport;
-use litebox::net::socket_channel::{ChannelWriteError, NetworkProxy};
+use litebox::net::socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy};
 use litebox::net::{ReceiveFlags, SendFlags};
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
@@ -105,7 +105,7 @@ impl<Platform: ShimPlatform> transport::Read for ShimTransport<Platform> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
         loop {
             match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
-                Ok(0) => {
+                Err(ChannelReadError::WouldBlock) => {
                     // No data yet — spin until something arrives.
                     core::hint::spin_loop();
                 }

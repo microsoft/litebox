@@ -18,12 +18,13 @@ use litebox::{
         wait::{WaitContext, WaitError},
     },
     fs::OFlags,
+    mm::linux::PAGE_SIZE,
     net::{
-        CloseBehavior, TcpOptionData,
+        CloseBehavior, SOCKET_RECEIVE_OPERATION_SIZE, TcpOptionData,
         errors::AcceptError,
         socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy, SocketState},
     },
-    platform::Instant as _,
+    platform::{Instant as _, page_mgmt::MemoryRegionPermissions},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
@@ -61,6 +62,20 @@ fn socket_io_errno(error: TryOpError<Errno>) -> Errno {
     match error {
         TryOpError::WaitError(WaitError::TimedOut) => Errno::EAGAIN,
         error => error.into(),
+    }
+}
+
+pub(crate) struct ReceiveContext<Instant> {
+    deadline: Option<Instant>,
+    has_prior_progress: bool,
+}
+
+impl<Instant> ReceiveContext<Instant> {
+    pub(crate) fn new(deadline: Option<Instant>, has_prior_progress: bool) -> Self {
+        Self {
+            deadline,
+            has_prior_progress,
+        }
     }
 }
 
@@ -827,11 +842,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         fd: &SocketFd<Platform>,
         buf: &mut [u8],
         flags: ReceiveFlags,
+        context: ReceiveContext<Platform::Instant>,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
-        let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
+        let timeout = context
+            .deadline
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(&self.platform.now())
+                    .unwrap_or(core::time::Duration::ZERO)
+            })
+            .or_else(|| self.with_socket_options(fd, |opt| opt.recv_timeout));
         let is_nonblock = self.get_status(fd).contains(OFlags::NONBLOCK)
             || flags.contains(ReceiveFlags::DONTWAIT);
+        let socket_type = self.get_socket_type(fd)?;
+        let peek = flags.contains(ReceiveFlags::PEEK);
+        let wait_all = flags.contains(ReceiveFlags::WAITALL)
+            && matches!(socket_type, SockType::Stream)
+            && !is_nonblock;
         if buf.is_empty()
             && matches!(
                 self.get_proxy(fd)?.as_ref(),
@@ -851,9 +879,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             PEEK,
             WAITALL,
         );
+        new_flags.set(litebox::net::ReceiveFlags::WAITALL, wait_all);
         // `MSG_TRUNC` behavior depends on the socket type
         if flags.contains(ReceiveFlags::TRUNC) {
-            match self.get_socket_type(fd)? {
+            match socket_type {
                 SockType::Datagram | SockType::Raw => {
                     new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
                 }
@@ -865,27 +894,92 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         }
 
         let proxy = self.get_proxy(fd)?;
-        cx.with_timeout(timeout)
-            .wait_on_events(
-                is_nonblock,
-                Events::IN,
-                |observer, filter| {
-                    proxy.register_observer(observer, filter);
-                    Ok(())
-                },
-                || match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
-                    Ok(0) => Err(TryOpError::TryAgain),
-                    Ok(n) => Ok(n),
+        let target_len = buf.len();
+        let mut received = 0;
+        let result = cx.with_timeout(timeout).wait_on_events(
+            is_nonblock,
+            Events::IN,
+            |observer, filter| {
+                proxy.register_observer(observer, filter);
+                Ok(())
+            },
+            || loop {
+                let destination = if wait_all && !peek {
+                    &mut buf[received..target_len]
+                } else {
+                    &mut buf[..target_len]
+                };
+                match proxy.try_read(destination, new_flags, source_addr.as_deref_mut()) {
+                    Ok(n) if !wait_all => return Ok(n),
+                    Ok(n) if peek => {
+                        received = n;
+                        if received == target_len
+                            || proxy
+                                .check_io_events()
+                                .intersects(Events::ERR | Events::HUP | Events::RDHUP)
+                        {
+                            return Ok(received);
+                        }
+                        return Err(TryOpError::TryAgain);
+                    }
+                    Ok(n) => {
+                        received += n;
+                        if received == target_len {
+                            return Ok(received);
+                        }
+                    }
+                    Err(ChannelReadError::ReadShutdown) => return Ok(received),
+                    Err(ChannelReadError::WouldBlock) => return Err(TryOpError::TryAgain),
+                    Err(ChannelReadError::ConnectionClosed) => {
+                        if received != 0 || context.has_prior_progress {
+                            return Ok(received);
+                        }
+                        return match proxy.get_async_error(true) {
+                            Some(err) => Err(TryOpError::Other(err.into())),
+                            None => Ok(0),
+                        };
+                    }
+                    Err(ChannelReadError::NotConnected)
+                        if received != 0 || context.has_prior_progress =>
+                    {
+                        return Ok(received);
+                    }
+                    Err(ChannelReadError::Socket(error))
+                        if received != 0 || context.has_prior_progress =>
+                    {
+                        proxy.set_async_error(error);
+                        return Ok(received);
+                    }
+                    Err(ChannelReadError::NotConnected) => {
+                        return Err(TryOpError::Other(Errno::ENOTCONN));
+                    }
+                    Err(ChannelReadError::Socket(error)) => {
+                        return Err(TryOpError::Other(error.into()));
+                    }
+                }
+            },
+        );
+        match result {
+            Ok(received) => Ok(received),
+            Err(TryOpError::WaitError(_)) if received != 0 || context.has_prior_progress => {
+                Ok(received)
+            }
+            Err(error @ TryOpError::WaitError(_)) if wait_all && peek => {
+                new_flags.remove(litebox::net::ReceiveFlags::WAITALL);
+                match proxy.try_read(&mut buf[..target_len], new_flags, source_addr) {
+                    Ok(received) => Ok(received),
                     Err(ChannelReadError::ReadShutdown) => Ok(0),
                     Err(ChannelReadError::ConnectionClosed) => match proxy.get_async_error(true) {
-                        Some(err) => Err(TryOpError::Other(err.into())),
+                        Some(error) => Err(error.into()),
                         None => Ok(0),
                     },
-                    Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
-                    Err(ChannelReadError::Socket(error)) => Err(TryOpError::Other(error.into())),
-                },
-            )
-            .map_err(socket_io_errno)
+                    Err(ChannelReadError::NotConnected) => Err(Errno::ENOTCONN),
+                    Err(ChannelReadError::Socket(error)) => Err(error.into()),
+                    Err(ChannelReadError::WouldBlock) => Err(socket_io_errno(error)),
+                }
+            }
+            Err(error) => Err(socket_io_errno(error)),
+        }
     }
 
     fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
@@ -1257,6 +1351,43 @@ fn copy_iovs_to_vec<Platform: ShimPlatform>(
     Ok(data)
 }
 
+fn validate_user_write_range<Platform: ShimPlatform>(
+    page_manager: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
+    ptr: UserPtrMut<u8>,
+    offset: usize,
+    len: usize,
+) -> Result<(), Errno> {
+    let start = ptr.as_usize().checked_add(offset).ok_or(Errno::EFAULT)?;
+    let end = start.checked_add(len).ok_or(Errno::EFAULT)?;
+    if !page_manager.range_has_permissions(start..end, MemoryRegionPermissions::WRITE) {
+        return Err(Errno::EFAULT);
+    }
+    Ok(())
+}
+
+fn validate_iov_write_ranges<Platform: ShimPlatform>(
+    page_manager: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
+    iovs: &[litebox_common_linux::IoVec],
+    mut skip: usize,
+    mut len: usize,
+) -> Result<(), Errno> {
+    for iov in iovs {
+        if skip >= iov.iov_len {
+            skip -= iov.iov_len;
+            continue;
+        }
+        let range_len = len.min(iov.iov_len - skip);
+        validate_user_write_range(page_manager, iov.iov_base, skip, range_len)?;
+        len -= range_len;
+        if len == 0 {
+            return Ok(());
+        }
+        skip = 0;
+    }
+    debug_assert_eq!(len, 0);
+    Ok(())
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `accept`
     pub(crate) fn sys_accept(
@@ -1601,28 +1732,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         addr: Option<UserPtrMut<u8>>,
         addrlen: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
-        const MAX_LEN: usize = 4096;
         let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
+        let (chunk_waitall, deadline) = self.inet_stream_receive_plan(sockfd, flags)?;
         let mut source_addr = None;
-        let mut buffer = [0u8; MAX_LEN];
-        let recv_buf = &mut buffer[..MAX_LEN.min(len)];
-        let (size, copy_received) = self.do_recvfrom_with_copy(
-            sockfd,
-            recv_buf,
-            flags,
-            if addr.is_some() {
-                Some(&mut source_addr)
-            } else {
-                None
-            },
-        )?;
-        let capped_size = size.min(recv_buf.len());
-        if copy_received {
-            buf.copy_from_slice::<Platform>(0, &recv_buf[..capped_size])
-                .ok_or(Errno::EFAULT)?;
-        }
+        let scratch_len = len.min(SOCKET_RECEIVE_OPERATION_SIZE);
+        let mut buffer = alloc::vec::Vec::new();
+        buffer
+            .try_reserve_exact(scratch_len)
+            .map_err(|_| Errno::ENOMEM)?;
+        buffer.resize(scratch_len, 0);
+        let mut received = 0;
+        let reported = loop {
+            let chunk_len = (len - received).min(buffer.len());
+            if chunk_waitall
+                && !flags.contains(ReceiveFlags::TRUNC)
+                && validate_user_write_range(&self.global.pm, buf, received, chunk_len).is_err()
+            {
+                return if received == 0 {
+                    Err(Errno::EFAULT)
+                } else {
+                    Ok(received)
+                };
+            }
+            let (size, copy_received) = self.do_recvfrom_with_copy(
+                sockfd,
+                &mut buffer[..chunk_len],
+                flags,
+                deadline,
+                received != 0,
+                if addr.is_some() {
+                    Some(&mut source_addr)
+                } else {
+                    None
+                },
+            )?;
+            let copied = size.min(chunk_len);
+            if copy_received
+                && buf
+                    .copy_from_slice::<Platform>(received, &buffer[..copied])
+                    .is_none()
+            {
+                return if received == 0 {
+                    Err(Errno::EFAULT)
+                } else {
+                    Ok(received)
+                };
+            }
+            received += copied;
+            let reported = if chunk_waitall { received } else { size };
+            if !chunk_waitall || copied < chunk_len || received == len {
+                break reported;
+            }
+        };
         if let Some(src_addr) = source_addr
             && let Some(sock_ptr) = addr
         {
@@ -1631,11 +1794,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         if flags.contains(ReceiveFlags::TRUNC) {
             // the actual message size
-            Ok(size)
+            Ok(reported)
         } else {
             // the number of bytes copied
-            Ok(capped_size)
+            Ok(received)
         }
+    }
+
+    fn inet_stream_receive_plan(
+        &self,
+        sockfd: u32,
+        flags: ReceiveFlags,
+    ) -> Result<(bool, Option<Platform::Instant>), Errno> {
+        let files = self.files.borrow();
+        let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
+        files.with_socket(
+            &self.global,
+            raw_fd.trunc(),
+            |fd| {
+                let is_nonblock = self.global.get_status(fd).contains(OFlags::NONBLOCK)
+                    || flags.contains(ReceiveFlags::DONTWAIT);
+                let chunk_waitall = flags.contains(ReceiveFlags::WAITALL)
+                    && !flags.contains(ReceiveFlags::PEEK)
+                    && matches!(self.global.get_socket_type(fd)?, SockType::Stream)
+                    && !is_nonblock;
+                let deadline = self
+                    .global
+                    .with_socket_options(fd, |options| options.recv_timeout)
+                    .map(|timeout| {
+                        self.global
+                            .platform
+                            .now()
+                            .checked_add(timeout)
+                            .ok_or(Errno::EINVAL)
+                    })
+                    .transpose()?;
+                Ok((chunk_waitall, deadline))
+            },
+            |_| Ok((false, None)),
+        )
     }
     /// Receive data from a socket.
     ///
@@ -1651,7 +1848,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
-        self.do_recvfrom_with_copy(sockfd, buf, flags, source_addr)
+        self.do_recvfrom_with_copy(sockfd, buf, flags, None, false, source_addr)
             .map(|(size, _)| size)
     }
 
@@ -1660,6 +1857,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         sockfd: u32,
         buf: &mut [u8],
         flags: ReceiveFlags,
+        deadline: Option<Platform::Instant>,
+        outer_partial: bool,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<(usize, bool), Errno> {
         let want_source = source_addr.is_some();
@@ -1679,6 +1878,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         fd,
                         &mut buf.borrow_mut(),
                         flags,
+                        ReceiveContext::new(deadline, outer_partial),
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Inet);
@@ -1717,7 +1917,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
 
-        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC;
+        let supported_flags = ReceiveFlags::DONTWAIT
+            | ReceiveFlags::PEEK
+            | ReceiveFlags::TRUNC
+            | ReceiveFlags::WAITALL;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -1754,59 +1957,87 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             capacity.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
         })?;
 
-        // Perform a single recv into a contiguous buffer.
         let want_source = msg_name.as_usize() != 0;
         let mut source_addr = None;
         let mut ret_flags = ReceiveFlags::empty();
+        let (chunk_waitall, deadline) = self.inet_stream_receive_plan(sockfd, flags)?;
 
-        // Heap-allocate the recv buffer to avoid stack overflow for large iovecs.
+        // Keep the scratch allocation bounded and scatter each completed chunk.
         let mut buffer = alloc::vec::Vec::new();
+        let receive_capacity = total_iov_capacity.min(SOCKET_RECEIVE_OPERATION_SIZE);
         buffer
-            .try_reserve_exact(total_iov_capacity)
+            .try_reserve_exact(receive_capacity)
             .map_err(|_| Errno::ENOMEM)?;
-        buffer.resize(total_iov_capacity, 0);
-        let recv_buf = &mut buffer[..];
-        let (size, copy_received) = self.do_recvfrom_with_copy(
-            sockfd,
-            recv_buf,
-            flags,
-            if want_source {
-                Some(&mut source_addr)
-            } else {
-                None
-            },
-        )?;
-
-        if size > total_iov_capacity {
-            ret_flags.insert(ReceiveFlags::TRUNC);
-        }
-
-        // Scatter the received data across iovecs sequentially.
-        let data_to_copy = size.min(total_iov_capacity);
-        let mut offset = 0usize;
-        if copy_received {
-            for iov in &iovs {
-                if offset >= data_to_copy {
-                    break;
+        buffer.resize(receive_capacity, 0);
+        let mut total_received = 0;
+        let reported = 'receive: loop {
+            let chunk_len = (total_iov_capacity - total_received).min(buffer.len());
+            if chunk_waitall
+                && !flags.contains(ReceiveFlags::TRUNC)
+                && validate_iov_write_ranges(&self.global.pm, &iovs, total_received, chunk_len)
+                    .is_err()
+            {
+                if total_received == 0 {
+                    return Err(Errno::EFAULT);
                 }
-                if iov.iov_len == 0 {
-                    continue;
-                }
-                let chunk = (data_to_copy - offset).min(iov.iov_len);
-                iov.iov_base
-                    .copy_from_slice::<Platform>(0, &recv_buf[offset..offset + chunk])
-                    .ok_or(Errno::EFAULT)?;
-                offset += chunk;
+                break 'receive total_received;
             }
-        }
-
-        let total_received = if flags.contains(ReceiveFlags::TRUNC) {
-            // the actual message size
-            size
-        } else {
-            // the number of bytes copied
-            size.min(total_iov_capacity)
+            let (size, copy_received) = self.do_recvfrom_with_copy(
+                sockfd,
+                &mut buffer[..chunk_len],
+                flags,
+                deadline,
+                total_received != 0,
+                if want_source {
+                    Some(&mut source_addr)
+                } else {
+                    None
+                },
+            )?;
+            if size > chunk_len {
+                ret_flags.insert(ReceiveFlags::TRUNC);
+            }
+            let copied = size.min(chunk_len);
+            if copy_received {
+                let mut skip = total_received;
+                let mut source_offset = 0;
+                for iov in &iovs {
+                    if skip >= iov.iov_len {
+                        skip -= iov.iov_len;
+                        continue;
+                    }
+                    let chunk = (copied - source_offset).min(iov.iov_len - skip);
+                    if iov
+                        .iov_base
+                        .copy_from_slice::<Platform>(
+                            skip,
+                            &buffer[source_offset..source_offset + chunk],
+                        )
+                        .is_none()
+                    {
+                        let copied_before_fault = total_received + source_offset;
+                        if copied_before_fault == 0 {
+                            return Err(Errno::EFAULT);
+                        }
+                        total_received = copied_before_fault;
+                        break 'receive copied_before_fault;
+                    }
+                    source_offset += chunk;
+                    skip = 0;
+                    if source_offset == copied {
+                        break;
+                    }
+                }
+            }
+            total_received += copied;
+            let reported = if chunk_waitall { total_received } else { size };
+            if !chunk_waitall || copied < chunk_len || total_received == total_iov_capacity {
+                break reported;
+            }
         };
+        if flags.contains(ReceiveFlags::TRUNC) {
+            total_received = reported;
+        }
 
         // Write back source address if requested.
         if want_source {
@@ -1852,8 +2083,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: ReceiveFlags,
         timeout: litebox_common_linux::TimeParam,
     ) -> Result<usize, Errno> {
-        let supported_flags =
-            ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::WAITFORONE;
+        let supported_flags = ReceiveFlags::DONTWAIT
+            | ReceiveFlags::PEEK
+            | ReceiveFlags::TRUNC
+            | ReceiveFlags::WAITALL
+            | ReceiveFlags::WAITFORONE;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);

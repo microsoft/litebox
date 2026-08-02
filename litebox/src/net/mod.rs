@@ -57,6 +57,8 @@ const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// Maximum size of rx/tx buffers for sockets
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
+/// Maximum bytes one socket receive syscall stages before returning.
+pub const SOCKET_RECEIVE_OPERATION_SIZE: usize = 0x80_000;
 
 /// Directions of a socket to shut down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,7 +641,6 @@ where
                         break;
                     }
                 }
-
                 if let tcp::State::Established = tcp_socket.state() {
                     proxy.set_state(socket_channel::SocketState::Connected);
                     proxy.clear_async_error();
@@ -670,6 +671,10 @@ where
                             proxy.set_state(socket_channel::SocketState::Closed);
                         }
                     }
+                }
+                if proxy.state() == socket_channel::SocketState::Connected && !tcp_socket.may_recv()
+                {
+                    proxy.set_peer_eof();
                 }
 
                 if let Some(server_socket) = tcp_specific.server_socket.as_ref()

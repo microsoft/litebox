@@ -8,8 +8,8 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
 use litebox_broker_protocol::socket::{
     AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE,
-    ReceiveFlags, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest,
-    ShutdownMode, ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
+    ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest, ShutdownMode,
+    ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
     SocketStatusRequest, SocketStatusResponse, SocketType,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
@@ -118,28 +118,22 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// returns a mismatched or oversized response.
     pub fn receive_socket(
         &self,
-        handle: ObjectHandle,
-        buffer: SharedBufferDescriptor,
+        request: ReceiveSocketRequest,
         destination: &mut [u8],
-        flags: ReceiveFlags,
         copy_received: bool,
     ) -> Result<core::result::Result<ReceiveSocketResponse, SocketError>, Channel::Error> {
-        self.validate_socket_buffer(buffer, destination.len());
-        match self.request_socket(SocketRequest::Receive(ReceiveSocketRequest {
-            handle,
-            buffer,
-            flags,
-        }))? {
+        self.validate_socket_buffer(request.buffer, destination.len());
+        match self.request_socket(SocketRequest::Receive(request))? {
             SocketResponse::Receive(response) => {
                 if let ReceiveSocketResponse::Received(received) = response {
                     assert!(
-                        received <= buffer.length,
+                        received <= request.buffer.length,
                         "broker returned oversized socket receive"
                     );
                     if copy_received {
                         let received = received as usize;
                         self.shared_buffers
-                            .read(buffer.slot_index, &mut destination[..received])
+                            .read(request.buffer.slot_index, &mut destination[..received])
                             .expect("validated shared socket receive range must be accessible");
                     }
                 }

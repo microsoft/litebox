@@ -545,7 +545,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
     use std::net::{Ipv4Addr, TcpListener};
 
     const REQUEST_SIZE: usize = 65_536;
-    const RESPONSE_SIZE: usize = 40_000;
+    const RESPONSE_SIZE: usize = 600_000;
     const BACKPRESSURE_SIZE: usize = 8 * 1024 * 1024;
 
     let target = common::compile(
@@ -563,7 +563,11 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         assert!(request.iter().all(|byte| *byte == 0x5a));
         std::thread::sleep(std::time::Duration::from_millis(100));
         stream.write_all(&[0x11; 16]).unwrap();
-        stream.write_all(&vec![0xa5; RESPONSE_SIZE]).unwrap();
+        stream.write_all(&vec![0xa5; 20_000]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stream
+            .write_all(&vec![0xa5; RESPONSE_SIZE - 20_000])
+            .unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         let mut backpressure = vec![0; BACKPRESSURE_SIZE];
@@ -578,6 +582,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         };
         for _ in 0..2 {
             let (reset_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
             // SAFETY: `reset_stream` owns a live socket and `linger` is valid for the supplied length.
             assert_eq!(
                 unsafe {
@@ -593,6 +598,28 @@ fn test_runner_broker_tcp_client_with_rewriter() {
             );
             drop(reset_stream);
         }
+        let (mut partial_reset_stream, _) = listener.accept().unwrap();
+        partial_reset_stream.write_all(&[0x7e]).unwrap();
+        // SAFETY: `partial_reset_stream` owns a live socket and `linger` is valid for the supplied length.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    std::os::fd::AsRawFd::as_raw_fd(&partial_reset_stream),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    std::ptr::from_ref(&linger).cast(),
+                    libc::socklen_t::try_from(std::mem::size_of_val(&linger)).unwrap(),
+                )
+            },
+            0
+        );
+        drop(partial_reset_stream);
+
+        let (mut fault_stream, _) = listener.accept().unwrap();
+        fault_stream
+            .write_all(&vec![0x6d; 512 * 1024 + 4096])
+            .unwrap();
+        fault_stream.shutdown(std::net::Shutdown::Write).unwrap();
     });
 
     let refused_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -612,7 +639,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         .arg(refused_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    assert_eq!(broker.next_close_object_count(), 5);
+    assert_eq!(broker.next_close_object_count(), 8);
     broker.join();
     server.join().unwrap();
 }

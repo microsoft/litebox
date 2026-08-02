@@ -9,8 +9,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    CreateSocketRequest, ReceiveFlags, ReceiveSocketResponse, SendFlags, ShutdownMode,
-    SocketAddressV4, SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse,
+    CreateSocketRequest, MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags, ReceiveSocketResponse, SendFlags,
+    ShutdownMode, SocketAddressV4, SocketConnectionStatus, SocketError, SocketOutcome,
+    SocketStatusResponse,
 };
 use spin::Once;
 
@@ -68,6 +69,8 @@ pub trait PlatformSocket: Send + Sync {
         &self,
         data: &mut [u8],
         flags: ReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
     ) -> Result<SocketOutcome<ReceiveSocketResponse>>;
 
     /// Shuts down one or both socket directions.
@@ -227,15 +230,33 @@ pub fn receive(
     handle: ObjectHandle,
     data: &mut [u8],
     flags: ReceiveFlags,
+    peek_offset: u32,
+    peek_length: u32,
 ) -> Result<SocketOutcome<ReceiveSocketResponse>> {
     if flags.has_unsupported_bits() {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    let peek = flags.contains(ReceiveFlags::PEEK);
+    let end = peek_offset
+        .checked_add(data.len().try_into().map_err(|_| BrokerError::Internal)?)
+        .ok_or(BrokerError::UnsupportedOperation)?;
+    let canonical_peek_length = peek_length
+        .checked_sub(peek_offset)
+        .map(|remaining| remaining.min(MAX_SOCKET_TRANSFER_SIZE));
+    if (!peek && (peek_offset != 0 || peek_length != 0))
+        || (peek
+            && (!peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE)
+                || canonical_peek_length != data.len().try_into().ok()
+                || peek_length < end
+                || peek_length > litebox_broker_protocol::socket::MAX_SOCKET_PEEK_SIZE))
+    {
         return Err(BrokerError::UnsupportedOperation);
     }
     let resource = socket_resource(session, handle, ObjectRights::WAIT)?;
     if data.is_empty() {
         return Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(0)));
     }
-    let outcome = resource.receive(data, flags)?;
+    let outcome = resource.receive(data, flags, peek_offset, peek_length)?;
     if let SocketOutcome::Completed(ReceiveSocketResponse::Received(received)) = outcome
         && (received as usize > data.len() || received == 0)
     {
@@ -369,8 +390,11 @@ impl SocketResource {
         &self,
         data: &mut [u8],
         flags: ReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
     ) -> Result<SocketOutcome<ReceiveSocketResponse>> {
-        self.platform_socket().receive(data, flags)
+        self.platform_socket()
+            .receive(data, flags, peek_offset, peek_length)
     }
 
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>> {
@@ -531,6 +555,8 @@ pub(crate) mod tests {
             &self,
             data: &mut [u8],
             _flags: ReceiveFlags,
+            _peek_offset: u32,
+            _peek_length: u32,
         ) -> Result<SocketOutcome<ReceiveSocketResponse>> {
             let received = data.len().min(2);
             data[..received].copy_from_slice(&[7, 9][..received]);
@@ -659,10 +685,14 @@ pub(crate) mod tests {
         );
         let mut data = [0; 4];
         assert_eq!(
-            receive(&session, handle, &mut data, ReceiveFlags::PEEK),
+            receive(&session, handle, &mut data, ReceiveFlags::PEEK, 0, 4),
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(2)))
         );
         assert_eq!(data, [7, 9, 0, 0]);
+        assert_eq!(
+            receive(&session, handle, &mut data[..1], ReceiveFlags::PEEK, 1, 2),
+            Err(BrokerError::UnsupportedOperation)
+        );
         assert_eq!(
             shutdown(&session, handle, ShutdownMode::Both),
             Ok(SocketOutcome::Completed(()))
