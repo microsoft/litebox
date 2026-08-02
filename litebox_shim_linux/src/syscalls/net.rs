@@ -346,10 +346,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         optlen: usize,
     ) -> Result<(), Errno> {
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
-            if matches!(
+            let unsupported_broker_option = matches!(
                 (so, &value),
                 (SocketOption::LINGER, SocketOptionValue::Timeout(Some(_)))
-            ) && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+                    | (SocketOption::KEEPALIVE, SocketOptionValue::U32(_))
+            );
+            if unsupported_broker_option
+                && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
             {
                 return Err(Errno::EOPNOTSUPP);
             }
@@ -504,7 +507,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                                 core::time::Duration::from_secs(u64::from(val)),
                             )),
                         )
-                        .expect("set TCP_KEEPALIVE should succeed");
+                        .map_err(Errno::from)?;
                 }
             },
         }

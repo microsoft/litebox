@@ -1714,8 +1714,8 @@ where
             .get_entry_mut(fd)
             .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if let Some(socket) = &socket_handle.broker_socket {
-            return socket.set_tcp_option(data);
+        if socket_handle.broker_socket.is_some() {
+            return Err(errors::SetTcpOptionError::Unsupported);
         }
         match socket_handle.protocol() {
             Protocol::Tcp => {
@@ -1754,8 +1754,8 @@ where
             .get_entry_mut(fd)
             .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if let Some(socket) = &socket_handle.broker_socket {
-            return socket.get_tcp_option(name);
+        if socket_handle.broker_socket.is_some() {
+            return Err(errors::GetTcpOptionError::Unsupported);
         }
         match socket_handle.protocol() {
             Protocol::Tcp => {

@@ -71,10 +71,17 @@ int main(int argc, char **argv) {
     assert(peer_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
     assert(peer_address.sin_port == address.sin_port);
     int option = 1;
-    assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option, sizeof(option)) == 0);
-    assert(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &option, sizeof(option)) == 0);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option, sizeof(option)) == -1);
+    assert(errno == EOPNOTSUPP);
+    assert(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &option, sizeof(option)) == -1);
+    assert(errno == EOPNOTSUPP);
+    socklen_t option_length = sizeof(option);
+    option = -1;
+    assert(getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &option, &option_length) == 0);
+    assert(option == 0);
     option = 30;
-    assert(setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &option, sizeof(option)) == 0);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &option, sizeof(option)) == -1);
+    assert(errno == EOPNOTSUPP);
     char congestion[16];
     socklen_t congestion_length = sizeof(congestion);
     assert(getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, congestion,
