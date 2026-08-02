@@ -36,6 +36,19 @@ struct BrokerSocketState {
     async_error: u32,
 }
 
+impl BrokerSocketState {
+    fn update_connection(&mut self, connection: SocketConnectionStatus) -> SocketConnectionStatus {
+        if matches!(
+            self.connection,
+            SocketConnectionStatus::Connected | SocketConnectionStatus::Failed(_)
+        ) {
+            return self.connection;
+        }
+        self.connection = connection;
+        connection
+    }
+}
+
 /// Local state and readiness adapter for one broker-owned TCP socket.
 pub struct BrokerTcpSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
@@ -163,7 +176,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             SocketState::Error => self.state.lock().connection,
             SocketState::Listening | SocketState::Closed => return,
         };
-        update_connection_state(&mut self.state.lock(), connection);
+        self.state.lock().update_connection(connection);
     }
 
     pub(super) fn set_async_error(&self, error: SocketAsyncError) {
@@ -307,7 +320,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     ) -> Result<(), ConnectError> {
         let status = {
             let mut state = self.state.lock();
-            let status = update_connection_state(&mut state, status);
+            let status = state.update_connection(status);
             if state.remote_address.is_none() {
                 state.remote_address = remote_address;
             }
@@ -342,7 +355,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     fn apply_socket_status(&self, response: SocketStatusResponse) {
         let mut state = self.state.lock();
         let previous_connection = state.connection;
-        let connection = update_connection_state(&mut state, response.status);
+        let connection = state.update_connection(response.status);
         let connection_error = match (previous_connection, connection) {
             (
                 SocketConnectionStatus::Unconnected | SocketConnectionStatus::Connecting,
@@ -375,20 +388,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 .notify_observers(Events::IN | Events::OUT | Events::HUP);
         }
     }
-}
-
-fn update_connection_state(
-    state: &mut BrokerSocketState,
-    connection: SocketConnectionStatus,
-) -> SocketConnectionStatus {
-    if matches!(
-        state.connection,
-        SocketConnectionStatus::Connected | SocketConnectionStatus::Failed(_)
-    ) {
-        return state.connection;
-    }
-    state.connection = connection;
-    connection
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerTcpSocket<Platform> {
