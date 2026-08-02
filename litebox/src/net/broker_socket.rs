@@ -107,7 +107,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             .socket_status(self.handle)
             .map_err(|error| ConnectError::Socket(socket_error_from_control(error.into())))?;
         let status = response.status;
-        self.apply_status_response(response);
+        self.apply_socket_status(response);
         self.handle_connect_status(status, None)
     }
 
@@ -334,12 +334,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             return;
         }
         match self.broker.socket_status(self.handle) {
-            Ok(response) => self.apply_status_response(response),
+            Ok(response) => self.apply_socket_status(response),
             Err(error) => self.set_async_error(socket_error_from_control(error.into())),
         }
     }
 
-    fn apply_status_response(&self, response: SocketStatusResponse) {
+    fn apply_socket_status(&self, response: SocketStatusResponse) {
         let mut state = self.state.lock();
         let previous_connection = state.connection;
         let connection = update_connection_state(&mut state, response.status);
