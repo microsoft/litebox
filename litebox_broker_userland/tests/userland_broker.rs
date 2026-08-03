@@ -17,6 +17,7 @@ use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRi
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
+const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -39,13 +40,42 @@ fn run_parent_test() {
     // the fake runner finishes its broker requests, it terminates the broker
     // parent process; this lets the test exercise the long-running broker
     // without a test-only shutdown path.
+    let mut event_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
+    event_command
+        .arg("--runner")
+        .arg(std::env::current_exe().unwrap())
+        .arg(RUNNER_ARGUMENT);
+    wait_for_broker(event_command);
+
+    let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    probe
+        .connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9))
+        .unwrap();
+    let std::net::IpAddr::V4(host_address) = probe.local_addr().unwrap().ip() else {
+        panic!("IPv4 route probe returned an IPv6 address");
+    };
+    assert!(!host_address.is_loopback() && !host_address.is_unspecified());
+
+    let listener = std::net::TcpListener::bind((host_address, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut network_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
+    network_command
+        .arg("--allow-tcp-destination")
+        .arg(format!("{host_address}/32:{port}"))
+        .arg("--runner")
+        .arg(std::env::current_exe().unwrap())
+        .arg(NETWORK_RUNNER_ARGUMENT)
+        .arg(host_address.to_string())
+        .arg(port.to_string());
+    wait_for_broker(network_command);
+
+    let (_stream, peer_address) = listener.accept().unwrap();
+    assert_eq!(peer_address.ip(), host_address);
+}
+
+fn wait_for_broker(mut command: Command) {
     let mut broker = ChildGuard {
-        child: Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
-            .arg("--runner")
-            .arg(std::env::current_exe().unwrap())
-            .arg(RUNNER_ARGUMENT)
-            .spawn()
-            .unwrap(),
+        child: command.spawn().unwrap(),
     };
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -68,11 +98,6 @@ fn run_fake_runner(args: &[OsString]) {
         args.get(1).map(OsString::as_os_str),
         Some(OsStr::new("--broker-control-socket"))
     );
-    assert_eq!(
-        args.get(3).map(OsString::as_os_str),
-        Some(OsStr::new(RUNNER_ARGUMENT))
-    );
-    assert_eq!(args.len(), 4, "unexpected runner arguments: {args:?}");
 
     let control_socket_path = args.get(2).unwrap();
     let setup_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
@@ -96,6 +121,44 @@ fn run_fake_runner(args: &[OsString]) {
     })
     .unwrap();
     let local = Arc::new(local);
+
+    if args.get(3).and_then(|argument| argument.to_str()) == Some(NETWORK_RUNNER_ARGUMENT) {
+        use litebox_broker_protocol::socket::{
+            Ipv4Address, Port, SocketAddressV4, SocketConnectionStatus,
+        };
+
+        assert_eq!(args.len(), 6, "unexpected runner arguments: {args:?}");
+        let address = args[4]
+            .to_str()
+            .unwrap()
+            .parse::<std::net::Ipv4Addr>()
+            .unwrap();
+        let port = args[5].to_str().unwrap().parse::<u16>().unwrap();
+        let handle = local.create_tcp_socket().unwrap();
+        let mut status = local
+            .connect_socket(
+                handle,
+                SocketAddressV4 {
+                    address: Ipv4Address(address.octets()),
+                    port: Port(port),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while status == SocketConnectionStatus::Connecting && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            status = local.socket_status(handle).unwrap().status;
+        }
+        assert_eq!(status, SocketConnectionStatus::Connected);
+        local.close_object(handle).unwrap();
+        return;
+    }
+    assert_eq!(
+        args.get(3).map(OsString::as_os_str),
+        Some(OsStr::new(RUNNER_ARGUMENT))
+    );
+    assert_eq!(args.len(), 4, "unexpected runner arguments: {args:?}");
 
     let start = Arc::new(std::sync::Barrier::new(17));
     let callers = (0..16)

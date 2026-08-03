@@ -4,9 +4,11 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::net::Ipv4Addr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::str::FromStr;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{
     Arc, Mutex,
@@ -15,11 +17,15 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine, SocketPolicy};
+use litebox_broker_core::{
+    BrokerCore, BrokerCoreLimits, CallerCredential, Ipv4Cidr, ObjectRights, PolicyEngine,
+    SocketPolicy, SocketPolicyError, TcpDestinationRule, TcpPortRange,
+};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
 use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
+use litebox_broker_protocol::socket::{Ipv4Address, Port};
 use litebox_broker_transport::channel::HostReceive;
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
@@ -36,8 +42,57 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const WORKER_COUNT: usize = 8;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AllowedTcpDestination {
+    destination: Ipv4Cidr,
+    ports: TcpPortRange,
+}
+
+impl FromStr for AllowedTcpDestination {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (cidr, ports) = value
+            .rsplit_once(':')
+            .ok_or_else(|| "expected CIDR:PORT or CIDR:START-END".to_owned())?;
+        let (network, prefix_length) = cidr
+            .split_once('/')
+            .ok_or_else(|| "destination must include an IPv4 CIDR prefix".to_owned())?;
+        let network = network
+            .parse::<Ipv4Addr>()
+            .map_err(|error| format!("invalid IPv4 network: {error}"))?;
+        let prefix_length = prefix_length
+            .parse::<u8>()
+            .map_err(|error| format!("invalid IPv4 prefix length: {error}"))?;
+        let destination =
+            Ipv4Cidr::new(Ipv4Address(network.octets()), prefix_length).ok_or_else(|| {
+                "IPv4 CIDR must have a valid prefix and canonical network address".to_owned()
+            })?;
+
+        let (start, end) = ports
+            .split_once('-')
+            .map_or((ports, ports), |(start, end)| (start, end));
+        let start = start
+            .parse::<u16>()
+            .map_err(|error| format!("invalid TCP port: {error}"))?;
+        let end = end
+            .parse::<u16>()
+            .map_err(|error| format!("invalid TCP port: {error}"))?;
+        let ports = TcpPortRange::new(Port(start), Port(end))
+            .ok_or_else(|| "TCP port range must be ordered and exclude port zero".to_owned())?;
+
+        Ok(Self { destination, ports })
+    }
+}
+
 #[derive(Parser, Debug)]
 struct CliArgs {
+    /// Permit outbound TCP connections to a destination CIDR and port range.
+    ///
+    /// May be repeated. Supplying any rule replaces the default loopback-only policy.
+    /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
+    #[arg(long, value_name = "CIDR:PORT[-PORT]")]
+    allow_tcp_destination: Vec<AllowedTcpDestination>,
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
@@ -57,7 +112,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let limits = BrokerCoreLimits::DEFAULT;
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
+            .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
         limits,
         Arc::new(LinuxSocketProvider::new(limits.max_sockets)?),
     )?;
@@ -82,6 +137,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(IoError::other(format!("runner exited with {runner_status}")).into());
     }
     Ok(())
+}
+
+fn configured_socket_policy(
+    allowed_destinations: &[AllowedTcpDestination],
+) -> Result<SocketPolicy, SocketPolicyError> {
+    if allowed_destinations.is_empty() {
+        return Ok(SocketPolicy::Ipv4LoopbackTcp);
+    }
+    let rules = allowed_destinations
+        .iter()
+        .map(|allowed| {
+            TcpDestinationRule::new(
+                CallerCredential::HostGuaranteed,
+                allowed.destination,
+                allowed.ports,
+            )
+        })
+        .collect::<Vec<_>>();
+    SocketPolicy::from_tcp_destination_rules(&rules)
 }
 
 fn serve_runner(
@@ -461,6 +535,48 @@ mod tests {
         UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
     };
     use std::os::fd::AsFd;
+
+    #[test]
+    fn tcp_destination_argument_parses_canonical_cidr_and_ports() {
+        let allowed = "203.0.113.0/24:443-444"
+            .parse::<AllowedTcpDestination>()
+            .unwrap();
+
+        assert_eq!(
+            allowed,
+            AllowedTcpDestination {
+                destination: Ipv4Cidr::new(Ipv4Address([203, 0, 113, 0]), 24).unwrap(),
+                ports: TcpPortRange::new(Port(443), Port(444)).unwrap(),
+            }
+        );
+        assert!(
+            "203.0.113.1/24:443"
+                .parse::<AllowedTcpDestination>()
+                .is_err()
+        );
+        assert!("203.0.113.0/24:0".parse::<AllowedTcpDestination>().is_err());
+    }
+
+    #[test]
+    fn tcp_destination_arguments_replace_the_loopback_default() {
+        assert_eq!(
+            configured_socket_policy(&[]).unwrap(),
+            SocketPolicy::Ipv4LoopbackTcp
+        );
+
+        let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
+        let policy = configured_socket_policy(&[allowed]).unwrap();
+        let rules = policy.tcp_destination_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0],
+            TcpDestinationRule::new(
+                CallerCredential::HostGuaranteed,
+                allowed.destination,
+                allowed.ports,
+            )
+        );
+    }
 
     /// One live host association: the endpoints teardown acts on, and the rest
     /// held open so the association stays up for the duration of a test.
