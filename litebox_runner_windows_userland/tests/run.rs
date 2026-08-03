@@ -107,10 +107,7 @@ fn run_multithreaded_pe() {
 }
 
 /// Runs a guest PE that imports the C runtime (ucrtbase via the CRT api-set
-/// contracts), forcing ucrtbase to load and initialize. This exercises the
-/// api-set forwards to `ucrtbase.dll` plus the `NtQueryLicenseValue` syscall
-/// that ucrtbase's startup invokes, and is the repeatable oracle for further
-/// CRT-path blockers.
+/// contracts), forcing ucrtbase to load and initialize.
 #[test]
 fn run_crt_locale_pe() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("crt_locale");

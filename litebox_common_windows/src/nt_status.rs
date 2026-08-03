@@ -202,6 +202,7 @@ impl NtStatus {
             0xC0000120 => "STATUS_CANCELLED: The operation was cancelled",
             0xC0000121 => "STATUS_CANNOT_DELETE: Cannot delete",
             0xC0000128 => "STATUS_FILE_CLOSED: File closed",
+            0xC0000135 => "STATUS_DLL_NOT_FOUND: A required DLL could not be found",
             0xC0000142 => "STATUS_DLL_INIT_FAILED: DLL initialization failed",
             0xC0000161 => "STATUS_ILLEGAL_CHARACTER: Illegal character",
             0xC0000162 => "STATUS_UNMAPPABLE_CHARACTER: Unmappable character",
@@ -575,6 +576,9 @@ impl NtStatus {
 
     /// STATUS_FILE_CLOSED
     pub const FILE_CLOSED: Self = Self::from_raw(0xC0000128);
+
+    /// STATUS_DLL_NOT_FOUND
+    pub const DLL_NOT_FOUND: Self = Self::from_raw(0xC0000135);
 
     /// STATUS_DLL_INIT_FAILED
     pub const DLL_INIT_FAILED: Self = Self::from_raw(0xC0000142);

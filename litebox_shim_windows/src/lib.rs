@@ -965,6 +965,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
                 .read_at_offset(0)
                 .unwrap_or_default();
+            #[cfg(debug_assertions)]
+            if NtSysno::from_raw(ctx.orig_rax) == Some(NtSysno::NtRaiseHardError) {
+                log_loader_hard_error::<Platform>(ctx);
+            }
             litebox_util_log::error!(
                 syscall:? = NtSysno::from_raw(ctx.orig_rax),
                 rip:% = format_args!("{:#x}", ctx.rip),
@@ -2401,6 +2405,85 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // TODO: Translate hardware exceptions into Windows SEH where appropriate.
         self.exit_thread(NtStatus::UNSUCCESSFUL.as_raw());
     }
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Eq, PartialEq)]
+struct DllNotFoundHardError {
+    dll_name: alloc::string::String,
+    search_path: alloc::string::String,
+}
+
+#[cfg(debug_assertions)]
+fn decode_dll_not_found_hard_error<Platform: RawPointerProvider>(
+    ctx: &litebox_common_linux::PtRegs,
+) -> Result<Option<DllNotFoundHardError>, NtStatus> {
+    let error_status = NtStatus::from_raw(ctx.r10.trunc());
+    if error_status != NtStatus::DLL_NOT_FOUND {
+        return Ok(None);
+    }
+
+    if ctx.rdx < 2 || ctx.r8 & 0b11 != 0b11 || ctx.r9 == 0 {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+
+    let parameters = ConstPtr::<Platform, usize>::from_usize(ctx.r9);
+    let dll_name = parameters
+        .read_at_offset(0)
+        .ok_or(NtStatus::ACCESS_VIOLATION)
+        .and_then(nt_types::read_unicode_string_at::<Platform>)?;
+    let search_path = parameters
+        .read_at_offset(1)
+        .ok_or(NtStatus::ACCESS_VIOLATION)
+        .and_then(nt_types::read_unicode_string_at::<Platform>)?;
+
+    Ok(Some(DllNotFoundHardError {
+        dll_name,
+        search_path,
+    }))
+}
+
+#[cfg(debug_assertions)]
+fn log_loader_hard_error<Platform: RawPointerProvider>(ctx: &litebox_common_linux::PtRegs) {
+    match decode_dll_not_found_hard_error::<Platform>(ctx) {
+        Ok(Some(error)) if is_api_set_contract(&error.dll_name) => {
+            litebox_util_log::error!(
+                status:? = NtStatus::DLL_NOT_FOUND,
+                contract:% = error.dll_name,
+                search_path:% = error.search_path;
+                "Windows loader could not resolve an API-set contract; add the missing contract to loader::pe::API_SET_MAPPINGS"
+            );
+        }
+        Ok(Some(error)) => {
+            litebox_util_log::error!(
+                status:? = NtStatus::DLL_NOT_FOUND,
+                dll:% = error.dll_name,
+                search_path:% = error.search_path;
+                "Windows loader could not find a required DLL"
+            );
+        }
+        Err(decode_status) => {
+            litebox_util_log::error!(
+                status:? = NtStatus::DLL_NOT_FOUND,
+                decode_status:? = decode_status,
+                parameter_count = ctx.rdx,
+                unicode_parameter_mask:% = format_args!("{:#x}", ctx.r8),
+                parameters:% = format_args!("{:#x}", ctx.r9);
+                "Windows loader raised STATUS_DLL_NOT_FOUND, but its diagnostic parameters could not be read"
+            );
+        }
+        Ok(None) => {}
+    }
+}
+
+#[cfg(debug_assertions)]
+fn is_api_set_contract(dll_name: &str) -> bool {
+    let file_name = dll_name.rsplit(['\\', '/']).next().unwrap_or(dll_name);
+    ["api-ms-", "ext-ms-"].iter().any(|prefix| {
+        file_name
+            .get(..prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+    })
 }
 
 trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
