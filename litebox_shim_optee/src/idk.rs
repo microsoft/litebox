@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::NormalWorldMutPtr;
+use crate::{NormalWorldConstPtr, NormalWorldMutPtr};
 use litebox::{mm::linux::PAGE_SIZE, platform::CrngProvider, utils::TruncateExt};
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 const IDENTITY_SIGNING_PRIVATE_KEY_LEN: usize = 48;
 const IDENTITY_SIGNING_PUBLIC_KEY_LEN: usize = 97;
+const TPM_IDKS_RANDOM_LEN: usize = 32;
 const KEY_ALGORITHM_MASK: u64 = 0xff00;
 const KEY_VARIANT_MASK: u64 = 0xff;
 const KEY_ALGORITHM_VALUE_MASK: u64 = KEY_ALGORITHM_MASK | KEY_VARIANT_MASK;
@@ -40,8 +41,8 @@ enum EcdsaCurve {
     P521 = 0x03,
 }
 
-pub fn generate_identity_signing_key(public_key_pa: u64, key_alg: u64) -> i64 {
-    match generate_identity_signing_key_inner(public_key_pa, key_alg) {
+pub fn generate_identity_signing_key(tpm_random_pa: u64, public_key_pa: u64, key_alg: u64) -> i64 {
+    match generate_identity_signing_key_inner(tpm_random_pa, public_key_pa, key_alg) {
         Ok(res) => res,
         Err(e) => e.as_neg().into(),
     }
@@ -61,8 +62,22 @@ pub fn generate_identity_signing_key(public_key_pa: u64, key_alg: u64) -> i64 {
 /// This function assumes that the caller prepares a buffer at the given physical
 /// address (in a single or contiguous physical memory page(s)) whose length is equal to
 /// or greater than `IDENTITY_SIGNING_PUBLIC_KEY_LEN`.
-fn generate_identity_signing_key_inner(public_key_pa: u64, key_alg: u64) -> Result<i64, Errno> {
+fn generate_identity_signing_key_inner(
+    tpm_random_pa: u64,
+    public_key_pa: u64,
+    key_alg: u64,
+) -> Result<i64, Errno> {
     validate_key_algorithm(key_alg)?;
+
+    let random_ptr = NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+        tpm_random_pa.trunc(),
+        TPM_IDKS_RANDOM_LEN,
+    )
+    .map_err(|_| Errno::EINVAL)?;
+    let mut tpm_random = [0u8; TPM_IDKS_RANDOM_LEN];
+    random_ptr
+        .read_slice_at_offset(0, &mut tpm_random)
+        .map_err(|_| Errno::EFAULT)?;
 
     let pubkey_ptr =
         NormalWorldMutPtr::<[u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], PAGE_SIZE>::with_usize(
@@ -70,7 +85,7 @@ fn generate_identity_signing_key_inner(public_key_pa: u64, key_alg: u64) -> Resu
         )
         .map_err(|_| Errno::EINVAL)?;
 
-    let key_pair = get_identity_signing_key_pair()?;
+    let key_pair = get_identity_signing_key_pair(Some(&tpm_random))?;
     pubkey_ptr
         .write_at_offset(0, key_pair.public_key)
         .map_err(|_| Errno::EFAULT)?;
@@ -100,9 +115,11 @@ fn validate_key_algorithm(key_alg: u64) -> Result<(), Errno> {
     }
 }
 
-fn get_identity_signing_key_pair() -> Result<&'static IdentitySigningKeyPair, Errno> {
+fn get_identity_signing_key_pair(
+    tpm_random: Option<&[u8; TPM_IDKS_RANDOM_LEN]>,
+) -> Result<&'static IdentitySigningKeyPair, Errno> {
     IDENTITY_SIGNING_KEY_PAIR.try_call_once(|| {
-        let private_key = generate_identity_signing_private_key()?;
+        let private_key = generate_identity_signing_private_key(tpm_random)?;
         let public_key = identity_signing_public_key_from_private_key(&private_key)?;
         Ok(IdentitySigningKeyPair {
             private_key,
@@ -111,8 +128,9 @@ fn get_identity_signing_key_pair() -> Result<&'static IdentitySigningKeyPair, Er
     })
 }
 
-fn generate_identity_signing_private_key()
--> Result<Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]>, Errno> {
+fn generate_identity_signing_private_key(
+    tpm_random: Option<&[u8; TPM_IDKS_RANDOM_LEN]>,
+) -> Result<Zeroizing<[u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]>, Errno> {
     let mut private_key_bytes = Zeroizing::new([0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]);
 
     for _ in 0..MAX_KEYGEN_ATTEMPT {
@@ -160,7 +178,7 @@ mod tests {
         let message = b"IDK_S signing test message";
 
         let _task = init_platform();
-        let private_key = generate_identity_signing_private_key().unwrap();
+        let private_key = generate_identity_signing_private_key(None).unwrap();
         assert!(is_valid_identity_signing_private_key(&private_key));
         let signing_key = SigningKey::from_slice(&private_key[..]).unwrap();
         let public_key = identity_signing_public_key_from_private_key(&private_key).unwrap();
