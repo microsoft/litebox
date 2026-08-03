@@ -107,8 +107,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             receive_lock: Mutex::new(()),
             state: Mutex::new(BrokerSocketState {
                 connection: SocketConnectionStatus::Connected,
-                local_address: Some(socket_address(accepted.local_address)),
-                remote_address: Some(socket_address(accepted.remote_address)),
+                local_address: Some(native_socket_address(accepted.local_address)),
+                remote_address: Some(native_socket_address(accepted.remote_address)),
                 async_error: 0,
                 listening: false,
             }),
@@ -127,11 +127,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         }
         let outcome = self
             .broker
-            .bind_socket(self.handle, broker_address(address))
+            .bind_socket(self.handle, protocol_socket_address(address))
             .map_err(|error| BindError::OperationFailed(BrokerObjectError::from(error).into()))?;
         match outcome {
             SocketOutcome::Completed(local_address) => {
-                self.state.lock().local_address = Some(socket_address(local_address));
+                self.state.lock().local_address = Some(native_socket_address(local_address));
                 Ok(())
             }
             SocketOutcome::Failed(error) => {
@@ -148,7 +148,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         match outcome {
             SocketOutcome::Completed(local_address) => {
                 let mut state = self.state.lock();
-                state.local_address = Some(socket_address(local_address));
+                state.local_address = Some(native_socket_address(local_address));
                 state.listening = true;
                 Ok(())
             }
@@ -509,14 +509,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 }
 
-fn broker_address(address: SocketAddrV4) -> BrokerSocketAddressV4 {
+fn protocol_socket_address(address: SocketAddrV4) -> BrokerSocketAddressV4 {
     BrokerSocketAddressV4 {
         address: Ipv4Address(address.ip().octets()),
         port: Port(address.port()),
     }
 }
 
-fn socket_address(address: BrokerSocketAddressV4) -> SocketAddrV4 {
+fn native_socket_address(address: BrokerSocketAddressV4) -> SocketAddrV4 {
     SocketAddrV4::new(core::net::Ipv4Addr::from(address.address.0), address.port.0)
 }
 
