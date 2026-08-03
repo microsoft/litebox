@@ -4,11 +4,12 @@
 use crate::message::{SocketRequest, SocketResponse};
 use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
 use crate::socket::{
-    AddressFamily, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-    CreateSocketResponse, IpProtocol, Ipv4Address, Port, ReceiveFlags, ReceiveSocketRequest,
-    ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse, ShutdownMode,
-    ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
-    SocketStatusRequest, SocketStatusResponse, SocketType,
+    AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
+    BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
+    CreateSocketResponse, IpProtocol, Ipv4Address, ListenSocketRequest, ListenSocketResponse, Port,
+    ReceiveFlags, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest,
+    SendSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketAddressV4,
+    SocketConnectionStatus, SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
 };
 
 use super::WireError;
@@ -20,6 +21,9 @@ const SOCKET_REQUEST_TAG_SEND: u8 = 2;
 const SOCKET_REQUEST_TAG_RECEIVE: u8 = 3;
 const SOCKET_REQUEST_TAG_SHUTDOWN: u8 = 4;
 const SOCKET_REQUEST_TAG_STATUS: u8 = 5;
+const SOCKET_REQUEST_TAG_BIND: u8 = 6;
+const SOCKET_REQUEST_TAG_LISTEN: u8 = 7;
+const SOCKET_REQUEST_TAG_ACCEPT: u8 = 8;
 
 const SOCKET_RESPONSE_TAG_CREATE: u8 = 0;
 const SOCKET_RESPONSE_TAG_CONNECT: u8 = 1;
@@ -28,6 +32,9 @@ const SOCKET_RESPONSE_TAG_RECEIVE: u8 = 3;
 const SOCKET_RESPONSE_TAG_SHUTDOWN: u8 = 4;
 const SOCKET_RESPONSE_TAG_STATUS: u8 = 5;
 const SOCKET_RESPONSE_TAG_FAILED: u8 = 6;
+const SOCKET_RESPONSE_TAG_BIND: u8 = 7;
+const SOCKET_RESPONSE_TAG_LISTEN: u8 = 8;
+const SOCKET_RESPONSE_TAG_ACCEPT: u8 = 9;
 
 const ADDRESS_FAMILY_TAG_IPV4: u8 = 0;
 
@@ -66,6 +73,20 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
             encoder.u8(SOCKET_REQUEST_TAG_CONNECT);
             encoder.handle(request.handle);
             encode_address(encoder, request.address);
+        }
+        SocketRequest::Bind(request) => {
+            encoder.u8(SOCKET_REQUEST_TAG_BIND);
+            encoder.handle(request.handle);
+            encode_address(encoder, request.address);
+        }
+        SocketRequest::Listen(request) => {
+            encoder.u8(SOCKET_REQUEST_TAG_LISTEN);
+            encoder.handle(request.handle);
+            encoder.u32(request.backlog);
+        }
+        SocketRequest::Accept(request) => {
+            encoder.u8(SOCKET_REQUEST_TAG_ACCEPT);
+            encoder.handle(request.handle);
         }
         SocketRequest::Send(request) => {
             encoder.u8(SOCKET_REQUEST_TAG_SEND);
@@ -118,6 +139,17 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
             handle: decoder.handle()?,
             address: decode_address(decoder)?,
         })),
+        SOCKET_REQUEST_TAG_BIND => Ok(SocketRequest::Bind(BindSocketRequest {
+            handle: decoder.handle()?,
+            address: decode_address(decoder)?,
+        })),
+        SOCKET_REQUEST_TAG_LISTEN => Ok(SocketRequest::Listen(ListenSocketRequest {
+            handle: decoder.handle()?,
+            backlog: decoder.u32()?,
+        })),
+        SOCKET_REQUEST_TAG_ACCEPT => Ok(SocketRequest::Accept(AcceptSocketRequest {
+            handle: decoder.handle()?,
+        })),
         SOCKET_REQUEST_TAG_SEND => Ok(SocketRequest::Send(SendSocketRequest {
             handle: decoder.handle()?,
             buffer: decode_shared_buffer_descriptor(decoder)?,
@@ -156,6 +188,20 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
         SocketResponse::Connect(response) => {
             encoder.u8(SOCKET_RESPONSE_TAG_CONNECT);
             encode_connection_status(encoder, response.status);
+        }
+        SocketResponse::Bind(response) => {
+            encoder.u8(SOCKET_RESPONSE_TAG_BIND);
+            encode_address(encoder, response.local_address);
+        }
+        SocketResponse::Listen(response) => {
+            encoder.u8(SOCKET_RESPONSE_TAG_LISTEN);
+            encode_address(encoder, response.local_address);
+        }
+        SocketResponse::Accept(response) => {
+            encoder.u8(SOCKET_RESPONSE_TAG_ACCEPT);
+            encoder.handle(response.handle);
+            encode_address(encoder, response.local_address);
+            encode_address(encoder, response.remote_address);
         }
         SocketResponse::Send(response) => {
             encoder.u8(SOCKET_RESPONSE_TAG_SEND);
@@ -196,6 +242,17 @@ pub(super) fn decode_socket_response(
         })),
         SOCKET_RESPONSE_TAG_CONNECT => Ok(SocketResponse::Connect(ConnectSocketResponse {
             status: decode_connection_status(decoder)?,
+        })),
+        SOCKET_RESPONSE_TAG_BIND => Ok(SocketResponse::Bind(BindSocketResponse {
+            local_address: decode_address(decoder)?,
+        })),
+        SOCKET_RESPONSE_TAG_LISTEN => Ok(SocketResponse::Listen(ListenSocketResponse {
+            local_address: decode_address(decoder)?,
+        })),
+        SOCKET_RESPONSE_TAG_ACCEPT => Ok(SocketResponse::Accept(AcceptSocketResponse {
+            handle: decoder.handle()?,
+            local_address: decode_address(decoder)?,
+            remote_address: decode_address(decoder)?,
         })),
         SOCKET_RESPONSE_TAG_SEND => Ok(SocketResponse::Send(SendSocketResponse {
             sent: decoder.u32()?,
