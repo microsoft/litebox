@@ -66,7 +66,7 @@ pub type DefaultFS<Platform> = LinuxFS<Platform>;
 
 pub(crate) type LinuxFS<Platform> = litebox::fs::layered::FileSystem<
     Platform,
-    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
     litebox::fs::layered::FileSystem<
         Platform,
         litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
@@ -243,7 +243,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// Create a default layered file system with the given in-memory layer and tar data.
     pub fn default_fs(
         &self,
-        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        in_mem_fs: litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
         default_fs(&self.litebox, in_mem_fs, tar_data)
@@ -390,7 +390,7 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
 /// Create a default layered file system with the given in-memory layer and tar data.
 fn default_fs<Platform: ShimPlatform>(
     litebox: &LiteBox<Platform>,
-    in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+    in_mem_fs: litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
     tar_data: Cow<'static, [u8]>,
 ) -> LinuxFS<Platform> {
     let dev_stdio = litebox::fs::resolver::Resolver::new(

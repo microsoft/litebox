@@ -21,11 +21,16 @@ impl TestLauncher {
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
         let litebox = shim_builder.litebox();
 
-        let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
-        in_mem_fs.with_root_privileges(|fs| {
-            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to set permissions on root");
-        });
+        let in_mem_fs = litebox::fs::resolver::Resolver::new(
+            litebox,
+            litebox::fs::in_mem::InMem::new_initialized([(
+                "/",
+                litebox::fs::in_mem::InitialNode::Directory {
+                    mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                    owner: litebox::fs::UserInfo::ROOT,
+                },
+            )]),
+        );
         let tar_data = if tar_data.is_empty() {
             litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
         } else {

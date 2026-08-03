@@ -3,7 +3,7 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use litebox::fs::{FileSystem as _, Mode};
+use litebox::fs::Mode;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
@@ -260,7 +260,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         egid: u32::from(DEFAULT_GUEST_GID),
     };
     let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        // The in-memory layer is pre-populated at construction, which lets us set up root-owned
+        // directories and files without ever acting as root at runtime.
+        //
+        // A host uid of 0 anywhere along the path means the entry stays root-owned; as soon as a
+        // path component belongs to a non-root host user, that component and everything below it
+        // is owned by the guest user.
+        let owner_of = |parent_host_user: u32, host_user: u32| {
+            if parent_host_user == 0 && host_user == 0 {
+                litebox::fs::UserInfo::ROOT
+            } else {
+                litebox::fs::UserInfo {
+                    user: DEFAULT_GUEST_UID,
+                    group: DEFAULT_GUEST_GID,
+                }
+            }
+        };
+        let mut entries: Vec<(String, litebox::fs::in_mem::InitialNode)> = Vec::new();
 
         // When loading the program from the tar, we don't need to create ancestor
         // directories or write the program binary into the in-memory FS -- the program
@@ -268,15 +284,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         if let Some(prog_data) = prog_data {
             let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
             let ancestors: Vec<_> = prog.ancestors().collect();
-            let chown_to_initial_user = |fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
-                                         path: &Path| {
-                fs.chown(
-                    path.to_str().unwrap(),
-                    Some(DEFAULT_GUEST_UID),
-                    Some(DEFAULT_GUEST_GID),
-                )
-                .unwrap();
-            };
             let mut prev_user = 0;
             for (path, &mode_and_user) in ancestors
                 .into_iter()
@@ -285,59 +292,50 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 .skip(1)
                 .zip(&ancestor_modes_and_users)
             {
-                if prev_user == 0 {
-                    // require root user
-                    in_mem.with_root_privileges(|fs| {
-                        fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
-                        if mode_and_user.1 != 0 {
-                            chown_to_initial_user(fs, path);
-                        }
-                    });
-                } else {
-                    in_mem
-                        .mkdir(path.to_str().unwrap(), mode_and_user.0)
-                        .unwrap();
-                }
+                entries.push((
+                    path.to_str().unwrap().to_owned(),
+                    litebox::fs::in_mem::InitialNode::Directory {
+                        mode: mode_and_user.0,
+                        owner: owner_of(prev_user, mode_and_user.1),
+                    },
+                ));
                 prev_user = mode_and_user.1;
             }
-
-            let open_file = |fs: &mut litebox::fs::in_mem::FileSystem<Platform>, path, mode| {
-                let fd = fs
-                    .open(
-                        path,
-                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                        mode,
-                    )
-                    .unwrap();
-                fs.initialize_primarily_read_heavy_file(&fd, prog_data);
-                fs.close(&fd).unwrap();
-            };
             let last = ancestor_modes_and_users.last().ok_or_else(|| {
                 anyhow!("program path has no ancestor directories (is it the root path?)")
             })?;
-            if prev_user == 0 {
-                in_mem.with_root_privileges(|fs| {
-                    open_file(fs, prog.to_str().unwrap(), last.0);
-                    if last.1 != 0 {
-                        chown_to_initial_user(fs, &prog);
-                    }
-                });
-            } else {
-                open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
-            }
+            entries.push((
+                prog.to_str().unwrap().to_owned(),
+                litebox::fs::in_mem::InitialNode::File {
+                    mode: last.0,
+                    owner: owner_of(prev_user, last.1),
+                    data: prog_data,
+                },
+            ));
         }
-        in_mem.with_root_privileges(|fs| {
-            let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-            if let Err(err) = fs.mkdir("/tmp", mode) {
-                match err {
-                    litebox::fs::errors::MkdirError::AlreadyExists => {
-                        fs.chmod("/tmp", mode).expect("Failed to call chmod");
-                    }
-                    _ => panic!(),
-                }
-            }
-        });
 
+        let tmp_mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        if let Some((_, node)) = entries.iter_mut().find(|(path, _)| path == "/tmp") {
+            // `/tmp` is an ancestor of the program, so it keeps the owner derived above and only
+            // has its mode widened.
+            let litebox::fs::in_mem::InitialNode::Directory { mode, .. } = node else {
+                unreachable!("ancestors are always directories")
+            };
+            *mode = tmp_mode;
+        } else {
+            entries.push((
+                "/tmp".to_owned(),
+                litebox::fs::in_mem::InitialNode::Directory {
+                    mode: tmp_mode,
+                    owner: litebox::fs::UserInfo::ROOT,
+                },
+            ));
+        }
+
+        let in_mem = litebox::fs::resolver::Resolver::new(
+            litebox,
+            litebox::fs::in_mem::InMem::new_initialized(entries),
+        );
         shim_builder.default_fs(in_mem, tar_data.into())
     };
 

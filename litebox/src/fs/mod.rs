@@ -44,7 +44,8 @@ mod private {
 /// A `FileSystem` provides access to all file-system related functionality provided by LiteBox.
 ///
 /// The design of the file-system is chosen by the specific underlying implementation of this trait
-/// (e.g., [`in_mem::FileSystem`]), each of which are parametric in the platform they run on.
+/// (e.g., [`resolver::Resolver`] over a [`backend::Backend`]), each of which are parametric in the
+/// platform they run on.
 /// However, users of any of these file systems might find benefit in having most of their code
 /// depend on this trait, rather than on any individual file system.
 pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
@@ -144,7 +145,7 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Get static backing data for a file, if available and supported.
     ///
     /// This method returns the (entire) underlying static byte slice if the file's contents are
-    /// backed by borrowed static data (e.g., loaded via `initialize_primarily_read_heavy_file`).
+    /// backed by borrowed static data (e.g., set up via [`in_mem::InitialNode::File`]).
     ///
     /// Returns `None` if indicating no static backing data is available/supported.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
