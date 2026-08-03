@@ -2631,8 +2631,8 @@ mod tests {
     use alloc::string::ToString as _;
     use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
-        AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
-        SocketOptionName, TcpOption, errno::Errno,
+        AddressFamily, MapFlags, ProtFlags, ReceiveFlags, SendFlags, SockFlags, SockType,
+        SocketOption, SocketOptionName, TcpOption, errno::Errno,
     };
     use zerocopy::FromZeros as _;
 
@@ -2892,18 +2892,34 @@ mod tests {
                         .do_recvfrom(client_fd, &mut recv_buf, flags, None)
                         .expect("Failed to receive data"),
                     "recvmsg" => {
+                        let mapped_buf = task
+                            .sys_mmap(
+                                0,
+                                recv_buf.len(),
+                                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                                -1,
+                                0,
+                            )
+                            .expect("failed to map recvmsg buffer");
                         let iovec = [litebox_common_linux::IoVec {
-                            iov_base: UserPtrMut::from_usize(
-                                recv_buf.as_mut_ptr().expose_provenance(),
-                            ),
+                            iov_base: mapped_buf,
                             iov_len: recv_buf.len(),
                         }];
                         let mut msg_hdr = litebox_common_linux::UserMsgHdr::new_zeroed();
                         msg_hdr.msg_iov = UserPtr::from_usize(iovec.as_ptr() as usize);
                         msg_hdr.msg_iovlen = iovec.len();
                         let msg_ptr = UserPtrMut::from_usize(&raw mut msg_hdr as usize);
-                        task.sys_recvmsg(i32::try_from(client_fd).unwrap(), msg_ptr, flags)
-                            .expect("failed to recvmsg")
+                        let received = task
+                            .sys_recvmsg(i32::try_from(client_fd).unwrap(), msg_ptr, flags)
+                            .expect("failed to recvmsg");
+                        let received_buf = mapped_buf
+                            .to_owned_slice::<crate::syscalls::tests::TestPlatform>(recv_buf.len())
+                            .expect("failed to read recvmsg buffer");
+                        recv_buf.copy_from_slice(&received_buf);
+                        task.sys_munmap(mapped_buf, recv_buf.len())
+                            .expect("failed to unmap recvmsg buffer");
+                        received
                     }
                     _ => unreachable!(),
                 };
