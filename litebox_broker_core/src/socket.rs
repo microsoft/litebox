@@ -139,7 +139,7 @@ pub fn create(
         }
     };
     resource.platform_socket.call_once(|| platform_socket);
-    let handle = reference.commit(ObjectEntry::Socket(SocketObject::new(resource)))?;
+    let handle = reference.commit(ObjectEntry::Socket(SocketObject::new(resource, request)))?;
     Ok(handle)
 }
 
@@ -154,20 +154,21 @@ pub fn connect(
     address: SocketAddressV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let object = session.authorized_object(handle, ObjectRights::WRITE)?;
-    {
+    let create_request = {
         let object = object.read();
-        let ObjectEntry::Socket(_) = &*object else {
+        let ObjectEntry::Socket(socket) = &*object else {
             return Err(BrokerError::InvalidRights);
         };
-    }
+        socket.create_request
+    };
 
     // Destination denial is an operation-level socket failure. Failures while
     // evaluating policy remain broker errors.
-    match session
-        .core
-        .policy
-        .authorize_socket_connect(session.caller_credential, address)
-    {
+    match session.core.policy.authorize_socket_connect(
+        session.caller_credential,
+        create_request,
+        address,
+    ) {
         Ok(()) => {}
         Err(BrokerError::PolicyDenied) => {
             return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
@@ -354,15 +355,17 @@ fn finish_connect(object: &spin::RwLock<ObjectEntry>, status: SocketConnectionSt
 
 pub(crate) struct SocketObject {
     resource: Arc<SocketResource>,
+    create_request: CreateSocketRequest,
     connection_status: SocketConnectionStatus,
     local_address: Option<SocketAddressV4>,
     connect_in_flight: bool,
 }
 
 impl SocketObject {
-    fn new(resource: Arc<SocketResource>) -> Self {
+    fn new(resource: Arc<SocketResource>, create_request: CreateSocketRequest) -> Self {
         Self {
             resource,
+            create_request,
             connection_status: SocketConnectionStatus::Unconnected,
             local_address: None,
             connect_in_flight: false,

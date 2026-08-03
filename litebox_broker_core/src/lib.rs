@@ -34,7 +34,10 @@ use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
-pub use policy::{PolicyEngine, PolicyProfile, SocketPolicy};
+pub use policy::{
+    Ipv4Cidr, MAX_TCP_DESTINATION_RULES, PolicyEngine, PolicyProfile, SocketPolicy,
+    SocketPolicyError, TcpDestinationPolicy, TcpDestinationRule, TcpPortRange,
+};
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
 use socket::SocketProvider;
@@ -105,7 +108,7 @@ impl Default for BrokerCoreLimits {
 /// core has already been constructed.
 #[derive(Clone)]
 pub struct BrokerCore {
-    pub(crate) policy: PolicyEngine,
+    pub(crate) policy: Arc<PolicyEngine>,
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
@@ -135,7 +138,7 @@ impl BrokerCore {
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
 
         Ok(Self {
-            policy,
+            policy: Arc::new(policy),
             limits,
             next_session_id: Arc::new(RwLock::new(1)),
             next_reference_handle: Arc::new(RwLock::new(1)),
