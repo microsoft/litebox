@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::net::SocketAddrV4;
+
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, SocketRequest, SocketResponse,
@@ -10,8 +12,8 @@ use litebox_broker_protocol::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
     ConnectSocketRequest, CreateSocketRequest, IpProtocol, ListenSocketRequest,
     MAX_SOCKET_TRANSFER_SIZE, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
-    SendSocketRequest, ShutdownMode, ShutdownSocketRequest, SocketAddressV4,
-    SocketConnectionStatus, SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
+    SendSocketRequest, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError,
+    SocketStatusRequest, SocketStatusResponse, SocketType,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -43,7 +45,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn connect_socket(
         &self,
         handle: ObjectHandle,
-        address: SocketAddressV4,
+        address: SocketAddrV4,
     ) -> Result<core::result::Result<SocketConnectionStatus, SocketError>, Channel::Error> {
         let response = self.request_socket(SocketRequest::Connect(ConnectSocketRequest {
             handle,
@@ -64,8 +66,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn bind_socket(
         &self,
         handle: ObjectHandle,
-        address: SocketAddressV4,
-    ) -> Result<core::result::Result<SocketAddressV4, SocketError>, Channel::Error> {
+        address: SocketAddrV4,
+    ) -> Result<core::result::Result<SocketAddrV4, SocketError>, Channel::Error> {
         match self.request_socket(SocketRequest::Bind(BindSocketRequest { handle, address }))? {
             SocketResponse::Bind(response) => Ok(Ok(response.local_address)),
             SocketResponse::Failed(error) => Ok(Err(error)),
@@ -82,7 +84,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         backlog: u32,
-    ) -> Result<core::result::Result<SocketAddressV4, SocketError>, Channel::Error> {
+    ) -> Result<core::result::Result<SocketAddrV4, SocketError>, Channel::Error> {
         match self.request_socket(SocketRequest::Listen(ListenSocketRequest {
             handle,
             backlog,

@@ -1,15 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::net::{Ipv4Addr, SocketAddrV4};
+
 use crate::message::{SocketRequest, SocketResponse};
 use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
     BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-    CreateSocketResponse, IpProtocol, Ipv4Address, ListenSocketRequest, ListenSocketResponse, Port,
-    ReceiveFlags, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest,
-    SendSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketAddressV4,
-    SocketConnectionStatus, SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
+    CreateSocketResponse, IpProtocol, ListenSocketRequest, ListenSocketResponse, ReceiveFlags,
+    ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse,
+    ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
+    SocketStatusResponse, SocketType,
 };
 
 use super::WireError;
@@ -307,34 +309,29 @@ fn decode_socket_error(decoder: &mut Decoder<'_>) -> Result<SocketError, WireErr
     SocketError::from_raw(decoder.u8()?).ok_or(WireError::InvalidTag)
 }
 
-fn encode_address(encoder: &mut Encoder, address: SocketAddressV4) {
-    for octet in address.address.0 {
+fn encode_address(encoder: &mut Encoder, address: SocketAddrV4) {
+    for octet in address.ip().octets() {
         encoder.u8(octet);
     }
-    encoder.u16(address.port.0);
+    encoder.u16(address.port());
 }
 
-fn decode_address(decoder: &mut Decoder<'_>) -> Result<SocketAddressV4, WireError> {
+fn decode_address(decoder: &mut Decoder<'_>) -> Result<SocketAddrV4, WireError> {
     let mut octets = [0; 4];
     for octet in &mut octets {
         *octet = decoder.u8()?;
     }
-    Ok(SocketAddressV4 {
-        address: Ipv4Address(octets),
-        port: Port(decoder.u16()?),
-    })
+    Ok(SocketAddrV4::new(Ipv4Addr::from(octets), decoder.u16()?))
 }
 
-fn encode_optional_address(encoder: &mut Encoder, address: Option<SocketAddressV4>) {
+fn encode_optional_address(encoder: &mut Encoder, address: Option<SocketAddrV4>) {
     encoder.u8(u8::from(address.is_some()));
     if let Some(address) = address {
         encode_address(encoder, address);
     }
 }
 
-fn decode_optional_address(
-    decoder: &mut Decoder<'_>,
-) -> Result<Option<SocketAddressV4>, WireError> {
+fn decode_optional_address(decoder: &mut Decoder<'_>) -> Result<Option<SocketAddrV4>, WireError> {
     match decoder.u8()? {
         0 => Ok(None),
         1 => decode_address(decoder).map(Some),

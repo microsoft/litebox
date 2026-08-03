@@ -353,13 +353,13 @@ mod tests {
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
         BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-        CreateSocketResponse, IpProtocol, Ipv4Address, ListenSocketRequest, ListenSocketResponse,
-        Port, ReceiveFlags, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
-        SendSocketRequest, SendSocketResponse, ShutdownMode, ShutdownSocketRequest,
-        SocketAddressV4, SocketConnectionStatus, SocketError, SocketStatusRequest,
-        SocketStatusResponse, SocketType,
+        CreateSocketResponse, IpProtocol, ListenSocketRequest, ListenSocketResponse, ReceiveFlags,
+        ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest,
+        SendSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
+        SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
+    use core::net::{Ipv4Addr, SocketAddrV4};
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 
@@ -431,10 +431,7 @@ mod tests {
             })),
             BrokerOperation::Socket(SocketRequest::Bind(BindSocketRequest {
                 handle,
-                address: SocketAddressV4 {
-                    address: Ipv4Address([127, 0, 0, 1]),
-                    port: Port(0),
-                },
+                address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
             })),
             BrokerOperation::Socket(SocketRequest::Listen(ListenSocketRequest {
                 handle,
@@ -443,10 +440,7 @@ mod tests {
             BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest { handle })),
             BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                 handle,
-                address: SocketAddressV4 {
-                    address: Ipv4Address([203, 0, 113, 7]),
-                    port: Port(443),
-                },
+                address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
             })),
             BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
                 handle,
@@ -643,27 +637,15 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResult::Socket(SocketResponse::Create(CreateSocketResponse { handle })),
             BrokerResult::Socket(SocketResponse::Bind(BindSocketResponse {
-                local_address: SocketAddressV4 {
-                    address: Ipv4Address([127, 0, 0, 1]),
-                    port: Port(49152),
-                },
+                local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
             })),
             BrokerResult::Socket(SocketResponse::Listen(ListenSocketResponse {
-                local_address: SocketAddressV4 {
-                    address: Ipv4Address([127, 0, 0, 1]),
-                    port: Port(49152),
-                },
+                local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
             })),
             BrokerResult::Socket(SocketResponse::Accept(AcceptSocketResponse {
                 handle,
-                local_address: SocketAddressV4 {
-                    address: Ipv4Address([127, 0, 0, 1]),
-                    port: Port(49152),
-                },
-                remote_address: SocketAddressV4 {
-                    address: Ipv4Address([127, 0, 0, 1]),
-                    port: Port(49153),
-                },
+                local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
+                remote_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
             })),
             BrokerResult::Socket(SocketResponse::Status(socket_status(
                 SocketConnectionStatus::Unconnected,
@@ -690,10 +672,7 @@ mod tests {
             ))),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddressV4 {
-                    address: Ipv4Address([127, 0, 0, 1]),
-                    port: Port(49152),
-                }),
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
                 pending_error: Some(SocketError::ConnectionReset),
             })),
             BrokerResult::Socket(SocketResponse::Status(socket_status(
@@ -884,10 +863,7 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                 handle: ObjectHandle(9),
-                address: SocketAddressV4 {
-                    address: Ipv4Address([203, 0, 113, 7]),
-                    port: Port(443),
-                },
+                address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
             })),
         });
         assert_eq!(
@@ -1133,10 +1109,7 @@ mod tests {
                 request_id: RequestId(13),
                 operation: BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                     handle: ObjectHandle(9),
-                    address: SocketAddressV4 {
-                        address: Ipv4Address([203, 0, 113, 7]),
-                        port: Port(443),
-                    },
+                    address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
                 })),
             }),
             [
@@ -1163,14 +1136,8 @@ mod tests {
                 request_id: RequestId(13),
                 result: BrokerResult::Socket(SocketResponse::Accept(AcceptSocketResponse {
                     handle: ObjectHandle(9),
-                    local_address: SocketAddressV4 {
-                        address: Ipv4Address([127, 0, 0, 1]),
-                        port: Port(49152),
-                    },
-                    remote_address: SocketAddressV4 {
-                        address: Ipv4Address([203, 0, 113, 7]),
-                        port: Port(443),
-                    },
+                    local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
+                    remote_address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
                 })),
             }),
             [

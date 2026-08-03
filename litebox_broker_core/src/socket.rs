@@ -4,14 +4,15 @@
 //! Broker-owned platform socket authority.
 
 use alloc::sync::Arc;
+use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    CreateSocketRequest, Ipv4Address, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG, Port,
-    ReceiveFlags, ReceiveSocketResponse, SendFlags, ShutdownMode, SocketAddressV4,
-    SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse,
+    CreateSocketRequest, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG, ReceiveFlags,
+    ReceiveSocketResponse, SendFlags, ShutdownMode, SocketConnectionStatus, SocketError,
+    SocketOutcome, SocketStatusResponse,
 };
 use spin::Once;
 
@@ -19,19 +20,16 @@ use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result, SessionId};
 
-const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddressV4 = SocketAddressV4 {
-    address: Ipv4Address([127, 0, 0, 1]),
-    port: Port(0),
-};
+const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
 
 /// Platform socket and endpoint metadata returned by an accept operation.
 pub struct AcceptedPlatformSocket {
     /// Accepted nonblocking platform socket.
     pub socket: Arc<dyn PlatformSocket>,
     /// Local endpoint of the accepted connection.
-    pub local_address: SocketAddressV4,
+    pub local_address: SocketAddrV4,
     /// Remote endpoint of the accepted connection.
-    pub remote_address: SocketAddressV4,
+    pub remote_address: SocketAddrV4,
 }
 
 /// Broker socket and endpoint metadata returned by an accept operation.
@@ -39,9 +37,9 @@ pub struct AcceptedSocket {
     /// Broker handle naming the accepted socket.
     pub handle: ObjectHandle,
     /// Local endpoint of the accepted connection.
-    pub local_address: SocketAddressV4,
+    pub local_address: SocketAddrV4,
     /// Remote endpoint of the accepted connection.
-    pub remote_address: SocketAddressV4,
+    pub remote_address: SocketAddrV4,
 }
 
 /// Broker-wide socket provider supplied by the host platform.
@@ -71,10 +69,10 @@ pub trait SocketProvider: Send + Sync {
 /// releases the platform socket.
 pub trait PlatformSocket: Send + Sync {
     /// Binds this socket to a local address.
-    fn bind(&self, address: SocketAddressV4) -> Result<SocketOutcome<SocketAddressV4>>;
+    fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Makes this socket listen for incoming connections.
-    fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddressV4>>;
+    fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Accepts one pending connection without waiting.
     fn accept(
@@ -89,7 +87,7 @@ pub trait PlatformSocket: Send + Sync {
     /// failures return `Failed`. A broker error is surfaced for that call and
     /// leaves the socket terminally failed, because retrying a platform call
     /// that may already have side effects is unsafe.
-    fn connect(&self, address: SocketAddressV4) -> Result<SocketConnectionStatus>;
+    fn connect(&self, address: SocketAddrV4) -> Result<SocketConnectionStatus>;
 
     /// Sends bytes without waiting for platform readiness.
     ///
@@ -188,7 +186,7 @@ pub fn create(
 pub fn connect(
     session: &BrokerSession,
     handle: ObjectHandle,
-    address: SocketAddressV4,
+    address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let object = session.authorized_object(handle, ObjectRights::WRITE)?;
     let create_request = {
@@ -249,8 +247,8 @@ pub fn connect(
 pub fn bind(
     session: &BrokerSession,
     handle: ObjectHandle,
-    address: SocketAddressV4,
-) -> Result<SocketOutcome<SocketAddressV4>> {
+    address: SocketAddrV4,
+) -> Result<SocketOutcome<SocketAddrV4>> {
     let object = session.authorized_object(handle, ObjectRights::WRITE)?;
     let (resource, create_request) = {
         let mut object = object.write();
@@ -305,7 +303,7 @@ pub fn listen(
     session: &BrokerSession,
     handle: ObjectHandle,
     backlog: u32,
-) -> Result<SocketOutcome<SocketAddressV4>> {
+) -> Result<SocketOutcome<SocketAddrV4>> {
     if backlog > MAX_TCP_LISTEN_BACKLOG {
         return Err(BrokerError::UnsupportedOperation);
     }
@@ -581,7 +579,7 @@ fn finish_connect(object: &spin::RwLock<ObjectEntry>, status: SocketConnectionSt
 
 fn finish_configuration(
     object: &spin::RwLock<ObjectEntry>,
-    local_address: Option<SocketAddressV4>,
+    local_address: Option<SocketAddrV4>,
     listening: bool,
 ) {
     let mut object = object.write();
@@ -596,7 +594,7 @@ pub(crate) struct SocketObject {
     resource: Arc<SocketResource>,
     create_request: CreateSocketRequest,
     connection_status: SocketConnectionStatus,
-    local_address: Option<SocketAddressV4>,
+    local_address: Option<SocketAddrV4>,
     connect_in_flight: bool,
     configuration_in_flight: bool,
     listening: bool,
@@ -618,7 +616,7 @@ impl SocketObject {
     fn new_connected(
         resource: Arc<SocketResource>,
         create_request: CreateSocketRequest,
-        local_address: SocketAddressV4,
+        local_address: SocketAddrV4,
     ) -> Self {
         Self {
             resource,
@@ -650,15 +648,15 @@ impl SocketResource {
             .as_ref()
     }
 
-    fn connect(&self, address: SocketAddressV4) -> Result<SocketConnectionStatus> {
+    fn connect(&self, address: SocketAddrV4) -> Result<SocketConnectionStatus> {
         self.platform_socket().connect(address)
     }
 
-    fn bind(&self, address: SocketAddressV4) -> Result<SocketOutcome<SocketAddressV4>> {
+    fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>> {
         self.platform_socket().bind(address)
     }
 
-    fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddressV4>> {
+    fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>> {
         self.platform_socket().listen(backlog)
     }
 
@@ -754,9 +752,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::readiness::tests::TestReadinessSink;
     use crate::{BrokerCore, CallerCredential};
-    use litebox_broker_protocol::socket::{
-        AddressFamily, IpProtocol, Ipv4Address, Port, SocketType,
-    };
+    use litebox_broker_protocol::socket::{AddressFamily, IpProtocol, SocketType};
     use std::sync::{Mutex as StdMutex, mpsc};
     use std::time::Duration;
 
@@ -774,7 +770,7 @@ pub(crate) mod tests {
         status_calls: AtomicUsize,
         status_responses: StdMutex<std::collections::VecDeque<SocketStatusResponse>>,
         status_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
-        binds: StdMutex<std::vec::Vec<SocketAddressV4>>,
+        binds: StdMutex<std::vec::Vec<SocketAddrV4>>,
         listens: StdMutex<std::vec::Vec<u32>>,
         shutdown_calls: AtomicUsize,
         dropped_sockets: AtomicUsize,
@@ -828,20 +824,22 @@ pub(crate) mod tests {
     }
 
     impl PlatformSocket for TestPlatformSocket {
-        fn bind(&self, mut address: SocketAddressV4) -> Result<SocketOutcome<SocketAddressV4>> {
+        fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>> {
             self.state.binds.lock().unwrap().push(address);
-            if address.port == Port(0) {
-                address.port = Port(49152);
-            }
+            let address = if address.port() == 0 {
+                SocketAddrV4::new(*address.ip(), 49152)
+            } else {
+                address
+            };
             Ok(SocketOutcome::Completed(address))
         }
 
-        fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddressV4>> {
+        fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>> {
             self.state.listens.lock().unwrap().push(backlog);
-            Ok(SocketOutcome::Completed(SocketAddressV4 {
-                address: Ipv4Address([127, 0, 0, 1]),
-                port: Port(49152),
-            }))
+            Ok(SocketOutcome::Completed(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                49152,
+            )))
         }
 
         fn accept(
@@ -851,7 +849,7 @@ pub(crate) mod tests {
             Err(BrokerError::WouldBlock)
         }
 
-        fn connect(&self, _address: SocketAddressV4) -> Result<SocketConnectionStatus> {
+        fn connect(&self, _address: SocketAddrV4) -> Result<SocketConnectionStatus> {
             self.state.connect_calls.fetch_add(1, Ordering::Relaxed);
             if self.state.fail_connect.swap(false, Ordering::Relaxed) {
                 return Err(BrokerError::Internal);
@@ -973,10 +971,7 @@ pub(crate) mod tests {
             connect(
                 &session,
                 handle,
-                SocketAddressV4 {
-                    address: Ipv4Address([10, 0, 0, 1]),
-                    port: Port(80),
-                },
+                SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 80),
             ),
             Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
         );
@@ -1062,10 +1057,7 @@ pub(crate) mod tests {
             .unwrap();
         let readiness = Arc::new(TestReadinessSink::default());
         let listener = create(&session, create_request(), readiness.clone()).unwrap();
-        let non_loopback = SocketAddressV4 {
-            address: Ipv4Address([10, 0, 0, 1]),
-            port: Port(8080),
-        };
+        let non_loopback = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8080);
         let binds_before = provider.state.binds.lock().unwrap().len();
         assert_eq!(
             bind(&session, listener, non_loopback),
@@ -1073,14 +1065,8 @@ pub(crate) mod tests {
         );
         assert_eq!(provider.state.binds.lock().unwrap().len(), binds_before);
 
-        let requested_address = SocketAddressV4 {
-            address: Ipv4Address([127, 0, 0, 1]),
-            port: Port(0),
-        };
-        let local_address = SocketAddressV4 {
-            address: Ipv4Address([127, 0, 0, 1]),
-            port: Port(49152),
-        };
+        let requested_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        let local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152);
         assert_eq!(
             bind(&session, listener, requested_address),
             Ok(SocketOutcome::Completed(local_address))
@@ -1297,10 +1283,7 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
         );
 
-        let local_address = SocketAddressV4 {
-            address: Ipv4Address([127, 0, 0, 1]),
-            port: Port(49152),
-        };
+        let local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152);
         *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
             SocketStatusResponse {
                 status: SocketConnectionStatus::Connecting,
@@ -1358,10 +1341,7 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
         );
 
-        let local_address = SocketAddressV4 {
-            address: Ipv4Address([127, 0, 0, 1]),
-            port: Port(49153),
-        };
+        let local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153);
         provider
             .state
             .status_responses
@@ -1390,10 +1370,7 @@ pub(crate) mod tests {
         }
     }
 
-    const fn loopback_address() -> SocketAddressV4 {
-        SocketAddressV4 {
-            address: Ipv4Address([127, 0, 0, 1]),
-            port: Port(8080),
-        }
+    const fn loopback_address() -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)
     }
 }

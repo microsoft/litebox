@@ -602,6 +602,7 @@ pub enum ConnectionTermination {
 mod tests {
     use super::*;
     use core::cell::Cell;
+    use core::net::{Ipv4Addr, SocketAddrV4};
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{AcceptedPlatformSocket, PlatformSocket, SocketProvider};
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
@@ -615,10 +616,9 @@ mod tests {
         SharedBufferDescriptor,
     };
     use litebox_broker_protocol::socket::{
-        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, Ipv4Address, Port,
-        ReceiveFlags, ReceiveSocketRequest, SendFlags, SendSocketRequest, ShutdownMode,
-        ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
-        SocketStatusRequest, SocketStatusResponse, SocketType,
+        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
+        ReceiveSocketRequest, SendFlags, SendSocketRequest, ShutdownMode, ShutdownSocketRequest,
+        SocketConnectionStatus, SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
@@ -678,22 +678,24 @@ mod tests {
     impl PlatformSocket for TestPlatformSocket {
         fn bind(
             &self,
-            mut address: SocketAddressV4,
-        ) -> litebox_broker_core::Result<SocketOutcome<SocketAddressV4>> {
-            if address.port == Port(0) {
-                address.port = Port(49152);
-            }
+            address: SocketAddrV4,
+        ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            let address = if address.port() == 0 {
+                SocketAddrV4::new(*address.ip(), 49152)
+            } else {
+                address
+            };
             Ok(SocketOutcome::Completed(address))
         }
 
         fn listen(
             &self,
             _backlog: u32,
-        ) -> litebox_broker_core::Result<SocketOutcome<SocketAddressV4>> {
-            Ok(SocketOutcome::Completed(SocketAddressV4 {
-                address: Ipv4Address([127, 0, 0, 1]),
-                port: Port(49152),
-            }))
+        ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            Ok(SocketOutcome::Completed(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                49152,
+            )))
         }
 
         fn accept(
@@ -705,7 +707,7 @@ mod tests {
 
         fn connect(
             &self,
-            _address: SocketAddressV4,
+            _address: SocketAddrV4,
         ) -> litebox_broker_core::Result<SocketConnectionStatus> {
             self.readiness
                 .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)?;
@@ -1189,10 +1191,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                     handle: response.handle,
-                    address: SocketAddressV4 {
-                        address: Ipv4Address([10, 0, 0, 1]),
-                        port: Port(8080),
-                    },
+                    address: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8080),
                 })),
                 &shared_buffers,
             ),
@@ -1203,10 +1202,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                     handle: response.handle,
-                    address: SocketAddressV4 {
-                        address: Ipv4Address([127, 0, 0, 1]),
-                        port: Port(8080),
-                    },
+                    address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080),
                 })),
                 &shared_buffers,
             ),

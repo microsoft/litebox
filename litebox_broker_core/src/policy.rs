@@ -1,9 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::net::SocketAddrV4;
+
 use crate::{BrokerError, CallerCredential, ObjectRights};
 use litebox_broker_protocol::socket::{
-    AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port, SocketAddressV4, SocketType,
+    AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port, SocketType,
 };
 use thiserror::Error;
 
@@ -135,10 +137,12 @@ impl TcpDestinationRule {
         self.ports
     }
 
-    fn permits(self, caller_credential: CallerCredential, address: SocketAddressV4) -> bool {
+    fn permits(self, caller_credential: CallerCredential, address: SocketAddrV4) -> bool {
         self.caller_credential == caller_credential
-            && self.destination.contains(address.address)
-            && self.ports.contains(address.port)
+            && self
+                .destination
+                .contains(Ipv4Address(address.ip().octets()))
+            && self.ports.contains(Port(address.port()))
     }
 }
 
@@ -251,11 +255,11 @@ impl SocketPolicy {
     fn permits_tcp_destination(
         self,
         caller_credential: CallerCredential,
-        address: SocketAddressV4,
+        address: SocketAddrV4,
     ) -> bool {
         match self {
             Self::Deny => false,
-            Self::Ipv4LoopbackTcp => address.address.0[0] == 127,
+            Self::Ipv4LoopbackTcp => address.ip().is_loopback(),
             Self::TcpDestinationRules(policy) => policy
                 .rules()
                 .iter()
@@ -358,7 +362,7 @@ impl PolicyEngine {
         &self,
         caller_credential: CallerCredential,
         request: CreateSocketRequest,
-        address: SocketAddressV4,
+        address: SocketAddrV4,
     ) -> Result<(), BrokerError> {
         self.principal_object_rights(caller_credential)?;
         if request.address_family == AddressFamily::Ipv4
@@ -378,7 +382,7 @@ impl PolicyEngine {
         &self,
         caller_credential: CallerCredential,
         request: CreateSocketRequest,
-        address: SocketAddressV4,
+        address: SocketAddrV4,
     ) -> Result<(), BrokerError> {
         self.principal_object_rights(caller_credential)?;
         // Egress rules do not describe local listener authority. Socket
@@ -386,7 +390,7 @@ impl PolicyEngine {
         if request.address_family == AddressFamily::Ipv4
             && request.socket_type == SocketType::Stream
             && request.protocol == IpProtocol::Tcp
-            && address.address.0[0] == 127
+            && address.ip().is_loopback()
         {
             Ok(())
         } else {
@@ -404,6 +408,7 @@ impl Default for PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::net::Ipv4Addr;
 
     const IPV4_TCP: CreateSocketRequest = CreateSocketRequest {
         address_family: AddressFamily::Ipv4,
@@ -419,11 +424,8 @@ mod tests {
         TcpPortRange::new(Port(start), Port(end)).unwrap()
     }
 
-    fn address(address: [u8; 4], port: u16) -> SocketAddressV4 {
-        SocketAddressV4 {
-            address: Ipv4Address(address),
-            port: Port(port),
-        }
+    fn address(address: [u8; 4], port: u16) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::from(address), port)
     }
 
     #[test]

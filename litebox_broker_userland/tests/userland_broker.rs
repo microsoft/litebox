@@ -140,9 +140,7 @@ fn run_fake_runner(args: &[OsString]) {
     let local = Arc::new(local);
 
     if args.get(3).and_then(|argument| argument.to_str()) == Some(NETWORK_RUNNER_ARGUMENT) {
-        use litebox_broker_protocol::socket::{
-            Ipv4Address, Port, SocketAddressV4, SocketConnectionStatus,
-        };
+        use litebox_broker_protocol::socket::SocketConnectionStatus;
 
         assert_eq!(args.len(), 6, "unexpected runner arguments: {args:?}");
         let address = args[4]
@@ -153,13 +151,7 @@ fn run_fake_runner(args: &[OsString]) {
         let port = args[5].to_str().unwrap().parse::<u16>().unwrap();
         let handle = local.create_tcp_socket().unwrap();
         let mut status = local
-            .connect_socket(
-                handle,
-                SocketAddressV4 {
-                    address: Ipv4Address(address.octets()),
-                    port: Port(port),
-                },
-            )
+            .connect_socket(handle, std::net::SocketAddrV4::new(address, port))
             .unwrap()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
