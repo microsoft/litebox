@@ -3,6 +3,9 @@ name = "litebox_shim_windows"
 version = "0.1.0"
 edition = "2024"
 
+[build-dependencies]
+litebox_common_windows = { path = "../litebox_common_windows/", version = "0.1.0" }
+
 [dependencies]
 bitflags = { version = "2.9.0", default-features = false }
 int-enum = "1.2.0"
