@@ -110,3 +110,102 @@ fn test_bidirectional_tcp_communication_automatic() {
     network.set_platform_interaction(PlatformInteraction::Automatic);
     bidi_tcp_comms(network, |_| {});
 }
+
+#[test]
+fn attach_socket_proxy_is_idempotent() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    let fd = network
+        .socket(Protocol::Tcp)
+        .expect("failed to create TCP socket");
+
+    let first = network
+        .attach_socket_proxy(&fd)
+        .expect("TCP socket must support a proxy");
+    let second = network
+        .attach_socket_proxy(&fd)
+        .expect("TCP socket must retain its proxy");
+
+    assert!(alloc::sync::Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn pinned_immediate_close_remains_abortive() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    let fd = network
+        .socket(Protocol::Tcp)
+        .expect("failed to create TCP socket");
+    let entry = litebox
+        .descriptor_table()
+        .entry_handle(&fd)
+        .expect("socket entry must exist");
+
+    network
+        .close(&fd, CloseBehavior::Immediate)
+        .expect("close must be queued while the entry is pinned");
+    assert!(
+        entry.with_entry(|socket| socket.entry.tcp().immediate_close.load(Ordering::SeqCst)),
+        "queued close must retain abortive semantics"
+    );
+
+    drop(entry);
+    assert!(!network.finish_deferred_closes());
+    assert!(network.queued_for_closure.is_empty());
+}
+
+#[test]
+fn final_duplicate_close_updates_abortive_behavior() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    let fd = network
+        .socket(Protocol::Tcp)
+        .expect("failed to create TCP socket");
+    let duplicate = litebox
+        .descriptor_table_mut()
+        .duplicate(&fd)
+        .expect("socket duplication must succeed");
+    let entry = litebox
+        .descriptor_table()
+        .entry_handle(&duplicate)
+        .expect("socket entry must exist");
+
+    network
+        .close(&fd, CloseBehavior::Immediate)
+        .expect("first duplicate close must be queued");
+    assert!(entry.with_entry(|socket| socket.entry.tcp().immediate_close.load(Ordering::SeqCst)));
+
+    network
+        .close(&duplicate, CloseBehavior::Graceful)
+        .expect("final duplicate close must be queued while the entry is pinned");
+    assert!(
+        !entry.with_entry(|socket| socket.entry.tcp().immediate_close.load(Ordering::SeqCst)),
+        "the final descriptor close must determine abortive behavior"
+    );
+
+    drop(entry);
+    assert!(!network.finish_deferred_closes());
+    assert!(network.queued_for_closure.is_empty());
+}
+
+#[test]
+fn final_duplicate_close_is_reaped_immediately() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    let fd = network
+        .socket(Protocol::Tcp)
+        .expect("failed to create TCP socket");
+    let duplicate = litebox
+        .descriptor_table_mut()
+        .duplicate(&fd)
+        .expect("socket duplication must succeed");
+
+    network
+        .close(&fd, CloseBehavior::Graceful)
+        .expect("first duplicate close must be queued");
+    assert_eq!(network.queued_for_closure.len(), 1);
+    network
+        .close(&duplicate, CloseBehavior::Graceful)
+        .expect("final duplicate close must succeed");
+    assert!(network.queued_for_closure.is_empty());
+}

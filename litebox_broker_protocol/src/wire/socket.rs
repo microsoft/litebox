@@ -38,6 +38,7 @@ const IP_PROTOCOL_TAG_TCP: u8 = 0;
 const SHUTDOWN_TAG_READ: u8 = 0;
 const SHUTDOWN_TAG_WRITE: u8 = 1;
 const SHUTDOWN_TAG_BOTH: u8 = 2;
+const SHUTDOWN_TAG_ABORT: u8 = 3;
 
 const CONNECTION_STATUS_TAG_UNCONNECTED: u8 = 0;
 const CONNECTION_STATUS_TAG_CONNECTING: u8 = 1;
@@ -87,6 +88,7 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
                 ShutdownMode::Read => SHUTDOWN_TAG_READ,
                 ShutdownMode::Write => SHUTDOWN_TAG_WRITE,
                 ShutdownMode::Both => SHUTDOWN_TAG_BOTH,
+                ShutdownMode::Abort => SHUTDOWN_TAG_ABORT,
             });
         }
         SocketRequest::Status(request) => {
@@ -134,6 +136,7 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
                 SHUTDOWN_TAG_READ => ShutdownMode::Read,
                 SHUTDOWN_TAG_WRITE => ShutdownMode::Write,
                 SHUTDOWN_TAG_BOTH => ShutdownMode::Both,
+                SHUTDOWN_TAG_ABORT => ShutdownMode::Abort,
                 _ => return Err(WireError::InvalidTag),
             },
         })),

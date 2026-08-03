@@ -34,16 +34,18 @@ use errors::{
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
-fn socket_error_from_broker(error: crate::broker::error::BrokerObjectError) -> SocketError {
-    match error {
-        crate::broker::error::BrokerObjectError::ResourceExhausted
-        | crate::broker::error::BrokerObjectError::OutOfMemory => SocketError::ResourceExhausted,
-        crate::broker::error::BrokerObjectError::PermissionDenied => SocketError::PermissionDenied,
-        crate::broker::error::BrokerObjectError::Control
-        | crate::broker::error::BrokerObjectError::InvalidObject
-        | crate::broker::error::BrokerObjectError::WouldBlock
-        | crate::broker::error::BrokerObjectError::PeerClosed
-        | crate::broker::error::BrokerObjectError::UnsupportedOperation => SocketError::Io,
+impl From<crate::broker::error::BrokerObjectError> for SocketError {
+    fn from(error: crate::broker::error::BrokerObjectError) -> Self {
+        match error {
+            crate::broker::error::BrokerObjectError::ResourceExhausted
+            | crate::broker::error::BrokerObjectError::OutOfMemory => Self::ResourceExhausted,
+            crate::broker::error::BrokerObjectError::PermissionDenied => Self::PermissionDenied,
+            crate::broker::error::BrokerObjectError::Control
+            | crate::broker::error::BrokerObjectError::InvalidObject
+            | crate::broker::error::BrokerObjectError::WouldBlock
+            | crate::broker::error::BrokerObjectError::PeerClosed
+            | crate::broker::error::BrokerObjectError::UnsupportedOperation => Self::BackendFailure,
+        }
     }
 }
 
@@ -84,7 +86,8 @@ const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::fr
 /// An important decision that must be made by a user of a `Network` is decided by
 /// [`set_platform_interaction`](Self::set_platform_interaction), whose docs explain this further.
 ///
-/// A user of `Network` who care about [events](crate::event) should call [set_socket_proxy](Self::set_socket_proxy)
+/// A user of `Network` who cares about [events](crate::event) should call
+/// [`attach_socket_proxy`](Self::attach_socket_proxy)
 /// to set up a proxy for each socket created, so that events can be notified properly.
 pub struct Network<Platform>
 where
@@ -180,7 +183,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
     }
 
     /// Convenience function to perform an operation depending on the socket type
-    fn with_socket<TCP, UDP, R>(
+    fn with_smoltcp_socket<TCP, UDP, R>(
         &self,
         socket_set: &smoltcp::iface::SocketSet<'static>,
         tcp: TCP,
@@ -206,7 +209,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
     }
 
     // Convenience function to perform a mutable operation depending on the socket type
-    fn with_socket_mut<TCP, UDP, R>(
+    fn with_smoltcp_socket_mut<TCP, UDP, R>(
         &mut self,
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         tcp: TCP,
@@ -569,7 +572,7 @@ where
                     continue;
                 }
 
-                let closed = socket_handle.with_socket_mut(
+                let closed = socket_handle.with_smoltcp_socket_mut(
                     &mut self.socket_set,
                     |tcp_socket| {
                         let has_pending_data = tcp_socket.may_send() && tcp_socket.send_queue() > 0;
@@ -771,14 +774,14 @@ where
     /// Creates a socket.
     ///
     /// By default, the created socket has no associated proxy; to set a proxy, use
-    /// [`set_socket_proxy`](Self::set_socket_proxy).
+    /// [`attach_socket_proxy`](Self::attach_socket_proxy).
     pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
         let broker_socket = if matches!(protocol, Protocol::Tcp) {
             self.litebox
                 .broker_control()
                 .map(|broker| {
                     BrokerTcpSocket::new(broker, self.litebox.broker_pollable_registry())
-                        .map_err(socket_error_from_broker)
+                        .map_err(SocketError::from)
                 })
                 .transpose()?
         } else {
@@ -861,43 +864,42 @@ where
         self.litebox.descriptor_table_mut().insert(socket_handle)
     }
 
-    /// Creates the userspace I/O proxy matching the backend of `fd`.
-    pub fn new_socket_proxy(&self, fd: &SocketFd<Platform>) -> Option<NetworkProxy<Platform>> {
-        let descriptor_table = self.litebox.descriptor_table();
-        let entry = descriptor_table.get_entry(fd)?;
-        if let Some(socket) = &entry.entry.broker_socket {
-            return Some(NetworkProxy::BrokerStream(alloc::sync::Arc::clone(socket)));
-        }
-        Some(match entry.entry.protocol() {
-            Protocol::Tcp => NetworkProxy::Stream(socket_channel::StreamSocketChannel::new()),
-            Protocol::Udp => NetworkProxy::Datagram(socket_channel::DatagramSocketChannel::new()),
-            Protocol::Raw { .. } => NetworkProxy::Raw,
-            Protocol::Icmp => return None,
-        })
-    }
-
-    /// Set the network proxy for the socket at `fd`
+    /// Creates and attaches the userspace I/O proxy matching the backend of `fd`.
     ///
-    /// Associating a proxy enables event notification and sending/receiving data without accessing
-    /// [`Network`] (which may help avoid lock contention but still requires a periodic call to
-    /// [`perform_platform_interaction`](Self::perform_platform_interaction) to move data between smoltcp
-    /// and the socket channels though).
+    /// Locally implemented sockets receive a channel that transfers data to and from smoltcp.
+    /// Broker-owned TCP sockets instead receive a proxy for their existing broker socket. The
+    /// returned [`Arc`](alloc::sync::Arc) is the same proxy stored by the network subsystem for
+    /// event notification and backend interaction.
     ///
-    /// If no proxy is set, then the socket can still be used for sending/receiving data via [`Network`]
-    /// interfaces like [`send`](Self::send)/[`receive`](Self::receive), but no events will be notified.
+    /// If a proxy is already attached, this returns another reference to that proxy.
+    ///
+    /// Returns `None` if `fd` is invalid or its protocol does not support userspace I/O proxies.
     #[must_use]
-    pub fn set_socket_proxy(
-        &mut self,
+    pub fn attach_socket_proxy(
+        &self,
         fd: &SocketFd<Platform>,
-        proxy: alloc::sync::Arc<NetworkProxy<Platform>>,
-    ) -> bool {
+    ) -> Option<alloc::sync::Arc<NetworkProxy<Platform>>> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Some(mut table_entry) = descriptor_table.get_entry_mut(fd) else {
-            return false;
+        let mut entry = descriptor_table.get_entry_mut(fd)?;
+        let socket_handle = &mut entry.entry;
+        if let Some(proxy) = &socket_handle.proxy {
+            return Some(alloc::sync::Arc::clone(proxy));
+        }
+        let proxy = if let Some(socket) = &socket_handle.broker_socket {
+            NetworkProxy::BrokerStream(alloc::sync::Arc::clone(socket))
+        } else {
+            match socket_handle.protocol() {
+                Protocol::Tcp => NetworkProxy::Stream(socket_channel::StreamSocketChannel::new()),
+                Protocol::Udp => {
+                    NetworkProxy::Datagram(socket_channel::DatagramSocketChannel::new())
+                }
+                Protocol::Raw { .. } => NetworkProxy::Raw,
+                Protocol::Icmp => return None,
+            }
         };
-        let socket_handle = &mut table_entry.entry;
-        socket_handle.proxy = Some(proxy);
-        true
+        let proxy = alloc::sync::Arc::new(proxy);
+        socket_handle.proxy = Some(alloc::sync::Arc::clone(&proxy));
+        Some(proxy)
     }
 
     /// Close the socket at `fd`
@@ -907,21 +909,21 @@ where
         behavior: CloseBehavior,
     ) -> Result<(), CloseError> {
         let mut dt = self.litebox.descriptor_table_mut();
+        dt.with_entry_mut(fd, |entry| {
+            let socket_handle = &entry.entry;
+            if let crate::net::Protocol::Tcp = socket_handle.protocol() {
+                socket_handle.tcp().immediate_close.store(
+                    matches!(behavior, CloseBehavior::Immediate),
+                    Ordering::SeqCst,
+                );
+            }
+        })
+        .ok_or(CloseError::InvalidFd)?;
         // We close immediately if we can
         match dt
             .close_and_duplicate_if_shared(fd, |entry| {
                 match behavior {
-                    CloseBehavior::Immediate => {
-                        let socket_handle = &entry.entry;
-                        if let crate::net::Protocol::Tcp = socket_handle.protocol() {
-                            socket_handle
-                                .tcp()
-                                .immediate_close
-                                .store(true, Ordering::SeqCst);
-                        }
-                        return true;
-                    }
-                    CloseBehavior::Graceful => return true,
+                    CloseBehavior::Immediate | CloseBehavior::Graceful => return true,
                     CloseBehavior::GracefulIfNoPendingData => {}
                 }
                 // check if there is pending data to be sent
@@ -934,7 +936,7 @@ where
                 if socket_handle.broker_socket.is_some() {
                     return true;
                 }
-                !socket_handle.with_socket(
+                !socket_handle.with_smoltcp_socket(
                     &self.socket_set,
                     |tcp_socket| tcp_socket.may_send() && tcp_socket.send_queue() > 0,
                     |udp_socket| udp_socket.is_open() && udp_socket.send_queue() > 0,
@@ -952,6 +954,8 @@ where
                 // can't immediately close it out.
                 // We attempt to queue it for future closure and then just return.
                 self.queued_for_closure.push(dup_fd);
+                drop(dt);
+                self.attempt_to_close_queued();
             }
             super::fd::CloseResult::Deferred => {
                 let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
@@ -983,6 +987,12 @@ where
         true
     }
 
+    /// Completes socket closures that were deferred while descriptor entries were in use.
+    pub fn finish_deferred_closes(&mut self) -> bool {
+        self.attempt_to_close_queued();
+        !self.queued_for_closure.is_empty()
+    }
+
     /// Close the `socket_handle`
     fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
         let SocketHandle {
@@ -992,10 +1002,9 @@ where
             mut specific,
             proxy,
         } = socket_handle;
-        if broker_socket.is_some() {
-            if let Some(proxy) = proxy {
-                proxy.set_state(socket_channel::SocketState::Closed);
-            }
+        if let Some(socket) = broker_socket {
+            let abortive = specific.tcp().immediate_close.load(Ordering::SeqCst);
+            socket.close(abortive);
             return;
         }
         let handle = handle.expect("local socket must have a smoltcp handle");
@@ -1234,7 +1243,9 @@ where
             ShutdownDirection::Write => litebox_broker_protocol::socket::ShutdownMode::Write,
             ShutdownDirection::Both => litebox_broker_protocol::socket::ShutdownMode::Both,
         };
-        socket.shutdown(mode).map_err(errors::ShutdownError::Socket)
+        socket
+            .shutdown(mode)
+            .map_err(errors::ShutdownError::OperationFailed)
     }
 
     /// Get the remote address and port a `SocketHandle` is connected to, if any.
@@ -1438,7 +1449,7 @@ where
     /// If `peer` is provided, it is filled with the remote address of the accepted connection.
     ///
     /// Note that the returned new socket has no associated proxy; to set a proxy, use
-    /// [`set_socket_proxy`](Self::set_socket_proxy).
+    /// [`attach_socket_proxy`](Self::attach_socket_proxy).
     pub fn accept(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -1538,11 +1549,24 @@ where
             .get_entry_mut(fd)
             .ok_or(SendError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if socket_handle.broker_socket.is_some() {
-            return Err(SendError::SocketInInvalidState);
-        }
         if !flags.is_empty() {
             unimplemented!()
+        }
+        if let Some(socket) = &socket_handle.broker_socket {
+            if destination.is_some() {
+                return Err(SendError::UnnecessaryDestinationAddress);
+            }
+            return socket.try_write(buf).map_err(|error| match error {
+                socket_channel::ChannelWriteError::BufferFull => SendError::BufferFull,
+                socket_channel::ChannelWriteError::Unaddressable => SendError::Unaddressable,
+                socket_channel::ChannelWriteError::DestinationAddressRequired => {
+                    SendError::DestinationAddressRequired
+                }
+                socket_channel::ChannelWriteError::WriteShutdown
+                | socket_channel::ChannelWriteError::NotConnected
+                | socket_channel::ChannelWriteError::ConnectionClosed
+                | socket_channel::ChannelWriteError::Socket(_) => SendError::SocketInInvalidState,
+            });
         }
 
         let ret = match socket_handle.protocol() {
@@ -1623,13 +1647,25 @@ where
             .get_entry_mut(fd)
             .ok_or(ReceiveError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if socket_handle.broker_socket.is_some() {
-            return Err(ReceiveError::SocketInInvalidState);
-        }
         if flags.intersects(
             (ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::DISCARD).complement(),
         ) {
             unimplemented!("flags: {:?}", flags);
+        }
+        if let Some(socket) = &socket_handle.broker_socket {
+            return socket
+                .try_read(buf, flags, source_addr)
+                .or_else(|error| match error {
+                    socket_channel::ChannelReadError::WouldBlock => Ok(0),
+                    socket_channel::ChannelReadError::ReadShutdown
+                    | socket_channel::ChannelReadError::ConnectionClosed => {
+                        Err(ReceiveError::OperationFinished)
+                    }
+                    socket_channel::ChannelReadError::NotConnected
+                    | socket_channel::ChannelReadError::Socket(_) => {
+                        Err(ReceiveError::SocketInInvalidState)
+                    }
+                });
         }
 
         let ret = match socket_handle.protocol() {

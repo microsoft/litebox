@@ -349,7 +349,7 @@ impl From<litebox::net::errors::SocketError> for Errno {
             litebox::net::errors::SocketError::UnsupportedProtocol(_) => Errno::EPROTONOSUPPORT,
             litebox::net::errors::SocketError::ResourceExhausted => Errno::ENOBUFS,
             litebox::net::errors::SocketError::PermissionDenied => Errno::EACCES,
-            litebox::net::errors::SocketError::Io => Errno::EIO,
+            litebox::net::errors::SocketError::BackendFailure => Errno::EIO,
             _ => unimplemented!(),
         }
     }
@@ -390,7 +390,7 @@ impl From<litebox::net::errors::ConnectError> for Errno {
             litebox::net::errors::ConnectError::InProgress => Errno::EINPROGRESS,
             litebox::net::errors::ConnectError::InvalidState => Errno::ECONNREFUSED,
             litebox::net::errors::ConnectError::TimedOut => Errno::ETIMEDOUT,
-            litebox::net::errors::ConnectError::Socket(error) => error.into(),
+            litebox::net::errors::ConnectError::OperationFailed(error) => error.into(),
             _ => unimplemented!(),
         }
     }
@@ -411,7 +411,7 @@ impl From<litebox::net::errors::SocketAsyncError> for Errno {
             litebox::net::errors::SocketAsyncError::PolicyDenied => Errno::EACCES,
             litebox::net::errors::SocketAsyncError::ResourceExhausted => Errno::ENOBUFS,
             litebox::net::errors::SocketAsyncError::UnsupportedOperation => Errno::EOPNOTSUPP,
-            litebox::net::errors::SocketAsyncError::Other => Errno::EIO,
+            litebox::net::errors::SocketAsyncError::BackendFailure => Errno::EIO,
             _ => unimplemented!(),
         }
     }
@@ -422,7 +422,7 @@ impl From<litebox::net::errors::ShutdownError> for Errno {
         match value {
             litebox::net::errors::ShutdownError::InvalidFd => Errno::EBADF,
             litebox::net::errors::ShutdownError::UnsupportedOperation => Errno::EOPNOTSUPP,
-            litebox::net::errors::ShutdownError::Socket(error) => error.into(),
+            litebox::net::errors::ShutdownError::OperationFailed(error) => error.into(),
             _ => unimplemented!(),
         }
     }
@@ -445,7 +445,7 @@ impl TryFrom<Errno> for litebox::net::errors::SocketAsyncError {
             Errno::EACCES => Ok(litebox::net::errors::SocketAsyncError::PolicyDenied),
             Errno::ENOBUFS => Ok(litebox::net::errors::SocketAsyncError::ResourceExhausted),
             Errno::EOPNOTSUPP => Ok(litebox::net::errors::SocketAsyncError::UnsupportedOperation),
-            Errno::EIO => Ok(litebox::net::errors::SocketAsyncError::Other),
+            Errno::EIO => Ok(litebox::net::errors::SocketAsyncError::BackendFailure),
             _ => Err(value),
         }
     }

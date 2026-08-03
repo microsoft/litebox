@@ -593,6 +593,14 @@ mod tests {
             Ok(())
         }
 
+        fn republish(
+            &self,
+            handle: ObjectHandle,
+            readiness: litebox_broker_protocol::readiness::ReadinessFlags,
+        ) -> litebox_broker_core::Result<()> {
+            self.publish(handle, readiness)
+        }
+
         fn retire(&self, _handle: ObjectHandle) {}
     }
 

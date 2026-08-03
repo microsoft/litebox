@@ -20,9 +20,7 @@ pub trait ReadinessSink: Send + Sync {
     fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()>;
 
     /// Re-publishes an unchanged readiness snapshot to wake state-dependent waiters.
-    fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
-        self.publish(handle, readiness)
-    }
+    fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()>;
 
     /// Retires all readiness state for an object that can no longer publish.
     fn retire(&self, handle: ObjectHandle);
@@ -181,6 +179,10 @@ pub(crate) mod tests {
         fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
             self.published.lock().unwrap().push((handle, readiness));
             Ok(())
+        }
+
+        fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+            self.publish(handle, readiness)
         }
 
         fn retire(&self, handle: ObjectHandle) {

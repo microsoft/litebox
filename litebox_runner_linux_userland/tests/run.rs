@@ -580,7 +580,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
             l_onoff: 1,
             l_linger: 0,
         };
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (reset_stream, _) = listener.accept().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(20));
             // SAFETY: `reset_stream` owns a live socket and `linger` is valid for the supplied length.
@@ -639,7 +639,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         .arg(refused_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    assert_eq!(broker.next_close_object_count(), 8);
+    assert_eq!(broker.next_close_object_count(), 9);
     broker.join();
     server.join().unwrap();
 }

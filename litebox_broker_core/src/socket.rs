@@ -277,7 +277,7 @@ pub fn shutdown(
 /// Returns broker-authoritative socket status and consumes its pending asynchronous error.
 pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketStatusResponse> {
     let object = session.authorized_object(handle, ObjectRights::WAIT)?;
-    let (resource, status, connect_in_flight) = {
+    let (resource, status, local_address, connect_in_flight) = {
         let object = object.read();
         let ObjectEntry::Socket(socket) = &*object else {
             return Err(BrokerError::InvalidRights);
@@ -285,6 +285,7 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
         (
             Arc::clone(&socket.resource),
             socket.connection_status,
+            socket.local_address,
             socket.connect_in_flight,
         )
     };
@@ -295,30 +296,37 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
             pending_error: None,
         });
     }
-    if matches!(
-        status,
-        SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_)
-    ) {
+    if matches!(status, SocketConnectionStatus::Unconnected) {
         return Ok(SocketStatusResponse {
             status,
             local_address: None,
             pending_error: None,
         });
     }
+    if matches!(status, SocketConnectionStatus::Failed(_)) {
+        return Ok(SocketStatusResponse {
+            status,
+            local_address,
+            pending_error: None,
+        });
+    }
     let mut response = resource.status()?;
-    if status == SocketConnectionStatus::Connected {
-        response.status = status;
-        return Ok(response);
-    }
-    if response.status == SocketConnectionStatus::Unconnected {
-        return Err(BrokerError::Internal);
-    }
     let mut object = object.write();
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
     };
+    if socket.connection_status == SocketConnectionStatus::Connecting
+        && response.status == SocketConnectionStatus::Unconnected
+    {
+        return Err(BrokerError::Internal);
+    }
+    socket.local_address = socket.local_address.or(response.local_address);
+    response.local_address = socket.local_address;
     if socket.connection_status == SocketConnectionStatus::Connecting {
         socket.connection_status = response.status;
+    } else {
+        // Another status call reached a terminal state while this platform query was in flight.
+        response.status = socket.connection_status;
     }
     Ok(response)
 }
@@ -347,6 +355,7 @@ fn finish_connect(object: &spin::RwLock<ObjectEntry>, status: SocketConnectionSt
 pub(crate) struct SocketObject {
     resource: Arc<SocketResource>,
     connection_status: SocketConnectionStatus,
+    local_address: Option<SocketAddressV4>,
     connect_in_flight: bool,
 }
 
@@ -355,6 +364,7 @@ impl SocketObject {
         Self {
             resource,
             connection_status: SocketConnectionStatus::Unconnected,
+            local_address: None,
             connect_in_flight: false,
         }
     }
@@ -485,6 +495,8 @@ pub(crate) mod tests {
         sent: StdMutex<std::vec::Vec<u8>>,
         connect_calls: AtomicUsize,
         status_calls: AtomicUsize,
+        status_responses: StdMutex<std::collections::VecDeque<SocketStatusResponse>>,
+        status_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         shutdown_calls: AtomicUsize,
         dropped_sockets: AtomicUsize,
         fail_create: core::sync::atomic::AtomicBool,
@@ -572,11 +584,23 @@ pub(crate) mod tests {
 
         fn status(&self) -> Result<SocketStatusResponse> {
             self.state.status_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(SocketStatusResponse {
-                status: SocketConnectionStatus::Connected,
-                local_address: None,
-                pending_error: None,
-            })
+            let response = self
+                .state
+                .status_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(SocketStatusResponse {
+                    status: SocketConnectionStatus::Connected,
+                    local_address: None,
+                    pending_error: None,
+                });
+            let status_block = self.state.status_block.lock().unwrap().take();
+            if let Some((started, release)) = status_block {
+                started.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Ok(response)
         }
 
         fn readiness(&self) -> ReadinessFlags {
@@ -594,6 +618,8 @@ pub(crate) mod tests {
         check_failed_create_rolls_back(broker, provider);
         check_socket_operations_and_policy(broker, provider);
         check_connect_error_is_terminal(broker, provider);
+        check_concurrent_status_preserves_terminal_state(broker, provider);
+        check_failed_status_preserves_local_address(broker, provider);
         check_quota_waits_for_deferred_retirement(broker, provider);
         check_socket_quotas(broker);
     }
@@ -793,6 +819,10 @@ pub(crate) mod tests {
                 .map_err(|_| BrokerError::Internal)
         }
 
+        fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+            self.publish(handle, readiness)
+        }
+
         fn retire(&self, _handle: ObjectHandle) {
             self.retired.fetch_add(1, Ordering::Relaxed);
         }
@@ -871,6 +901,111 @@ pub(crate) mod tests {
             provider.state.connect_calls.load(Ordering::Relaxed),
             calls_before + 1
         );
+    }
+
+    fn check_concurrent_status_preserves_terminal_state(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = Arc::new(
+            broker
+                .create_session(CallerCredential::Unauthenticated)
+                .unwrap(),
+        );
+        let handle = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            connect(&session, handle, loopback_address()),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+        );
+
+        let local_address = SocketAddressV4 {
+            address: Ipv4Address([127, 0, 0, 1]),
+            port: Port(49152),
+        };
+        *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
+            SocketStatusResponse {
+                status: SocketConnectionStatus::Connecting,
+                local_address: None,
+                pending_error: None,
+            },
+            SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: Some(local_address),
+                pending_error: Some(SocketError::ConnectionReset),
+            },
+        ]);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *provider.state.status_block.lock().unwrap() = Some((started_tx, release_rx));
+
+        let first_session = Arc::clone(&session);
+        let first = std::thread::spawn(move || status(&first_session, handle).unwrap());
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert_eq!(
+            status(&session, handle).unwrap(),
+            SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: Some(local_address),
+                pending_error: Some(SocketError::ConnectionReset),
+            }
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            first.join().unwrap(),
+            SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: Some(local_address),
+                pending_error: None,
+            }
+        );
+    }
+
+    fn check_failed_status_preserves_local_address(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            connect(&session, handle, loopback_address()),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+        );
+
+        let local_address = SocketAddressV4 {
+            address: Ipv4Address([127, 0, 0, 1]),
+            port: Port(49153),
+        };
+        provider
+            .state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::TimedOut),
+                local_address: Some(local_address),
+                pending_error: None,
+            });
+
+        let expected = SocketStatusResponse {
+            status: SocketConnectionStatus::Failed(SocketError::TimedOut),
+            local_address: Some(local_address),
+            pending_error: None,
+        };
+        assert_eq!(status(&session, handle), Ok(expected));
+        assert_eq!(status(&session, handle), Ok(expected));
     }
 
     const fn create_request() -> CreateSocketRequest {

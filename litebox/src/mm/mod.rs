@@ -643,23 +643,52 @@ where
         if range.start > range.end {
             return false;
         }
-        if range.is_empty() {
-            return true;
+        self.range_prefix_with_permissions(range.clone(), required) == range.len()
+    }
+
+    /// Returns the length of the contiguous prefix of `range` mapped with `required` permissions.
+    pub fn range_prefix_with_permissions(
+        &self,
+        range: Range<usize>,
+        required: MemoryRegionPermissions,
+    ) -> usize {
+        if range.start >= range.end {
+            return 0;
         }
         let vmem = self.vmem.read();
         let mut covered_until = range.start;
-        for (mapped, area) in vmem.overlapping(range.clone()) {
-            if mapped.start > covered_until
-                || !MemoryRegionPermissions::from(area.flags()).contains(required)
-            {
-                return false;
+        while covered_until < range.end {
+            let Some((mapped, area)) = vmem
+                .overlapping(covered_until..Platform::TASK_ADDR_MAX)
+                .next()
+            else {
+                break;
+            };
+            let area_permissions = MemoryRegionPermissions::from(area.flags());
+            if mapped.start > covered_until {
+                let fault_addr = covered_until & !(ALIGN - 1);
+                let stack_can_grow = (Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX)
+                    .contains(&fault_addr)
+                    && area.flags().contains(VmFlags::VM_GROWSDOWN)
+                    && area_permissions.contains(required)
+                    && vmem
+                        .overlapping(Platform::TASK_ADDR_MIN..fault_addr)
+                        .next_back()
+                        .is_none_or(|(previous_range, previous_area)| {
+                            (previous_area.flags().contains(VmFlags::VM_GROWSDOWN)
+                                && !(previous_area.flags() & VmFlags::VM_ACCESS_FLAGS).is_empty())
+                                || fault_addr - previous_range.end
+                                    >= Vmem::<Platform, ALIGN>::STACK_GUARD_GAP
+                        });
+                if !stack_can_grow {
+                    break;
+                }
+            } else if !area_permissions.contains(required) {
+                break;
             }
             covered_until = covered_until.max(mapped.end);
-            if covered_until >= range.end {
-                return true;
-            }
         }
-        false
+        covered_until.saturating_sub(range.start).min(range.len())
     }
 
     /// Get the memory permissions of a given address range.

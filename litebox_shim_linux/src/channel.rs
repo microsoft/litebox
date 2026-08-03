@@ -121,6 +121,24 @@ impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
         Err(Errno::EAGAIN)
     }
 
+    pub(crate) fn for_each_queued(&self, mut f: impl FnMut(&T) -> bool) -> Result<(), Errno> {
+        let is_shutdown = self.is_shutdown() || self.is_peer_shutdown();
+        let guard = self.endpoint.rb.lock();
+        if guard.is_empty() {
+            return if is_shutdown {
+                Err(Errno::ESHUTDOWN)
+            } else {
+                Err(Errno::EAGAIN)
+            };
+        }
+        for item in guard.iter() {
+            if !f(item) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     common_functions_for_channel!();
 }
 

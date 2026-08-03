@@ -25,8 +25,8 @@ pub enum SocketError {
     ResourceExhausted,
     #[error("Socket creation was denied")]
     PermissionDenied,
-    #[error("Socket creation failed")]
-    Io,
+    #[error("Socket backend failed to create the socket")]
+    BackendFailure,
 }
 
 /// Possible errors from [`Network::close`]
@@ -48,7 +48,7 @@ pub enum ShutdownError {
     #[error("Shutdown is unsupported for this socket")]
     UnsupportedOperation,
     #[error("Socket operation failed: {0:?}")]
-    Socket(SocketAsyncError),
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::connect`]
@@ -70,7 +70,7 @@ pub enum ConnectError {
     #[error("Connection timed out")]
     TimedOut,
     #[error("Socket operation failed: {0:?}")]
-    Socket(SocketAsyncError),
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::get_local_addr`]
@@ -199,7 +199,7 @@ crate::utilities::macros::repr_enum! {
         /// The socket operation is unsupported.
         UnsupportedOperation = 12,
         /// The broker association or host socket failed.
-        Other = 13,
+        BackendFailure = 13,
     }
 }
 

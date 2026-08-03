@@ -42,7 +42,7 @@ pub enum IpProtocol {
     Tcp,
 }
 
-/// Which directions of a socket to shut down.
+/// How to stop I/O on a socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ShutdownMode {
@@ -52,6 +52,8 @@ pub enum ShutdownMode {
     Write,
     /// Both directions.
     Both,
+    /// The final close discards queued data and resets the connection.
+    Abort,
 }
 
 /// IPv4 address in network byte order.

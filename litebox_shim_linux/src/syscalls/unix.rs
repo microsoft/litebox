@@ -527,10 +527,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
 
     fn try_sendto(&self, msg: Message) -> Result<(), (Message, Errno)> {
         // TODO: write partial data?
+        if msg.data.is_empty() {
+            return if self.connected_send_channel.is_shutdown()
+                || self.connected_send_channel.is_peer_shutdown()
+            {
+                Err((msg, Errno::EPIPE))
+            } else {
+                Ok(())
+            };
+        }
         self.connected_send_channel.try_write_one(msg)
     }
 
-    fn try_recvfrom(&self, mut buf: &mut [u8]) -> Result<usize, TryOpError<Errno>> {
+    fn try_recvfrom(&self, mut buf: &mut [u8], peek: bool) -> Result<usize, TryOpError<Errno>> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if peek {
+            let mut total_read = 0;
+            self.recv_channel
+                .for_each_queued(|msg| {
+                    let copy_len = (buf.len() - total_read).min(msg.data.len());
+                    buf[total_read..total_read + copy_len].copy_from_slice(&msg.data[..copy_len]);
+                    total_read += copy_len;
+                    total_read != buf.len()
+                })
+                .map_err(|error| match error {
+                    Errno::EAGAIN => TryOpError::TryAgain,
+                    other => TryOpError::Other(other),
+                })?;
+            return Ok(total_read);
+        }
         let mut total_read = 0;
         while !buf.is_empty() {
             let n = match self.recv_channel.peek_and_consume_one(|msg| {
@@ -823,6 +850,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         timeout: Option<Duration>,
         buf: &mut [u8],
         is_nonblocking: bool,
+        peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
         let res = cx
@@ -842,7 +870,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                         let conn = state
                             .connected()
                             .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                        let n = conn.try_recvfrom(buf)?;
+                        let n = conn.try_recvfrom(buf, peek)?;
                         // For connected stream sockets, no need to return the source address
                         if let Some(source_addr) = source_addr.as_deref_mut() {
                             *source_addr = None;
@@ -970,6 +998,7 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
     fn try_read(
         &self,
         buf: &mut [u8],
+        peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, TryOpError<Errno>> {
         let is_self_shutdown = self.is_shutdown();
@@ -979,8 +1008,7 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
             if let Some(source_addr) = source_addr.as_deref_mut() {
                 *source_addr = Some(msg.source.clone());
             }
-            // Always consume the entire message to preserve boundaries.
-            Ok((true, msg.data.len()))
+            Ok((!peek, msg.data.len()))
         })
         .map_err(|e| match e {
             Errno::EAGAIN => TryOpError::TryAgain,
@@ -1173,6 +1201,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         timeout: Option<Duration>,
         buf: &mut [u8],
         is_nonblocking: bool,
+        peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
         let res = cx
@@ -1189,7 +1218,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                     let Some(recv_channel) = &guard.recv_channel else {
                         return Err(TryOpError::Other(Errno::ENOTCONN));
                     };
-                    recv_channel.try_read(buf, source_addr.as_deref_mut())
+                    recv_channel.try_read(buf, peek, source_addr.as_deref_mut())
                 },
             )
             .map_err(Errno::from);
@@ -1321,6 +1350,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
     }
 
+    pub(super) fn recv_timeout(&self) -> Option<Duration> {
+        self.options.lock().recv_timeout
+    }
+
+    pub(super) fn is_stream(&self) -> bool {
+        matches!(self.inner, UnixSocketInner::Stream(_))
+    }
+
     pub(super) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
         let inner = match sock_type {
             SockType::Stream => UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Init(
@@ -1420,22 +1457,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         cx: &WaitContext<'_, Platform>,
         buf: &mut [u8],
         flags: ReceiveFlags,
+        timeout_override: Option<Duration>,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC;
+        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::PEEK | ReceiveFlags::TRUNC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
         let is_nonblocking =
             flags.contains(ReceiveFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
-        let timeout = self.options.lock().recv_timeout;
+        let peek = flags.contains(ReceiveFlags::PEEK);
+        let timeout = timeout_override.or_else(|| self.options.lock().recv_timeout);
         let ret = match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                stream.recvfrom(cx, timeout, buf, is_nonblocking, peek, source_addr)
             }
             UnixSocketInner::Datagram(datagram) => {
-                datagram.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                datagram.recvfrom(cx, timeout, buf, is_nonblocking, peek, source_addr)
             }
         };
         match ret {
