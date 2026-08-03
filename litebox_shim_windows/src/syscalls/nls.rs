@@ -42,7 +42,9 @@ bitflags::bitflags! {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
 struct MuiRegistryInfo {
     owned: u32,
     install_language_fallback: [u16; 4],
@@ -120,7 +122,9 @@ struct MuiLanguageConfigList {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq,
+)]
 struct MuiLanguageConfigNode {
     language_index: i16,
     fallback_types: u16,
@@ -128,8 +132,6 @@ struct MuiLanguageConfigNode {
     fallback_indices: [i16; 3],
 }
 
-const MUI_INSTALLED_SKU_SIZE: usize = size_of::<[u16; 387]>();
-const MUI_INSTALLED_OFFSET: usize = size_of::<MuiRegistryInfo>();
 const EMPTY_MUI_LANGUAGE_INFO: MuiLanguageInfo = MuiLanguageInfo {
     flags: 0,
     reserved: 0,
@@ -154,32 +156,40 @@ const EN_US_MUI_LANGUAGE: MuiLanguage<'static> = MuiLanguage {
     info: EN_US_MUI_LANGUAGE_INFO,
     name: "en-US",
 };
-const EMPTY_MUI_LANGUAGE_CONFIG: MuiLanguageConfigNode = MuiLanguageConfigNode {
-    language_index: 0,
-    fallback_types: 0,
-    reserved: 0,
-    fallback_indices: [0; 3],
-};
-
 #[derive(Clone, Copy)]
 struct MuiLanguage<'a> {
     info: MuiLanguageInfo,
     name: &'a str,
 }
 
-#[derive(Clone, Copy)]
-struct MuiRegistryLayout {
-    language_capacity: usize,
-    installed_size: usize,
-    strings_offset: usize,
-    string_capacity: usize,
-    character_capacity: usize,
-    string_pool_size: usize,
-    machine_config_offset: usize,
-    language_config_capacity: usize,
-    machine_config_size: usize,
-    installed_sku_offset: usize,
+struct MuiInstalledSection {
+    header: MuiLanguages,
+    language_info: Vec<MuiLanguageInfo>,
+}
+
+struct MuiStringsSection {
+    header: MuiStringPool,
+    indices: Vec<i16>,
+    characters: Vec<u16>,
+    language_count: usize,
+}
+
+struct MuiMachineConfigSection {
+    header: MuiLanguageConfigList,
+    configs: Vec<MuiLanguageConfigNode>,
+}
+
+struct MuiRegistryBlob {
+    registry_info: MuiRegistryInfo,
+    installed: MuiInstalledSection,
+    strings: MuiStringsSection,
+    machine_config: MuiMachineConfigSection,
+    installed_sku: Vec<u16>,
     total_size: usize,
+}
+
+struct MuiBlobWriter {
+    data: Vec<u8>,
 }
 
 const INSTALLED_SKU_BYTES: &[u8] = b"en-US\0en-AU\0en-CA\0en-GB\0en-HK\0en-IE\0en-NZ\0en-SG\0\
@@ -189,17 +199,12 @@ de-DE\0he-IL\0hu-HU\0it-IT\0ja-JP\0ko-KR\0nl-BE\0nl-NL\0nb-NO\0pl-PL\0pt-PT\0\
 ru-RU\0sv-SE\0tr-TR\0bg-BG\0hr-HR\0et-EE\0lv-LV\0lt-LT\0ro-RO\0sr-Latn-CS\0\
 sr-Latn-RS\0sk-SK\0sl-SI\0th-TH\0uk-UA\0fy-NL\0qps-ploc\0qps-plocm\0\
 qps-Latn-x-sh\0\0\0";
-const _: () = assert!(core::mem::size_of::<[u16; 387]>() == 774);
 
-const fn utf16_from_ascii<const N: usize>(bytes: &[u8]) -> [u16; N] {
-    assert!(bytes.len() == N);
-    let mut output = [0; N];
-    let mut index = 0;
-    while index < bytes.len() {
-        output[index] = bytes[index] as u16;
-        index += 1;
-    }
-    output
+fn installed_sku() -> Vec<u16> {
+    INSTALLED_SKU_BYTES
+        .iter()
+        .map(|&byte| u16::from(byte))
+        .collect()
 }
 
 fn align_up(value: usize, alignment: usize) -> Option<usize> {
@@ -209,171 +214,223 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
         .checked_mul(alignment)
 }
 
-fn mui_registry_layout(
-    languages: &[MuiLanguage<'_>],
-    language_config_count: usize,
-) -> Option<MuiRegistryLayout> {
-    let language_capacity = languages.len().max(MUI_MIN_LANGUAGE_CAPACITY);
-    let installed_size = align_up(
-        size_of::<MuiLanguages>()
-            .checked_add(language_capacity.checked_mul(size_of::<MuiLanguageInfo>())?)?,
-        8,
-    )?;
-    let strings_offset = MUI_INSTALLED_OFFSET.checked_add(installed_size)?;
-    let string_capacity = languages.len().checked_add(1)?.max(MUI_STRING_CAPACITY);
-    let characters = languages.iter().try_fold(2usize, |characters, language| {
-        characters.checked_add(language.name.encode_utf16().count().checked_add(1)?)
-    })?;
-    let character_capacity = characters.max(40);
-    let string_pool_size = size_of::<MuiStringPool>()
-        .checked_add(string_capacity.checked_mul(size_of::<i16>())?)?
-        .checked_add(character_capacity.checked_mul(size_of::<u16>())?)?;
-    let machine_config_offset = align_up(strings_offset.checked_add(string_pool_size)?, 8)?;
-    let language_config_capacity = language_config_count.max(MUI_MIN_LANGUAGE_CONFIG_CAPACITY);
-    let machine_config_size = size_of::<MuiLanguageConfigList>()
-        .checked_add(language_config_capacity.checked_mul(size_of::<MuiLanguageConfigNode>())?)?;
-    let installed_sku_offset =
-        align_up(machine_config_offset.checked_add(machine_config_size)?, 8)?;
-    let total_size = align_up(installed_sku_offset.checked_add(MUI_INSTALLED_SKU_SIZE)?, 8)?;
-    debug_assert_eq!(strings_offset % 8, 0);
-    debug_assert_eq!(machine_config_offset % 8, 0);
-    debug_assert_eq!(installed_sku_offset % 8, 0);
-    Some(MuiRegistryLayout {
-        language_capacity,
-        installed_size,
-        strings_offset,
-        string_capacity,
-        character_capacity,
-        string_pool_size,
-        machine_config_offset,
-        language_config_capacity,
-        machine_config_size,
-        installed_sku_offset,
-        total_size,
-    })
+impl MuiInstalledSection {
+    fn new(languages: &[MuiLanguage<'_>], name_indices: &[i16]) -> Option<Self> {
+        if languages.len() != name_indices.len() {
+            return None;
+        }
+        let capacity = languages.len().max(MUI_MIN_LANGUAGE_CAPACITY);
+        let encoded_len = align_up(
+            size_of::<MuiLanguages>()
+                .checked_add(capacity.checked_mul(size_of::<MuiLanguageInfo>())?)?,
+            8,
+        )?;
+        let mut language_info = Vec::with_capacity(capacity);
+        for (language, &name_index) in languages.iter().zip(name_indices) {
+            let mut info = language.info;
+            info.language_name_index = name_index;
+            language_info.push(info);
+        }
+        language_info.resize(capacity, EMPTY_MUI_LANGUAGE_INFO);
+        Some(Self {
+            header: MuiLanguages {
+                total_size: u32::try_from(encoded_len).ok()?,
+                max_languages: u16::try_from(capacity).ok()?,
+                languages: u16::try_from(languages.len()).ok()?,
+                installed_languages: 0,
+                padding_a: [0; 6],
+                // A zero nested offset is the native inline-array representation.
+                language_info_offset: 0,
+            },
+            language_info,
+        })
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.header.total_size as usize
+    }
+
+    fn encode_into(&self, writer: &mut MuiBlobWriter) -> Option<()> {
+        let end = writer.data.len().checked_add(self.encoded_len())?;
+        writer.write(&self.header);
+        writer.write(self.language_info.as_slice());
+        writer.pad_to(end)
+    }
 }
 
-// TODO(mui-registry-info): Populate the generic serializer from the guest registry when installed
-// language configuration becomes mutable. The shim currently supplies only its fixed en-US locale.
-fn mui_registry_data(
-    generation: u32,
-    languages: &[MuiLanguage<'_>],
-    language_configs: &[MuiLanguageConfigNode],
-) -> Option<Vec<u8>> {
-    let layout = mui_registry_layout(languages, language_configs.len())?;
-    let language_count = u16::try_from(languages.len()).ok()?;
-    let language_capacity = u16::try_from(layout.language_capacity).ok()?;
-    let language_config_count = u16::try_from(language_configs.len()).ok()?;
-    let language_config_capacity = u16::try_from(layout.language_config_capacity).ok()?;
+impl MuiStringsSection {
+    fn new(languages: &[MuiLanguage<'_>]) -> Option<Self> {
+        let string_count = languages.len().checked_add(1)?;
+        let string_capacity = string_count.max(MUI_STRING_CAPACITY);
+        let mut indices = Vec::with_capacity(string_capacity);
+        indices.push(0);
+        let mut characters = Vec::new();
+        characters.push(0);
+        for language in languages {
+            indices.push(i16::try_from(characters.len()).ok()?);
+            characters.extend(language.name.encode_utf16());
+            characters.push(0);
+        }
+        characters.push(0);
+        let character_count = characters.len();
+        let character_capacity = character_count.max(40);
+        indices.resize(string_capacity, 0);
+        characters.resize(character_capacity, 0);
+        let encoded_len = size_of::<MuiStringPool>()
+            .checked_add(indices.len().checked_mul(size_of::<i16>())?)?
+            .checked_add(characters.len().checked_mul(size_of::<u16>())?)?;
+        Some(Self {
+            header: MuiStringPool {
+                total_size: u32::try_from(encoded_len).ok()?,
+                max_strings: u16::try_from(string_capacity).ok()?,
+                strings: u16::try_from(string_count).ok()?,
+                max_characters: u16::try_from(character_capacity).ok()?,
+                characters: u16::try_from(character_count).ok()?,
+                padding_c: [0; 4],
+                // Zero nested offsets are the native inline-array representation.
+                string_indices_offset: 0,
+                pool_offset: 0,
+            },
+            indices,
+            characters,
+            language_count: languages.len(),
+        })
+    }
 
-    let mut install_language_fallback = [0; 4];
-    for (slot, language) in install_language_fallback.iter_mut().zip(languages.iter()) {
-        *slot = language.info.language_id;
+    fn language_name_indices(&self) -> &[i16] {
+        &self.indices[1..=self.language_count]
     }
-    let registry_info = MuiRegistryInfo {
-        owned: 0x400,
-        install_language_fallback,
-        generation,
-        process_generation: 0,
-        padding_14: [0; 4],
-        installed_offset: u64::try_from(MUI_INSTALLED_OFFSET).expect("MUI offset fits in u64"),
-        strings_offset: u64::try_from(layout.strings_offset).expect("MUI offset fits in u64"),
-        machine_config_offset: u64::try_from(layout.machine_config_offset)
-            .expect("MUI offset fits in u64"),
-        user_config_offset: 0,
-        machine_preferred_offset: 0,
-        user_preferred_offset: 0,
-        process_preferred_offset: 0,
-        merged_user_offset: 0,
-        merged_machine_offset: 0,
-        merged_fallback_offset: 0,
-        previous_registry_info_offset: 0,
-        locked: 0,
-        secure_environment: 0,
-        number_allowed: 1000,
-        padding_7c: [0; 4],
-        allowed_language_offset: 0,
-        installed_sku_offset: u64::try_from(layout.installed_sku_offset)
-            .expect("MUI offset fits in u64"),
-        installed_sku_size: MUI_INSTALLED_SKU_SIZE.trunc(),
-        allowed_language_size: 0,
-        disallowed_language_offset: 0,
-        disallowed_language_size: 0,
-        padding_a4: [0; 4],
-    };
-    let installed = MuiLanguages {
-        total_size: layout.installed_size.trunc(),
-        max_languages: language_capacity,
-        languages: language_count,
-        installed_languages: 0,
-        padding_a: [0; 6],
-        // A zero nested offset is the native inline-array representation.
-        language_info_offset: 0,
-    };
-    let string_count = u16::try_from(languages.len().checked_add(1)?).ok()?;
-    let string_capacity = u16::try_from(layout.string_capacity).ok()?;
-    let character_capacity = u16::try_from(layout.character_capacity).ok()?;
-    let mut string_indices = Vec::with_capacity(layout.string_capacity);
-    string_indices.push(0i16);
-    let mut string_pool = Vec::with_capacity(layout.character_capacity);
-    string_pool.push(0u16);
-    let mut language_info = Vec::with_capacity(languages.len());
-    for language in languages {
-        let name_index = i16::try_from(string_pool.len()).ok()?;
-        string_indices.push(name_index);
-        let mut info = language.info;
-        info.language_name_index = name_index;
-        language_info.push(info);
-        string_pool.extend(language.name.encode_utf16());
-        string_pool.push(0);
-    }
-    string_pool.push(0);
-    let characters = u16::try_from(string_pool.len()).ok()?;
-    string_indices.resize(layout.string_capacity, 0);
-    string_pool.resize(layout.character_capacity, 0);
-    let strings = MuiStringPool {
-        total_size: layout.string_pool_size.trunc(),
-        max_strings: string_capacity,
-        strings: string_count,
-        max_characters: character_capacity,
-        characters,
-        padding_c: [0; 4],
-        string_indices_offset: 0,
-        pool_offset: 0,
-    };
-    let machine_config = MuiLanguageConfigList {
-        total_size: layout.machine_config_size.trunc(),
-        languages: language_config_count,
-        max_languages: language_config_capacity,
-        // A zero nested offset is the native inline-array representation.
-        language_configs_offset: 0,
-    };
 
-    let mut data = Vec::with_capacity(layout.total_size);
-    data.extend_from_slice(registry_info.as_bytes());
-    data.extend_from_slice(installed.as_bytes());
-    for language in &language_info {
-        data.extend_from_slice(language.as_bytes());
+    fn encoded_len(&self) -> usize {
+        self.header.total_size as usize
     }
-    for _ in language_info.len()..layout.language_capacity {
-        data.extend_from_slice(EMPTY_MUI_LANGUAGE_INFO.as_bytes());
+
+    fn encode_into(&self, writer: &mut MuiBlobWriter) {
+        writer.write(&self.header);
+        writer.write(self.indices.as_slice());
+        writer.write(self.characters.as_slice());
     }
-    data.resize(layout.strings_offset, 0);
-    data.extend_from_slice(strings.as_bytes());
-    data.extend_from_slice(string_indices.as_bytes());
-    data.extend_from_slice(string_pool.as_bytes());
-    data.resize(layout.machine_config_offset, 0);
-    data.extend_from_slice(machine_config.as_bytes());
-    for config in language_configs {
-        data.extend_from_slice(config.as_bytes());
+}
+
+impl MuiMachineConfigSection {
+    fn new(language_configs: &[MuiLanguageConfigNode]) -> Option<Self> {
+        let capacity = language_configs.len().max(MUI_MIN_LANGUAGE_CONFIG_CAPACITY);
+        let encoded_len = size_of::<MuiLanguageConfigList>()
+            .checked_add(capacity.checked_mul(size_of::<MuiLanguageConfigNode>())?)?;
+        let mut configs = Vec::with_capacity(capacity);
+        configs.extend_from_slice(language_configs);
+        configs.resize(capacity, MuiLanguageConfigNode::default());
+        Some(Self {
+            header: MuiLanguageConfigList {
+                total_size: u32::try_from(encoded_len).ok()?,
+                languages: u16::try_from(language_configs.len()).ok()?,
+                max_languages: u16::try_from(capacity).ok()?,
+                // A zero nested offset is the native inline-array representation.
+                language_configs_offset: 0,
+            },
+            configs,
+        })
     }
-    for _ in language_configs.len()..layout.language_config_capacity {
-        data.extend_from_slice(EMPTY_MUI_LANGUAGE_CONFIG.as_bytes());
+
+    fn encoded_len(&self) -> usize {
+        self.header.total_size as usize
     }
-    data.resize(layout.installed_sku_offset, 0);
-    data.extend_from_slice(utf16_from_ascii::<387>(INSTALLED_SKU_BYTES).as_bytes());
-    data.resize(layout.total_size, 0);
-    Some(data)
+
+    fn encode_into(&self, writer: &mut MuiBlobWriter) {
+        writer.write(&self.header);
+        writer.write(self.configs.as_slice());
+    }
+}
+
+impl MuiRegistryBlob {
+    fn new(
+        generation: u32,
+        languages: &[MuiLanguage<'_>],
+        language_configs: &[MuiLanguageConfigNode],
+    ) -> Option<Self> {
+        let strings = MuiStringsSection::new(languages)?;
+        let installed = MuiInstalledSection::new(languages, strings.language_name_indices())?;
+        let machine_config = MuiMachineConfigSection::new(language_configs)?;
+        let installed_sku = installed_sku();
+        let installed_sku_size = installed_sku.len().checked_mul(size_of::<u16>())?;
+
+        let installed_offset = size_of::<MuiRegistryInfo>();
+        let strings_offset = installed_offset.checked_add(installed.encoded_len())?;
+        let machine_config_offset =
+            align_up(strings_offset.checked_add(strings.encoded_len())?, 8)?;
+        let installed_sku_offset = align_up(
+            machine_config_offset.checked_add(machine_config.encoded_len())?,
+            8,
+        )?;
+        let total_size = align_up(installed_sku_offset.checked_add(installed_sku_size)?, 8)?;
+        let mut install_language_fallback = [0; 4];
+        for (slot, language) in install_language_fallback.iter_mut().zip(languages) {
+            *slot = language.info.language_id;
+        }
+        let registry_info = MuiRegistryInfo {
+            // TODO(mui-registry-info): Identify this host-observed ownership bit.
+            owned: 0x400,
+            install_language_fallback,
+            generation,
+            installed_offset: u64::try_from(installed_offset).ok()?,
+            strings_offset: u64::try_from(strings_offset).ok()?,
+            machine_config_offset: u64::try_from(machine_config_offset).ok()?,
+            number_allowed: 1000,
+            installed_sku_offset: u64::try_from(installed_sku_offset).ok()?,
+            installed_sku_size: u32::try_from(installed_sku_size).ok()?,
+            ..MuiRegistryInfo::default()
+        };
+        Some(Self {
+            registry_info,
+            installed,
+            strings,
+            machine_config,
+            installed_sku,
+            total_size,
+        })
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.total_size
+    }
+
+    fn encode(&self) -> Option<Vec<u8>> {
+        let mut writer = MuiBlobWriter::new(self.total_size);
+        writer.write(&self.registry_info);
+        self.installed.encode_into(&mut writer)?;
+        writer.pad_to(usize::try_from(self.registry_info.strings_offset).ok()?)?;
+        self.strings.encode_into(&mut writer);
+        writer.pad_to(usize::try_from(self.registry_info.machine_config_offset).ok()?)?;
+        self.machine_config.encode_into(&mut writer);
+        writer.pad_to(usize::try_from(self.registry_info.installed_sku_offset).ok()?)?;
+        writer.write(self.installed_sku.as_slice());
+        writer.finish(self.total_size)
+    }
+}
+
+impl MuiBlobWriter {
+    fn new(capacity: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn write<T: IntoBytes + Immutable + ?Sized>(&mut self, value: &T) {
+        self.data.extend_from_slice(value.as_bytes());
+    }
+
+    fn pad_to(&mut self, offset: usize) -> Option<()> {
+        if self.data.len() > offset {
+            return None;
+        }
+        self.data.resize(offset, 0);
+        Some(())
+    }
+
+    fn finish(mut self, total_size: usize) -> Option<Vec<u8>> {
+        self.pad_to(total_size)?;
+        Some(self.data)
+    }
 }
 
 struct NlsSectionRequest<Platform: RawPointerProvider> {
@@ -438,9 +495,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         if !flags.contains(MuiRegistryInfoFlags::QUERY) {
             if flags.contains(MuiRegistryInfoFlags::COMMIT) {
-                self.global
+                let previous_generation = self
+                    .global
                     .mui_generation
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                litebox_util_log::warn!(
+                    previous_generation,
+                    generation = previous_generation.wrapping_add(1);
+                    "Advanced the MUI generation without persisting MUI configuration"
+                );
             }
             return NtStatus::SUCCESS;
         }
@@ -452,10 +515,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .global
             .mui_generation
             .load(core::sync::atomic::Ordering::Relaxed);
-        let Some(layout) = mui_registry_layout(&[EN_US_MUI_LANGUAGE], 0) else {
+        // TODO(mui-registry-info): Populate the serializer from the guest registry when installed
+        // language configuration becomes mutable. The shim currently supplies only fixed en-US.
+        let Some(registry_blob) = MuiRegistryBlob::new(generation, &[EN_US_MUI_LANGUAGE], &[])
+        else {
             return NtStatus::UNSUCCESSFUL;
         };
-        let required_size = layout.total_size.trunc();
+        let required_size = registry_blob.encoded_len().trunc();
         if supplied_size == 0 {
             return write_required_output::<Platform, u32>(data_size, required_size);
         }
@@ -473,7 +539,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(data) = data else {
             return NtStatus::INVALID_PARAMETER;
         };
-        let Some(registry_data) = mui_registry_data(generation, &[EN_US_MUI_LANGUAGE], &[]) else {
+        let Some(registry_data) = registry_blob.encode() else {
             return NtStatus::UNSUCCESSFUL;
         };
         if data.copy_from_slice(0, &registry_data).is_none() {
@@ -993,6 +1059,14 @@ mod tests {
 
     type TestPlatform = crate::tests::TestPlatform;
 
+    fn mui_registry_data(
+        generation: u32,
+        languages: &[MuiLanguage<'_>],
+        language_configs: &[MuiLanguageConfigNode],
+    ) -> Option<Vec<u8>> {
+        MuiRegistryBlob::new(generation, languages, language_configs)?.encode()
+    }
+
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     unsafe extern "system" {
         fn NtGetNlsSectionPtr(
@@ -1036,241 +1110,6 @@ mod tests {
         NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
     }
 
-    #[test]
-    fn nt_get_mui_registry_info_queries_and_fills_host_shaped_data() {
-        let task = crate::tests::test_task();
-        let mut data_size = 0u32;
-        let expected = mui_registry_data(0, &[EN_US_MUI_LANGUAGE], &[]).unwrap();
-
-        assert_eq!(
-            task.sys_nt_get_mui_registry_info(0, Some(mut_ptr(&mut data_size)), None,),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(data_size as usize, expected.len());
-        assert_eq!(data_size, 1232);
-
-        let mut data = vec![0; data_size as usize];
-        assert_eq!(
-            task.sys_nt_get_mui_registry_info(
-                MuiRegistryInfoFlags::QUERY.bits(),
-                Some(mut_ptr(&mut data_size)),
-                Some(mut_ptr(data.first_mut().unwrap())),
-            ),
-            NtStatus::SUCCESS
-        );
-
-        let registry_info = MuiRegistryInfo::read_from_prefix(&data).unwrap().0;
-        assert_eq!(
-            data,
-            mui_registry_data(registry_info.generation, &[EN_US_MUI_LANGUAGE], &[]).unwrap()
-        );
-        assert_eq!(registry_info.install_language_fallback[0], 0x0409);
-        assert_eq!(registry_info.installed_offset, 0xa8);
-        assert_eq!(registry_info.strings_offset, 0x130);
-        assert_eq!(registry_info.machine_config_offset, 0x1a8);
-        assert_eq!(registry_info.installed_sku_offset, 0x1c8);
-        let installed_offset = usize::try_from(registry_info.installed_offset).unwrap();
-        let strings_offset = usize::try_from(registry_info.strings_offset).unwrap();
-        let installed = MuiLanguages::read_from_prefix(&data[installed_offset..])
-            .unwrap()
-            .0;
-        assert_eq!(installed.total_size, 0x88);
-        let language_info = MuiLanguageInfo::read_from_prefix(
-            &data[installed_offset + size_of::<MuiLanguages>()..],
-        )
-        .unwrap()
-        .0;
-        assert_eq!(language_info.language_id, 0x0409);
-        assert_eq!(
-            &data[strings_offset
-                + size_of::<MuiStringPool>()
-                + size_of::<[i16; MUI_STRING_CAPACITY]>()
-                + size_of::<u16>()
-                ..strings_offset
-                    + size_of::<MuiStringPool>()
-                    + size_of::<[i16; MUI_STRING_CAPACITY]>()
-                    + 7 * size_of::<u16>()],
-            &[b'e', 0, b'n', 0, b'-', 0, b'U', 0, b'S', 0, 0, 0]
-        );
-    }
-
-    #[test]
-    fn nt_get_mui_registry_info_reports_required_size_without_touching_short_buffer() {
-        let task = crate::tests::test_task();
-        let required_size = mui_registry_data(0, &[EN_US_MUI_LANGUAGE], &[])
-            .unwrap()
-            .len();
-        let mut data_size: u32 = required_size.trunc();
-        data_size -= 1;
-        let mut data = vec![0xa5; data_size as usize];
-        let before = data.clone();
-
-        assert_eq!(
-            task.sys_nt_get_mui_registry_info(
-                MuiRegistryInfoFlags::QUERY.bits(),
-                Some(mut_ptr(&mut data_size)),
-                Some(mut_ptr(data.first_mut().unwrap())),
-            ),
-            NtStatus::BUFFER_TOO_SMALL
-        );
-        assert_eq!(data_size as usize, required_size);
-        assert_eq!(data, before);
-    }
-
-    #[test]
-    fn nt_get_mui_registry_info_rejects_invalid_flags_and_buffer_shapes() {
-        let task = crate::tests::test_task();
-        let mut data_size = 0u32;
-        let mut data = mui_registry_data(0, &[EN_US_MUI_LANGUAGE], &[]).unwrap();
-
-        assert_eq!(
-            task.sys_nt_get_mui_registry_info(0x4, Some(mut_ptr(&mut data_size)), None,),
-            NtStatus::INVALID_PARAMETER
-        );
-        assert_eq!(
-            task.sys_nt_get_mui_registry_info(
-                0,
-                Some(mut_ptr(&mut data_size)),
-                Some(mut_ptr(data.first_mut().unwrap())),
-            ),
-            NtStatus::INVALID_PARAMETER
-        );
-        data_size = data.len().trunc();
-        assert_eq!(
-            task.sys_nt_get_mui_registry_info(0, Some(mut_ptr(&mut data_size)), None,),
-            NtStatus::INVALID_PARAMETER
-        );
-    }
-
-    #[test]
-    fn mui_registry_data_serializes_multiple_languages_and_configs() {
-        let second_language = MuiLanguage {
-            info: MuiLanguageInfo {
-                language_id: 0x040c,
-                ..EN_US_MUI_LANGUAGE_INFO
-            },
-            name: "fr-FR",
-        };
-        let configs = [
-            EMPTY_MUI_LANGUAGE_CONFIG,
-            MuiLanguageConfigNode {
-                language_index: 1,
-                fallback_types: 1,
-                ..EMPTY_MUI_LANGUAGE_CONFIG
-            },
-        ];
-        let languages = [EN_US_MUI_LANGUAGE, second_language];
-        let data = mui_registry_data(7, &languages, &configs).unwrap();
-        let layout = mui_registry_layout(&languages, 2).unwrap();
-        assert_eq!(data.len(), layout.total_size);
-
-        let registry_info = MuiRegistryInfo::read_from_prefix(&data).unwrap().0;
-        assert_eq!(registry_info.generation, 7);
-        assert_eq!(
-            registry_info.install_language_fallback[..2],
-            [0x0409, 0x040c]
-        );
-        let installed_offset = usize::try_from(registry_info.installed_offset).unwrap();
-        let machine_config_offset = usize::try_from(registry_info.machine_config_offset).unwrap();
-        let installed = MuiLanguages::read_from_prefix(&data[installed_offset..])
-            .unwrap()
-            .0;
-        assert_eq!(installed.languages, 2);
-        assert_eq!(installed.max_languages, 4);
-        assert_eq!(installed.language_info_offset, 0);
-        let second_info_offset =
-            installed_offset + size_of::<MuiLanguages>() + size_of::<MuiLanguageInfo>();
-        assert_eq!(
-            MuiLanguageInfo::read_from_prefix(&data[second_info_offset..])
-                .unwrap()
-                .0
-                .language_id,
-            second_language.info.language_id
-        );
-        assert_eq!(
-            MuiLanguageInfo::read_from_prefix(&data[second_info_offset..])
-                .unwrap()
-                .0
-                .language_name_index,
-            7
-        );
-        for index in 2..layout.language_capacity {
-            let offset =
-                installed_offset + size_of::<MuiLanguages>() + index * size_of::<MuiLanguageInfo>();
-            assert_eq!(
-                MuiLanguageInfo::read_from_prefix(&data[offset..])
-                    .unwrap()
-                    .0,
-                EMPTY_MUI_LANGUAGE_INFO
-            );
-        }
-
-        let strings_offset = usize::try_from(registry_info.strings_offset).unwrap();
-        let strings = MuiStringPool::read_from_prefix(&data[strings_offset..])
-            .unwrap()
-            .0;
-        assert_eq!(strings.strings, 3);
-        assert_eq!(strings.max_strings, 4);
-        assert_eq!(strings.characters, 14);
-        assert_eq!(strings.max_characters, 40);
-        let indices_offset = strings_offset + size_of::<MuiStringPool>();
-        let indices = <[i16; MUI_STRING_CAPACITY]>::read_from_prefix(&data[indices_offset..])
-            .unwrap()
-            .0;
-        assert_eq!(indices, [0, 1, 7, 0]);
-        let pool_offset = indices_offset + size_of::<[i16; MUI_STRING_CAPACITY]>();
-        let names = <[u16; 14]>::read_from_prefix(&data[pool_offset..])
-            .unwrap()
-            .0;
-        assert_eq!(
-            names,
-            [0, 101, 110, 45, 85, 83, 0, 102, 114, 45, 70, 82, 0, 0]
-        );
-
-        let machine_config =
-            MuiLanguageConfigList::read_from_prefix(&data[machine_config_offset..])
-                .unwrap()
-                .0;
-        assert_eq!(machine_config.languages, 2);
-        assert_eq!(machine_config.max_languages, 2);
-        assert_eq!(machine_config.language_configs_offset, 0);
-        assert_eq!(
-            machine_config.total_size as usize,
-            size_of::<MuiLanguageConfigList>() + 2 * size_of::<MuiLanguageConfigNode>()
-        );
-        let second_config_offset = machine_config_offset
-            + size_of::<MuiLanguageConfigList>()
-            + size_of::<MuiLanguageConfigNode>();
-        assert_eq!(
-            MuiLanguageConfigNode::read_from_prefix(&data[second_config_offset..])
-                .unwrap()
-                .0,
-            configs[1]
-        );
-        assert_eq!(
-            usize::try_from(registry_info.installed_sku_offset).unwrap(),
-            align_up(
-                machine_config_offset + machine_config.total_size as usize,
-                8
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn mui_registry_data_rejects_unrepresentable_language_name_indices() {
-        let long_name = "a".repeat(i16::MAX as usize);
-        let languages = [
-            MuiLanguage {
-                info: EN_US_MUI_LANGUAGE_INFO,
-                name: &long_name,
-            },
-            EN_US_MUI_LANGUAGE,
-        ];
-
-        assert!(mui_registry_data(0, &languages, &[]).is_none());
-    }
-
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     #[test]
     fn nt_get_mui_registry_info_matches_host_query_contract_and_layout() {
@@ -1301,7 +1140,7 @@ mod tests {
         let host_registry_info = MuiRegistryInfo::read_from_prefix(&host_data).unwrap().0;
         assert_eq!(
             host_registry_info.installed_offset,
-            u64::try_from(MUI_INSTALLED_OFFSET).unwrap(),
+            u64::try_from(size_of::<MuiRegistryInfo>()).unwrap(),
         );
         let expected =
             mui_registry_data(host_registry_info.generation, &[EN_US_MUI_LANGUAGE], &[]).unwrap();
