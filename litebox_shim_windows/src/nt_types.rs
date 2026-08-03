@@ -274,26 +274,30 @@ pub(crate) struct UnicodeString {
 }
 
 impl UnicodeString {
-    pub(crate) fn read_string<Platform: RawPointerProvider>(self) -> Result<String, NtStatus> {
+    pub(crate) fn character_count(self) -> Result<usize, NtStatus> {
         if !self.length.is_multiple_of(2) {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         if self.maximum_length < self.length {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        if self.length == 0 {
+        Ok(usize::from(self.length / 2))
+    }
+
+    pub(crate) fn read_string<Platform: RawPointerProvider>(self) -> Result<String, NtStatus> {
+        let character_count = self.character_count()?;
+        if character_count == 0 {
             return Ok(String::new());
         }
         if self.buffer == 0 {
             return Err(NtStatus::ACCESS_VIOLATION);
         }
 
-        let chars = usize::from(self.length / 2);
         let buffer =
             <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<u16>::from_usize(
                 self.buffer,
             );
-        let Some(units) = buffer.to_owned_slice(chars) else {
+        let Some(units) = buffer.to_owned_slice(character_count) else {
             return Err(NtStatus::ACCESS_VIOLATION);
         };
         Ok(String::from_utf16_lossy(&units))
