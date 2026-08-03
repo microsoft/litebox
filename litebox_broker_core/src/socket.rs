@@ -33,7 +33,7 @@ pub struct AcceptedPlatformSocket {
 }
 
 /// Broker socket and endpoint metadata returned by an accept operation.
-pub struct AcceptedSocket {
+pub struct AcceptedBrokerSocket {
     /// Broker handle naming the accepted socket.
     pub handle: ObjectHandle,
     /// Local endpoint of the accepted connection.
@@ -379,7 +379,7 @@ pub fn accept(
     session: &BrokerSession,
     handle: ObjectHandle,
     readiness_sink: Arc<dyn ReadinessSink>,
-) -> Result<SocketOutcome<AcceptedSocket>> {
+) -> Result<SocketOutcome<AcceptedBrokerSocket>> {
     let listener = session.authorized_object(handle, ObjectRights::WAIT)?;
     let (listener_resource, create_request) = {
         let listener = listener.read();
@@ -422,7 +422,7 @@ pub fn accept(
     let accepted_socket =
         SocketObject::new_connected(resource, create_request, accepted.local_address);
     let handle = reference.commit(ObjectEntry::Socket(accepted_socket))?;
-    Ok(SocketOutcome::Completed(AcceptedSocket {
+    Ok(SocketOutcome::Completed(AcceptedBrokerSocket {
         handle,
         local_address: accepted.local_address,
         remote_address: accepted.remote_address,
