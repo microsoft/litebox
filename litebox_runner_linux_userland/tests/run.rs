@@ -10,7 +10,12 @@ use std::{
 };
 
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c", "tcp_broker.c"];
+const BROKER_ONLY_C_TESTS: &[&str] = &[
+    "eventfd.c",
+    "pipe_broker.c",
+    "tcp_broker.c",
+    "tcp_broker_server.c",
+];
 
 #[must_use]
 struct Runner {
@@ -645,6 +650,130 @@ fn test_runner_broker_tcp_client_with_rewriter() {
     assert_eq!(broker.next_close_object_count(), 9);
     broker.join();
     server.join().unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_broker_tcp_server_with_rewriter() {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::net::{Ipv4Addr, TcpStream};
+    use std::process::Stdio;
+
+    let target = common::compile(
+        "./tests/tcp_broker_server.c",
+        "broker_tcp_server_rewriter",
+        false,
+        false,
+    );
+    let control_socket_path = unique_test_socket_path("runner-broker-tcp-server-control");
+    let broker = spawn_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4LoopbackTcp),
+        1,
+    );
+    let mut child = Runner::new(&target, "broker_tcp_server_rewriter")
+        .broker_socket(&control_socket_path)
+        .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::inherit());
+    let stdout = child.stdout.take().unwrap();
+    let (line_sender, line_receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line_sender.send(line.unwrap()).is_err() {
+                return;
+            }
+        }
+    });
+    let mut output = String::new();
+    let mut next_marker =
+        |prefix: &str| {
+            let deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
+            loop {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or_default();
+                let line = line_receiver.recv_timeout(remaining).unwrap_or_else(|error| {
+                panic!("timed out waiting for guest marker {prefix:?}: {error}; output:\n{output}")
+            });
+                output.push_str(&line);
+                output.push('\n');
+                if line.starts_with(prefix) {
+                    return line;
+                }
+            }
+        };
+
+    let listen = next_marker("LISTEN ");
+    let port = listen.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let mut first = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    first.set_read_timeout(Some(BROKER_HELPER_TIMEOUT)).unwrap();
+    first
+        .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
+        .unwrap();
+    let first_port = first.local_addr().unwrap().port();
+    first.write_all(&[0x31]).unwrap();
+    let mut response = [0];
+    first.read_exact(&mut response).unwrap();
+    assert_eq!(response, [0x41]);
+    let first_marker = next_marker("FIRST ");
+    assert_eq!(
+        first_marker
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap(),
+        first_port
+    );
+
+    assert_eq!(next_marker("BLOCKING"), "BLOCKING");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "blocking accept returned before a client connected"
+    );
+    let mut second = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    second
+        .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
+        .unwrap();
+    second
+        .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
+        .unwrap();
+    let second_port = second.local_addr().unwrap().port();
+    second.write_all(&[0x32]).unwrap();
+    second.read_exact(&mut response).unwrap();
+    assert_eq!(response, [0x42]);
+    let second_marker = next_marker("SECOND ");
+    assert_eq!(
+        second_marker
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap(),
+        second_port
+    );
+
+    let deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("broker TCP server guest did not exit; output:\n{output}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    reader.join().unwrap();
+    assert!(
+        status.success(),
+        "broker TCP server guest failed with {status}; output:\n{output}"
+    );
+    assert_eq!(broker.next_close_object_count(), 3);
+    broker.join();
 }
 
 #[cfg(target_arch = "x86_64")]

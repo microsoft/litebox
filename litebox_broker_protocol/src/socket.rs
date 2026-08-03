@@ -17,6 +17,8 @@ use thiserror::Error;
 pub const MAX_SOCKET_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE;
 /// Maximum stream prefix addressable by offset-based peek requests.
 pub const MAX_SOCKET_PEEK_SIZE: u32 = 0x80_000;
+/// Maximum TCP listen backlog accepted by the broker protocol.
+pub const MAX_TCP_LISTEN_BACKLOG: u32 = 4096;
 
 /// Address family of a broker socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +273,56 @@ pub struct ConnectSocketRequest {
 pub struct ConnectSocketResponse {
     /// Connection state after the nonblocking attempt.
     pub status: SocketConnectionStatus,
+}
+
+/// Request to bind a socket to a local IPv4 address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Requested local address. Port zero requests an ephemeral port.
+    pub address: SocketAddressV4,
+}
+
+/// Response to a socket bind request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSocketResponse {
+    /// Local address assigned by the host network stack.
+    pub local_address: SocketAddressV4,
+}
+
+/// Request to make a bound socket listen for connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Maximum pending connection backlog.
+    pub backlog: u32,
+}
+
+/// Response to a socket listen request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenSocketResponse {
+    /// Local address assigned by the host network stack.
+    pub local_address: SocketAddressV4,
+}
+
+/// Request to accept one pending connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptSocketRequest {
+    /// Listening socket handle.
+    pub handle: ObjectHandle,
+}
+
+/// Response containing one accepted broker socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptSocketResponse {
+    /// Handle naming the accepted socket.
+    pub handle: ObjectHandle,
+    /// Local endpoint of the accepted connection.
+    pub local_address: SocketAddressV4,
+    /// Remote endpoint of the accepted connection.
+    pub remote_address: SocketAddressV4,
 }
 
 /// Broker-authoritative socket connection state.

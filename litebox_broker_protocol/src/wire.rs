@@ -351,11 +351,13 @@ mod tests {
     };
     use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use crate::socket::{
-        AddressFamily, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-        CreateSocketResponse, IpProtocol, Ipv4Address, Port, ReceiveFlags, ReceiveSocketRequest,
-        ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse, ShutdownMode,
-        ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
-        SocketStatusRequest, SocketStatusResponse, SocketType,
+        AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
+        BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
+        CreateSocketResponse, IpProtocol, Ipv4Address, ListenSocketRequest, ListenSocketResponse,
+        Port, ReceiveFlags, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
+        SendSocketRequest, SendSocketResponse, ShutdownMode, ShutdownSocketRequest,
+        SocketAddressV4, SocketConnectionStatus, SocketError, SocketStatusRequest,
+        SocketStatusResponse, SocketType,
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
@@ -427,6 +429,18 @@ mod tests {
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
             })),
+            BrokerOperation::Socket(SocketRequest::Bind(BindSocketRequest {
+                handle,
+                address: SocketAddressV4 {
+                    address: Ipv4Address([127, 0, 0, 1]),
+                    port: Port(0),
+                },
+            })),
+            BrokerOperation::Socket(SocketRequest::Listen(ListenSocketRequest {
+                handle,
+                backlog: 4096,
+            })),
+            BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest { handle })),
             BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                 handle,
                 address: SocketAddressV4 {
@@ -628,6 +642,29 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 })),
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResult::Socket(SocketResponse::Create(CreateSocketResponse { handle })),
+            BrokerResult::Socket(SocketResponse::Bind(BindSocketResponse {
+                local_address: SocketAddressV4 {
+                    address: Ipv4Address([127, 0, 0, 1]),
+                    port: Port(49152),
+                },
+            })),
+            BrokerResult::Socket(SocketResponse::Listen(ListenSocketResponse {
+                local_address: SocketAddressV4 {
+                    address: Ipv4Address([127, 0, 0, 1]),
+                    port: Port(49152),
+                },
+            })),
+            BrokerResult::Socket(SocketResponse::Accept(AcceptSocketResponse {
+                handle,
+                local_address: SocketAddressV4 {
+                    address: Ipv4Address([127, 0, 0, 1]),
+                    port: Port(49152),
+                },
+                remote_address: SocketAddressV4 {
+                    address: Ipv4Address([127, 0, 0, 1]),
+                    port: Port(49153),
+                },
+            })),
             BrokerResult::Socket(SocketResponse::Status(socket_status(
                 SocketConnectionStatus::Unconnected,
             ))),
@@ -1116,6 +1153,30 @@ mod tests {
                 result: BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset,)),
             }),
             [8, 13, 0, 0, 0, 0, 0, 0, 0, 6, 2]
+        );
+    }
+
+    #[test]
+    fn socket_accept_response_wire_shape_is_pinned() {
+        assert_eq!(
+            encode_response(BrokerResponse {
+                request_id: RequestId(13),
+                result: BrokerResult::Socket(SocketResponse::Accept(AcceptSocketResponse {
+                    handle: ObjectHandle(9),
+                    local_address: SocketAddressV4 {
+                        address: Ipv4Address([127, 0, 0, 1]),
+                        port: Port(49152),
+                    },
+                    remote_address: SocketAddressV4 {
+                        address: Ipv4Address([203, 0, 113, 7]),
+                        port: Port(443),
+                    },
+                })),
+            }),
+            [
+                8, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0, 192, 203,
+                0, 113, 7, 187, 1,
+            ]
         );
     }
 

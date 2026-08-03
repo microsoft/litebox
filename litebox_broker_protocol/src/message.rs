@@ -12,9 +12,11 @@ use crate::pipe::{
 };
 use crate::readiness::ReadinessFlags;
 use crate::socket::{
+    AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
-    ReceiveSocketRequest, ReceiveSocketResponse, SendSocketRequest, SendSocketResponse,
-    ShutdownSocketRequest, SocketError, SocketStatusRequest, SocketStatusResponse,
+    ListenSocketRequest, ListenSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse,
+    SendSocketRequest, SendSocketResponse, ShutdownSocketRequest, SocketError, SocketStatusRequest,
+    SocketStatusResponse,
 };
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
@@ -102,6 +104,12 @@ pub enum SocketRequest {
     Create(CreateSocketRequest),
     /// Connect a socket to a remote address.
     Connect(ConnectSocketRequest),
+    /// Bind a socket to a local address.
+    Bind(BindSocketRequest),
+    /// Make a bound socket listen for connections.
+    Listen(ListenSocketRequest),
+    /// Accept one pending connection.
+    Accept(AcceptSocketRequest),
     /// Send bytes staged in shared memory.
     Send(SendSocketRequest),
     /// Receive bytes into shared memory.
@@ -167,6 +175,12 @@ pub enum SocketResponse {
     Create(CreateSocketResponse),
     /// Connect operation response.
     Connect(ConnectSocketResponse),
+    /// Bind operation response.
+    Bind(BindSocketResponse),
+    /// Listen operation response.
+    Listen(ListenSocketResponse),
+    /// Accept operation response.
+    Accept(AcceptSocketResponse),
     /// Send operation response.
     Send(SendSocketResponse),
     /// Receive operation response.

@@ -9,7 +9,7 @@ use core::{
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::socket::{
-    Ipv4Address, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, Port,
+    AcceptSocketResponse, Ipv4Address, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, Port,
     ReceiveFlags as BrokerReceiveFlags, ReceiveSocketResponse, SendFlags as BrokerSendFlags,
     ShutdownMode, SocketAddressV4 as BrokerSocketAddressV4, SocketConnectionStatus,
     SocketError as BrokerSocketError, SocketOutcome, SocketStatusResponse,
@@ -17,7 +17,9 @@ use litebox_broker_protocol::socket::{
 
 use super::{
     ReceiveFlags,
-    errors::{ConnectError, RemoteAddrError, SocketAsyncError},
+    errors::{
+        AcceptError, BindError, ConnectError, ListenError, RemoteAddrError, SocketAsyncError,
+    },
     socket_channel::{ChannelReadError, ChannelWriteError, SocketState},
 };
 use crate::{
@@ -34,6 +36,7 @@ struct BrokerSocketState {
     local_address: Option<SocketAddrV4>,
     remote_address: Option<SocketAddrV4>,
     async_error: u32,
+    listening: bool,
 }
 
 impl BrokerSocketState {
@@ -80,6 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 local_address: None,
                 remote_address: None,
                 async_error: 0,
+                listening: false,
             }),
             write_shutdown: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -88,6 +92,90 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             .pollable_registry
             .register_pollable(handle, &socket.pollee);
         Ok(socket)
+    }
+
+    fn from_accepted(
+        broker: Arc<dyn BrokerControl>,
+        pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
+        accepted: AcceptSocketResponse,
+    ) -> Arc<Self> {
+        let socket = Arc::new(Self {
+            broker,
+            handle: accepted.handle,
+            pollable_registry,
+            pollee: Arc::new(Pollee::new()),
+            receive_lock: Mutex::new(()),
+            state: Mutex::new(BrokerSocketState {
+                connection: SocketConnectionStatus::Connected,
+                local_address: Some(socket_address(accepted.local_address)),
+                remote_address: Some(socket_address(accepted.remote_address)),
+                async_error: 0,
+                listening: false,
+            }),
+            write_shutdown: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        });
+        socket
+            .pollable_registry
+            .register_pollable(accepted.handle, &socket.pollee);
+        socket
+    }
+
+    pub(super) fn bind(&self, address: SocketAddrV4) -> Result<(), BindError> {
+        if self.state.lock().local_address.is_some() {
+            return Err(BindError::AlreadyBound);
+        }
+        let outcome = self
+            .broker
+            .bind_socket(self.handle, broker_address(address))
+            .map_err(|error| BindError::OperationFailed(BrokerObjectError::from(error).into()))?;
+        match outcome {
+            SocketOutcome::Completed(local_address) => {
+                self.state.lock().local_address = Some(socket_address(local_address));
+                Ok(())
+            }
+            SocketOutcome::Failed(error) => {
+                Err(BindError::OperationFailed(SocketAsyncError::from(error)))
+            }
+        }
+    }
+
+    pub(super) fn listen(&self, backlog: u32) -> Result<(), ListenError> {
+        let outcome = self
+            .broker
+            .listen_socket(self.handle, backlog)
+            .map_err(|error| ListenError::OperationFailed(BrokerObjectError::from(error).into()))?;
+        match outcome {
+            SocketOutcome::Completed(local_address) => {
+                let mut state = self.state.lock();
+                state.local_address = Some(socket_address(local_address));
+                state.listening = true;
+                Ok(())
+            }
+            SocketOutcome::Failed(error) => Err(ListenError::OperationFailed(error.into())),
+        }
+    }
+
+    pub(super) fn accept(&self) -> Result<Arc<Self>, AcceptError> {
+        if !self.state.lock().listening {
+            return Err(AcceptError::NotListening);
+        }
+        let outcome = self.broker.accept_socket(self.handle).map_err(|error| {
+            let error = BrokerObjectError::from(error);
+            if error == BrokerObjectError::WouldBlock {
+                AcceptError::NoConnectionsReady
+            } else {
+                AcceptError::OperationFailed(error.into())
+            }
+        })?;
+        match outcome {
+            SocketOutcome::Completed(accepted) => Ok(Self::from_accepted(
+                Arc::clone(&self.broker),
+                Arc::clone(&self.pollable_registry),
+                accepted,
+            )),
+            SocketOutcome::Failed(error) => Err(AcceptError::OperationFailed(error.into())),
+        }
     }
 
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
@@ -178,7 +266,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             SocketState::Connecting => SocketConnectionStatus::Connecting,
             SocketState::Connected => SocketConnectionStatus::Connected,
             SocketState::Error => self.state.lock().connection,
-            SocketState::Listening | SocketState::Closed => return,
+            SocketState::Listening => {
+                self.state.lock().listening = true;
+                return;
+            }
+            SocketState::Closed => return,
         };
         self.state.lock().update_connection(connection);
     }
@@ -415,6 +507,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 .notify_observers(Events::IN | Events::OUT | Events::HUP);
         }
     }
+}
+
+fn broker_address(address: SocketAddrV4) -> BrokerSocketAddressV4 {
+    BrokerSocketAddressV4 {
+        address: Ipv4Address(address.ip().octets()),
+        port: Port(address.port()),
+    }
+}
+
+fn socket_address(address: BrokerSocketAddressV4) -> SocketAddrV4 {
+    SocketAddrV4::new(core::net::Ipv4Addr::from(address.address.0), address.port.0)
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerTcpSocket<Platform> {

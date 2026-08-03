@@ -7,10 +7,11 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
 use litebox_broker_protocol::socket::{
-    AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE,
-    ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest, ShutdownMode,
-    ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
-    SocketStatusRequest, SocketStatusResponse, SocketType,
+    AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
+    ConnectSocketRequest, CreateSocketRequest, IpProtocol, ListenSocketRequest,
+    MAX_SOCKET_TRANSFER_SIZE, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
+    SendSocketRequest, ShutdownMode, ShutdownSocketRequest, SocketAddressV4,
+    SocketConnectionStatus, SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -52,6 +53,59 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             SocketResponse::Connect(response) => Ok(Ok(response.status)),
             SocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected socket connect response: {response:?}"),
+        }
+    }
+
+    /// Binds a broker-owned TCP socket to a local IPv4 address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn bind_socket(
+        &self,
+        handle: ObjectHandle,
+        address: SocketAddressV4,
+    ) -> Result<core::result::Result<SocketAddressV4, SocketError>, Channel::Error> {
+        match self.request_socket(SocketRequest::Bind(BindSocketRequest { handle, address }))? {
+            SocketResponse::Bind(response) => Ok(Ok(response.local_address)),
+            SocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected socket bind response: {response:?}"),
+        }
+    }
+
+    /// Makes a broker-owned TCP socket listen for incoming connections.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn listen_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> Result<core::result::Result<SocketAddressV4, SocketError>, Channel::Error> {
+        match self.request_socket(SocketRequest::Listen(ListenSocketRequest {
+            handle,
+            backlog,
+        }))? {
+            SocketResponse::Listen(response) => Ok(Ok(response.local_address)),
+            SocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected socket listen response: {response:?}"),
+        }
+    }
+
+    /// Accepts one pending connection from a broker-owned TCP listener.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn accept_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<core::result::Result<AcceptSocketResponse, SocketError>, Channel::Error> {
+        match self.request_socket(SocketRequest::Accept(AcceptSocketRequest { handle }))? {
+            SocketResponse::Accept(response) => Ok(Ok(response)),
+            SocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected socket accept response: {response:?}"),
         }
     }
 

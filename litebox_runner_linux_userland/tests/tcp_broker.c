@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
     assert(local_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
     assert(local_address.sin_port != 0);
     assert(accept(fd, NULL, NULL) == -1);
-    assert(errno == EOPNOTSUPP);
+    assert(errno == ENOTCONN);
     struct sockaddr_in peer_address;
     address_length = sizeof(peer_address);
     assert(getpeername(fd, (struct sockaddr *)&peer_address, &address_length) == 0);

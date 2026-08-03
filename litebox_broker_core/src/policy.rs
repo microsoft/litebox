@@ -190,7 +190,11 @@ impl TcpDestinationPolicy {
     }
 }
 
-/// Network access available to broker-owned sockets.
+/// Socket creation and outbound destination access available to broker-owned sockets.
+///
+/// Listener authority is separate from egress destination rules: any principal
+/// permitted to create an IPv4 TCP socket may bind it only within the IPv4
+/// loopback network.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 #[expect(
@@ -363,6 +367,26 @@ impl PolicyEngine {
             && self
                 .socket_policy
                 .permits_tcp_destination(caller_credential, address)
+        {
+            Ok(())
+        } else {
+            Err(BrokerError::PolicyDenied)
+        }
+    }
+
+    pub(crate) fn authorize_socket_bind(
+        &self,
+        caller_credential: CallerCredential,
+        request: CreateSocketRequest,
+        address: SocketAddressV4,
+    ) -> Result<(), BrokerError> {
+        self.principal_object_rights(caller_credential)?;
+        // Egress rules do not describe local listener authority. Socket
+        // creation admission plus this fixed loopback boundary governs binds.
+        if request.address_family == AddressFamily::Ipv4
+            && request.socket_type == SocketType::Stream
+            && request.protocol == IpProtocol::Tcp
+            && address.address.0[0] == 127
         {
             Ok(())
         } else {

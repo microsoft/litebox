@@ -1291,8 +1291,14 @@ where
             .get_entry_mut(fd)
             .ok_or(BindError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if socket_handle.broker_socket.is_some() {
-            return Err(BindError::UnsupportedOperation);
+        if let Some(socket) = socket_handle
+            .broker_socket
+            .as_ref()
+            .map(alloc::sync::Arc::clone)
+        {
+            drop(table_entry);
+            drop(descriptor_table);
+            return socket.bind(*addr);
         }
         match socket_handle.protocol() {
             Protocol::Tcp => {
@@ -1364,8 +1370,16 @@ where
             .get_entry_mut(fd)
             .ok_or(ListenError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if socket_handle.broker_socket.is_some() {
-            return Err(ListenError::UnsupportedOperation);
+        if let Some(socket) = socket_handle
+            .broker_socket
+            .as_ref()
+            .map(alloc::sync::Arc::clone)
+        {
+            drop(table_entry);
+            drop(descriptor_table);
+            return socket.listen(
+                u32::from(backlog).min(litebox_broker_protocol::socket::MAX_TCP_LISTEN_BACKLOG),
+            );
         }
         if backlog == 0 {
             // What should actually happen here?
@@ -1461,8 +1475,31 @@ where
             .get_entry_mut(fd)
             .ok_or(AcceptError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if socket_handle.broker_socket.is_some() {
-            return Err(AcceptError::UnsupportedOperation);
+        if let Some(listener) = socket_handle
+            .broker_socket
+            .as_ref()
+            .map(alloc::sync::Arc::clone)
+        {
+            drop(table_entry);
+            drop(descriptor_table);
+            let accepted = listener.accept()?;
+            if let Some(peer) = peer {
+                *peer = accepted.remote_addr().map_err(|_| {
+                    AcceptError::OperationFailed(errors::SocketAsyncError::BackendFailure)
+                })?;
+            }
+            return Ok(self.new_socket_fd_for(SocketHandle {
+                consider_closed: false,
+                handle: None,
+                broker_socket: Some(accepted),
+                specific: ProtocolSpecific::Tcp(TcpSpecific {
+                    local_port: None,
+                    server_socket: None,
+                    immediate_close: AtomicBool::new(false),
+                    connect_initiated_at_us: None,
+                }),
+                proxy: None,
+            }));
         }
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {

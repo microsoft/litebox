@@ -105,6 +105,8 @@ pub enum BindError {
     AlreadyBound,
     #[error("Binding is unsupported for this socket")]
     UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::listen`]
@@ -121,6 +123,8 @@ pub enum ListenError {
     NoAvailableFreeEphemeralPorts,
     #[error("Listening is unsupported for this socket")]
     UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::accept`]
@@ -135,6 +139,8 @@ pub enum AcceptError {
     NoConnectionsReady,
     #[error("Accepting connections is unsupported for this socket")]
     UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::send`]

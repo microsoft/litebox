@@ -362,6 +362,7 @@ impl From<litebox::net::errors::AcceptError> for Errno {
             litebox::net::errors::AcceptError::NotListening => Errno::ENOTCONN,
             litebox::net::errors::AcceptError::NoConnectionsReady => Errno::EAGAIN,
             litebox::net::errors::AcceptError::UnsupportedOperation => Errno::EOPNOTSUPP,
+            litebox::net::errors::AcceptError::OperationFailed(error) => error.into(),
             _ => unimplemented!(),
         }
     }
@@ -375,6 +376,7 @@ impl From<litebox::net::errors::BindError> for Errno {
             litebox::net::errors::BindError::PortAlreadyInUse(_) => Errno::EADDRINUSE,
             litebox::net::errors::BindError::AlreadyBound => Errno::EINVAL,
             litebox::net::errors::BindError::UnsupportedOperation => Errno::EOPNOTSUPP,
+            litebox::net::errors::BindError::OperationFailed(error) => error.into(),
             _ => unimplemented!(),
         }
     }
@@ -478,6 +480,7 @@ impl From<litebox::net::errors::ListenError> for Errno {
             litebox::net::errors::ListenError::InvalidState => Errno::EINVAL,
             litebox::net::errors::ListenError::NoAvailableFreeEphemeralPorts => Errno::ENOSPC,
             litebox::net::errors::ListenError::UnsupportedOperation => Errno::EOPNOTSUPP,
+            litebox::net::errors::ListenError::OperationFailed(error) => error.into(),
 
             _ => unimplemented!(),
         }

@@ -752,7 +752,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd
             | AcceptError::NotListening
-            | AcceptError::UnsupportedOperation => TryOpError::Other(e.into()),
+            | AcceptError::UnsupportedOperation
+            | AcceptError::OperationFailed(_) => TryOpError::Other(e.into()),
             _ => unimplemented!(),
         })
     }

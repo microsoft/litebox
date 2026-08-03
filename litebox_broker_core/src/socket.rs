@@ -9,15 +9,40 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    CreateSocketRequest, MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags, ReceiveSocketResponse, SendFlags,
-    ShutdownMode, SocketAddressV4, SocketConnectionStatus, SocketError, SocketOutcome,
-    SocketStatusResponse,
+    CreateSocketRequest, Ipv4Address, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG, Port,
+    ReceiveFlags, ReceiveSocketResponse, SendFlags, ShutdownMode, SocketAddressV4,
+    SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse,
 };
 use spin::Once;
 
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result, SessionId};
+
+const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddressV4 = SocketAddressV4 {
+    address: Ipv4Address([127, 0, 0, 1]),
+    port: Port(0),
+};
+
+/// Platform socket and endpoint metadata returned by an accept operation.
+pub struct AcceptedPlatformSocket {
+    /// Accepted nonblocking platform socket.
+    pub socket: Arc<dyn PlatformSocket>,
+    /// Local endpoint of the accepted connection.
+    pub local_address: SocketAddressV4,
+    /// Remote endpoint of the accepted connection.
+    pub remote_address: SocketAddressV4,
+}
+
+/// Broker socket and endpoint metadata returned by an accept operation.
+pub struct AcceptedSocket {
+    /// Broker handle naming the accepted socket.
+    pub handle: ObjectHandle,
+    /// Local endpoint of the accepted connection.
+    pub local_address: SocketAddressV4,
+    /// Remote endpoint of the accepted connection.
+    pub remote_address: SocketAddressV4,
+}
 
 /// Broker-wide socket provider supplied by the host platform.
 ///
@@ -45,6 +70,18 @@ pub trait SocketProvider: Send + Sync {
 /// in flight to finish after its object handle closes. Dropping the final `Arc`
 /// releases the platform socket.
 pub trait PlatformSocket: Send + Sync {
+    /// Binds this socket to a local address.
+    fn bind(&self, address: SocketAddressV4) -> Result<SocketOutcome<SocketAddressV4>>;
+
+    /// Makes this socket listen for incoming connections.
+    fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddressV4>>;
+
+    /// Accepts one pending connection without waiting.
+    fn accept(
+        &self,
+        readiness: ReadinessRegistration,
+    ) -> Result<SocketOutcome<AcceptedPlatformSocket>>;
+
     /// Starts a connection attempt.
     ///
     /// `Unconnected` is not a valid result once the attempt reaches the
@@ -184,6 +221,9 @@ pub fn connect(
         if socket.connect_in_flight {
             return Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting));
         }
+        if socket.configuration_in_flight || socket.listening {
+            return Ok(SocketOutcome::Failed(SocketError::Other));
+        }
         if socket.connection_status != SocketConnectionStatus::Unconnected {
             return Ok(SocketOutcome::Completed(socket.connection_status));
         }
@@ -203,6 +243,192 @@ pub fn connect(
     };
     finish_connect(&object, status);
     Ok(SocketOutcome::Completed(status))
+}
+
+/// Binds a socket to an authorized loopback address.
+pub fn bind(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    address: SocketAddressV4,
+) -> Result<SocketOutcome<SocketAddressV4>> {
+    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let (resource, create_request) = {
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::InvalidRights);
+        };
+        if socket.configuration_in_flight
+            || socket.connect_in_flight
+            || socket.listening
+            || socket.local_address.is_some()
+            || socket.connection_status != SocketConnectionStatus::Unconnected
+        {
+            return Ok(SocketOutcome::Failed(SocketError::Other));
+        }
+        socket.configuration_in_flight = true;
+        (Arc::clone(&socket.resource), socket.create_request)
+    };
+    match session.core.policy.authorize_socket_bind(
+        session.caller_credential,
+        create_request,
+        address,
+    ) {
+        Ok(()) => {}
+        Err(BrokerError::PolicyDenied) => {
+            finish_configuration(&object, None, false);
+            return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+        }
+        Err(error) => {
+            finish_configuration(&object, None, false);
+            return Err(error);
+        }
+    }
+    let outcome = resource.bind(address);
+    match outcome {
+        Ok(SocketOutcome::Completed(local_address)) => {
+            finish_configuration(&object, Some(local_address), false);
+            Ok(SocketOutcome::Completed(local_address))
+        }
+        Ok(SocketOutcome::Failed(error)) => {
+            finish_configuration(&object, None, false);
+            Ok(SocketOutcome::Failed(error))
+        }
+        Err(error) => {
+            finish_configuration(&object, None, false);
+            Err(error)
+        }
+    }
+}
+
+/// Makes a socket listen for incoming loopback connections.
+pub fn listen(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    backlog: u32,
+) -> Result<SocketOutcome<SocketAddressV4>> {
+    if backlog > MAX_TCP_LISTEN_BACKLOG {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let (resource, create_request, needs_bind) = {
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::InvalidRights);
+        };
+        if socket.configuration_in_flight
+            || socket.connect_in_flight
+            || socket.connection_status != SocketConnectionStatus::Unconnected
+        {
+            return Ok(SocketOutcome::Failed(SocketError::Other));
+        }
+        socket.configuration_in_flight = true;
+        (
+            Arc::clone(&socket.resource),
+            socket.create_request,
+            socket.local_address.is_none(),
+        )
+    };
+
+    let mut local_address = None;
+    if needs_bind {
+        match session.core.policy.authorize_socket_bind(
+            session.caller_credential,
+            create_request,
+            DEFAULT_TCP_LISTEN_ADDRESS,
+        ) {
+            Ok(()) => {}
+            Err(BrokerError::PolicyDenied) => {
+                finish_configuration(&object, None, false);
+                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+            }
+            Err(error) => {
+                finish_configuration(&object, None, false);
+                return Err(error);
+            }
+        }
+        match resource.bind(DEFAULT_TCP_LISTEN_ADDRESS) {
+            Ok(SocketOutcome::Completed(address)) => local_address = Some(address),
+            Ok(SocketOutcome::Failed(error)) => {
+                finish_configuration(&object, None, false);
+                return Ok(SocketOutcome::Failed(error));
+            }
+            Err(error) => {
+                finish_configuration(&object, None, false);
+                return Err(error);
+            }
+        }
+    }
+
+    match resource.listen(backlog) {
+        Ok(SocketOutcome::Completed(address)) => {
+            local_address = Some(address);
+            finish_configuration(&object, local_address, true);
+            Ok(SocketOutcome::Completed(address))
+        }
+        Ok(SocketOutcome::Failed(error)) => {
+            finish_configuration(&object, local_address, false);
+            Ok(SocketOutcome::Failed(error))
+        }
+        Err(error) => {
+            finish_configuration(&object, local_address, false);
+            Err(error)
+        }
+    }
+}
+
+/// Accepts one pending connection and creates a new broker socket capability.
+pub fn accept(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    readiness_sink: Arc<dyn ReadinessSink>,
+) -> Result<SocketOutcome<AcceptedSocket>> {
+    let listener = session.authorized_object(handle, ObjectRights::WAIT)?;
+    let (listener_resource, create_request) = {
+        let listener = listener.read();
+        let ObjectEntry::Socket(socket) = &*listener else {
+            return Err(BrokerError::InvalidRights);
+        };
+        if !socket.listening {
+            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+        }
+        (Arc::clone(&socket.resource), socket.create_request)
+    };
+    let rights = session
+        .core
+        .policy
+        .principal_object_rights(session.caller_credential)?;
+    let quota = Arc::new(SocketQuotaReservation::new(session)?);
+    let reference = session.reserve_object_reference(rights)?;
+    let readiness = ReadinessRegistration::new_with_retirement_guard(
+        reference.handle(),
+        readiness_sink,
+        Arc::clone(&quota),
+    );
+    let resource = Arc::new(SocketResource {
+        platform_socket: Once::new(),
+        readiness,
+        _quota: quota,
+    });
+    let accepted = match listener_resource.accept(resource.readiness.clone()) {
+        Ok(SocketOutcome::Completed(accepted)) => accepted,
+        Ok(SocketOutcome::Failed(error)) => {
+            resource.readiness.retire();
+            return Ok(SocketOutcome::Failed(error));
+        }
+        Err(error) => {
+            resource.readiness.retire();
+            return Err(error);
+        }
+    };
+    resource.platform_socket.call_once(|| accepted.socket);
+    let accepted_socket =
+        SocketObject::new_connected(resource, create_request, accepted.local_address);
+    let handle = reference.commit(ObjectEntry::Socket(accepted_socket))?;
+    Ok(SocketOutcome::Completed(AcceptedSocket {
+        handle,
+        local_address: accepted.local_address,
+        remote_address: accepted.remote_address,
+    }))
 }
 
 /// Sends bytes without waiting for readiness.
@@ -300,7 +526,7 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
     if matches!(status, SocketConnectionStatus::Unconnected) {
         return Ok(SocketStatusResponse {
             status,
-            local_address: None,
+            local_address,
             pending_error: None,
         });
     }
@@ -353,12 +579,27 @@ fn finish_connect(object: &spin::RwLock<ObjectEntry>, status: SocketConnectionSt
     }
 }
 
+fn finish_configuration(
+    object: &spin::RwLock<ObjectEntry>,
+    local_address: Option<SocketAddressV4>,
+    listening: bool,
+) {
+    let mut object = object.write();
+    if let ObjectEntry::Socket(socket) = &mut *object {
+        socket.configuration_in_flight = false;
+        socket.local_address = socket.local_address.or(local_address);
+        socket.listening |= listening;
+    }
+}
+
 pub(crate) struct SocketObject {
     resource: Arc<SocketResource>,
     create_request: CreateSocketRequest,
     connection_status: SocketConnectionStatus,
     local_address: Option<SocketAddressV4>,
     connect_in_flight: bool,
+    configuration_in_flight: bool,
+    listening: bool,
 }
 
 impl SocketObject {
@@ -369,6 +610,24 @@ impl SocketObject {
             connection_status: SocketConnectionStatus::Unconnected,
             local_address: None,
             connect_in_flight: false,
+            configuration_in_flight: false,
+            listening: false,
+        }
+    }
+
+    fn new_connected(
+        resource: Arc<SocketResource>,
+        create_request: CreateSocketRequest,
+        local_address: SocketAddressV4,
+    ) -> Self {
+        Self {
+            resource,
+            create_request,
+            connection_status: SocketConnectionStatus::Connected,
+            local_address: Some(local_address),
+            connect_in_flight: false,
+            configuration_in_flight: false,
+            listening: false,
         }
     }
 
@@ -393,6 +652,21 @@ impl SocketResource {
 
     fn connect(&self, address: SocketAddressV4) -> Result<SocketConnectionStatus> {
         self.platform_socket().connect(address)
+    }
+
+    fn bind(&self, address: SocketAddressV4) -> Result<SocketOutcome<SocketAddressV4>> {
+        self.platform_socket().bind(address)
+    }
+
+    fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddressV4>> {
+        self.platform_socket().listen(backlog)
+    }
+
+    fn accept(
+        &self,
+        readiness: ReadinessRegistration,
+    ) -> Result<SocketOutcome<AcceptedPlatformSocket>> {
+        self.platform_socket().accept(readiness)
     }
 
     fn send(&self, data: &[u8], flags: SendFlags) -> Result<SocketOutcome<usize>> {
@@ -500,6 +774,8 @@ pub(crate) mod tests {
         status_calls: AtomicUsize,
         status_responses: StdMutex<std::collections::VecDeque<SocketStatusResponse>>,
         status_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+        binds: StdMutex<std::vec::Vec<SocketAddressV4>>,
+        listens: StdMutex<std::vec::Vec<u32>>,
         shutdown_calls: AtomicUsize,
         dropped_sockets: AtomicUsize,
         fail_create: core::sync::atomic::AtomicBool,
@@ -552,6 +828,29 @@ pub(crate) mod tests {
     }
 
     impl PlatformSocket for TestPlatformSocket {
+        fn bind(&self, mut address: SocketAddressV4) -> Result<SocketOutcome<SocketAddressV4>> {
+            self.state.binds.lock().unwrap().push(address);
+            if address.port == Port(0) {
+                address.port = Port(49152);
+            }
+            Ok(SocketOutcome::Completed(address))
+        }
+
+        fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddressV4>> {
+            self.state.listens.lock().unwrap().push(backlog);
+            Ok(SocketOutcome::Completed(SocketAddressV4 {
+                address: Ipv4Address([127, 0, 0, 1]),
+                port: Port(49152),
+            }))
+        }
+
+        fn accept(
+            &self,
+            _readiness: ReadinessRegistration,
+        ) -> Result<SocketOutcome<AcceptedPlatformSocket>> {
+            Err(BrokerError::WouldBlock)
+        }
+
         fn connect(&self, _address: SocketAddressV4) -> Result<SocketConnectionStatus> {
             self.state.connect_calls.fetch_add(1, Ordering::Relaxed);
             if self.state.fail_connect.swap(false, Ordering::Relaxed) {
@@ -620,6 +919,7 @@ pub(crate) mod tests {
     pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
         check_failed_create_rolls_back(broker, provider);
         check_socket_operations_and_policy(broker, provider);
+        check_server_socket_operations(broker, provider);
         check_connect_error_is_terminal(broker, provider);
         check_concurrent_status_preserves_terminal_state(broker, provider);
         check_failed_status_preserves_local_address(broker, provider);
@@ -754,6 +1054,77 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains(&session_id)
         );
+    }
+
+    fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let readiness = Arc::new(TestReadinessSink::default());
+        let listener = create(&session, create_request(), readiness.clone()).unwrap();
+        let non_loopback = SocketAddressV4 {
+            address: Ipv4Address([10, 0, 0, 1]),
+            port: Port(8080),
+        };
+        let binds_before = provider.state.binds.lock().unwrap().len();
+        assert_eq!(
+            bind(&session, listener, non_loopback),
+            Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
+        );
+        assert_eq!(provider.state.binds.lock().unwrap().len(), binds_before);
+
+        let requested_address = SocketAddressV4 {
+            address: Ipv4Address([127, 0, 0, 1]),
+            port: Port(0),
+        };
+        let local_address = SocketAddressV4 {
+            address: Ipv4Address([127, 0, 0, 1]),
+            port: Port(49152),
+        };
+        assert_eq!(
+            bind(&session, listener, requested_address),
+            Ok(SocketOutcome::Completed(local_address))
+        );
+        assert_eq!(
+            status(&session, listener),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(local_address),
+                pending_error: None,
+            })
+        );
+        assert_eq!(
+            listen(&session, listener, 128),
+            Ok(SocketOutcome::Completed(local_address))
+        );
+        assert_eq!(
+            listen(&session, listener, MAX_TCP_LISTEN_BACKLOG + 1),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert_eq!(
+            connect(&session, listener, loopback_address()),
+            Ok(SocketOutcome::Failed(SocketError::Other))
+        );
+        assert!(matches!(
+            accept(&session, listener, readiness.clone()),
+            Err(BrokerError::ResourceExhausted)
+        ));
+        assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+
+        session.close_object_reference(listener).unwrap();
+        assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
+
+        let auto_bound = create(&session, create_request(), readiness).unwrap();
+        assert_eq!(
+            listen(&session, auto_bound, 0),
+            Ok(SocketOutcome::Completed(local_address))
+        );
+        assert_eq!(
+            provider.state.binds.lock().unwrap().last(),
+            Some(&DEFAULT_TCP_LISTEN_ADDRESS)
+        );
+        session.close_object_reference(auto_bound).unwrap();
     }
 
     fn check_socket_quotas(broker: &BrokerCore) {
