@@ -1059,6 +1059,7 @@ mod tests {
 
     type TestPlatform = crate::tests::TestPlatform;
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     fn mui_registry_data(
         generation: u32,
         languages: &[MuiLanguage<'_>],
