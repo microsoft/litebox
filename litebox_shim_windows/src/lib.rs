@@ -2411,7 +2411,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[derive(Debug, Eq, PartialEq)]
 struct DllNotFoundHardError {
     dll_name: alloc::string::String,
-    search_path: alloc::string::String,
+    search_path: Option<alloc::string::String>,
 }
 
 #[cfg(debug_assertions)]
@@ -2423,7 +2423,7 @@ fn decode_dll_not_found_hard_error<Platform: RawPointerProvider>(
         return Ok(None);
     }
 
-    if ctx.rdx < 2 || ctx.r8 & 0b11 != 0b11 || ctx.r9 == 0 {
+    if ctx.rdx == 0 || ctx.r8 & 1 == 0 || ctx.r9 == 0 {
         return Err(NtStatus::INVALID_PARAMETER);
     }
 
@@ -2432,10 +2432,16 @@ fn decode_dll_not_found_hard_error<Platform: RawPointerProvider>(
         .read_at_offset(0)
         .ok_or(NtStatus::ACCESS_VIOLATION)
         .and_then(nt_types::read_unicode_string_at::<Platform>)?;
-    let search_path = parameters
-        .read_at_offset(1)
-        .ok_or(NtStatus::ACCESS_VIOLATION)
-        .and_then(nt_types::read_unicode_string_at::<Platform>)?;
+    let search_path = if ctx.rdx >= 2 && ctx.r8 & 0b10 != 0 {
+        Some(
+            parameters
+                .read_at_offset(1)
+                .ok_or(NtStatus::ACCESS_VIOLATION)
+                .and_then(nt_types::read_unicode_string_at::<Platform>)?,
+        )
+    } else {
+        None
+    };
 
     Ok(Some(DllNotFoundHardError {
         dll_name,
@@ -2450,7 +2456,7 @@ fn log_loader_hard_error<Platform: RawPointerProvider>(ctx: &litebox_common_linu
             litebox_util_log::error!(
                 status:? = NtStatus::DLL_NOT_FOUND,
                 contract:% = error.dll_name,
-                search_path:% = error.search_path;
+                search_path:% = error.search_path.as_deref().unwrap_or("<not supplied>");
                 "Windows loader could not resolve an API-set contract; add the missing contract to loader::pe::API_SET_MAPPINGS"
             );
         }
@@ -2458,7 +2464,7 @@ fn log_loader_hard_error<Platform: RawPointerProvider>(ctx: &litebox_common_linu
             litebox_util_log::error!(
                 status:? = NtStatus::DLL_NOT_FOUND,
                 dll:% = error.dll_name,
-                search_path:% = error.search_path;
+                search_path:% = error.search_path.as_deref().unwrap_or("<not supplied>");
                 "Windows loader could not find a required DLL"
             );
         }
