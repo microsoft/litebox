@@ -599,6 +599,9 @@ fn test_runner_broker_tcp_client_with_rewriter() {
             drop(reset_stream);
         }
         let (mut partial_reset_stream, _) = listener.accept().unwrap();
+        let mut connected = [0; 1];
+        partial_reset_stream.read_exact(&mut connected).unwrap();
+        assert_eq!(connected, [0x4c]);
         partial_reset_stream.write_all(&[0x7e]).unwrap();
         // SAFETY: `partial_reset_stream` owns a live socket and `linger` is valid for the supplied length.
         assert_eq!(

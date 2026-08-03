@@ -244,6 +244,9 @@ int main(int argc, char **argv) {
     fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     assert(fd >= 0);
     assert(connect(fd, (const struct sockaddr *)&address, sizeof(address)) == 0);
+    unsigned char partial_ready = 0x4c;
+    assert(send(fd, &partial_ready, sizeof(partial_ready), MSG_NOSIGNAL) ==
+           sizeof(partial_ready));
     unsigned char partial_reset[2];
     assert(recv(fd, partial_reset, sizeof(partial_reset), MSG_WAITALL) == 1);
     assert(partial_reset[0] == 0x7e);
