@@ -47,16 +47,9 @@ fn run_parent_test() {
         .arg(RUNNER_ARGUMENT);
     wait_for_broker(event_command);
 
-    let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-    probe
-        .connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9))
-        .unwrap();
-    let std::net::IpAddr::V4(host_address) = probe.local_addr().unwrap().ip() else {
-        panic!("IPv4 route probe returned an IPv6 address");
+    let Some((host_address, listener)) = non_loopback_listener() else {
+        return;
     };
-    assert!(!host_address.is_loopback() && !host_address.is_unspecified());
-
-    let listener = std::net::TcpListener::bind((host_address, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let mut network_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
     network_command
@@ -71,6 +64,30 @@ fn run_parent_test() {
 
     let (_stream, peer_address) = listener.accept().unwrap();
     assert_eq!(peer_address.ip(), host_address);
+}
+
+fn non_loopback_listener() -> Option<(std::net::Ipv4Addr, std::net::TcpListener)> {
+    let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    if let Err(error) = probe.connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9)) {
+        eprintln!("skipping non-loopback broker TCP test: IPv4 route unavailable: {error}");
+        return None;
+    }
+    let std::net::IpAddr::V4(host_address) = probe.local_addr().unwrap().ip() else {
+        unreachable!("an IPv4 route probe must select an IPv4 source address");
+    };
+    if host_address.is_loopback() || host_address.is_unspecified() {
+        eprintln!(
+            "skipping non-loopback broker TCP test: route selected unusable address {host_address}"
+        );
+        return None;
+    }
+    match std::net::TcpListener::bind((host_address, 0)) {
+        Ok(listener) => Some((host_address, listener)),
+        Err(error) => {
+            eprintln!("skipping non-loopback broker TCP test: cannot bind {host_address}: {error}");
+            None
+        }
+    }
 }
 
 fn wait_for_broker(mut command: Command) {
