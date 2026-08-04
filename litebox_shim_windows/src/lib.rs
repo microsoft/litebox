@@ -1396,6 +1396,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 byte_offset,
                 key,
             ),
+            SyscallRequest::NtGetCurrentProcessorNumberEx { processor_number } => {
+                self.sys_nt_get_current_processor_number_ex(processor_number)
+            }
             SyscallRequest::NtQueryDebugFilterState {
                 component_id,
                 level,

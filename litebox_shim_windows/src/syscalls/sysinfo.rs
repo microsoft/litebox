@@ -36,6 +36,14 @@ const SYSTEM_VERIFIER_INFORMATION_LENGTH: u32 = 0x90;
 const SYSTEM_VERIFIER_INFORMATION_LENGTH_USIZE: usize = 0x90;
 const X64_SYSTEM_RANGE_START: usize = 0xffff_8000_0000_0000;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+pub(crate) struct ProcessorNumber {
+    group: u16,
+    number: u8,
+    reserved: u8,
+}
+
 pub(crate) const WINDOWS_TIME_ZONE_ID_INVALID: u32 = u32::MAX;
 pub(crate) const WINDOWS_OS_MAJOR_VERSION: u16 = 10;
 pub(crate) const WINDOWS_OS_MINOR_VERSION: u16 = 0;
@@ -71,6 +79,7 @@ enum LogicalProcessorRelationship {
     Cache = 2,
     ProcessorPackage = 3,
     Group = 4,
+    NumaNodeEx = 6,
     All = 0xffff,
 }
 
@@ -219,6 +228,23 @@ struct GroupRelationshipInformation {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    #[expect(
+        clippy::unused_self,
+        reason = "syscall handlers consistently operate on the current task"
+    )]
+    pub(crate) fn sys_nt_get_current_processor_number_ex(
+        &self,
+        processor_number: MutPtr<Platform, ProcessorNumber>,
+    ) -> NtStatus {
+        if processor_number
+            .write_at_offset(0, ProcessorNumber::default())
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
     pub(crate) fn sys_nt_query_system_information(
         system_information_class: u32,
         system_information: MutPtr<Platform, u8>,
@@ -384,12 +410,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return_length,
                 &processor_relationship_information(LogicalProcessorRelationship::ProcessorCore),
             ),
-            LogicalProcessorRelationship::NumaNode => Self::write_system_information(
-                system_information,
-                system_information_length,
-                return_length,
-                &numa_node_relationship_information(),
-            ),
+            // Windows returns RelationNumaNode-tagged records for a RelationNumaNodeEx query.
+            // The synthetic topology has one processor group, so the existing one-element
+            // GroupMasks array is the complete extended-NUMA response.
+            LogicalProcessorRelationship::NumaNode | LogicalProcessorRelationship::NumaNodeEx => {
+                Self::write_system_information(
+                    system_information,
+                    system_information_length,
+                    return_length,
+                    &numa_node_relationship_information(),
+                )
+            }
             LogicalProcessorRelationship::Cache => Self::write_system_information(
                 system_information,
                 system_information_length,
@@ -851,6 +882,25 @@ mod tests {
     }
 
     #[test]
+    fn nt_get_current_processor_number_ex_reports_synthetic_processor() {
+        run_with_test_platform_pointers(|| {
+            let mut processor_number = ProcessorNumber {
+                group: u16::MAX,
+                number: u8::MAX,
+                reserved: u8::MAX,
+            };
+            assert_eq!(
+                crate::tests::test_task()
+                    .sys_nt_get_current_processor_number_ex(mut_ptr(&mut processor_number)),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(processor_number.group, 0);
+            assert_eq!(processor_number.number, 0);
+            assert_eq!(processor_number.reserved, 0);
+        });
+    }
+
+    #[test]
     fn nt_query_system_information_ex_validates_query_input() {
         run_with_test_platform_pointers(|| {
             let relationship = LogicalProcessorRelationship::All as u32;
@@ -973,6 +1023,35 @@ mod tests {
                 return_length,
                 u32::try_from(LOGICAL_PROCESSOR_ALL_INFORMATION_SIZE).unwrap()
             );
+        });
+    }
+
+    #[test]
+    fn nt_query_system_information_ex_reports_extended_numa_node() {
+        run_with_test_platform_pointers(|| {
+            let relationship = LogicalProcessorRelationship::NumaNodeEx as u32;
+            let mut output = [0u8; size_of::<NumaNodeRelationshipInformation>()];
+            let mut return_length = 0;
+            assert_eq!(
+                TestTask::sys_nt_query_system_information_ex(
+                    SystemInformationClass::LogicalProcessorAndGroup as u32,
+                    Some(const_byte_ptr(&relationship)),
+                    DWORD_SIZE_U32,
+                    mut_byte_ptr(&mut output),
+                    output.len().try_into().unwrap(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(
+                return_length,
+                size_of::<NumaNodeRelationshipInformation>().trunc()
+            );
+            assert_eq!(
+                u32::from_ne_bytes(output[..4].try_into().unwrap()),
+                LogicalProcessorRelationship::NumaNode as u32
+            );
+            assert_eq!(u16::from_ne_bytes(output[30..32].try_into().unwrap()), 1);
         });
     }
 
