@@ -249,6 +249,7 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
 #[ignore = "downloads an official x64 7-Zip binary unless LITEBOX_7ZA_PATH is set"]
 fn run_7za_benchmark_pe() {
     let source = seven_zip_source();
+    let codec_source = source.with_file_name("7z.dll");
 
     let test_dir =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("seven_zip_benchmark");
@@ -259,9 +260,21 @@ fn run_7za_benchmark_pe() {
     let rewritten = litebox_syscall_rewriter::rewrite_binary(&host_exe, None)
         .expect("failed to rewrite 7za.exe");
     std::fs::write(test_dir.join("7za.exe"), &rewritten).unwrap();
+
+    let host_codec = std::fs::read(&codec_source)
+        .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", codec_source.display()));
+    let rewritten_codec = litebox_syscall_rewriter::rewrite_binary(&host_codec, None)
+        .expect("failed to rewrite 7z.dll");
+    std::fs::write(test_dir.join("7z.dll"), rewritten_codec).unwrap();
+
     // Import parsing walks the original host image; rewriting does not change
     // the import tables.
     stage_transitive_import_closure(&test_dir, &host_exe);
+    stage_transitive_import_closure(&test_dir, &host_codec);
+
+    // TODO(runtime-plugin-staging): `stage_transitive_import_closure`
+    // under-approximates runtime dependencies. Keep general discovery of DLLs
+    // loaded by name at runtime out of this benchmark-specific fixture.
 
     // Oracle for the deliverable: the transitive walk must reach depth the old
     // hardcoded 7-DLL list missed. `cryptbase.dll` is only reachable through
