@@ -23,7 +23,7 @@ const SOCKET_TAG_SEND: u8 = 2;
 const SOCKET_TAG_RECEIVE: u8 = 3;
 const SOCKET_TAG_SHUTDOWN: u8 = 4;
 const SOCKET_TAG_STATUS: u8 = 5;
-const SOCKET_RESPONSE_TAG_FAILED: u8 = 6;
+const SOCKET_TAG_FAILED: u8 = 6;
 const SOCKET_TAG_BIND: u8 = 7;
 const SOCKET_TAG_LISTEN: u8 = 8;
 const SOCKET_TAG_ACCEPT: u8 = 9;
@@ -219,7 +219,7 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
             encode_optional_socket_error(encoder, response.pending_error);
         }
         SocketResponse::Failed(error) => {
-            encoder.u8(SOCKET_RESPONSE_TAG_FAILED);
+            encoder.u8(SOCKET_TAG_FAILED);
             encode_socket_error(encoder, error);
         }
     }
@@ -260,7 +260,7 @@ pub(super) fn decode_socket_response(
             local_address: decode_optional_address(decoder)?,
             pending_error: decode_optional_socket_error(decoder)?,
         })),
-        SOCKET_RESPONSE_TAG_FAILED => Ok(SocketResponse::Failed(decode_socket_error(decoder)?)),
+        SOCKET_TAG_FAILED => Ok(SocketResponse::Failed(decode_socket_error(decoder)?)),
         _ => Err(WireError::InvalidTag),
     }
 }
