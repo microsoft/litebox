@@ -839,9 +839,8 @@ impl Reactor {
                 }
             }
         };
-        let remote_address = remote_address
-            .ok_or(BrokerError::Internal)
-            .and_then(socket_address)?;
+        let remote_address = SocketAddrV4::try_from(remote_address.ok_or(BrokerError::Internal)?)
+            .map_err(|_| BrokerError::Internal)?;
         let local_address = local_socket_address(&socket)?;
         epoll::add(
             &self.epoll,
@@ -1371,10 +1370,6 @@ fn local_socket_address(socket: &OwnedFd) -> BrokerResult<SocketAddrV4> {
         Ok(address) => SocketAddrV4::try_from(address).map_err(|_| BrokerError::Internal),
         Err(_) => Err(BrokerError::Internal),
     }
-}
-
-fn socket_address(address: rustix::net::SocketAddrAny) -> BrokerResult<SocketAddrV4> {
-    SocketAddrV4::try_from(address).map_err(|_| BrokerError::Internal)
 }
 
 fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse> {
