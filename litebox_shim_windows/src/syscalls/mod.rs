@@ -381,6 +381,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         component_id: u32,
         level: u32,
     },
+    NtQueryDirectoryFileEx {
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<Platform::RawConstPointer<u8>>,
+        apc_context: Option<Platform::RawConstPointer<u8>>,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        file_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        file_information_class: u32,
+        query_flags: u32,
+        file_name: Option<Platform::RawConstPointer<nt_types::UnicodeString>>,
+    },
     NtQueryVolumeInformationFile {
         file_handle: Handle,
         io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
@@ -1070,6 +1082,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtQueryDebugFilterState => Some(sys_req!(NtQueryDebugFilterState {
                 component_id,
                 level,
+            })),
+            NtSysno::NtQueryDirectoryFileEx => Some(sys_req!(NtQueryDirectoryFileEx {
+                file_handle:{Handle::from_raw},
+                event:{Handle::from_raw},
+                apc_routine:*,
+                apc_context:*,
+                io_status_block:*,
+                file_information:*,
+                length,
+                file_information_class,
+                query_flags,
+                file_name:*,
             })),
             NtSysno::NtQueryVolumeInformationFile => Some(sys_req!(NtQueryVolumeInformationFile {
                 file_handle:{Handle::from_raw},

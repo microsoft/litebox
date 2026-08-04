@@ -101,6 +101,7 @@ impl NtStatus {
             0x80000003 => "STATUS_BREAKPOINT: Breakpoint encountered",
             0x80000004 => "STATUS_SINGLE_STEP: Single instruction executed",
             0x80000005 => "STATUS_BUFFER_OVERFLOW: Buffer overflow",
+            0x80000006 => "STATUS_NO_MORE_FILES: No more files are available",
             0x8000001A => "STATUS_NO_MORE_ENTRIES: No more entries are available",
             0xC0000001 => "STATUS_UNSUCCESSFUL: The operation completed with an error",
             0xC0000002 => "STATUS_NOT_IMPLEMENTED: The function is not implemented",
@@ -281,6 +282,8 @@ impl NtStatus {
 
     /// STATUS_BUFFER_OVERFLOW
     pub const BUFFER_OVERFLOW: Self = Self::from_raw(0x80000005);
+    /// STATUS_NO_MORE_FILES
+    pub const NO_MORE_FILES: Self = Self::from_raw(0x80000006);
     /// STATUS_NO_MORE_ENTRIES
     pub const NO_MORE_ENTRIES: Self = Self::from_raw(0x8000001A);
 

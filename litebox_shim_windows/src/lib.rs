@@ -1410,6 +1410,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 NtStatus::DEBUGGER_INACTIVE
             }
+            SyscallRequest::NtQueryDirectoryFileEx {
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+                query_flags,
+                file_name,
+            } => self.sys_nt_query_directory_file_ex(
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+                query_flags,
+                file_name,
+            ),
             SyscallRequest::NtQueryVolumeInformationFile {
                 file_handle,
                 io_status_block,
