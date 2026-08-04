@@ -102,7 +102,7 @@ impl<Platform: crate::ShimPlatform> EventObject<Platform> {
         }
     }
 
-    fn set(&self) -> i32 {
+    pub(crate) fn set(&self) -> i32 {
         let previous = self.replace_state(true);
         if previous == 0 {
             self.pollee.notify_observers(Events::IN);

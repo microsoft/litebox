@@ -27,7 +27,7 @@ use litebox::platform::{
     SystemInfoProvider, TimeProvider,
 };
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
-use litebox::sync::RawSyncPrimitivesProvider;
+use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::PAGE_SIZE;
@@ -596,6 +596,8 @@ pub struct Process<Platform: ShimPlatform> {
     user_lcid: AtomicU32,
     user_ui_language: AtomicU32,
     default_hard_error_mode: AtomicU32,
+    wnf_notification_event: Mutex<Platform, Option<Arc<syscalls::event::EventObject<Platform>>>>,
+    wnf_subscriptions: Mutex<Platform, syscalls::wnf::WnfProcessSubscriptions>,
     cookie: u32,
     exit_code: AtomicI32,
     next_thread_id: AtomicUsize,
@@ -689,6 +691,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
             user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             default_hard_error_mode: AtomicU32::new(0),
+            wnf_notification_event: Mutex::new(None),
+            wnf_subscriptions: Mutex::new(syscalls::wnf::WnfProcessSubscriptions::default()),
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
             next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
@@ -1715,6 +1719,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 buffer,
                 buffer_size,
             ),
+            SyscallRequest::NtSetWnfProcessNotificationEvent { notification_event } => {
+                self.sys_nt_set_wnf_process_notification_event(notification_event)
+            }
+            SyscallRequest::NtSubscribeWnfStateChange {
+                state_name,
+                change_stamp,
+                event_mask,
+                subscription_id,
+            } => self.sys_nt_subscribe_wnf_state_change(
+                state_name,
+                change_stamp,
+                event_mask,
+                subscription_id,
+            ),
+            SyscallRequest::NtUnsubscribeWnfStateChange { state_name } => {
+                self.sys_nt_unsubscribe_wnf_state_change(state_name)
+            }
             SyscallRequest::NtQuerySection {
                 section_handle,
                 section_information_class,

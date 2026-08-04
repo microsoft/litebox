@@ -9,6 +9,8 @@ use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::Guid;
+use crate::syscalls::Handle;
+use crate::syscalls::event::{EventAccess, EventSubsystem};
 use crate::{
     ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_buffer,
     probe_guest_output_preserving_value,
@@ -19,6 +21,7 @@ const STATE_NAME_XOR_KEY: u64 = 0x41c6_4e6d_a3bc_0074;
 const MAXIMUM_UNIQUE_ID: u32 = 0x001f_ffff;
 const STATE_NAME_INFORMATION_SIZE: u32 = 4;
 const INITIAL_CHANGE_STAMP: u32 = 0;
+const STATUS_WNF_EVENT_ALREADY_SUBSCRIBED: NtStatus = NtStatus::from_raw(0xc000_0718);
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
@@ -64,6 +67,12 @@ pub(crate) struct WnfStateStoreData {
 
 pub(crate) type WnfStateStore<Platform> = litebox::sync::RwLock<Platform, WnfStateStoreData>;
 
+#[derive(Default)]
+pub(crate) struct WnfProcessSubscriptions {
+    next_id: u64,
+    subscriptions: BTreeMap<u64, u64>,
+}
+
 pub(crate) struct WnfCreateStateNameParameters<Platform: litebox::platform::RawPointerProvider> {
     pub(crate) state_name: MutPtr<Platform, u64>,
     pub(crate) name_lifetime: u32,
@@ -85,6 +94,95 @@ pub(crate) struct WnfUpdateStateDataParameters<Platform: litebox::platform::RawP
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn sys_nt_set_wnf_process_notification_event(
+        &self,
+        notification_event: Handle,
+    ) -> NtStatus {
+        let entry = match self.typed_handle_entry_with_access::<EventSubsystem<Platform>>(
+            notification_event,
+            EventAccess::MODIFY_STATE.bits(),
+        ) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        let event = entry.with_entry(|entry| entry.event.clone());
+        let mut registered = self.process.wnf_notification_event.lock();
+        if registered.is_some() {
+            return STATUS_WNF_EVENT_ALREADY_SUBSCRIBED;
+        }
+        *registered = Some(event);
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_subscribe_wnf_state_change(
+        &self,
+        state_name: ConstPtr<Platform, u64>,
+        _change_stamp: u32,
+        _event_mask: u32,
+        subscription_id: Option<MutPtr<Platform, u64>>,
+    ) -> NtStatus {
+        let Some(state_name) = state_name.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if let Some(subscription_id) = subscription_id
+            && probe_guest_output_preserving_value::<Platform, u64>(subscription_id).is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let Some(lifetime) = decode_state_name_lifetime(state_name) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let exists = match lifetime {
+            WnfStateNameLifetime::WellKnown => state_name_unique_id(state_name) != 0,
+            _ => self
+                .global
+                .wnf_states
+                .read()
+                .states
+                .contains_key(&state_name),
+        };
+        if !exists {
+            return NtStatus::OBJECT_NAME_NOT_FOUND;
+        }
+
+        let mut subscriptions = self.process.wnf_subscriptions.lock();
+        let id = if let Some(id) = subscriptions.subscriptions.get(&state_name) {
+            *id
+        } else {
+            subscriptions.next_id = subscriptions.next_id.wrapping_add(1).max(1);
+            let id = subscriptions.next_id;
+            subscriptions.subscriptions.insert(state_name, id);
+            id
+        };
+        if let Some(subscription_id) = subscription_id
+            && subscription_id.write_at_offset(0, id).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_unsubscribe_wnf_state_change(
+        &self,
+        state_name: ConstPtr<Platform, u64>,
+    ) -> NtStatus {
+        let Some(state_name) = state_name.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if self
+            .process
+            .wnf_subscriptions
+            .lock()
+            .subscriptions
+            .remove(&state_name)
+            .is_some()
+        {
+            NtStatus::SUCCESS
+        } else {
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        }
+    }
+
     pub(crate) fn sys_nt_create_wnf_state_name(
         &self,
         params: WnfCreateStateNameParameters<Platform>,
@@ -200,8 +298,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         state.change_stamp = state.change_stamp.wrapping_add(1);
         state.data = data;
-        // TODO(wnf-notify): Deliver successful updates to subscribers when WNF subscriptions are
-        // modeled.
+        drop(store);
+        self.signal_wnf_process_notification_event();
         NtStatus::SUCCESS
     }
 
@@ -224,6 +322,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         state.change_stamp = 0;
         state.data.clear();
+        drop(store);
+        self.signal_wnf_process_notification_event();
         NtStatus::SUCCESS
     }
 
@@ -242,6 +342,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER;
         }
         store.states.remove(&state_name);
+        drop(store);
+        self.signal_wnf_process_notification_event();
         NtStatus::SUCCESS
     }
 
@@ -364,6 +466,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         status
     }
+
+    fn signal_wnf_process_notification_event(&self) {
+        if let Some(event) = self.process.wnf_notification_event.lock().as_ref() {
+            event.set();
+        }
+    }
 }
 
 fn read_type_id<Platform: ShimPlatform>(
@@ -393,9 +501,23 @@ fn encode_state_name(
     clear ^ STATE_NAME_XOR_KEY
 }
 
+fn decode_state_name_lifetime(state_name: u64) -> Option<WnfStateNameLifetime> {
+    let clear = state_name ^ STATE_NAME_XOR_KEY;
+    if clear & 0xf != 1 || ((clear >> 6) & 0xf) > WnfDataScope::Machine as u64 {
+        return None;
+    }
+    let lifetime: u32 = ((clear >> 4) & 0x3).trunc();
+    WnfStateNameLifetime::try_from(lifetime).ok()
+}
+
+fn state_name_unique_id(state_name: u64) -> u32 {
+    ((state_name ^ STATE_NAME_XOR_KEY) >> 11).trunc()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syscalls::event::{EventAccess, EventType};
     use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
 
     const SECURITY_DESCRIPTOR_REVISION: u8 = 1;
@@ -438,6 +560,122 @@ mod tests {
             matching_change_stamp,
             check_stamp,
         })
+    }
+
+    #[test]
+    fn process_notification_event_validates_and_signals() {
+        let task = test_task();
+
+        assert_eq!(
+            task.sys_nt_set_wnf_process_notification_event(Handle::from_raw(0xdead)),
+            NtStatus::INVALID_HANDLE
+        );
+
+        let mut semaphore = Handle::from_raw(0);
+        assert_eq!(
+            task.sys_nt_create_semaphore(mut_ptr(&mut semaphore), 0x001f_0003, None, 0, 1,),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_set_wnf_process_notification_event(semaphore),
+            NtStatus::OBJECT_TYPE_MISMATCH
+        );
+
+        let mut query_only_event = Handle::from_raw(0);
+        assert_eq!(
+            task.sys_nt_create_event(
+                mut_ptr(&mut query_only_event),
+                EventAccess::QUERY_STATE.bits(),
+                None,
+                EventType::Notification as u32,
+                0,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_set_wnf_process_notification_event(query_only_event),
+            NtStatus::ACCESS_DENIED
+        );
+
+        let mut event = Handle::from_raw(0);
+        assert_eq!(
+            task.sys_nt_create_event(
+                mut_ptr(&mut event),
+                EventAccess::ALL_ACCESS.bits(),
+                None,
+                EventType::Notification as u32,
+                0,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_set_wnf_process_notification_event(event),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_set_wnf_process_notification_event(event),
+            STATUS_WNF_EVENT_ALREADY_SUBSCRIBED
+        );
+
+        let state_name = create_state(&task, None, 4);
+        assert_eq!(
+            update_state(&task, state_name, &[1, 2], None, 0, 0),
+            NtStatus::SUCCESS
+        );
+        let timeout = 0;
+        assert_eq!(
+            task.sys_nt_wait_for_single_object(event, false, Some(const_ptr(&timeout))),
+            NtStatus::SUCCESS
+        );
+    }
+
+    #[test]
+    fn state_change_subscription_reuses_id_and_unsubscribes_by_name() {
+        const WNF_SHEL_APPLICATION_STARTED: u64 = 0x0d83_063e_a3bc_1035;
+
+        let task = test_task();
+        let mut first_id = 0;
+        assert_eq!(
+            task.sys_nt_subscribe_wnf_state_change(
+                const_ptr(&WNF_SHEL_APPLICATION_STARTED),
+                0,
+                0x11,
+                Some(mut_ptr(&mut first_id)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_ne!(first_id, 0);
+
+        let mut second_id = 0;
+        assert_eq!(
+            task.sys_nt_subscribe_wnf_state_change(
+                const_ptr(&WNF_SHEL_APPLICATION_STARTED),
+                0,
+                0,
+                Some(mut_ptr(&mut second_id)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(second_id, first_id);
+        assert_eq!(
+            task.sys_nt_unsubscribe_wnf_state_change(const_ptr(&WNF_SHEL_APPLICATION_STARTED)),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_unsubscribe_wnf_state_change(const_ptr(&WNF_SHEL_APPLICATION_STARTED)),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+
+        let nonexistent = STATE_NAME_XOR_KEY ^ 1;
+        assert_eq!(
+            task.sys_nt_subscribe_wnf_state_change(const_ptr(&nonexistent), 0, 0x11, None,),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+        let malformed = 0;
+        assert_eq!(
+            task.sys_nt_subscribe_wnf_state_change(const_ptr(&malformed), 0, 0x11, None,),
+            NtStatus::INVALID_PARAMETER
+        );
     }
 
     #[test]

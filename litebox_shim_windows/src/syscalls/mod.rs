@@ -567,6 +567,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         buffer: Platform::RawMutPointer<u32>,
         buffer_size: u32,
     },
+    NtSetWnfProcessNotificationEvent {
+        notification_event: Handle,
+    },
+    NtSubscribeWnfStateChange {
+        state_name: Platform::RawConstPointer<u64>,
+        change_stamp: u32,
+        event_mask: u32,
+        subscription_id: Option<Platform::RawMutPointer<u64>>,
+    },
+    NtUnsubscribeWnfStateChange {
+        state_name: Platform::RawConstPointer<u64>,
+    },
     NtQuerySection {
         section_handle: Handle,
         section_information_class: u32,
@@ -1222,6 +1234,20 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     buffer_size,
                 }))
             }
+            NtSysno::NtSetWnfProcessNotificationEvent => {
+                Some(sys_req!(NtSetWnfProcessNotificationEvent {
+                    notification_event: { Handle::from_raw },
+                }))
+            }
+            NtSysno::NtSubscribeWnfStateChange => Some(sys_req!(NtSubscribeWnfStateChange {
+                state_name:*,
+                change_stamp,
+                event_mask,
+                subscription_id:*,
+            })),
+            NtSysno::NtUnsubscribeWnfStateChange => Some(sys_req!(NtUnsubscribeWnfStateChange {
+                state_name:*,
+            })),
             NtSysno::NtQuerySection => Some(sys_req!(NtQuerySection {
                 section_handle: { Handle::from_raw },
                 section_information_class,
