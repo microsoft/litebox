@@ -680,6 +680,55 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         }
         Ok(summary)
     }
+
+    /// Returns the deterministically-ordered leaf name of the `index`-th direct
+    /// subkey of `key`, or `None` when `index` is out of range.
+    ///
+    /// `NtEnumerateKey` requires a stable subkey ordering across successive calls,
+    /// but the backing directory iteration order is unspecified, so the filtered
+    /// subkey names are sorted before indexing.
+    fn nth_subkey_name(
+        &self,
+        key: &RegistryKeyObject<Platform>,
+        index: u32,
+    ) -> Result<Option<String>, NtStatus> {
+        let mut names = Vec::new();
+        for entry in self.fs.read_dir(&key.fd).map_err(map_read_dir_error)? {
+            if entry.file_type == FileType::Directory
+                && entry.name != "."
+                && entry.name != ".."
+                && entry.name != VALUES_DIR_NAME
+            {
+                names.push(entry.name);
+            }
+        }
+        names.sort_unstable();
+        Ok(names.into_iter().nth(index as usize))
+    }
+
+    /// Computes a [`KeySummary`] for the named direct subkey of `key`.
+    fn subkey_summary(
+        &self,
+        key: &RegistryKeyObject<Platform>,
+        name: &str,
+    ) -> Result<KeySummary, NtStatus> {
+        let child_path = format!("{}/{}", key.path.trim_end_matches('/'), name);
+        let child_fd = self
+            .fs
+            .open(
+                &*child_path,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .map_err(map_open_error)?;
+        let child = RegistryKeyObject {
+            path: child_path,
+            fd: child_fd,
+        };
+        let summary = self.key_summary(&child);
+        let _ = self.fs.close(&child.fd);
+        summary
+    }
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -1331,6 +1380,156 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             key_information_class:? = key_information_class,
             length = length;
             "Handled NtQueryKey syscall"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn sys_nt_enumerate_key(
+        &self,
+        key_handle: Handle,
+        index: u32,
+        key_information_class: u32,
+        key_information: MutPtr<Platform, u8>,
+        length: u32,
+        result_length: MutPtr<Platform, u32>,
+    ) -> NtStatus {
+        let Ok(key_information_class) = KeyInformationClass::try_from(key_information_class) else {
+            litebox_util_log::debug!(
+                key_information_class = key_information_class;
+                "Unsupported NtEnumerateKey class"
+            );
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if !matches!(
+            key_information_class,
+            KeyInformationClass::Basic | KeyInformationClass::Node | KeyInformationClass::Full
+        ) {
+            // NtEnumerateKey only produces KEY_BASIC/NODE/FULL_INFORMATION.
+            litebox_util_log::debug!(
+                key_information_class:? = key_information_class;
+                "Unsupported NtEnumerateKey class"
+            );
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        match self.do_nt_enumerate_key(
+            key_handle,
+            index,
+            key_information_class,
+            key_information,
+            length,
+            result_length,
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
+    }
+
+    fn do_nt_enumerate_key(
+        &self,
+        key_handle: Handle,
+        index: u32,
+        key_information_class: KeyInformationClass,
+        key_information: MutPtr<Platform, u8>,
+        length: u32,
+        result_length: MutPtr<Platform, u32>,
+    ) -> Result<(), NtStatus> {
+        let key = self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+            key_handle,
+            RegistryKeyAccess::ENUMERATE_SUB_KEYS.bits(),
+        )?;
+        let Some(subkey_name) =
+            key.with_entry(|key| self.global.registry.nth_subkey_name(key, index))?
+        else {
+            return Err(NtStatus::NO_MORE_ENTRIES);
+        };
+        let summary = if key_information_class == KeyInformationClass::Full {
+            key.with_entry(|key| self.global.registry.subkey_summary(key, &subkey_name))?
+        } else {
+            KeySummary::default()
+        };
+        let leaf_name = utf16le(&subkey_name);
+
+        match key_information_class {
+            KeyInformationClass::Basic => {
+                let header_len = offset_of!(KeyBasicInformation, name);
+                let required_length = header_len
+                    .checked_add(leaf_name.len())
+                    .ok_or(NtStatus::UNSUCCESSFUL)?;
+                let information = KeyBasicInformation {
+                    // TODO(registry-time): Track registry key last-write timestamps.
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    name_length: leaf_name.len().trunc(),
+                    name: [],
+                };
+                write_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    header_len,
+                    required_length,
+                    information.as_bytes(),
+                    &[(header_len, leaf_name.as_slice())],
+                )?;
+            }
+            KeyInformationClass::Node => {
+                let header_len = offset_of!(KeyNodeInformation, name);
+                let required_length = header_len
+                    .checked_add(leaf_name.len())
+                    .ok_or(NtStatus::UNSUCCESSFUL)?;
+                let information = KeyNodeInformation {
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    class_offset: u32::MAX,
+                    class_length: 0,
+                    name_length: leaf_name.len().trunc(),
+                    name: [],
+                };
+                write_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    header_len,
+                    required_length,
+                    information.as_bytes(),
+                    &[(header_len, leaf_name.as_slice())],
+                )?;
+            }
+            KeyInformationClass::Full => {
+                let required_length = offset_of!(KeyFullInformation, class);
+                let information = KeyFullInformation {
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    class_offset: u32::MAX,
+                    class_length: 0,
+                    sub_keys: summary.sub_keys.trunc(),
+                    max_name_len: summary.max_name_len.trunc(),
+                    max_class_len: 0,
+                    values: summary.values.trunc(),
+                    max_value_name_len: summary.max_value_name_len.trunc(),
+                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    class: [],
+                };
+                write_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    required_length,
+                    required_length,
+                    information.as_bytes(),
+                    &[],
+                )?;
+            }
+            _ => return Err(NtStatus::INVALID_INFO_CLASS),
+        }
+
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", key_handle.as_raw()),
+            index = index,
+            key_information_class:? = key_information_class,
+            length = length;
+            "Handled NtEnumerateKey syscall"
         );
         Ok(())
     }
@@ -2083,6 +2282,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nt_enumerate_key_lists_subkeys_in_stable_sorted_order() {
+        let task = crate::tests::test_task();
+
+        let create_key = |path: &str| -> Handle {
+            let name_utf16 = utf16(path);
+            let name = unicode_string(&name_utf16);
+            let attributes = object_attributes(&name, 0);
+            let mut handle = Handle::default();
+            assert_eq!(
+                task.sys_nt_create_key(
+                    mut_ptr(&mut handle),
+                    RegistryKeyAccess::READ.bits(),
+                    Some(const_ptr(&attributes)),
+                    0,
+                    None,
+                    0,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            handle
+        };
+
+        let parent_path = r"\Registry\Machine\Software\LiteBoxEnumParent";
+        let parent = create_key(parent_path);
+        // Create the subkeys out of alphabetical order to prove enumeration
+        // imposes a deterministic sorted ordering independent of insertion order.
+        task.close_registry_key_handle(create_key(&format!(r"{parent_path}\Beta")));
+        task.close_registry_key_handle(create_key(&format!(r"{parent_path}\Alpha")));
+
+        let enumerate_name = |index: u32| -> Option<Vec<u8>> {
+            let mut information = [0u8; 128];
+            let mut result_length = 0u32;
+            let status = task.sys_nt_enumerate_key(
+                parent,
+                index,
+                u32::from(KeyInformationClass::Basic),
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            );
+            if status == NtStatus::NO_MORE_ENTRIES {
+                return None;
+            }
+            assert_eq!(status, NtStatus::SUCCESS);
+            let header_len = offset_of!(KeyBasicInformation, name);
+            let name_len = result_length as usize - header_len;
+            Some(information[header_len..header_len + name_len].to_vec())
+        };
+
+        // Key path components are stored lower-cased in the backing store.
+        assert_eq!(enumerate_name(0), Some(utf16le("alpha")));
+        assert_eq!(enumerate_name(1), Some(utf16le("beta")));
+        assert_eq!(enumerate_name(2), None);
+
+        // A class that `NtEnumerateKey` does not produce is rejected.
+        let mut information = [0u8; 128];
+        let mut result_length = 0u32;
+        assert_eq!(
+            task.sys_nt_enumerate_key(
+                parent,
+                0,
+                u32::from(KeyInformationClass::Name),
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
+
+        task.close_registry_key_handle(parent);
+    }
+
     fn notify_params(
         key_handle: Handle,
         io_status_block: &mut IoStatusBlock,
@@ -2711,5 +2984,144 @@ mod tests {
         assert_eq!(cached.max_value_name_len, full.max_value_name_len);
         assert_eq!(cached.max_value_data_len, full.max_value_data_len);
         assert_eq!(cached.name_length, utf16le("codepage").len().trunc());
+    }
+
+    #[test]
+    fn nt_enumerate_key_reports_indexed_subkeys_and_buffer_statuses() {
+        let task = crate::tests::test_task();
+        let parent_name = r"\Registry\Machine\Software\EnumerationTest";
+        create_key_in_fs(&task.global.registry.fs, parent_name).unwrap();
+        create_key_in_fs(
+            &task.global.registry.fs,
+            r"\Registry\Machine\Software\EnumerationTest\Zulu",
+        )
+        .unwrap();
+        create_key_in_fs(
+            &task.global.registry.fs,
+            r"\Registry\Machine\Software\EnumerationTest\Alpha\Nested",
+        )
+        .unwrap();
+        write_value_in_fs(
+            &task.global.registry.fs,
+            r"\Registry\Machine\Software\EnumerationTest\Alpha",
+            "Value",
+            RegistryValueType::Binary,
+            &[1, 2, 3],
+        )
+        .unwrap();
+
+        let parent_name = utf16(parent_name);
+        let parent_name = unicode_string(&parent_name);
+        let key_handle = open_key(&task, object_attributes(&parent_name, 0)).unwrap();
+        let mut information = [0xa5; 128];
+        let mut result_length = 0;
+
+        assert!(
+            task.do_nt_enumerate_key(
+                key_handle,
+                0,
+                KeyInformationClass::Basic,
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            )
+            .is_ok()
+        );
+        let expected_name = utf16le("alpha");
+        let header_len = offset_of!(KeyBasicInformation, name);
+        assert_eq!(result_length as usize, header_len + expected_name.len());
+        let basic = KeyBasicInformation::read_from_prefix(&information)
+            .unwrap()
+            .0;
+        assert_eq!(basic.name_length as usize, expected_name.len());
+        assert_eq!(
+            &information[header_len..header_len + expected_name.len()],
+            expected_name
+        );
+
+        information.fill(0xa5);
+        assert!(
+            task.do_nt_enumerate_key(
+                key_handle,
+                1,
+                KeyInformationClass::Node,
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            )
+            .is_ok()
+        );
+        let expected_name = utf16le("zulu");
+        let header_len = offset_of!(KeyNodeInformation, name);
+        let node = KeyNodeInformation::read_from_prefix(&information)
+            .unwrap()
+            .0;
+        assert_eq!(node.class_offset, u32::MAX);
+        assert_eq!(node.class_length, 0);
+        assert_eq!(
+            &information[header_len..header_len + expected_name.len()],
+            expected_name
+        );
+
+        assert!(
+            task.do_nt_enumerate_key(
+                key_handle,
+                0,
+                KeyInformationClass::Full,
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            )
+            .is_ok()
+        );
+        let full = KeyFullInformation::read_from_prefix(&information)
+            .unwrap()
+            .0;
+        assert_eq!(full.sub_keys, 1);
+        assert_eq!(full.values, 1);
+        assert_eq!(full.max_value_data_len, 3);
+
+        assert_eq!(
+            task.do_nt_enumerate_key(
+                key_handle,
+                2,
+                KeyInformationClass::Basic,
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            Err(NtStatus::NO_MORE_ENTRIES)
+        );
+
+        assert_eq!(
+            task.do_nt_enumerate_key(
+                key_handle,
+                0,
+                KeyInformationClass::Basic,
+                mut_byte_ptr(&mut information),
+                (offset_of!(KeyBasicInformation, name) - 1).trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            Err(NtStatus::BUFFER_TOO_SMALL)
+        );
+        assert_eq!(
+            result_length as usize,
+            offset_of!(KeyBasicInformation, name) + utf16le("alpha").len()
+        );
+
+        let header_len = offset_of!(KeyBasicInformation, name);
+        information.fill(0xa5);
+        assert_eq!(
+            task.do_nt_enumerate_key(
+                key_handle,
+                0,
+                KeyInformationClass::Basic,
+                mut_byte_ptr(&mut information),
+                (header_len + 2).trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            Err(NtStatus::BUFFER_OVERFLOW)
+        );
+        assert_eq!(information[header_len..header_len + 2], [b'a', 0]);
     }
 }
