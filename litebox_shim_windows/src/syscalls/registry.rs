@@ -729,6 +729,38 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let _ = self.fs.close(&child.fd);
         summary
     }
+
+    /// Returns the deterministically-ordered name of the `index`-th value of
+    /// `key`, or `None` when `index` is out of range.
+    ///
+    /// Like [`Self::nth_subkey_name`], `NtEnumerateValueKey` requires a stable
+    /// ordering across successive calls, so the value names (stored as regular
+    /// files under the key's `.values` directory) are sorted before indexing.
+    fn nth_value_name(
+        &self,
+        key: &RegistryKeyObject<Platform>,
+        index: u32,
+    ) -> Result<Option<String>, NtStatus> {
+        let values_path = format!("{}/{}", key.path.trim_end_matches('/'), VALUES_DIR_NAME);
+        let values_fd = self
+            .fs
+            .open(
+                &*values_path,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .map_err(map_open_error)?;
+        let entries = self.fs.read_dir(&values_fd).map_err(map_read_dir_error);
+        let _ = self.fs.close(&values_fd);
+        let mut names = Vec::new();
+        for entry in entries? {
+            if entry.file_type == FileType::RegularFile {
+                names.push(entry.name);
+            }
+        }
+        names.sort_unstable();
+        Ok(names.into_iter().nth(index as usize))
+    }
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -998,6 +1030,83 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(()) => NtStatus::SUCCESS,
             Err(status) => status,
         }
+    }
+
+    pub(crate) fn sys_nt_enumerate_value_key(
+        &self,
+        key_handle: Handle,
+        index: u32,
+        key_value_information_class: u32,
+        key_value_information: MutPtr<Platform, u8>,
+        length: u32,
+        result_length: MutPtr<Platform, u32>,
+    ) -> NtStatus {
+        let Ok(key_value_information_class) =
+            KeyValueInformationClass::try_from(key_value_information_class)
+        else {
+            litebox_util_log::debug!(
+                key_value_information_class = key_value_information_class;
+                "Unsupported NtEnumerateValueKey class"
+            );
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+        match self.do_nt_enumerate_value_key(
+            key_handle,
+            index,
+            key_value_information_class,
+            key_value_information,
+            length,
+            result_length,
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
+    }
+
+    fn do_nt_enumerate_value_key(
+        &self,
+        key_handle: Handle,
+        index: u32,
+        key_value_information_class: KeyValueInformationClass,
+        key_value_information: MutPtr<Platform, u8>,
+        length: u32,
+        result_length: MutPtr<Platform, u32>,
+    ) -> Result<(), NtStatus> {
+        let key = self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+            key_handle,
+            RegistryKeyAccess::QUERY_VALUE.bits(),
+        )?;
+        let (value_name, value) = key
+            .with_entry(|key| {
+                let Some(value_name) = self.global.registry.nth_value_name(key, index)? else {
+                    return Ok(None);
+                };
+                let value = self
+                    .global
+                    .registry
+                    .read_value_at_path(&key.path, &value_name)?;
+                Ok::<_, NtStatus>(Some((value_name, value)))
+            })?
+            .ok_or(NtStatus::NO_MORE_ENTRIES)?;
+        let name = utf16le(&value_name);
+        write_key_value_information::<Platform>(
+            key_value_information_class,
+            key_value_information,
+            length,
+            &name,
+            &value,
+            result_length,
+        )?;
+
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", key_handle.as_raw()),
+            index = index,
+            value_name:% = value_name,
+            key_value_information_class:? = key_value_information_class,
+            length = length;
+            "Handled NtEnumerateValueKey syscall"
+        );
+        Ok(())
     }
 
     pub(crate) fn sys_nt_set_value_key(
@@ -1555,84 +1664,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .read_value_at_path(&key.path, &value_name)
         })?;
         let name = utf16le(&value_name);
-        match key_value_information_class {
-            KeyValueInformationClass::Basic => {
-                let required_length = size_of::<KeyValueBasicInformation>()
-                    .checked_add(name.len())
-                    .ok_or(NtStatus::UNSUCCESSFUL)?;
-                let information = KeyValueBasicInformation {
-                    title_index: 0,
-                    value_type: value.value_type,
-                    name_length: name.len().trunc(),
-                    name: [0u8; 0],
-                };
-                write_query_information::<Platform>(
-                    result_length,
-                    key_value_information,
-                    length,
-                    offset_of!(KeyValueBasicInformation, name),
-                    required_length,
-                    information.as_bytes(),
-                    &[(offset_of!(KeyValueBasicInformation, name), name.as_slice())],
-                )?;
-            }
-            KeyValueInformationClass::Full => {
-                let name_end = offset_of!(KeyValueFullInformation, name)
-                    .checked_add(name.len())
-                    .ok_or(NtStatus::UNSUCCESSFUL)?;
-                let data_offset = name_end
-                    .checked_next_multiple_of(4)
-                    .ok_or(NtStatus::UNSUCCESSFUL)?;
-                let required_length = data_offset
-                    .checked_add(value.data.len())
-                    .ok_or(NtStatus::UNSUCCESSFUL)?;
-                let information = KeyValueFullInformation {
-                    title_index: 0,
-                    value_type: value.value_type,
-                    data_offset: data_offset.trunc(),
-                    data_length: value.data.len().trunc(),
-                    name_length: name.len().trunc(),
-                    name: [0u8; 0],
-                };
-
-                write_query_information::<Platform>(
-                    result_length,
-                    key_value_information,
-                    length,
-                    offset_of!(KeyValueFullInformation, name),
-                    required_length,
-                    information.as_bytes(),
-                    &[
-                        (offset_of!(KeyValueFullInformation, name), name.as_slice()),
-                        (data_offset, value.data.as_slice()),
-                    ],
-                )?;
-            }
-            KeyValueInformationClass::Partial => {
-                let required_length = size_of::<KeyValuePartialInformation>()
-                    .checked_add(value.data.len())
-                    .ok_or(NtStatus::UNSUCCESSFUL)?;
-                let information = KeyValuePartialInformation {
-                    title_index: 0,
-                    value_type: value.value_type,
-                    data_length: value.data.len().trunc(),
-                    data: [0u8; 0],
-                };
-
-                write_query_information::<Platform>(
-                    result_length,
-                    key_value_information,
-                    length,
-                    offset_of!(KeyValuePartialInformation, data),
-                    required_length,
-                    information.as_bytes(),
-                    &[(
-                        offset_of!(KeyValuePartialInformation, data),
-                        value.data.as_slice(),
-                    )],
-                )?;
-            }
-        }
+        write_key_value_information::<Platform>(
+            key_value_information_class,
+            key_value_information,
+            length,
+            &name,
+            &value,
+            result_length,
+        )?;
 
         litebox_util_log::debug!(
             handle:% = format_args!("{:#x}", key_handle.as_raw()),
@@ -1644,6 +1683,95 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         Ok(())
     }
+}
+
+/// Serializes a registry value into the requested `KEY_VALUE_*_INFORMATION`
+/// layout, shared by `NtQueryValueKey` and `NtEnumerateValueKey`.
+fn write_key_value_information<Platform: litebox::platform::RawPointerProvider>(
+    key_value_information_class: KeyValueInformationClass,
+    key_value_information: MutPtr<Platform, u8>,
+    length: u32,
+    name: &[u8],
+    value: &RegistryValue,
+    result_length: MutPtr<Platform, u32>,
+) -> Result<(), NtStatus> {
+    match key_value_information_class {
+        KeyValueInformationClass::Basic => {
+            let required_length = size_of::<KeyValueBasicInformation>()
+                .checked_add(name.len())
+                .ok_or(NtStatus::UNSUCCESSFUL)?;
+            let information = KeyValueBasicInformation {
+                title_index: 0,
+                value_type: value.value_type,
+                name_length: name.len().trunc(),
+                name: [0u8; 0],
+            };
+            write_query_information::<Platform>(
+                result_length,
+                key_value_information,
+                length,
+                offset_of!(KeyValueBasicInformation, name),
+                required_length,
+                information.as_bytes(),
+                &[(offset_of!(KeyValueBasicInformation, name), name)],
+            )?;
+        }
+        KeyValueInformationClass::Full => {
+            let name_end = offset_of!(KeyValueFullInformation, name)
+                .checked_add(name.len())
+                .ok_or(NtStatus::UNSUCCESSFUL)?;
+            let data_offset = name_end
+                .checked_next_multiple_of(4)
+                .ok_or(NtStatus::UNSUCCESSFUL)?;
+            let required_length = data_offset
+                .checked_add(value.data.len())
+                .ok_or(NtStatus::UNSUCCESSFUL)?;
+            let information = KeyValueFullInformation {
+                title_index: 0,
+                value_type: value.value_type,
+                data_offset: data_offset.trunc(),
+                data_length: value.data.len().trunc(),
+                name_length: name.len().trunc(),
+                name: [0u8; 0],
+            };
+            write_query_information::<Platform>(
+                result_length,
+                key_value_information,
+                length,
+                offset_of!(KeyValueFullInformation, name),
+                required_length,
+                information.as_bytes(),
+                &[
+                    (offset_of!(KeyValueFullInformation, name), name),
+                    (data_offset, value.data.as_slice()),
+                ],
+            )?;
+        }
+        KeyValueInformationClass::Partial => {
+            let required_length = size_of::<KeyValuePartialInformation>()
+                .checked_add(value.data.len())
+                .ok_or(NtStatus::UNSUCCESSFUL)?;
+            let information = KeyValuePartialInformation {
+                title_index: 0,
+                value_type: value.value_type,
+                data_length: value.data.len().trunc(),
+                data: [0u8; 0],
+            };
+            write_query_information::<Platform>(
+                result_length,
+                key_value_information,
+                length,
+                offset_of!(KeyValuePartialInformation, data),
+                required_length,
+                information.as_bytes(),
+                &[(
+                    offset_of!(KeyValuePartialInformation, data),
+                    value.data.as_slice(),
+                )],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn write_query_information<Platform: litebox::platform::RawPointerProvider>(
@@ -2849,6 +2977,86 @@ mod tests {
         assert_eq!(
             &full_information[data_offset..data_offset + DEFAULT_OEMCP_VALUE.len()],
             DEFAULT_OEMCP_VALUE
+        );
+    }
+
+    #[test]
+    fn nt_enumerate_value_key_lists_values_in_stable_sorted_order() {
+        let task = crate::tests::test_task();
+        // The code-page key is seeded with ACP, OEMCP, and MACCP values, which
+        // are stored lower-cased and therefore enumerate as acp, maccp, oemcp.
+        let key_handle = open_code_page_key(&task);
+
+        let expected = [("acp", DEFAULT_ACP_VALUE), ("maccp", DEFAULT_MACCP_VALUE)];
+        for (index, (name, data)) in expected.iter().enumerate() {
+            let index = u32::try_from(index).unwrap();
+            let mut information = [0u8; 96];
+            let mut result_length = 0;
+            assert_eq!(
+                task.sys_nt_enumerate_value_key(
+                    key_handle,
+                    index,
+                    u32::from(KeyValueInformationClass::Full),
+                    mut_byte_ptr(&mut information),
+                    information.len().trunc(),
+                    mut_ptr(&mut result_length),
+                ),
+                NtStatus::SUCCESS
+            );
+            let (full_header, full_tail) =
+                KeyValueFullInformation::read_from_prefix(&information[..result_length as usize])
+                    .unwrap();
+            let name_utf16 = utf16le(name);
+            assert_eq!(full_header.name_length as usize, name_utf16.len());
+            assert_eq!(&full_tail[..name_utf16.len()], name_utf16.as_slice());
+            let data_offset = full_header.data_offset as usize;
+            assert_eq!(full_header.data_length as usize, data.len());
+            assert_eq!(&information[data_offset..data_offset + data.len()], *data);
+        }
+
+        // The third value (oemcp) is reachable via Basic information at index 2.
+        let mut information = [0u8; 96];
+        let mut result_length = 0;
+        assert_eq!(
+            task.sys_nt_enumerate_value_key(
+                key_handle,
+                2,
+                u32::from(KeyValueInformationClass::Basic),
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::SUCCESS
+        );
+        let (_, basic_name) =
+            KeyValueBasicInformation::read_from_prefix(&information[..result_length as usize])
+                .unwrap();
+        assert_eq!(basic_name, utf16le("oemcp").as_slice());
+
+        // Enumerating past the final value reports STATUS_NO_MORE_ENTRIES.
+        assert_eq!(
+            task.sys_nt_enumerate_value_key(
+                key_handle,
+                3,
+                u32::from(KeyValueInformationClass::Basic),
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::NO_MORE_ENTRIES
+        );
+
+        // An unsupported information class is rejected.
+        assert_eq!(
+            task.sys_nt_enumerate_value_key(
+                key_handle,
+                0,
+                0xffff,
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::INVALID_INFO_CLASS
         );
     }
 
