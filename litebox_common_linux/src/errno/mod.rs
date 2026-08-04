@@ -423,6 +423,7 @@ impl From<litebox::net::errors::ShutdownError> for Errno {
     fn from(value: litebox::net::errors::ShutdownError) -> Self {
         match value {
             litebox::net::errors::ShutdownError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::ShutdownError::Listening => Errno::ENOTCONN,
             litebox::net::errors::ShutdownError::UnsupportedOperation => Errno::EOPNOTSUPP,
             litebox::net::errors::ShutdownError::OperationFailed(error) => error.into(),
             _ => unimplemented!(),

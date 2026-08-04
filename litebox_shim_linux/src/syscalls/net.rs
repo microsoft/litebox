@@ -2604,11 +2604,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     ShutdownHow::Write => litebox::net::ShutdownDirection::Write,
                     ShutdownHow::Both => litebox::net::ShutdownDirection::Both,
                 };
-                self.global
-                    .net
-                    .lock()
-                    .shutdown(fd, direction)
-                    .map_err(Errno::from)
+                let network = self.global.net.lock();
+                match network.shutdown(fd, direction) {
+                    Err(litebox::net::errors::ShutdownError::Listening) => match how {
+                        ShutdownHow::Read | ShutdownHow::Both => {
+                            network.stop_listening(fd).map_err(Errno::from)
+                        }
+                        ShutdownHow::Write => Ok(()),
+                    },
+                    result => result.map_err(Errno::from),
+                }
             },
             |file| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;

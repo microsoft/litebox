@@ -502,7 +502,10 @@ pub fn shutdown(
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
-        let serializes_configuration = matches!(mode, ShutdownMode::Read | ShutdownMode::Both);
+        if socket.listening && !matches!(mode, ShutdownMode::Abort | ShutdownMode::StopListening) {
+            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+        }
+        let serializes_configuration = mode == ShutdownMode::StopListening;
         if serializes_configuration {
             if socket.configuration_in_flight {
                 return Ok(SocketOutcome::Failed(SocketError::Other));
@@ -512,7 +515,7 @@ pub fn shutdown(
         (
             Arc::clone(&socket.resource),
             serializes_configuration,
-            socket.listening && serializes_configuration,
+            socket.listening && mode == ShutdownMode::StopListening,
         )
     };
     let outcome = resource.shutdown(mode);
@@ -1146,7 +1149,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             shutdown(&session, listener, ShutdownMode::Write),
-            Ok(SocketOutcome::Completed(()))
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
         );
         assert!(matches!(
             accept(&session, listener, readiness.clone()),
@@ -1155,7 +1158,7 @@ pub(crate) mod tests {
         assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
         assert_eq!(
-            shutdown(&session, listener, ShutdownMode::Read),
+            shutdown(&session, listener, ShutdownMode::StopListening),
             Ok(SocketOutcome::Completed(()))
         );
         assert_eq!(
@@ -1211,7 +1214,7 @@ pub(crate) mod tests {
         ));
         provider.fail_next_shutdown();
         assert_eq!(
-            shutdown(&session, handle, ShutdownMode::Read),
+            shutdown(&session, handle, ShutdownMode::StopListening),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
@@ -1245,7 +1248,7 @@ pub(crate) mod tests {
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let shutdown_calls = provider.state.shutdown_calls.load(Ordering::Relaxed);
         assert_eq!(
-            shutdown(&session, handle, ShutdownMode::Read),
+            shutdown(&session, handle, ShutdownMode::StopListening),
             Ok(SocketOutcome::Failed(SocketError::Other))
         );
         assert_eq!(
@@ -1258,7 +1261,7 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(_))
         ));
         assert_eq!(
-            shutdown(&session, handle, ShutdownMode::Read),
+            shutdown(&session, handle, ShutdownMode::StopListening),
             Ok(SocketOutcome::Completed(()))
         );
         session.close_object_reference(handle).unwrap();

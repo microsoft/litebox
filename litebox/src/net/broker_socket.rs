@@ -231,23 +231,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn shutdown(&self, mode: ShutdownMode) -> Result<(), SocketAsyncError> {
-        let was_listening = self.state.lock().listening;
         match self
             .broker
             .shutdown_socket(self.handle, mode)
             .map_err(|error| SocketAsyncError::from(BrokerObjectError::from(error)))?
         {
             SocketOutcome::Completed(()) => {
-                if was_listening && matches!(mode, ShutdownMode::Read | ShutdownMode::Both) {
-                    let mut state = self.state.lock();
-                    state.listening = false;
-                    state.update_connection(SocketConnectionStatus::Failed(
-                        BrokerSocketError::NotConnected,
-                    ));
-                    drop(state);
-                    self.pollee.notify_observers(Events::OUT | Events::HUP);
-                } else if !was_listening && matches!(mode, ShutdownMode::Write | ShutdownMode::Both)
-                {
+                if matches!(mode, ShutdownMode::Write | ShutdownMode::Both) {
                     self.write_shutdown.store(true, Ordering::Release);
                     self.pollee.notify_observers(Events::OUT);
                 }
@@ -257,6 +247,30 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 let error = error.into();
                 Err(error)
             }
+        }
+    }
+
+    pub(super) fn is_listening(&self) -> bool {
+        self.state.lock().listening
+    }
+
+    pub(super) fn stop_listening(&self) -> Result<(), SocketAsyncError> {
+        match self
+            .broker
+            .shutdown_socket(self.handle, ShutdownMode::StopListening)
+            .map_err(|error| SocketAsyncError::from(BrokerObjectError::from(error)))?
+        {
+            SocketOutcome::Completed(()) => {
+                let mut state = self.state.lock();
+                state.listening = false;
+                state.update_connection(SocketConnectionStatus::Failed(
+                    BrokerSocketError::NotConnected,
+                ));
+                drop(state);
+                self.pollee.notify_observers(Events::OUT | Events::HUP);
+                Ok(())
+            }
+            SocketOutcome::Failed(error) => Err(error.into()),
         }
     }
 

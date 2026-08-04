@@ -58,6 +58,8 @@ pub enum ShutdownMode {
     Both,
     /// The final close discards queued data and resets the connection.
     Abort,
+    /// Stops accepting new connections while retaining the socket object.
+    StopListening,
 }
 
 /// IPv4 address in network byte order.

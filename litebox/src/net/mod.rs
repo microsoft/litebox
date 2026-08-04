@@ -1238,6 +1238,9 @@ where
             .broker_socket
             .as_ref()
             .ok_or(errors::ShutdownError::UnsupportedOperation)?;
+        if socket.is_listening() {
+            return Err(errors::ShutdownError::Listening);
+        }
         let mode = match direction {
             ShutdownDirection::Read => litebox_broker_protocol::socket::ShutdownMode::Read,
             ShutdownDirection::Write => litebox_broker_protocol::socket::ShutdownMode::Write,
@@ -1245,6 +1248,27 @@ where
         };
         socket
             .shutdown(mode)
+            .map_err(errors::ShutdownError::OperationFailed)
+    }
+
+    /// Stops a broker-owned listener without closing its socket object.
+    pub fn stop_listening(&self, fd: &SocketFd<Platform>) -> Result<(), errors::ShutdownError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table
+            .get_entry(fd)
+            .ok_or(errors::ShutdownError::InvalidFd)?;
+        let socket = entry
+            .entry
+            .broker_socket
+            .as_ref()
+            .ok_or(errors::ShutdownError::UnsupportedOperation)?;
+        if !socket.is_listening() {
+            return Err(errors::ShutdownError::OperationFailed(
+                errors::SocketAsyncError::NotConnected,
+            ));
+        }
+        socket
+            .stop_listening()
             .map_err(errors::ShutdownError::OperationFailed)
     }
 

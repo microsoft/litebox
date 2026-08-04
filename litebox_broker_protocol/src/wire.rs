@@ -476,6 +476,10 @@ mod tests {
                 handle,
                 mode: ShutdownMode::Abort,
             })),
+            BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+                handle,
+                mode: ShutdownMode::StopListening,
+            })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
         ];
         let mut maximum_encoded_size = 0;

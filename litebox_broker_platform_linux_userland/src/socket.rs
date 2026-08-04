@@ -1204,7 +1204,14 @@ fn shutdown_socket(
             .map_err(broker_error_from_errno)?;
         return Ok(SocketOutcome::Completed(()));
     }
-    let was_listening = socket.listening;
+    let stop_listening = mode == ShutdownMode::StopListening;
+    if stop_listening {
+        if !socket.listening {
+            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+        }
+    } else if socket.listening {
+        return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+    }
     let (mode, add, clear, shuts_down_read, shuts_down_write) = match mode {
         ShutdownMode::Read => (
             LinuxShutdown::Read,
@@ -1227,23 +1234,27 @@ fn shutdown_socket(
             true,
             true,
         ),
+        ShutdownMode::StopListening => (
+            LinuxShutdown::Read,
+            ReadinessFlags::default(),
+            ReadinessFlags::default(),
+            true,
+            false,
+        ),
         _ => return Err(BrokerError::UnsupportedOperation),
     };
     loop {
         match shutdown(&socket.socket, mode) {
             Ok(()) => {
-                if was_listening {
-                    if shuts_down_read {
-                        socket.listening = false;
-                        socket.read_shutdown = true;
-                        socket.write_shutdown |= shuts_down_write;
-                        socket.peek_waitall_threshold = None;
-                        update_snapshot(
-                            socket,
-                            Some(SocketConnectionStatus::Failed(SocketError::NotConnected)),
-                            ReadinessFlags::WRITE | ReadinessFlags::HANGUP,
-                        )?;
-                    }
+                if stop_listening {
+                    socket.listening = false;
+                    socket.read_shutdown = true;
+                    socket.peek_waitall_threshold = None;
+                    update_snapshot(
+                        socket,
+                        Some(SocketConnectionStatus::Failed(SocketError::NotConnected)),
+                        ReadinessFlags::WRITE | ReadinessFlags::HANGUP,
+                    )?;
                     return Ok(SocketOutcome::Completed(()));
                 }
                 socket.read_shutdown |= shuts_down_read;
@@ -1974,7 +1985,7 @@ mod tests {
         );
         assert_eq!(
             litebox_broker_core::socket::shutdown(&session, listener, ShutdownMode::Write),
-            Ok(SocketOutcome::Completed(()))
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
         );
         assert!(matches!(
             litebox_broker_core::socket::accept(&session, listener, readiness.clone()),
@@ -2064,7 +2075,7 @@ mod tests {
         first_client.read_exact(&mut response).unwrap();
         assert_eq!(&response, b"response");
         assert_eq!(
-            litebox_broker_core::socket::shutdown(&session, listener, ShutdownMode::Read),
+            litebox_broker_core::socket::shutdown(&session, listener, ShutdownMode::StopListening,),
             Ok(SocketOutcome::Completed(()))
         );
         wait_for_readiness(&publications, listener, ReadinessFlags::HANGUP);

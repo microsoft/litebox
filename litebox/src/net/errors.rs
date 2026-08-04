@@ -45,6 +45,8 @@ pub enum CloseError {
 pub enum ShutdownError {
     #[error("Not a valid open file descriptor")]
     InvalidFd,
+    #[error("Socket is listening for connections")]
+    Listening,
     #[error("Shutdown is unsupported for this socket")]
     UnsupportedOperation,
     #[error("Socket operation failed: {0:?}")]
