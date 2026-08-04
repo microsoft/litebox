@@ -76,6 +76,17 @@ fn test_runner_hello_ta() {
     run("hello-ta");
 }
 
+/// Same TA as [`test_runner_hello_ta`], but built with three `PT_LOAD`
+/// segments instead of two.
+///
+/// A third segment produces a middle segment mapped at a *fixed* address with
+/// non-zero `pad_end`, which is the case that collides with the LiteBox
+/// trampoline pages.
+#[test]
+fn test_runner_hello_3seg_ta() {
+    run("hello3seg-ta");
+}
+
 #[test]
 fn test_runner_random_ta() {
     run("random-ta");

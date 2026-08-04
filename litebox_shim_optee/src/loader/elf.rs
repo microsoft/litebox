@@ -28,7 +28,7 @@ use litebox_common_linux::{
     errno::Errno,
     loader::{ElfParseError, ElfParsedFile},
 };
-use litebox_common_optee::LdelfArg;
+use litebox_common_optee::{LdelfArg, TeeUuid};
 use thiserror::Error;
 
 /// An ELF file loaded in memory
@@ -221,6 +221,26 @@ impl<'a> ElfLoader<'a> {
     pub fn new(task: &'a Task, elf_bin: &[u8], is_ldelf: bool) -> Result<Self, ElfLoaderError> {
         let main = FileAndParsed::new(task, elf_bin)?;
         Ok(Self { main, is_ldelf })
+    }
+
+    /// The pages the TA's trampoline occupies, relative to the TA's load
+    /// address, or `None` if the TA has no trampoline.
+    ///
+    /// Callers anchor the result at the address `ldelf` maps the first segment
+    /// at, whereas [`Self::load_ta_trampoline`] anchors at
+    /// `entry_point - e_entry`. The two agree as long as the first `PT_LOAD`
+    /// starts at vaddr 0, which `ldelf` assumes too.
+    pub(crate) fn ta_trampoline_relative_page_range(
+        task: &'a Task,
+        ta_uuid: &TeeUuid,
+    ) -> Result<Option<core::ops::Range<usize>>, ElfLoaderError> {
+        let ta_bin = task
+            .global
+            .get_ta_bin(ta_uuid)
+            .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
+        // Constructing the loader only parses headers; it maps nothing.
+        let loader = Self::new(task, &ta_bin, false)?;
+        Ok(loader.main.parsed.trampoline_page_range(0))
     }
 
     /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID.

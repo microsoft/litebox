@@ -272,7 +272,7 @@ impl OpteeShim {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                ta_initial_map_end_addr: Cell::new(0),
+                ta_trampoline_page_range: Cell::new(None),
                 #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             },
@@ -1391,9 +1391,8 @@ struct Task {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
-    /// Upper address of the location-selecting map made while loading the TA image,
-    /// bounding the `pad_end` collision probes (0 if none was made yet).
-    ta_initial_map_end_addr: Cell<usize>,
+    /// Pages left mapped for the TA's syscall trampoline, if any
+    ta_trampoline_page_range: Cell<Option<(usize, usize)>>,
     /// TLS base address for x86_64 (stored to restore FS before each TA entry)
     #[cfg(target_arch = "x86_64")]
     tls_base_addr: Cell<usize>,
@@ -1561,7 +1560,7 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                ta_initial_map_end_addr: Cell::new(0),
+                ta_trampoline_page_range: Cell::new(None),
                 #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             }

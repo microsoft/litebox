@@ -16,6 +16,7 @@ litebox_platform_multiplex = { path = "../litebox_platform_multiplex/", version 
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 hmac = { version = "0.12", default-features = false }
 num_enum = { version = "0.7.3", default-features = false }
+rangemap = { version = "1.5.1", features = ["const_fn"] }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 sha2 = { version = "0.10", default-features = false }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex", "once"] }
