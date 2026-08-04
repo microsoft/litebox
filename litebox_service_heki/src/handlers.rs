@@ -89,7 +89,7 @@ impl<P: Vtl0Gate> Heki<P> {
                     continue;
                 }
 
-                self.gate.protect_frame(
+                self.gate.protect_frames(
                     PhysFrame::range(
                         // `HekiRange::is_valid` already validated both physical addresses.
                         PhysFrame::containing_address(PhysAddr::new(pa)),
@@ -198,7 +198,7 @@ impl<P: Vtl0Gate> Heki<P> {
         // fails, letting kdata load proceed so that heki is not broken.
         if !kexec_trampoline_insert_failed {
             for kexec_trampoline_range in &kexec_trampoline_metadata {
-                self.gate.protect_frame(
+                self.gate.protect_frames(
                     kexec_trampoline_range.phys_frame_range,
                     MemAttr::MEM_ATTR_READ,
                 )?;
@@ -410,7 +410,7 @@ impl<P: Vtl0Gate> Heki<P> {
                     ModMemType::RoAfterInit => {
                         // make this memory range read-only after initialization
                         self.gate
-                            .protect_frame(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)
+                            .protect_frames(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)
                     }
                     _ => Ok(()),
                 };
@@ -632,7 +632,7 @@ impl<P: Vtl0Gate> Heki<P> {
             PhysFrame::from_start_address(end).map_err(|_| VsmError::AddressNotPageAligned)?,
         );
         self.gate
-            .protect_frame(frame_range, MemAttr::MEM_ATTR_READ)?;
+            .protect_frames(frame_range, MemAttr::MEM_ATTR_READ)?;
         self.gate.install_ringbuffer(phys_addr.as_u64(), size);
         log::debug!("HEKI: Ring buffer allocated");
         Ok(0)
@@ -680,7 +680,7 @@ fn copy_heki_patch_from_vtl0<P: Vtl0Gate>(
             PhysPageAddr::<PAGE_SIZE>::new(patch_pa_1.as_u64().trunc())
                 .ok_or(VsmError::Vtl0CopyFailed)?,
         ];
-        gate.read_vtl0_bytes(
+        gate.read_vtl0_pages(
             &pages,
             (patch_pa_0 - patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
             heki_patch_bytes,
@@ -814,6 +814,6 @@ impl<'a> ValidatedTextPatch<'a> {
     /// The write parameters are never handed out separately, so a validated
     /// page list cannot be paired with some other patch's offset or bytes.
     fn apply(self, writer: &impl Vtl0PrivilegedWrite) -> Result<(), VsmError> {
-        writer.write_vtl0_bytes(&self.pages[..self.page_count], self.offset, self.bytes)
+        writer.write_vtl0_pages(&self.pages[..self.page_count], self.offset, self.bytes)
     }
 }

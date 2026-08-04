@@ -842,8 +842,10 @@ impl HekiKernelInfo {
 /// protected VTL0 frames.
 pub trait Vtl0Gate {
     /// Copy `out.len()` bytes out of VTL0 physical memory, starting at `offset`
-    /// within the first page of `pages`, into `out`.
-    fn read_vtl0_bytes(
+    /// within the first page of `pages`, into `out`. The pages need not be
+    /// physically contiguous; use [`Self::read_vtl0_contiguous`] when the source
+    /// is a single contiguous span.
+    fn read_vtl0_pages(
         &self,
         pages: &[PhysPageAddr<PAGE_SIZE>],
         offset: usize,
@@ -851,13 +853,16 @@ pub trait Vtl0Gate {
     ) -> Result<(), VsmError>;
 
     /// Directly set VTL0 protection on a frame range — no reservation, no
-    /// rollback. Use when the caller already trusts the frame, or is re-protecting
-    /// a frame the registry already owns.
-    fn protect_frame(&self, range: PhysFrameRange<Size4KiB>, attr: MemAttr)
-    -> Result<(), VsmError>;
+    /// rollback. Use when the caller already trusts the frames, or is
+    /// re-protecting frames the registry already owns.
+    fn protect_frames(
+        &self,
+        range: PhysFrameRange<Size4KiB>,
+        attr: MemAttr,
+    ) -> Result<(), VsmError>;
 
     /// Release a frame range the registry currently protects, restoring VTL0
-    /// read/write access — the standalone inverse of [`Self::protect_frame`].
+    /// read/write access — the standalone inverse of [`Self::protect_frames`].
     fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError>;
 
     /// Run a reserve-then-commit transaction: reserve `initial` (claiming the
@@ -886,7 +891,8 @@ pub trait Vtl0Gate {
 
     /// Read `out.len()` bytes from a contiguous VTL0 physical-memory span
     /// starting at `phys_addr`, into `out`. The span may cross page boundaries;
-    /// the covered pages are required to be physically contiguous.
+    /// the covered pages are required to be physically contiguous. Use
+    /// [`Self::read_vtl0_pages`] when they are not.
     fn read_vtl0_contiguous(&self, phys_addr: u64, out: &mut [u8]) -> Result<(), VsmError> {
         if out.is_empty() {
             return Ok(());
@@ -912,7 +918,7 @@ pub trait Vtl0Gate {
             }
             p += page_size;
         }
-        self.read_vtl0_bytes(&pages, offset, out)
+        self.read_vtl0_pages(&pages, offset, out)
     }
 
     /// Read a `FromBytes` value out of a contiguous VTL0 physical span starting
@@ -934,8 +940,9 @@ pub trait Vtl0Gate {
 /// written — whether the destination is legitimate is the grantee's business.
 pub trait Vtl0PrivilegedWrite {
     /// Copy `bytes` into VTL0 physical memory, starting at `offset` within the
-    /// first page of `pages`, bypassing VTL0 protection masks.
-    fn write_vtl0_bytes(
+    /// first page of `pages`, bypassing VTL0 protection masks. The pages need
+    /// not be physically contiguous.
+    fn write_vtl0_pages(
         &self,
         pages: &[PhysPageAddr<PAGE_SIZE>],
         offset: usize,

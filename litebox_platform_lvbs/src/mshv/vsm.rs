@@ -668,7 +668,7 @@ impl FrameTxn for PlatformFrameTxn<'_> {
 }
 
 impl Vtl0Gate for LvbsVtl0Gate {
-    fn read_vtl0_bytes(
+    fn read_vtl0_pages(
         &self,
         pages: &[PhysPageAddr<PAGE_SIZE>],
         offset: usize,
@@ -680,7 +680,7 @@ impl Vtl0Gate for LvbsVtl0Gate {
             .map_err(|_| VsmError::Vtl0CopyFailed)
     }
 
-    fn protect_frame(
+    fn protect_frames(
         &self,
         range: PhysFrameRange<Size4KiB>,
         attr: MemAttr,
@@ -722,7 +722,7 @@ impl Vtl0Gate for LvbsVtl0Gate {
 }
 
 impl Vtl0PrivilegedWrite for LvbsVtl0PrivilegedWriter {
-    fn write_vtl0_bytes(
+    fn write_vtl0_pages(
         &self,
         pages: &[PhysPageAddr<PAGE_SIZE>],
         offset: usize,
