@@ -174,6 +174,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 Arc::clone(&self.pollable_registry),
                 accepted,
             )),
+            SocketOutcome::Failed(BrokerSocketError::NotConnected) => {
+                Err(AcceptError::NotListening)
+            }
             SocketOutcome::Failed(error) => Err(AcceptError::OperationFailed(error.into())),
         }
     }
@@ -228,13 +231,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn shutdown(&self, mode: ShutdownMode) -> Result<(), SocketAsyncError> {
+        let was_listening = self.state.lock().listening;
         match self
             .broker
             .shutdown_socket(self.handle, mode)
             .map_err(|error| SocketAsyncError::from(BrokerObjectError::from(error)))?
         {
             SocketOutcome::Completed(()) => {
-                if matches!(mode, ShutdownMode::Write | ShutdownMode::Both) {
+                if was_listening && matches!(mode, ShutdownMode::Read | ShutdownMode::Both) {
+                    let mut state = self.state.lock();
+                    state.listening = false;
+                    state.update_connection(SocketConnectionStatus::Failed(
+                        BrokerSocketError::NotConnected,
+                    ));
+                    drop(state);
+                    self.pollee.notify_observers(Events::OUT | Events::HUP);
+                } else if !was_listening && matches!(mode, ShutdownMode::Write | ShutdownMode::Both)
+                {
                     self.write_shutdown.store(true, Ordering::Release);
                     self.pollee.notify_observers(Events::OUT);
                 }

@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/socket.h>
@@ -43,6 +44,20 @@ static void exchange_byte(int fd, unsigned char expected,
     assert(write(fd, &response, sizeof(response)) == sizeof(response));
 }
 
+struct blocking_accept {
+    int fd;
+    int result;
+    int error;
+};
+
+static void *blocking_accept_thread(void *argument) {
+    struct blocking_accept *accept = argument;
+    errno = 0;
+    accept->result = accept4(accept->fd, NULL, NULL, 0);
+    accept->error = errno;
+    return NULL;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -56,6 +71,7 @@ int main(void) {
     };
     assert(bind(listener, (const struct sockaddr *)&local, sizeof(local)) == 0);
     assert(listen(listener, 8) == 0);
+    assert(shutdown(listener, SHUT_WR) == 0);
     socklen_t length = sizeof(local);
     assert(getsockname(listener, (struct sockaddr *)&local, &length) == 0);
     assert(length == sizeof(local));
@@ -97,6 +113,24 @@ int main(void) {
     verify_endpoints(second, &local, &second_peer);
     exchange_byte(second, 0x32, 0x42);
     printf("SECOND %u\n", (unsigned int)ntohs(second_peer.sin_port));
+
+    struct blocking_accept accept = {
+        .fd = listener,
+        .result = 0,
+        .error = 0,
+    };
+    pthread_t accept_thread;
+    assert(pthread_create(&accept_thread, NULL, blocking_accept_thread, &accept) ==
+           0);
+    usleep(100 * 1000);
+    assert(shutdown(listener, SHUT_RDWR) == 0);
+    assert(pthread_join(accept_thread, NULL) == 0);
+    assert(accept.result == -1);
+    assert(accept.error == EINVAL);
+    ready.events = POLLIN;
+    ready.revents = 0;
+    assert(poll(&ready, 1, 0) == 1);
+    assert((ready.revents & POLLHUP) != 0);
 
     assert(close(first) == 0);
     assert(close(second) == 0);

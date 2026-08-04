@@ -496,7 +496,44 @@ pub fn shutdown(
     handle: ObjectHandle,
     mode: ShutdownMode,
 ) -> Result<SocketOutcome<()>> {
-    socket_resource(session, handle, ObjectRights::WRITE)?.shutdown(mode)
+    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let (resource, serializes_configuration, shuts_down_listener) = {
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::InvalidRights);
+        };
+        let serializes_configuration = matches!(mode, ShutdownMode::Read | ShutdownMode::Both);
+        if serializes_configuration {
+            if socket.configuration_in_flight {
+                return Ok(SocketOutcome::Failed(SocketError::Other));
+            }
+            socket.configuration_in_flight = true;
+        }
+        (
+            Arc::clone(&socket.resource),
+            serializes_configuration,
+            socket.listening && serializes_configuration,
+        )
+    };
+    let outcome = resource.shutdown(mode);
+    if serializes_configuration {
+        let mut object = object.write();
+        if let ObjectEntry::Socket(socket) = &mut *object {
+            socket.configuration_in_flight = false;
+            if shuts_down_listener
+                && matches!(
+                    &outcome,
+                    Ok(SocketOutcome::Completed(())
+                        | SocketOutcome::Failed(SocketError::NotConnected))
+                )
+            {
+                socket.listening = false;
+                socket.connection_status =
+                    SocketConnectionStatus::Failed(SocketError::NotConnected);
+            }
+        }
+    }
+    outcome
 }
 
 /// Returns broker-authoritative socket status and consumes its pending asynchronous error.
@@ -772,10 +809,12 @@ pub(crate) mod tests {
         status_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         binds: StdMutex<std::vec::Vec<SocketAddrV4>>,
         listens: StdMutex<std::vec::Vec<u32>>,
+        listen_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         shutdown_calls: AtomicUsize,
         dropped_sockets: AtomicUsize,
         fail_create: core::sync::atomic::AtomicBool,
         fail_connect: core::sync::atomic::AtomicBool,
+        fail_shutdown: core::sync::atomic::AtomicBool,
         failed_readiness: StdMutex<Option<ReadinessRegistration>>,
         live_readiness: StdMutex<Option<ReadinessRegistration>>,
     }
@@ -787,6 +826,10 @@ pub(crate) mod tests {
 
         fn fail_next_connect(&self) {
             self.state.fail_connect.store(true, Ordering::Relaxed);
+        }
+
+        fn fail_next_shutdown(&self) {
+            self.state.fail_shutdown.store(true, Ordering::Relaxed);
         }
     }
 
@@ -836,6 +879,11 @@ pub(crate) mod tests {
 
         fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>> {
             self.state.listens.lock().unwrap().push(backlog);
+            let listen_block = self.state.listen_block.lock().unwrap().take();
+            if let Some((started, release)) = listen_block {
+                started.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
             Ok(SocketOutcome::Completed(SocketAddrV4::new(
                 Ipv4Addr::LOCALHOST,
                 49152,
@@ -879,6 +927,9 @@ pub(crate) mod tests {
 
         fn shutdown(&self, _mode: ShutdownMode) -> Result<SocketOutcome<()>> {
             self.state.shutdown_calls.fetch_add(1, Ordering::Relaxed);
+            if self.state.fail_shutdown.swap(false, Ordering::Relaxed) {
+                return Err(BrokerError::ResourceExhausted);
+            }
             Ok(SocketOutcome::Completed(()))
         }
 
@@ -918,6 +969,8 @@ pub(crate) mod tests {
         check_failed_create_rolls_back(broker, provider);
         check_socket_operations_and_policy(broker, provider);
         check_server_socket_operations(broker, provider);
+        check_failed_listener_shutdown_preserves_state(broker, provider);
+        check_listener_shutdown_does_not_race_listen(broker, provider);
         check_connect_error_is_terminal(broker, provider);
         check_concurrent_status_preserves_terminal_state(broker, provider);
         check_failed_status_preserves_local_address(broker, provider);
@@ -1091,12 +1144,38 @@ pub(crate) mod tests {
             connect(&session, listener, loopback_address()),
             Ok(SocketOutcome::Failed(SocketError::Other))
         );
+        assert_eq!(
+            shutdown(&session, listener, ShutdownMode::Write),
+            Ok(SocketOutcome::Completed(()))
+        );
         assert!(matches!(
             accept(&session, listener, readiness.clone()),
             Err(BrokerError::ResourceExhausted)
         ));
         assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shutdown(&session, listener, ShutdownMode::Read),
+            Ok(SocketOutcome::Completed(()))
+        );
+        assert_eq!(
+            status(&session, listener),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::NotConnected),
+                local_address: Some(local_address),
+                pending_error: None,
+            })
+        );
+        assert!(matches!(
+            accept(&session, listener, readiness.clone()),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        ));
+        assert_eq!(
+            connect(&session, listener, loopback_address()),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
+                SocketError::NotConnected
+            )))
+        );
 
         session.close_object_reference(listener).unwrap();
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
@@ -1111,6 +1190,78 @@ pub(crate) mod tests {
             Some(&DEFAULT_TCP_LISTEN_ADDRESS)
         );
         session.close_object_reference(auto_bound).unwrap();
+    }
+
+    fn check_failed_listener_shutdown_preserves_state(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert!(matches!(
+            listen(&session, handle, 8),
+            Ok(SocketOutcome::Completed(_))
+        ));
+        provider.fail_next_shutdown();
+        assert_eq!(
+            shutdown(&session, handle, ShutdownMode::Read),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(
+            connect(&session, handle, loopback_address()),
+            Ok(SocketOutcome::Failed(SocketError::Other))
+        );
+        session.close_object_reference(handle).unwrap();
+    }
+
+    fn check_listener_shutdown_does_not_race_listen(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = Arc::new(
+            broker
+                .create_session(CallerCredential::Unauthenticated)
+                .unwrap(),
+        );
+        let handle = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *provider.state.listen_block.lock().unwrap() = Some((started_tx, release_rx));
+
+        let listen_session = Arc::clone(&session);
+        let listening = std::thread::spawn(move || listen(&listen_session, handle, 8));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let shutdown_calls = provider.state.shutdown_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            shutdown(&session, handle, ShutdownMode::Read),
+            Ok(SocketOutcome::Failed(SocketError::Other))
+        );
+        assert_eq!(
+            provider.state.shutdown_calls.load(Ordering::Relaxed),
+            shutdown_calls
+        );
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            listening.join().unwrap(),
+            Ok(SocketOutcome::Completed(_))
+        ));
+        assert_eq!(
+            shutdown(&session, handle, ShutdownMode::Read),
+            Ok(SocketOutcome::Completed(()))
+        );
+        session.close_object_reference(handle).unwrap();
     }
 
     fn check_socket_quotas(broker: &BrokerCore) {
