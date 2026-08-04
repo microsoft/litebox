@@ -7,6 +7,7 @@ pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod file_path;
 pub(crate) mod iocp;
+pub(crate) mod ksecdd;
 pub(crate) mod license;
 pub(crate) mod lpc;
 pub(crate) mod mm;

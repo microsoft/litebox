@@ -12,6 +12,7 @@ use crate::syscalls::object_manager::{FileDeviceObject, ObjectManager};
 pub(crate) enum FileTarget {
     Filesystem(String),
     Condrv(CondrvObject),
+    KsecDevice,
 }
 
 pub(crate) enum FilePathRoot<'a> {
@@ -89,6 +90,13 @@ fn file_device_path_to_file_target(
         FileDeviceObject::ConsoleDriver => {
             CondrvObject::from_device_name(remaining).map(FileTarget::Condrv)
         }
+        FileDeviceObject::KsecDevice => {
+            if remaining.is_empty() {
+                Ok(FileTarget::KsecDevice)
+            } else {
+                Err(NtStatus::OBJECT_PATH_NOT_FOUND)
+            }
+        }
     }
 }
 
@@ -142,6 +150,7 @@ mod tests {
             resolve(name).map(|target| match target {
                 FileTarget::Filesystem(path) => path,
                 FileTarget::Condrv(object) => String::from(object.handle_path()),
+                FileTarget::KsecDevice => String::from(r"\Device\KsecDD"),
             })
         };
 
