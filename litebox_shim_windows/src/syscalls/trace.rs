@@ -10,7 +10,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::Guid;
 use crate::syscalls::Handle;
-use crate::{ConstPtr, ShimFS, ShimPlatform, Task};
+use crate::syscalls::event::{EventAccess, EventSubsystem};
+use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
 
 const ETW_NT_TRACE_TYPE_MASK: u32 = 0x0000_ff00;
 const USER_LOADER_PROVIDER_ID: Guid = Guid {
@@ -32,6 +33,12 @@ enum EtwNtTraceType {
     Mark = 0x0000_0600,
     EventNoRegistration = 0x0000_0700,
     Instance = 0x0000_0800,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum EtwTraceControlCode {
+    AddNotificationEvent = 27,
 }
 
 bitflags::bitflags! {
@@ -89,6 +96,47 @@ const _: () = assert!(size_of::<EventDescriptor>() == 16);
 const _: () = assert!(size_of::<EventHeader>() == 80);
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn sys_nt_trace_control(
+        &self,
+        function_code: u32,
+        input_buffer: ConstPtr<Platform, u32>,
+        input_buffer_length: u32,
+        output_buffer: Option<MutPtr<Platform, u8>>,
+        output_buffer_length: u32,
+        _return_length: MutPtr<Platform, u32>,
+    ) -> NtStatus {
+        let Ok(EtwTraceControlCode::AddNotificationEvent) =
+            EtwTraceControlCode::try_from(function_code)
+        else {
+            // TODO(etw-trace-control): Model logger and provider control operations.
+            litebox_util_log::debug!(function_code; "Unsupported NtTraceControl operation");
+            return NtStatus::NOT_SUPPORTED;
+        };
+        if input_buffer_length != u32::try_from(size_of::<u32>()).unwrap()
+            || output_buffer.is_some()
+            || output_buffer_length != 0
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let Some(event_handle) = input_buffer.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let entry = match self.typed_handle_entry_with_access::<EventSubsystem<Platform>>(
+            Handle::from_raw(event_handle as usize),
+            EventAccess::MODIFY_STATE.bits(),
+        ) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        let event = entry.with_entry(|entry| entry.event.clone());
+        let mut registered = self.process.trace_notification_event.lock();
+        if registered.is_some() {
+            return NtStatus::from_raw(0xc000_0718);
+        }
+        *registered = Some(event);
+        NtStatus::SUCCESS
+    }
+
     pub(crate) fn sys_nt_trace_event(
         &self,
         trace_handle: Handle,
@@ -176,7 +224,8 @@ mod tests {
     use litebox::platform::ThreadProvider;
 
     use super::*;
-    use crate::tests::{const_ptr, null_const_ptr};
+    use crate::syscalls::event::EventType;
+    use crate::tests::{const_ptr, mut_ptr, null_const_ptr};
 
     type TestPlatform = crate::tests::TestPlatform;
 
@@ -267,6 +316,47 @@ mod tests {
                 NtStatus::ACCESS_VIOLATION
             );
         });
+    }
+
+    #[test]
+    fn nt_trace_control_registers_one_notification_event() {
+        let task = crate::tests::test_task();
+        let mut event = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_event(
+                mut_ptr(&mut event),
+                EventAccess::MODIFY_STATE.bits(),
+                None,
+                EventType::Notification as u32,
+                0,
+            ),
+            NtStatus::SUCCESS
+        );
+        let event_handle: u32 = event.as_raw().try_into().unwrap();
+        let mut return_length = u32::MAX;
+        assert_eq!(
+            task.sys_nt_trace_control(
+                EtwTraceControlCode::AddNotificationEvent as u32,
+                const_ptr(&event_handle),
+                4,
+                None,
+                0,
+                mut_ptr(&mut return_length),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(return_length, u32::MAX);
+        assert_eq!(
+            task.sys_nt_trace_control(
+                EtwTraceControlCode::AddNotificationEvent as u32,
+                const_ptr(&event_handle),
+                4,
+                None,
+                0,
+                mut_ptr(&mut return_length),
+            ),
+            NtStatus::from_raw(0xc000_0718)
+        );
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

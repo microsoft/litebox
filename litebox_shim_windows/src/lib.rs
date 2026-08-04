@@ -598,6 +598,7 @@ pub struct Process<Platform: ShimPlatform> {
     default_hard_error_mode: AtomicU32,
     wnf_notification_event: Mutex<Platform, Option<Arc<syscalls::event::EventObject<Platform>>>>,
     wnf_subscriptions: Mutex<Platform, syscalls::wnf::WnfProcessSubscriptions>,
+    trace_notification_event: Mutex<Platform, Option<Arc<syscalls::event::EventObject<Platform>>>>,
     cookie: u32,
     exit_code: AtomicI32,
     next_thread_id: AtomicUsize,
@@ -693,6 +694,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             default_hard_error_mode: AtomicU32::new(0),
             wnf_notification_event: Mutex::new(None),
             wnf_subscriptions: Mutex::new(syscalls::wnf::WnfProcessSubscriptions::default()),
+            trace_notification_event: Mutex::new(None),
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
             next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
@@ -1394,6 +1396,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 byte_offset,
                 key,
             ),
+            SyscallRequest::NtGetCurrentProcessorNumberEx { processor_number } => {
+                self.sys_nt_get_current_processor_number_ex(processor_number)
+            }
+            SyscallRequest::NtQueryDebugFilterState {
+                component_id,
+                level,
+            } => {
+                litebox_util_log::debug!(
+                    component_id,
+                    level;
+                    "NtQueryDebugFilterState reports no attached debugger"
+                );
+                NtStatus::from_raw(0xC000_0354)
+            }
             SyscallRequest::NtQueryVolumeInformationFile {
                 file_handle,
                 io_status_block,
@@ -2069,6 +2085,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 field_size,
                 fields,
             } => self.sys_nt_trace_event(trace_handle, flags, field_size, fields),
+            SyscallRequest::NtTraceControl {
+                function_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+                return_length,
+            } => self.sys_nt_trace_control(
+                function_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+                return_length,
+            ),
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,
