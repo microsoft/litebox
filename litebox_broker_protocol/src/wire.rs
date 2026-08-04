@@ -1119,6 +1119,19 @@ mod tests {
     }
 
     #[test]
+    fn socket_accept_request_wire_shape_is_pinned() {
+        assert_eq!(
+            encode_request(BrokerRequest {
+                request_id: RequestId(13),
+                operation: BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest {
+                    handle: ObjectHandle(9),
+                })),
+            }),
+            [5, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
     fn socket_failure_response_wire_shape_is_pinned() {
         assert_eq!(
             encode_response(BrokerResponse {
