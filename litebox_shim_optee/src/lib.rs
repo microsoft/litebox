@@ -22,7 +22,7 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, vmap::GlobalVmapManager};
+use litebox_common_linux::{errno::Errno, vmap::GlobalVmapManager};
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SyscallRequest, TaFlags, TeeAlgorithm, TeeAlgorithmClass,
     TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
@@ -272,8 +272,6 @@ impl OpteeShim {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                #[cfg(target_arch = "x86_64")]
-                tls_base_addr: Cell::new(0),
             },
         };
         if let Some(ta_bin) = ta_bin
@@ -798,14 +796,8 @@ impl Task {
             let ta_entry_point = self.get_ta_entry_point();
             let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin, false)?;
             elf_loader.load_ta_trampoline(ta_entry_point)?;
-            self.allocate_guest_tls(None).map_err(|_| {
-                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
-            })?;
             self.ta_prepared.set(true);
         }
-
-        #[cfg(target_arch = "x86_64")]
-        self.restore_guest_tls();
 
         let mut ta_stack =
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
@@ -852,54 +844,6 @@ impl Task {
         if matches!(self.thread.init_state.get(), ThreadInitState::Ta { .. }) {
             self.thread.init_state.set(ThreadInitState::None);
         }
-    }
-
-    /// Allocate the guest TLS for an OP-TEE TA.
-    ///
-    /// This function is required to overcome the compatibility issue coming from
-    /// system and build toolchain differences. OP-TEE OS only supports a single thread and
-    /// thus does not explicitly set up the TLS area. In contrast, we do use an x86 toolchain to
-    /// compile OP-TEE TAs and this toolchain assumes there is a valid TLS areas for various purposes
-    /// including stack protection. To this end, the toolchain generates binaries using
-    /// the `FS` register for TLS access.
-    /// This function allocates a TLS area on behalf of the TA to satisfy the toolchain's assumption.
-    /// Instead of using this function, we could change the flags of the toolchain to not use TLS
-    /// (e.g., `-fno-stack-protector`), but this might be insecure. Also, the toolchain might have
-    /// other features relying on TLS.
-    #[cfg(target_arch = "x86_64")]
-    fn allocate_guest_tls(
-        &self,
-        tls_size: Option<usize>,
-    ) -> Result<(), litebox_common_linux::errno::Errno> {
-        let tls_size = tls_size.unwrap_or(PAGE_SIZE).next_multiple_of(PAGE_SIZE);
-        let addr = self.sys_mmap(
-            0,
-            tls_size,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-            -1,
-            0,
-        )?;
-        // Store TLS address for later restoration
-        self.tls_base_addr.set(addr.as_usize());
-        self.restore_guest_tls();
-        Ok(())
-    }
-
-    /// Restore the guest TLS (FS base) before entering the TA.
-    ///
-    /// FS base is cleared across VTL switches, so we must restore it before
-    /// every TA entry.
-    #[cfg(target_arch = "x86_64")]
-    fn restore_guest_tls(&self) {
-        use litebox::platform::ArchSpecificProvider as _;
-        let addr = self.tls_base_addr.get();
-        if addr == 0 {
-            return; // TLS not allocated yet
-        }
-        litebox_platform_multiplex::platform()
-            .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, addr)
-            .expect("requires guaranteed platform support for FsBase");
     }
 
     /// Retrieve the result of the `ldelf` execution.
@@ -1390,9 +1334,6 @@ struct Task {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
-    /// TLS base address for x86_64 (stored to restore FS before each TA entry)
-    #[cfg(target_arch = "x86_64")]
-    tls_base_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
 }
 
@@ -1557,8 +1498,6 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                #[cfg(target_arch = "x86_64")]
-                tls_base_addr: Cell::new(0),
             }
         }
     }
