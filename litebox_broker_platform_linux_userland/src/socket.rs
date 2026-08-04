@@ -1229,6 +1229,11 @@ fn shutdown_socket(
         ),
         _ => return Err(BrokerError::UnsupportedOperation),
     };
+    // A read-side Linux shutdown removes TCP_LISTEN, which would leave the
+    // broker's listener state and readiness snapshot inconsistent.
+    if socket.listening {
+        return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+    }
     loop {
         match shutdown(&socket.socket, mode) {
             Ok(()) => {
@@ -1959,6 +1964,12 @@ mod tests {
             litebox_broker_core::socket::listen(&session, listener, 8),
             Ok(SocketOutcome::Completed(local_address))
         );
+        for mode in [ShutdownMode::Read, ShutdownMode::Write, ShutdownMode::Both] {
+            assert_eq!(
+                litebox_broker_core::socket::shutdown(&session, listener, mode),
+                Ok(SocketOutcome::Failed(SocketError::NotConnected))
+            );
+        }
         assert!(matches!(
             litebox_broker_core::socket::accept(&session, listener, readiness.clone()),
             Err(BrokerError::WouldBlock)
