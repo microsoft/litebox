@@ -174,6 +174,7 @@ mod tests {
             resolve_path(r"\Device\ConDrv\Output").unwrap(),
             "/dev/stdout"
         );
+        assert_eq!(resolve(r"\Device\CNG"), Ok(FileTarget::KsecDevice));
         assert_eq!(
             resolve_path(r"\Device\ConDrv\Reference"),
             Err(NtStatus::INVALID_HANDLE)

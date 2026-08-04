@@ -1416,6 +1416,7 @@ pub(crate) fn seed_object_manager<Platform: crate::ShimPlatform>()
     );
     object_manager.seed_file_device(r"\Device\ConDrv", FileDeviceObject::ConsoleDriver);
     object_manager.seed_file_device(r"\Device\KsecDD", FileDeviceObject::KsecDevice);
+    object_manager.seed_file_device(r"\Device\CNG", FileDeviceObject::KsecDevice);
     object_manager.seed_port(WINDOWS_API_PORT);
     for (path, target) in SEEDED_SYMLINK_PATHS {
         object_manager.seed_symlink(path, target);
