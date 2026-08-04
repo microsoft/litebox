@@ -2229,65 +2229,83 @@ mod tests {
     }
 
     #[test]
-    fn ksecdd_rng_ioctl_fills_output_buffer_with_success() {
-        let task = crate::tests::test_task();
-        let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
+    fn ksecdd_delivers_entropy_and_rejects_unknown_controls() {
+        run_with_test_platform_pointers(|| {
+            const UNKNOWN_KSEC_IOCTL: u32 = 0x0039_0000;
+            let task = crate::tests::test_task();
+            let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
 
-        let mut output = [0u8; 32];
-        let mut ioctl_status = IoStatusBlock::default();
-        let status = task.sys_nt_device_io_control_file(
-            handle,
-            Handle::default(),
-            None,
-            None,
-            mut_ptr(&mut ioctl_status),
-            ksecdd::IOCTL_KSEC_RANDOM_FILL_BUFFER,
-            None,
-            0,
-            Some(mut_byte_ptr(&mut output)),
-            output.len().try_into().unwrap(),
-        );
-        assert_eq!(status, NtStatus::SUCCESS);
-        assert_eq!(ioctl_status.information, output.len());
-    }
+            let mut first = [0u8; 32];
+            let mut second = [0u8; 32];
+            let mut io_status = IoStatusBlock::default();
+            for output in [&mut first, &mut second] {
+                assert_eq!(
+                    task.sys_nt_device_io_control_file(
+                        handle,
+                        Handle::default(),
+                        None,
+                        None,
+                        mut_ptr(&mut io_status),
+                        ksecdd::IOCTL_KSEC_RANDOM_FILL_BUFFER,
+                        None,
+                        0,
+                        Some(mut_byte_ptr(output)),
+                        output.len().try_into().unwrap(),
+                    ),
+                    NtStatus::SUCCESS
+                );
+                assert_eq!(io_status.information, output.len());
+            }
+            assert_ne!(first, second, "successive random fills must differ");
 
-    #[test]
-    fn ksecdd_open_returns_valid_handle_and_rng_ioctl_populates_buffer() {
-        // Reproduces the bcrypt.dll DllMain entropy path: CNG opens \Device\KsecDD and
-        // issues IOCTL_KSEC_RNG to seed its user-mode PRNG. bcrypt's DllMain returns FALSE
-        // (aborting process init with STATUS_DLL_INIT_FAILED) unless the device both opens
-        // successfully AND fills the caller's buffer with entropy. Asserting only status and
-        // the reported length is insufficient: it would pass even if the buffer were left
-        // untouched, so this test also proves the buffer is actually written.
-        let task = crate::tests::test_task();
-        let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
-        assert!(!handle.is_null(), "KsecDD open must return a valid handle");
+            let mut scratch = [0xa5; 8];
+            assert_eq!(
+                task.sys_nt_device_io_control_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    UNKNOWN_KSEC_IOCTL,
+                    None,
+                    0,
+                    Some(mut_byte_ptr(&mut scratch)),
+                    scratch.len().try_into().unwrap(),
+                ),
+                NtStatus::NOT_SUPPORTED
+            );
+            assert_eq!(io_status.status, NtStatus::NOT_SUPPORTED.as_raw());
+            assert_eq!(io_status.information, 0);
 
-        // Seed with an all-zero sentinel so we can prove the IOCTL overwrote it.
-        let mut output = [0u8; 32];
-        let mut ioctl_status = IoStatusBlock::default();
-        let status = task.sys_nt_device_io_control_file(
-            handle,
-            Handle::default(),
-            None,
-            None,
-            mut_ptr(&mut ioctl_status),
-            ksecdd::IOCTL_KSEC_RANDOM_FILL_BUFFER,
-            None,
-            0,
-            Some(mut_byte_ptr(&mut output)),
-            output.len().try_into().unwrap(),
-        );
-
-        assert_eq!(status, NtStatus::SUCCESS);
-        assert_eq!(ioctl_status.status, NtStatus::SUCCESS.as_raw());
-        assert_eq!(ioctl_status.information, output.len());
-        // The whole point of the device is entropy delivery: a real CRNG leaving all 32
-        // bytes zero has probability ~2^-256, so this reliably proves the buffer was filled.
-        assert!(
-            output.iter().any(|&byte| byte != 0),
-            "KsecDD RNG IOCTL must populate the output buffer with entropy"
-        );
+            let request = ksecdd::KsecCngDeriveKeyRequest {
+                magic: 0,
+                operation: ksecdd::KSEC_CNG_DERIVE_KEY,
+                opaque_arguments: [0; 11],
+                event_handle: Handle::default(),
+            };
+            let mut output = [0xa5; size_of::<usize>()];
+            assert_eq!(
+                task.sys_nt_device_io_control_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    ksecdd::IOCTL_KSEC_CNG_REQUEST,
+                    Some(ConstPtr::<TestPlatform, u8>::from_usize(
+                        core::ptr::from_ref(&request) as usize,
+                    )),
+                    size_of::<ksecdd::KsecCngDeriveKeyRequest>()
+                        .try_into()
+                        .unwrap(),
+                    Some(mut_byte_ptr(&mut output)),
+                    output.len().try_into().unwrap(),
+                ),
+                NtStatus::INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(io_status.status, NtStatus::INVALID_DEVICE_REQUEST.as_raw());
+            assert_eq!(io_status.information, 0);
+        });
     }
 
     #[test]
@@ -2416,28 +2434,6 @@ mod tests {
             );
             assert_eq!(io_status.information, 0);
         });
-    }
-
-    #[test]
-    fn ksecdd_unsupported_ioctl_returns_not_supported() {
-        let task = crate::tests::test_task();
-        let handle = open_ksecdd(&task, FILE_GENERIC_READ);
-
-        let mut ioctl_status = IoStatusBlock::default();
-        // `IOCTL_KSEC_RNG_REKEY`-style control we deliberately do not serve.
-        let status = task.sys_nt_device_io_control_file(
-            handle,
-            Handle::default(),
-            None,
-            None,
-            mut_ptr(&mut ioctl_status),
-            0x0039_0004,
-            None,
-            0,
-            None,
-            0,
-        );
-        assert_eq!(status, NtStatus::NOT_SUPPORTED);
     }
 
     fn open_directory_with_access(
