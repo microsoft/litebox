@@ -1942,7 +1942,7 @@ mod tests {
         let provider = Arc::new(LinuxSocketProvider::new(8).unwrap());
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
             BrokerCoreLimits::new_with_all_limits(16, 0, 8, 8),
             provider,
         )
@@ -2254,7 +2254,7 @@ mod tests {
         let provider = Arc::new(LinuxSocketProvider::new(4).unwrap());
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
             BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
             provider,
         )
@@ -2410,7 +2410,7 @@ mod tests {
         let provider = Arc::new(LinuxSocketProvider::new(2).unwrap());
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_socket_policy(SocketPolicy::Ipv4LoopbackTcpUdp),
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
             BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
             provider,
         )

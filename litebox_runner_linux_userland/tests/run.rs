@@ -639,7 +639,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4LoopbackTcp),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
         1,
     );
     Runner::new(&target, "broker_tcp_client_rewriter")
@@ -671,7 +671,7 @@ fn test_runner_broker_tcp_server_with_rewriter() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4LoopbackTcp),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
         1,
     );
     let mut child = Runner::new(&target, "broker_tcp_server_rewriter")

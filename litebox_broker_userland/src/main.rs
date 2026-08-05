@@ -143,7 +143,7 @@ fn configured_socket_policy(
     allowed_destinations: &[AllowedTcpDestination],
 ) -> Result<SocketPolicy, SocketPolicyError> {
     if allowed_destinations.is_empty() {
-        return Ok(SocketPolicy::Ipv4LoopbackTcpUdp);
+        return Ok(SocketPolicy::Ipv4Loopback);
     }
     let rules = allowed_destinations
         .iter()
@@ -567,7 +567,7 @@ mod tests {
     fn tcp_destination_arguments_replace_the_loopback_default() {
         assert_eq!(
             configured_socket_policy(&[]).unwrap(),
-            SocketPolicy::Ipv4LoopbackTcpUdp
+            SocketPolicy::Ipv4Loopback
         );
 
         let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
