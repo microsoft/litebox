@@ -291,8 +291,10 @@ pub(crate) struct SocketOFlags(pub OFlags);
 pub(crate) struct SocketProxy<Platform: ShimPlatform>(pub Arc<NetworkProxy<Platform>>);
 #[derive(Clone)]
 struct SocketIoState(Arc<core::sync::atomic::AtomicUsize>);
+/// Entry metadata that shares `recvmmsg` serialization across duplicated descriptors.
 struct SocketRecvmmsgLock<Platform: ShimPlatform>(Arc<RecvmmsgLock<Platform>>);
 
+/// Serializes multi-message receives while allowing contended waits to be interrupted or timed out.
 struct RecvmmsgLock<Platform: ShimPlatform> {
     mutex: Mutex<Platform, ()>,
     pollee: Pollee<Platform>,
