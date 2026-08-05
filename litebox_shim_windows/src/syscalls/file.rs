@@ -669,8 +669,8 @@ impl FileCreateOptions {
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
 enum CreateDisposition {
     Supersede = 0,
-    Create = 1,
-    Open = 2,
+    Open = 1,
+    Create = 2,
     OpenIf = 3,
     Overwrite = 4,
     OverwriteIf = 5,
@@ -2026,8 +2026,8 @@ mod tests {
         | FileAccess::APPEND_DATA.bits()
         | AccessMask::SYNCHRONIZE.bits();
     const FILE_SUPERSEDE: u32 = 0;
-    const FILE_OPEN: u32 = 2;
-    const FILE_CREATE: u32 = 1;
+    const FILE_OPEN: u32 = 1;
+    const FILE_CREATE: u32 = 2;
     const FILE_OVERWRITE: u32 = 4;
 
     fn open_object_attributes(
@@ -2041,6 +2041,18 @@ mod tests {
         let name = std::boxed::Box::new(unicode_string(&path));
         let attributes = object_attributes(&name, 0);
         (path, name, attributes)
+    }
+
+    #[test]
+    fn create_disposition_decodes_nt_abi_values() {
+        assert_eq!(
+            CreateDisposition::try_from(FILE_OPEN),
+            Ok(CreateDisposition::Open)
+        );
+        assert_eq!(
+            CreateDisposition::try_from(FILE_CREATE),
+            Ok(CreateDisposition::Create)
+        );
     }
 
     fn create_existing_file(task: &Task<TestPlatform, TestFS>, path: &str, data: &[u8]) {
