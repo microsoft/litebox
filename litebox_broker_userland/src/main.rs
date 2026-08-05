@@ -18,9 +18,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, CallerCredential, Ipv4Cidr, ObjectRights, PolicyEngine,
-    SocketPolicy, SocketPolicyError, TcpDestinationRule, TcpPortRange, UdpDestinationRule,
-    UdpPortRange,
+    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, Ipv4Cidr, ObjectRights,
+    PolicyEngine, SocketPolicy, SocketPolicyError, TcpDestinationRule, UdpDestinationRule,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
@@ -46,7 +45,7 @@ const WORKER_COUNT: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedTcpDestination {
     destination: Ipv4Cidr,
-    ports: TcpPortRange,
+    ports: DestinationPortRange,
 }
 
 impl FromStr for AllowedTcpDestination {
@@ -79,7 +78,7 @@ impl FromStr for AllowedTcpDestination {
         let end = end
             .parse::<u16>()
             .map_err(|error| format!("invalid TCP port: {error}"))?;
-        let ports = TcpPortRange::new(Port(start), Port(end))
+        let ports = DestinationPortRange::new(Port(start), Port(end))
             .ok_or_else(|| "TCP port range must be ordered and exclude port zero".to_owned())?;
 
         Ok(Self { destination, ports })
@@ -159,7 +158,7 @@ fn configured_socket_policy(
     let udp_loopback = UdpDestinationRule::new(
         CallerCredential::HostGuaranteed,
         Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).expect("the IPv4 loopback CIDR is canonical"),
-        UdpPortRange::new(Port(1), Port(u16::MAX))
+        DestinationPortRange::new(Port(1), Port(u16::MAX))
             .expect("the full nonzero UDP port range is valid"),
     );
     SocketPolicy::from_tcp_udp_destination_rules(&rules, &[udp_loopback])
@@ -553,7 +552,7 @@ mod tests {
             allowed,
             AllowedTcpDestination {
                 destination: Ipv4Cidr::new(Ipv4Address([203, 0, 113, 0]), 24).unwrap(),
-                ports: TcpPortRange::new(Port(443), Port(444)).unwrap(),
+                ports: DestinationPortRange::new(Port(443), Port(444)).unwrap(),
             }
         );
         assert!(
@@ -588,7 +587,7 @@ mod tests {
             &[UdpDestinationRule::new(
                 CallerCredential::HostGuaranteed,
                 Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-                UdpPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
             )]
         );
     }

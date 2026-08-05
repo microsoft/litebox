@@ -66,15 +66,12 @@ const fn ipv4_prefix_mask(prefix_length: u8) -> u32 {
 
 /// Inclusive nonzero transport destination-port range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TcpPortRange {
+pub struct DestinationPortRange {
     start: Port,
     end: Port,
 }
 
-/// Inclusive nonzero UDP destination-port range.
-pub type UdpPortRange = TcpPortRange;
-
-impl TcpPortRange {
+impl DestinationPortRange {
     /// Creates a nonempty range of valid transport destination ports.
     #[must_use]
     pub const fn new(start: Port, end: Port) -> Option<Self> {
@@ -106,7 +103,7 @@ impl TcpPortRange {
 pub struct TcpDestinationRule {
     caller_credential: CallerCredential,
     destination: Ipv4Cidr,
-    ports: TcpPortRange,
+    ports: DestinationPortRange,
 }
 
 impl TcpDestinationRule {
@@ -115,7 +112,7 @@ impl TcpDestinationRule {
     pub const fn new(
         caller_credential: CallerCredential,
         destination: Ipv4Cidr,
-        ports: TcpPortRange,
+        ports: DestinationPortRange,
     ) -> Self {
         Self {
             caller_credential,
@@ -138,7 +135,7 @@ impl TcpDestinationRule {
 
     /// Returns the authorized destination-port range.
     #[must_use]
-    pub const fn ports(self) -> TcpPortRange {
+    pub const fn ports(self) -> DestinationPortRange {
         self.ports
     }
 
@@ -156,7 +153,7 @@ impl TcpDestinationRule {
 pub struct UdpDestinationRule {
     caller_credential: CallerCredential,
     destination: Ipv4Cidr,
-    ports: UdpPortRange,
+    ports: DestinationPortRange,
 }
 
 impl UdpDestinationRule {
@@ -165,7 +162,7 @@ impl UdpDestinationRule {
     pub const fn new(
         caller_credential: CallerCredential,
         destination: Ipv4Cidr,
-        ports: UdpPortRange,
+        ports: DestinationPortRange,
     ) -> Self {
         Self {
             caller_credential,
@@ -188,7 +185,7 @@ impl UdpDestinationRule {
 
     /// Returns the authorized destination-port range.
     #[must_use]
-    pub const fn ports(self) -> UdpPortRange {
+    pub const fn ports(self) -> DestinationPortRange {
         self.ports
     }
 
@@ -207,7 +204,7 @@ const EMPTY_TCP_DESTINATION_RULE: TcpDestinationRule = TcpDestinationRule {
         network: Ipv4Address([0, 0, 0, 0]),
         prefix_length: 0,
     },
-    ports: TcpPortRange {
+    ports: DestinationPortRange {
         start: Port(1),
         end: Port(1),
     },
@@ -219,7 +216,7 @@ const EMPTY_UDP_DESTINATION_RULE: UdpDestinationRule = UdpDestinationRule {
         network: Ipv4Address([0, 0, 0, 0]),
         prefix_length: 0,
     },
-    ports: UdpPortRange {
+    ports: DestinationPortRange {
         start: Port(1),
         end: Port(1),
     },
@@ -631,8 +628,8 @@ mod tests {
         Ipv4Cidr::new(Ipv4Address(address), prefix_length).unwrap()
     }
 
-    fn ports(start: u16, end: u16) -> TcpPortRange {
-        TcpPortRange::new(Port(start), Port(end)).unwrap()
+    fn ports(start: u16, end: u16) -> DestinationPortRange {
+        DestinationPortRange::new(Port(start), Port(end)).unwrap()
     }
 
     fn address(address: [u8; 4], port: u16) -> SocketAddrV4 {
@@ -702,8 +699,8 @@ mod tests {
 
     #[test]
     fn port_ranges_are_nonzero_ordered_and_inclusive() {
-        assert_eq!(TcpPortRange::new(Port(0), Port(80)), None);
-        assert_eq!(TcpPortRange::new(Port(81), Port(80)), None);
+        assert_eq!(DestinationPortRange::new(Port(0), Port(80)), None);
+        assert_eq!(DestinationPortRange::new(Port(81), Port(80)), None);
 
         let range = ports(443, 444);
         assert!(!range.contains(Port(442)));
