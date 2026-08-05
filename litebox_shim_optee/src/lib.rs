@@ -273,7 +273,7 @@ impl OpteeShim {
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
                 #[cfg(target_arch = "x86_64")]
-                tls_base_addr: Cell::new(0),
+                stack_guard_page_addr: Cell::new(0),
             },
         };
         if let Some(ta_bin) = ta_bin
@@ -798,14 +798,11 @@ impl Task {
             let ta_entry_point = self.get_ta_entry_point();
             let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin, false)?;
             elf_loader.load_ta_trampoline(ta_entry_point)?;
-            self.allocate_guest_tls(None).map_err(|_| {
-                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
-            })?;
+            self.allocate_stack_guard_page()?;
             self.ta_prepared.set(true);
         }
 
-        #[cfg(target_arch = "x86_64")]
-        self.restore_guest_tls();
+        self.restore_stack_guard_fs_base();
 
         let mut ta_stack =
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
@@ -854,51 +851,47 @@ impl Task {
         }
     }
 
-    /// Allocate the guest TLS for an OP-TEE TA.
+    /// Allocate and initialize the page backing the x86-64 stack-guard slot.
     ///
-    /// This function is required to overcome the compatibility issue coming from
-    /// system and build toolchain differences. OP-TEE OS only supports a single thread and
-    /// thus does not explicitly set up the TLS area. In contrast, we do use an x86 toolchain to
-    /// compile OP-TEE TAs and this toolchain assumes there is a valid TLS areas for various purposes
-    /// including stack protection. To this end, the toolchain generates binaries using
-    /// the `FS` register for TLS access.
-    /// This function allocates a TLS area on behalf of the TA to satisfy the toolchain's assumption.
-    /// Instead of using this function, we could change the flags of the toolchain to not use TLS
-    /// (e.g., `-fno-stack-protector`), but this might be insecure. Also, the toolchain might have
-    /// other features relying on TLS.
-    #[cfg(target_arch = "x86_64")]
-    fn allocate_guest_tls(
-        &self,
-        tls_size: Option<usize>,
-    ) -> Result<(), litebox_common_linux::errno::Errno> {
-        let tls_size = tls_size.unwrap_or(PAGE_SIZE).next_multiple_of(PAGE_SIZE);
-        let addr = self.sys_mmap(
-            0,
-            tls_size,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-            -1,
-            0,
-        )?;
-        // Store TLS address for later restoration
-        self.tls_base_addr.set(addr.as_usize());
-        self.restore_guest_tls();
+    /// The x86-64 toolchain emits stack-protector accesses to `%fs:0x28`.
+    /// Normally glibc or musl initializes that ABI slot before application code
+    /// runs. OP-TEE TAs use neither runtime, so the shim must provide and
+    /// initialize the slot before entering a protected TA.
+    fn allocate_stack_guard_page(&self) -> Result<(), ElfLoaderError> {
+        use litebox::platform::CrngProvider as _;
+
+        let page = self
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE,
+                -1,
+                0,
+            )
+            .map_err(|_| {
+                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
+            })?;
+        let mut guard = [0u8; core::mem::size_of::<usize>()];
+        self.global.platform.fill_bytes_crng(&mut guard);
+        // Terminator-canary convention (matches glibc `_dl_setup_stack_chk_guard`):
+        // zero the lowest-addressed byte of the guard to stop the overflow by C string func.
+        guard[0] = 0;
+        page.copy_from_slice(loader::ta_stack::ABI_STACK_GUARD_FS_OFFSET, &guard)
+            .ok_or(ElfLoaderError::InvalidStackAddr)?;
+        self.sys_mprotect(page, PAGE_SIZE, ProtFlags::PROT_READ)
+            .map_err(ElfLoaderError::ProtectError)?;
+        self.stack_guard_page_addr.set(page.as_usize());
         Ok(())
     }
 
-    /// Restore the guest TLS (FS base) before entering the TA.
-    ///
-    /// FS base is cleared across VTL switches, so we must restore it before
-    /// every TA entry.
-    #[cfg(target_arch = "x86_64")]
-    fn restore_guest_tls(&self) {
+    /// Restore the guest FS base so `%fs:0x28` reads the stack guard page.
+    fn restore_stack_guard_fs_base(&self) {
         use litebox::platform::ArchSpecificProvider as _;
-        let addr = self.tls_base_addr.get();
-        if addr == 0 {
-            return; // TLS not allocated yet
-        }
+        let fs_base = self.stack_guard_page_addr.get();
+        debug_assert_ne!(fs_base, 0);
         litebox_platform_multiplex::platform()
-            .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, addr)
+            .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, fs_base)
             .expect("requires guaranteed platform support for FsBase");
     }
 
@@ -1390,9 +1383,9 @@ struct Task {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
-    /// TLS base address for x86_64 (stored to restore FS before each TA entry)
+    /// Base address of the read-only page containing the stack guard.
     #[cfg(target_arch = "x86_64")]
-    tls_base_addr: Cell<usize>,
+    stack_guard_page_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
 }
 
@@ -1558,7 +1551,7 @@ mod test_utils {
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
                 #[cfg(target_arch = "x86_64")]
-                tls_base_addr: Cell::new(0),
+                stack_guard_page_addr: Cell::new(0),
             }
         }
     }

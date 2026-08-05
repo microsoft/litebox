@@ -12,6 +12,23 @@ use zerocopy::IntoBytes;
 
 use crate::{Platform, UserMutPtr};
 
+/// Offset of the stack-protector guard from the x86-64 thread pointer (`%fs`).
+///
+/// This is a compiler + C-library convention: when using the default TLS-based
+/// stack protector, both GCC and Clang emit the stack-guard access as
+/// `%fs:0x28`, matching the `stack_guard` slot in the glibc/musl `tcbhead_t`.
+/// The offset is nominally tunable via `-mstack-protector-guard-offset`, but
+/// `0x28` is the fixed default across GCC, Clang, glibc, and musl on x86-64,
+/// so we treat it as a constant here.
+///
+/// The guard itself is a single pointer-sized word, i.e., **8 bytes** on x86-64.
+/// The read therefore spans `[%fs:0x28 .. %fs:0x30)`.
+///
+/// OP-TEE TAs have no TLS block, so the shim provides a dedicated stack-guard
+/// page whose guard word is stored at this offset.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const ABI_STACK_GUARD_FS_OFFSET: usize = 0x28;
+
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
