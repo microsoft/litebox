@@ -16,7 +16,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, PlatformSocket, ReceivedPlatformDatagram, SocketProvider,
+    AcceptedPlatformSocket, PlatformConnectError, PlatformSocket, ReceivedPlatformDatagram,
+    SocketProvider,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -157,12 +158,11 @@ impl PlatformSocket for LinuxSocket {
         }
     }
 
-    fn connect(&self, address: SocketAddrV4) -> BrokerResult<SocketConnectionStatus> {
-        self.reactor.request(|response| ReactorCommand::Connect {
-            id: self.id,
-            address,
-            response,
-        })
+    fn connect(
+        &self,
+        address: SocketAddrV4,
+    ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+        self.reactor.connect(self.id, address)
     }
 
     fn send(&self, data: &[u8], _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
@@ -385,6 +385,38 @@ impl ReactorClient {
         }
         self.signal().map_err(|_| BrokerError::Internal)?;
         receive.recv().map_err(|_| BrokerError::Internal)?
+    }
+
+    fn connect(
+        &self,
+        id: u64,
+        address: SocketAddrV4,
+    ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+        let (response, receive) = sync_channel(1);
+        let command = ReactorCommand::Connect {
+            id,
+            address,
+            response,
+        };
+        match self.commands.try_send(command) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err(PlatformConnectError::PeerUnchanged(
+                    BrokerError::ResourceExhausted,
+                ));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(PlatformConnectError::PeerIndeterminate(
+                    BrokerError::Internal,
+                ));
+            }
+        }
+        self.signal()
+            .map_err(|_| PlatformConnectError::PeerIndeterminate(BrokerError::Internal))?;
+        receive
+            .recv()
+            .map_err(|_| PlatformConnectError::PeerIndeterminate(BrokerError::Internal))?
+            .map_err(PlatformConnectError::PeerIndeterminate)
     }
 
     fn close_socket(&self, id: u64) {

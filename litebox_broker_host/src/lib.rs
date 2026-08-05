@@ -679,7 +679,8 @@ mod tests {
     use core::net::{Ipv4Addr, SocketAddrV4};
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
-        AcceptedPlatformSocket, PlatformSocket, ReceivedPlatformDatagram, SocketProvider,
+        AcceptedPlatformSocket, PlatformConnectError, PlatformSocket, ReceivedPlatformDatagram,
+        SocketProvider,
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
@@ -790,9 +791,10 @@ mod tests {
         fn connect(
             &self,
             _address: SocketAddrV4,
-        ) -> litebox_broker_core::Result<SocketConnectionStatus> {
+        ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
             self.readiness
-                .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)?;
+                .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)
+                .map_err(PlatformConnectError::PeerUnchanged)?;
             if self.create_request.socket_type == SocketType::Datagram {
                 Ok(SocketConnectionStatus::Connected)
             } else {

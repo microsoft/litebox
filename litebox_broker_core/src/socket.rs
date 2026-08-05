@@ -33,6 +33,15 @@ pub struct AcceptedPlatformSocket {
     pub remote_address: SocketAddrV4,
 }
 
+/// Broker failure from a platform connect operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlatformConnectError {
+    /// The operation did not change the socket's peer.
+    PeerUnchanged(BrokerError),
+    /// The operation may have changed the socket's peer.
+    PeerIndeterminate(BrokerError),
+}
+
 /// Broker socket and endpoint metadata returned by an accept operation.
 pub struct AcceptedBrokerSocket {
     /// Broker handle naming the accepted socket.
@@ -97,8 +106,13 @@ pub trait PlatformSocket: Send + Sync {
     /// A stream attempt may return `Connecting` and stores ordinary failures as
     /// terminal state. A datagram connect completes immediately; the core
     /// permits replacing its peer and treats synchronous failures as retryable
-    /// operation outcomes.
-    fn connect(&self, address: SocketAddrV4) -> Result<SocketConnectionStatus>;
+    /// operation outcomes. A datagram `Failed` status must leave the previous
+    /// peer unchanged. Platform failures must distinguish a peer known to be
+    /// unchanged from one whose state is indeterminate.
+    fn connect(
+        &self,
+        address: SocketAddrV4,
+    ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError>;
 
     /// Sends bytes without waiting for platform readiness.
     ///
@@ -271,7 +285,11 @@ pub fn connect(
             return Err(BrokerError::Internal);
         }
         Ok(status) => status,
-        Err(error) => {
+        Err(PlatformConnectError::PeerUnchanged(error)) => {
+            finish_connect(&object, SocketConnectionStatus::Unconnected);
+            return Err(error);
+        }
+        Err(PlatformConnectError::PeerIndeterminate(error)) => {
             finish_connect(&object, SocketConnectionStatus::Failed(SocketError::Other));
             return Err(error);
         }
@@ -696,7 +714,7 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
             pending_error: None,
         });
     }
-    if matches!(status, SocketConnectionStatus::Failed(_)) {
+    if matches!(status, SocketConnectionStatus::Failed(_)) && !is_udp(create_request) {
         return Ok(SocketStatusResponse {
             status,
             local_address,
@@ -803,11 +821,23 @@ fn connect_datagram(
             Ok(SocketOutcome::Failed(error))
         }
         Ok(_) => {
-            finish_datagram_connect(object, previous_status, false);
+            finish_datagram_connect(
+                object,
+                SocketConnectionStatus::Failed(SocketError::Other),
+                true,
+            );
             Err(BrokerError::Internal)
         }
-        Err(error) => {
+        Err(PlatformConnectError::PeerUnchanged(error)) => {
             finish_datagram_connect(object, previous_status, false);
+            Err(error)
+        }
+        Err(PlatformConnectError::PeerIndeterminate(error)) => {
+            finish_datagram_connect(
+                object,
+                SocketConnectionStatus::Failed(SocketError::Other),
+                true,
+            );
             Err(error)
         }
     }
@@ -816,16 +846,17 @@ fn connect_datagram(
 fn finish_datagram_connect(
     object: &spin::RwLock<ObjectEntry>,
     status: SocketConnectionStatus,
-    connected: bool,
+    peer_state_changed: bool,
 ) {
     let mut object = object.write();
     if let ObjectEntry::Socket(socket) = &mut *object {
         socket.configuration_in_flight = false;
         socket.connection_status = status;
-        if connected {
-            // This only distinguishes operations concurrently in flight. A
-            // status call cannot overlap enough connects for wrapping to make
-            // a stale snapshot appear current.
+        if peer_state_changed {
+            // This distinguishes status snapshots from before a successful
+            // peer replacement or an indeterminate platform failure. A status
+            // call cannot overlap enough connects for wrapping to make a stale
+            // snapshot appear current.
             socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
         }
     }
@@ -913,7 +944,10 @@ impl SocketResource {
             .as_ref()
     }
 
-    fn connect(&self, address: SocketAddrV4) -> Result<SocketConnectionStatus> {
+    fn connect(
+        &self,
+        address: SocketAddrV4,
+    ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         self.platform_socket().connect(address)
     }
 
@@ -1073,6 +1107,7 @@ pub(crate) mod tests {
         dropped_sockets: AtomicUsize,
         fail_create: core::sync::atomic::AtomicBool,
         fail_connect: core::sync::atomic::AtomicBool,
+        fail_connect_indeterminate: core::sync::atomic::AtomicBool,
         fail_shutdown: core::sync::atomic::AtomicBool,
         failed_readiness: StdMutex<Option<ReadinessRegistration>>,
         live_readiness: StdMutex<Option<ReadinessRegistration>>,
@@ -1085,6 +1120,12 @@ pub(crate) mod tests {
 
         fn fail_next_connect(&self) {
             self.state.fail_connect.store(true, Ordering::Relaxed);
+        }
+
+        fn fail_next_connect_indeterminate(&self) {
+            self.state
+                .fail_connect_indeterminate
+                .store(true, Ordering::Relaxed);
         }
 
         fn fail_next_shutdown(&self) {
@@ -1158,12 +1199,26 @@ pub(crate) mod tests {
             Err(BrokerError::WouldBlock)
         }
 
-        fn connect(&self, _address: SocketAddrV4) -> Result<SocketConnectionStatus> {
+        fn connect(
+            &self,
+            _address: SocketAddrV4,
+        ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
             self.state.connect_calls.fetch_add(1, Ordering::Relaxed);
             if self.state.fail_connect.swap(false, Ordering::Relaxed) {
-                return Err(BrokerError::Internal);
+                return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
             }
-            self.readiness.publish(ReadinessFlags::WRITE)?;
+            if self
+                .state
+                .fail_connect_indeterminate
+                .swap(false, Ordering::Relaxed)
+            {
+                return Err(PlatformConnectError::PeerIndeterminate(
+                    BrokerError::Internal,
+                ));
+            }
+            self.readiness
+                .publish(ReadinessFlags::WRITE)
+                .map_err(PlatformConnectError::PeerIndeterminate)?;
             if is_udp(self.create_request) {
                 Ok(SocketConnectionStatus::Connected)
             } else {
@@ -1262,7 +1317,7 @@ pub(crate) mod tests {
         check_server_socket_operations(broker, provider);
         check_failed_listener_shutdown_preserves_state(broker, provider);
         check_listener_shutdown_does_not_race_listen(broker, provider);
-        check_connect_error_is_terminal(broker, provider);
+        check_connect_errors_classify_peer_state(broker, provider);
         check_concurrent_status_preserves_terminal_state(broker, provider);
         check_failed_status_preserves_local_address(broker, provider);
         check_quota_waits_for_deferred_retirement(broker, provider);
@@ -1396,6 +1451,7 @@ pub(crate) mod tests {
     }
 
     fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {
+        let connect_calls_before = provider.state.connect_calls.load(Ordering::Relaxed);
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -1445,6 +1501,46 @@ pub(crate) mod tests {
             connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53),),
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
         );
+        provider.fail_next_connect();
+        assert_eq!(
+            connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54),),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            status(&session, handle).unwrap().status,
+            SocketConnectionStatus::Connected
+        );
+        assert_eq!(
+            send_to(&session, handle, b"peer", SendFlags::NONE, None),
+            Ok(SocketOutcome::Completed(4))
+        );
+        provider.fail_next_connect_indeterminate();
+        assert_eq!(
+            connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54),),
+            Err(BrokerError::Internal)
+        );
+        provider
+            .state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: None,
+                pending_error: Some(SocketError::ConnectionRefused),
+            });
+        assert_eq!(
+            status(&session, handle),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::Other),
+                local_address: None,
+                pending_error: Some(SocketError::ConnectionRefused),
+            })
+        );
+        assert_eq!(
+            send_to(&session, handle, b"peer", SendFlags::NONE, None),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
         assert_eq!(
             connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54),),
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
@@ -1470,7 +1566,10 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(()))
         );
         session.close_object_reference(handle).unwrap();
-        assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            provider.state.connect_calls.load(Ordering::Relaxed),
+            connect_calls_before + 4
+        );
     }
 
     fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {
@@ -1796,11 +1895,14 @@ pub(crate) mod tests {
         *provider.state.live_readiness.lock().unwrap() = None;
     }
 
-    fn check_connect_error_is_terminal(broker: &BrokerCore, provider: &TestSocketProvider) {
+    fn check_connect_errors_classify_peer_state(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let handle = create(
+        let retryable = create(
             &session,
             create_request(),
             Arc::new(TestReadinessSink::default()),
@@ -1809,17 +1911,38 @@ pub(crate) mod tests {
         let calls_before = provider.state.connect_calls.load(Ordering::Relaxed);
         provider.fail_next_connect();
         assert_eq!(
-            connect(&session, handle, loopback_address()),
+            connect(&session, retryable, loopback_address()),
             Err(BrokerError::Internal)
         );
         assert_eq!(
-            connect(&session, handle, loopback_address()),
+            status(&session, retryable).unwrap().status,
+            SocketConnectionStatus::Unconnected
+        );
+        assert_eq!(
+            connect(&session, retryable, loopback_address()),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+        );
+        session.close_object_reference(retryable).unwrap();
+
+        let poisoned = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        provider.fail_next_connect_indeterminate();
+        assert_eq!(
+            connect(&session, poisoned, loopback_address()),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            connect(&session, poisoned, loopback_address()),
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
                 SocketError::Other
             )))
         );
         assert_eq!(
-            status(&session, handle),
+            status(&session, poisoned),
             Ok(SocketStatusResponse {
                 status: SocketConnectionStatus::Failed(SocketError::Other),
                 local_address: None,
@@ -1828,7 +1951,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             provider.state.connect_calls.load(Ordering::Relaxed),
-            calls_before + 1
+            calls_before + 3
         );
     }
 
