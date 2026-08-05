@@ -663,17 +663,16 @@ fn test_runner_broker_udp_with_rewriter() {
     let port = server.local_addr().unwrap().port();
     let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let refused_port = refused.local_addr().unwrap().port();
-    drop(refused);
     let mut runner = Runner::new(&target, "broker_udp_rewriter");
-    server
-        .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
-        .unwrap();
     let server = std::thread::spawn(move || {
         let mut packet = [0_u8; 64];
 
         let (received, client) = server.recv_from(&mut packet).unwrap();
         assert_eq!(&packet[..received], b"unconnected");
         server.send_to(b"0123456789", client).unwrap();
+        server
+            .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
+            .unwrap();
 
         let (received, source) = server.recv_from(&mut packet).unwrap();
         assert_eq!(&packet[..received], b"read");
@@ -720,6 +719,7 @@ fn test_runner_broker_udp_with_rewriter() {
         let (received, source) = server.recv_from(&mut packet).unwrap();
         assert_eq!(&packet[..received], b"preserved");
         assert_eq!(source, client);
+        drop(refused);
         server.send_to(b"preserved-reply", client).unwrap();
     });
 

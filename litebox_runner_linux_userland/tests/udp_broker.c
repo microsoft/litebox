@@ -161,10 +161,14 @@ int main(int argc, char **argv) {
                   sizeof(server)) == 0);
     wait_readable(fd);
     unsigned char empty = 0xff;
+    memset(&source, 0xa5, sizeof(source));
     address_length = sizeof(source);
     assert(recvfrom(fd, &empty, sizeof(empty), 0,
                     (struct sockaddr *)&source, &address_length) == 0);
     assert(empty == 0xff);
+    assert(address_length == sizeof(source));
+    assert(source.sin_family == AF_INET);
+    assert(source.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
     assert(source.sin_port == server.sin_port);
     retract_readable(fd);
 
@@ -242,6 +246,17 @@ int main(int argc, char **argv) {
     assert(peer.sin_addr.s_addr == server.sin_addr.s_addr);
     assert(peer.sin_port == server.sin_port);
 
+    int refused_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                            0);
+    assert(refused_fd >= 0);
+    struct sockaddr_in refused = {
+        .sin_family = AF_INET,
+        .sin_port = htons((uint16_t)strtoul(argv[2], NULL, 10)),
+    };
+    assert(inet_pton(AF_INET, "127.0.0.1", &refused.sin_addr) == 1);
+    assert(connect(refused_fd, (const struct sockaddr *)&refused,
+                   sizeof(refused)) == 0);
+
     const char preserved[] = "preserved";
     assert(send(fd, preserved, sizeof(preserved) - 1, 0) ==
            (ssize_t)(sizeof(preserved) - 1));
@@ -250,6 +265,19 @@ int main(int argc, char **argv) {
     assert(recv(fd, reply, sizeof(reply), 0) == 15);
     assert(memcmp(reply, "preserved-reply", 15) == 0);
     retract_readable(fd);
+
+    assert(send(refused_fd, "x", 1, 0) == 1);
+    struct pollfd failed = {.fd = refused_fd, .events = POLLERR};
+    assert(poll(&failed, 1, 5000) == 1);
+    assert((failed.revents & POLLERR) != 0);
+    assert(recv(refused_fd, reply, sizeof(reply), 0) == -1);
+    assert(errno == ECONNREFUSED);
+    int socket_error = -1;
+    socklen_t socket_error_length = sizeof(socket_error);
+    assert(getsockopt(refused_fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                      &socket_error_length) == 0);
+    assert(socket_error == 0);
+    assert(close(refused_fd) == 0);
 
     assert(shutdown(fd, SHUT_WR) == 0);
     writable.revents = 0;
@@ -305,27 +333,6 @@ int main(int argc, char **argv) {
     assert(getsockname(fd, (struct sockaddr *)&local, &address_length) == 0);
     assert(local.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
     assert(local.sin_port != 0);
-    assert(close(fd) == 0);
-
-    fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    assert(fd >= 0);
-    struct sockaddr_in refused = {
-        .sin_family = AF_INET,
-        .sin_port = htons((uint16_t)strtoul(argv[2], NULL, 10)),
-    };
-    assert(inet_pton(AF_INET, "127.0.0.1", &refused.sin_addr) == 1);
-    assert(connect(fd, (const struct sockaddr *)&refused, sizeof(refused)) == 0);
-    assert(send(fd, "x", 1, 0) == 1);
-    struct pollfd failed = {.fd = fd, .events = POLLERR};
-    assert(poll(&failed, 1, 5000) == 1);
-    assert((failed.revents & POLLERR) != 0);
-    assert(recv(fd, reply, sizeof(reply), 0) == -1);
-    assert(errno == ECONNREFUSED);
-    int socket_error = -1;
-    socklen_t socket_error_length = sizeof(socket_error);
-    assert(getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
-                      &socket_error_length) == 0);
-    assert(socket_error == 0);
     assert(close(fd) == 0);
     return 0;
 }
