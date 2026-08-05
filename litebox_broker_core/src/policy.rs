@@ -9,10 +9,8 @@ use litebox_broker_protocol::socket::{
 };
 use thiserror::Error;
 
-/// Maximum number of TCP destination rules in one socket policy.
-pub const MAX_TCP_DESTINATION_RULES: usize = 64;
-/// Maximum number of UDP destination rules in one socket policy.
-pub const MAX_UDP_DESTINATION_RULES: usize = 64;
+/// Maximum number of destination rules in one transport policy.
+pub const MAX_DESTINATION_RULES: usize = 64;
 
 /// An IPv4 network in canonical CIDR form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,65 +162,35 @@ const EMPTY_DESTINATION_RULE: DestinationRule = DestinationRule {
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SocketPolicyError {
-    /// The configured rule count exceeds [`MAX_TCP_DESTINATION_RULES`].
-    #[error("TCP destination policy has {actual} rules; maximum is {maximum}")]
+    /// The configured rule count exceeds [`MAX_DESTINATION_RULES`].
+    #[error("destination policy has {actual} rules; maximum is {maximum}")]
     TooManyRules {
         /// Maximum supported rule count.
         maximum: usize,
         /// Requested rule count.
         actual: usize,
     },
-    /// The configured rule count exceeds [`MAX_UDP_DESTINATION_RULES`].
-    #[error("UDP destination policy has {actual} rules; maximum is {maximum}")]
-    TooManyUdpRules {
-        /// Maximum supported rule count.
-        maximum: usize,
-        /// Requested rule count.
-        actual: usize,
-    },
 }
 
-/// Bounded static IPv4 TCP destination rules.
+/// Bounded static IPv4 destination rules for one transport protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TcpDestinationPolicy {
-    tcp_destination_rules: [DestinationRule; MAX_TCP_DESTINATION_RULES],
-    tcp_destination_rule_count: usize,
+pub struct DestinationPolicy {
+    destination_rules: [DestinationRule; MAX_DESTINATION_RULES],
+    destination_rule_count: usize,
 }
 
-impl TcpDestinationPolicy {
+impl DestinationPolicy {
     const fn empty() -> Self {
         Self {
-            tcp_destination_rules: [EMPTY_DESTINATION_RULE; MAX_TCP_DESTINATION_RULES],
-            tcp_destination_rule_count: 0,
+            destination_rules: [EMPTY_DESTINATION_RULE; MAX_DESTINATION_RULES],
+            destination_rule_count: 0,
         }
     }
 
-    /// Returns the configured TCP destination rules.
+    /// Returns the configured destination rules.
     #[must_use]
     pub fn rules(&self) -> &[DestinationRule] {
-        &self.tcp_destination_rules[..self.tcp_destination_rule_count]
-    }
-}
-
-/// Bounded static IPv4 UDP destination rules.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UdpDestinationPolicy {
-    udp_destination_rules: [DestinationRule; MAX_UDP_DESTINATION_RULES],
-    udp_destination_rule_count: usize,
-}
-
-impl UdpDestinationPolicy {
-    const fn empty() -> Self {
-        Self {
-            udp_destination_rules: [EMPTY_DESTINATION_RULE; MAX_UDP_DESTINATION_RULES],
-            udp_destination_rule_count: 0,
-        }
-    }
-
-    /// Returns the configured UDP destination rules.
-    #[must_use]
-    pub fn rules(&self) -> &[DestinationRule] {
-        &self.udp_destination_rules[..self.udp_destination_rule_count]
+        &self.destination_rules[..self.destination_rule_count]
     }
 }
 
@@ -245,15 +213,15 @@ pub enum SocketPolicy {
     /// Allow IPv4 TCP and UDP sockets to use only the IPv4 loopback network.
     Ipv4LoopbackTcpUdp,
     /// Apply bounded caller, IPv4 CIDR, and destination-port rules.
-    TcpDestinationRules(TcpDestinationPolicy),
+    TcpDestinationRules(DestinationPolicy),
     /// Apply bounded UDP caller, IPv4 CIDR, and destination-port rules.
-    UdpDestinationRules(UdpDestinationPolicy),
+    UdpDestinationRules(DestinationPolicy),
     /// Apply independent bounded TCP and UDP destination rules.
     TcpUdpDestinationRules {
         /// TCP destination policy.
-        tcp: TcpDestinationPolicy,
+        tcp: DestinationPolicy,
         /// UDP destination policy.
-        udp: UdpDestinationPolicy,
+        udp: DestinationPolicy,
     },
 }
 
@@ -262,16 +230,14 @@ impl SocketPolicy {
     pub fn from_tcp_destination_rules(
         rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        Ok(Self::TcpDestinationRules(copy_tcp_destination_rules(
-            rules,
-        )?))
+        Ok(Self::TcpDestinationRules(copy_destination_rules(rules)?))
     }
 
     /// Creates a bounded policy from static IPv4 UDP destination rules.
     pub fn from_udp_destination_rules(
         rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        let policy = copy_udp_destination_rules(rules)?;
+        let policy = copy_destination_rules(rules)?;
         Ok(Self::UdpDestinationRules(policy))
     }
 
@@ -280,8 +246,8 @@ impl SocketPolicy {
         tcp_rules: &[DestinationRule],
         udp_rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        let tcp = copy_tcp_destination_rules(tcp_rules)?;
-        let udp = copy_udp_destination_rules(udp_rules)?;
+        let tcp = copy_destination_rules(tcp_rules)?;
+        let udp = copy_destination_rules(udp_rules)?;
         Ok(Self::TcpUdpDestinationRules { tcp, udp })
     }
 
@@ -368,33 +334,18 @@ impl SocketPolicy {
     }
 }
 
-fn copy_tcp_destination_rules(
+fn copy_destination_rules(
     rules: &[DestinationRule],
-) -> Result<TcpDestinationPolicy, SocketPolicyError> {
-    if rules.len() > MAX_TCP_DESTINATION_RULES {
+) -> Result<DestinationPolicy, SocketPolicyError> {
+    if rules.len() > MAX_DESTINATION_RULES {
         return Err(SocketPolicyError::TooManyRules {
-            maximum: MAX_TCP_DESTINATION_RULES,
+            maximum: MAX_DESTINATION_RULES,
             actual: rules.len(),
         });
     }
-    let mut policy = TcpDestinationPolicy::empty();
-    policy.tcp_destination_rules[..rules.len()].copy_from_slice(rules);
-    policy.tcp_destination_rule_count = rules.len();
-    Ok(policy)
-}
-
-fn copy_udp_destination_rules(
-    rules: &[DestinationRule],
-) -> Result<UdpDestinationPolicy, SocketPolicyError> {
-    if rules.len() > MAX_UDP_DESTINATION_RULES {
-        return Err(SocketPolicyError::TooManyUdpRules {
-            maximum: MAX_UDP_DESTINATION_RULES,
-            actual: rules.len(),
-        });
-    }
-    let mut policy = UdpDestinationPolicy::empty();
-    policy.udp_destination_rules[..rules.len()].copy_from_slice(rules);
-    policy.udp_destination_rule_count = rules.len();
+    let mut policy = DestinationPolicy::empty();
+    policy.destination_rules[..rules.len()].copy_from_slice(rules);
+    policy.destination_rule_count = rules.len();
     Ok(policy)
 }
 
@@ -654,7 +605,7 @@ mod tests {
             cidr([127, 0, 0, 0], 8),
             ports(1, u16::MAX),
         );
-        let maximum = [rule; MAX_TCP_DESTINATION_RULES];
+        let maximum = [rule; MAX_DESTINATION_RULES];
         assert_eq!(
             SocketPolicy::from_tcp_destination_rules(&maximum)
                 .unwrap()
@@ -663,12 +614,12 @@ mod tests {
             &maximum
         );
 
-        let excessive = [rule; MAX_TCP_DESTINATION_RULES + 1];
+        let excessive = [rule; MAX_DESTINATION_RULES + 1];
         assert_eq!(
             SocketPolicy::from_tcp_destination_rules(&excessive),
             Err(SocketPolicyError::TooManyRules {
-                maximum: MAX_TCP_DESTINATION_RULES,
-                actual: MAX_TCP_DESTINATION_RULES + 1,
+                maximum: MAX_DESTINATION_RULES,
+                actual: MAX_DESTINATION_RULES + 1,
             })
         );
     }
@@ -680,7 +631,7 @@ mod tests {
             cidr([127, 0, 0, 0], 8),
             ports(1, u16::MAX),
         );
-        let maximum = [rule; MAX_UDP_DESTINATION_RULES];
+        let maximum = [rule; MAX_DESTINATION_RULES];
         assert_eq!(
             SocketPolicy::from_udp_destination_rules(&maximum)
                 .unwrap()
@@ -689,12 +640,12 @@ mod tests {
             &maximum
         );
 
-        let excessive = [rule; MAX_UDP_DESTINATION_RULES + 1];
+        let excessive = [rule; MAX_DESTINATION_RULES + 1];
         assert_eq!(
             SocketPolicy::from_udp_destination_rules(&excessive),
-            Err(SocketPolicyError::TooManyUdpRules {
-                maximum: MAX_UDP_DESTINATION_RULES,
-                actual: MAX_UDP_DESTINATION_RULES + 1,
+            Err(SocketPolicyError::TooManyRules {
+                maximum: MAX_DESTINATION_RULES,
+                actual: MAX_DESTINATION_RULES + 1,
             })
         );
     }
