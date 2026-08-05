@@ -1007,6 +1007,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
         let socket = self.pin_socket(fd)?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let received = self.receive_from_socket(cx, &socket, buf, flags, context, source_addr)?;
         Ok(if flags.contains(ReceiveFlags::TRUNC) {
             received

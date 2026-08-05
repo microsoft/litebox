@@ -48,6 +48,7 @@ int main(int argc, char **argv) {
     assert(argc == 3);
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     assert(fd >= 0);
+    assert(read(fd, NULL, 0) == 0);
     assert(readv(fd, NULL, 0) == 0);
     assert(writev(fd, NULL, 0) == 0);
 
@@ -83,6 +84,7 @@ int main(int argc, char **argv) {
     assert(errno == ENOTCONN);
 
     wait_readable(fd);
+    assert(read(fd, NULL, 0) == 0);
     char truncated[4] = {0};
     struct iovec iov = {.iov_base = truncated, .iov_len = sizeof(truncated)};
     struct sockaddr_in source;
