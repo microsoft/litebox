@@ -1538,10 +1538,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 CondrvStreamDirection::Input => FileAccess::READ_DATA,
                 CondrvStreamDirection::Output => FileAccess::WRITE_DATA,
             };
+            let backing_disposition = match create_disposition {
+                CreateDisposition::Create => CreateDisposition::Open,
+                disposition => disposition,
+            };
             let (fd, _, information) = self.open_backing_fd(
                 &path,
                 backing_access,
-                create_disposition,
+                backing_disposition,
                 create_options,
                 Mode::empty(),
             )?;
@@ -2492,6 +2496,32 @@ mod tests {
         assert_eq!(current_input_status, NtStatus::SUCCESS);
         assert_eq!(current_output_status, NtStatus::SUCCESS);
         assert_eq!(screen_buffer_status, NtStatus::SUCCESS);
+        let (_created_path, _created_name, created_attributes) =
+            open_object_attributes(r"\Device\ConDrv\ScreenBuffer");
+        let (created_handle, created_information) = task
+            .do_nt_create_file(
+                FILE_GENERIC_WRITE,
+                created_attributes,
+                mut_ptr(&mut io_status),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                CreateDisposition::Create,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                None,
+                0,
+            )
+            .expect("ConDrv stream creation must open its existing host backing");
+        assert_eq!(created_information, FileCreateInformation::Opened);
+        assert_eq!(
+            task.file_entry(created_handle)
+                .unwrap()
+                .with_entry(|file| (file.condrv_object(), file.path.clone())),
+            (
+                Some(CondrvObject::ScreenBuffer),
+                String::from("/dev/stdout")
+            )
+        );
+        assert_eq!(task.sys_nt_close(created_handle), NtStatus::SUCCESS);
         let stream_identity = |handle| {
             task.file_entry(handle).unwrap().with_entry(|file| {
                 (
