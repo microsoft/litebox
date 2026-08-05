@@ -653,6 +653,7 @@ impl From<BrokerSocketError> for SocketAsyncError {
             BrokerSocketError::AddressInUse => Self::AddressInUse,
             BrokerSocketError::AddressNotAvailable => Self::AddressNotAvailable,
             BrokerSocketError::NotConnected => Self::NotConnected,
+            BrokerSocketError::InvalidArgument => Self::InvalidArgument,
             BrokerSocketError::PolicyDenied => Self::PolicyDenied,
             _ => Self::BackendFailure,
         }

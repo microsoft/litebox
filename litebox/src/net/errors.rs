@@ -208,6 +208,8 @@ crate::utilities::macros::repr_enum! {
         UnsupportedOperation = 12,
         /// The broker association or host socket failed.
         BackendFailure = 13,
+        /// An argument or socket state is invalid for the operation.
+        InvalidArgument = 14,
     }
 }
 

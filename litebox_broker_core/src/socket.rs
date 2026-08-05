@@ -261,7 +261,7 @@ pub fn bind(
             || socket.local_address.is_some()
             || socket.connection_status != SocketConnectionStatus::Unconnected
         {
-            return Ok(SocketOutcome::Failed(SocketError::Other));
+            return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         socket.configuration_in_flight = true;
         (Arc::clone(&socket.resource), socket.create_request)
@@ -317,7 +317,7 @@ pub fn listen(
             || socket.connect_in_flight
             || socket.connection_status != SocketConnectionStatus::Unconnected
         {
-            return Ok(SocketOutcome::Failed(SocketError::Other));
+            return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         socket.configuration_in_flight = true;
         (

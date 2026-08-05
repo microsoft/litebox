@@ -990,37 +990,47 @@ fn listen_socket(
     backlog: u32,
 ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
     let backlog = i32::try_from(backlog).map_err(|_| BrokerError::UnsupportedOperation)?;
+    let local_address = local_socket_address(&socket.socket)?;
+    let was_listening = socket.listening;
+    if !was_listening {
+        epoll::modify(
+            epoll_fd,
+            &socket.socket,
+            epoll::EventData::new_u64(id),
+            active_epoll_events(),
+        )
+        .map_err(broker_error_from_errno)?;
+    }
     loop {
         match listen(&socket.socket, backlog) {
             Ok(()) => break,
             Err(Errno::INTR) => {}
             Err(error) => {
+                if !was_listening {
+                    epoll::modify(
+                        epoll_fd,
+                        &socket.socket,
+                        epoll::EventData::new_u64(id),
+                        idle_epoll_events(),
+                    )
+                    .map_err(broker_error_from_errno)?;
+                }
                 return Ok(SocketOutcome::Failed(socket_operation_error_from_errno(
                     error,
                 )?));
             }
         }
     }
-    epoll::modify(
-        epoll_fd,
-        &socket.socket,
-        epoll::EventData::new_u64(id),
-        active_epoll_events(),
-    )
-    .map_err(broker_error_from_errno)?;
-    let local_address = local_socket_address(&socket.socket)?;
     socket.listening = true;
     let mut snapshot = socket
         .snapshot
         .lock()
         .expect("Linux socket snapshot mutex poisoned");
     snapshot.local_address = Some(local_address);
-    snapshot.readiness = ReadinessFlags::default();
-    drop(snapshot);
-    socket
-        .readiness
-        .publish(ReadinessFlags::default())
-        .map(|()| SocketOutcome::Completed(local_address))
+    if !was_listening {
+        snapshot.readiness = ReadinessFlags::default();
+    }
+    Ok(SocketOutcome::Completed(local_address))
 }
 
 fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutcome<usize>> {
@@ -1281,9 +1291,6 @@ fn shutdown_socket(
             Err(Errno::NOTCONN) => {
                 return Ok(SocketOutcome::Failed(SocketError::NotConnected));
             }
-            Err(Errno::INVAL) => {
-                return Ok(SocketOutcome::Failed(SocketError::Other));
-            }
             Err(error) => {
                 let error = socket_operation_error_from_errno(error)?;
                 return Ok(SocketOutcome::Failed(error));
@@ -1519,6 +1526,7 @@ const fn socket_error_from_errno(error: Errno) -> SocketError {
         Errno::ADDRINUSE => SocketError::AddressInUse,
         Errno::ADDRNOTAVAIL => SocketError::AddressNotAvailable,
         Errno::NOTCONN => SocketError::NotConnected,
+        Errno::INVAL => SocketError::InvalidArgument,
         _ => SocketError::Other,
     }
 }
@@ -2005,6 +2013,10 @@ mod tests {
         first_client.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
         first_client.set_write_timeout(Some(TEST_TIMEOUT)).unwrap();
         wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        assert_eq!(
+            litebox_broker_core::socket::listen(&session, listener, 4),
+            Ok(SocketOutcome::Completed(local_address))
+        );
 
         let first = match litebox_broker_core::socket::accept(&session, listener, readiness.clone())
             .unwrap()

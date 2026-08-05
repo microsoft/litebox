@@ -178,6 +178,9 @@ pub enum SocketError {
     /// The operation requires a connected socket.
     #[error("socket is not connected")]
     NotConnected,
+    /// An argument or socket state is invalid for the operation.
+    #[error("invalid socket operation argument")]
+    InvalidArgument,
     /// The policy engine refused the destination.
     #[error("socket policy denied the operation")]
     PolicyDenied,
@@ -204,6 +207,7 @@ impl SocketError {
             9 => Some(Self::PolicyDenied),
             10 => Some(Self::Other),
             11 => Some(Self::NotConnected),
+            12 => Some(Self::InvalidArgument),
             _ => None,
         }
     }
@@ -222,6 +226,7 @@ impl SocketError {
             Self::PolicyDenied => 9,
             Self::Other => 10,
             Self::NotConnected => 11,
+            Self::InvalidArgument => 12,
         }
     }
 }
