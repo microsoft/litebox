@@ -210,9 +210,9 @@ pub enum SocketPolicy {
     Deny,
     /// Allow IPv4 TCP and UDP sockets to use only the IPv4 loopback network.
     Ipv4Loopback,
-    /// Apply bounded caller, IPv4 CIDR, and destination-port rules.
+    /// Apply bounded TCP destination rules.
     TcpDestinationRules(DestinationPolicy),
-    /// Apply bounded UDP caller, IPv4 CIDR, and destination-port rules.
+    /// Apply bounded UDP destination rules.
     UdpDestinationRules(DestinationPolicy),
     /// Apply independent bounded TCP and UDP destination rules.
     TcpUdpDestinationRules {
