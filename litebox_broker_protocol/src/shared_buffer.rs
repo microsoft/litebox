@@ -14,7 +14,7 @@ use core::ops::Range;
 use thiserror::Error;
 
 /// Size of each association shared-buffer slot.
-pub const SHARED_BUFFER_SLOT_SIZE: u32 = 32 * 1024;
+pub const SHARED_BUFFER_SLOT_SIZE: u32 = 64 * 1024;
 
 /// Number of slots in one association shared-buffer pool.
 pub const SHARED_BUFFER_SLOT_COUNT: u32 = 16;
@@ -131,9 +131,15 @@ mod tests {
 
     #[test]
     fn association_layout_has_expected_size() {
-        assert_eq!(SHARED_BUFFER_LAYOUT.slot_size(), 32 * 1024);
+        assert_eq!(SHARED_BUFFER_LAYOUT.slot_size(), 64 * 1024);
         assert_eq!(SHARED_BUFFER_LAYOUT.slot_count(), 16);
-        assert_eq!(SHARED_BUFFER_POOL_SIZE, 512 * 1024);
+        assert_eq!(SHARED_BUFFER_POOL_SIZE, 1024 * 1024);
+    }
+
+    #[test]
+    fn larger_slots_do_not_change_existing_transfer_limits() {
+        assert_eq!(crate::pipe::MAX_PIPE_TRANSFER_SIZE, 32 * 1024);
+        assert_eq!(crate::socket::MAX_SOCKET_TRANSFER_SIZE, 32 * 1024);
     }
 
     #[test]

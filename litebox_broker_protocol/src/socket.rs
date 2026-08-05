@@ -16,7 +16,13 @@ use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
 use thiserror::Error;
 
 /// Maximum socket bytes transferred by one broker request.
-pub const MAX_SOCKET_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE;
+///
+/// This remains independent of slot capacity so increasing the shared-buffer
+/// layout does not change existing TCP behavior.
+pub const MAX_SOCKET_TRANSFER_SIZE: u32 = 32 * 1024;
+
+const _: () = assert!(MAX_SOCKET_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
+
 /// Maximum stream prefix addressable by offset-based peek requests.
 pub const MAX_SOCKET_PEEK_SIZE: u32 = 0x80_000;
 /// Maximum TCP listen backlog accepted by the broker protocol.

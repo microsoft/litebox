@@ -8,8 +8,11 @@ use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
 ///
 /// One transfer occupies at most one association shared-buffer slot. Larger
 /// blocking writes are split across requests, while reads may return at most
-/// this amount.
-pub const MAX_PIPE_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE;
+/// this amount. This remains independent of slot capacity so increasing the
+/// shared-buffer layout does not change pipe behavior.
+pub const MAX_PIPE_TRANSFER_SIZE: u32 = 32 * 1024;
+
+const _: () = assert!(MAX_PIPE_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
 
 /// Request to create a broker-owned byte pipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
