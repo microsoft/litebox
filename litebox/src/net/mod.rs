@@ -1890,6 +1890,7 @@ where
             .get_entry_mut(fd)
             .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        // Broker-owned TCP sockets have no smoltcp handle, and their TCP options are not exposed.
         if matches!(&socket_handle.broker_socket, Some(BrokerSocket::Tcp(_))) {
             return Err(errors::SetTcpOptionError::Unsupported);
         }
@@ -1930,6 +1931,7 @@ where
             .get_entry_mut(fd)
             .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        // Broker-owned TCP sockets have no smoltcp handle, and their TCP options are not exposed.
         if matches!(&socket_handle.broker_socket, Some(BrokerSocket::Tcp(_))) {
             return Err(errors::GetTcpOptionError::Unsupported);
         }
