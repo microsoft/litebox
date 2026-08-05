@@ -297,15 +297,11 @@ fn vtlcall_dispatch(platform: &'static Platform, params: &[u64; NUM_VTLCALL_PARA
             let smc_args_pfn = params[1];
             optee_smc_handler_entry(platform, smc_args_pfn)
         }
-        VsmFunction::SetPlatformRootKeyAndGenerateIdentitySigningKey => {
+        VsmFunction::ExchangeSecrets => {
             let public_key_pa = params[2];
             let key_alg = params[3];
 
-            let return_code = vsm_dispatch(
-                platform,
-                VsmFunction::SetPlatformRootKeyAndGenerateIdentitySigningKey,
-                &params[1..2],
-            );
+            let return_code = vsm_dispatch(platform, VsmFunction::ExchangeSecrets, &params[1..2]);
             if return_code < 0 {
                 return return_code;
             }
@@ -363,9 +359,10 @@ fn vsm_dispatch(platform: &'static Platform, func_id: VsmFunction, params: &[u64
         VsmFunction::AllocateRingbufferMemory => {
             heki.allocate_ringbuffer_memory(params[0], params[1])
         }
-        VsmFunction::SetPlatformRootKeyAndGenerateIdentitySigningKey => {
-            vtl1.set_platform_root_key(params[0]).map(|()| 0)
-        }
+        VsmFunction::ExchangeSecrets => vtl1
+            .set_platform_root_key(params[0])
+            .and_then(|()| vtl1.set_crng_seed(params[0] + PRK_LEN as u64))
+            .map(|()| 0),
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
     };
     match result {
