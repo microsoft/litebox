@@ -1007,3 +1007,12 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("ext-ms-win32-subsystem-query-l1-1-0", ""),
     ("ext-ms-windowscore-deviceinfo-l1-1-0", ""),
 ];
+
+const API_SET_ALIASES: &[(&str, &str, &str)] = &[
+    ("api-ms-win-core-appinit-l1-1-0", "kernel32.dll", "kernelbase.dll"),
+    ("api-ms-win-core-io-l1-1-1", "kernel32.dll", "kernelbase.dll"),
+    ("api-ms-win-core-processsecurity-l1-1-0", "kernel32.dll", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-8", "kernel32.dll", "kernelbase.dll"),
+    ("api-ms-win-core-util-l1-1-1", "kernel32.dll", "kernelbase.dll"),
+    ("ext-ms-win-kernel32-errorhandling-l1-1-0", "kernel32.dll", "faultrep.dll"),
+];

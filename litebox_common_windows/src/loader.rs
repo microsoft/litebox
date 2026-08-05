@@ -208,26 +208,53 @@ pub enum ApiSetNamespaceBuildError {
     InvalidHashedPrefix,
     #[error("API-set namespace mappings have a duplicate hashed prefix")]
     DuplicateHashedPrefix,
+    #[error("API-set namespace alias refers to an unknown contract")]
+    UnknownAliasContract,
 }
 
 pub fn build_api_set_namespace(
     mappings: &[(&str, &str)],
 ) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
+    build_api_set_namespace_with_aliases(mappings, &[])
+}
+
+/// Builds an API-set namespace with importer-specific host overrides.
+pub fn build_api_set_namespace_with_aliases(
+    mappings: &[(&str, &str)],
+    aliases: &[(&str, &str, &str)],
+) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
     let mappings = mappings
         .iter()
         .map(|&(contract, host_dll)| ApiSetMapping::new(contract, host_dll))
         .collect::<Vec<_>>();
-    build_api_set_namespace_from_mappings(&mappings)
+    build_api_set_namespace_from_mappings_and_aliases(&mappings, aliases)
 }
 
 /// Builds an API-set namespace from mappings that can carry explicit hash prefixes.
 pub fn build_api_set_namespace_from_mappings(
     mappings: &[ApiSetMapping<'_>],
 ) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
+    build_api_set_namespace_from_mappings_and_aliases(mappings, &[])
+}
+
+fn build_api_set_namespace_from_mappings_and_aliases(
+    mappings: &[ApiSetMapping<'_>],
+    aliases: &[(&str, &str, &str)],
+) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
     let mut mappings = mappings.to_vec();
     mappings.sort_by(|left, right| left.contract.cmp(right.contract));
 
     let count = mappings.len();
+    let contracts = mappings
+        .iter()
+        .map(|mapping| mapping.contract)
+        .collect::<BTreeSet<_>>();
+    if aliases
+        .iter()
+        .any(|(contract, _, _)| !contracts.contains(contract))
+    {
+        return Err(ApiSetNamespaceBuildError::UnknownAliasContract);
+    }
     let entry_offset = size_of::<ApiSetNamespace>();
     let value_offset = api_set_checked_add(
         entry_offset,
@@ -235,7 +262,10 @@ pub fn build_api_set_namespace_from_mappings(
     )?;
     let strings_offset = api_set_checked_add(
         value_offset,
-        api_set_checked_mul(count, size_of::<ApiSetValueEntry>())?,
+        api_set_checked_mul(
+            api_set_checked_add(count, aliases.len())?,
+            size_of::<ApiSetValueEntry>(),
+        )?,
     )?;
     let mut string_data = Vec::new();
     let mut entries = Vec::with_capacity(count);
@@ -246,6 +276,10 @@ pub fn build_api_set_namespace_from_mappings(
     for (index, mapping) in mappings.iter().enumerate() {
         let contract = mapping.contract;
         let host_dll = mapping.host_dll;
+        let contract_aliases = aliases
+            .iter()
+            .filter(|(alias_contract, _, _)| *alias_contract == contract);
+        let alias_count = contract_aliases.clone().count();
         let hashed_prefix = mapping
             .hashed_prefix
             .unwrap_or_else(|| &contract[..api_set_hashed_name_len(contract)]);
@@ -264,7 +298,7 @@ pub fn build_api_set_namespace_from_mappings(
         string_data.extend_from_slice(&host);
         let value_entry_offset = api_set_checked_add(
             value_offset,
-            api_set_checked_mul(index, size_of::<ApiSetValueEntry>())?,
+            api_set_checked_mul(values.len(), size_of::<ApiSetValueEntry>())?,
         )?;
         entries.push(ApiSetNamespaceEntry {
             flags: API_SET_NAMESPACE_ENTRY_FLAGS,
@@ -272,7 +306,7 @@ pub fn build_api_set_namespace_from_mappings(
             name_length: api_set_to_u32(name.len())?,
             hashed_length: api_set_to_u32(utf16_byte_len(hashed_prefix)?)?,
             value_offset: api_set_to_u32(value_entry_offset)?,
-            value_count: 1,
+            value_count: api_set_to_u32(api_set_checked_add(1, alias_count)?)?,
         });
         values.push(ApiSetValueEntry {
             flags: 0,
@@ -281,6 +315,21 @@ pub fn build_api_set_namespace_from_mappings(
             value_offset: api_set_to_u32(host_offset)?,
             value_length: api_set_to_u32(host.len())?,
         });
+        for &(_, importing_dll, alias_host_dll) in contract_aliases {
+            let alias_name = utf16_bytes(importing_dll)?;
+            let alias_host = utf16_bytes(alias_host_dll)?;
+            let alias_name_offset = api_set_checked_add(strings_offset, string_data.len())?;
+            string_data.extend_from_slice(&alias_name);
+            let alias_host_offset = api_set_checked_add(strings_offset, string_data.len())?;
+            string_data.extend_from_slice(&alias_host);
+            values.push(ApiSetValueEntry {
+                flags: 0,
+                name_offset: api_set_to_u32(alias_name_offset)?,
+                name_length: api_set_to_u32(alias_name.len())?,
+                value_offset: api_set_to_u32(alias_host_offset)?,
+                value_length: api_set_to_u32(alias_host.len())?,
+            });
+        }
         hashes.push(ApiSetHashEntry {
             hash: api_set_hash_prefix(hashed_prefix),
             index: api_set_to_u32(index)?,

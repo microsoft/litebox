@@ -1795,6 +1795,10 @@ mod tests {
     }
 
     fn api_set_default_value(bytes: &[u8], contract: &str) -> Option<String> {
+        api_set_value(bytes, contract, None)
+    }
+
+    fn api_set_value(bytes: &[u8], contract: &str, importing_dll: Option<&str>) -> Option<String> {
         let namespace = parse_api_set_namespace(bytes)?;
         let requested_family = &contract[..contract.rfind('-')?];
         for index in 0..namespace.count {
@@ -1803,8 +1807,17 @@ mod tests {
             let hashed_units = usize::try_from(entry.hashed_length / 2).ok()?;
             let family = name.get(..hashed_units)?;
             if family.eq_ignore_ascii_case(requested_family) {
-                let value = api_set_namespace_entry_value(entry, bytes, 0)?;
-                return api_set_value_entry_value(value, bytes);
+                let mut default = None;
+                for value_index in 0..entry.value_count {
+                    let value = api_set_namespace_entry_value(entry, bytes, value_index)?;
+                    let alias = api_set_value_entry_name(value, bytes)?;
+                    if alias.is_empty() {
+                        default = api_set_value_entry_value(value, bytes);
+                    } else if importing_dll.is_some_and(|dll| alias.eq_ignore_ascii_case(dll)) {
+                        return api_set_value_entry_value(value, bytes);
+                    }
+                }
+                return default;
             }
         }
         None
@@ -1910,9 +1923,11 @@ mod tests {
     fn api_set_namespace_matches_host_invariants() {
         let host_bytes = host_api_set_namespace_bytes();
         let host = parse_api_set_namespace(&host_bytes).expect("valid host API_SET_NAMESPACE");
-        let synthetic_bytes =
-            litebox_common_windows::loader::build_api_set_namespace(API_SET_MAPPINGS)
-                .expect("LiteBox API_SET_NAMESPACE builds");
+        let synthetic_bytes = litebox_common_windows::loader::build_api_set_namespace_with_aliases(
+            API_SET_MAPPINGS,
+            API_SET_ALIASES,
+        )
+        .expect("LiteBox API_SET_NAMESPACE builds");
         assert_eq!(
             synthetic_bytes, API_SET_NAMESPACE,
             "build.rs output must match API_SET_MAPPINGS"
@@ -1981,6 +1996,18 @@ mod tests {
             None,
             "a different API-set minor version must not roll forward"
         );
+        for &(contract, importing_dll, expected_host) in API_SET_ALIASES {
+            assert_eq!(
+                api_set_value(&synthetic_bytes, contract, Some(importing_dll)).as_deref(),
+                Some(expected_host),
+                "synthetic alias mapping for {importing_dll} importing {contract}"
+            );
+            assert_eq!(
+                api_set_value(&host_bytes, contract, Some(importing_dll)).as_deref(),
+                Some(expected_host),
+                "host alias mapping for {importing_dll} importing {contract}"
+            );
+        }
     }
 
     #[test]

@@ -107,7 +107,9 @@ def decode_utf16(namespace: bytes, offset: int, length: int, description: str) -
         raise ExtractionError(f"{description} is not valid UTF-16LE") from error
 
 
-def parse_default_mappings(section: bytes) -> list[tuple[str, str]]:
+def parse_mappings(
+    section: bytes,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
     version, size, _, count, entry_offset, _, _ = unpack_from(
         "<IIIIIII", section, 0, "API-set namespace header"
     )
@@ -126,6 +128,7 @@ def parse_default_mappings(section: bytes) -> list[tuple[str, str]]:
         raise ExtractionError("API-set namespace entry table extends past the namespace")
 
     mappings: list[tuple[str, str]] = []
+    aliases: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for index in range(count):
         offset = entry_offset + index * API_SET_NAMESPACE_ENTRY_SIZE
@@ -151,20 +154,32 @@ def parse_default_mappings(section: bytes) -> list[tuple[str, str]]:
         default_host = None
         for value_index in range(value_count):
             value_entry_offset = value_offset + value_index * API_SET_VALUE_ENTRY_SIZE
-            _, _, alias_length, host_offset, host_length = unpack_from(
+            _, alias_offset, alias_length, host_offset, host_length = unpack_from(
                 "<IIIII",
                 namespace,
                 value_entry_offset,
                 f"value entry {value_index} for {contract!r}",
             )
+            host = decode_utf16(
+                namespace,
+                host_offset,
+                host_length,
+                f"host {value_index} for {contract!r}",
+            )
             if alias_length == 0:
-                default_host = decode_utf16(
+                default_host = host
+            else:
+                importing_dll = decode_utf16(
                     namespace,
-                    host_offset,
-                    host_length,
-                    f"default host for {contract!r}",
+                    alias_offset,
+                    alias_length,
+                    f"importing DLL {value_index} for {contract!r}",
                 )
-                break
+                if not importing_dll.isascii() or not host.isascii():
+                    raise ExtractionError(
+                        f"alias mapping for API-set contract {contract!r} is not ASCII"
+                    )
+                aliases.append((contract.lower(), importing_dll.lower(), host.lower()))
 
         if default_host is None:
             raise ExtractionError(
@@ -176,7 +191,7 @@ def parse_default_mappings(section: bytes) -> list[tuple[str, str]]:
             )
         mappings.append((contract.lower(), default_host.lower()))
 
-    return sorted(mappings)
+    return sorted(mappings), sorted(aliases)
 
 
 def rust_string(value: str) -> str:
@@ -211,7 +226,9 @@ def contract_family(contract: str) -> str:
 
 
 def render_rust(
-    mappings: list[tuple[str, str]], retain_existing: bool
+    mappings: list[tuple[str, str]],
+    aliases: list[tuple[str, str, str]],
+    retain_existing: bool,
 ) -> str:
     lines = [
         "// Copyright (c) Microsoft Corporation.",
@@ -244,6 +261,11 @@ def render_rust(
                     "    ),",
                 ]
             )
+    lines.extend(["];", "", "const API_SET_ALIASES: &[(&str, &str, &str)] = &["])
+    for contract, importing_dll, host in aliases:
+        lines.append(
+            f"    ({rust_string(contract)}, {rust_string(importing_dll)}, {rust_string(host)}),"
+        )
     lines.extend(["];", ""])
     return "\n".join(lines)
 
@@ -290,7 +312,7 @@ def main() -> int:
             if args.live
             else extract_apiset_section(args.schema.read_bytes())
         )
-        extracted = parse_default_mappings(namespace)
+        extracted, aliases = parse_mappings(namespace)
         extracted_families = {contract_family(contract) for contract, _ in extracted}
         mappings_by_contract = {}
         if not args.replace:
@@ -301,7 +323,9 @@ def main() -> int:
             )
         mappings_by_contract.update(extracted)
         mappings = sorted(mappings_by_contract.items())
-        generated = render_rust(mappings, retain_existing=not args.replace)
+        generated = render_rust(
+            mappings, aliases, retain_existing=not args.replace
+        )
         if args.check:
             try:
                 existing = args.output.read_text(encoding="utf-8")
