@@ -23,6 +23,14 @@ pub const MAX_SOCKET_TRANSFER_SIZE: u32 = 32 * 1024;
 
 const _: () = assert!(MAX_SOCKET_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
 
+/// Maximum bytes carried by one IPv4 UDP datagram.
+///
+/// A complete datagram fits in one association shared-buffer slot, preserving
+/// datagram atomicity across the broker boundary.
+pub const MAX_UDP_DATAGRAM_SIZE: u32 = 65_507;
+
+const _: () = assert!(MAX_UDP_DATAGRAM_SIZE <= SHARED_BUFFER_SLOT_SIZE);
+
 /// Maximum stream prefix addressable by offset-based peek requests.
 pub const MAX_SOCKET_PEEK_SIZE: u32 = 0x80_000;
 /// Maximum TCP listen backlog accepted by the broker protocol.
@@ -42,6 +50,8 @@ pub enum AddressFamily {
 pub enum SocketType {
     /// Reliable ordered byte stream.
     Stream,
+    /// Message-oriented datagrams.
+    Datagram,
 }
 
 /// IP protocol carried by a broker socket.
@@ -50,21 +60,23 @@ pub enum SocketType {
 pub enum IpProtocol {
     /// TCP.
     Tcp,
+    /// UDP.
+    Udp,
 }
 
 /// How to stop I/O on a socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ShutdownMode {
-    /// Further receives return end of stream.
+    /// Disables further receives.
     Read,
-    /// The peer sees end of stream.
+    /// Disables further sends.
     Write,
     /// Both directions.
     Both,
-    /// The final close discards queued data and resets the connection.
+    /// The final TCP close discards queued data and resets the connection.
     Abort,
-    /// Stops accepting new connections while retaining the socket object.
+    /// Stops accepting new TCP connections while retaining the socket object.
     StopListening,
 }
 
@@ -131,6 +143,36 @@ impl ReceiveFlags {
 
     /// Every receive flag this protocol version defines.
     pub const SUPPORTED: Self = Self(Self::PEEK.0 | Self::WAITALL.0);
+
+    /// Returns whether any bit outside [`Self::SUPPORTED`] is set.
+    #[must_use]
+    pub const fn has_unsupported_bits(self) -> bool {
+        self.0 & !Self::SUPPORTED.0 != 0
+    }
+
+    /// Returns whether every flag in `other` is set.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// Flags for receiving one datagram.
+///
+/// Stream-only flags such as [`ReceiveFlags::WAITALL`] are intentionally not
+/// representable on this operation.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReceiveFromFlags(pub u32);
+
+impl ReceiveFromFlags {
+    /// No flags.
+    pub const NONE: Self = Self(0);
+    /// Return the next datagram without consuming it.
+    pub const PEEK: Self = Self(1 << 0);
+
+    /// Every datagram receive flag this protocol version defines.
+    pub const SUPPORTED: Self = Self(Self::PEEK.0);
 
     /// Returns whether any bit outside [`Self::SUPPORTED`] is set.
     #[must_use]
@@ -338,8 +380,10 @@ pub struct AcceptSocketResponse {
 /// caller waits for write readiness and then reads the authoritative state with
 /// a status request.
 ///
-/// Connected and failed states are terminal and idempotent: repeated status
-/// requests return the same state.
+/// Stream connected and failed states are terminal and idempotent. Datagram
+/// connects complete immediately, may replace an existing peer, and report a
+/// synchronous failure as an operation failure rather than storing
+/// [`Self::Failed`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SocketConnectionStatus {
@@ -367,6 +411,26 @@ pub struct SendSocketRequest {
 /// Response describing a completed send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendSocketResponse {
+    /// Number of bytes accepted by the socket.
+    pub sent: u32,
+}
+
+/// Request to send one datagram staged in shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendToSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Leased shared-buffer region containing the complete datagram.
+    pub buffer: SharedBufferDescriptor,
+    /// Send flags.
+    pub flags: SendFlags,
+    /// Explicit destination, or `None` to use the connected peer.
+    pub destination: Option<SocketAddrV4>,
+}
+
+/// Response describing a completed atomic datagram send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SendToSocketResponse {
     /// Number of bytes accepted by the socket.
     pub sent: u32,
 }
@@ -399,6 +463,28 @@ pub enum ReceiveSocketResponse {
     Received(u32),
     /// The socket's receive direction reached end of stream.
     EndOfStream,
+}
+
+/// Request to receive one datagram into shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveFromSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Leased shared-buffer receive region.
+    pub buffer: SharedBufferDescriptor,
+    /// Datagram receive flags.
+    pub flags: ReceiveFromFlags,
+}
+
+/// Response describing one received datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveFromSocketResponse {
+    /// Number of bytes copied into the shared-buffer region.
+    pub received: u32,
+    /// Original datagram length before any truncation.
+    pub datagram_length: u32,
+    /// Source address of the datagram.
+    pub source_address: SocketAddrV4,
 }
 
 /// Request to shut down one or both directions of a socket.

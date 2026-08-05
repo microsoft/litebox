@@ -9,9 +9,10 @@ use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
     BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
     CreateSocketResponse, IpProtocol, ListenSocketRequest, ListenSocketResponse, ReceiveFlags,
-    ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse,
-    ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
-    SocketStatusResponse, SocketType,
+    ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
+    ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse, SendToSocketRequest,
+    SendToSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError,
+    SocketStatusRequest, SocketStatusResponse, SocketType,
 };
 
 use super::WireError;
@@ -27,12 +28,16 @@ const SOCKET_TAG_FAILED: u8 = 6;
 const SOCKET_TAG_BIND: u8 = 7;
 const SOCKET_TAG_LISTEN: u8 = 8;
 const SOCKET_TAG_ACCEPT: u8 = 9;
+const SOCKET_TAG_SEND_TO: u8 = 10;
+const SOCKET_TAG_RECEIVE_FROM: u8 = 11;
 
 const ADDRESS_FAMILY_TAG_IPV4: u8 = 0;
 
 const TYPE_TAG_STREAM: u8 = 0;
+const TYPE_TAG_DATAGRAM: u8 = 1;
 
 const IP_PROTOCOL_TAG_TCP: u8 = 0;
+const IP_PROTOCOL_TAG_UDP: u8 = 1;
 
 const SHUTDOWN_TAG_READ: u8 = 0;
 const SHUTDOWN_TAG_WRITE: u8 = 1;
@@ -57,9 +62,11 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
             });
             encoder.u8(match request.socket_type {
                 SocketType::Stream => TYPE_TAG_STREAM,
+                SocketType::Datagram => TYPE_TAG_DATAGRAM,
             });
             encoder.u8(match request.protocol {
                 IpProtocol::Tcp => IP_PROTOCOL_TAG_TCP,
+                IpProtocol::Udp => IP_PROTOCOL_TAG_UDP,
             });
         }
         SocketRequest::Connect(request) => {
@@ -87,6 +94,13 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
             encode_shared_buffer_descriptor(encoder, request.buffer);
             encoder.u32(request.flags.0);
         }
+        SocketRequest::SendTo(request) => {
+            encoder.u8(SOCKET_TAG_SEND_TO);
+            encoder.handle(request.handle);
+            encode_shared_buffer_descriptor(encoder, request.buffer);
+            encoder.u32(request.flags.0);
+            encode_optional_address(encoder, request.destination);
+        }
         SocketRequest::Receive(request) => {
             encoder.u8(SOCKET_TAG_RECEIVE);
             encoder.handle(request.handle);
@@ -94,6 +108,12 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
             encoder.u32(request.flags.0);
             encoder.u32(request.peek_offset);
             encoder.u32(request.peek_length);
+        }
+        SocketRequest::ReceiveFrom(request) => {
+            encoder.u8(SOCKET_TAG_RECEIVE_FROM);
+            encoder.handle(request.handle);
+            encode_shared_buffer_descriptor(encoder, request.buffer);
+            encoder.u32(request.flags.0);
         }
         SocketRequest::Shutdown(request) => {
             encoder.u8(SOCKET_TAG_SHUTDOWN);
@@ -122,10 +142,12 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
             },
             socket_type: match decoder.u8()? {
                 TYPE_TAG_STREAM => SocketType::Stream,
+                TYPE_TAG_DATAGRAM => SocketType::Datagram,
                 _ => return Err(WireError::InvalidTag),
             },
             protocol: match decoder.u8()? {
                 IP_PROTOCOL_TAG_TCP => IpProtocol::Tcp,
+                IP_PROTOCOL_TAG_UDP => IpProtocol::Udp,
                 _ => return Err(WireError::InvalidTag),
             },
         })),
@@ -149,12 +171,23 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
             buffer: decode_shared_buffer_descriptor(decoder)?,
             flags: SendFlags(decoder.u32()?),
         })),
+        SOCKET_TAG_SEND_TO => Ok(SocketRequest::SendTo(SendToSocketRequest {
+            handle: decoder.handle()?,
+            buffer: decode_shared_buffer_descriptor(decoder)?,
+            flags: SendFlags(decoder.u32()?),
+            destination: decode_optional_address(decoder)?,
+        })),
         SOCKET_TAG_RECEIVE => Ok(SocketRequest::Receive(ReceiveSocketRequest {
             handle: decoder.handle()?,
             buffer: decode_shared_buffer_descriptor(decoder)?,
             flags: ReceiveFlags(decoder.u32()?),
             peek_offset: decoder.u32()?,
             peek_length: decoder.u32()?,
+        })),
+        SOCKET_TAG_RECEIVE_FROM => Ok(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
+            handle: decoder.handle()?,
+            buffer: decode_shared_buffer_descriptor(decoder)?,
+            flags: ReceiveFromFlags(decoder.u32()?),
         })),
         SOCKET_TAG_SHUTDOWN => Ok(SocketRequest::Shutdown(ShutdownSocketRequest {
             handle: decoder.handle()?,
@@ -202,6 +235,10 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
             encoder.u8(SOCKET_TAG_SEND);
             encoder.u32(response.sent);
         }
+        SocketResponse::SendTo(response) => {
+            encoder.u8(SOCKET_TAG_SEND_TO);
+            encoder.u32(response.sent);
+        }
         SocketResponse::Receive(response) => {
             encoder.u8(SOCKET_TAG_RECEIVE);
             match response {
@@ -213,6 +250,12 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
                     encoder.u8(RECEIVE_RESPONSE_TAG_END_OF_STREAM);
                 }
             }
+        }
+        SocketResponse::ReceiveFrom(response) => {
+            encoder.u8(SOCKET_TAG_RECEIVE_FROM);
+            encoder.u32(response.received);
+            encoder.u32(response.datagram_length);
+            encode_address(encoder, response.source_address);
         }
         SocketResponse::Shutdown => encoder.u8(SOCKET_TAG_SHUTDOWN),
         SocketResponse::Status(response) => {
@@ -252,10 +295,18 @@ pub(super) fn decode_socket_response(
         SOCKET_TAG_SEND => Ok(SocketResponse::Send(SendSocketResponse {
             sent: decoder.u32()?,
         })),
+        SOCKET_TAG_SEND_TO => Ok(SocketResponse::SendTo(SendToSocketResponse {
+            sent: decoder.u32()?,
+        })),
         SOCKET_TAG_RECEIVE => Ok(SocketResponse::Receive(match decoder.u8()? {
             RECEIVE_RESPONSE_TAG_RECEIVED => ReceiveSocketResponse::Received(decoder.u32()?),
             RECEIVE_RESPONSE_TAG_END_OF_STREAM => ReceiveSocketResponse::EndOfStream,
             _ => return Err(WireError::InvalidTag),
+        })),
+        SOCKET_TAG_RECEIVE_FROM => Ok(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
+            received: decoder.u32()?,
+            datagram_length: decoder.u32()?,
+            source_address: decode_address(decoder)?,
         })),
         SOCKET_TAG_SHUTDOWN => Ok(SocketResponse::Shutdown),
         SOCKET_TAG_STATUS => Ok(SocketResponse::Status(SocketStatusResponse {

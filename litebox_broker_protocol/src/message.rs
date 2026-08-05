@@ -14,9 +14,10 @@ use crate::readiness::ReadinessFlags;
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
-    ListenSocketRequest, ListenSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse,
-    SendSocketRequest, SendSocketResponse, ShutdownSocketRequest, SocketError, SocketStatusRequest,
-    SocketStatusResponse,
+    ListenSocketRequest, ListenSocketResponse, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
+    ReceiveSocketRequest, ReceiveSocketResponse, SendSocketRequest, SendSocketResponse,
+    SendToSocketRequest, SendToSocketResponse, ShutdownSocketRequest, SocketError,
+    SocketStatusRequest, SocketStatusResponse,
 };
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
@@ -112,8 +113,12 @@ pub enum SocketRequest {
     Accept(AcceptSocketRequest),
     /// Send bytes staged in shared memory.
     Send(SendSocketRequest),
+    /// Send one complete datagram staged in shared memory.
+    SendTo(SendToSocketRequest),
     /// Receive bytes into shared memory.
     Receive(ReceiveSocketRequest),
+    /// Receive one datagram into shared memory.
+    ReceiveFrom(ReceiveFromSocketRequest),
     /// Shut down one or both directions.
     Shutdown(ShutdownSocketRequest),
     /// Read a socket's connection state.
@@ -183,18 +188,22 @@ pub enum SocketResponse {
     Accept(AcceptSocketResponse),
     /// Send operation response.
     Send(SendSocketResponse),
+    /// Datagram send operation response.
+    SendTo(SendToSocketResponse),
     /// Receive operation response.
     Receive(ReceiveSocketResponse),
+    /// Datagram receive operation response.
+    ReceiveFrom(ReceiveFromSocketResponse),
     /// Shutdown operation completed.
     Shutdown,
     /// Status operation response.
     Status(SocketStatusResponse),
-    /// A non-connect host network operation failed.
+    /// A host network operation failed.
     ///
-    /// Connect and status responses carry terminal failures in
-    /// [`SocketConnectionStatus`] so repeated status requests remain
-    /// idempotent. Broker and request-validation failures use
-    /// [`BrokerResult::Error`] instead.
+    /// Stream connect and status responses carry terminal connection failures
+    /// in [`SocketConnectionStatus`]. Datagram connect failures and other
+    /// ordinary socket failures use this variant. Broker and request-validation
+    /// failures use [`BrokerResult::Error`] instead.
     ///
     /// [`SocketConnectionStatus`]: crate::socket::SocketConnectionStatus
     Failed(SocketError),

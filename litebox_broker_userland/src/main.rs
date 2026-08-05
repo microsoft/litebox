@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, Ipv4Cidr, ObjectRights, PolicyEngine,
-    SocketPolicy, SocketPolicyError, TcpDestinationRule, TcpPortRange,
+    SocketPolicy, SocketPolicyError, TcpDestinationRule, TcpPortRange, UdpDestinationRule,
+    UdpPortRange,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
@@ -143,7 +144,7 @@ fn configured_socket_policy(
     allowed_destinations: &[AllowedTcpDestination],
 ) -> Result<SocketPolicy, SocketPolicyError> {
     if allowed_destinations.is_empty() {
-        return Ok(SocketPolicy::Ipv4LoopbackTcp);
+        return Ok(SocketPolicy::Ipv4LoopbackTcpUdp);
     }
     let rules = allowed_destinations
         .iter()
@@ -155,7 +156,13 @@ fn configured_socket_policy(
             )
         })
         .collect::<Vec<_>>();
-    SocketPolicy::from_tcp_destination_rules(&rules)
+    let udp_loopback = UdpDestinationRule::new(
+        CallerCredential::HostGuaranteed,
+        Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).expect("the IPv4 loopback CIDR is canonical"),
+        UdpPortRange::new(Port(1), Port(u16::MAX))
+            .expect("the full nonzero UDP port range is valid"),
+    );
+    SocketPolicy::from_tcp_udp_destination_rules(&rules, &[udp_loopback])
 }
 
 fn serve_runner(
@@ -561,7 +568,7 @@ mod tests {
     fn tcp_destination_arguments_replace_the_loopback_default() {
         assert_eq!(
             configured_socket_policy(&[]).unwrap(),
-            SocketPolicy::Ipv4LoopbackTcp
+            SocketPolicy::Ipv4LoopbackTcpUdp
         );
 
         let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
@@ -575,6 +582,14 @@ mod tests {
                 allowed.destination,
                 allowed.ports,
             )
+        );
+        assert_eq!(
+            policy.udp_destination_rules().unwrap(),
+            &[UdpDestinationRule::new(
+                CallerCredential::HostGuaranteed,
+                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
+                UdpPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            )]
         );
     }
 

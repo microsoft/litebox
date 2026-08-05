@@ -354,9 +354,11 @@ mod tests {
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
         BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
         CreateSocketResponse, IpProtocol, ListenSocketRequest, ListenSocketResponse, ReceiveFlags,
+        ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
         ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest,
-        SendSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
-        SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
+        SendSocketResponse, SendToSocketRequest, SendToSocketResponse, ShutdownMode,
+        ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
+        SocketStatusResponse, SocketType,
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
@@ -429,6 +431,11 @@ mod tests {
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
             })),
+            BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Datagram,
+                protocol: IpProtocol::Udp,
+            })),
             BrokerOperation::Socket(SocketRequest::Bind(BindSocketRequest {
                 handle,
                 address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
@@ -450,6 +457,24 @@ mod tests {
                 },
                 flags: SendFlags::NONE,
             })),
+            BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(15),
+                    length: 3,
+                },
+                flags: SendFlags::NONE,
+                destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53)),
+            })),
+            BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(15),
+                    length: 0,
+                },
+                flags: SendFlags::NONE,
+                destination: None,
+            })),
             BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
                 handle,
                 buffer: SharedBufferDescriptor {
@@ -459,6 +484,14 @@ mod tests {
                 flags: ReceiveFlags::PEEK,
                 peek_offset: 2,
                 peek_length: 5,
+            })),
+            BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(15),
+                    length: 3,
+                },
+                flags: ReceiveFromFlags::PEEK,
             })),
             BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
                 handle,
@@ -528,6 +561,11 @@ mod tests {
                 peek_offset: 0,
                 peek_length: 0,
             })),
+            BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
+                handle,
+                buffer,
+                flags: ReceiveFromFlags(unsupported),
+            })),
         ] {
             let request = BrokerRequest {
                 request_id: TEST_REQUEST_ID,
@@ -547,6 +585,9 @@ mod tests {
         assert!(!ReceiveFlags::PEEK.has_unsupported_bits());
         assert!(ReceiveFlags::PEEK.contains(ReceiveFlags::PEEK));
         assert!(!ReceiveFlags::NONE.contains(ReceiveFlags::PEEK));
+        assert!(ReceiveFromFlags(unsupported).has_unsupported_bits());
+        assert!(!ReceiveFromFlags::PEEK.has_unsupported_bits());
+        assert!(ReceiveFromFlags::PEEK.contains(ReceiveFromFlags::PEEK));
     }
 
     #[test]
@@ -665,9 +706,20 @@ mod tests {
                 status: SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
             })),
             BrokerResult::Socket(SocketResponse::Send(SendSocketResponse { sent: 3 })),
+            BrokerResult::Socket(SocketResponse::SendTo(SendToSocketResponse { sent: 3 })),
             BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(3))),
             BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(0))),
             BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::EndOfStream)),
+            BrokerResult::Socket(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
+                received: 3,
+                datagram_length: 7,
+                source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+            })),
+            BrokerResult::Socket(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
+                received: 0,
+                datagram_length: 0,
+                source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+            })),
             BrokerResult::Socket(SocketResponse::Shutdown),
             BrokerResult::Socket(SocketResponse::Status(socket_status(
                 SocketConnectionStatus::Connecting,
@@ -874,6 +926,24 @@ mod tests {
         assert_eq!(
             decode_request(&connect[..connect.len() - 1]),
             Err(WireError::TruncatedFrame)
+        );
+
+        let mut unknown_send_to_destination = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle: ObjectHandle(9),
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(1),
+                    length: 0,
+                },
+                flags: SendFlags::NONE,
+                destination: None,
+            })),
+        });
+        *unknown_send_to_destination.last_mut().unwrap() = 2;
+        assert_eq!(
+            decode_request(&unknown_send_to_destination),
+            Err(WireError::InvalidTag)
         );
 
         let mut trailing = connect;
@@ -1133,6 +1203,28 @@ mod tests {
                 })),
             }),
             [5, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn socket_send_to_request_wire_shape_is_pinned() {
+        assert_eq!(
+            encode_request(BrokerRequest {
+                request_id: RequestId(13),
+                operation: BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                    handle: ObjectHandle(9),
+                    buffer: SharedBufferDescriptor {
+                        slot_index: SharedBufferSlotIndex(2),
+                        length: 3,
+                    },
+                    flags: SendFlags::NONE,
+                    destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53,)),
+                })),
+            }),
+            [
+                5, 13, 0, 0, 0, 0, 0, 0, 0, 10, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0,
+                0, 0, 0, 1, 203, 0, 113, 7, 53, 0
+            ]
         );
     }
 
