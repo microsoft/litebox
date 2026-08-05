@@ -1796,9 +1796,13 @@ mod tests {
 
     fn api_set_default_value(bytes: &[u8], contract: &str) -> Option<String> {
         let namespace = parse_api_set_namespace(bytes)?;
+        let requested_family = &contract[..contract.rfind('-')?];
         for index in 0..namespace.count {
             let entry = api_set_namespace_entry(namespace, bytes, index)?;
-            if api_set_namespace_entry_name(entry, bytes)?.eq_ignore_ascii_case(contract) {
+            let name = api_set_namespace_entry_name(entry, bytes)?;
+            let hashed_units = usize::try_from(entry.hashed_length / 2).ok()?;
+            let family = name.get(..hashed_units)?;
+            if family.eq_ignore_ascii_case(requested_family) {
                 let value = api_set_namespace_entry_value(entry, bytes, 0)?;
                 return api_set_value_entry_value(value, bytes);
             }
@@ -1964,17 +1968,35 @@ mod tests {
                 "synthetic mapping for {contract}"
             );
         }
+        for revision in ["0", "1", "2"] {
+            let contract = std::format!("api-ms-win-core-versionansi-l1-1-{revision}");
+            assert_eq!(
+                api_set_default_value(&synthetic_bytes, &contract).as_deref(),
+                Some("kernelbase.dll"),
+                "synthetic mapping for {contract}"
+            );
+        }
+        assert_eq!(
+            api_set_default_value(&synthetic_bytes, "api-ms-win-core-versionansi-l1-2-0"),
+            None,
+            "a different API-set minor version must not roll forward"
+        );
     }
 
     #[test]
-    fn api_set_mappings_have_no_duplicate_contracts() {
-        // The namespace builder does no dedup (`count = mappings.len()`), so a duplicate
-        // contract would silently emit phantom namespace slots. Guard against that class of bug.
+    fn api_set_mappings_have_no_duplicate_families() {
         let mut seen = alloc::collections::BTreeSet::new();
         for (contract, _) in API_SET_MAPPINGS {
+            let (family, revision) = contract
+                .rsplit_once('-')
+                .expect("API-set contract has a revision");
             assert!(
-                seen.insert(*contract),
-                "duplicate API-set contract: {contract}"
+                revision.bytes().all(|byte| byte.is_ascii_digit()),
+                "API-set contract has a non-numeric revision: {contract}"
+            );
+            assert!(
+                seen.insert(family),
+                "duplicate API-set contract family: {family}"
             );
         }
         assert_eq!(seen.len(), API_SET_MAPPINGS.len());

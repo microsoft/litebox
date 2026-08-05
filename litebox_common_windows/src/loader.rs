@@ -4,7 +4,7 @@
 //! PE loader-facing parser and mapper.
 //!
 //! This module parses PE metadata and maps images through platform-provided traits.
-use alloc::{string::String, vec::Vec};
+use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::cmp;
 use core::mem::size_of;
 use object::read::pe::ImageOptionalHeader as _;
@@ -206,6 +206,8 @@ pub enum ApiSetNamespaceBuildError {
     TooLarge,
     #[error("API-set namespace mapping has an invalid hashed prefix")]
     InvalidHashedPrefix,
+    #[error("API-set namespace mappings have a duplicate hashed prefix")]
+    DuplicateHashedPrefix,
 }
 
 pub fn build_api_set_namespace(
@@ -239,6 +241,7 @@ pub fn build_api_set_namespace_from_mappings(
     let mut entries = Vec::with_capacity(count);
     let mut values = Vec::with_capacity(count);
     let mut hashes = Vec::with_capacity(count);
+    let mut hashed_prefixes = BTreeSet::new();
 
     for (index, mapping) in mappings.iter().enumerate() {
         let contract = mapping.contract;
@@ -248,6 +251,9 @@ pub fn build_api_set_namespace_from_mappings(
             .unwrap_or_else(|| &contract[..api_set_hashed_name_len(contract)]);
         if !hashed_prefix.is_ascii() || !contract.starts_with(hashed_prefix) {
             return Err(ApiSetNamespaceBuildError::InvalidHashedPrefix);
+        }
+        if !hashed_prefixes.insert(hashed_prefix) {
+            return Err(ApiSetNamespaceBuildError::DuplicateHashedPrefix);
         }
 
         let name = utf16_bytes(contract)?;
