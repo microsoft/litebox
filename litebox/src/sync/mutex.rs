@@ -222,15 +222,15 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
         self.creation
             .ensure_registered(LockType::Mutex, || self.raw.raw.underlying_atomic());
 
-        if !self.raw.try_lock() {
-            return None;
-        }
-
         #[cfg(feature = "lock_tracing")]
         let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
             LockType::Mutex,
             self.raw.raw.underlying_atomic(),
         );
+
+        if !self.raw.try_lock() {
+            return None;
+        }
 
         Some(MutexGuard {
             mutex: self,

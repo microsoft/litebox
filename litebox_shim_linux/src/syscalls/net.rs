@@ -2547,14 +2547,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             match &socket {
                 ReceiveSocket::Inet(socket)
-                    if timeout_duration.is_some()
-                        || flags.contains(ReceiveFlags::DONTWAIT)
-                        || socket.is_nonblock =>
+                    if flags.contains(ReceiveFlags::DONTWAIT) || socket.is_nonblock =>
                 {
                     Some(socket.recvmmsg_lock.0.try_lock().ok_or(Errno::EAGAIN)?)
                 }
                 ReceiveSocket::Inet(socket) => {
-                    Some(socket.recvmmsg_lock.0.lock_interruptibly(&self.wait_cx())?)
+                    let wait_cx = self.wait_cx().with_deadline(deadline);
+                    Some(socket.recvmmsg_lock.0.lock_interruptibly(&wait_cx)?)
                 }
                 ReceiveSocket::Unix(_) => None,
             }
@@ -3013,6 +3012,22 @@ mod tests {
         acquired_rx
             .recv_timeout(core::time::Duration::from_secs(1))
             .unwrap();
+    }
+
+    #[test]
+    fn recvmmsg_lock_honors_wait_deadline() {
+        let task = init_platform(None);
+        let lock = super::RecvmmsgLock::new();
+        let guard = lock.try_lock().unwrap();
+        let wait_cx = task
+            .wait_cx()
+            .with_timeout(core::time::Duration::from_millis(20));
+
+        assert!(matches!(
+            lock.lock_interruptibly(&wait_cx),
+            Err(Errno::EAGAIN)
+        ));
+        drop(guard);
     }
 
     #[test]
