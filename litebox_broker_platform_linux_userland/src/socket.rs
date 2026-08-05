@@ -1714,9 +1714,7 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse>
             .snapshot
             .lock()
             .expect("Linux socket snapshot mutex poisoned");
-        snapshot.pending_error.is_none()
-            && (snapshot.status == SocketConnectionStatus::Connected
-                || socket.kind == SocketKind::Udp)
+        (snapshot.status == SocketConnectionStatus::Connected || socket.kind == SocketKind::Udp)
             && snapshot.readiness.contains(ReadinessFlags::ERROR)
     };
     let socket_error = if query_socket_error {
@@ -1724,13 +1722,15 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse>
     } else {
         None
     };
-    let (response, readiness) = {
+    let (response, readiness, republish_error) = {
         let mut snapshot = socket
             .snapshot
             .lock()
             .expect("Linux socket snapshot mutex poisoned");
-        let pending_error = snapshot.pending_error.take().or(socket_error);
-        if pending_error.is_some() {
+        let cached_error = snapshot.pending_error.take();
+        let (pending_error, next_pending_error) = shift_pending_error(cached_error, socket_error);
+        snapshot.pending_error = next_pending_error;
+        if pending_error.is_some() && next_pending_error.is_none() {
             snapshot.readiness = ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0);
         }
         (
@@ -1740,12 +1740,25 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse>
                 pending_error,
             },
             snapshot.readiness,
+            next_pending_error.is_some(),
         )
     };
-    if response.pending_error.is_some() {
+    if republish_error {
+        socket.readiness.republish(readiness)?;
+    } else if response.pending_error.is_some() {
         socket.readiness.publish(readiness)?;
     }
     Ok(response)
+}
+
+fn shift_pending_error(
+    cached_error: Option<SocketError>,
+    socket_error: Option<SocketError>,
+) -> (Option<SocketError>, Option<SocketError>) {
+    match cached_error {
+        Some(error) => (Some(error), socket_error),
+        None => (socket_error, None),
+    }
 }
 
 fn readiness_from_epoll(socket: &SocketEntry, events: epoll::EventFlags) -> ReadinessFlags {
@@ -1841,12 +1854,46 @@ fn clear_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerRes
 }
 
 fn consume_synchronous_error(socket: &SocketEntry) -> BrokerResult<()> {
-    socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .pending_error = None;
-    clear_readiness(socket, ReadinessFlags::ERROR)
+    let query_socket_error = {
+        let snapshot = socket
+            .snapshot
+            .lock()
+            .expect("Linux socket snapshot mutex poisoned");
+        if !can_consume_synchronous_error(socket.kind, snapshot.status) {
+            return Ok(());
+        }
+        snapshot.pending_error.is_none()
+    };
+    let socket_error = if query_socket_error {
+        take_socket_error(socket)?
+    } else {
+        None
+    };
+    let (readiness, changed) = {
+        let mut snapshot = socket
+            .snapshot
+            .lock()
+            .expect("Linux socket snapshot mutex poisoned");
+        if snapshot.pending_error.is_none() {
+            snapshot.pending_error = socket_error;
+        }
+        let readiness = if snapshot.pending_error.is_some() {
+            snapshot.readiness | ReadinessFlags::ERROR
+        } else {
+            ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0)
+        };
+        let changed = readiness != snapshot.readiness;
+        snapshot.readiness = readiness;
+        (readiness, changed)
+    };
+    if changed {
+        socket.readiness.publish(readiness)?;
+    }
+    Ok(())
+}
+
+const fn can_consume_synchronous_error(kind: SocketKind, status: SocketConnectionStatus) -> bool {
+    matches!(kind, SocketKind::Udp) || matches!(status, SocketConnectionStatus::Connected)
 }
 
 const fn socket_error_from_errno(error: Errno) -> SocketError {
@@ -1907,6 +1954,40 @@ mod tests {
     use litebox_broker_protocol::socket::{Ipv4Address, Port};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn cached_socket_error_precedes_a_new_kernel_error() {
+        assert_eq!(
+            shift_pending_error(
+                Some(SocketError::ConnectionRefused),
+                Some(SocketError::NetworkUnreachable),
+            ),
+            (
+                Some(SocketError::ConnectionRefused),
+                Some(SocketError::NetworkUnreachable),
+            )
+        );
+        assert_eq!(
+            shift_pending_error(None, Some(SocketError::NetworkUnreachable)),
+            (Some(SocketError::NetworkUnreachable), None)
+        );
+    }
+
+    #[test]
+    fn synchronous_errors_do_not_consume_tcp_connect_status() {
+        assert!(!can_consume_synchronous_error(
+            SocketKind::Tcp,
+            SocketConnectionStatus::Connecting,
+        ));
+        assert!(can_consume_synchronous_error(
+            SocketKind::Tcp,
+            SocketConnectionStatus::Connected,
+        ));
+        assert!(can_consume_synchronous_error(
+            SocketKind::Udp,
+            SocketConnectionStatus::Unconnected,
+        ));
+    }
 
     struct TestReadinessSink {
         published: Sender<(ObjectHandle, ReadinessFlags)>,
@@ -2695,6 +2776,38 @@ mod tests {
                 None,
             ),
             Ok(SocketOutcome::Completed(7))
+        );
+        wait_for_readiness(&publications, handle, ReadinessFlags::ERROR);
+        assert_eq!(
+            litebox_broker_core::socket::send_to(
+                &session,
+                handle,
+                b"broadcast",
+                SendFlags::NONE,
+                Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, 9)),
+            ),
+            Ok(SocketOutcome::Failed(SocketError::Other))
+        );
+        let send_error_status = litebox_broker_core::socket::status(&session, handle).unwrap();
+        assert_eq!(
+            send_error_status.pending_error,
+            Some(SocketError::ConnectionRefused)
+        );
+        assert!(
+            !session
+                .check_readiness(handle)
+                .unwrap()
+                .contains(ReadinessFlags::ERROR)
+        );
+        assert_eq!(
+            litebox_broker_core::socket::send_to(
+                &session,
+                handle,
+                b"refused again",
+                SendFlags::NONE,
+                None,
+            ),
+            Ok(SocketOutcome::Completed(13))
         );
         wait_for_readiness(&publications, handle, ReadinessFlags::ERROR);
         assert_eq!(

@@ -721,44 +721,61 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
             pending_error: None,
         });
     }
-    let mut response = resource.status()?;
-    let mut object = object.write();
-    let ObjectEntry::Socket(socket) = &mut *object else {
-        return Err(BrokerError::InvalidRights);
-    };
-    if is_udp(socket.create_request) {
-        if matches!(
-            response.status,
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
-        ) {
+    let mut expected_datagram_generation = datagram_connect_generation;
+    let mut retried_datagram_status = false;
+    let mut pending_error = None;
+    loop {
+        let mut response = resource.status()?;
+        pending_error = pending_error.or(response.pending_error);
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::InvalidRights);
+        };
+        if is_udp(socket.create_request) {
+            if matches!(
+                response.status,
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
+            ) {
+                return Err(BrokerError::Internal);
+            }
+            if socket.datagram_connect_generation != expected_datagram_generation {
+                if !retried_datagram_status && pending_error.is_none() {
+                    expected_datagram_generation = socket.datagram_connect_generation;
+                    retried_datagram_status = true;
+                    drop(object);
+                    continue;
+                }
+                // Continuous peer replacement can race both bounded queries.
+                // Do not let an unordered platform snapshot overwrite newer
+                // broker observations.
+                response.status = socket.connection_status;
+                socket.local_address = socket.local_address.or(response.local_address);
+                response.local_address = socket.local_address;
+                response.pending_error = pending_error;
+                return Ok(response);
+            }
+        } else if socket.connection_status == SocketConnectionStatus::Connecting
+            && response.status == SocketConnectionStatus::Unconnected
+        {
             return Err(BrokerError::Internal);
         }
-        if socket.datagram_connect_generation != datagram_connect_generation {
-            // The platform response is a valid snapshot from before or after a
-            // concurrent peer replacement, but must not overwrite the newer
-            // broker state.
-            return Ok(response);
+        socket.local_address = if is_udp(socket.create_request) {
+            response.local_address.or(socket.local_address)
+        } else {
+            socket.local_address.or(response.local_address)
+        };
+        response.local_address = socket.local_address;
+        response.pending_error = pending_error;
+        if is_udp(socket.create_request) {
+            response.status = socket.connection_status;
+        } else if socket.connection_status == SocketConnectionStatus::Connecting {
+            socket.connection_status = response.status;
+        } else {
+            // Another status call reached a terminal state while this platform query was in flight.
+            response.status = socket.connection_status;
         }
-    } else if socket.connection_status == SocketConnectionStatus::Connecting
-        && response.status == SocketConnectionStatus::Unconnected
-    {
-        return Err(BrokerError::Internal);
+        return Ok(response);
     }
-    socket.local_address = if is_udp(socket.create_request) {
-        response.local_address.or(socket.local_address)
-    } else {
-        socket.local_address.or(response.local_address)
-    };
-    response.local_address = socket.local_address;
-    if is_udp(socket.create_request) {
-        response.status = socket.connection_status;
-    } else if socket.connection_status == SocketConnectionStatus::Connecting {
-        socket.connection_status = response.status;
-    } else {
-        // Another status call reached a terminal state while this platform query was in flight.
-        response.status = socket.connection_status;
-    }
-    Ok(response)
 }
 
 #[cfg(test)]
@@ -1675,16 +1692,19 @@ pub(crate) mod tests {
             Arc::new(TestReadinessSink::default()),
         )
         .unwrap();
-        provider
-            .state
-            .status_responses
-            .lock()
-            .unwrap()
-            .push_back(SocketStatusResponse {
+        let local_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 49152);
+        *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
+            SocketStatusResponse {
                 status: SocketConnectionStatus::Unconnected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 49152)),
+                local_address: None,
                 pending_error: None,
-            });
+            },
+            SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: Some(local_address),
+                pending_error: None,
+            },
+        ]);
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         *provider.state.status_block.lock().unwrap() = Some((started_tx, release_rx));
@@ -1698,11 +1718,52 @@ pub(crate) mod tests {
         );
         release_tx.send(()).unwrap();
         let stale = in_flight.join().unwrap();
-        assert_eq!(stale.status, SocketConnectionStatus::Unconnected);
+        assert_eq!(stale.status, SocketConnectionStatus::Connected);
+        assert_eq!(stale.local_address, Some(local_address));
+        assert_eq!(stale.pending_error, None);
+
+        let next_local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153);
+        let stale_local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49154);
+        *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
+            SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(stale_local_address),
+                pending_error: Some(SocketError::ConnectionRefused),
+            },
+            SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: Some(next_local_address),
+                pending_error: Some(SocketError::NetworkUnreachable),
+            },
+        ]);
+        let status_calls = provider.state.status_calls.load(Ordering::Relaxed);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *provider.state.status_block.lock().unwrap() = Some((started_tx, release_rx));
+        let status_session = Arc::clone(&session);
+        let in_flight = std::thread::spawn(move || status(&status_session, handle).unwrap());
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
-            stale.local_address,
-            Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 49152))
+            connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54),),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
         );
+        release_tx.send(()).unwrap();
+        let status_with_error = in_flight.join().unwrap();
+        assert_eq!(
+            status_with_error.pending_error,
+            Some(SocketError::ConnectionRefused)
+        );
+        assert_eq!(status_with_error.local_address, Some(local_address));
+        assert_eq!(
+            provider.state.status_calls.load(Ordering::Relaxed),
+            status_calls + 1
+        );
+        let next_status = status(&session, handle).unwrap();
+        assert_eq!(
+            next_status.pending_error,
+            Some(SocketError::NetworkUnreachable)
+        );
+        assert_eq!(next_status.local_address, Some(next_local_address));
         assert_eq!(
             status(&session, handle).unwrap().status,
             SocketConnectionStatus::Connected
