@@ -31,7 +31,7 @@ use crate::{
 
 const _: () = assert!(MAX_SOCKET_PEEK_SIZE as usize == super::SOCKET_RECEIVE_OPERATION_SIZE);
 
-struct BrokerSocketState {
+struct BrokerTcpSocketState {
     connection: SocketConnectionStatus,
     local_address: Option<SocketAddrV4>,
     remote_address: Option<SocketAddrV4>,
@@ -39,7 +39,7 @@ struct BrokerSocketState {
     listening: bool,
 }
 
-impl BrokerSocketState {
+impl BrokerTcpSocketState {
     fn update_connection(&mut self, connection: SocketConnectionStatus) -> SocketConnectionStatus {
         if matches!(
             self.connection,
@@ -59,7 +59,7 @@ pub struct BrokerTcpSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
     receive_lock: Mutex<Platform, ()>,
-    state: Mutex<Platform, BrokerSocketState>,
+    state: Mutex<Platform, BrokerTcpSocketState>,
     write_shutdown: AtomicBool,
     closed: AtomicBool,
 }
@@ -78,7 +78,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             pollable_registry,
             pollee: Arc::new(Pollee::new()),
             receive_lock: Mutex::new(()),
-            state: Mutex::new(BrokerSocketState {
+            state: Mutex::new(BrokerTcpSocketState {
                 connection: SocketConnectionStatus::Unconnected,
                 local_address: None,
                 remote_address: None,
@@ -105,7 +105,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             pollable_registry,
             pollee: Arc::new(Pollee::new()),
             receive_lock: Mutex::new(()),
-            state: Mutex::new(BrokerSocketState {
+            state: Mutex::new(BrokerTcpSocketState {
                 connection: SocketConnectionStatus::Connected,
                 local_address: Some(accepted.local_address),
                 remote_address: Some(accepted.remote_address),
