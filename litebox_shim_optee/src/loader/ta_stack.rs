@@ -258,7 +258,7 @@ impl TaStack {
 
         // Random 16-byte stack canary
         let mut canary = [0u8; 16];
-        <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(platform, &mut canary);
+        <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(platform, &mut canary, None);
         self.push_bytes(&canary)?;
 
         // `reenter_thread` *jumps* into the TA entry point (which is a function) rather than

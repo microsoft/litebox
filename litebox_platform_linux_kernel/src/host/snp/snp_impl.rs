@@ -589,7 +589,7 @@ impl HostInterface for HostSnpInterface {
 }
 
 impl litebox::platform::CrngProvider for SnpLinuxKernel {
-    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+    fn fill_bytes_crng(&self, buf: &mut [u8], _seed: Option<&[u8]>) {
         // FIXME: call into the trusted host to get random bytes.
         static RANDOM: spin::mutex::SpinMutex<litebox::utils::rng::FastRng> =
             spin::mutex::SpinMutex::new(litebox::utils::rng::FastRng::new_from_seed(

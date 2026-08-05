@@ -2341,7 +2341,7 @@ unsafe fn interrupt_signal_handler(
 }
 
 impl litebox::platform::CrngProvider for LinuxUserland {
-    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+    fn fill_bytes_crng(&self, buf: &mut [u8], _seed: Option<&[u8]>) {
         getrandom::fill(buf).expect("getrandom failed");
     }
 }

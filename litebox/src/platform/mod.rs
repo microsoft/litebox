@@ -599,7 +599,7 @@ pub trait CrngProvider {
     /// Panics if unable to fill the buffer with random bytes. This is
     /// considered a fatal error--LiteBox code is not expected to handle such
     /// failures.
-    fn fill_bytes_crng(&self, buf: &mut [u8]);
+    fn fill_bytes_crng(&self, buf: &mut [u8], seed: Option<&[u8]>);
 }
 
 /// Provider of derived device-specific keys.

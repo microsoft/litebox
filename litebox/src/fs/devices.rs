@@ -293,7 +293,7 @@ where
                 Ok(0)
             }
             Device::URandom => {
-                self.litebox.x.platform.fill_bytes_crng(buf);
+                self.litebox.x.platform.fill_bytes_crng(buf, None);
                 Ok(buf.len())
             }
         }

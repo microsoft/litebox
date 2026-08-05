@@ -2057,7 +2057,7 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 }
 
 impl litebox::platform::CrngProvider for WindowsUserland {
-    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+    fn fill_bytes_crng(&self, buf: &mut [u8], _seed: Option<&[u8]>) {
         getrandom::fill(buf).expect("getrandom failed");
     }
 }

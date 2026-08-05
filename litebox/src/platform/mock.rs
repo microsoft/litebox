@@ -321,7 +321,7 @@ impl StdioProvider for MockPlatform {
 }
 
 impl CrngProvider for MockPlatform {
-    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+    fn fill_bytes_crng(&self, buf: &mut [u8], _seed: Option<&[u8]>) {
         let mut random = self.random.lock().unwrap();
         let mut off = 0;
         while off < buf.len() {

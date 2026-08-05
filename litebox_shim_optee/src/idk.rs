@@ -69,13 +69,13 @@ fn generate_identity_signing_key_inner(
 ) -> Result<i64, Errno> {
     validate_key_algorithm(key_alg)?;
 
-    let random_ptr = NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+    let tpm_random_ptr = NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         tpm_random_pa.trunc(),
         TPM_IDKS_RANDOM_LEN,
     )
     .map_err(|_| Errno::EINVAL)?;
     let mut tpm_random = [0u8; TPM_IDKS_RANDOM_LEN];
-    random_ptr
+    tpm_random_ptr
         .read_slice_at_offset(0, &mut tpm_random)
         .map_err(|_| Errno::EFAULT)?;
 
@@ -134,7 +134,8 @@ fn generate_identity_signing_private_key(
     let mut private_key_bytes = Zeroizing::new([0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]);
 
     for _ in 0..MAX_KEYGEN_ATTEMPT {
-        litebox_platform_multiplex::platform().fill_bytes_crng(&mut *private_key_bytes);
+        litebox_platform_multiplex::platform()
+            .fill_bytes_crng(&mut *private_key_bytes, tpm_random.map(|r| &r[..]));
         if is_valid_identity_signing_private_key(&private_key_bytes) {
             return Ok(private_key_bytes);
         }

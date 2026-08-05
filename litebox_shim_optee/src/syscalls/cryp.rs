@@ -310,6 +310,7 @@ impl Task {
             <crate::Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
                 self.global.platform,
                 buf,
+                None,
             );
         }
         Ok(())

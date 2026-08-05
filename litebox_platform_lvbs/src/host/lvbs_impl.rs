@@ -105,14 +105,14 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
 }
 
 impl litebox::platform::CrngProvider for LvbsLinuxKernel {
-    fn fill_bytes_crng(&self, buf: &mut [u8]) {
+    fn fill_bytes_crng(&self, buf: &mut [u8], seed: Option<&[u8]>) {
         static RANDOM: spin::mutex::SpinMutex<Option<LvbsCrng>> = spin::mutex::SpinMutex::new(None);
 
         let mut random = RANDOM.lock();
         random
             .get_or_insert_with(|| {
                 LvbsCrng::new(
-                    PRK_ONCE.get().expect("Platform root key not initialized"),
+                    seed.expect("CRNG seed not provided"),
                     rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
                 )
             })
@@ -134,10 +134,10 @@ struct LvbsCrng {
 }
 
 impl LvbsCrng {
-    fn new(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> Self {
+    fn new(seed: &[u8], rdrand_seed: CrngSeed) -> Self {
         Self {
-            random: rand_chacha::ChaCha20Rng::from_seed(crng_seed_from_prk_and_rdrand(
-                prk,
+            random: rand_chacha::ChaCha20Rng::from_seed(crng_seed_from_tpm_and_rdrand(
+                seed,
                 rdrand_seed,
             )),
             bytes_until_reseed: CRNG_RESEED_INTERVAL_BYTES,
@@ -231,10 +231,10 @@ fn rdrand_seed() -> Option<CrngSeed> {
     Some(seed)
 }
 
-fn crng_seed_from_prk_and_rdrand(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> CrngSeed {
+fn crng_seed_from_tpm_and_rdrand(seed: &[u8], rdrand_seed: CrngSeed) -> CrngSeed {
     sha2::Sha256::new()
         .chain_update(b"litebox-lvbs-crng-seed-v1")
-        .chain_update(prk)
+        .chain_update(seed)
         .chain_update(rdrand_seed)
         .finalize()
         .into()
