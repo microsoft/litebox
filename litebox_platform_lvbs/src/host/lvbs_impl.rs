@@ -8,7 +8,7 @@ use crate::{
     host::per_cpu_variables::with_per_cpu_variables,
 };
 use digest::Digest;
-use litebox_common_lvbs::PRK_LEN;
+use litebox_common_lvbs::CRNG_SEED_LEN;
 use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
@@ -111,10 +111,10 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
         let mut random = RANDOM.lock();
         random
             .get_or_insert_with(|| {
-                let rdrand = rdrand_seed().expect("RDRAND unavailable during CRNG initialization");
-                LvbsCrng::from_seed(
-                    crng_seed_in_vault(rdrand).expect("Platform root key not initialized"),
-                )
+                LvbsCrng::from_seed(crng_seed_from_rot_and_rdrand(
+                    CRNG_SEED_ONCE.get().expect("CRNG seed not set"),
+                    rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
+                ))
             })
             .fill_bytes(buf, rdrand_seed);
     }
@@ -175,6 +175,19 @@ impl LvbsCrng {
 // The PRK lives only in `crate::vault`. Never expose a raw PRK getter; use
 // `DerivedKeyProvider`. `derive_key` uses the PRK; `compute_with_derived_key`
 // supports only the per-boot key (`RootKey::PerBoot`) derived from it.
+static CRNG_SEED_ONCE: spin::Once<[u8; CRNG_SEED_LEN]> = spin::Once::new();
+
+/// Sets the trusted CRNG seed for this platform.
+///
+/// This should be called once during platform initialization with a seed
+/// derived from a hardware root of trust (e.g., a TPM).
+pub(crate) fn set_crng_seed(seed: &[u8; CRNG_SEED_LEN]) {
+    CRNG_SEED_ONCE.call_once(|| {
+        let mut s = Zeroizing::new([0u8; CRNG_SEED_LEN]);
+        s.copy_from_slice(seed);
+        *s
+    });
+}
 
 impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
     fn derive_key<E>(
@@ -283,19 +296,6 @@ fn per_boot_key_from_prk_and_nonce(
     )
 }
 
-/// Derive the initial CRNG seed inside the vault.
-///
-/// TODO: We don't need to use the vault to initialize CRNG seed if
-/// we get an additional nonce from the TPM/VTL0.
-fn crng_seed_in_vault(rdrand: CrngSeed) -> Option<CrngSeed> {
-    let mut ctx = (rdrand, CrngSeed::default());
-    crate::vault::with_prk(&mut ctx, |prk, ctx| {
-        ctx.1 = crng_seed_from_prk_and_rdrand(prk, ctx.0);
-    })
-    .ok()?;
-    Some(ctx.1)
-}
-
 fn rdrand_seed() -> Option<CrngSeed> {
     let mut seed = CrngSeed::default();
     for chunk in seed.chunks_mut(8) {
@@ -318,10 +318,10 @@ fn rdrand_seed() -> Option<CrngSeed> {
     Some(seed)
 }
 
-fn crng_seed_from_prk_and_rdrand(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> CrngSeed {
+fn crng_seed_from_tpm_and_rdrand(seed: &[u8], rdrand_seed: CrngSeed) -> CrngSeed {
     sha2::Sha256::new()
         .chain_update(b"litebox-lvbs-crng-seed-v1")
-        .chain_update(prk)
+        .chain_update(seed)
         .chain_update(rdrand_seed)
         .finalize()
         .into()
@@ -397,13 +397,14 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    const TEST_PRK: [u8; PRK_LEN] = [0x42; PRK_LEN];
+    const TEST_ROT_SEED: [u8; CRNG_SEED_LEN] = [0x42; CRNG_SEED_LEN];
     const INIT_SEED: CrngSeed = [0xA5; 32];
     const RESEED_SEED: CrngSeed = [0x5A; 32];
 
     #[test]
     fn crosses_reseed_boundary_twice_with_accurate_budget() {
-        let mut crng = LvbsCrng::from_seed(crng_seed_from_prk_and_rdrand(&TEST_PRK, INIT_SEED));
+        let mut crng =
+            LvbsCrng::from_seed(crng_seed_from_rot_and_rdrand(&TEST_ROT_SEED, INIT_SEED));
         let mut buf = vec![0u8; CRNG_RESEED_INTERVAL_BYTES * 2 + 7];
         crng.fill_bytes(&mut buf, || Some(RESEED_SEED));
         assert_eq!(crng.reseed_counter, 2);
@@ -412,7 +413,8 @@ mod tests {
 
     #[test]
     fn rdrand_failure_engages_backoff_without_reseed() {
-        let mut crng = LvbsCrng::from_seed(crng_seed_from_prk_and_rdrand(&TEST_PRK, INIT_SEED));
+        let mut crng =
+            LvbsCrng::from_seed(crng_seed_from_rot_and_rdrand(&TEST_ROT_SEED, INIT_SEED));
         let mut buf = vec![0u8; CRNG_RESEED_INTERVAL_BYTES];
         crng.fill_bytes(&mut buf, || None);
         assert_eq!(crng.reseed_counter, 0);
