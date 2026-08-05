@@ -7,6 +7,11 @@ use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
 
+#[cfg(target_arch = "x86_64")]
+use litebox::shim::{Exception, ExceptionInfo};
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::signal::Signal;
+
 extern crate std;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
@@ -76,6 +81,26 @@ pub(crate) fn init_platform(
         });
     }
     task
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn exceptions_queue_their_corresponding_signals() {
+    let task = init_platform(None);
+
+    for (exception, signal) in [
+        (Exception::DIVIDE_ERROR, Signal::SIGFPE),
+        (Exception::BREAKPOINT, Signal::SIGTRAP),
+        (Exception::INVALID_OPCODE, Signal::SIGILL),
+    ] {
+        task.handle_exception_request(&ExceptionInfo {
+            exception,
+            error_code: 0,
+            cr2: 0,
+            kernel_mode: false,
+        });
+        assert!(task.pending_signal_set().contains(signal));
+    }
 }
 
 #[test]

@@ -712,7 +712,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
-        assert!(matches!(signal, Signal::SIGKILL | Signal::SIGSEGV));
+        assert!(matches!(
+            signal,
+            Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
+        ));
 
         self.signals
             .pending
