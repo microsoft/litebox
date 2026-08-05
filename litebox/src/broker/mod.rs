@@ -15,9 +15,10 @@ use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags as BrokerReceiveFlags,
-    ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode, SocketConnectionStatus,
-    SocketOutcome, SocketStatusResponse,
+    AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
+    ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
+    ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
+    SocketConnectionStatus, SocketOutcome, SocketStatusResponse,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -41,6 +42,8 @@ use shared_buffer::{SlotAllocator, SlotLease};
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn create_udp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn connect_socket(
         &self,
@@ -86,6 +89,21 @@ pub(crate) trait BrokerControl: Send + Sync {
         peek_length: u32,
         discard: bool,
     ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError>;
+
+    fn send_to_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+        flags: BrokerSendFlags,
+        destination: Option<SocketAddrV4>,
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
+
+    fn receive_from_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        flags: BrokerReceiveFromFlags,
+    ) -> core::result::Result<SocketOutcome<ReceiveFromSocketResponse>, BrokerControlError>;
 
     fn shutdown_socket(
         &self,
@@ -274,6 +292,10 @@ where
         self.request(BrokerLocal::create_tcp_socket)
     }
 
+    fn create_udp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(BrokerLocal::create_udp_socket)
+    }
+
     fn connect_socket(
         &self,
         handle: ObjectHandle,
@@ -379,6 +401,47 @@ where
             Ok(received) => SocketOutcome::Completed(received),
             Err(error) => SocketOutcome::Failed(error),
         })
+    }
+
+    fn send_to_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+        flags: BrokerSendFlags,
+        destination: Option<SocketAddrV4>,
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
+        if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length =
+            u32::try_from(data.len()).expect("validated UDP datagram length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| {
+            local.send_to_socket(handle, lease.descriptor(), data, flags, destination)
+        })
+        .map(|result| match result {
+            Ok(sent) => SocketOutcome::Completed(sent),
+            Err(error) => SocketOutcome::Failed(error),
+        })
+    }
+
+    fn receive_from_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        flags: BrokerReceiveFromFlags,
+    ) -> core::result::Result<SocketOutcome<ReceiveFromSocketResponse>, BrokerControlError> {
+        if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length =
+            u32::try_from(data.len()).expect("validated UDP receive length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.receive_from_socket(handle, lease.descriptor(), data, flags))
+            .map(|result| match result {
+                Ok(received) => SocketOutcome::Completed(received),
+                Err(error) => SocketOutcome::Failed(error),
+            })
     }
 
     fn shutdown_socket(

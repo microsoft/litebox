@@ -23,7 +23,7 @@ pub mod local_ports;
 mod phy;
 pub mod socket_channel;
 
-pub use broker_socket::BrokerTcpSocket;
+pub use broker_socket::{BrokerTcpSocket, BrokerUdpSocket};
 
 #[cfg(test)]
 mod tests;
@@ -61,6 +61,9 @@ const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 /// Maximum bytes one socket receive syscall stages before returning.
 pub const SOCKET_RECEIVE_OPERATION_SIZE: usize = 0x80_000;
+/// Maximum payload size of one IPv4 UDP datagram.
+pub const MAX_UDP_DATAGRAM_SIZE: usize =
+    litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE as usize;
 
 /// Directions of a socket to shut down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,13 +170,27 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     consider_closed: bool,
     /// The handle into the `socket_set`, absent for broker-owned sockets.
     handle: Option<smoltcp::iface::SocketHandle>,
-    /// Broker-owned TCP state, absent for locally implemented sockets.
-    broker_socket: Option<alloc::sync::Arc<BrokerTcpSocket<Platform>>>,
+    /// Broker-owned socket state, absent for locally implemented sockets.
+    broker_socket: Option<BrokerSocket<Platform>>,
     // Protocol-specific data
     specific: ProtocolSpecific,
     /// The proxy associated with this socket to enable lock-free data transfer
     /// and event notification
     proxy: Option<alloc::sync::Arc<NetworkProxy<Platform>>>,
+}
+
+enum BrokerSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    Tcp(alloc::sync::Arc<BrokerTcpSocket<Platform>>),
+    Udp(alloc::sync::Arc<BrokerUdpSocket<Platform>>),
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Clone for BrokerSocket<Platform> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Tcp(socket) => Self::Tcp(alloc::sync::Arc::clone(socket)),
+            Self::Udp(socket) => Self::Udp(alloc::sync::Arc::clone(socket)),
+        }
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
@@ -742,7 +759,12 @@ where
             (Protocol::Icmp | Protocol::Raw { .. }, _) => {
                 unimplemented!()
             }
-            (Protocol::Tcp, NetworkProxy::BrokerStream(_)) => unreachable!(),
+            (
+                Protocol::Tcp | Protocol::Udp,
+                NetworkProxy::BrokerStream(_) | NetworkProxy::BrokerDatagram(_),
+            ) => {
+                unreachable!()
+            }
             _ => panic!("Mismatched protocol and proxy type"),
         }
     }
@@ -776,19 +798,19 @@ where
     /// By default, the created socket has no associated proxy; to set a proxy, use
     /// [`attach_socket_proxy`](Self::attach_socket_proxy).
     pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
-        let broker_socket = if matches!(protocol, Protocol::Tcp) {
-            self.litebox
-                .broker_control()
-                .map(|broker| {
-                    BrokerTcpSocket::new(broker, self.litebox.broker_pollable_registry())
-                        .map_err(SocketError::from)
-                })
-                .transpose()?
-        } else {
-            None
+        let broker_socket = match (&protocol, self.litebox.broker_control()) {
+            (Protocol::Tcp, Some(broker)) => Some(BrokerSocket::Tcp(
+                BrokerTcpSocket::new(broker, self.litebox.broker_pollable_registry())
+                    .map_err(SocketError::from)?,
+            )),
+            (Protocol::Udp, Some(broker)) => Some(BrokerSocket::Udp(
+                BrokerUdpSocket::new(broker, self.litebox.broker_pollable_registry())
+                    .map_err(SocketError::from)?,
+            )),
+            _ => None,
         };
         let handle = match protocol {
-            Protocol::Tcp if broker_socket.is_some() => None,
+            Protocol::Tcp | Protocol::Udp if broker_socket.is_some() => None,
             Protocol::Tcp => Some(self.socket_set.add(tcp::Socket::new(
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
@@ -867,7 +889,7 @@ where
     /// Creates and attaches the userspace I/O proxy matching the backend of `fd`.
     ///
     /// Locally implemented sockets receive a channel that transfers data to and from smoltcp.
-    /// Broker-owned TCP sockets instead receive a proxy for their existing broker socket. The
+    /// Broker-owned sockets instead receive a proxy for their existing broker socket. The
     /// returned [`Arc`](alloc::sync::Arc) is the same proxy stored by the network subsystem for
     /// event notification and backend interaction.
     ///
@@ -886,7 +908,14 @@ where
             return Some(alloc::sync::Arc::clone(proxy));
         }
         let proxy = if let Some(socket) = &socket_handle.broker_socket {
-            NetworkProxy::BrokerStream(alloc::sync::Arc::clone(socket))
+            match socket {
+                BrokerSocket::Tcp(socket) => {
+                    NetworkProxy::BrokerStream(alloc::sync::Arc::clone(socket))
+                }
+                BrokerSocket::Udp(socket) => {
+                    NetworkProxy::BrokerDatagram(alloc::sync::Arc::clone(socket))
+                }
+            }
         } else {
             match socket_handle.protocol() {
                 Protocol::Tcp => NetworkProxy::Stream(socket_channel::StreamSocketChannel::new()),
@@ -1003,8 +1032,13 @@ where
             proxy,
         } = socket_handle;
         if let Some(socket) = broker_socket {
-            let abortive = specific.tcp().immediate_close.load(Ordering::SeqCst);
-            socket.close(abortive);
+            match socket {
+                BrokerSocket::Tcp(socket) => {
+                    let abortive = specific.tcp().immediate_close.load(Ordering::SeqCst);
+                    socket.close(abortive);
+                }
+                BrokerSocket::Udp(socket) => socket.close(),
+            }
             return;
         }
         let handle = handle.expect("local socket must have a smoltcp handle");
@@ -1070,7 +1104,7 @@ where
         let now = self.now();
         let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
-                if let Some(socket) = &socket_handle.broker_socket {
+                if let Some(BrokerSocket::Tcp(socket)) = &socket_handle.broker_socket {
                     if check_progress {
                         socket.check_connect_progress()
                     } else {
@@ -1122,21 +1156,30 @@ where
                 }
             }
             Protocol::Udp => {
-                if addr.port() == 0 {
-                    return Err(ConnectError::Unaddressable);
+                if let Some(BrokerSocket::Udp(socket)) = &socket_handle.broker_socket {
+                    if check_progress {
+                        socket.check_connect_progress()
+                    } else {
+                        socket.start_connect(*addr)
+                    }
+                } else {
+                    if addr.port() == 0 {
+                        return Err(ConnectError::Unaddressable);
+                    }
+                    let socket: &mut udp::Socket =
+                        self.socket_set.get_mut(socket_handle.smoltcp_handle());
+                    if !socket.is_open() {
+                        let local_port = self.local_port_allocator.ephemeral_port()?;
+                        let local_endpoint: smoltcp::wire::IpListenEndpoint =
+                            local_port.port().into();
+                        let Ok(()) = socket.bind(local_endpoint) else {
+                            unreachable!("binding to a free port cannot fail")
+                        };
+                    }
+                    let addr: smoltcp::wire::IpEndpoint = (*addr).into();
+                    socket_handle.udp_mut().remote_endpoint = Some(addr);
+                    Ok(())
                 }
-                let socket: &mut udp::Socket =
-                    self.socket_set.get_mut(socket_handle.smoltcp_handle());
-                if !socket.is_open() {
-                    let local_port = self.local_port_allocator.ephemeral_port()?;
-                    let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
-                    let Ok(()) = socket.bind(local_endpoint) else {
-                        unreachable!("binding to a free port cannot fail")
-                    };
-                }
-                let addr: smoltcp::wire::IpEndpoint = (*addr).into();
-                socket_handle.udp_mut().remote_endpoint = Some(addr);
-                Ok(())
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
@@ -1149,10 +1192,9 @@ where
                 Err(ConnectError::InProgress) => {
                     proxy.set_state(socket_channel::SocketState::Connecting);
                 }
-                Err(ConnectError::Unaddressable) => {
-                    proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused);
-                }
-                Err(ConnectError::InvalidState) => {
+                Err(ConnectError::InvalidState)
+                    if matches!(socket_handle.protocol(), Protocol::Tcp) =>
+                {
                     // Distinguish timeout from RST using elapsed time
                     match socket_handle.tcp().connect_initiated_at_us {
                         Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
@@ -1161,6 +1203,9 @@ where
                         }
                         _ => proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused),
                     }
+                }
+                Err(ConnectError::Unaddressable | ConnectError::InvalidState) => {
+                    proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused);
                 }
                 Err(_) => {}
             }
@@ -1180,11 +1225,15 @@ where
             .ok_or(LocalAddrError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
 
+        if let Some(socket) = &socket_handle.broker_socket {
+            return Ok(match socket {
+                BrokerSocket::Tcp(socket) => socket.local_addr(),
+                BrokerSocket::Udp(socket) => socket.local_addr(),
+            });
+        }
+
         match socket_handle.protocol() {
             Protocol::Tcp => {
-                if let Some(socket) = &socket_handle.broker_socket {
-                    return Ok(socket.local_addr());
-                }
                 let socket: &tcp::Socket = self.socket_set.get(socket_handle.smoltcp_handle());
                 match socket.local_endpoint() {
                     Some(endpoint) => match endpoint.addr {
@@ -1238,17 +1287,21 @@ where
             .broker_socket
             .as_ref()
             .ok_or(errors::ShutdownError::UnsupportedOperation)?;
-        if socket.is_listening() {
-            return Err(errors::ShutdownError::Listening);
-        }
         let mode = match direction {
             ShutdownDirection::Read => litebox_broker_protocol::socket::ShutdownMode::Read,
             ShutdownDirection::Write => litebox_broker_protocol::socket::ShutdownMode::Write,
             ShutdownDirection::Both => litebox_broker_protocol::socket::ShutdownMode::Both,
         };
-        socket
-            .shutdown(mode)
-            .map_err(errors::ShutdownError::OperationFailed)
+        match socket {
+            BrokerSocket::Tcp(socket) => {
+                if socket.is_listening() {
+                    return Err(errors::ShutdownError::Listening);
+                }
+                socket.shutdown(mode)
+            }
+            BrokerSocket::Udp(socket) => socket.shutdown(mode),
+        }
+        .map_err(errors::ShutdownError::OperationFailed)
     }
 
     /// Stops a broker-owned listener without closing its socket object.
@@ -1262,6 +1315,9 @@ where
             .broker_socket
             .as_ref()
             .ok_or(errors::ShutdownError::UnsupportedOperation)?;
+        let BrokerSocket::Tcp(socket) = socket else {
+            return Err(errors::ShutdownError::UnsupportedOperation);
+        };
         if !socket.is_listening() {
             return Err(errors::ShutdownError::OperationFailed(
                 errors::SocketAsyncError::NotConnected,
@@ -1278,7 +1334,10 @@ where
         socket_handle: &SocketHandle<Platform>,
     ) -> Result<SocketAddr, RemoteAddrError> {
         if let Some(socket) = &socket_handle.broker_socket {
-            return socket.remote_addr();
+            return match socket {
+                BrokerSocket::Tcp(socket) => socket.remote_addr(),
+                BrokerSocket::Udp(socket) => socket.remote_addr(),
+            };
         }
         let endpoint = match socket_handle.protocol() {
             Protocol::Tcp => self
@@ -1315,14 +1374,13 @@ where
             .get_entry_mut(fd)
             .ok_or(BindError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if let Some(socket) = socket_handle
-            .broker_socket
-            .as_ref()
-            .map(alloc::sync::Arc::clone)
-        {
+        if let Some(socket) = socket_handle.broker_socket.clone() {
             drop(table_entry);
             drop(descriptor_table);
-            return socket.bind(*addr);
+            return match socket {
+                BrokerSocket::Tcp(socket) => socket.bind(*addr),
+                BrokerSocket::Udp(socket) => socket.bind(*addr),
+            };
         }
         match socket_handle.protocol() {
             Protocol::Tcp => {
@@ -1394,11 +1452,11 @@ where
             .get_entry_mut(fd)
             .ok_or(ListenError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if let Some(socket) = socket_handle
-            .broker_socket
-            .as_ref()
-            .map(alloc::sync::Arc::clone)
-        {
+        if let Some(socket) = socket_handle.broker_socket.as_ref() {
+            let BrokerSocket::Tcp(socket) = socket else {
+                return Err(ListenError::UnsupportedOperation);
+            };
+            let socket = alloc::sync::Arc::clone(socket);
             drop(table_entry);
             drop(descriptor_table);
             return socket.listen(
@@ -1499,11 +1557,11 @@ where
             .get_entry_mut(fd)
             .ok_or(AcceptError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if let Some(listener) = socket_handle
-            .broker_socket
-            .as_ref()
-            .map(alloc::sync::Arc::clone)
-        {
+        if let Some(listener) = socket_handle.broker_socket.as_ref() {
+            let BrokerSocket::Tcp(listener) = listener else {
+                return Err(AcceptError::UnsupportedOperation);
+            };
+            let listener = alloc::sync::Arc::clone(listener);
             drop(table_entry);
             drop(descriptor_table);
             let accepted = listener.accept()?;
@@ -1515,7 +1573,7 @@ where
             return Ok(self.new_socket_fd_for(SocketHandle {
                 consider_closed: false,
                 handle: None,
-                broker_socket: Some(accepted),
+                broker_socket: Some(BrokerSocket::Tcp(accepted)),
                 specific: ProtocolSpecific::Tcp(TcpSpecific {
                     local_port: None,
                     server_socket: None,
@@ -1614,11 +1672,18 @@ where
             unimplemented!()
         }
         if let Some(socket) = &socket_handle.broker_socket {
-            if destination.is_some() {
-                return Err(SendError::UnnecessaryDestinationAddress);
-            }
-            return socket.try_write(buf).map_err(|error| match error {
+            let outcome = match socket {
+                BrokerSocket::Tcp(socket) => {
+                    if destination.is_some() {
+                        return Err(SendError::UnnecessaryDestinationAddress);
+                    }
+                    socket.try_write(buf)
+                }
+                BrokerSocket::Udp(socket) => socket.try_write(buf, destination),
+            };
+            return outcome.map_err(|error| match error {
                 socket_channel::ChannelWriteError::BufferFull => SendError::BufferFull,
+                socket_channel::ChannelWriteError::MessageTooLong => SendError::MessageTooLong,
                 socket_channel::ChannelWriteError::Unaddressable => SendError::Unaddressable,
                 socket_channel::ChannelWriteError::DestinationAddressRequired => {
                     SendError::DestinationAddressRequired
@@ -1714,19 +1779,29 @@ where
             unimplemented!("flags: {:?}", flags);
         }
         if let Some(socket) = &socket_handle.broker_socket {
-            return socket
-                .try_read(buf, flags, source_addr)
-                .or_else(|error| match error {
-                    socket_channel::ChannelReadError::WouldBlock => Ok(0),
-                    socket_channel::ChannelReadError::ReadShutdown
-                    | socket_channel::ChannelReadError::ConnectionClosed => {
-                        Err(ReceiveError::OperationFinished)
-                    }
-                    socket_channel::ChannelReadError::NotConnected
-                    | socket_channel::ChannelReadError::Socket(_) => {
-                        Err(ReceiveError::SocketInInvalidState)
-                    }
-                });
+            let outcome = match socket {
+                BrokerSocket::Tcp(socket) => socket.try_read(buf, flags, source_addr),
+                BrokerSocket::Udp(socket) => {
+                    socket.try_read(buf, flags, source_addr).map(|received| {
+                        if flags.intersects(ReceiveFlags::TRUNC | ReceiveFlags::DISCARD) {
+                            received
+                        } else {
+                            received.min(buf.len())
+                        }
+                    })
+                }
+            };
+            return outcome.or_else(|error| match error {
+                socket_channel::ChannelReadError::WouldBlock => Ok(0),
+                socket_channel::ChannelReadError::ReadShutdown
+                | socket_channel::ChannelReadError::ConnectionClosed => {
+                    Err(ReceiveError::OperationFinished)
+                }
+                socket_channel::ChannelReadError::NotConnected
+                | socket_channel::ChannelReadError::Socket(_) => {
+                    Err(ReceiveError::SocketInInvalidState)
+                }
+            });
         }
 
         let ret = match socket_handle.protocol() {
@@ -1815,7 +1890,7 @@ where
             .get_entry_mut(fd)
             .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if socket_handle.broker_socket.is_some() {
+        if matches!(&socket_handle.broker_socket, Some(BrokerSocket::Tcp(_))) {
             return Err(errors::SetTcpOptionError::Unsupported);
         }
         match socket_handle.protocol() {
@@ -1855,7 +1930,7 @@ where
             .get_entry_mut(fd)
             .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        if socket_handle.broker_socket.is_some() {
+        if matches!(&socket_handle.broker_socket, Some(BrokerSocket::Tcp(_))) {
             return Err(errors::GetTcpOptionError::Unsupported);
         }
         match socket_handle.protocol() {

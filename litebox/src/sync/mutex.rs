@@ -214,6 +214,31 @@ unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for Mutex<Platfor
 unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Sync for Mutex<Platform, T> {}
 
 impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
+    /// Attempts to acquire this mutex without blocking.
+    #[inline]
+    #[track_caller]
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, Platform, T>> {
+        #[cfg(feature = "lock_tracing")]
+        self.creation
+            .ensure_registered(LockType::Mutex, || self.raw.raw.underlying_atomic());
+
+        if !self.raw.try_lock() {
+            return None;
+        }
+
+        #[cfg(feature = "lock_tracing")]
+        let attempt = super::lock_tracing::LockTracker::begin_lock_attempt(
+            LockType::Mutex,
+            self.raw.raw.underlying_atomic(),
+        );
+
+        Some(MutexGuard {
+            mutex: self,
+            #[cfg(feature = "lock_tracing")]
+            locked_witness: attempt.map(super::lock_tracing::LockTracker::mark_lock),
+        })
+    }
+
     #[inline]
     #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, Platform, T> {

@@ -15,6 +15,7 @@ const BROKER_ONLY_C_TESTS: &[&str] = &[
     "pipe_broker.c",
     "tcp_broker.c",
     "tcp_broker_server.c",
+    "udp_broker.c",
 ];
 
 #[must_use]
@@ -648,6 +649,95 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         .broker_socket(&control_socket_path)
         .run();
     assert_eq!(broker.next_close_object_count(), 9);
+    broker.join();
+    server.join().unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_broker_udp_with_rewriter() {
+    use std::net::{Ipv4Addr, UdpSocket};
+
+    let target = common::compile("./tests/udp_broker.c", "broker_udp_rewriter", false, false);
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = server.local_addr().unwrap().port();
+    let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let refused_port = refused.local_addr().unwrap().port();
+    drop(refused);
+    let mut runner = Runner::new(&target, "broker_udp_rewriter");
+    server
+        .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
+        .unwrap();
+    let server = std::thread::spawn(move || {
+        let mut packet = [0_u8; 64];
+
+        let (received, client) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"unconnected");
+        server.send_to(b"0123456789", client).unwrap();
+
+        let (received, source) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"read");
+        assert_eq!(source, client);
+        server.send_to(b"abcdefghij", client).unwrap();
+
+        let (received, source) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"readv");
+        assert_eq!(source, client);
+        server.send_to(b"abcdefghij", client).unwrap();
+
+        let (received, source) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"readv-fault");
+        assert_eq!(source, client);
+        server.send_to(b"abcdefghij", client).unwrap();
+
+        let (received, source) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(received, 0);
+        assert_eq!(source, client);
+        server.send_to(&[], client).unwrap();
+
+        let (received, source) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"connected");
+        assert_eq!(source, client);
+        server.send_to(b"connected-reply", client).unwrap();
+
+        let (received, source) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"writev");
+        assert_eq!(source, client);
+        server.send_to(b"writev-reply", client).unwrap();
+
+        let (received, source) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"explicit");
+        assert_eq!(source, client);
+        server.send_to(b"explicit-reply", client).unwrap();
+
+        let mut maximum = vec![0_u8; 65_507];
+        let (received, source) = server.recv_from(&mut maximum).unwrap();
+        assert_eq!(received, maximum.len());
+        assert!(maximum.iter().all(|byte| *byte == 0x5a));
+        assert_eq!(source, client);
+        server.send_to(b"maximum-reply", client).unwrap();
+
+        let (received, source) = server.recv_from(&mut packet).unwrap();
+        assert_eq!(&packet[..received], b"preserved");
+        assert_eq!(source, client);
+        server.send_to(b"preserved-reply", client).unwrap();
+    });
+
+    let control_socket_path = unique_test_socket_path("runner-broker-udp-control");
+    let broker = spawn_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
+        1,
+    );
+    runner
+        .arg(port.to_string())
+        .arg(refused_port.to_string())
+        .broker_socket(&control_socket_path)
+        .run();
+    assert_eq!(broker.next_close_object_count(), 3);
     broker.join();
     server.join().unwrap();
 }

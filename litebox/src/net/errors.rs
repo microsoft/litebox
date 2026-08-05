@@ -157,6 +157,8 @@ pub enum SendError {
     Unaddressable,
     #[error("Buffer is full")]
     BufferFull,
+    #[error("Datagram is too large")]
+    MessageTooLong,
     #[error("port allocation failed: {0}")]
     PortAllocationFailure(#[from] LocalPortAllocationError),
     #[error("unnecessary destination address provided")]

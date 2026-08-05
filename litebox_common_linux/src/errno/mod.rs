@@ -510,6 +510,7 @@ impl From<litebox::net::errors::SendError> for Errno {
             litebox::net::errors::SendError::SocketInInvalidState => Errno::EPIPE,
             litebox::net::errors::SendError::Unaddressable => Errno::EINVAL,
             litebox::net::errors::SendError::BufferFull => Errno::EAGAIN,
+            litebox::net::errors::SendError::MessageTooLong => Errno::EMSGSIZE,
             litebox::net::errors::SendError::PortAllocationFailure(e) => e.into(),
             litebox::net::errors::SendError::UnnecessaryDestinationAddress => Errno::EISCONN,
             litebox::net::errors::SendError::DestinationAddressRequired => Errno::EDESTADDRREQ,
@@ -526,6 +527,7 @@ impl From<litebox::net::socket_channel::ChannelWriteError> for Errno {
             | litebox::net::socket_channel::ChannelWriteError::ConnectionClosed => Errno::EPIPE,
             litebox::net::socket_channel::ChannelWriteError::Unaddressable => Errno::EINVAL,
             litebox::net::socket_channel::ChannelWriteError::BufferFull => Errno::EAGAIN,
+            litebox::net::socket_channel::ChannelWriteError::MessageTooLong => Errno::EMSGSIZE,
             litebox::net::socket_channel::ChannelWriteError::DestinationAddressRequired => {
                 Errno::EDESTADDRREQ
             }

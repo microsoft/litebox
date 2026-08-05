@@ -14,7 +14,7 @@ use alloc::sync::Arc;
 use litebox::{
     event::{
         Events, IOPollable,
-        polling::TryOpError,
+        polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
     },
     fd::EntryHandle,
@@ -26,6 +26,7 @@ use litebox::{
         socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy, SocketState},
     },
     platform::{Instant as _, page_mgmt::MemoryRegionPermissions},
+    sync::{Mutex, MutexGuard},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
@@ -80,33 +81,41 @@ impl<Instant> ReceiveContext<Instant> {
     }
 }
 
-struct InetReceiveSocket<'a, Platform: ShimPlatform, FS: ShimFS> {
+pub(crate) struct InetSocketPin<'a, Platform: ShimPlatform, FS: ShimFS> {
     global: &'a GlobalState<Platform, FS>,
     entry: Option<EntryHandle<Platform, litebox::net::Network<Platform>>>,
-    state: SocketReceiveState,
+    state: SocketIoState,
     proxy: Arc<NetworkProxy<Platform>>,
     recv_timeout: Option<core::time::Duration>,
+    send_timeout: Option<core::time::Duration>,
     is_nonblock: bool,
     socket_type: SockType,
+    recvmmsg_lock: SocketRecvmmsgLock<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Drop for InetReceiveSocket<'_, Platform, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> InetSocketPin<'_, Platform, FS> {
+    pub(crate) fn is_broker_datagram(&self) -> bool {
+        matches!(self.proxy.as_ref(), NetworkProxy::BrokerDatagram(_))
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Drop for InetSocketPin<'_, Platform, FS> {
     fn drop(&mut self) {
         drop(self.entry.take());
         let previous = self
             .state
             .0
             .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-        let active_pins = previous & SOCKET_RECEIVE_PIN_COUNT_MASK;
-        assert_ne!(active_pins, 0, "receive pin count underflow");
-        if active_pins != 1 || previous & SOCKET_RECEIVE_CLOSE_PENDING == 0 {
+        let active_pins = previous & SOCKET_IO_PIN_COUNT_MASK;
+        assert_ne!(active_pins, 0, "socket I/O pin count underflow");
+        if active_pins != 1 || previous & SOCKET_IO_CLOSE_PENDING == 0 {
             return;
         }
         let mut net = self.global.net.lock();
         let pending = net.finish_deferred_closes();
         if !pending {
             self.state.0.fetch_and(
-                !SOCKET_RECEIVE_CLOSE_PENDING,
+                !SOCKET_IO_CLOSE_PENDING,
                 core::sync::atomic::Ordering::Release,
             );
         }
@@ -114,11 +123,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for InetReceiveSocket<'_, Platform
 }
 
 enum ReceiveSocket<'a, Platform: ShimPlatform, FS: ShimFS> {
-    Inet(InetReceiveSocket<'a, Platform, FS>),
+    Inet(InetSocketPin<'a, Platform, FS>),
     Unix(EntryHandle<Platform, UnixSocketSubsystem<Platform, FS>>),
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
+    pub(crate) fn try_pin_inet_socket<'a>(
+        &self,
+        global: &'a GlobalState<Platform, FS>,
+        raw_fd: usize,
+    ) -> Result<Option<InetSocketPin<'a, Platform, FS>>, Errno> {
+        let rds = self.raw_descriptor_store.read();
+        let fd = match rds.fd_from_raw_integer(raw_fd) {
+            Ok(fd) => fd,
+            Err(litebox::fd::ErrRawIntFd::NotFound) => return Err(Errno::EBADF),
+            Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => return Ok(None),
+        };
+        let socket = global.pin_socket(&fd)?;
+        drop(rds);
+        Ok(Some(socket))
+    }
+
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
     ///
     /// This method handles the common pattern of:
@@ -168,7 +193,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
         let raw_fd = sockfd as usize;
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(raw_fd) {
-            let socket = ReceiveSocket::Inet(global.pin_receive_socket(&fd)?);
+            let socket = ReceiveSocket::Inet(global.pin_socket(&fd)?);
             drop(rds);
             return Ok(socket);
         }
@@ -265,10 +290,66 @@ pub(super) struct SocketOptions {
 pub(crate) struct SocketOFlags(pub OFlags);
 pub(crate) struct SocketProxy<Platform: ShimPlatform>(pub Arc<NetworkProxy<Platform>>);
 #[derive(Clone)]
-struct SocketReceiveState(Arc<core::sync::atomic::AtomicUsize>);
+struct SocketIoState(Arc<core::sync::atomic::AtomicUsize>);
+struct SocketRecvmmsgLock<Platform: ShimPlatform>(Arc<RecvmmsgLock<Platform>>);
 
-const SOCKET_RECEIVE_CLOSE_PENDING: usize = 1 << (usize::BITS - 1);
-const SOCKET_RECEIVE_PIN_COUNT_MASK: usize = SOCKET_RECEIVE_CLOSE_PENDING - 1;
+struct RecvmmsgLock<Platform: ShimPlatform> {
+    mutex: Mutex<Platform, ()>,
+    pollee: Pollee<Platform>,
+}
+
+struct RecvmmsgGuard<'a, Platform: ShimPlatform> {
+    guard: Option<MutexGuard<'a, Platform, ()>>,
+    lock: &'a RecvmmsgLock<Platform>,
+}
+
+impl<Platform: ShimPlatform> RecvmmsgLock<Platform> {
+    fn new() -> Self {
+        Self {
+            mutex: Mutex::new(()),
+            pollee: Pollee::new(),
+        }
+    }
+
+    fn try_lock(&self) -> Option<RecvmmsgGuard<'_, Platform>> {
+        Some(RecvmmsgGuard {
+            guard: Some(self.mutex.try_lock()?),
+            lock: self,
+        })
+    }
+
+    fn lock_interruptibly(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+    ) -> Result<RecvmmsgGuard<'_, Platform>, Errno> {
+        cx.wait_on_events(
+            false,
+            Events::IN,
+            |observer, filter| {
+                self.pollee.register_observer(observer, filter);
+                Ok(())
+            },
+            || self.try_lock().ok_or(TryOpError::TryAgain),
+        )
+        .map_err(socket_io_errno)
+    }
+}
+
+impl<Platform: ShimPlatform> Drop for RecvmmsgGuard<'_, Platform> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.lock.pollee.notify_observers(Events::IN);
+    }
+}
+
+impl<Platform: ShimPlatform> Clone for SocketRecvmmsgLock<Platform> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+const SOCKET_IO_CLOSE_PENDING: usize = 1 << (usize::BITS - 1);
+const SOCKET_IO_PIN_COUNT_MASK: usize = SOCKET_IO_CLOSE_PENDING - 1;
 
 impl<Platform: ShimPlatform> Clone for SocketProxy<Platform> {
     fn clone(&self) -> Self {
@@ -302,13 +383,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             let old = dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        let old = dt.set_fd_metadata(fd, sock_type);
+        let old = dt.set_entry_metadata(fd, sock_type);
         assert!(old.is_none());
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
         let old = dt.set_entry_metadata(
             fd,
-            SocketReceiveState(Arc::new(core::sync::atomic::AtomicUsize::new(0))),
+            SocketIoState(Arc::new(core::sync::atomic::AtomicUsize::new(0))),
+        );
+        assert!(old.is_none());
+        let old = dt.set_entry_metadata(
+            fd,
+            SocketRecvmmsgLock(Arc::new(RecvmmsgLock::<Platform>::new())),
         );
         assert!(old.is_none());
         drop(dt);
@@ -920,14 +1006,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         context: ReceiveContext<Platform::Instant>,
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
-        let socket = self.pin_receive_socket(fd)?;
-        self.receive_from_socket(cx, &socket, buf, flags, context, source_addr)
+        let socket = self.pin_socket(fd)?;
+        let received = self.receive_from_socket(cx, &socket, buf, flags, context, source_addr)?;
+        Ok(if flags.contains(ReceiveFlags::TRUNC) {
+            received
+        } else {
+            received.min(buf.len())
+        })
     }
 
-    fn pin_receive_socket(
+    pub(crate) fn pin_socket(
         &self,
         fd: &SocketFd<Platform>,
-    ) -> Result<InetReceiveSocket<'_, Platform, FS>, Errno> {
+    ) -> Result<InetSocketPin<'_, Platform, FS>, Errno> {
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table.entry_handle(fd).ok_or(Errno::EBADF)?;
         let proxy = descriptor_table
@@ -936,8 +1027,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
             })?;
-        let recv_timeout = descriptor_table
-            .with_metadata(fd, |options: &SocketOptions| options.recv_timeout)
+        let (recv_timeout, send_timeout) = descriptor_table
+            .with_metadata(fd, |options: &SocketOptions| {
+                (options.recv_timeout, options.send_timeout)
+            })
             .map_err(|error| match error {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
@@ -955,33 +1048,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
             })?;
         let state = descriptor_table
-            .with_metadata(fd, |state: &SocketReceiveState| state.clone())
+            .with_metadata(fd, |state: &SocketIoState| state.clone())
+            .map_err(|error| match error {
+                litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
+                litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+            })?;
+        let recvmmsg_lock = descriptor_table
+            .with_metadata(fd, |lock: &SocketRecvmmsgLock<Platform>| lock.clone())
             .map_err(|error| match error {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
             })?;
         let previous = state.0.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         assert_ne!(
-            previous & SOCKET_RECEIVE_PIN_COUNT_MASK,
-            SOCKET_RECEIVE_PIN_COUNT_MASK,
-            "receive pin count overflow"
+            previous & SOCKET_IO_PIN_COUNT_MASK,
+            SOCKET_IO_PIN_COUNT_MASK,
+            "socket I/O pin count overflow"
         );
         drop(descriptor_table);
-        Ok(InetReceiveSocket {
+        Ok(InetSocketPin {
             global: self,
             entry: Some(entry),
             state,
             proxy,
             recv_timeout,
+            send_timeout,
             is_nonblock,
             socket_type,
+            recvmmsg_lock,
         })
     }
 
-    fn receive_from_socket(
+    pub(crate) fn receive_from_socket(
         &self,
         cx: &WaitContext<'_, Platform>,
-        socket: &InetReceiveSocket<'_, Platform, FS>,
+        socket: &InetSocketPin<'_, Platform, FS>,
         buf: &mut [u8],
         flags: ReceiveFlags,
         context: ReceiveContext<Platform::Instant>,
@@ -1069,6 +1170,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                             return Ok(received);
                         }
                     }
+                    Err(ChannelReadError::ReadShutdown)
+                        if is_nonblock && matches!(socket_type, SockType::Datagram) =>
+                    {
+                        return Err(TryOpError::TryAgain);
+                    }
                     Err(ChannelReadError::ReadShutdown) => return Ok(received),
                     Err(ChannelReadError::WouldBlock) => return Err(TryOpError::TryAgain),
                     Err(ChannelReadError::ConnectionClosed) => {
@@ -1119,11 +1225,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     Err(ChannelReadError::WouldBlock) => Err(socket_io_errno(error)),
                 }
             }
+
             Err(error) => Err(socket_io_errno(error)),
         }
     }
 
-    fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
+    pub(crate) fn send_to_pinned_socket(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        socket: &InetSocketPin<'_, Platform, FS>,
+        buf: &[u8],
+        flags: SendFlags,
+    ) -> Result<usize, Errno> {
+        let new_flags = convert_flags!(
+            flags,
+            SendFlags,
+            litebox::net::SendFlags,
+            CONFIRM,
+            DONTROUTE,
+            EOR,
+            MORE,
+            OOB,
+        );
+        cx.with_timeout(socket.send_timeout)
+            .wait_on_events(
+                socket.is_nonblock || flags.contains(SendFlags::DONTWAIT),
+                Events::OUT,
+                |observer, filter| {
+                    socket.proxy.register_observer(observer, filter);
+                    Ok(())
+                },
+                || match socket.proxy.try_write(buf, new_flags, None) {
+                    Ok(0) if buf.is_empty() => Ok(0),
+                    Ok(0) | Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
+                    Ok(n) => Ok(n),
+                    Err(error) => Err(TryOpError::Other(Errno::from(error))),
+                },
+            )
+            .map_err(socket_io_errno)
+    }
+
+    pub(crate) fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
         self.litebox
             .descriptor_table()
             .with_metadata(fd, |sock_type: &SockType| *sock_type)
@@ -1198,22 +1340,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let state = self
             .litebox
             .descriptor_table()
-            .with_metadata(fd, |state: &SocketReceiveState| state.clone())
+            .with_metadata(fd, |state: &SocketIoState| state.clone())
             .map_err(|_| litebox::net::errors::CloseError::InvalidFd)?;
         state.0.fetch_or(
-            SOCKET_RECEIVE_CLOSE_PENDING,
+            SOCKET_IO_CLOSE_PENDING,
             core::sync::atomic::Ordering::AcqRel,
         );
         let mut net = self.net.lock();
         state.0.fetch_or(
-            SOCKET_RECEIVE_CLOSE_PENDING,
+            SOCKET_IO_CLOSE_PENDING,
             core::sync::atomic::Ordering::AcqRel,
         );
         let result = net.close(fd, behavior);
         let pending = net.finish_deferred_closes();
         if !pending {
             state.0.fetch_and(
-                !SOCKET_RECEIVE_CLOSE_PENDING,
+                !SOCKET_IO_CLOSE_PENDING,
                 core::sync::atomic::Ordering::Release,
             );
         }
@@ -1746,10 +1888,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
+        let is_inet_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
+                is_inet_datagram.set(matches!(
+                    self.global.get_socket_type(fd)?,
+                    SockType::Datagram
+                ));
                 let sockaddr = sockaddr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
@@ -1767,6 +1914,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
+            && !is_inet_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -1817,10 +1965,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EFAULT)?,
             )
         };
+        let is_inet_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
+                is_inet_datagram.set(matches!(
+                    self.global.get_socket_type(fd)?,
+                    SockType::Datagram
+                ));
                 let sock_addr = sock_addr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
@@ -1840,6 +1993,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
+            && !is_inet_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -2380,7 +2534,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // A `None` deadline means either no user-supplied timeout or a saturating overflow
         // — both are treated as "no deadline".
         let deadline = timeout_duration.and_then(|d| self.global.platform.now().checked_add(d));
-
         let stride = size_of::<UserMmsgHdr>();
         let msg_len_off = offset_of!(UserMmsgHdr, msg_len);
         let msgvec_base = msgvec.as_usize();
@@ -2388,6 +2541,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if msgvec_base.checked_add(msgvec_len).is_none() {
             return Err(Errno::EFAULT);
         }
+
+        let _recvmmsg = if vlen <= 1 {
+            None
+        } else {
+            match &socket {
+                ReceiveSocket::Inet(socket)
+                    if timeout_duration.is_some()
+                        || flags.contains(ReceiveFlags::DONTWAIT)
+                        || socket.is_nonblock =>
+                {
+                    Some(socket.recvmmsg_lock.0.try_lock().ok_or(Errno::EAGAIN)?)
+                }
+                ReceiveSocket::Inet(socket) => {
+                    Some(socket.recvmmsg_lock.0.lock_interruptibly(&self.wait_cx())?)
+                }
+                ReceiveSocket::Unix(_) => None,
+            }
+        };
 
         // WAITFORONE is mmsg-only; the inner recvmsg doesn't recognize it.
         let waitforone = flags.contains(ReceiveFlags::WAITFORONE);
@@ -2680,7 +2851,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_inet_receive_pin_reaps_deferred_close() {
+    fn dropping_inet_socket_pin_reaps_deferred_close() {
         let task = init_platform(None);
         let fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
@@ -2697,13 +2868,151 @@ mod tests {
 
         close_socket(&task, fd);
         assert!(
-            state.0.load(core::sync::atomic::Ordering::Acquire)
-                & super::SOCKET_RECEIVE_CLOSE_PENDING
+            state.0.load(core::sync::atomic::Ordering::Acquire) & super::SOCKET_IO_CLOSE_PENDING
                 != 0
         );
 
         drop(socket);
         assert_eq!(state.0.load(core::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn socket_io_pin_keeps_backend_alive_for_send_after_close() {
+        let task = init_platform(None);
+        let fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let socket = task
+            .files
+            .borrow()
+            .pin_receive_socket(&task.global, fd)
+            .unwrap();
+        let state = match &socket {
+            super::ReceiveSocket::Inet(socket) => socket.state.clone(),
+            super::ReceiveSocket::Unix(_) => unreachable!(),
+        };
+
+        close_socket(&task, fd);
+        assert!(
+            state.0.load(core::sync::atomic::Ordering::Acquire) & super::SOCKET_IO_CLOSE_PENDING
+                != 0
+        );
+        let result = match &socket {
+            super::ReceiveSocket::Inet(socket) => task.global.send_to_pinned_socket(
+                &task.wait_cx(),
+                socket,
+                b"pinned",
+                SendFlags::empty(),
+            ),
+            super::ReceiveSocket::Unix(_) => unreachable!(),
+        };
+        assert_eq!(result, Err(Errno::EDESTADDRREQ));
+
+        drop(socket);
+        assert_eq!(state.0.load(core::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn raw_inet_socket_pin_does_not_follow_dup2_replacement() {
+        let task = init_platform(None);
+        let old_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let new_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let old_socket = task
+            .files
+            .borrow()
+            .try_pin_inet_socket(&task.global, old_fd as usize)
+            .unwrap()
+            .unwrap();
+        let old_state = old_socket.state.clone();
+        let new_socket = task
+            .files
+            .borrow()
+            .try_pin_inet_socket(&task.global, new_fd as usize)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            task.sys_dup(
+                new_fd.try_into().unwrap(),
+                Some(old_fd.try_into().unwrap()),
+                None,
+            )
+            .unwrap(),
+            old_fd
+        );
+        assert!(
+            old_state.0.load(core::sync::atomic::Ordering::Acquire)
+                & super::SOCKET_IO_CLOSE_PENDING
+                != 0
+        );
+        let replacement = task
+            .files
+            .borrow()
+            .try_pin_inet_socket(&task.global, old_fd as usize)
+            .unwrap()
+            .unwrap();
+        assert!(alloc::sync::Arc::ptr_eq(
+            &replacement.proxy,
+            &new_socket.proxy
+        ));
+        assert!(!alloc::sync::Arc::ptr_eq(
+            &replacement.proxy,
+            &old_socket.proxy
+        ));
+
+        drop(old_socket);
+        assert_eq!(old_state.0.load(core::sync::atomic::Ordering::Acquire), 0);
+        drop(replacement);
+        drop(new_socket);
+        close_socket(&task, old_fd);
+        close_socket(&task, new_fd);
+    }
+
+    #[test]
+    fn recvmmsg_lock_wakes_contended_waiter() {
+        let task = init_platform(None);
+        let lock = alloc::sync::Arc::new(super::RecvmmsgLock::new());
+        let guard = lock.try_lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let worker_lock = alloc::sync::Arc::clone(&lock);
+        task.spawn_clone_for_test(move |task| {
+            started_tx.send(()).unwrap();
+            let _guard = worker_lock.lock_interruptibly(&task.wait_cx()).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(core::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(core::time::Duration::from_millis(20))
+                .is_err()
+        );
+        drop(guard);
+        acquired_rx
+            .recv_timeout(core::time::Duration::from_secs(1))
+            .unwrap();
     }
 
     #[test]
