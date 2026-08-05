@@ -1,7 +1,7 @@
-#define _GNU_SOURCE
-
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
+
+#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <assert.h>
