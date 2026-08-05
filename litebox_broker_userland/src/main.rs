@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, Ipv4Cidr, ObjectRights,
-    PolicyEngine, SocketPolicy, SocketPolicyError, TcpDestinationRule, UdpDestinationRule,
+    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
+    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
@@ -148,14 +148,14 @@ fn configured_socket_policy(
     let rules = allowed_destinations
         .iter()
         .map(|allowed| {
-            TcpDestinationRule::new(
+            DestinationRule::new(
                 CallerCredential::HostGuaranteed,
                 allowed.destination,
                 allowed.ports,
             )
         })
         .collect::<Vec<_>>();
-    let udp_loopback = UdpDestinationRule::new(
+    let udp_loopback = DestinationRule::new(
         CallerCredential::HostGuaranteed,
         Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).expect("the IPv4 loopback CIDR is canonical"),
         DestinationPortRange::new(Port(1), Port(u16::MAX))
@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(
             rules[0],
-            TcpDestinationRule::new(
+            DestinationRule::new(
                 CallerCredential::HostGuaranteed,
                 allowed.destination,
                 allowed.ports,
@@ -584,7 +584,7 @@ mod tests {
         );
         assert_eq!(
             policy.udp_destination_rules().unwrap(),
-            &[UdpDestinationRule::new(
+            &[DestinationRule::new(
                 CallerCredential::HostGuaranteed,
                 Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
                 DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),

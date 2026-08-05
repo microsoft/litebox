@@ -98,15 +98,15 @@ impl DestinationPortRange {
     }
 }
 
-/// One static IPv4 TCP destination authorization rule.
+/// One static IPv4 destination authorization rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TcpDestinationRule {
+pub struct DestinationRule {
     caller_credential: CallerCredential,
     destination: Ipv4Cidr,
     ports: DestinationPortRange,
 }
 
-impl TcpDestinationRule {
+impl DestinationRule {
     /// Creates a rule for one caller, destination network, and port range.
     #[must_use]
     pub const fn new(
@@ -148,69 +148,7 @@ impl TcpDestinationRule {
     }
 }
 
-/// One static IPv4 UDP destination authorization rule.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UdpDestinationRule {
-    caller_credential: CallerCredential,
-    destination: Ipv4Cidr,
-    ports: DestinationPortRange,
-}
-
-impl UdpDestinationRule {
-    /// Creates a rule for one caller, destination network, and port range.
-    #[must_use]
-    pub const fn new(
-        caller_credential: CallerCredential,
-        destination: Ipv4Cidr,
-        ports: DestinationPortRange,
-    ) -> Self {
-        Self {
-            caller_credential,
-            destination,
-            ports,
-        }
-    }
-
-    /// Returns the caller authorized by this rule.
-    #[must_use]
-    pub const fn caller_credential(self) -> CallerCredential {
-        self.caller_credential
-    }
-
-    /// Returns the authorized destination network.
-    #[must_use]
-    pub const fn destination(self) -> Ipv4Cidr {
-        self.destination
-    }
-
-    /// Returns the authorized destination-port range.
-    #[must_use]
-    pub const fn ports(self) -> DestinationPortRange {
-        self.ports
-    }
-
-    fn permits(self, caller_credential: CallerCredential, address: SocketAddrV4) -> bool {
-        self.caller_credential == caller_credential
-            && self
-                .destination
-                .contains(Ipv4Address(address.ip().octets()))
-            && self.ports.contains(Port(address.port()))
-    }
-}
-
-const EMPTY_TCP_DESTINATION_RULE: TcpDestinationRule = TcpDestinationRule {
-    caller_credential: CallerCredential::Unauthenticated,
-    destination: Ipv4Cidr {
-        network: Ipv4Address([0, 0, 0, 0]),
-        prefix_length: 0,
-    },
-    ports: DestinationPortRange {
-        start: Port(1),
-        end: Port(1),
-    },
-};
-
-const EMPTY_UDP_DESTINATION_RULE: UdpDestinationRule = UdpDestinationRule {
+const EMPTY_DESTINATION_RULE: DestinationRule = DestinationRule {
     caller_credential: CallerCredential::Unauthenticated,
     destination: Ipv4Cidr {
         network: Ipv4Address([0, 0, 0, 0]),
@@ -247,21 +185,21 @@ pub enum SocketPolicyError {
 /// Bounded static IPv4 TCP destination rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TcpDestinationPolicy {
-    tcp_destination_rules: [TcpDestinationRule; MAX_TCP_DESTINATION_RULES],
+    tcp_destination_rules: [DestinationRule; MAX_TCP_DESTINATION_RULES],
     tcp_destination_rule_count: usize,
 }
 
 impl TcpDestinationPolicy {
     const fn empty() -> Self {
         Self {
-            tcp_destination_rules: [EMPTY_TCP_DESTINATION_RULE; MAX_TCP_DESTINATION_RULES],
+            tcp_destination_rules: [EMPTY_DESTINATION_RULE; MAX_TCP_DESTINATION_RULES],
             tcp_destination_rule_count: 0,
         }
     }
 
     /// Returns the configured TCP destination rules.
     #[must_use]
-    pub fn rules(&self) -> &[TcpDestinationRule] {
+    pub fn rules(&self) -> &[DestinationRule] {
         &self.tcp_destination_rules[..self.tcp_destination_rule_count]
     }
 }
@@ -269,21 +207,21 @@ impl TcpDestinationPolicy {
 /// Bounded static IPv4 UDP destination rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpDestinationPolicy {
-    udp_destination_rules: [UdpDestinationRule; MAX_UDP_DESTINATION_RULES],
+    udp_destination_rules: [DestinationRule; MAX_UDP_DESTINATION_RULES],
     udp_destination_rule_count: usize,
 }
 
 impl UdpDestinationPolicy {
     const fn empty() -> Self {
         Self {
-            udp_destination_rules: [EMPTY_UDP_DESTINATION_RULE; MAX_UDP_DESTINATION_RULES],
+            udp_destination_rules: [EMPTY_DESTINATION_RULE; MAX_UDP_DESTINATION_RULES],
             udp_destination_rule_count: 0,
         }
     }
 
     /// Returns the configured UDP destination rules.
     #[must_use]
-    pub fn rules(&self) -> &[UdpDestinationRule] {
+    pub fn rules(&self) -> &[DestinationRule] {
         &self.udp_destination_rules[..self.udp_destination_rule_count]
     }
 }
@@ -322,7 +260,7 @@ pub enum SocketPolicy {
 impl SocketPolicy {
     /// Creates a bounded policy from static IPv4 TCP destination rules.
     pub fn from_tcp_destination_rules(
-        rules: &[TcpDestinationRule],
+        rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
         Ok(Self::TcpDestinationRules(copy_tcp_destination_rules(
             rules,
@@ -331,7 +269,7 @@ impl SocketPolicy {
 
     /// Creates a bounded policy from static IPv4 UDP destination rules.
     pub fn from_udp_destination_rules(
-        rules: &[UdpDestinationRule],
+        rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
         let policy = copy_udp_destination_rules(rules)?;
         Ok(Self::UdpDestinationRules(policy))
@@ -339,8 +277,8 @@ impl SocketPolicy {
 
     /// Creates a policy with independent static IPv4 TCP and UDP rules.
     pub fn from_tcp_udp_destination_rules(
-        tcp_rules: &[TcpDestinationRule],
-        udp_rules: &[UdpDestinationRule],
+        tcp_rules: &[DestinationRule],
+        udp_rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
         let tcp = copy_tcp_destination_rules(tcp_rules)?;
         let udp = copy_udp_destination_rules(udp_rules)?;
@@ -349,7 +287,7 @@ impl SocketPolicy {
 
     /// Returns the configured rules for a bounded destination policy.
     #[must_use]
-    pub fn tcp_destination_rules(&self) -> Option<&[TcpDestinationRule]> {
+    pub fn tcp_destination_rules(&self) -> Option<&[DestinationRule]> {
         match self {
             Self::TcpDestinationRules(policy)
             | Self::TcpUdpDestinationRules { tcp: policy, .. } => Some(policy.rules()),
@@ -362,7 +300,7 @@ impl SocketPolicy {
 
     /// Returns the configured UDP rules for a bounded destination policy.
     #[must_use]
-    pub fn udp_destination_rules(&self) -> Option<&[UdpDestinationRule]> {
+    pub fn udp_destination_rules(&self) -> Option<&[DestinationRule]> {
         match self {
             Self::UdpDestinationRules(policy)
             | Self::TcpUdpDestinationRules { udp: policy, .. } => Some(policy.rules()),
@@ -431,7 +369,7 @@ impl SocketPolicy {
 }
 
 fn copy_tcp_destination_rules(
-    rules: &[TcpDestinationRule],
+    rules: &[DestinationRule],
 ) -> Result<TcpDestinationPolicy, SocketPolicyError> {
     if rules.len() > MAX_TCP_DESTINATION_RULES {
         return Err(SocketPolicyError::TooManyRules {
@@ -446,7 +384,7 @@ fn copy_tcp_destination_rules(
 }
 
 fn copy_udp_destination_rules(
-    rules: &[UdpDestinationRule],
+    rules: &[DestinationRule],
 ) -> Result<UdpDestinationPolicy, SocketPolicyError> {
     if rules.len() > MAX_UDP_DESTINATION_RULES {
         return Err(SocketPolicyError::TooManyUdpRules {
@@ -711,7 +649,7 @@ mod tests {
 
     #[test]
     fn destination_policy_is_bounded() {
-        let rule = TcpDestinationRule::new(
+        let rule = DestinationRule::new(
             CallerCredential::Unauthenticated,
             cidr([127, 0, 0, 0], 8),
             ports(1, u16::MAX),
@@ -737,7 +675,7 @@ mod tests {
 
     #[test]
     fn udp_destination_policy_is_bounded() {
-        let rule = UdpDestinationRule::new(
+        let rule = DestinationRule::new(
             CallerCredential::Unauthenticated,
             cidr([127, 0, 0, 0], 8),
             ports(1, u16::MAX),
@@ -764,12 +702,12 @@ mod tests {
     #[test]
     fn destination_rules_enforce_principal_cidr_and_port() {
         let socket_policy = SocketPolicy::from_tcp_destination_rules(&[
-            TcpDestinationRule::new(
+            DestinationRule::new(
                 CallerCredential::Unauthenticated,
                 cidr([10, 8, 0, 0], 13),
                 ports(443, 444),
             ),
-            TcpDestinationRule::new(
+            DestinationRule::new(
                 CallerCredential::HostGuaranteed,
                 cidr([192, 0, 2, 7], 32),
                 ports(8443, 8443),
@@ -839,12 +777,12 @@ mod tests {
 
     #[test]
     fn mixed_policy_authorizes_udp_independently_from_tcp() {
-        let tcp_rule = TcpDestinationRule::new(
+        let tcp_rule = DestinationRule::new(
             CallerCredential::Unauthenticated,
             cidr([192, 0, 2, 0], 24),
             ports(443, 443),
         );
-        let udp_rule = UdpDestinationRule::new(
+        let udp_rule = DestinationRule::new(
             CallerCredential::Unauthenticated,
             cidr([127, 0, 0, 0], 8),
             ports(53, 53),
