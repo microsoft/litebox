@@ -525,6 +525,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 .notify_observers(Events::IN | Events::OUT | Events::HUP);
         }
     }
+
+    pub(super) fn close(&self, abortive: bool) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.pollable_registry.unregister_pollable(self.handle);
+        if abortive {
+            let _ = self
+                .broker
+                .shutdown_socket(self.handle, ShutdownMode::Abort);
+        }
+        let _ = self.broker.close_object(self.handle);
+        self.pollee.notify_observers(Events::OUT | Events::HUP);
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerTcpSocket<Platform> {
@@ -568,22 +582,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerTc
             events.insert(Events::OUT);
         }
         events
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platform> {
-    pub(super) fn close(&self, abortive: bool) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.pollable_registry.unregister_pollable(self.handle);
-        if abortive {
-            let _ = self
-                .broker
-                .shutdown_socket(self.handle, ShutdownMode::Abort);
-        }
-        let _ = self.broker.close_object(self.handle);
-        self.pollee.notify_observers(Events::OUT | Events::HUP);
     }
 }
 
@@ -1014,6 +1012,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
             state.async_error = SocketAsyncError::from(error) as u32;
         }
     }
+
+    pub(super) fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.pollable_registry.unregister_pollable(self.handle);
+        let _ = self.broker.close_object(self.handle);
+        self.pollee.notify_observers(Events::OUT | Events::HUP);
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerUdpSocket<Platform> {
@@ -1046,17 +1053,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerUd
             events.insert(Events::HUP);
         }
         events
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platform> {
-    pub(super) fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
-        self.pollee.notify_observers(Events::OUT | Events::HUP);
     }
 }
 
