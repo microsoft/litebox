@@ -570,6 +570,14 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtSetWnfProcessNotificationEvent {
         notification_event: Handle,
     },
+    NtGetCompleteWnfStateSubscription {
+        old_state_name: Option<Platform::RawConstPointer<u64>>,
+        old_subscription_id: Option<Platform::RawConstPointer<u64>>,
+        old_event_mask: u32,
+        old_status: i32,
+        delivery_descriptor: Platform::RawMutPointer<u8>,
+        descriptor_size: u32,
+    },
     NtSubscribeWnfStateChange {
         state_name: Platform::RawConstPointer<u64>,
         change_stamp: u32,
@@ -1237,6 +1245,16 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtSetWnfProcessNotificationEvent => {
                 Some(sys_req!(NtSetWnfProcessNotificationEvent {
                     notification_event: { Handle::from_raw },
+                }))
+            }
+            NtSysno::NtGetCompleteWnfStateSubscription => {
+                Some(sys_req!(NtGetCompleteWnfStateSubscription {
+                    old_state_name:*,
+                    old_subscription_id:*,
+                    old_event_mask,
+                    old_status,
+                    delivery_descriptor:*,
+                    descriptor_size,
                 }))
             }
             NtSysno::NtSubscribeWnfStateChange => Some(sys_req!(NtSubscribeWnfStateChange {

@@ -1722,6 +1722,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::NtSetWnfProcessNotificationEvent { notification_event } => {
                 self.sys_nt_set_wnf_process_notification_event(notification_event)
             }
+            SyscallRequest::NtGetCompleteWnfStateSubscription {
+                old_state_name,
+                old_subscription_id,
+                old_event_mask,
+                old_status,
+                delivery_descriptor,
+                descriptor_size,
+            } => self.sys_nt_get_complete_wnf_state_subscription(
+                old_state_name,
+                old_subscription_id,
+                old_event_mask,
+                old_status,
+                delivery_descriptor,
+                descriptor_size,
+            ),
             SyscallRequest::NtSubscribeWnfStateChange {
                 state_name,
                 change_stamp,

@@ -221,6 +221,9 @@ impl NtStatus {
             0xC0000286 => "STATUS_MAGAZINE_NOT_PRESENT: Magazine not present",
             0xC0000287 => "STATUS_REINITIALIZATION_NEEDED: Reinitialization needed",
             0xC0000302 => "STATUS_WMI_ALREADY_DISABLED: WMI collection or events already disabled",
+            0xC0000718 => {
+                "STATUS_WNF_EVENT_ALREADY_SUBSCRIBED: The WNF event is already subscribed"
+            }
             _ => "STATUS_UNKNOWN: Unknown status code",
         }
     }
@@ -633,6 +636,9 @@ impl NtStatus {
 
     /// STATUS_WMI_ALREADY_DISABLED
     pub const WMI_ALREADY_DISABLED: Self = Self::from_raw(0xC0000302);
+
+    /// STATUS_WNF_EVENT_ALREADY_SUBSCRIBED
+    pub const WNF_EVENT_ALREADY_SUBSCRIBED: Self = Self::from_raw(0xC0000718);
 }
 
 impl From<i32> for NtStatus {

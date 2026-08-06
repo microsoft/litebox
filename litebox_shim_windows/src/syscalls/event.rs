@@ -121,7 +121,7 @@ impl<Platform: crate::ShimPlatform> EventObject<Platform> {
         self.replace_state(false)
     }
 
-    fn clear(&self) -> i32 {
+    pub(crate) fn clear(&self) -> i32 {
         self.replace_state(false)
     }
 
