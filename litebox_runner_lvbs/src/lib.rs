@@ -224,6 +224,11 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
     // Per-CPU; safe to call on BSP and APs.
     timer::init();
 
+    if is_bsp {
+        let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
+        register_embedded_tas(&shim);
+    }
+
     ret
 }
 
@@ -778,7 +783,8 @@ fn open_session_new_instance(
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
-    let Some(ta_bin) = find_ta_binary(ta_uuid) else {
+    let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
+    let Some(ta_bin) = find_ta_binary(&shim, &ta_uuid) else {
         msg_args.session = 0;
         msg_args.ret = TeeResult::ItemNotFound;
         msg_args.ret_origin = TeeOrigin::Tee;
@@ -801,9 +807,8 @@ fn open_session_new_instance(
     })?;
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
-    let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
     let loaded_program = Box::new(
-        shim.load_ldelf(LDELF_BINARY, ta_uuid, Some(ta_bin))
+        shim.load_ldelf(LDELF_BINARY, ta_uuid, Some(&ta_bin))
             .map_err(|_| {
                 // Safety: We are about to tear down this TA instance;
                 // no references to user-space memory will be held afterwards.
@@ -1337,24 +1342,38 @@ fn write_rpc_args_to_normal_world(
     Ok(())
 }
 
-// use include_bytes! to include ldelf and (KMPP) TA binaries
+// use include_bytes! to include ldelf
 const LDELF_BINARY: &[u8] = &[0u8; 0];
-const TA_BINARY: &[u8] = &[0u8; 0];
-const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
+
+/// Register a TA binary embedded in the runner image.
+fn register_embedded_ta(shim: &litebox_shim_optee::OpteeShim, ta_binary: &'static [u8]) -> bool {
+    let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_binary) else {
+        return false;
+    };
+    shim.store_ta_bin(&ta_head.uuid, ta_binary)
+}
+
+/// Register all TA binaries embedded in the runner image.
+fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim) {
+    static REGISTERED: spin::Once<()> = spin::Once::new();
+    REGISTERED.call_once(|| {
+        assert!(register_embedded_ta(
+            shim,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf"
+            ))
+        ));
+    });
+}
 
 /// Look up TA binary by UUID.
 /// TODO: Handle PTA UUIDs
-fn find_ta_binary(ta_uuid: litebox_common_optee::TeeUuid) -> Option<&'static [u8]> {
-    use litebox_common_optee::parse_ta_head;
-
-    for ta_binary in TA_BINARIES {
-        if let Some(ta_head) = parse_ta_head(ta_binary)
-            && ta_head.uuid == ta_uuid
-        {
-            return Some(ta_binary);
-        }
-    }
-    None
+fn find_ta_binary(
+    shim: &litebox_shim_optee::OpteeShim,
+    ta_uuid: &litebox_common_optee::TeeUuid,
+) -> Option<Box<[u8]>> {
+    shim.get_ta_bin(ta_uuid)
 }
 
 #[panic_handler]

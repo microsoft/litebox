@@ -150,7 +150,6 @@ impl OpteeShimBuilder {
             boot_instant: TimeProvider::now(self.platform),
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
-            ta_uuid_map: TaUuidMap::new(),
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
         });
         OpteeShim(global)
@@ -169,8 +168,6 @@ struct GlobalState {
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The LiteBox instance used throughout the shim.
     _litebox: litebox::LiteBox<Platform>,
-    /// The TA UUID to binary map for TA loading.
-    ta_uuid_map: TaUuidMap,
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
     /// rather than queued.
@@ -187,12 +184,12 @@ impl GlobalState {
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
     pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        self.ta_uuid_map.insert(*ta_uuid, ta_bin.into())
+        ta_uuid_map().insert(*ta_uuid, ta_bin.into())
     }
 
     /// Get the TA binary associated with the given TA UUID.
     pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
-        if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
+        if let Some(ta_bin) = ta_uuid_map().get(ta_uuid) {
             Some(ta_bin)
         } else {
             let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
@@ -205,7 +202,7 @@ impl GlobalState {
 
     /// Get the TA flags associated with the given TA UUID.
     pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
-        self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
+        ta_uuid_map().get_flags(ta_uuid).unwrap_or_default()
     }
 
     /// Monotonic time elapsed since this instance was created, used as GP
@@ -227,7 +224,7 @@ impl GlobalState {
     /// this TA binary
     #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
-        let _ = self.ta_uuid_map.remove(ta_uuid);
+        let _ = ta_uuid_map().remove(ta_uuid);
     }
 
     /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
@@ -308,6 +305,19 @@ impl OpteeShim {
     /// Get the global page manager
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
+    }
+
+    /// Store a TA binary associated with the given TA UUID.
+    ///
+    /// Returns `true` if the binary was successfully stored, `false` if the binary's
+    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
+    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
+        self.0.store_ta_bin(ta_uuid, ta_bin)
+    }
+
+    /// Get the TA binary associated with the given TA UUID.
+    pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+        self.0.get_ta_bin(ta_uuid)
     }
 
     /// Release all user-space memory mappings owned by this shim instance.
@@ -1322,13 +1332,13 @@ struct TaInfo {
 
 /// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
 pub(crate) struct TaUuidMap {
-    inner: spin::mutex::SpinMutex<HashMap<TeeUuid, TaInfo>>,
+    inner: spin::rwlock::RwLock<HashMap<TeeUuid, TaInfo>>,
 }
 
 impl TaUuidMap {
     pub(crate) fn new() -> Self {
         Self {
-            inner: spin::mutex::SpinMutex::new(HashMap::new()),
+            inner: spin::rwlock::RwLock::new(HashMap::new()),
         }
     }
 
@@ -1343,8 +1353,7 @@ impl TaUuidMap {
             return false;
         }
 
-        let mut inner = self.inner.lock();
-        inner.insert(
+        let _replaced = self.inner.write().insert(
             uuid,
             TaInfo {
                 binary: ta_bin,
@@ -1355,18 +1364,26 @@ impl TaUuidMap {
     }
 
     pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
-        self.inner.lock().get(uuid).map(|info| info.binary.clone())
+        self.inner.read().get(uuid).map(|info| info.binary.clone())
     }
 
     /// Get the TA flags for a given UUID.
     pub(crate) fn get_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
-        self.inner.lock().get(uuid).map(|info| info.flags)
+        self.inner.read().get(uuid).map(|info| info.flags)
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
     pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
-        self.inner.lock().remove(uuid).map(|info| info.binary)
+        self.inner.write().remove(uuid).map(|info| info.binary)
     }
+}
+
+/// Get the global TA UUID map.
+fn ta_uuid_map() -> Arc<TaUuidMap> {
+    static TA_UUID_MAP: once_cell::race::OnceBox<Arc<TaUuidMap>> = once_cell::race::OnceBox::new();
+    TA_UUID_MAP
+        .get_or_init(|| alloc::boxed::Box::new(Arc::new(TaUuidMap::new())))
+        .clone()
 }
 
 /// Per-instance TA state which can be shared between sessions if it is
