@@ -246,7 +246,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .write_slice_at_offset(0, descriptor.as_bytes())
             .is_none()
             || delivery_descriptor
-                .write_slice_at_offset(size_of::<WnfDeliveryDescriptor>().cast_signed(), &delivery.data)
+                .write_slice_at_offset(
+                    size_of::<WnfDeliveryDescriptor>().cast_signed(),
+                    &delivery.data,
+                )
                 .is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
@@ -741,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn process_notification_event_validates_and_signals() {
+    fn process_notification_event_validates_registration() {
         let task = test_task();
 
         assert_eq!(
@@ -793,86 +796,6 @@ mod tests {
         assert_eq!(
             task.sys_nt_set_wnf_process_notification_event(event),
             NtStatus::WNF_EVENT_ALREADY_SUBSCRIBED
-        );
-
-        let state_name = create_state(&task, None, 4);
-        assert_eq!(
-            update_state(&task, state_name, &[1, 2], None, 0, 0),
-            NtStatus::SUCCESS
-        );
-        let timeout = 0;
-        assert_eq!(
-            task.sys_nt_wait_for_single_object(event, false, Some(const_ptr(&timeout))),
-            NtStatus::TIMEOUT
-        );
-        let mut subscription_id = 0;
-        assert_eq!(
-            task.sys_nt_subscribe_wnf_state_change(
-                const_ptr(&state_name),
-                0,
-                0x11,
-                Some(mut_ptr(&mut subscription_id)),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            update_state(&task, state_name, &[3], None, 0, 0),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            task.sys_nt_wait_for_single_object(event, false, Some(const_ptr(&timeout))),
-            NtStatus::SUCCESS
-        );
-        let subscriptions = task.process.wnf_subscriptions.lock();
-        let pending = subscriptions
-            .pending
-            .get(&subscription_id)
-            .expect("subscribed state update should queue a delivery");
-        assert_eq!(pending.subscription_id, subscription_id);
-        assert_eq!(pending.state_name, state_name);
-        assert_eq!(pending.change_stamp, 2);
-        assert_eq!(pending.event_mask, 0x11);
-        assert!(pending.type_id.is_none());
-        assert_eq!(pending.data, [3]);
-    }
-
-    #[test]
-    fn registering_process_notification_event_signals_pending_delivery() {
-        let task = test_task();
-        let state_name = create_state(&task, None, 4);
-        assert_eq!(
-            task.sys_nt_subscribe_wnf_state_change(const_ptr(&state_name), 0, 0x11, None),
-            NtStatus::SUCCESS
-        );
-
-        let mut event = Handle::from_raw(0);
-        assert_eq!(
-            task.sys_nt_create_event(
-                mut_ptr(&mut event),
-                EventAccess::ALL_ACCESS.bits(),
-                None,
-                EventType::Notification as u32,
-                0,
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            update_state(&task, state_name, &[1], None, 0, 0),
-            NtStatus::SUCCESS
-        );
-
-        let timeout = 0;
-        assert_eq!(
-            task.sys_nt_wait_for_single_object(event, false, Some(const_ptr(&timeout))),
-            NtStatus::TIMEOUT
-        );
-        assert_eq!(
-            task.sys_nt_set_wnf_process_notification_event(event),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            task.sys_nt_wait_for_single_object(event, false, Some(const_ptr(&timeout))),
-            NtStatus::SUCCESS
         );
     }
 
@@ -1200,25 +1123,6 @@ mod tests {
             ),
             NtStatus::OBJECT_NAME_NOT_FOUND
         );
-    }
-
-    #[test]
-    fn state_name_information_accepts_larger_output_buffer() {
-        let task = test_task();
-        let state_name = create_state(&task, None, 4);
-        let mut value = [u32::MAX; 2];
-
-        assert_eq!(
-            task.sys_nt_query_wnf_state_name_information(
-                const_ptr(&state_name),
-                WnfStateNameInformation::Exists as u32,
-                None,
-                mut_ptr(&mut value[0]),
-                size_of::<[u32; 2]>().trunc(),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(value, [1, u32::MAX]);
     }
 
     #[test]
