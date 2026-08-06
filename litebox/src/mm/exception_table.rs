@@ -82,6 +82,9 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
             inout("cx") size => _,
             fault = label { return Err(Fault) }
         }
+
+        // If we reach this statement, copy succeeded:
+        return Ok(());
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -121,9 +124,16 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
             t2 = out(reg) _,
             fault = label { return Err(Fault) }
         }
+
+        // If we reach this statement, copy succeeded:
+        return Ok(());
     }
 
-    Ok(())
+    // No implementation for the selected architecture exists, pretend that a
+    // fault happened on the first byte (never silently pretend `dst` as was
+    // overwritten and the copy went through):
+    #[allow(unreachable_code)]
+    Err(Fault)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -137,7 +147,6 @@ macro_rules! read_fn {
         pub unsafe fn $name(src: *const $ty) -> Result<$ty, Fault> {
             let value: usize;
             let failed: u32;
-            #[cfg(target_arch = "x86_64")]
             unsafe {
                 core::arch::asm! {
                     "2:",
@@ -221,7 +230,6 @@ macro_rules! write_fn {
         /// in non-Rust memory.
         pub unsafe fn $name(dest: *mut $ty, value: $ty) -> Result<(), Fault> {
             let value: usize = (u64::from(value)).trunc();
-            #[cfg(target_arch = "x86_64")]
             unsafe {
                 core::arch::asm! {
                     "2:",
