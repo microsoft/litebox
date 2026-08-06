@@ -1248,7 +1248,6 @@ fn listen_socket(
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     let backlog = i32::try_from(backlog).map_err(|_| BrokerError::UnsupportedOperation)?;
-    let local_address = local_socket_address(&socket.socket)?;
     let was_listening = socket.listening;
     if !was_listening {
         epoll::modify(
@@ -1280,6 +1279,9 @@ fn listen_socket(
         }
     }
     socket.listening = true;
+    // An unbound TCP socket is implicitly bound by listen(2), so query the assigned
+    // address only after listen succeeds.
+    let local_address = local_socket_address(&socket.socket)?;
     let mut snapshot = socket
         .snapshot
         .lock()
@@ -2520,6 +2522,54 @@ mod tests {
         release_read_shutdown_server.send(()).unwrap();
         read_shutdown_server.join().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn reactor_assigns_a_port_to_an_unbound_tcp_listener() {
+        let provider = Arc::new(LinuxSocketProvider::new(2).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+            provider,
+        )
+        .unwrap();
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let listener = create_socket(&session, readiness.clone());
+
+        let local_address = match litebox_broker_core::socket::listen(&session, listener, 1)
+            .expect("listen request must succeed")
+        {
+            SocketOutcome::Completed(address) => address,
+            SocketOutcome::Failed(error) => panic!("listen failed: {error:?}"),
+        };
+        assert_ne!(local_address.port(), 0);
+
+        let connect_address = SocketAddrV4::new(
+            if local_address.ip().is_unspecified() {
+                Ipv4Addr::LOCALHOST
+            } else {
+                *local_address.ip()
+            },
+            local_address.port(),
+        );
+        let client = TcpStream::connect(connect_address).unwrap();
+        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        let accepted =
+            match litebox_broker_core::socket::accept(&session, listener, readiness).unwrap() {
+                SocketOutcome::Completed(accepted) => accepted,
+                SocketOutcome::Failed(error) => panic!("accept failed: {error:?}"),
+            };
+        assert_eq!(accepted.local_address, connect_address);
+        assert_eq!(
+            accepted.remote_address,
+            socket_address_v4(client.local_addr().unwrap())
+        );
     }
 
     #[test]
