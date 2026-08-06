@@ -34,6 +34,3 @@ jobs:
       - name: Set up Nextest
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-      - name: Set up tun device for Linux userland testing
-        run: |
-          sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh

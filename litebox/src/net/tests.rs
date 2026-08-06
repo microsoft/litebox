@@ -13,7 +13,7 @@ extern crate std;
 fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<MockPlatform>)) {
     // Create a listening socket
     let listener_fd = network
-        .socket(Protocol::Tcp)
+        .local_socket(Protocol::Tcp)
         .expect("Failed to create TCP socket");
     let listen_addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
 
@@ -26,7 +26,7 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
 
     // Create a connecting socket
     let client_fd = network
-        .socket(Protocol::Tcp)
+        .local_socket(Protocol::Tcp)
         .expect("Failed to create TCP socket");
     let err = network
         .connect(&client_fd, &listen_addr, false)
@@ -116,7 +116,7 @@ fn attach_socket_proxy_is_idempotent() {
     let litebox = LiteBox::new(MockPlatform::new());
     let mut network = Network::new(&litebox);
     let fd = network
-        .socket(Protocol::Tcp)
+        .local_socket(Protocol::Tcp)
         .expect("failed to create TCP socket");
 
     let first = network
@@ -134,7 +134,7 @@ fn pinned_immediate_close_remains_abortive() {
     let litebox = LiteBox::new(MockPlatform::new());
     let mut network = Network::new(&litebox);
     let fd = network
-        .socket(Protocol::Tcp)
+        .local_socket(Protocol::Tcp)
         .expect("failed to create TCP socket");
     let entry = litebox
         .descriptor_table()
@@ -159,7 +159,7 @@ fn final_duplicate_close_updates_abortive_behavior() {
     let litebox = LiteBox::new(MockPlatform::new());
     let mut network = Network::new(&litebox);
     let fd = network
-        .socket(Protocol::Tcp)
+        .local_socket(Protocol::Tcp)
         .expect("failed to create TCP socket");
     let duplicate = litebox
         .descriptor_table_mut()
@@ -193,7 +193,7 @@ fn final_duplicate_close_is_reaped_immediately() {
     let litebox = LiteBox::new(MockPlatform::new());
     let mut network = Network::new(&litebox);
     let fd = network
-        .socket(Protocol::Tcp)
+        .local_socket(Protocol::Tcp)
         .expect("failed to create TCP socket");
     let duplicate = litebox
         .descriptor_table_mut()
@@ -208,4 +208,23 @@ fn final_duplicate_close_is_reaped_immediately() {
         .close(&duplicate, CloseBehavior::Graceful)
         .expect("final duplicate close must succeed");
     assert!(network.queued_for_closure.is_empty());
+}
+
+#[test]
+fn unsupported_sockets_fail_cleanly_without_broker() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+
+    assert!(matches!(
+        network.socket(Protocol::Tcp),
+        Err(SocketError::BrokerUnavailable)
+    ));
+    assert!(matches!(
+        network.socket(Protocol::Udp),
+        Err(SocketError::BrokerUnavailable)
+    ));
+    assert!(matches!(
+        network.socket(Protocol::Icmp),
+        Err(SocketError::UnsupportedProtocol(1))
+    ));
 }

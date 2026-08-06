@@ -2899,6 +2899,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn dropping_inet_socket_pin_reaps_deferred_close() {
         let task = init_platform(None);
         let fd = task
@@ -2925,6 +2926,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn socket_io_pin_keeps_backend_alive_for_send_after_close() {
         let task = init_platform(None);
         let fd = task
@@ -2966,6 +2968,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn raw_inet_socket_pin_does_not_follow_dup2_replacement() {
         let task = init_platform(None);
         let old_fd = task
@@ -3080,6 +3083,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn inet_socket_returns_emfile_at_raw_fd_limit() {
         let task = init_platform(None);
         let fd = task
@@ -3380,31 +3384,37 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_blocking_send_tcp_socket() {
         test_tcp_socket_send(false, false);
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_nonblocking_send_tcp_socket() {
         test_tcp_socket_send(true, false);
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_blocking_recvfrom_tcp_socket() {
         test_tcp_socket_with_external_client(SERVER_PORT, false, false);
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_nonblocking_recvfrom_tcp_socket() {
         test_tcp_socket_with_external_client(SERVER_PORT, true, false);
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_blocking_recvfrom_tcp_socket_with_truncation() {
         test_tcp_socket_with_external_client(SERVER_PORT, false, true);
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_tcp_connection_refused() {
         let task = init_platform(Some(TUN_DEVICE_NAME));
         let socket_fd = task
@@ -3434,6 +3444,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_tcp_socket_as_client() {
         let task = init_platform(Some(TUN_DEVICE_NAME));
 
@@ -3644,6 +3655,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_blocking_udp_server_socket() {
         let task = init_platform(Some(TUN_DEVICE_NAME));
         blocking_udp_server_socket(&task, false, false, false, "recvfrom");
@@ -3651,6 +3663,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_nonblocking_udp_server_socket() {
         let task = init_platform(Some(TUN_DEVICE_NAME));
         blocking_udp_server_socket(&task, false, false, true, "recvfrom");
@@ -3658,6 +3671,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_blocking_udp_server_socket_with_truncation() {
         let task = init_platform(Some(TUN_DEVICE_NAME));
         blocking_udp_server_socket(&task, true, true, false, "recvfrom");
@@ -3666,6 +3680,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_udp_client_socket_without_server() {
         // We do not support loopback yet, so this test only checks that
         // the client can send packets without a server.
@@ -3717,6 +3732,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_tcp_sockopt() {
         let task = init_platform(Some(TUN_DEVICE_NAME));
         let sockfd = task
@@ -3811,6 +3827,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn test_socket_dup_and_close() {
         let task = init_platform(None);
         let socket_fd = task

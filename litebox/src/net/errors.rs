@@ -21,6 +21,8 @@ use thiserror::Error;
 pub enum SocketError {
     #[error("Unsupported protocol {0}")]
     UnsupportedProtocol(u8),
+    #[error("Brokered networking is unavailable")]
+    BrokerUnavailable,
     #[error("Socket resources are exhausted")]
     ResourceExhausted,
     #[error("Socket creation was denied")]

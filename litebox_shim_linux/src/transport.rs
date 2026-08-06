@@ -285,6 +285,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_nine_p_create_and_read_file() {
         let task = init_platform(Some(TUN_DEVICE_NAME));
 
@@ -319,6 +320,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "local TUN networking is no longer supported"]
     fn test_tun_nine_p_host_files_visible() {
         let task = init_platform(Some(TUN_DEVICE_NAME));
 

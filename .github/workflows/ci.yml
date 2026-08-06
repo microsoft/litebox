@@ -40,12 +40,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
-      - name: Set up tun
-        run: |
-          sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
-      - name: Install iperf3
-        run: |
-          sudo apt install -y iperf3
       - name: Install diod
         run: |
           sudo apt install -y diod
@@ -136,9 +130,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
-      - name: Set up tun
-        run: |
-          sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
       - uses: Swatinem/rust-cache@v2
       - name: Cache custom out directories
         uses: actions/cache@v5

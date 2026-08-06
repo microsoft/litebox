@@ -347,6 +347,7 @@ impl From<litebox::net::errors::SocketError> for Errno {
     fn from(value: litebox::net::errors::SocketError) -> Self {
         match value {
             litebox::net::errors::SocketError::UnsupportedProtocol(_) => Errno::EPROTONOSUPPORT,
+            litebox::net::errors::SocketError::BrokerUnavailable => Errno::EAFNOSUPPORT,
             litebox::net::errors::SocketError::ResourceExhausted => Errno::ENOBUFS,
             litebox::net::errors::SocketError::PermissionDenied => Errno::EACCES,
             litebox::net::errors::SocketError::BackendFailure => Errno::EIO,

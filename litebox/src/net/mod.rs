@@ -15,7 +15,7 @@ use crate::sync::RawSyncPrimitivesProvider;
 use crate::{LiteBox, platform, sync};
 
 use bitflags::bitflags;
-use smoltcp::socket::{icmp, raw, tcp, udp};
+use smoltcp::socket::{tcp, udp};
 
 mod broker_socket;
 pub mod errors;
@@ -56,6 +56,7 @@ const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 /// IP address for the gateway
 // TODO: Make this configurable
 const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+const ICMP_PROTOCOL_NUMBER: u8 = 1;
 
 /// Maximum size of rx/tx buffers for sockets
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
@@ -77,6 +78,7 @@ pub enum ShutdownDirection {
 }
 
 /// Limits maximum number of packets in a buffer
+#[cfg(test)]
 const MAX_PACKET_COUNT: usize = 32;
 
 /// TCP connection timeout.
@@ -793,24 +795,37 @@ where
         )
     }
 
-    /// Creates a socket.
+    /// Creates a broker-owned TCP or UDP socket.
     ///
     /// By default, the created socket has no associated proxy; to set a proxy, use
     /// [`attach_socket_proxy`](Self::attach_socket_proxy).
     pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
         let broker_socket = match (&protocol, self.litebox.broker_control()) {
-            (Protocol::Tcp, Some(broker)) => Some(BrokerSocket::Tcp(
+            (Protocol::Tcp, Some(broker)) => BrokerSocket::Tcp(
                 BrokerTcpSocket::new(broker, self.litebox.broker_pollable_registry())
                     .map_err(SocketError::from)?,
-            )),
-            (Protocol::Udp, Some(broker)) => Some(BrokerSocket::Udp(
+            ),
+            (Protocol::Udp, Some(broker)) => BrokerSocket::Udp(
                 BrokerUdpSocket::new(broker, self.litebox.broker_pollable_registry())
                     .map_err(SocketError::from)?,
-            )),
-            _ => None,
+            ),
+            (Protocol::Tcp | Protocol::Udp, None) => {
+                return Err(SocketError::BrokerUnavailable);
+            }
+            (Protocol::Icmp, _) => {
+                return Err(SocketError::UnsupportedProtocol(ICMP_PROTOCOL_NUMBER));
+            }
+            (Protocol::Raw { protocol }, _) => {
+                return Err(SocketError::UnsupportedProtocol(*protocol));
+            }
         };
+
+        Ok(self.new_socket_fd(protocol, None, Some(broker_socket)))
+    }
+
+    #[cfg(test)]
+    fn local_socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
         let handle = match protocol {
-            Protocol::Tcp | Protocol::Udp if broker_socket.is_some() => None,
             Protocol::Tcp => Some(self.socket_set.add(tcp::Socket::new(
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
                 smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
@@ -825,42 +840,24 @@ where
                     vec![0u8; SOCKET_BUFFER_SIZE],
                 ),
             ))),
-            Protocol::Icmp => Some(self.socket_set.add(icmp::Socket::new(
-                smoltcp::storage::PacketBuffer::new(
-                    vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                    vec![0u8; SOCKET_BUFFER_SIZE],
-                ),
-                smoltcp::storage::PacketBuffer::new(
-                    vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                    vec![0u8; SOCKET_BUFFER_SIZE],
-                ),
-            ))),
+            Protocol::Icmp => {
+                return Err(SocketError::UnsupportedProtocol(ICMP_PROTOCOL_NUMBER));
+            }
             Protocol::Raw { protocol } => {
-                // TODO: Should we maintain a specific allow-list of protocols for raw sockets?
-                // Should we allow everything except TCP/UDP/ICMP? Should we allow everything? These
-                // questions should be resolved; for now I am disallowing everything else.
                 return Err(SocketError::UnsupportedProtocol(protocol));
-
-                #[expect(
-                    unreachable_code,
-                    reason = "currently raw is just directly disallowed; we might bring this code back in the future"
-                )]
-                Some(self.socket_set.add(raw::Socket::new(
-                    smoltcp::wire::IpVersion::Ipv4,
-                    smoltcp::wire::IpProtocol::from(protocol),
-                    smoltcp::storage::PacketBuffer::new(
-                        vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                        vec![0u8; SOCKET_BUFFER_SIZE],
-                    ),
-                    smoltcp::storage::PacketBuffer::new(
-                        vec![smoltcp::storage::PacketMetadata::EMPTY; MAX_PACKET_COUNT],
-                        vec![0u8; SOCKET_BUFFER_SIZE],
-                    ),
-                )))
             }
         };
 
-        Ok(self.new_socket_fd_for(SocketHandle {
+        Ok(self.new_socket_fd(protocol, handle, None))
+    }
+
+    fn new_socket_fd(
+        &mut self,
+        protocol: Protocol,
+        handle: Option<smoltcp::iface::SocketHandle>,
+        broker_socket: Option<BrokerSocket<Platform>>,
+    ) -> SocketFd<Platform> {
+        self.new_socket_fd_for(SocketHandle {
             consider_closed: false,
             handle,
             broker_socket,
@@ -878,7 +875,7 @@ where
                 Protocol::Raw { protocol: _ } => unimplemented!(),
             },
             proxy: None,
-        }))
+        })
     }
 
     /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
