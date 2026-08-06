@@ -503,7 +503,7 @@ pub struct ListEntry {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
 pub struct Guid {
     pub data: [u8; 16],
 }

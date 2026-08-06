@@ -374,9 +374,6 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         byte_offset: Option<Platform::RawConstPointer<i64>>,
         key: Option<Platform::RawConstPointer<u32>>,
     },
-    NtGetCurrentProcessorNumberEx {
-        processor_number: Platform::RawMutPointer<sysinfo::ProcessorNumber>,
-    },
     NtQueryDebugFilterState {
         component_id: u32,
         level: u32,
@@ -1062,11 +1059,6 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 byte_offset:*,
                 key:*,
             })),
-            NtSysno::NtGetCurrentProcessorNumberEx => {
-                Some(sys_req!(NtGetCurrentProcessorNumberEx {
-                    processor_number:*,
-                }))
-            }
             NtSysno::NtQueryDebugFilterState => Some(sys_req!(NtQueryDebugFilterState {
                 component_id,
                 level,

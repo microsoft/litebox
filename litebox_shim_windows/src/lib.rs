@@ -598,7 +598,7 @@ pub struct Process<Platform: ShimPlatform> {
     default_hard_error_mode: AtomicU32,
     wnf_notification_event: Mutex<Platform, Option<Arc<syscalls::event::EventObject<Platform>>>>,
     wnf_subscriptions: Mutex<Platform, syscalls::wnf::WnfProcessSubscriptions>,
-    trace_notification_event: Mutex<Platform, Option<Arc<syscalls::event::EventObject<Platform>>>>,
+    trace_notifications: Mutex<Platform, syscalls::trace::TraceNotifications<Platform>>,
     cookie: u32,
     exit_code: AtomicI32,
     next_thread_id: AtomicUsize,
@@ -694,7 +694,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             default_hard_error_mode: AtomicU32::new(0),
             wnf_notification_event: Mutex::new(None),
             wnf_subscriptions: Mutex::new(syscalls::wnf::WnfProcessSubscriptions::default()),
-            trace_notification_event: Mutex::new(None),
+            trace_notifications: Mutex::new(syscalls::trace::TraceNotifications::default()),
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
             next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
@@ -1396,9 +1396,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 byte_offset,
                 key,
             ),
-            SyscallRequest::NtGetCurrentProcessorNumberEx { processor_number } => {
-                self.sys_nt_get_current_processor_number_ex(processor_number)
-            }
             SyscallRequest::NtQueryDebugFilterState {
                 component_id,
                 level,
@@ -1408,7 +1405,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     level;
                     "NtQueryDebugFilterState reports no attached debugger"
                 );
-                NtStatus::from_raw(0xC000_0354)
+                NtStatus::DEBUGGER_INACTIVE
             }
             SyscallRequest::NtQueryVolumeInformationFile {
                 file_handle,
