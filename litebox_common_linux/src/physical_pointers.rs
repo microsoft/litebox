@@ -38,6 +38,10 @@ use crate::vmap::{
     VmapManager,
 };
 use core::marker::PhantomData;
+use litebox::platform::RawConstPointer;
+use litebox::platform::common_providers::userspace_pointers::{
+    UserConstPtr, UserMutPtr, ValidateAccess,
+};
 use zerocopy::{FromBytes, IntoBytes};
 
 /// The concrete [`PhysPageMapInfo`] produced by the `VmapManager` behind a [`GlobalVmapManager`].
@@ -93,10 +97,8 @@ where
     /// object of type `T` starting from `offset`. If these conditions are not met, this function
     /// returns `Err(PhysPointerError)`.
     ///
-    /// Note: `T` does not need to satisfy `align_of::<T>()` at its location in (foreign) physical
-    /// memory. This is sound because the foreign `T` is never dereferenced as a Rust reference or
-    /// via a typed load/store: all access goes through `copy_in`/`copy_out`, which cast the
-    /// mapped pointer to `*mut u8` and perform a byte-granular, unaligned-safe `memcpy_fallible`.
+    /// `T` need not be aligned in foreign memory. Access is always byte-granular and fallible;
+    /// this type never creates a reference to the foreign `T`.
     pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
         Self::from_boxed(pages.into(), offset)
     }
@@ -358,17 +360,56 @@ where
     }
 }
 
-/// RAII guard that unmaps physical pages when dropped.
-///
-/// Created by `map_and_get_ptr_guard`. Its lifetime is tied to the parent
-/// `PhysMutPtr`, and it owns the map info for the duration of the temporary mapping.
-///
+impl<const ALIGN: usize, V> PhysMutPtr<u8, ALIGN, V>
+where
+    V: GlobalVmapManager<ALIGN>,
+{
+    /// Copies `len` bytes from the start of this view.
+    ///
+    /// Returns an error if `len` exceeds the view or either memory range faults.
+    pub fn copy_to_user<U: ValidateAccess>(
+        &self,
+        destination: UserMutPtr<U, u8>,
+        len: usize,
+    ) -> Result<(), PhysPointerError> {
+        if len > self.count {
+            return Err(PhysPointerError::IndexOutOfBounds(len, self.count));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let guard = self.map_and_get_ptr_guard(0, len, PhysPageMapPermissions::READ)?;
+        guard.copy_to_user(destination)
+    }
+
+    /// Copies `len` bytes into the start of this view.
+    ///
+    /// Returns an error if `len` exceeds the view or either memory range faults.
+    pub fn copy_from_user<U: ValidateAccess>(
+        &self,
+        source: UserConstPtr<U, u8>,
+        len: usize,
+    ) -> Result<(), PhysPointerError> {
+        if len > self.count {
+            return Err(PhysPointerError::IndexOutOfBounds(len, self.count));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let guard = self.map_and_get_ptr_guard(
+            0,
+            len,
+            PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
+        )?;
+        guard.copy_from_user(source)
+    }
+}
+
 /// # Invariant
 ///
-/// `ptr` points into the live mapping owned by `map_info`, and the `size` bytes starting
-/// at `ptr` lie within that mapping. The mapping refers to foreign (non-Rust) physical
-/// memory that another core may unmap concurrently, so `ptr` must only ever be accessed
-/// through [`Self::copy_in`]/[`Self::copy_out`], which perform fault-tolerant copies.
+/// `ptr..ptr + size` lies within the mapping owned by `map_info`. Because the foreign
+/// mapping may disappear concurrently, every access through `ptr` must use
+/// [`litebox::mm::exception_table::memcpy_fallible`] and must not create Rust references.
 struct MappedGuard<'a, T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     map_info: Option<MapInfoOf<V, ALIGN>>,
     ptr: *mut T,
@@ -377,9 +418,58 @@ struct MappedGuard<'a, T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
 }
 
 impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, T, ALIGN, V> {
+    fn copy_to_user<U: ValidateAccess>(
+        &self,
+        destination: UserMutPtr<U, u8>,
+    ) -> Result<(), PhysPointerError> {
+        destination
+            .as_usize()
+            .checked_add(self.size)
+            .ok_or(PhysPointerError::CopyFailed)?;
+        let destination = core::ptr::with_exposed_provenance_mut::<u8>(destination.as_usize());
+        let destination =
+            U::validate_slice(core::ptr::slice_from_raw_parts_mut(destination, self.size))
+                .ok_or(PhysPointerError::CopyFailed)?;
+        U::with_user_memory_access(|| {
+            // SAFETY: validation confines the destination to user memory, and the guard
+            // invariant covers the foreign source range. Faults are reported by the copy.
+            unsafe {
+                litebox::mm::exception_table::memcpy_fallible(
+                    destination,
+                    self.ptr.cast::<u8>().cast_const(),
+                    self.size,
+                )
+            }
+        })
+        .map_err(|_| PhysPointerError::CopyFailed)
+    }
+
+    fn copy_from_user<U: ValidateAccess>(
+        &self,
+        source: UserConstPtr<U, u8>,
+    ) -> Result<(), PhysPointerError> {
+        source
+            .as_usize()
+            .checked_add(self.size)
+            .ok_or(PhysPointerError::CopyFailed)?;
+        let source = core::ptr::with_exposed_provenance_mut::<u8>(source.as_usize());
+        let source = U::validate_slice(core::ptr::slice_from_raw_parts_mut(source, self.size))
+            .ok_or(PhysPointerError::CopyFailed)?;
+        U::with_user_memory_access(|| {
+            // SAFETY: validation confines the source to user memory, and the guard
+            // invariant covers the foreign destination range. Faults are reported by the copy.
+            unsafe {
+                litebox::mm::exception_table::memcpy_fallible(
+                    self.ptr.cast::<u8>(),
+                    source.cast_const(),
+                    self.size,
+                )
+            }
+        })
+        .map_err(|_| PhysPointerError::CopyFailed)
+    }
+
     /// Copy the `self.size` mapped bytes out into `dst`.
-    ///
-    /// This is the only path through which the raw mapped pointer is dereferenced.
     ///
     /// # Safety
     ///
@@ -394,8 +484,6 @@ impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, T, ALIG
     }
 
     /// Copy `self.size` bytes from `src` into the mapped memory.
-    ///
-    /// This is the only path through which the raw mapped pointer is dereferenced.
     ///
     /// # Safety
     ///
@@ -499,6 +587,22 @@ where
         T: FromBytes,
     {
         self.inner.read_slice_at_offset(count, values)
+    }
+}
+
+impl<const ALIGN: usize, V> PhysConstPtr<u8, ALIGN, V>
+where
+    V: GlobalVmapManager<ALIGN>,
+{
+    /// Copies `len` bytes from the start of this view.
+    ///
+    /// Returns an error if `len` exceeds the view or either memory range faults.
+    pub fn copy_to_user<U: ValidateAccess>(
+        &self,
+        destination: UserMutPtr<U, u8>,
+        len: usize,
+    ) -> Result<(), PhysPointerError> {
+        self.inner.copy_to_user(destination, len)
     }
 }
 

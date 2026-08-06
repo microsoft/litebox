@@ -234,8 +234,35 @@ impl GlobalState {
     }
 }
 
-type UserMutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+pub type UserMutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 pub type UserConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
+
+/// A TA stack buffer whose payload is copied after context setup.
+#[derive(Clone, Copy)]
+pub enum DeferredMemref {
+    Input { len: usize },
+    Inout { len: usize },
+}
+
+/// A TA userspace range assigned to a memref.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaMemrefDestination {
+    address: usize,
+    len: usize,
+}
+
+impl TaMemrefDestination {
+    pub fn address(self) -> usize {
+        self.address
+    }
+
+    pub fn size(self) -> usize {
+        self.len
+    }
+}
+
+pub type TaMemrefDestinations =
+    [Option<TaMemrefDestination>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS];
 
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
@@ -333,19 +360,22 @@ impl OpteeShim {
 }
 
 impl OpteeShimEntrypoints {
-    /// Load the CPU context to (re)enter the loaded TA.
+    /// Prepares the CPU and stack context for TA entry.
+    ///
+    /// Returned input and inout destinations must be populated before entering the TA.
     pub fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
+        deferred: &[Option<DeferredMemref>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS],
         session_id: u32,
         func_id: u32,
         cmd_id: Option<u32>,
-    ) -> Result<(), loader::elf::ElfLoaderError> {
-        let init_state = self
+    ) -> Result<TaMemrefDestinations, loader::elf::ElfLoaderError> {
+        let (init_state, destinations) = self
             .task
-            .load_ta_context(params, session_id, func_id, cmd_id)?;
+            .load_ta_context(params, deferred, session_id, func_id, cmd_id)?;
         self.task.thread.init_state.set(init_state);
-        Ok(())
+        Ok(destinations)
     }
 }
 
@@ -792,10 +822,11 @@ impl Task {
     fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
+        deferred: &[Option<DeferredMemref>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS],
         session_id: u32,
         func_id: u32,
         cmd_id: Option<u32>,
-    ) -> Result<ThreadInitState, ElfLoaderError> {
+    ) -> Result<(ThreadInitState, TaMemrefDestinations), ElfLoaderError> {
         if !self.ta_prepared.get() {
             let ta_bin = self
                 .global
@@ -817,18 +848,21 @@ impl Task {
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
                 ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
             )?;
-        ta_stack
-            .init(self.global.platform, params)
+        let destinations = ta_stack
+            .init(self.global.platform, params, deferred)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
-        Ok(ThreadInitState::Ta {
-            cmd_id: cmd_id.unwrap_or(0) as usize,
-            params_address: ta_stack.get_params_address(),
-            session_id: session_id as usize,
-            func_id: func_id as usize,
-            entry_point: self.get_ta_entry_point(),
-            stack_top: ta_stack.get_cur_stack_top(),
-        })
+        Ok((
+            ThreadInitState::Ta {
+                cmd_id: cmd_id.unwrap_or(0) as usize,
+                params_address: ta_stack.get_params_address(),
+                session_id: session_id as usize,
+                func_id: func_id as usize,
+                entry_point: self.get_ta_entry_point(),
+                stack_top: ta_stack.get_cur_stack_top(),
+            },
+            destinations,
+        ))
     }
 
     /// The session id currently executing in this task (set per entry by

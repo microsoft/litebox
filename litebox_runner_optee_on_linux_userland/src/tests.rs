@@ -105,6 +105,7 @@ pub fn run_ta_with_test_commands(
                 .unwrap()
                 .load_ta_context(
                     params.as_slice(),
+                    &[None; litebox_common_optee::UteeParams::TEE_NUM_PARAMS],
                     session_id,
                     func_id as u32,
                     Some(cmd.cmd_id),

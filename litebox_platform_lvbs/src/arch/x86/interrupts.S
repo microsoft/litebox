@@ -96,6 +96,8 @@
 .global \name
 \name:
     cld
+    /* Do not enter kernel Rust with SMAP bypassed; iretq restores saved AC. */
+    clac
     push    0                   /* Push dummy error code */
     test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
     jnz     .Luser_\name
@@ -118,6 +120,8 @@
 .global \name
 \name:
     cld
+    /* Do not enter kernel Rust with SMAP bypassed; iretq restores saved AC. */
+    clac
     test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
     jnz     .Luser_\name
     push_regs
@@ -176,6 +180,8 @@ isr_with_err_code isr_general_protection_fault general_protection_fault_handler_
 .global isr_page_fault
 isr_page_fault:
     cld
+    /* Keep SMAP enforced in Rust; saved RFLAGS preserves an interrupted user copy. */
+    clac
     test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
     push    14                  /* Pass vector number (push does not affect flags) */
     jnz     .Luser_isr_page_fault

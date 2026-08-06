@@ -137,7 +137,13 @@ fn run_ta_with_default_commands(
             // loaded binary and heap. In that sense, we can create (and destroy) a stack
             // for each command freely.
             let _ = entrypoints
-                .load_ta_context(params.as_slice(), session_id, func_id as u32, None)
+                .load_ta_context(
+                    params.as_slice(),
+                    &[None; litebox_common_optee::UteeParams::TEE_NUM_PARAMS],
+                    session_id,
+                    func_id as u32,
+                    None,
+                )
                 .map_err(|_| {
                     panic!("Failed to load TA context");
                 });
