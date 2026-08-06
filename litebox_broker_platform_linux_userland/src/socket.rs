@@ -28,7 +28,7 @@ use litebox_broker_protocol::socket::{
     SocketType, TcpOptionName, TcpOptionValue,
 };
 use rustix::buffer::spare_capacity;
-use rustix::event::{EventfdFlags, epoll, eventfd};
+use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, poll};
 use rustix::io::{Errno, ioctl_fionread, read, write};
 use rustix::net::{
     AddressFamily as LinuxAddressFamily, RecvFlags as LinuxRecvFlags, SendFlags as LinuxSendFlags,
@@ -1031,6 +1031,22 @@ impl Reactor {
                 }
             }
         };
+        let no_wait = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        loop {
+            let mut poll_fd = [PollFd::new(&listener.socket, PollFlags::IN)];
+            match poll(&mut poll_fd, Some(&no_wait)) {
+                Ok(_) if poll_fd[0].revents().contains(PollFlags::IN) => break,
+                Ok(_) => {
+                    clear_readiness(listener, ReadinessFlags::READ)?;
+                    break;
+                }
+                Err(Errno::INTR) => {}
+                Err(error) => return Err(broker_error_from_errno(error)),
+            }
+        }
         let remote_address = SocketAddrV4::try_from(remote_address.ok_or(BrokerError::Internal)?)
             .map_err(|_| BrokerError::Internal)?;
         let local_address = local_socket_address(&socket)?;
@@ -1526,6 +1542,19 @@ fn receive_socket_once(
             }
             Ok((_buffer, received)) => {
                 data.truncate(received);
+                let terminal_readable = socket.read_shutdown
+                    || socket
+                        .snapshot
+                        .lock()
+                        .expect("Linux socket snapshot mutex poisoned")
+                        .readiness
+                        .contains(ReadinessFlags::HANGUP);
+                if !flags.contains(LinuxRecvFlags::PEEK)
+                    && !terminal_readable
+                    && ioctl_fionread(&socket.socket).map_err(broker_error_from_errno)? == 0
+                {
+                    clear_readiness(socket, ReadinessFlags::READ)?;
+                }
                 return Ok(ReactorReceiveOutcome::Received(data));
             }
             Err(Errno::INTR) => {}
@@ -2280,6 +2309,12 @@ mod tests {
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(3)))
         );
         assert_eq!(&received, b"ong");
+        assert!(
+            !session
+                .check_readiness(handle)
+                .unwrap()
+                .contains(ReadinessFlags::READ)
+        );
         assert_eq!(
             litebox_broker_core::socket::receive(
                 &session,
@@ -2365,6 +2400,12 @@ mod tests {
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
         );
         assert_eq!(queued_after_shutdown, [b'x']);
+        assert!(
+            session
+                .check_readiness(read_shutdown_handle)
+                .unwrap()
+                .contains(ReadinessFlags::READ)
+        );
         assert_eq!(
             litebox_broker_core::socket::receive(
                 &session,
@@ -2568,6 +2609,13 @@ mod tests {
         assert_eq!(
             second.remote_address,
             socket_address_v4(second_client.local_addr().unwrap())
+        );
+        assert!(
+            !session
+                .check_readiness(listener)
+                .unwrap()
+                .contains(ReadinessFlags::READ),
+            "accept must clear listener readiness after draining the queue"
         );
         assert!(matches!(
             litebox_broker_core::socket::accept(&session, listener, readiness.clone()),
