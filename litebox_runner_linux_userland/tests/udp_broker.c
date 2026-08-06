@@ -56,13 +56,26 @@ int main(int argc, char **argv) {
     assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled,
                       sizeof(enabled)) == -1);
     assert(errno == ENOPROTOOPT);
-    assert(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled,
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled,
+                      sizeof(enabled) - 1) == -1);
+    assert(errno == ENOPROTOOPT);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const void *)1,
                       sizeof(enabled)) == -1);
-    assert(errno == EOPNOTSUPP);
+    assert(errno == ENOPROTOOPT);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_CORK, &enabled,
+                      sizeof(enabled) - 1) == -1);
+    assert(errno == ENOPROTOOPT);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_CORK, (const void *)1,
+                      sizeof(enabled)) == -1);
+    assert(errno == ENOPROTOOPT);
+    assert(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled,
+                      sizeof(enabled)) == 0);
+    enabled = -1;
     socklen_t enabled_length = sizeof(enabled);
     assert(getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled,
                       &enabled_length) == 0);
-    assert(enabled == 0);
+    assert(enabled == 1);
+    assert(enabled_length == sizeof(enabled));
 
     struct pollfd writable = {.fd = fd, .events = POLLOUT};
     assert(poll(&writable, 1, 0) == 1);

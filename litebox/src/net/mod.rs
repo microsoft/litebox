@@ -1886,13 +1886,20 @@ where
         data: TcpOptionData,
     ) -> Result<(), errors::SetTcpOptionError> {
         let descriptor_table = self.litebox.descriptor_table();
+        let entry_handle = descriptor_table
+            .entry_handle(fd)
+            .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
         if let Some(BrokerSocket::Tcp(socket)) = &socket_handle.broker_socket {
+            let socket = alloc::sync::Arc::clone(socket);
+            drop(table_entry);
+            drop(descriptor_table);
             return socket.set_tcp_option(data);
         }
+        drop(entry_handle);
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self
@@ -1931,13 +1938,20 @@ where
         name: TcpOptionName,
     ) -> Result<TcpOptionData, errors::GetTcpOptionError> {
         let descriptor_table = self.litebox.descriptor_table();
+        let entry_handle = descriptor_table
+            .entry_handle(fd)
+            .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
         if let Some(BrokerSocket::Tcp(socket)) = &socket_handle.broker_socket {
+            let socket = alloc::sync::Arc::clone(socket);
+            drop(table_entry);
+            drop(descriptor_table);
             return socket.get_tcp_option(name);
         }
+        drop(entry_handle);
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self

@@ -1174,7 +1174,7 @@ pub(crate) mod tests {
         fail_connect: core::sync::atomic::AtomicBool,
         fail_connect_indeterminate: core::sync::atomic::AtomicBool,
         fail_shutdown: core::sync::atomic::AtomicBool,
-        tcp_options: StdMutex<std::vec::Vec<TcpOptionValue>>,
+        tcp_option_sets: StdMutex<std::vec::Vec<TcpOptionValue>>,
         failed_readiness: StdMutex<Option<ReadinessRegistration>>,
         live_readiness: StdMutex<Option<ReadinessRegistration>>,
     }
@@ -1220,6 +1220,7 @@ pub(crate) mod tests {
                 state: Arc::clone(&self.state),
                 readiness,
                 create_request: request,
+                tcp_options: StdMutex::new(TestTcpOptions::default()),
             }))
         }
 
@@ -1232,6 +1233,13 @@ pub(crate) mod tests {
         state: Arc<TestSocketState>,
         readiness: ReadinessRegistration,
         create_request: CreateSocketRequest,
+        tcp_options: StdMutex<TestTcpOptions>,
+    }
+
+    #[derive(Default)]
+    struct TestTcpOptions {
+        no_delay: bool,
+        keep_alive: bool,
     }
 
     impl PlatformSocket for TestPlatformSocket {
@@ -1344,29 +1352,23 @@ pub(crate) mod tests {
         }
 
         fn set_tcp_option(&self, value: TcpOptionValue) -> Result<()> {
-            self.state.tcp_options.lock().unwrap().push(value);
+            self.state.tcp_option_sets.lock().unwrap().push(value);
+            let mut options = self.tcp_options.lock().unwrap();
+            match value {
+                TcpOptionValue::NoDelay(value) => options.no_delay = value,
+                TcpOptionValue::KeepAlive(value) => options.keep_alive = value,
+                _ => return Err(BrokerError::UnsupportedOperation),
+            }
             Ok(())
         }
 
         fn get_tcp_option(&self, name: TcpOptionName) -> Result<TcpOptionValue> {
-            let options = self.state.tcp_options.lock().unwrap();
-            let default = match name {
-                TcpOptionName::NoDelay => TcpOptionValue::NoDelay(false),
-                TcpOptionName::KeepAlive => TcpOptionValue::KeepAlive(false),
-                _ => return Err(BrokerError::UnsupportedOperation),
-            };
-            Ok(options
-                .iter()
-                .rev()
-                .copied()
-                .find(|value| {
-                    matches!(
-                        (name, value),
-                        (TcpOptionName::NoDelay, TcpOptionValue::NoDelay(_))
-                            | (TcpOptionName::KeepAlive, TcpOptionValue::KeepAlive(_))
-                    )
-                })
-                .unwrap_or(default))
+            let options = self.tcp_options.lock().unwrap();
+            match name {
+                TcpOptionName::NoDelay => Ok(TcpOptionValue::NoDelay(options.no_delay)),
+                TcpOptionName::KeepAlive => Ok(TcpOptionValue::KeepAlive(options.keep_alive)),
+                _ => Err(BrokerError::UnsupportedOperation),
+            }
         }
 
         fn status(&self) -> Result<SocketStatusResponse> {
@@ -1404,6 +1406,7 @@ pub(crate) mod tests {
     pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
         check_failed_create_rolls_back(broker, provider);
         check_socket_operations_and_policy(broker, provider);
+        check_tcp_option_state_is_per_socket(broker);
         check_udp_socket_operations(broker, provider);
         check_concurrent_udp_status_does_not_regress_connection(broker, provider);
         check_server_socket_operations(broker, provider);
@@ -1546,7 +1549,7 @@ pub(crate) mod tests {
         assert_eq!(provider.state.status_calls.load(Ordering::Relaxed), 1);
         assert_eq!(provider.state.shutdown_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
-            provider.state.tcp_options.lock().unwrap().as_slice(),
+            provider.state.tcp_option_sets.lock().unwrap().as_slice(),
             [
                 TcpOptionValue::NoDelay(true),
                 TcpOptionValue::KeepAlive(true),
@@ -1563,6 +1566,45 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains(&session_id)
         );
+    }
+
+    fn check_tcp_option_state_is_per_socket(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let first = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            set_tcp_option(&session, first, TcpOptionValue::NoDelay(true)),
+            Ok(())
+        );
+        assert_eq!(
+            set_tcp_option(&session, first, TcpOptionValue::KeepAlive(true)),
+            Ok(())
+        );
+        assert_eq!(session.close_object_reference(first), Ok(()));
+
+        let second = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            get_tcp_option(&session, second, TcpOptionName::NoDelay),
+            Ok(TcpOptionValue::NoDelay(false))
+        );
+        assert_eq!(
+            get_tcp_option(&session, second, TcpOptionName::KeepAlive),
+            Ok(TcpOptionValue::KeepAlive(false))
+        );
+
+        assert_eq!(session.close_object_reference(second), Ok(()));
     }
 
     fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {

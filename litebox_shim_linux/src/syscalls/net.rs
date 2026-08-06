@@ -502,19 +502,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         optval: UserPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
-        if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE)) {
-            match self.get_proxy(fd)?.as_ref() {
-                NetworkProxy::BrokerStream(_) => {
-                    let value: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
-                    return self
-                        .net
-                        .lock()
-                        .set_tcp_option(fd, litebox::net::TcpOptionData::KEEPALIVE(value != 0))
-                        .map_err(Errno::from);
-                }
-                NetworkProxy::BrokerDatagram(_) => return Err(Errno::EOPNOTSUPP),
-                _ => {}
-            }
+        let keepalive_socket_type =
+            if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE)) {
+                Some(self.get_socket_type(fd)?)
+            } else {
+                None
+            };
+        if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE))
+            && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+        {
+            let value: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+            return self
+                .net
+                .lock()
+                .set_tcp_option(fd, litebox::net::TcpOptionData::KEEPALIVE(value != 0))
+                .map_err(Errno::from);
         }
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
             let unsupported_broker_option = matches!(
@@ -553,8 +555,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
-                        deferred_tcp_option =
-                            Some(litebox::net::TcpOptionData::KEEPALIVE(keep_alive));
+                        if matches!(keepalive_socket_type, Some(SockType::Stream)) {
+                            deferred_tcp_option =
+                                Some(litebox::net::TcpOptionData::KEEPALIVE(keep_alive));
+                        }
                         opt.keep_alive = keep_alive;
                     }
                     _ => unreachable!(),
@@ -570,7 +574,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         return Err(Errno::EBADF);
                     }
                     litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                        unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                        return Err(Errno::EOPNOTSUPP);
                     }
                     litebox::net::errors::SetTcpOptionError::Unsupported
                     | litebox::net::errors::SetTcpOptionError::BackendFailure => {
@@ -646,12 +650,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
-                    if matches!(to, TcpOption::CORK)
-                        && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
-                    {
+                    let proxy = self.get_proxy(fd)?;
+                    let is_broker_stream = match proxy.as_ref() {
+                        NetworkProxy::Stream(_) => false,
+                        NetworkProxy::BrokerStream(_) => true,
+                        NetworkProxy::Datagram(_)
+                        | NetworkProxy::Raw
+                        | NetworkProxy::BrokerDatagram(_) => return Err(Errno::ENOPROTOOPT),
+                    };
+                    drop(proxy);
+                    let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+                    if matches!(to, TcpOption::CORK) && is_broker_stream {
                         return Err(Errno::EOPNOTSUPP);
                     }
-                    let val: u32 = super::read_from_user::<_, Platform>(optval, size_of::<u32>())?;
                     // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
                     // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
                     // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
