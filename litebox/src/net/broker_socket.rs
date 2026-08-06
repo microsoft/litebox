@@ -276,7 +276,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         &self,
         name: TcpOptionName,
     ) -> Result<TcpOptionData, GetTcpOptionError> {
-        let protocol_name = match name {
+        let tcp_option_name = match name {
             TcpOptionName::NODELAY => BrokerTcpOptionName::NoDelay,
             TcpOptionName::KEEPALIVE => BrokerTcpOptionName::KeepAlive,
             TcpOptionName::KEEPINTVL | TcpOptionName::CONGESTION => {
@@ -285,7 +285,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         };
         let value = self
             .broker
-            .get_tcp_option(self.handle, protocol_name)
+            .get_tcp_option(self.handle, tcp_option_name)
             .map_err(|error| match BrokerObjectError::from(error) {
                 BrokerObjectError::UnsupportedOperation => GetTcpOptionError::Unsupported,
                 _ => GetTcpOptionError::BackendFailure,
