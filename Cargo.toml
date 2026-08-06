@@ -36,10 +36,6 @@ members = [
     "dev_tests",
     "dev_bench",
 ]
-exclude = [
-    # SNP support is paused until networking can use a kernel-mode broker.
-    "litebox_runner_snp",
-]
 default-members = [
     "litebox",
     "litebox_broker_local",
