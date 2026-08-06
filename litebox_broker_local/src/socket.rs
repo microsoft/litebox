@@ -10,11 +10,12 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
 use litebox_broker_protocol::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
-    ConnectSocketRequest, CreateSocketRequest, IpProtocol, ListenSocketRequest,
-    MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, ReceiveFromSocketRequest,
-    ReceiveFromSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
-    SendSocketRequest, SendToSocketRequest, ShutdownMode, ShutdownSocketRequest,
-    SocketConnectionStatus, SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
+    ConnectSocketRequest, CreateSocketRequest, GetTcpOptionRequest, IpProtocol,
+    ListenSocketRequest, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags,
+    ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
+    ReceiveSocketResponse, SendFlags, SendSocketRequest, SendToSocketRequest, SetTcpOptionRequest,
+    ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
+    SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -167,6 +168,60 @@ mod tests {
                 BrokerOperation::Socket(SocketRequest::ReceiveFrom(_)),
             ]
         ));
+    }
+
+    #[test]
+    fn tcp_options_use_typed_requests() {
+        let handle = ObjectHandle(7);
+        let channel = ScriptedChannel::new([
+            BrokerResult::Socket(SocketResponse::SetTcpOption),
+            BrokerResult::Socket(SocketResponse::GetTcpOption(
+                litebox_broker_protocol::socket::GetTcpOptionResponse {
+                    value: TcpOptionValue::NoDelay(true),
+                },
+            )),
+            BrokerResult::Socket(SocketResponse::GetTcpOption(
+                litebox_broker_protocol::socket::GetTcpOptionResponse {
+                    value: TcpOptionValue::KeepAlive(false),
+                },
+            )),
+        ]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let (local, ()) =
+            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
+
+        local
+            .set_tcp_option(handle, TcpOptionValue::NoDelay(true))
+            .unwrap();
+        assert_eq!(
+            local
+                .get_tcp_option(handle, TcpOptionName::NoDelay)
+                .unwrap(),
+            TcpOptionValue::NoDelay(true)
+        );
+        assert_eq!(
+            local
+                .get_tcp_option(handle, TcpOptionName::KeepAlive)
+                .unwrap(),
+            TcpOptionValue::KeepAlive(false)
+        );
+        assert_eq!(
+            local.channel.sent_operations.borrow().as_slice(),
+            [
+                BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+                    handle,
+                    value: TcpOptionValue::NoDelay(true),
+                })),
+                BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                    handle,
+                    name: TcpOptionName::NoDelay,
+                })),
+                BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                    handle,
+                    name: TcpOptionName::KeepAlive,
+                })),
+            ]
+        );
     }
 
     const fn descriptor(slot: u32, length: u32) -> SharedBufferDescriptor {
@@ -350,6 +405,57 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             panic!("broker returned unexpected socket status response: {response:?}");
         };
         Ok(response)
+    }
+
+    /// Sets a typed option on a broker-owned TCP socket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn set_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        value: TcpOptionValue,
+    ) -> Result<(), Channel::Error> {
+        let response = self.request_socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+            handle,
+            value,
+        }))?;
+        assert_eq!(
+            response,
+            SocketResponse::SetTcpOption,
+            "broker returned unexpected TCP option set response"
+        );
+        Ok(())
+    }
+
+    /// Reads a typed option from a broker-owned TCP socket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation or
+    /// returns a value for a different option.
+    pub fn get_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        name: TcpOptionName,
+    ) -> Result<TcpOptionValue, Channel::Error> {
+        let response = self.request_socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+            handle,
+            name,
+        }))?;
+        let SocketResponse::GetTcpOption(response) = response else {
+            panic!("broker returned unexpected TCP option get response: {response:?}");
+        };
+        assert!(
+            matches!(
+                (name, response.value),
+                (TcpOptionName::NoDelay, TcpOptionValue::NoDelay(_))
+                    | (TcpOptionName::KeepAlive, TcpOptionValue::KeepAlive(_))
+            ),
+            "broker returned a mismatched TCP option value"
+        );
+        Ok(response.value)
     }
 
     /// Sends bytes from an operation-scoped shared-buffer lease.

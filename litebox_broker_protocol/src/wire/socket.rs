@@ -8,11 +8,13 @@ use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
     BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-    CreateSocketResponse, IpProtocol, ListenSocketRequest, ListenSocketResponse, ReceiveFlags,
-    ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
+    CreateSocketResponse, GetTcpOptionRequest, GetTcpOptionResponse, IpProtocol,
+    ListenSocketRequest, ListenSocketResponse, ReceiveFlags, ReceiveFromFlags,
+    ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
     ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse, SendToSocketRequest,
-    SendToSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError,
-    SocketStatusRequest, SocketStatusResponse, SocketType,
+    SendToSocketResponse, SetTcpOptionRequest, ShutdownMode, ShutdownSocketRequest,
+    SocketConnectionStatus, SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
+    TcpOptionName, TcpOptionValue,
 };
 
 use super::WireError;
@@ -30,6 +32,8 @@ const SOCKET_TAG_LISTEN: u8 = 8;
 const SOCKET_TAG_ACCEPT: u8 = 9;
 const SOCKET_TAG_SEND_TO: u8 = 10;
 const SOCKET_TAG_RECEIVE_FROM: u8 = 11;
+const SOCKET_TAG_SET_TCP_OPTION: u8 = 12;
+const SOCKET_TAG_GET_TCP_OPTION: u8 = 13;
 
 const ADDRESS_FAMILY_TAG_IPV4: u8 = 0;
 
@@ -52,6 +56,9 @@ const CONNECTION_STATUS_TAG_FAILED: u8 = 3;
 
 const RECEIVE_RESPONSE_TAG_RECEIVED: u8 = 0;
 const RECEIVE_RESPONSE_TAG_END_OF_STREAM: u8 = 1;
+
+const TCP_OPTION_TAG_NODELAY: u8 = 0;
+const TCP_OPTION_TAG_KEEPALIVE: u8 = 1;
 
 pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketRequest) {
     match request {
@@ -125,6 +132,16 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
                 ShutdownMode::Abort => SHUTDOWN_TAG_ABORT,
                 ShutdownMode::StopListening => SHUTDOWN_TAG_STOP_LISTENING,
             });
+        }
+        SocketRequest::SetTcpOption(request) => {
+            encoder.u8(SOCKET_TAG_SET_TCP_OPTION);
+            encoder.handle(request.handle);
+            encode_tcp_option_value(encoder, request.value);
+        }
+        SocketRequest::GetTcpOption(request) => {
+            encoder.u8(SOCKET_TAG_GET_TCP_OPTION);
+            encoder.handle(request.handle);
+            encode_tcp_option_name(encoder, request.name);
         }
         SocketRequest::Status(request) => {
             encoder.u8(SOCKET_TAG_STATUS);
@@ -200,6 +217,14 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
                 _ => return Err(WireError::InvalidTag),
             },
         })),
+        SOCKET_TAG_SET_TCP_OPTION => Ok(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+            handle: decoder.handle()?,
+            value: decode_tcp_option_value(decoder)?,
+        })),
+        SOCKET_TAG_GET_TCP_OPTION => Ok(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+            handle: decoder.handle()?,
+            name: decode_tcp_option_name(decoder)?,
+        })),
         SOCKET_TAG_STATUS => Ok(SocketRequest::Status(SocketStatusRequest {
             handle: decoder.handle()?,
         })),
@@ -258,6 +283,11 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
             encode_address(encoder, response.source_address);
         }
         SocketResponse::Shutdown => encoder.u8(SOCKET_TAG_SHUTDOWN),
+        SocketResponse::SetTcpOption => encoder.u8(SOCKET_TAG_SET_TCP_OPTION),
+        SocketResponse::GetTcpOption(response) => {
+            encoder.u8(SOCKET_TAG_GET_TCP_OPTION);
+            encode_tcp_option_value(encoder, response.value);
+        }
         SocketResponse::Status(response) => {
             encoder.u8(SOCKET_TAG_STATUS);
             encode_connection_status(encoder, response.status);
@@ -309,12 +339,58 @@ pub(super) fn decode_socket_response(
             source_address: decode_address(decoder)?,
         })),
         SOCKET_TAG_SHUTDOWN => Ok(SocketResponse::Shutdown),
+        SOCKET_TAG_SET_TCP_OPTION => Ok(SocketResponse::SetTcpOption),
+        SOCKET_TAG_GET_TCP_OPTION => Ok(SocketResponse::GetTcpOption(GetTcpOptionResponse {
+            value: decode_tcp_option_value(decoder)?,
+        })),
         SOCKET_TAG_STATUS => Ok(SocketResponse::Status(SocketStatusResponse {
             status: decode_connection_status(decoder)?,
             local_address: decode_optional_address(decoder)?,
             pending_error: decode_optional_socket_error(decoder)?,
         })),
         SOCKET_TAG_FAILED => Ok(SocketResponse::Failed(decode_socket_error(decoder)?)),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_tcp_option_name(encoder: &mut Encoder, name: TcpOptionName) {
+    encoder.u8(match name {
+        TcpOptionName::NoDelay => TCP_OPTION_TAG_NODELAY,
+        TcpOptionName::KeepAlive => TCP_OPTION_TAG_KEEPALIVE,
+    });
+}
+
+fn decode_tcp_option_name(decoder: &mut Decoder<'_>) -> Result<TcpOptionName, WireError> {
+    match decoder.u8()? {
+        TCP_OPTION_TAG_NODELAY => Ok(TcpOptionName::NoDelay),
+        TCP_OPTION_TAG_KEEPALIVE => Ok(TcpOptionName::KeepAlive),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_tcp_option_value(encoder: &mut Encoder, value: TcpOptionValue) {
+    match value {
+        TcpOptionValue::NoDelay(value) => {
+            encoder.u8(TCP_OPTION_TAG_NODELAY);
+            encoder.u8(u8::from(value));
+        }
+        TcpOptionValue::KeepAlive(value) => {
+            encoder.u8(TCP_OPTION_TAG_KEEPALIVE);
+            encoder.u8(u8::from(value));
+        }
+    }
+}
+
+fn decode_tcp_option_value(decoder: &mut Decoder<'_>) -> Result<TcpOptionValue, WireError> {
+    let tag = decoder.u8()?;
+    let value = match decoder.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(WireError::InvalidTag),
+    };
+    match tag {
+        TCP_OPTION_TAG_NODELAY => Ok(TcpOptionValue::NoDelay(value)),
+        TCP_OPTION_TAG_KEEPALIVE => Ok(TcpOptionValue::KeepAlive(value)),
         _ => Err(WireError::InvalidTag),
     }
 }

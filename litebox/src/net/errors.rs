@@ -225,6 +225,8 @@ pub enum SetTcpOptionError {
     NotTcpSocket,
     #[error("TCP option is unsupported by this socket backend")]
     Unsupported,
+    #[error("TCP option backend operation failed")]
+    BackendFailure,
 }
 /// Possible errors from [`Network::get_tcp_option`]
 #[non_exhaustive]
@@ -236,4 +238,6 @@ pub enum GetTcpOptionError {
     NotTcpSocket,
     #[error("TCP option is unsupported by this socket backend")]
     Unsupported,
+    #[error("TCP option backend operation failed")]
+    BackendFailure,
 }

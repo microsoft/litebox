@@ -353,12 +353,13 @@ mod tests {
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
         BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-        CreateSocketResponse, IpProtocol, ListenSocketRequest, ListenSocketResponse, ReceiveFlags,
-        ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
-        ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest,
-        SendSocketResponse, SendToSocketRequest, SendToSocketResponse, ShutdownMode,
+        CreateSocketResponse, GetTcpOptionRequest, GetTcpOptionResponse, IpProtocol,
+        ListenSocketRequest, ListenSocketResponse, ReceiveFlags, ReceiveFromFlags,
+        ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
+        ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse,
+        SendToSocketRequest, SendToSocketResponse, SetTcpOptionRequest, ShutdownMode,
         ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
-        SocketStatusResponse, SocketType,
+        SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
@@ -512,6 +513,22 @@ mod tests {
             BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
                 handle,
                 mode: ShutdownMode::StopListening,
+            })),
+            BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+                handle,
+                value: TcpOptionValue::NoDelay(true),
+            })),
+            BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+                handle,
+                value: TcpOptionValue::KeepAlive(false),
+            })),
+            BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                handle,
+                name: TcpOptionName::NoDelay,
+            })),
+            BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                handle,
+                name: TcpOptionName::KeepAlive,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
         ];
@@ -721,6 +738,13 @@ mod tests {
                 source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
             })),
             BrokerResult::Socket(SocketResponse::Shutdown),
+            BrokerResult::Socket(SocketResponse::SetTcpOption),
+            BrokerResult::Socket(SocketResponse::GetTcpOption(GetTcpOptionResponse {
+                value: TcpOptionValue::NoDelay(true),
+            })),
+            BrokerResult::Socket(SocketResponse::GetTcpOption(GetTcpOptionResponse {
+                value: TcpOptionValue::KeepAlive(false),
+            })),
             BrokerResult::Socket(SocketResponse::Status(socket_status(
                 SocketConnectionStatus::Connecting,
             ))),
@@ -903,6 +927,20 @@ mod tests {
             Err(WireError::TruncatedFrame)
         );
 
+        let set_tcp_option = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+                handle: ObjectHandle(13),
+                value: TcpOptionValue::NoDelay(true),
+            })),
+        });
+        for offset in 1..=2 {
+            let mut frame = set_tcp_option.clone();
+            let index = frame.len() - offset;
+            frame[index] = 0xff;
+            assert_eq!(decode_request(&frame), Err(WireError::InvalidTag));
+        }
+
         let mut unknown_shutdown_mode = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
@@ -987,6 +1025,19 @@ mod tests {
         });
         *unknown_status.last_mut().unwrap() = 0xff;
         assert_eq!(decode_response(&unknown_status), Err(WireError::InvalidTag));
+
+        let get_tcp_option = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Socket(SocketResponse::GetTcpOption(GetTcpOptionResponse {
+                value: TcpOptionValue::KeepAlive(true),
+            })),
+        });
+        for offset in 1..=2 {
+            let mut frame = get_tcp_option.clone();
+            let index = frame.len() - offset;
+            frame[index] = 0xff;
+            assert_eq!(decode_response(&frame), Err(WireError::InvalidTag));
+        }
 
         let socket_error = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,

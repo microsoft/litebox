@@ -107,6 +107,8 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
                 | SocketRequest::Listen(_)
                 | SocketRequest::Accept(_)
                 | SocketRequest::Shutdown(_)
+                | SocketRequest::SetTcpOption(_)
+                | SocketRequest::GetTcpOption(_)
                 | SocketRequest::Status(_),
             ) => None,
         };
@@ -572,6 +574,20 @@ fn handle_socket_request<Memory: SharedMemory>(
                 SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
             }
         }
+        SocketRequest::SetTcpOption(request) => {
+            litebox_broker_core::socket::set_tcp_option(session, request.handle, request.value)
+                .map(|()| SocketResponse::SetTcpOption)
+                .map_err(RequestFailure::from)
+        }
+        SocketRequest::GetTcpOption(request) => {
+            litebox_broker_core::socket::get_tcp_option(session, request.handle, request.name)
+                .map(|value| {
+                    SocketResponse::GetTcpOption(
+                        litebox_broker_protocol::socket::GetTcpOptionResponse { value },
+                    )
+                })
+                .map_err(RequestFailure::from)
+        }
         SocketRequest::Status(request) => {
             litebox_broker_core::socket::status(session, request.handle)
                 .map(SocketResponse::Status)
@@ -697,7 +713,8 @@ mod tests {
         ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
         ReceiveSocketRequest, SendFlags, SendSocketRequest, SendToSocketRequest,
         SendToSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
-        SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
+        SocketError, SocketStatusRequest, SocketStatusResponse, SocketType, TcpOptionName,
+        TcpOptionValue,
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
@@ -849,6 +866,21 @@ mod tests {
 
         fn shutdown(&self, _mode: ShutdownMode) -> litebox_broker_core::Result<SocketOutcome<()>> {
             Ok(SocketOutcome::Completed(()))
+        }
+
+        fn set_tcp_option(&self, _value: TcpOptionValue) -> litebox_broker_core::Result<()> {
+            Ok(())
+        }
+
+        fn get_tcp_option(
+            &self,
+            name: TcpOptionName,
+        ) -> litebox_broker_core::Result<TcpOptionValue> {
+            match name {
+                TcpOptionName::NoDelay => Ok(TcpOptionValue::NoDelay(false)),
+                TcpOptionName::KeepAlive => Ok(TcpOptionValue::KeepAlive(false)),
+                _ => Err(litebox_broker_core::BrokerError::UnsupportedOperation),
+            }
         }
 
         fn status(&self) -> litebox_broker_core::Result<SocketStatusResponse> {

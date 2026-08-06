@@ -14,9 +14,10 @@ use crate::readiness::ReadinessFlags;
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
-    ListenSocketRequest, ListenSocketResponse, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
-    ReceiveSocketRequest, ReceiveSocketResponse, SendSocketRequest, SendSocketResponse,
-    SendToSocketRequest, SendToSocketResponse, ShutdownSocketRequest, SocketError,
+    GetTcpOptionRequest, GetTcpOptionResponse, ListenSocketRequest, ListenSocketResponse,
+    ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
+    ReceiveSocketResponse, SendSocketRequest, SendSocketResponse, SendToSocketRequest,
+    SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
     SocketStatusRequest, SocketStatusResponse,
 };
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
@@ -121,6 +122,10 @@ pub enum SocketRequest {
     ReceiveFrom(ReceiveFromSocketRequest),
     /// Shut down one or both directions.
     Shutdown(ShutdownSocketRequest),
+    /// Set a typed TCP socket option.
+    SetTcpOption(SetTcpOptionRequest),
+    /// Read a typed TCP socket option.
+    GetTcpOption(GetTcpOptionRequest),
     /// Read a socket's connection state.
     Status(SocketStatusRequest),
 }
@@ -196,6 +201,10 @@ pub enum SocketResponse {
     ReceiveFrom(ReceiveFromSocketResponse),
     /// Shutdown operation completed.
     Shutdown,
+    /// TCP socket option was updated.
+    SetTcpOption,
+    /// TCP socket option response.
+    GetTcpOption(GetTcpOptionResponse),
     /// Status operation response.
     Status(SocketStatusResponse),
     /// A host network operation failed.

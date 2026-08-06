@@ -25,7 +25,7 @@ use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE,
     MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromFlags, ReceiveSocketResponse, SendFlags,
     ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse,
-    SocketType,
+    SocketType, TcpOptionName, TcpOptionValue,
 };
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, epoll, eventfd};
@@ -267,6 +267,24 @@ impl PlatformSocket for LinuxSocket {
             mode,
             response,
         })
+    }
+
+    fn set_tcp_option(&self, value: TcpOptionValue) -> BrokerResult<()> {
+        self.reactor
+            .request(|response| ReactorCommand::SetTcpOption {
+                id: self.id,
+                value,
+                response,
+            })
+    }
+
+    fn get_tcp_option(&self, name: TcpOptionName) -> BrokerResult<TcpOptionValue> {
+        self.reactor
+            .request(|response| ReactorCommand::GetTcpOption {
+                id: self.id,
+                name,
+                response,
+            })
     }
 
     fn status(&self) -> BrokerResult<SocketStatusResponse> {
@@ -538,6 +556,16 @@ enum ReactorCommand {
         id: u64,
         mode: ShutdownMode,
         response: SyncSender<BrokerResult<SocketOutcome<()>>>,
+    },
+    SetTcpOption {
+        id: u64,
+        value: TcpOptionValue,
+        response: SyncSender<BrokerResult<()>>,
+    },
+    GetTcpOption {
+        id: u64,
+        name: TcpOptionName,
+        response: SyncSender<BrokerResult<TcpOptionValue>>,
     },
     Status {
         id: u64,
@@ -849,6 +877,26 @@ impl Reactor {
                         .get_mut(&id)
                         .ok_or(BrokerError::Internal)
                         .and_then(|socket| shutdown_socket(socket, mode));
+                    let _ = response.send(outcome);
+                }
+                ReactorCommand::SetTcpOption {
+                    id,
+                    value,
+                    response,
+                } => {
+                    let outcome = self
+                        .sockets
+                        .get(&id)
+                        .ok_or(BrokerError::Internal)
+                        .and_then(|socket| set_tcp_option(socket, value));
+                    let _ = response.send(outcome);
+                }
+                ReactorCommand::GetTcpOption { id, name, response } => {
+                    let outcome = self
+                        .sockets
+                        .get(&id)
+                        .ok_or(BrokerError::Internal)
+                        .and_then(|socket| get_tcp_option(socket, name));
                     let _ = response.send(outcome);
                 }
                 ReactorCommand::Status { id, response } => {
@@ -1494,6 +1542,33 @@ fn receive_socket_once(
     }
 }
 
+fn set_tcp_option(socket: &SocketEntry, value: TcpOptionValue) -> BrokerResult<()> {
+    if socket.kind != SocketKind::Tcp {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    match value {
+        TcpOptionValue::NoDelay(value) => sockopt::set_tcp_nodelay(&socket.socket, value),
+        TcpOptionValue::KeepAlive(value) => sockopt::set_socket_keepalive(&socket.socket, value),
+        _ => return Err(BrokerError::UnsupportedOperation),
+    }
+    .map_err(broker_error_from_errno)
+}
+
+fn get_tcp_option(socket: &SocketEntry, name: TcpOptionName) -> BrokerResult<TcpOptionValue> {
+    if socket.kind != SocketKind::Tcp {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    match name {
+        TcpOptionName::NoDelay => sockopt::tcp_nodelay(&socket.socket)
+            .map(TcpOptionValue::NoDelay)
+            .map_err(broker_error_from_errno),
+        TcpOptionName::KeepAlive => sockopt::socket_keepalive(&socket.socket)
+            .map(TcpOptionValue::KeepAlive)
+            .map_err(broker_error_from_errno),
+        _ => Err(BrokerError::UnsupportedOperation),
+    }
+}
+
 fn shutdown_socket(
     socket: &mut SocketEntry,
     mode: ShutdownMode,
@@ -2101,6 +2176,34 @@ mod tests {
         assert_eq!(*local_address.ip(), Ipv4Addr::LOCALHOST);
         assert_ne!(local_address.port(), 0);
         assert_eq!(status.pending_error, None);
+        assert_eq!(
+            litebox_broker_core::socket::get_tcp_option(&session, handle, TcpOptionName::NoDelay,),
+            Ok(TcpOptionValue::NoDelay(false))
+        );
+        litebox_broker_core::socket::set_tcp_option(
+            &session,
+            handle,
+            TcpOptionValue::NoDelay(true),
+        )
+        .unwrap();
+        assert_eq!(
+            litebox_broker_core::socket::get_tcp_option(&session, handle, TcpOptionName::NoDelay,),
+            Ok(TcpOptionValue::NoDelay(true))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::get_tcp_option(&session, handle, TcpOptionName::KeepAlive,),
+            Ok(TcpOptionValue::KeepAlive(false))
+        );
+        litebox_broker_core::socket::set_tcp_option(
+            &session,
+            handle,
+            TcpOptionValue::KeepAlive(true),
+        )
+        .unwrap();
+        assert_eq!(
+            litebox_broker_core::socket::get_tcp_option(&session, handle, TcpOptionName::KeepAlive,),
+            Ok(TcpOptionValue::KeepAlive(true))
+        );
 
         let mut unavailable = [0_u8; 1];
         assert_eq!(

@@ -13,12 +13,14 @@ use litebox_broker_protocol::socket::{
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
     SocketConnectionStatus, SocketError as BrokerSocketError, SocketOutcome, SocketStatusResponse,
+    TcpOptionName as BrokerTcpOptionName, TcpOptionValue as BrokerTcpOptionValue,
 };
 
 use super::{
-    ReceiveFlags,
+    ReceiveFlags, TcpOptionData, TcpOptionName,
     errors::{
-        AcceptError, BindError, ConnectError, ListenError, RemoteAddrError, SocketAsyncError,
+        AcceptError, BindError, ConnectError, GetTcpOptionError, ListenError, RemoteAddrError,
+        SetTcpOptionError, SocketAsyncError,
     },
     socket_channel::{ChannelReadError, ChannelWriteError, SocketState},
 };
@@ -252,6 +254,51 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
 
     pub(super) fn is_listening(&self) -> bool {
         self.state.lock().listening
+    }
+
+    pub(super) fn set_tcp_option(&self, data: TcpOptionData) -> Result<(), SetTcpOptionError> {
+        let value = match data {
+            TcpOptionData::NODELAY(value) => BrokerTcpOptionValue::NoDelay(value),
+            TcpOptionData::KEEPALIVE(value) => BrokerTcpOptionValue::KeepAlive(value),
+            TcpOptionData::KEEPINTVL(_) | TcpOptionData::CONGESTION(_) => {
+                return Err(SetTcpOptionError::Unsupported);
+            }
+        };
+        self.broker.set_tcp_option(self.handle, value).map_err(
+            |error| match BrokerObjectError::from(error) {
+                BrokerObjectError::UnsupportedOperation => SetTcpOptionError::Unsupported,
+                _ => SetTcpOptionError::BackendFailure,
+            },
+        )
+    }
+
+    pub(super) fn get_tcp_option(
+        &self,
+        name: TcpOptionName,
+    ) -> Result<TcpOptionData, GetTcpOptionError> {
+        let broker_name = match name {
+            TcpOptionName::NODELAY => BrokerTcpOptionName::NoDelay,
+            TcpOptionName::KEEPALIVE => BrokerTcpOptionName::KeepAlive,
+            TcpOptionName::KEEPINTVL | TcpOptionName::CONGESTION => {
+                return Err(GetTcpOptionError::Unsupported);
+            }
+        };
+        let value = self
+            .broker
+            .get_tcp_option(self.handle, broker_name)
+            .map_err(|error| match BrokerObjectError::from(error) {
+                BrokerObjectError::UnsupportedOperation => GetTcpOptionError::Unsupported,
+                _ => GetTcpOptionError::BackendFailure,
+            })?;
+        match (name, value) {
+            (TcpOptionName::NODELAY, BrokerTcpOptionValue::NoDelay(value)) => {
+                Ok(TcpOptionData::NODELAY(value))
+            }
+            (TcpOptionName::KEEPALIVE, BrokerTcpOptionValue::KeepAlive(value)) => {
+                Ok(TcpOptionData::KEEPALIVE(value))
+            }
+            _ => Err(GetTcpOptionError::BackendFailure),
+        }
     }
 
     pub(super) fn stop_listening(&self) -> Result<(), SocketAsyncError> {

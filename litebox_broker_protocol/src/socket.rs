@@ -80,6 +80,26 @@ pub enum ShutdownMode {
     StopListening,
 }
 
+/// Broker-supported TCP socket option name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TcpOptionName {
+    /// Disable or enable Nagle's algorithm.
+    NoDelay,
+    /// Enable or disable TCP keepalive probes.
+    KeepAlive,
+}
+
+/// Broker-supported TCP socket option value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TcpOptionValue {
+    /// Whether Nagle's algorithm is disabled.
+    NoDelay(bool),
+    /// Whether TCP keepalive probes are enabled.
+    KeepAlive(bool),
+}
+
 /// IPv4 address in network byte order.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -494,6 +514,31 @@ pub struct ShutdownSocketRequest {
     pub handle: ObjectHandle,
     /// Directions to shut down.
     pub mode: ShutdownMode,
+}
+
+/// Request to set a typed TCP socket option.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetTcpOptionRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Option value to apply.
+    pub value: TcpOptionValue,
+}
+
+/// Request to read a typed TCP socket option.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetTcpOptionRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Option name to read.
+    pub name: TcpOptionName,
+}
+
+/// Response containing a typed TCP socket option value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetTcpOptionResponse {
+    /// Authoritative option value returned by the platform socket.
+    pub value: TcpOptionValue,
 }
 
 /// Request for a socket's connection state.

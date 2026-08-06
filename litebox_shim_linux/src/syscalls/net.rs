@@ -502,11 +502,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         optval: UserPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
+        if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE)) {
+            match self.get_proxy(fd)?.as_ref() {
+                NetworkProxy::BrokerStream(_) => {
+                    let value: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+                    return self
+                        .net
+                        .lock()
+                        .set_tcp_option(fd, litebox::net::TcpOptionData::KEEPALIVE(value != 0))
+                        .map_err(Errno::from);
+                }
+                NetworkProxy::BrokerDatagram(_) => return Err(Errno::EOPNOTSUPP),
+                _ => {}
+            }
+        }
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
             let unsupported_broker_option = matches!(
                 (so, &value),
                 (SocketOption::LINGER, SocketOptionValue::Timeout(Some(_)))
-                    | (SocketOption::KEEPALIVE, SocketOptionValue::U32(_))
             );
             if unsupported_broker_option
                 && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
@@ -540,14 +553,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
-                        deferred_tcp_option = Some(if keep_alive {
-                            // default time interval is 2 hours
-                            litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                core::time::Duration::from_hours(2),
-                            ))
-                        } else {
-                            litebox::net::TcpOptionData::KEEPALIVE(None)
-                        });
+                        deferred_tcp_option =
+                            Some(litebox::net::TcpOptionData::KEEPALIVE(keep_alive));
                         opt.keep_alive = keep_alive;
                     }
                     _ => unreachable!(),
@@ -565,7 +572,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
                         unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
                     }
-                    _ => unimplemented!(),
+                    litebox::net::errors::SetTcpOptionError::Unsupported
+                    | litebox::net::errors::SetTcpOptionError::BackendFailure => {
+                        return Err(err.into());
+                    }
+                    _ => unreachable!(),
                 }
             }
             Ok(())
@@ -635,6 +646,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
+                    if matches!(to, TcpOption::CORK)
+                        && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+                    {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
                     let val: u32 = super::read_from_user::<_, Platform>(optval, size_of::<u32>())?;
                     // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
                     // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
@@ -660,7 +676,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         .lock()
                         .set_tcp_option(
                             fd,
-                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                            litebox::net::TcpOptionData::KEEPINTVL(Some(
                                 core::time::Duration::from_secs(u64::from(val)),
                             )),
                         )
@@ -729,6 +745,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         optval: UserPtrMut<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
+        if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE))
+            && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+        {
+            let TcpOptionData::KEEPALIVE(enabled) = self
+                .net
+                .lock()
+                .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+            else {
+                unreachable!()
+            };
+            return super::write_to_user::<_, Platform>(u32::from(enabled), optval, len);
+        }
         match self.getsockopt_common(optname, optval, len, |sopt| {
             self.with_socket_options(fd, |options| match sopt {
                 SocketOption::RCVTIMEO => SocketOptionValue::Timeout(options.recv_timeout),
@@ -801,16 +829,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     TcpOption::KEEPINTVL => {
-                        let TcpOptionData::KEEPALIVE(interval) = self
+                        let TcpOptionData::KEEPINTVL(interval) = self
                             .net
                             .lock()
-                            .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+                            .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPINTVL)?
                         else {
                             unreachable!()
                         };
                         interval.map_or(0, |d| d.as_secs().try_into().unwrap())
                     }
                     TcpOption::NODELAY | TcpOption::CORK => {
+                        if matches!(tcpopt, TcpOption::CORK)
+                            && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+                        {
+                            return Err(Errno::EOPNOTSUPP);
+                        }
                         let TcpOptionData::NODELAY(nodelay) = self
                             .net
                             .lock()

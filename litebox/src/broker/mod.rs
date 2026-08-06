@@ -18,7 +18,7 @@ use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
-    SocketConnectionStatus, SocketOutcome, SocketStatusResponse,
+    SocketConnectionStatus, SocketOutcome, SocketStatusResponse, TcpOptionName, TcpOptionValue,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -110,6 +110,18 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         mode: ShutdownMode,
     ) -> core::result::Result<SocketOutcome<()>, BrokerControlError>;
+
+    fn set_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        value: TcpOptionValue,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn get_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        name: TcpOptionName,
+    ) -> core::result::Result<TcpOptionValue, BrokerControlError>;
 
     fn create_event_with_count(
         &self,
@@ -454,6 +466,22 @@ where
                 Ok(()) => SocketOutcome::Completed(()),
                 Err(error) => SocketOutcome::Failed(error),
             })
+    }
+
+    fn set_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        value: TcpOptionValue,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_tcp_option(handle, value))
+    }
+
+    fn get_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        name: TcpOptionName,
+    ) -> core::result::Result<TcpOptionValue, BrokerControlError> {
+        self.request(|local| local.get_tcp_option(handle, name))
     }
 
     fn create_event_with_count(

@@ -56,6 +56,13 @@ int main(int argc, char **argv) {
     assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled,
                       sizeof(enabled)) == -1);
     assert(errno == ENOPROTOOPT);
+    assert(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled,
+                      sizeof(enabled)) == -1);
+    assert(errno == EOPNOTSUPP);
+    socklen_t enabled_length = sizeof(enabled);
+    assert(getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled,
+                      &enabled_length) == 0);
+    assert(enabled == 0);
 
     struct pollfd writable = {.fd = fd, .events = POLLOUT};
     assert(poll(&writable, 1, 0) == 1);
