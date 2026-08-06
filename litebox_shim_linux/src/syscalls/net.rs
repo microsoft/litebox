@@ -2854,14 +2854,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
+    use core::net::SocketAddr;
+
     type TestTask = crate::Task<
         crate::syscalls::tests::TestPlatform,
         crate::DefaultFS<crate::syscalls::tests::TestPlatform>,
     >;
 
-    use litebox_common_linux::{AddressFamily, SendFlags, SockFlags, SockType, errno::Errno};
+    use alloc::string::ToString as _;
+    use litebox::utils::TruncateExt as _;
+    use litebox_common_linux::{
+        AddressFamily, MapFlags, ProtFlags, ReceiveFlags, SendFlags, SockFlags, SockType,
+        SocketOption, SocketOptionName, errno::Errno,
+    };
+    use zerocopy::FromZeros as _;
 
-    use crate::syscalls::tests::init_platform;
+    use super::SocketAddress;
+    use crate::{
+        UserPtr, UserPtrMut,
+        syscalls::{
+            net::{CSockInetAddr, read_sockaddr_from_user},
+            tests::init_platform,
+        },
+    };
 
     extern crate alloc;
     extern crate std;
@@ -2871,6 +2886,25 @@ mod tests {
         core::mem::size_of::<litebox_common_linux::UserMsgHdr>()
             == core::mem::size_of::<libc::msghdr>()
     );
+
+    const LOOPBACK_IP_ADDR: [u8; 4] = [127, 0, 0, 1];
+    const LOOPBACK_IP_ADDR_STR: &str = "127.0.0.1";
+
+    fn find_free_tcp_port() -> u16 {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("failed to reserve TCP port")
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn find_free_udp_port() -> u16 {
+        std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("failed to reserve UDP port")
+            .local_addr()
+            .unwrap()
+            .port()
+    }
 
     fn close_socket(task: &TestTask, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
@@ -3074,6 +3108,659 @@ mod tests {
             Err(Errno::EMFILE)
         );
         close_socket(&task, fd);
+    }
+
+    /// Helper to read SO_ERROR from a socket via getsockopt.
+    /// Returns the errno integer value (0 means no error).
+    fn get_so_error(task: &TestTask, sockfd: u32) -> u32 {
+        let mut optval: u32 = 0xDEAD;
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::ERROR),
+                UserPtrMut::from_usize((&raw mut optval).cast::<u8>() as usize),
+                core::mem::size_of::<u32>().trunc(),
+            )
+            .expect("getsockopt SO_ERROR failed");
+        assert_eq!(len, core::mem::size_of::<u32>());
+        optval
+    }
+
+    fn epoll_add(task: &TestTask, epfd: i32, target_fd: u32, events: litebox::event::Events) {
+        let ev = litebox_common_linux::EpollEvent {
+            events: events.bits(),
+            data: u64::from(target_fd),
+        };
+        let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
+        let ev_const = UserPtr::from_usize(ev_ptr as usize);
+        task.sys_epoll_ctl(
+            epfd,
+            litebox_common_linux::EpollOp::EpollCtlAdd,
+            i32::try_from(target_fd).unwrap(),
+            ev_const,
+        )
+        .expect("epoll_ctl add server failed");
+    }
+
+    fn epoll_wait(
+        task: &TestTask,
+        epfd: i32,
+        events: &mut [litebox_common_linux::EpollEvent],
+    ) -> usize {
+        let events_ptr = UserPtrMut::from_usize(events.as_mut_ptr() as usize);
+        task.sys_epoll_pwait(epfd, events_ptr, events.len().trunc(), -1, None, 0)
+            .expect("epoll_wait failed")
+    }
+
+    fn test_tcp_socket_as_server(
+        task: &TestTask,
+        ip: [u8; 4],
+        port: u16,
+        is_nonblocking: bool,
+        test_trunc: bool,
+        option: &'static str,
+    ) {
+        let server = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                if is_nonblocking {
+                    SockFlags::NONBLOCK
+                } else {
+                    SockFlags::empty()
+                },
+                0,
+            )
+            .unwrap();
+        let server_sockaddr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(ip),
+            port,
+        )));
+        task.do_bind(server, server_sockaddr.clone())
+            .expect("Failed to bind socket");
+        task.do_listen(server, 1)
+            .expect("Failed to listen on socket");
+
+        // Create an epoll instance and register the server fd for EPOLLIN
+        let epfd = task
+            .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
+            .expect("failed to create epoll");
+        let epfd = i32::try_from(epfd).unwrap();
+        epoll_add(task, epfd, server, litebox::event::Events::IN);
+
+        let buf = "Hello, world!";
+        let child_handle = std::thread::spawn(move || {
+            std::thread::sleep(core::time::Duration::from_millis(200)); // Give server time to start
+            let port = port.to_string();
+            match option {
+                "sendto" | "sendmsg" => std::process::Command::new("nc")
+                    .args([
+                        "-w", // timeout for connects and final net reads
+                        "1",
+                        LOOPBACK_IP_ADDR_STR,
+                        &port,
+                    ])
+                    .stdout(std::process::Stdio::piped())
+                    .output(),
+                "recvfrom" | "recvmsg" => std::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        &alloc::format!("echo -n '{buf}' | nc -w 1 {LOOPBACK_IP_ADDR_STR} {port}"),
+                    ])
+                    .output(),
+                _ => panic!("Unknown option"),
+            }
+        });
+
+        if is_nonblocking {
+            // wait on epoll for server to be readable (incoming connection)
+            let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+            let n = epoll_wait(task, epfd, &mut events);
+            assert_eq!(n, 1);
+            for ev in &events[..n] {
+                let events = ev.events;
+                assert!(events & litebox::event::Events::IN.bits() != 0);
+            }
+        }
+
+        let mut remote_addr = super::SocketAddress::default();
+        let client_fd = task
+            .do_accept(
+                server,
+                Some(&mut remote_addr),
+                if is_nonblocking {
+                    SockFlags::NONBLOCK
+                } else {
+                    SockFlags::empty()
+                },
+            )
+            .expect("Failed to accept connection");
+        assert_eq!(server_sockaddr, task.do_getsockname(client_fd).unwrap());
+        assert_eq!(remote_addr, task.do_getpeername(client_fd).unwrap());
+        let super::SocketAddress::Inet(SocketAddr::V4(remote_addr)) = remote_addr else {
+            panic!("Expected IPv4 address");
+        };
+        assert_eq!(remote_addr.ip().octets(), LOOPBACK_IP_ADDR);
+        assert_ne!(remote_addr.port(), 0);
+
+        match option {
+            "sendto" => {
+                let n = task
+                    .do_sendto(client_fd, buf.as_bytes(), SendFlags::empty(), None)
+                    .expect("Failed to send data");
+                assert_eq!(n, buf.len());
+                let output = child_handle
+                    .join()
+                    .unwrap()
+                    .expect("Failed to wait for client");
+                let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
+                assert_eq!(stdout, buf);
+            }
+            "sendmsg" => {
+                let buf1 = "Hello,";
+                let buf2 = " world!\n";
+                let iovec = [
+                    litebox_common_linux::IoVec {
+                        iov_base: UserPtrMut::from_usize(buf1.as_ptr().expose_provenance()),
+                        iov_len: buf1.len(),
+                    },
+                    litebox_common_linux::IoVec {
+                        iov_base: UserPtrMut::from_usize(buf2.as_ptr().expose_provenance()),
+                        iov_len: buf2.len(),
+                    },
+                ];
+                let hdr = {
+                    let mut h = litebox_common_linux::UserMsgHdr::new_zeroed();
+                    h.msg_iov = UserPtr::from_usize(iovec.as_ptr() as usize);
+                    h.msg_iovlen = iovec.len();
+                    h
+                };
+                assert_eq!(
+                    task.do_sendmsg(client_fd, &hdr, SendFlags::empty())
+                        .expect("Failed to sendmsg"),
+                    buf1.len() + buf2.len()
+                );
+                let output = child_handle
+                    .join()
+                    .unwrap()
+                    .expect("Failed to wait for client");
+                let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
+                assert_eq!(stdout, alloc::format!("{buf1}{buf2}"));
+            }
+            "recvfrom" | "recvmsg" => {
+                if is_nonblocking {
+                    epoll_add(task, epfd, client_fd, litebox::event::Events::IN);
+                    let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+                    let n = epoll_wait(task, epfd, &mut events);
+                    for ev in &events[..n] {
+                        assert!(ev.events & litebox::event::Events::IN.bits() != 0);
+                        let fd = u32::try_from(ev.data).unwrap();
+                        assert_eq!(fd, client_fd);
+                    }
+                }
+                let mut recv_buf = [0u8; 48];
+                let flags = if test_trunc {
+                    ReceiveFlags::TRUNC
+                } else {
+                    ReceiveFlags::empty()
+                };
+                let n = match option {
+                    "recvfrom" => task
+                        .do_recvfrom(client_fd, &mut recv_buf, flags, None)
+                        .expect("Failed to receive data"),
+                    "recvmsg" => {
+                        let mapped_buf = task
+                            .sys_mmap(
+                                0,
+                                recv_buf.len(),
+                                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                                -1,
+                                0,
+                            )
+                            .expect("failed to map recvmsg buffer");
+                        let iovec = [litebox_common_linux::IoVec {
+                            iov_base: mapped_buf,
+                            iov_len: recv_buf.len(),
+                        }];
+                        let mut msg_hdr = litebox_common_linux::UserMsgHdr::new_zeroed();
+                        msg_hdr.msg_iov = UserPtr::from_usize(iovec.as_ptr() as usize);
+                        msg_hdr.msg_iovlen = iovec.len();
+                        let msg_ptr = UserPtrMut::from_usize(&raw mut msg_hdr as usize);
+                        let received = task
+                            .sys_recvmsg(i32::try_from(client_fd).unwrap(), msg_ptr, flags)
+                            .expect("failed to recvmsg");
+                        let received_buf = mapped_buf
+                            .to_owned_slice::<crate::syscalls::tests::TestPlatform>(recv_buf.len())
+                            .expect("failed to read recvmsg buffer");
+                        recv_buf.copy_from_slice(&received_buf);
+                        task.sys_munmap(mapped_buf, recv_buf.len())
+                            .expect("failed to unmap recvmsg buffer");
+                        received
+                    }
+                    _ => unreachable!(),
+                };
+                if test_trunc {
+                    assert!(recv_buf.iter().all(|&b| b == 0)); // buf remains unchanged
+                } else {
+                    assert_eq!(recv_buf[..n], buf.as_bytes()[..n]);
+                }
+                assert_eq!(n, buf.len()); // even with truncation, it returns the actual length
+                let _ = child_handle.join().expect("Failed to wait for client");
+            }
+            _ => panic!("Unknown option"),
+        }
+
+        close_socket(task, client_fd);
+        close_socket(task, server);
+    }
+
+    fn test_tcp_socket_with_external_client(is_nonblocking: bool, test_trunc: bool) {
+        let task = init_platform(None);
+        test_tcp_socket_as_server(
+            &task,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
+            is_nonblocking,
+            test_trunc,
+            "recvfrom",
+        );
+        test_tcp_socket_as_server(
+            &task,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
+            is_nonblocking,
+            test_trunc,
+            "recvmsg",
+        );
+    }
+
+    fn test_tcp_socket_send(is_nonblocking: bool, test_trunc: bool) {
+        let task = init_platform(None);
+        test_tcp_socket_as_server(
+            &task,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
+            is_nonblocking,
+            test_trunc,
+            "sendto",
+        );
+        test_tcp_socket_as_server(
+            &task,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
+            is_nonblocking,
+            test_trunc,
+            "sendmsg",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_blocking_send_tcp_socket() {
+        test_tcp_socket_send(false, false);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_nonblocking_send_tcp_socket() {
+        test_tcp_socket_send(true, false);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_blocking_recvfrom_tcp_socket() {
+        test_tcp_socket_with_external_client(false, false);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_nonblocking_recvfrom_tcp_socket() {
+        test_tcp_socket_with_external_client(true, false);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_blocking_recvfrom_tcp_socket_with_truncation() {
+        test_tcp_socket_with_external_client(false, true);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_tcp_connection_refused() {
+        let task = init_platform(None);
+        let port = find_free_tcp_port();
+        let socket_fd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .expect("failed to create socket");
+        let socket_fd2 = task
+            .sys_dup(i32::try_from(socket_fd).unwrap(), None, None)
+            .unwrap();
+
+        close_socket(&task, socket_fd);
+        let err = task
+            .do_connect(
+                socket_fd2,
+                SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+                    core::net::Ipv4Addr::from(LOOPBACK_IP_ADDR),
+                    port,
+                ))),
+            )
+            .unwrap_err();
+        assert_eq!(err, litebox_common_linux::errno::Errno::ECONNREFUSED);
+
+        let so_err = get_so_error(&task, socket_fd2);
+        assert_eq!(so_err, i32::from(Errno::ECONNREFUSED).cast_unsigned());
+
+        // Second read should be cleared (self-clearing semantics)
+        assert_eq!(get_so_error(&task, socket_fd2), 0);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_tcp_socket_as_client() {
+        let task = init_platform(None);
+        let port = find_free_tcp_port();
+
+        let child_handle = std::thread::spawn(move || {
+            let port = port.to_string();
+            std::process::Command::new("nc")
+                .args(["-w", "1", "-l", LOOPBACK_IP_ADDR_STR, &port])
+                .output()
+        });
+        std::thread::sleep(core::time::Duration::from_secs(1));
+
+        // Client socket
+        let client_fd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .expect("failed to create client socket");
+
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(LOOPBACK_IP_ADDR),
+            port,
+        )));
+        task.do_connect(client_fd, server_addr)
+            .expect("failed to connect to server");
+        let so_error = get_so_error(&task, client_fd);
+        assert_eq!(
+            so_error, 0,
+            "SO_ERROR should be 0 after successful connect, got {so_error}"
+        );
+
+        let buf = "Hello, world!";
+        let n = task
+            .do_sendto(client_fd, buf.as_bytes(), SendFlags::empty(), None)
+            .unwrap();
+        assert_eq!(n, buf.len());
+
+        close_socket(&task, client_fd);
+
+        let output = child_handle
+            .join()
+            .unwrap()
+            .expect("Failed to wait for client");
+        let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout, buf);
+    }
+
+    fn blocking_udp_server_socket(
+        task: &TestTask,
+        test_trunc: bool,
+        set_trunc_flag: bool,
+        is_nonblocking: bool,
+        op: &str,
+    ) {
+        let server_port = find_free_udp_port();
+        let client_port = find_free_udp_port();
+
+        // Server socket and bind
+        let server_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                if is_nonblocking {
+                    SockFlags::NONBLOCK
+                } else {
+                    SockFlags::empty()
+                },
+                litebox_common_linux::IPProtocol::UDP as u8,
+            )
+            .expect("failed to create server socket");
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(LOOPBACK_IP_ADDR),
+            server_port,
+        )));
+        task.do_bind(server_fd, server_addr.clone())
+            .expect("failed to bind server");
+        assert_eq!(
+            server_addr,
+            task.do_getsockname(server_fd).expect("getsockname failed")
+        );
+
+        // Create an epoll instance and register the server fd for EPOLLIN
+        let epfd = task
+            .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
+            .expect("failed to create epoll");
+        let epfd = i32::try_from(epfd).unwrap();
+        epoll_add(task, epfd, server_fd, litebox::event::Events::IN);
+
+        let msg = "Hello from client";
+        let mut child = std::process::Command::new("nc")
+            .args([
+                "-u", // udp mode
+                "-N", // Shutdown the network socket after EOF on stdin
+                "-q", // quit after EOF on stdin and delay of secs
+                "1",
+                "-p", // Specify local port for remote connects
+                client_port.to_string().as_str(),
+                LOOPBACK_IP_ADDR_STR,
+                server_port.to_string().as_str(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn client");
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("Failed to open stdin");
+            stdin
+                .write_all(msg.as_bytes())
+                .expect("Failed to write to stdin");
+            stdin.flush().ok();
+            drop(stdin);
+        }
+
+        // Server receives and inspects sender addr
+        let mut recv_buf = [0u8; 48];
+        let mut recv_flags = ReceiveFlags::empty();
+        if test_trunc && set_trunc_flag {
+            recv_flags.insert(ReceiveFlags::TRUNC);
+        }
+        if is_nonblocking {
+            let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+            let n = epoll_wait(task, epfd, &mut events);
+            assert_eq!(n, 1);
+            for ev in &events[..n] {
+                assert!(ev.events & litebox::event::Events::IN.bits() != 0);
+                let fd = u32::try_from(ev.data).unwrap();
+                assert_eq!(fd, server_fd);
+            }
+        }
+        let recv_len = if test_trunc {
+            8 // intentionally small size to test truncation
+        } else {
+            recv_buf.len()
+        };
+        let source_addr = [0u8; core::mem::size_of::<CSockInetAddr>()];
+        let n = match op {
+            "recvfrom" => {
+                let mut addrlen = core::mem::size_of::<CSockInetAddr>();
+                task.sys_recvfrom(
+                    i32::try_from(server_fd).unwrap(),
+                    UserPtrMut::from_usize(recv_buf.as_mut_ptr() as usize),
+                    recv_len,
+                    recv_flags,
+                    Some(UserPtrMut::from_usize(source_addr.as_ptr() as usize)),
+                    UserPtrMut::from_usize(&raw mut addrlen as usize),
+                )
+                .expect("recvfrom failed")
+            }
+            "recvmsg" => {
+                let iovec = [litebox_common_linux::IoVec {
+                    iov_base: UserPtrMut::from_usize(recv_buf.as_mut_ptr() as usize),
+                    iov_len: recv_len,
+                }];
+                let mut msg_hdr = litebox_common_linux::UserMsgHdr::new_zeroed();
+                msg_hdr.msg_iov = UserPtr::from_usize(iovec.as_ptr() as usize);
+                msg_hdr.msg_iovlen = iovec.len();
+                msg_hdr.msg_name = UserPtrMut::from_usize(source_addr.as_ptr() as usize);
+                msg_hdr.msg_namelen = source_addr.len().trunc();
+                let msg_ptr = UserPtrMut::from_usize(&raw mut msg_hdr as usize);
+                let n = task
+                    .sys_recvmsg(i32::try_from(server_fd).unwrap(), msg_ptr, recv_flags)
+                    .expect("recvmsg failed");
+                if test_trunc {
+                    let flags = msg_hdr.msg_flags;
+                    assert!(flags.contains(ReceiveFlags::TRUNC));
+                }
+                n
+            }
+            _ => panic!("Unknown operation"),
+        };
+        let sender_addr = read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
+            UserPtr::from_usize(source_addr.as_ptr() as usize),
+            source_addr.len(),
+        )
+        .ok();
+        if test_trunc && set_trunc_flag {
+            assert_eq!(n, msg.len()); // return the actual length of the datagram rather than the received length
+            assert_eq!(recv_buf[..8], msg.as_bytes()[..8]); // only part of the message is received
+        }
+        if test_trunc && !set_trunc_flag {
+            assert_eq!(n, 8); // returns the size of the copied data, not the actual message length
+            assert_eq!(recv_buf[..n], msg.as_bytes()[..n]);
+        }
+        if !test_trunc {
+            assert_eq!(n, msg.len());
+            assert_eq!(recv_buf[..n], msg.as_bytes()[..n]);
+        }
+        let SocketAddress::Inet(sender_addr) = sender_addr.unwrap() else {
+            panic!("Expected Inet socket address");
+        };
+        assert_eq!(sender_addr.port(), client_port);
+
+        close_socket(task, server_fd);
+
+        child.wait().expect("Failed to wait for client");
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_blocking_udp_server_socket() {
+        let task = init_platform(None);
+        blocking_udp_server_socket(&task, false, false, false, "recvfrom");
+        blocking_udp_server_socket(&task, false, false, false, "recvmsg");
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_nonblocking_udp_server_socket() {
+        let task = init_platform(None);
+        blocking_udp_server_socket(&task, false, false, true, "recvfrom");
+        blocking_udp_server_socket(&task, false, false, true, "recvmsg");
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_blocking_udp_server_socket_with_truncation() {
+        let task = init_platform(None);
+        blocking_udp_server_socket(&task, true, true, false, "recvfrom");
+        blocking_udp_server_socket(&task, true, true, false, "recvmsg");
+        blocking_udp_server_socket(&task, true, false, false, "recvmsg");
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_udp_client_socket_without_server() {
+        let task = init_platform(None);
+        let server_port = find_free_udp_port();
+
+        // Client socket and explicit bind
+        let client_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                litebox_common_linux::IPProtocol::UDP as u8,
+            )
+            .expect("failed to create client socket");
+
+        let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from([127, 0, 0, 1]),
+            server_port,
+        )));
+
+        // Send from client to server
+        let msg = "Hello without connect()";
+        task.do_sendto(
+            client_fd,
+            msg.as_bytes(),
+            SendFlags::empty(),
+            Some(server_addr.clone()),
+        )
+        .expect("failed to sendto");
+
+        // Client implicitly bound to an ephemeral port via sendto
+        let SocketAddress::Inet(client_addr) =
+            task.do_getsockname(client_fd).expect("getsockname failed")
+        else {
+            panic!("Expected Inet socket address");
+        };
+        assert_ne!(client_addr.port(), 0);
+
+        // Client connects to server address
+        task.do_connect(client_fd, server_addr.clone())
+            .expect("failed to connect");
+
+        // Now client can send without specifying addr
+        let msg = "Hello with connect()";
+        task.do_sendto(client_fd, msg.as_bytes(), SendFlags::empty(), None)
+            .expect("failed to sendto");
+
+        close_socket(&task, client_fd);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_broker_tcp_keepalive_sockopt() {
+        let task = init_platform(None);
+        let sockfd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .expect("failed to create socket");
+
+        let val: u32 = 1;
+        let optval = UserPtr::from_usize((&raw const val).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::KEEPALIVE),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("failed to set SO_KEEPALIVE");
+
+        // Verify SO_KEEPALIVE is enabled
+        let mut result: u32 = 0;
+        let optval_out = UserPtrMut::from_usize((&raw mut result).cast::<u8>() as usize);
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::KEEPALIVE),
+                optval_out,
+                core::mem::size_of::<u32>().trunc(),
+            )
+            .expect("failed to get SO_KEEPALIVE");
+        assert_eq!(len, core::mem::size_of::<u32>());
+        assert_eq!(result, 1);
+        close_socket(&task, sockfd);
     }
 
     #[test]
