@@ -3397,37 +3397,37 @@ mod tests {
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_blocking_send_tcp_socket() {
+    fn test_blocking_send_tcp_socket() {
         test_tcp_socket_send(false, false);
     }
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_nonblocking_send_tcp_socket() {
+    fn test_nonblocking_send_tcp_socket() {
         test_tcp_socket_send(true, false);
     }
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_blocking_recvfrom_tcp_socket() {
+    fn test_blocking_recvfrom_tcp_socket() {
         test_tcp_socket_with_external_client(false, false);
     }
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_nonblocking_recvfrom_tcp_socket() {
+    fn test_nonblocking_recvfrom_tcp_socket() {
         test_tcp_socket_with_external_client(true, false);
     }
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_blocking_recvfrom_tcp_socket_with_truncation() {
+    fn test_blocking_recvfrom_tcp_socket_with_truncation() {
         test_tcp_socket_with_external_client(false, true);
     }
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_tcp_connection_refused() {
+    fn test_tcp_connection_refused() {
         let task = init_platform(None);
         let port = find_free_tcp_port();
         let socket_fd = task
@@ -3458,7 +3458,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_tcp_socket_as_client() {
+    fn test_tcp_socket_as_client() {
         let task = init_platform(None);
         let port = find_free_tcp_port();
 
@@ -3655,7 +3655,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_blocking_udp_server_socket() {
+    fn test_blocking_udp_server_socket() {
         let task = init_platform(None);
         blocking_udp_server_socket(&task, false, false, false, "recvfrom");
         blocking_udp_server_socket(&task, false, false, false, "recvmsg");
@@ -3663,7 +3663,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_nonblocking_udp_server_socket() {
+    fn test_nonblocking_udp_server_socket() {
         let task = init_platform(None);
         blocking_udp_server_socket(&task, false, false, true, "recvfrom");
         blocking_udp_server_socket(&task, false, false, true, "recvmsg");
@@ -3671,7 +3671,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_blocking_udp_server_socket_with_truncation() {
+    fn test_blocking_udp_server_socket_with_truncation() {
         let task = init_platform(None);
         blocking_udp_server_socket(&task, true, true, false, "recvfrom");
         blocking_udp_server_socket(&task, true, true, false, "recvmsg");
@@ -3680,7 +3680,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_udp_client_socket_without_server() {
+    fn test_udp_client_socket_without_server() {
         let task = init_platform(None);
         let server_port = find_free_udp_port();
 
@@ -3731,7 +3731,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn test_broker_tcp_keepalive_sockopt() {
+    fn test_tcp_keepalive_sockopt() {
         let task = init_platform(None);
         let sockfd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
