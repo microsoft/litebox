@@ -3,10 +3,12 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::mem::size_of;
 use int_enum::IntEnum;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::Guid;
 use crate::syscalls::Handle;
@@ -21,8 +23,28 @@ const STATE_NAME_XOR_KEY: u64 = 0x41c6_4e6d_a3bc_0074;
 const MAXIMUM_UNIQUE_ID: u32 = 0x001f_ffff;
 const STATE_NAME_INFORMATION_SIZE: u32 = 4;
 const INITIAL_CHANGE_STAMP: u32 = 0;
-const DELIVERY_DESCRIPTOR_HEADER_SIZE: u32 = 48;
-const DELIVERY_DESCRIPTOR_BUFFER_SIZE: u32 = DELIVERY_DESCRIPTOR_HEADER_SIZE + MAXIMUM_STATE_SIZE;
+const DELIVERY_DESCRIPTOR_HEADER_SIZE: usize = size_of::<WnfDeliveryDescriptor>();
+const DELIVERY_DESCRIPTOR_BUFFER_SIZE: usize =
+    DELIVERY_DESCRIPTOR_HEADER_SIZE + MAXIMUM_STATE_SIZE as usize;
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct WnfEventMask: u32 {
+        const _ = !0;
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct WnfDeliveryDescriptor {
+    subscription_id: u64,
+    state_name: u64,
+    change_stamp: u32,
+    state_data_size: u32,
+    event_mask: u32,
+    type_id: Guid,
+    state_data_offset: u32,
+}
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
@@ -55,7 +77,7 @@ enum WnfStateNameInformation {
 pub(crate) struct WnfStateData {
     change_stamp: u32,
     type_id: Option<Guid>,
-    data: Vec<u8>,
+    data: Option<Vec<u8>>,
     maximum_state_size: u32,
     lifetime: WnfStateNameLifetime,
 }
@@ -79,7 +101,7 @@ pub(crate) struct WnfProcessSubscriptions {
 struct WnfSubscription {
     id: u64,
     change_stamp: u32,
-    event_mask: u32,
+    event_mask: WnfEventMask,
 }
 
 #[derive(Clone)]
@@ -87,7 +109,7 @@ struct WnfPendingDelivery {
     subscription_id: u64,
     state_name: u64,
     change_stamp: u32,
-    event_mask: u32,
+    event_mask: WnfEventMask,
     type_id: Option<Guid>,
     data: Vec<u8>,
 }
@@ -125,11 +147,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Err(status) => return status,
         };
         let event = entry.with_entry(|entry| entry.event.clone());
+        let subscriptions = self.process.wnf_subscriptions.lock();
         let mut registered = self.process.wnf_notification_event.lock();
         if registered.is_some() {
             return NtStatus::WNF_EVENT_ALREADY_SUBSCRIBED;
         }
-        if !self.process.wnf_subscriptions.lock().pending.is_empty() {
+        if !subscriptions.pending.is_empty() {
             event.set();
         }
         *registered = Some(event);
@@ -148,7 +171,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if descriptor_size == 0 {
             return NtStatus::INVALID_PARAMETER;
         }
-        if descriptor_size < DELIVERY_DESCRIPTOR_BUFFER_SIZE {
+        if descriptor_size < DELIVERY_DESCRIPTOR_BUFFER_SIZE.trunc() {
             return NtStatus::BUFFER_TOO_SMALL;
         }
         if probe_guest_output_buffer::<Platform>(delivery_descriptor, descriptor_size as usize)
@@ -171,42 +194,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Err(status) => return status,
         };
 
-        let delivery = {
-            let mut subscriptions = self.process.wnf_subscriptions.lock();
-            if let (Some(state_name), Some(subscription_id)) = (old_state_name, old_subscription_id)
-                && let Some(change_stamp) = subscriptions
-                    .pending
-                    .get(&subscription_id)
-                    .filter(|delivery| {
-                        delivery.state_name == state_name && delivery.event_mask == old_event_mask
-                    })
-                    .map(|delivery| delivery.change_stamp)
+        let mut subscriptions = self.process.wnf_subscriptions.lock();
+        if let (Some(state_name), Some(subscription_id)) = (old_state_name, old_subscription_id)
+            && let Some(change_stamp) = subscriptions
+                .pending
+                .get(&subscription_id)
+                .filter(|delivery| {
+                    delivery.state_name == state_name
+                        && delivery.event_mask.bits() == old_event_mask
+                })
+                .map(|delivery| delivery.change_stamp)
+        {
+            subscriptions.pending.remove(&subscription_id);
+            if let Some(subscription) = subscriptions.subscriptions.get_mut(&state_name)
+                && subscription.id == subscription_id
             {
-                subscriptions.pending.remove(&subscription_id);
-                if let Some(subscription) = subscriptions.subscriptions.get_mut(&state_name)
-                    && subscription.id == subscription_id
-                {
-                    subscription.change_stamp = change_stamp;
-                }
+                subscription.change_stamp = change_stamp;
             }
-            subscriptions.pending.values().next().cloned()
-        };
+        }
+        let delivery = subscriptions.pending.values().next().cloned();
         let Some(delivery) = delivery else {
             if let Some(event) = self.process.wnf_notification_event.lock().as_ref() {
                 event.clear();
             }
             return NtStatus::NO_MORE_ENTRIES;
         };
+        drop(subscriptions);
 
+        let descriptor = WnfDeliveryDescriptor {
+            subscription_id: delivery.subscription_id,
+            state_name: delivery.state_name,
+            change_stamp: delivery.change_stamp,
+            state_data_size: delivery.data.len().trunc(),
+            event_mask: delivery.event_mask.bits(),
+            type_id: delivery.type_id.unwrap_or(Guid { data: [0; 16] }),
+            state_data_offset: DELIVERY_DESCRIPTOR_HEADER_SIZE.trunc(),
+        };
         let mut bytes =
-            Vec::with_capacity(DELIVERY_DESCRIPTOR_HEADER_SIZE as usize + delivery.data.len());
-        bytes.extend_from_slice(&delivery.subscription_id.to_le_bytes());
-        bytes.extend_from_slice(&delivery.state_name.to_le_bytes());
-        bytes.extend_from_slice(&delivery.change_stamp.to_le_bytes());
-        bytes.extend_from_slice(&u32::try_from(delivery.data.len()).unwrap().to_le_bytes());
-        bytes.extend_from_slice(&delivery.event_mask.to_le_bytes());
-        bytes.extend_from_slice(&delivery.type_id.map_or([0; 16], |type_id| type_id.data));
-        bytes.extend_from_slice(&DELIVERY_DESCRIPTOR_HEADER_SIZE.to_le_bytes());
+            Vec::with_capacity(size_of::<WnfDeliveryDescriptor>() + delivery.data.len());
+        bytes.extend_from_slice(descriptor.as_bytes());
         bytes.extend_from_slice(&delivery.data);
         delivery_descriptor
             .write_slice_at_offset(0, &bytes)
@@ -231,6 +257,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(lifetime) = decode_state_name_lifetime(state_name) else {
             return NtStatus::INVALID_PARAMETER;
         };
+        let event_mask = WnfEventMask::from_bits_retain(event_mask);
         let current_state = match lifetime {
             WnfStateNameLifetime::WellKnown => None,
             _ => self
@@ -242,6 +269,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .cloned(),
         };
         let exists = match lifetime {
+            // TODO(wnf-well-known): Validate names against the host's well-known state-name
+            // registry once it is modeled instead of accepting every encoded nonzero identifier.
             WnfStateNameLifetime::WellKnown => state_name_unique_id(state_name) != 0,
             _ => current_state.is_some(),
         };
@@ -252,6 +281,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut subscriptions = self.process.wnf_subscriptions.lock();
         let (id, inserted) =
             if let Some(subscription) = subscriptions.subscriptions.get(&state_name) {
+                // A host probe confirms the repeat-subscribe discriminator is the event mask alone:
+                // a same-context repeat returns the existing id even when the change stamp differs,
+                // while a mismatched mask is rejected with STATUS_INVALID_PARAMETER. The supplied
+                // change stamp on a repeat is ignored (the original registration is retained).
+                // TODO(wnf-multi-subscription): Genuinely independent subscribers to one state name
+                // are unprobed and not modeled.
+                if subscription.event_mask != event_mask {
+                    return NtStatus::INVALID_PARAMETER;
+                }
                 (subscription.id, false)
             } else {
                 subscriptions.next_id = subscriptions.next_id.wrapping_add(1).max(1);
@@ -291,9 +329,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut subscriptions = self.process.wnf_subscriptions.lock();
         if let Some(subscription) = subscriptions.subscriptions.remove(&state_name) {
             subscriptions.pending.remove(&subscription.id);
-            let clear_event = subscriptions.pending.is_empty();
-            drop(subscriptions);
-            if clear_event && let Some(event) = self.process.wnf_notification_event.lock().as_ref()
+            if subscriptions.pending.is_empty()
+                && let Some(event) = self.process.wnf_notification_event.lock().as_ref()
             {
                 event.clear();
             }
@@ -354,7 +391,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let state = WnfStateData {
                 change_stamp: INITIAL_CHANGE_STAMP,
                 type_id,
-                data: Vec::new(),
+                data: Some(Vec::new()),
                 maximum_state_size: params.maximum_state_size,
                 lifetime,
             };
@@ -417,7 +454,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::UNSUCCESSFUL;
         }
         state.change_stamp = state.change_stamp.wrapping_add(1);
-        state.data = data;
+        state.data = Some(data);
         let state = state.clone();
         drop(store);
         self.queue_wnf_delivery(state_name, &state);
@@ -441,10 +478,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(state) = store.states.get_mut(&state_name) else {
             return NtStatus::OBJECT_NAME_NOT_FOUND;
         };
-        state.change_stamp = 0;
-        state.data.clear();
+        state.data = None;
         let state = state.clone();
         drop(store);
+        // TODO(wnf-delete-delivery): A host delivery-level probe shows NtDeleteWnfStateData that
+        // does not advance the change stamp yields STATUS_NO_MORE_ENTRIES to a caught-up
+        // subscriber (i.e. no delivery). queue_wnf_delivery currently enqueues unconditionally;
+        // model change-stamp-based delivery filtering (deliver only when the stamp advances past
+        // the subscriber's acknowledged baseline) as a follow-up once the delivery path is
+        // independently reproduced.
         self.queue_wnf_delivery(state_name, &state);
         NtStatus::SUCCESS
     }
@@ -485,7 +527,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         else {
             return NtStatus::INVALID_INFO_CLASS;
         };
-        if buffer_size != STATE_NAME_INFORMATION_SIZE {
+        if buffer_size < STATE_NAME_INFORMATION_SIZE {
             return NtStatus::INVALID_PARAMETER;
         }
         if explicit_scope.is_some() {
@@ -575,17 +617,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER;
         }
 
-        let required_size = state.data.len().trunc();
+        let (reported_change_stamp, data) = state
+            .data
+            .as_deref()
+            .map_or((0, &[][..]), |data| (state.change_stamp, data));
+        let required_size = data.len().trunc();
         let status = if available_size < required_size {
             NtStatus::BUFFER_TOO_SMALL
         } else {
-            if !state.data.is_empty() && buffer.write_slice_at_offset(0, &state.data).is_none() {
+            if !data.is_empty() && buffer.write_slice_at_offset(0, data).is_none() {
                 return NtStatus::ACCESS_VIOLATION;
             }
             NtStatus::SUCCESS
         };
         if change_stamp
-            .write_at_offset(0, state.change_stamp)
+            .write_at_offset(0, reported_change_stamp)
             .is_none()
             || buffer_size.write_at_offset(0, required_size).is_none()
         {
@@ -595,25 +641,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn queue_wnf_delivery(&self, state_name: u64, state: &WnfStateData) {
-        let queued = {
-            let mut subscriptions = self.process.wnf_subscriptions.lock();
-            let Some(subscription) = subscriptions.subscriptions.get(&state_name).copied() else {
-                return;
-            };
-            subscriptions.pending.insert(
-                subscription.id,
-                WnfPendingDelivery {
-                    subscription_id: subscription.id,
-                    state_name,
-                    change_stamp: state.change_stamp,
-                    event_mask: subscription.event_mask,
-                    type_id: state.type_id,
-                    data: state.data.clone(),
-                },
-            );
-            true
+        let mut subscriptions = self.process.wnf_subscriptions.lock();
+        let Some(subscription) = subscriptions.subscriptions.get(&state_name).copied() else {
+            return;
         };
-        if queued && let Some(event) = self.process.wnf_notification_event.lock().as_ref() {
+        subscriptions.pending.insert(
+            subscription.id,
+            WnfPendingDelivery {
+                subscription_id: subscription.id,
+                state_name,
+                change_stamp: state.change_stamp,
+                event_mask: subscription.event_mask,
+                type_id: state.type_id,
+                // TODO(wnf-delete-delivery-stamp): Probe the descriptor stamp and payload emitted
+                // when state data is absent, including the stamp acknowledged by a subscription;
+                // the query contract alone does not establish them.
+                data: state.data.clone().unwrap_or_default(),
+            },
+        );
+        if let Some(event) = self.process.wnf_notification_event.lock().as_ref() {
             event.set();
         }
     }
@@ -798,7 +844,7 @@ mod tests {
         assert_eq!(pending.subscription_id, subscription_id);
         assert_eq!(pending.state_name, state_name);
         assert_eq!(pending.change_stamp, 2);
-        assert_eq!(pending.event_mask, 0x11);
+        assert_eq!(pending.event_mask.bits(), 0x11);
         assert!(pending.type_id.is_none());
         assert_eq!(pending.data, [3]);
     }
@@ -843,7 +889,7 @@ mod tests {
             NtStatus::SUCCESS
         );
 
-        let mut descriptor = [0xcc; DELIVERY_DESCRIPTOR_BUFFER_SIZE as usize];
+        let mut descriptor = [0xcc; DELIVERY_DESCRIPTOR_BUFFER_SIZE];
         assert_eq!(
             task.sys_nt_get_complete_wnf_state_subscription(
                 None,
@@ -851,7 +897,7 @@ mod tests {
                 0,
                 0,
                 mut_byte_ptr(&mut descriptor),
-                DELIVERY_DESCRIPTOR_BUFFER_SIZE - 1,
+                (DELIVERY_DESCRIPTOR_BUFFER_SIZE - 1).trunc(),
             ),
             NtStatus::BUFFER_TOO_SMALL
         );
@@ -862,36 +908,24 @@ mod tests {
                 0,
                 0,
                 mut_byte_ptr(&mut descriptor),
-                DELIVERY_DESCRIPTOR_BUFFER_SIZE,
+                DELIVERY_DESCRIPTOR_BUFFER_SIZE.trunc(),
             ),
             NtStatus::SUCCESS
         );
+        let delivery =
+            WnfDeliveryDescriptor::read_from_bytes(&descriptor[..DELIVERY_DESCRIPTOR_HEADER_SIZE])
+                .unwrap();
+        assert_eq!(delivery.subscription_id, subscription_id);
+        assert_eq!(delivery.state_name, state_name);
+        assert_eq!(delivery.change_stamp, 2);
+        assert_eq!(delivery.state_data_size, 1);
+        assert_eq!(delivery.event_mask, 0x11);
+        assert_eq!(delivery.type_id.data, type_id.data);
         assert_eq!(
-            u64::from_le_bytes(descriptor[0..8].try_into().unwrap()),
-            subscription_id
+            delivery.state_data_offset,
+            DELIVERY_DESCRIPTOR_HEADER_SIZE.trunc()
         );
-        assert_eq!(
-            u64::from_le_bytes(descriptor[8..16].try_into().unwrap()),
-            state_name
-        );
-        assert_eq!(
-            u32::from_le_bytes(descriptor[16..20].try_into().unwrap()),
-            2
-        );
-        assert_eq!(
-            u32::from_le_bytes(descriptor[20..24].try_into().unwrap()),
-            1
-        );
-        assert_eq!(
-            u32::from_le_bytes(descriptor[24..28].try_into().unwrap()),
-            0x11
-        );
-        assert_eq!(descriptor[28..44], type_id.data);
-        assert_eq!(
-            u32::from_le_bytes(descriptor[44..48].try_into().unwrap()),
-            48
-        );
-        assert_eq!(descriptor[48], 4);
+        assert_eq!(descriptor[delivery.state_data_offset as usize], 4,);
 
         assert_eq!(
             task.sys_nt_get_complete_wnf_state_subscription(
@@ -900,7 +934,7 @@ mod tests {
                 0x11,
                 NtStatus::SUCCESS.as_raw(),
                 mut_byte_ptr(&mut descriptor),
-                DELIVERY_DESCRIPTOR_BUFFER_SIZE,
+                DELIVERY_DESCRIPTOR_BUFFER_SIZE.trunc(),
             ),
             NtStatus::NO_MORE_ENTRIES
         );
@@ -924,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn state_change_subscription_reuses_id_and_unsubscribes_by_name() {
+    fn state_change_subscription_validates_repeat_and_unsubscribes_by_name() {
         const WNF_SHEL_APPLICATION_STARTED: u64 = 0x0d83_063e_a3bc_1035;
 
         let task = test_task();
@@ -945,12 +979,35 @@ mod tests {
             task.sys_nt_subscribe_wnf_state_change(
                 const_ptr(&WNF_SHEL_APPLICATION_STARTED),
                 0,
-                0,
+                0x11,
                 Some(mut_ptr(&mut second_id)),
             ),
             NtStatus::SUCCESS
         );
         assert_eq!(second_id, first_id);
+        // A differing change stamp with the same mask is accepted and returns the existing id
+        // (host-probed: the repeat-subscribe discriminator is the event mask alone).
+        let mut changed_stamp_id = 0;
+        assert_eq!(
+            task.sys_nt_subscribe_wnf_state_change(
+                const_ptr(&WNF_SHEL_APPLICATION_STARTED),
+                1,
+                0x11,
+                Some(mut_ptr(&mut changed_stamp_id)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(changed_stamp_id, first_id);
+        // A differing mask is rejected.
+        assert_eq!(
+            task.sys_nt_subscribe_wnf_state_change(
+                const_ptr(&WNF_SHEL_APPLICATION_STARTED),
+                0,
+                0x22,
+                None,
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
         assert_eq!(
             task.sys_nt_unsubscribe_wnf_state_change(const_ptr(&WNF_SHEL_APPLICATION_STARTED)),
             NtStatus::SUCCESS
@@ -973,11 +1030,15 @@ mod tests {
     }
 
     #[test]
-    fn delete_data_resets_state_and_delete_name_removes_it() {
+    fn delete_data_reports_zero_but_preserves_next_update_stamp() {
         let task = test_task();
         let state_name = create_state(&task, None, 4);
         assert_eq!(
             update_state(&task, state_name, &[1, 2], None, 0, 0),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            update_state(&task, state_name, &[3], None, 0, 0),
             NtStatus::SUCCESS
         );
         assert_eq!(
@@ -1008,6 +1069,26 @@ mod tests {
         assert_eq!(buffer, [0xaa; 2]);
 
         assert_eq!(
+            update_state(&task, state_name, &[4], None, 0, 0),
+            NtStatus::SUCCESS
+        );
+        buffer_size = 2;
+        assert_eq!(
+            task.sys_nt_query_wnf_state_data(
+                const_ptr(&state_name),
+                None,
+                None,
+                mut_ptr(&mut change_stamp),
+                mut_byte_ptr(&mut buffer),
+                mut_ptr(&mut buffer_size),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(change_stamp, 3);
+        assert_eq!(buffer_size, 1);
+        assert_eq!(buffer, [4, 0xaa]);
+
+        assert_eq!(
             task.sys_nt_delete_wnf_state_name(const_ptr(&state_name)),
             NtStatus::SUCCESS
         );
@@ -1026,6 +1107,25 @@ mod tests {
             ),
             NtStatus::OBJECT_NAME_NOT_FOUND
         );
+    }
+
+    #[test]
+    fn state_name_information_accepts_larger_output_buffer() {
+        let task = test_task();
+        let state_name = create_state(&task, None, 4);
+        let mut value = [u32::MAX; 2];
+
+        assert_eq!(
+            task.sys_nt_query_wnf_state_name_information(
+                const_ptr(&state_name),
+                WnfStateNameInformation::Exists as u32,
+                None,
+                mut_ptr(&mut value[0]),
+                size_of::<[u32; 2]>().trunc(),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(value, [1, u32::MAX]);
     }
 
     #[test]
