@@ -40,12 +40,12 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
-      - name: Install diod
-        run: |
-          sudo apt install -y diod
       - name: Install iperf3
         run: |
           sudo apt install -y iperf3
+      - name: Install diod
+        run: |
+          sudo apt install -y diod
       - name: Install AArch64 binutils
         run: |
           sudo apt install -y binutils-aarch64-linux-gnu
