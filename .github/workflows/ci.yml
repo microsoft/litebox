@@ -290,6 +290,7 @@ jobs:
           # - `litebox_packager` is allowed to have `std` access since it is a
           #   userland CLI tool that packages ELF programs for LiteBox.
           #
+          # - `litebox_runner_snp` is `no_std` but requires custom target to build
           # - `litebox_runner_snp` is temporarily disabled until SNP networking
           #   can use a kernel-mode broker
           #
