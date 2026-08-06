@@ -6,8 +6,12 @@ use clap::Parser;
 use std::sync::atomic::Ordering::Relaxed;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::{BufRead as _, BufReader},
+    net::{Ipv4Addr, TcpListener},
     path::{Path, PathBuf},
+    process::{Child, Stdio},
     sync::atomic::AtomicBool,
+    thread::JoinHandle,
     time::Duration,
 };
 use tracing::{debug, error, info, trace, warn};
@@ -421,6 +425,8 @@ const BENCHMARKS: &[(&str, BenchFn)] = benchtable![
     run_rewritten_hello_static,
     rewriter_node,
     run_rewritten_node,
+    rewriter_iperf3,
+    run_rewritten_iperf3,
     //
 ];
 
@@ -623,6 +629,199 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
             sh,
             "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --env HOME=/ --initial-files {tar_file} node_rewritten hello_world.js"
         ).run()?;
+    }
+    Ok(())
+}
+
+fn rewriter_iperf3(ctx: BenchCtx) -> Result<()> {
+    let BenchCtx {
+        sh,
+        cli_args: _,
+        project_root,
+        is_init,
+        lock_tracing: _,
+    } = ctx;
+    let iperf3 = locate_command(sh, "iperf3")?;
+    if is_init {
+        cmd!(sh, "cargo build -p litebox_syscall_rewriter --release").run()?;
+    } else {
+        cmd!(
+            sh,
+            "{project_root}/target/release/litebox_syscall_rewriter {iperf3} -o iperf3_rewritten"
+        )
+        .run()?;
+    }
+    Ok(())
+}
+
+struct IperfServer {
+    port: u16,
+    child: Option<Child>,
+    output_thread: Option<JoinHandle<std::io::Result<String>>>,
+}
+
+impl IperfServer {
+    fn start(iperf3: &Path) -> Result<Self> {
+        const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+        const START_ATTEMPTS: usize = 5;
+
+        let mut last_output = String::new();
+        for _ in 0..START_ATTEMPTS {
+            let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
+                .local_addr()?
+                .port();
+            let mut child = std::process::Command::new(iperf3)
+                .args([
+                    "-s",
+                    "-1",
+                    "--forceflush",
+                    "-B",
+                    "127.0.0.1",
+                    "-p",
+                    &port.to_string(),
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("iperf3 server stdout was not piped"))?;
+            let (listening_tx, listening_rx) = std::sync::mpsc::channel();
+            let output_thread = std::thread::spawn(move || {
+                let mut stdout = BufReader::new(stdout);
+                let mut output = String::new();
+                let mut listening_reported = false;
+                loop {
+                    let mut line = String::new();
+                    if stdout.read_line(&mut line)? == 0 {
+                        break;
+                    }
+                    output.push_str(&line);
+                    if !listening_reported && line.contains("Server listening") {
+                        listening_reported = true;
+                        let _ = listening_tx.send(());
+                    }
+                }
+                Ok(output)
+            });
+
+            if listening_rx.recv_timeout(STARTUP_TIMEOUT).is_ok() {
+                return Ok(Self {
+                    port,
+                    child: Some(child),
+                    output_thread: Some(output_thread),
+                });
+            }
+
+            let _ = child.kill();
+            let _ = child.wait();
+            last_output = output_thread
+                .join()
+                .map_err(|panic| anyhow!("iperf3 server output thread panicked: {panic:?}"))??;
+        }
+
+        Err(anyhow!(
+            "iperf3 server did not start after {START_ATTEMPTS} attempts; output:\n{last_output}"
+        ))
+    }
+
+    const fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let status = self
+            .child
+            .as_mut()
+            .ok_or_else(|| anyhow!("iperf3 server process is missing"))?
+            .wait()?;
+        self.child = None;
+        let output = self
+            .output_thread
+            .take()
+            .ok_or_else(|| anyhow!("iperf3 server output thread is missing"))?
+            .join()
+            .map_err(|panic| anyhow!("iperf3 server output thread panicked: {panic:?}"))??;
+        if !status.success() {
+            return Err(anyhow!(
+                "iperf3 server exited with {status}; output:\n{output}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for IperfServer {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(output_thread) = self.output_thread.take() {
+            let _ = output_thread.join();
+        }
+    }
+}
+
+fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
+    let BenchCtx {
+        sh,
+        cli_args: _,
+        project_root,
+        is_init,
+        lock_tracing,
+    } = ctx;
+    let tar_file = sh.current_dir().join("iperf3_rootfs.tar");
+    if is_init {
+        rewriter_iperf3(ctx.with_init(true))?;
+        rewriter_iperf3(ctx.with_init(false))?;
+
+        let tar_base_dir = sh.current_dir().join("iperf3_tar_base");
+        sh.create_dir(&tar_base_dir)?;
+        let libs = find_dependencies(sh, "iperf3")?;
+        for lib in libs {
+            let dest_path = tar_base_dir
+                .join(lib.strip_prefix("/").unwrap_or_else(|_| {
+                    panic!("Library path '{}' is not absolute", lib.display())
+                }));
+            if let Some(parent) = dest_path.parent() {
+                sh.create_dir(parent)?;
+            }
+            cmd!(
+                sh,
+                "{project_root}/target/release/litebox_syscall_rewriter {lib} -o {dest_path}"
+            )
+            .run()?;
+        }
+
+        sh.remove_path(&tar_file)?;
+        cmd!(sh, "tar --format=ustar -C {tar_base_dir} -cvf {tar_file} .").run()?;
+        let features: &[&str] = if lock_tracing {
+            &["--features", "lock_tracing"]
+        } else {
+            &[]
+        };
+        cmd!(
+            sh,
+            "cargo build -p litebox_runner_linux_userland --release {features...}"
+        )
+        .run()?;
+        cmd!(sh, "cargo build -p litebox_broker_userland --release").run()?;
+    } else {
+        let iperf3_host = locate_command(sh, "iperf3")?;
+        let runner = project_root.join("target/release/litebox_runner_linux_userland");
+        let broker = project_root.join("target/release/litebox-broker-userland");
+        let iperf3_rewritten = sh.current_dir().join("iperf3_rewritten");
+        let server = IperfServer::start(&iperf3_host)?;
+        let port = server.port().to_string();
+
+        cmd!(
+            sh,
+            "{broker} --runner {runner} -- --env LD_LIBRARY_PATH=/lib64:/lib32:/lib --env HOME=/ --initial-files {tar_file} {iperf3_rewritten} -c 127.0.0.1 -p {port} --connect-timeout 1000 --bytes 1G"
+        )
+        .run()?;
+        server.finish()?;
     }
     Ok(())
 }
