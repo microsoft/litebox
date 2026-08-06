@@ -61,7 +61,7 @@ jobs:
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
           # We exclude `litebox_runner_lvbs` because it requires a custom target and nightly
           # features. `build_and_test_lvbs` covers it.
@@ -79,7 +79,7 @@ jobs:
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
@@ -192,29 +192,6 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
 
-  build_and_test_snp:
-    name: Build and Test SNP
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -Dwarnings
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v6
-      - name: Set up Rust
-        run: |
-          RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_snp/rust-toolchain.toml)
-          rustup toolchain install ${RUST_CHANNEL} --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-none
-          rustup component add rust-src --toolchain ${RUST_CHANNEL}-x86_64-unknown-linux-gnu
-          rustup default ${RUST_CHANNEL}
-          rustup override set ${RUST_CHANNEL}
-          rustup show
-      - uses: Swatinem/rust-cache@v2
-      - run: ./.github/tools/github_actions_run_cargo clippy --all-features --target litebox_runner_snp/target.json --manifest-path=litebox_runner_snp/Cargo.toml -Zbuild-std=core,compiler_builtins,alloc
-      - run: |
-          ./.github/tools/github_actions_run_cargo build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
-      - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
-
   confirm_no_std:
     name: Confirm no_std
     runs-on: ubuntu-latest
@@ -313,7 +290,8 @@ jobs:
           # - `litebox_packager` is allowed to have `std` access since it is a
           #   userland CLI tool that packages ELF programs for LiteBox.
           #
-          # - `litebox_runner_snp` is `no_std` but requires custom target to build
+          # - `litebox_runner_snp` is temporarily disabled until SNP networking
+          #   can use a kernel-mode broker
           #
           # - `dev_tests` is meant to only be used for tests, and thus can
           #   safely use std.
