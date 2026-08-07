@@ -16,8 +16,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, PlatformConnectError, PlatformSocket, ReceivedPlatformDatagram,
-    SocketProvider,
+    AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
+    PlatformStreamReceive, ReceivedPlatformDatagram, SocketProvider,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -165,15 +165,19 @@ impl PlatformSocket for LinuxSocket {
         self.reactor.connect(self.id, address)
     }
 
-    fn send(&self, data: &[u8], _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
+    fn send(&self, data: &[u8], flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
         let mut owned = Vec::new();
         owned
             .try_reserve_exact(data.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         owned.extend_from_slice(data);
+        self.send_owned(owned, flags)
+    }
+
+    fn send_owned(&self, data: Vec<u8>, _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
         self.reactor.request(|response| ReactorCommand::Send {
             id: self.id,
-            data: owned,
+            data,
             response,
         })
     }
@@ -181,7 +185,7 @@ impl PlatformSocket for LinuxSocket {
     fn send_to(
         &self,
         data: &[u8],
-        _flags: SendFlags,
+        flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         let mut owned = Vec::new();
@@ -189,9 +193,18 @@ impl PlatformSocket for LinuxSocket {
             .try_reserve_exact(data.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         owned.extend_from_slice(data);
+        self.send_to_owned(owned, flags, destination)
+    }
+
+    fn send_to_owned(
+        &self,
+        data: Vec<u8>,
+        _flags: SendFlags,
+        destination: Option<SocketAddrV4>,
+    ) -> BrokerResult<SocketOutcome<usize>> {
         self.reactor.request(|response| ReactorCommand::SendTo {
             id: self.id,
-            data: owned,
+            data,
             destination,
             response,
         })
@@ -204,19 +217,8 @@ impl PlatformSocket for LinuxSocket {
         peek_offset: u32,
         peek_length: u32,
     ) -> BrokerResult<SocketOutcome<ReceiveSocketResponse>> {
-        let peek_offset =
-            usize::try_from(peek_offset).map_err(|_| BrokerError::UnsupportedOperation)?;
-        let peek_length =
-            usize::try_from(peek_length).map_err(|_| BrokerError::UnsupportedOperation)?;
-        match self.reactor.request(|response| ReactorCommand::Receive {
-            id: self.id,
-            length: data.len(),
-            flags,
-            peek_offset,
-            peek_length,
-            response,
-        })? {
-            ReactorReceiveOutcome::Received(received) => {
+        match self.receive_owned(data.len(), flags, peek_offset, peek_length)? {
+            SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
                 data[..received.len()].copy_from_slice(&received);
                 Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
                     received
@@ -225,8 +227,37 @@ impl PlatformSocket for LinuxSocket {
                         .map_err(|_| BrokerError::Internal)?,
                 )))
             }
-            ReactorReceiveOutcome::EndOfStream => {
+            SocketOutcome::Completed(PlatformStreamReceive::EndOfStream) => {
                 Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+            }
+            SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
+        }
+    }
+
+    fn receive_owned(
+        &self,
+        length: usize,
+        flags: ReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
+    ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
+        let peek_offset =
+            usize::try_from(peek_offset).map_err(|_| BrokerError::UnsupportedOperation)?;
+        let peek_length =
+            usize::try_from(peek_length).map_err(|_| BrokerError::UnsupportedOperation)?;
+        match self.reactor.request(|response| ReactorCommand::Receive {
+            id: self.id,
+            length,
+            flags,
+            peek_offset,
+            peek_length,
+            response,
+        })? {
+            ReactorReceiveOutcome::Received(received) => Ok(SocketOutcome::Completed(
+                PlatformStreamReceive::Received(received),
+            )),
+            ReactorReceiveOutcome::EndOfStream => {
+                Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
             }
             ReactorReceiveOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
         }
@@ -237,11 +268,29 @@ impl PlatformSocket for LinuxSocket {
         data: &mut [u8],
         flags: ReceiveFromFlags,
     ) -> BrokerResult<SocketOutcome<ReceivedPlatformDatagram>> {
+        match self.receive_from_owned(data.len(), flags)? {
+            SocketOutcome::Completed(received) => {
+                data[..received.data.len()].copy_from_slice(&received.data);
+                Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                    received: received.data.len(),
+                    datagram_length: received.datagram_length,
+                    source_address: received.source_address,
+                }))
+            }
+            SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
+        }
+    }
+
+    fn receive_from_owned(
+        &self,
+        length: usize,
+        flags: ReceiveFromFlags,
+    ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         match self
             .reactor
             .request(|response| ReactorCommand::ReceiveFrom {
                 id: self.id,
-                length: data.len(),
+                length,
                 flags,
                 response,
             })? {
@@ -249,14 +298,11 @@ impl PlatformSocket for LinuxSocket {
                 data: received,
                 datagram_length,
                 source_address,
-            } => {
-                data[..received.len()].copy_from_slice(&received);
-                Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-                    received: received.len(),
-                    datagram_length,
-                    source_address,
-                }))
-            }
+            } => Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                data: received,
+                datagram_length,
+                source_address,
+            })),
             ReactorReceiveFromOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
         }
     }

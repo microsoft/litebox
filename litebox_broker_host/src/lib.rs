@@ -438,8 +438,13 @@ fn handle_socket_request<Memory: SharedMemory>(
             shared_buffers
                 .read(request.buffer.slot_index, &mut data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-            match litebox_broker_core::socket::send(session, request.handle, &data, request.flags)
-                .map_err(RequestFailure::from)?
+            match litebox_broker_core::socket::send_owned(
+                session,
+                request.handle,
+                data,
+                request.flags,
+            )
+            .map_err(RequestFailure::from)?
             {
                 SocketOutcome::Completed(sent) => {
                     let sent = sent
@@ -464,10 +469,10 @@ fn handle_socket_request<Memory: SharedMemory>(
             shared_buffers
                 .read(request.buffer.slot_index, &mut data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-            match litebox_broker_core::socket::send_to(
+            match litebox_broker_core::socket::send_to_owned(
                 session,
                 request.handle,
-                &data,
+                data,
                 request.flags,
                 request.destination,
             )
@@ -502,27 +507,33 @@ fn handle_socket_request<Memory: SharedMemory>(
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             let length = request.buffer.length as usize;
-            let mut data = Vec::new();
-            if data.try_reserve_exact(length).is_err() {
-                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
-            }
-            data.resize(length, 0);
-            match litebox_broker_core::socket::receive(
+            match litebox_broker_core::socket::receive_owned(
                 session,
                 request.handle,
-                &mut data,
+                length,
                 request.flags,
                 request.peek_offset,
                 request.peek_length,
             )
             .map_err(RequestFailure::from)?
             {
-                SocketOutcome::Completed(response) => {
-                    if let ReceiveSocketResponse::Received(received) = response {
-                        shared_buffers
-                            .write(request.buffer.slot_index, &data[..received as usize])
-                            .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-                    }
+                SocketOutcome::Completed(received) => {
+                    let response = match received {
+                        litebox_broker_core::socket::PlatformStreamReceive::Received(data) => {
+                            let received = data.len();
+                            shared_buffers
+                                .write(request.buffer.slot_index, &data)
+                                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+                            ReceiveSocketResponse::Received(
+                                received
+                                    .try_into()
+                                    .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?,
+                            )
+                        }
+                        litebox_broker_core::socket::PlatformStreamReceive::EndOfStream => {
+                            ReceiveSocketResponse::EndOfStream
+                        }
+                    };
                     Ok(SocketResponse::Receive(response))
                 }
                 SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
@@ -534,26 +545,22 @@ fn handle_socket_request<Memory: SharedMemory>(
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             let length = request.buffer.length as usize;
-            let mut data = Vec::new();
-            if data.try_reserve_exact(length).is_err() {
-                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
-            }
-            data.resize(length, 0);
-            match litebox_broker_core::socket::receive_from(
+            match litebox_broker_core::socket::receive_from_owned(
                 session,
                 request.handle,
-                &mut data,
+                length,
                 request.flags,
             )
             .map_err(RequestFailure::from)?
             {
                 SocketOutcome::Completed(received) => {
                     shared_buffers
-                        .write(request.buffer.slot_index, &data[..received.received])
+                        .write(request.buffer.slot_index, &received.data)
                         .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
                     Ok(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
                         received: received
-                            .received
+                            .data
+                            .len()
                             .try_into()
                             .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?,
                         datagram_length: received

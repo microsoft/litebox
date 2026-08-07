@@ -3,7 +3,7 @@
 
 //! Broker-owned platform socket authority.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -57,6 +57,26 @@ pub struct AcceptedBrokerSocket {
 pub struct ReceivedPlatformDatagram {
     /// Number of bytes copied into the caller's buffer.
     pub received: usize,
+    /// Original datagram length before truncation.
+    pub datagram_length: usize,
+    /// Source address of the datagram.
+    pub source_address: SocketAddrV4,
+}
+
+/// Owned platform result for one stream receive.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PlatformStreamReceive {
+    /// Bytes received from the stream.
+    Received(Vec<u8>),
+    /// The stream's receive direction reached end of stream.
+    EndOfStream,
+}
+
+/// Owned platform result for one datagram receive.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlatformDatagramReceive {
+    /// Received datagram prefix, truncated to the requested capacity.
+    pub data: Vec<u8>,
     /// Original datagram length before truncation.
     pub datagram_length: usize,
     /// Source address of the datagram.
@@ -120,6 +140,15 @@ pub trait PlatformSocket: Send + Sync {
     /// network failures return [`SocketOutcome::Failed`].
     fn send(&self, data: &[u8], flags: SendFlags) -> Result<SocketOutcome<usize>>;
 
+    /// Sends owned bytes without waiting for platform readiness.
+    ///
+    /// Threaded implementations can override this method to move the payload
+    /// into their command queue. The default preserves compatibility with
+    /// slice-based platform implementations.
+    fn send_owned(&self, data: Vec<u8>, flags: SendFlags) -> Result<SocketOutcome<usize>> {
+        self.send(&data, flags)
+    }
+
     /// Sends one complete datagram without waiting for platform readiness.
     ///
     /// A destination is required for an unconnected socket and omitted to use
@@ -130,6 +159,16 @@ pub trait PlatformSocket: Send + Sync {
         flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> Result<SocketOutcome<usize>>;
+
+    /// Sends one owned datagram without waiting for platform readiness.
+    fn send_to_owned(
+        &self,
+        data: Vec<u8>,
+        flags: SendFlags,
+        destination: Option<SocketAddrV4>,
+    ) -> Result<SocketOutcome<usize>> {
+        self.send_to(&data, flags, destination)
+    }
 
     /// Receives bytes without waiting for platform readiness.
     ///
@@ -144,6 +183,34 @@ pub trait PlatformSocket: Send + Sync {
         peek_length: u32,
     ) -> Result<SocketOutcome<ReceiveSocketResponse>>;
 
+    /// Receives bytes into an owned platform buffer without waiting.
+    fn receive_owned(
+        &self,
+        length: usize,
+        flags: ReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
+    ) -> Result<SocketOutcome<PlatformStreamReceive>> {
+        let mut data = zeroed_vec(length)?;
+        match self.receive(&mut data, flags, peek_offset, peek_length)? {
+            SocketOutcome::Completed(ReceiveSocketResponse::Received(received)) => {
+                let received = usize::try_from(received).map_err(|_| BrokerError::Internal)?;
+                if received > data.len() {
+                    return Err(BrokerError::Internal);
+                }
+                data.truncate(received);
+                Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+                    data,
+                )))
+            }
+            SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream) => {
+                Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
+            }
+            SocketOutcome::Completed(_) => Err(BrokerError::Internal),
+            SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
+        }
+    }
+
     /// Receives one datagram without waiting for platform readiness.
     ///
     /// The original datagram length is returned even when the caller's buffer
@@ -153,6 +220,29 @@ pub trait PlatformSocket: Send + Sync {
         data: &mut [u8],
         flags: ReceiveFromFlags,
     ) -> Result<SocketOutcome<ReceivedPlatformDatagram>>;
+
+    /// Receives one datagram into an owned platform buffer without waiting.
+    fn receive_from_owned(
+        &self,
+        length: usize,
+        flags: ReceiveFromFlags,
+    ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
+        let mut data = zeroed_vec(length)?;
+        match self.receive_from(&mut data, flags)? {
+            SocketOutcome::Completed(received) => {
+                if received.received > data.len() {
+                    return Err(BrokerError::Internal);
+                }
+                data.truncate(received.received);
+                Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                    data,
+                    datagram_length: received.datagram_length,
+                    source_address: received.source_address,
+                }))
+            }
+            SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
+        }
+    }
 
     /// Shuts down one or both socket directions.
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>>;
@@ -519,6 +609,33 @@ pub fn send(
     Ok(outcome)
 }
 
+/// Sends owned bytes without waiting for readiness.
+///
+/// Ownership is passed through to the platform so threaded implementations can
+/// avoid copying the payload into a separate command buffer.
+pub fn send_owned(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    data: Vec<u8>,
+    flags: SendFlags,
+) -> Result<SocketOutcome<usize>> {
+    if flags.has_unsupported_bits() {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    let length = data.len();
+    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WRITE)?;
+    if !is_tcp(create_request) {
+        return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    let outcome = resource.send_owned(data, flags)?;
+    if let SocketOutcome::Completed(sent) = outcome
+        && sent > length
+    {
+        return Err(BrokerError::Internal);
+    }
+    Ok(outcome)
+}
+
 /// Sends one complete datagram without waiting for readiness.
 pub fn send_to(
     session: &BrokerSession,
@@ -553,6 +670,50 @@ pub fn send_to(
     let outcome = resource.send_to(data, flags, destination)?;
     if let SocketOutcome::Completed(sent) = outcome
         && sent != data.len()
+    {
+        return Err(BrokerError::Internal);
+    }
+    Ok(outcome)
+}
+
+/// Sends one owned datagram without waiting for readiness.
+///
+/// Ownership is passed through to the platform so threaded implementations can
+/// avoid copying the payload into a separate command buffer.
+pub fn send_to_owned(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    data: Vec<u8>,
+    flags: SendFlags,
+    destination: Option<SocketAddrV4>,
+) -> Result<SocketOutcome<usize>> {
+    if flags.has_unsupported_bits() || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    let length = data.len();
+    let (resource, create_request, connection_status) =
+        socket_state(session, handle, ObjectRights::WRITE)?;
+    if !is_udp(create_request) {
+        return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    if let Some(destination) = destination {
+        match session.core.policy.authorize_socket_connect(
+            session.caller_credential,
+            create_request,
+            destination,
+        ) {
+            Ok(()) => {}
+            Err(BrokerError::PolicyDenied) => {
+                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+            }
+            Err(error) => return Err(error),
+        }
+    } else if connection_status != SocketConnectionStatus::Connected {
+        return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+    }
+    let outcome = resource.send_to_owned(data, flags, destination)?;
+    if let SocketOutcome::Completed(sent) = outcome
+        && sent != length
     {
         return Err(BrokerError::Internal);
     }
@@ -603,6 +764,52 @@ pub fn receive(
     Ok(outcome)
 }
 
+/// Receives stream bytes into an owned platform buffer without waiting.
+pub fn receive_owned(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    length: usize,
+    flags: ReceiveFlags,
+    peek_offset: u32,
+    peek_length: u32,
+) -> Result<SocketOutcome<PlatformStreamReceive>> {
+    if flags.has_unsupported_bits() || length > MAX_SOCKET_TRANSFER_SIZE as usize {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    let peek = flags.contains(ReceiveFlags::PEEK);
+    let end = peek_offset
+        .checked_add(length.try_into().map_err(|_| BrokerError::Internal)?)
+        .ok_or(BrokerError::UnsupportedOperation)?;
+    let canonical_peek_length = peek_length
+        .checked_sub(peek_offset)
+        .map(|remaining| remaining.min(MAX_SOCKET_TRANSFER_SIZE));
+    if (!peek && (peek_offset != 0 || peek_length != 0))
+        || (peek
+            && (!peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE)
+                || canonical_peek_length != length.try_into().ok()
+                || peek_length < end
+                || peek_length > litebox_broker_protocol::socket::MAX_SOCKET_PEEK_SIZE))
+    {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WAIT)?;
+    if !is_tcp(create_request) {
+        return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    if length == 0 {
+        return Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+            Vec::new(),
+        )));
+    }
+    let outcome = resource.receive_owned(length, flags, peek_offset, peek_length)?;
+    if let SocketOutcome::Completed(PlatformStreamReceive::Received(received)) = &outcome
+        && (received.len() > length || received.is_empty())
+    {
+        return Err(BrokerError::Internal);
+    }
+    Ok(outcome)
+}
+
 /// Receives one datagram without waiting for readiness.
 pub fn receive_from(
     session: &BrokerSession,
@@ -626,6 +833,39 @@ pub fn receive_from(
         return Err(BrokerError::Internal);
     }
     Ok(outcome)
+}
+
+/// Receives one datagram into an owned platform buffer without waiting.
+pub fn receive_from_owned(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    length: usize,
+    flags: ReceiveFromFlags,
+) -> Result<SocketOutcome<PlatformDatagramReceive>> {
+    if flags.has_unsupported_bits() || length > MAX_UDP_DATAGRAM_SIZE as usize {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WAIT)?;
+    if !is_udp(create_request) {
+        return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    let outcome = resource.receive_from_owned(length, flags)?;
+    if let SocketOutcome::Completed(received) = &outcome
+        && (received.data.len() > length
+            || received.datagram_length < received.data.len()
+            || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize)
+    {
+        return Err(BrokerError::Internal);
+    }
+    Ok(outcome)
+}
+
+fn zeroed_vec(length: usize) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(length)
+        .map_err(|_| BrokerError::OutOfMemory)?;
+    data.resize(length, 0);
+    Ok(data)
 }
 
 /// Sets a typed option on a broker-owned TCP socket.
@@ -1027,6 +1267,10 @@ impl SocketResource {
         self.platform_socket().send(data, flags)
     }
 
+    fn send_owned(&self, data: Vec<u8>, flags: SendFlags) -> Result<SocketOutcome<usize>> {
+        self.platform_socket().send_owned(data, flags)
+    }
+
     fn send_to(
         &self,
         data: &[u8],
@@ -1034,6 +1278,16 @@ impl SocketResource {
         destination: Option<SocketAddrV4>,
     ) -> Result<SocketOutcome<usize>> {
         self.platform_socket().send_to(data, flags, destination)
+    }
+
+    fn send_to_owned(
+        &self,
+        data: Vec<u8>,
+        flags: SendFlags,
+        destination: Option<SocketAddrV4>,
+    ) -> Result<SocketOutcome<usize>> {
+        self.platform_socket()
+            .send_to_owned(data, flags, destination)
     }
 
     fn receive(
@@ -1047,12 +1301,31 @@ impl SocketResource {
             .receive(data, flags, peek_offset, peek_length)
     }
 
+    fn receive_owned(
+        &self,
+        length: usize,
+        flags: ReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
+    ) -> Result<SocketOutcome<PlatformStreamReceive>> {
+        self.platform_socket()
+            .receive_owned(length, flags, peek_offset, peek_length)
+    }
+
     fn receive_from(
         &self,
         data: &mut [u8],
         flags: ReceiveFromFlags,
     ) -> Result<SocketOutcome<ReceivedPlatformDatagram>> {
         self.platform_socket().receive_from(data, flags)
+    }
+
+    fn receive_from_owned(
+        &self,
+        length: usize,
+        flags: ReceiveFromFlags,
+    ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
+        self.platform_socket().receive_from_owned(length, flags)
     }
 
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>> {
@@ -1509,6 +1782,22 @@ pub(crate) mod tests {
         assert_eq!(data, [7, 9, 0, 0]);
         assert_eq!(
             receive(&session, handle, &mut data[..1], ReceiveFlags::PEEK, 1, 2),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        let mut oversized = std::vec![0; MAX_SOCKET_TRANSFER_SIZE as usize + 1];
+        assert_eq!(
+            receive(&session, handle, &mut oversized, ReceiveFlags::NONE, 0, 0,),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(2)))
+        );
+        assert_eq!(
+            receive_owned(
+                &session,
+                handle,
+                MAX_SOCKET_TRANSFER_SIZE as usize + 1,
+                ReceiveFlags::NONE,
+                0,
+                0,
+            ),
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(
