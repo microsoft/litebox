@@ -384,7 +384,11 @@ fn python_runner(unique_name: &str) -> Runner {
 
                 if source_path.is_dir() {
                     let python_lib_dst = out_dir.join(source_path.strip_prefix("/").unwrap());
-                    if !python_lib_dst.exists() {
+                    let source_encodings = source_path.join("encodings/__init__.py");
+                    let staged_encodings = python_lib_dst.join("encodings/__init__.py");
+                    if !python_lib_dst.exists()
+                        || (source_encodings.exists() && !staged_encodings.exists())
+                    {
                         std::fs::create_dir_all(&python_lib_dst).unwrap();
                         println!(
                             "Copying python3 lib from {} to {}",
