@@ -221,6 +221,9 @@ impl NtStatus {
             0xC0000286 => "STATUS_MAGAZINE_NOT_PRESENT: Magazine not present",
             0xC0000287 => "STATUS_REINITIALIZATION_NEEDED: Reinitialization needed",
             0xC0000302 => "STATUS_WMI_ALREADY_DISABLED: WMI collection or events already disabled",
+            0xC0000354 => {
+                "STATUS_DEBUGGER_INACTIVE: An attempt to do an operation on a debug object failed because the object is in the process of being deleted"
+            }
             0xC0000718 => {
                 "STATUS_WNF_EVENT_ALREADY_SUBSCRIBED: The WNF event is already subscribed"
             }
@@ -636,6 +639,9 @@ impl NtStatus {
 
     /// STATUS_WMI_ALREADY_DISABLED
     pub const WMI_ALREADY_DISABLED: Self = Self::from_raw(0xC0000302);
+
+    /// STATUS_DEBUGGER_INACTIVE
+    pub const DEBUGGER_INACTIVE: Self = Self::from_raw(0xC0000354);
 
     /// STATUS_WNF_EVENT_ALREADY_SUBSCRIBED
     pub const WNF_EVENT_ALREADY_SUBSCRIBED: Self = Self::from_raw(0xC0000718);

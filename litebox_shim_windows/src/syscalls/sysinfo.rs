@@ -36,6 +36,14 @@ const SYSTEM_VERIFIER_INFORMATION_LENGTH: u32 = 0x90;
 const SYSTEM_VERIFIER_INFORMATION_LENGTH_USIZE: usize = 0x90;
 const X64_SYSTEM_RANGE_START: usize = 0xffff_8000_0000_0000;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+pub(crate) struct ProcessorNumber {
+    group: u16,
+    number: u8,
+    reserved: u8,
+}
+
 pub(crate) const WINDOWS_TIME_ZONE_ID_INVALID: u32 = u32::MAX;
 pub(crate) const WINDOWS_OS_MAJOR_VERSION: u16 = 10;
 pub(crate) const WINDOWS_OS_MINOR_VERSION: u16 = 0;
@@ -71,6 +79,7 @@ enum LogicalProcessorRelationship {
     Cache = 2,
     ProcessorPackage = 3,
     Group = 4,
+    NumaNodeEx = 6,
     All = 0xffff,
 }
 
@@ -219,6 +228,30 @@ struct GroupRelationshipInformation {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    #[expect(
+        clippy::unused_self,
+        reason = "syscall handlers consistently operate on the current task"
+    )]
+    pub(crate) fn sys_nt_get_current_processor_number_ex(
+        &self,
+        processor_number: MutPtr<Platform, ProcessorNumber>,
+    ) -> NtStatus {
+        if processor_number
+            .write_at_offset(
+                0,
+                ProcessorNumber {
+                    group: 0,
+                    number: 0,
+                    reserved: 0,
+                },
+            )
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
     pub(crate) fn sys_nt_query_system_information(
         system_information_class: u32,
         system_information: MutPtr<Platform, u8>,
@@ -384,12 +417,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return_length,
                 &processor_relationship_information(LogicalProcessorRelationship::ProcessorCore),
             ),
-            LogicalProcessorRelationship::NumaNode => Self::write_system_information(
-                system_information,
-                system_information_length,
-                return_length,
-                &numa_node_relationship_information(),
-            ),
+            // Windows returns RelationNumaNode-tagged records for a RelationNumaNodeEx query.
+            // The synthetic topology has one processor group, so the existing one-element
+            // GroupMasks array is the complete extended-NUMA response.
+            LogicalProcessorRelationship::NumaNode | LogicalProcessorRelationship::NumaNodeEx => {
+                Self::write_system_information(
+                    system_information,
+                    system_information_length,
+                    return_length,
+                    &numa_node_relationship_information(),
+                )
+            }
             LogicalProcessorRelationship::Cache => Self::write_system_information(
                 system_information,
                 system_information_length,
