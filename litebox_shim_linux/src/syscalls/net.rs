@@ -635,10 +635,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     self.net.lock().set_tcp_option(
                         fd,
                         match name {
-                            "reno" | "cubic" => {
-                                log_unsupported!("enable {} for smoltcp?", name);
-                                return Err(Errno::EINVAL);
-                            }
+                            "reno" => litebox::net::TcpOptionData::CONGESTION(
+                                litebox::net::CongestionControl::Reno,
+                            ),
+                            "cubic" => litebox::net::TcpOptionData::CONGESTION(
+                                litebox::net::CongestionControl::Cubic,
+                            ),
                             "none" => litebox::net::TcpOptionData::CONGESTION(
                                 litebox::net::CongestionControl::None,
                             ),
