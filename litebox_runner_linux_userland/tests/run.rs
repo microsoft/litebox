@@ -386,9 +386,20 @@ fn python_runner(unique_name: &str) -> Runner {
                     let python_lib_dst = out_dir.join(source_path.strip_prefix("/").unwrap());
                     let source_encodings = source_path.join("encodings/__init__.py");
                     let staged_encodings = python_lib_dst.join("encodings/__init__.py");
-                    if !python_lib_dst.exists()
-                        || (source_encodings.exists() && !staged_encodings.exists())
-                    {
+                    if python_lib_dst.exists() && source_encodings.exists() && !staged_encodings.exists() {
+                        eprintln!(
+                            "Warning: Python lib directory {} already exists, but encodings/__init__.py is missing. \
+                            This may cause Python to fail to find the encodings package. \
+                            Consider removing the existing directory and re-running the test.",
+                            python_lib_dst.display()
+                        );
+                    }
+                    eprintln!(
+                        "Staging python3 lib from {} to {}",
+                        source_path.display(),
+                        python_lib_dst.display()
+                    );
+                    if !python_lib_dst.exists() {
                         std::fs::create_dir_all(&python_lib_dst).unwrap();
                         println!(
                             "Copying python3 lib from {} to {}",
