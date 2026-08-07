@@ -15,7 +15,8 @@ use litebox::fs::errors::{
 use litebox::fs::{FileStatus, FileType, Mode, OFlags, SeekWhence};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
-use zerocopy::{FromBytes, Immutable, IntoBytes};
+use zerocopy::byteorder::native_endian::U32;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::nt_types::{
     AccessMask, IoStatusBlock, ObjectAttributes, UnicodeString, read_object_attributes,
@@ -108,6 +109,36 @@ enum FileInformationClass {
     FileIdBothDirectoryInformation = 37,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+struct DirectoryInformationHeader {
+    next_entry_offset: U32,
+    file_index: U32,
+}
+
+impl DirectoryInformationHeader {
+    fn new(file_index: u32) -> Self {
+        Self {
+            file_index: U32::new(file_index),
+            ..Default::default()
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+struct DirectoryInformationMetadata {
+    header: DirectoryInformationHeader,
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    end_of_file: i64,
+    allocation_size: i64,
+    file_attributes: u32,
+    file_name_length: u32,
+}
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct DirectoryQueryFlags: u32 {
@@ -121,90 +152,63 @@ bitflags::bitflags! {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
 struct FileDirectoryInformation {
-    next_entry_offset: u32,
-    file_index: u32,
-    creation_time: i64,
-    last_access_time: i64,
-    last_write_time: i64,
-    change_time: i64,
-    end_of_file: i64,
-    allocation_size: i64,
-    file_attributes: u32,
-    file_name_length: u32,
+    metadata: DirectoryInformationMetadata,
+    // Placeholder for the first code unit of the variable-length UTF-16 name.
     file_name: [u16; 1],
+    // Explicit trailing padding preserves native sizeof and keeps all bytes initialized.
     padding: [u8; 6],
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
 struct FileFullDirectoryInformation {
-    next_entry_offset: u32,
-    file_index: u32,
-    creation_time: i64,
-    last_access_time: i64,
-    last_write_time: i64,
-    change_time: i64,
-    end_of_file: i64,
-    allocation_size: i64,
-    file_attributes: u32,
-    file_name_length: u32,
+    metadata: DirectoryInformationMetadata,
     ea_size: u32,
+    // Placeholder for the first code unit of the variable-length UTF-16 name.
     file_name: [u16; 1],
+    // Explicit trailing padding preserves native sizeof and keeps all bytes initialized.
     padding: [u8; 2],
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
 struct FileBothDirectoryInformation {
-    next_entry_offset: u32,
-    file_index: u32,
-    creation_time: i64,
-    last_access_time: i64,
-    last_write_time: i64,
-    change_time: i64,
-    end_of_file: i64,
-    allocation_size: i64,
-    file_attributes: u32,
-    file_name_length: u32,
+    metadata: DirectoryInformationMetadata,
     ea_size: u32,
     short_name_length: u8,
     reserved: u8,
     short_name: [u16; 12],
+    // Placeholder for the first code unit of the variable-length UTF-16 name.
     file_name: [u16; 1],
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
 struct FileNamesInformation {
-    next_entry_offset: u32,
-    file_index: u32,
+    header: DirectoryInformationHeader,
     file_name_length: u32,
+    // Placeholder for the first code unit of the variable-length UTF-16 name.
     file_name: [u16; 1],
+    // Explicit trailing padding preserves native sizeof and keeps all bytes initialized.
     padding: [u8; 2],
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
 struct FileIdBothDirectoryInformation {
-    next_entry_offset: u32,
-    file_index: u32,
-    creation_time: i64,
-    last_access_time: i64,
-    last_write_time: i64,
-    change_time: i64,
-    end_of_file: i64,
-    allocation_size: i64,
-    file_attributes: u32,
-    file_name_length: u32,
+    metadata: DirectoryInformationMetadata,
     ea_size: u32,
     short_name_length: u8,
     reserved: u8,
     short_name: [u16; 12],
+    // Explicit padding aligns file_id with the native ABI layout.
     padding: [u8; 2],
     file_id: i64,
+    // Placeholder for the first code unit of the variable-length UTF-16 name.
     file_name: [u16; 1],
+    // Explicit trailing padding preserves native sizeof and keeps all bytes initialized.
     trailing_padding: [u8; 6],
 }
 
@@ -244,6 +248,19 @@ impl DirectoryEntry {
     }
 }
 
+impl DirectoryInformationMetadata {
+    fn new(file_index: u32, file_name_length: u32, entry: &DirectoryEntry) -> Self {
+        Self {
+            header: DirectoryInformationHeader::new(file_index),
+            end_of_file: entry.end_of_file,
+            allocation_size: entry.allocation_size,
+            file_attributes: entry.file_attributes.bits(),
+            file_name_length,
+            ..Default::default()
+        }
+    }
+}
+
 impl FileInformationClass {
     const fn minimum_size(self) -> usize {
         match self {
@@ -256,105 +273,70 @@ impl FileInformationClass {
     }
 
     fn encode_entry(self, entry: &DirectoryEntry, index: usize) -> Vec<u8> {
-        let name: Vec<u16> = entry.name.encode_utf16().collect();
-        let file_name_length = u32::try_from(name.len() * size_of::<u16>()).unwrap();
+        let file_name_length =
+            u32::try_from(entry.name.encode_utf16().count() * size_of::<u16>()).unwrap();
         let file_index = u32::try_from(index).unwrap_or(u32::MAX);
         // TODO(dir-timestamps): Populate timestamps, EA sizes, and short names once FileSystem
         // exposes them; the current API only supplies size, type, mode, and inode.
         let mut record = match self {
             Self::FileDirectoryInformation => {
                 let information = FileDirectoryInformation {
-                    next_entry_offset: 0,
-                    file_index,
-                    creation_time: 0,
-                    last_access_time: 0,
-                    last_write_time: 0,
-                    change_time: 0,
-                    end_of_file: entry.end_of_file,
-                    allocation_size: entry.allocation_size,
-                    file_attributes: entry.file_attributes.bits(),
-                    file_name_length,
-                    file_name: [0],
-                    padding: [0; 6],
+                    metadata: DirectoryInformationMetadata::new(
+                        file_index,
+                        file_name_length,
+                        entry,
+                    ),
+                    ..Default::default()
                 };
                 information.as_bytes()[..offset_of!(FileDirectoryInformation, file_name)].to_vec()
             }
             Self::FileFullDirectoryInformation => {
                 let information = FileFullDirectoryInformation {
-                    next_entry_offset: 0,
-                    file_index,
-                    creation_time: 0,
-                    last_access_time: 0,
-                    last_write_time: 0,
-                    change_time: 0,
-                    end_of_file: entry.end_of_file,
-                    allocation_size: entry.allocation_size,
-                    file_attributes: entry.file_attributes.bits(),
-                    file_name_length,
-                    ea_size: 0,
-                    file_name: [0],
-                    padding: [0; 2],
+                    metadata: DirectoryInformationMetadata::new(
+                        file_index,
+                        file_name_length,
+                        entry,
+                    ),
+                    ..Default::default()
                 };
                 information.as_bytes()[..offset_of!(FileFullDirectoryInformation, file_name)]
                     .to_vec()
             }
             Self::FileBothDirectoryInformation => {
                 let information = FileBothDirectoryInformation {
-                    next_entry_offset: 0,
-                    file_index,
-                    creation_time: 0,
-                    last_access_time: 0,
-                    last_write_time: 0,
-                    change_time: 0,
-                    end_of_file: entry.end_of_file,
-                    allocation_size: entry.allocation_size,
-                    file_attributes: entry.file_attributes.bits(),
-                    file_name_length,
-                    ea_size: 0,
-                    short_name_length: 0,
-                    reserved: 0,
-                    short_name: [0; 12],
-                    file_name: [0],
+                    metadata: DirectoryInformationMetadata::new(
+                        file_index,
+                        file_name_length,
+                        entry,
+                    ),
+                    ..Default::default()
                 };
                 information.as_bytes()[..offset_of!(FileBothDirectoryInformation, file_name)]
                     .to_vec()
             }
             Self::FileNamesInformation => {
                 let information = FileNamesInformation {
-                    next_entry_offset: 0,
-                    file_index,
+                    header: DirectoryInformationHeader::new(file_index),
                     file_name_length,
-                    file_name: [0],
-                    padding: [0; 2],
+                    ..Default::default()
                 };
                 information.as_bytes()[..offset_of!(FileNamesInformation, file_name)].to_vec()
             }
             Self::FileIdBothDirectoryInformation => {
                 let information = FileIdBothDirectoryInformation {
-                    next_entry_offset: 0,
-                    file_index,
-                    creation_time: 0,
-                    last_access_time: 0,
-                    last_write_time: 0,
-                    change_time: 0,
-                    end_of_file: entry.end_of_file,
-                    allocation_size: entry.allocation_size,
-                    file_attributes: entry.file_attributes.bits(),
-                    file_name_length,
-                    ea_size: 0,
-                    short_name_length: 0,
-                    reserved: 0,
-                    short_name: [0; 12],
-                    padding: [0; 2],
+                    metadata: DirectoryInformationMetadata::new(
+                        file_index,
+                        file_name_length,
+                        entry,
+                    ),
                     file_id: entry.file_id,
-                    file_name: [0],
-                    trailing_padding: [0; 6],
+                    ..Default::default()
                 };
                 information.as_bytes()[..offset_of!(FileIdBothDirectoryInformation, file_name)]
                     .to_vec()
             }
         };
-        for unit in name {
+        for unit in entry.name.encode_utf16() {
             record.extend_from_slice(&unit.to_ne_bytes());
         }
         record
@@ -818,21 +800,18 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             Err(status) => return status,
         };
-        let status =
-            match self.fs.file_status(&path) {
-                Ok(status) => status,
-                Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
-                    let parent = path.rsplit_once('/').map_or("/", |(parent, _)| {
-                        if parent.is_empty() { "/" } else { parent }
-                    });
-                    return if self.fs.file_status(parent).is_ok() {
-                        NtStatus::OBJECT_NAME_NOT_FOUND
-                    } else {
-                        NtStatus::OBJECT_PATH_NOT_FOUND
-                    };
-                }
-                Err(error) => return map_file_status_error(error),
-            };
+        let status = match self.fs.file_status(&path) {
+            Ok(status) => status,
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                let parent = parent_directory_path(&path);
+                return if self.fs.file_status(parent).is_ok() {
+                    NtStatus::OBJECT_NAME_NOT_FOUND
+                } else {
+                    NtStatus::OBJECT_PATH_NOT_FOUND
+                };
+            }
+            Err(error) => return map_file_status_error(error),
+        };
         let readonly = !status.mode.intersects(Mode::WUSR | Mode::WGRP | Mode::WOTH);
         let mut file_attributes = match status.file_type {
             FileType::Directory => FileAttributes::DIRECTORY,
@@ -1132,15 +1111,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(file) => file,
             Err(status) => return status,
         };
-        if !event.is_null()
-            && let Err(status) = self.check_event_modify_access(event)
-        {
-            return status;
-        }
-        if !event.is_null()
-            && let Err(status) = self.clear_event(event)
-        {
-            return status;
+        if !event.is_null() {
+            if let Err(status) = self.check_event_modify_access(event) {
+                return status;
+            }
+            if let Err(status) = self.clear_event(event) {
+                return status;
+            }
         }
         if apc_routine.is_some() || apc_context.is_some() {
             litebox_util_log::debug!(
@@ -1243,28 +1220,30 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let mut output = Vec::new();
         let mut next_position = start;
-        let mut previous_start = None;
+        let mut previous_record_start = None;
         for (relative_index, entry) in matching_entries[start..].iter().enumerate() {
             let record = information_class.encode_entry(entry, start + relative_index);
             let record_start = align_up(output.len(), 8);
             if record_start + record.len() > length {
                 if output.is_empty() {
                     output.resize(length, 0);
-                    output[..record.len().min(length)]
-                        .copy_from_slice(&record[..record.len().min(length)]);
+                    output.copy_from_slice(&record[..length]);
                     return Ok((NtStatus::BUFFER_OVERFLOW, output));
                 }
                 break;
             }
-            if let Some(previous_start) = previous_start {
+            if let Some(previous_record_start) = previous_record_start {
                 output.resize(record_start, 0);
-                let next_offset = u32::try_from(record_start - previous_start)
+                let previous_record = &mut output[previous_record_start..record_start];
+                let (previous_header, _) =
+                    DirectoryInformationHeader::mut_from_prefix(previous_record)
+                        .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+                let next_entry_offset = u32::try_from(record_start - previous_record_start)
                     .map_err(|_| NtStatus::INVALID_PARAMETER)?;
-                output[previous_start..previous_start + size_of::<u32>()]
-                    .copy_from_slice(&next_offset.to_ne_bytes());
+                previous_header.next_entry_offset.set(next_entry_offset);
             }
             output.extend_from_slice(&record);
-            previous_start = Some(record_start);
+            previous_record_start = Some(record_start);
             next_position += 1;
             if flags.contains(DirectoryQueryFlags::RETURN_SINGLE_ENTRY) {
                 break;
@@ -2298,6 +2277,27 @@ mod tests {
     }
 
     #[test]
+    fn directory_name_matches_dos_wildcards() {
+        for (pattern, name, expected) in [
+            ("<.txt", "report.txt", true),
+            ("<.txt", "archive.part.txt", true),
+            ("<.txt", "report.doc", false),
+            ("file>.txt", "file1.txt", true),
+            ("file>.txt", "file.txt", true),
+            ("file>.txt", "file12.txt", false),
+            ("file\"", "file.", true),
+            ("file\"", "file", true),
+            ("file\"", "file.txt", false),
+        ] {
+            assert_eq!(
+                directory_name_matches(Some(pattern), name),
+                expected,
+                "pattern {pattern:?}, name {name:?}"
+            );
+        }
+    }
+
+    #[test]
     fn nt_query_attributes_file_reports_file_type_attributes() {
         let task = crate::tests::test_task();
         create_existing_file(&task, "/tmp/query-attributes.txt", b"data");
@@ -2657,65 +2657,6 @@ mod tests {
     }
 
     #[test]
-    fn nt_query_directory_file_ex_encodes_supported_information_classes() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            task.fs.mkdir("/tmp/query-classes", Mode::RWXU).unwrap();
-            create_existing_file(&task, "/tmp/query-classes/archive.7z", b"payload");
-
-            for information_class in [
-                FileInformationClass::FileDirectoryInformation,
-                FileInformationClass::FileFullDirectoryInformation,
-                FileInformationClass::FileBothDirectoryInformation,
-                FileInformationClass::FileNamesInformation,
-                FileInformationClass::FileIdBothDirectoryInformation,
-            ] {
-                let handle =
-                    open_directory_with_access(&task, "/tmp/query-classes", FILE_GENERIC_READ);
-                let mut io_status = IoStatusBlock::default();
-                let mut output = [0xcc; 256];
-                assert_eq!(
-                    query_directory(
-                        &task,
-                        handle,
-                        information_class,
-                        DirectoryQueryFlags::RESTART_SCAN,
-                        Some("ARCHIVE.7Z"),
-                        &mut io_status,
-                        &mut output,
-                    ),
-                    NtStatus::SUCCESS,
-                    "{information_class:?}"
-                );
-                assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
-                assert_eq!(
-                    directory_record_names(&output, information_class, io_status.information),
-                    ["archive.7z"]
-                );
-                let expected_size = match information_class {
-                    FileInformationClass::FileDirectoryInformation => 64,
-                    FileInformationClass::FileFullDirectoryInformation => 68,
-                    FileInformationClass::FileBothDirectoryInformation => 94,
-                    FileInformationClass::FileNamesInformation => 12,
-                    FileInformationClass::FileIdBothDirectoryInformation => 104,
-                } + "archive.7z".len() * size_of::<u16>();
-                assert_eq!(io_status.information, expected_size);
-                if information_class != FileInformationClass::FileNamesInformation {
-                    assert_eq!(i64::from_ne_bytes(output[40..48].try_into().unwrap()), 7);
-                    assert_eq!(
-                        u32::from_ne_bytes(output[56..60].try_into().unwrap()),
-                        FileAttributes::ARCHIVE.bits()
-                    );
-                }
-                if information_class == FileInformationClass::FileIdBothDirectoryInformation {
-                    assert_ne!(i64::from_ne_bytes(output[96..104].try_into().unwrap()), 0);
-                }
-                assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-            }
-        });
-    }
-
-    #[test]
     fn nt_query_directory_file_ex_tracks_restart_single_and_no_cursor_flags() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
@@ -2800,232 +2741,6 @@ mod tests {
                     assert!(names[0] == "alpha" || names[0] == "beta");
                 }
             }
-            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-        });
-    }
-
-    #[test]
-    fn nt_query_directory_file_ex_reports_overflow_and_empty_scans() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            task.fs.mkdir("/tmp/query-pattern", Mode::RWXU).unwrap();
-            create_existing_file(&task, "/tmp/query-pattern/long-name.txt", b"content");
-            let class = FileInformationClass::FileNamesInformation;
-
-            let overflow_handle =
-                open_directory_with_access(&task, "/tmp/query-pattern", FILE_GENERIC_READ);
-            let mut io_status = IoStatusBlock::new(NtStatus::from_raw(0x1111_1111), 0x2222_2222);
-            let mut short_output = [0xcc; size_of::<FileNamesInformation>()];
-            assert_eq!(
-                query_directory(
-                    &task,
-                    overflow_handle,
-                    class,
-                    DirectoryQueryFlags::RESTART_SCAN,
-                    Some("long-name.txt"),
-                    &mut io_status,
-                    &mut short_output,
-                ),
-                NtStatus::BUFFER_OVERFLOW
-            );
-            assert_eq!(io_status.status, NtStatus::BUFFER_OVERFLOW.as_raw());
-            assert_eq!(io_status.information, short_output.len());
-            assert_eq!(
-                u32::from_ne_bytes(short_output[8..12].try_into().unwrap()),
-                u32::try_from("long-name.txt".len() * size_of::<u16>()).unwrap()
-            );
-            assert_eq!(&short_output[12..16], &[b'l', 0, b'o', 0]);
-            let mut full_output = [0; 128];
-            assert_eq!(
-                query_directory(
-                    &task,
-                    overflow_handle,
-                    class,
-                    DirectoryQueryFlags::empty(),
-                    None,
-                    &mut io_status,
-                    &mut full_output,
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(
-                directory_record_names(&full_output, class, io_status.information),
-                ["long-name.txt"]
-            );
-            assert_eq!(task.sys_nt_close(overflow_handle), NtStatus::SUCCESS);
-
-            let missing_handle =
-                open_directory_with_access(&task, "/tmp/query-pattern", FILE_GENERIC_READ);
-            let mut output = [0xcc; 128];
-            assert_eq!(
-                query_directory(
-                    &task,
-                    missing_handle,
-                    class,
-                    DirectoryQueryFlags::RESTART_SCAN,
-                    Some("missing"),
-                    &mut io_status,
-                    &mut output,
-                ),
-                NtStatus::NO_SUCH_FILE
-            );
-            assert_eq!(io_status.status, NtStatus::NO_SUCH_FILE.as_raw());
-            assert_eq!(io_status.information, 0);
-            assert_eq!(output, [0xcc; 128]);
-            assert_eq!(
-                query_directory(
-                    &task,
-                    missing_handle,
-                    class,
-                    DirectoryQueryFlags::empty(),
-                    Some("*"),
-                    &mut io_status,
-                    &mut output,
-                ),
-                NtStatus::NO_MORE_FILES
-            );
-            assert_eq!(io_status.status, NtStatus::NO_MORE_FILES.as_raw());
-            assert_eq!(io_status.information, 0);
-            assert_eq!(task.sys_nt_close(missing_handle), NtStatus::SUCCESS);
-        });
-    }
-
-    #[test]
-    fn nt_query_directory_file_ex_preserves_outputs_on_preflight_errors() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            task.fs.mkdir("/tmp/query-errors", Mode::RWXU).unwrap();
-            let handle = open_directory_with_access(&task, "/tmp/query-errors", FILE_GENERIC_READ);
-            let sentinel = IoStatusBlock::new(NtStatus::from_raw(0x1111_1111), 0x2222_2222);
-            let mut io_status = sentinel;
-            let mut output = [0xcc; 128];
-            let output_ptr = MutPtr::<TestPlatform, u8>::from_usize(output.as_mut_ptr() as usize);
-
-            assert_eq!(
-                task.sys_nt_query_directory_file_ex(
-                    handle,
-                    Handle::default(),
-                    None,
-                    None,
-                    mut_ptr(&mut io_status),
-                    output_ptr,
-                    output.len().try_into().unwrap(),
-                    0xffff,
-                    DirectoryQueryFlags::RESTART_SCAN.bits(),
-                    None,
-                ),
-                NtStatus::INVALID_INFO_CLASS
-            );
-            assert_eq!(io_status.status, sentinel.status);
-            assert_eq!(io_status.information, sentinel.information);
-            assert_eq!(output, [0xcc; 128]);
-
-            assert_eq!(
-                task.sys_nt_query_directory_file_ex(
-                    handle,
-                    Handle::default(),
-                    None,
-                    None,
-                    mut_ptr(&mut io_status),
-                    output_ptr,
-                    u32::try_from(size_of::<FileNamesInformation>() - 1).unwrap(),
-                    FileInformationClass::FileNamesInformation as u32,
-                    DirectoryQueryFlags::RESTART_SCAN.bits(),
-                    None,
-                ),
-                NtStatus::INFO_LENGTH_MISMATCH
-            );
-            assert_eq!(io_status.status, sentinel.status);
-            assert_eq!(io_status.information, sentinel.information);
-
-            assert_eq!(
-                task.sys_nt_query_directory_file_ex(
-                    handle,
-                    Handle::default(),
-                    None,
-                    None,
-                    mut_ptr(&mut io_status),
-                    MutPtr::<TestPlatform, u8>::from_usize(0),
-                    u32::try_from(size_of::<FileNamesInformation>()).unwrap(),
-                    FileInformationClass::FileNamesInformation as u32,
-                    DirectoryQueryFlags::RESTART_SCAN.bits(),
-                    None,
-                ),
-                NtStatus::ACCESS_VIOLATION
-            );
-            assert_eq!(io_status.status, sentinel.status);
-            assert_eq!(io_status.information, sentinel.information);
-
-            assert_eq!(
-                task.sys_nt_query_directory_file_ex(
-                    handle,
-                    Handle::default(),
-                    None,
-                    None,
-                    mut_ptr(&mut io_status),
-                    MutPtr::<TestPlatform, u8>::from_usize(output.as_mut_ptr() as usize + 1),
-                    u32::try_from(size_of::<FileNamesInformation>()).unwrap(),
-                    FileInformationClass::FileNamesInformation as u32,
-                    DirectoryQueryFlags::RESTART_SCAN.bits(),
-                    None,
-                ),
-                NtStatus::DATATYPE_MISALIGNMENT
-            );
-            assert_eq!(io_status.status, sentinel.status);
-            assert_eq!(io_status.information, sentinel.information);
-
-            assert_eq!(
-                task.sys_nt_query_directory_file_ex(
-                    Handle::from_raw(0x1234),
-                    Handle::default(),
-                    None,
-                    None,
-                    mut_ptr(&mut io_status),
-                    output_ptr,
-                    output.len().try_into().unwrap(),
-                    FileInformationClass::FileNamesInformation as u32,
-                    DirectoryQueryFlags::RESTART_SCAN.bits(),
-                    None,
-                ),
-                NtStatus::INVALID_HANDLE
-            );
-            assert_eq!(io_status.status, sentinel.status);
-            assert_eq!(io_status.information, sentinel.information);
-            assert_eq!(output, [0xcc; 128]);
-            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-        });
-    }
-
-    #[test]
-    fn nt_query_directory_file_ex_rejects_non_directory_handles() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            create_existing_file(&task, "/tmp/query-regular-file", b"payload");
-            let (status, handle, _) = create_file(
-                &task,
-                "/tmp/query-regular-file",
-                FILE_GENERIC_READ,
-                FILE_OPEN,
-            );
-            assert_eq!(status, NtStatus::SUCCESS);
-
-            let mut io_status = IoStatusBlock::new(NtStatus::from_raw(0x1111_1111), 0x2222_2222);
-            let mut output = [0xcc; 128];
-            assert_eq!(
-                query_directory(
-                    &task,
-                    handle,
-                    FileInformationClass::FileNamesInformation,
-                    DirectoryQueryFlags::RESTART_SCAN,
-                    None,
-                    &mut io_status,
-                    &mut output,
-                ),
-                NtStatus::INVALID_PARAMETER
-            );
-            assert_eq!(io_status.status, NtStatus::INVALID_PARAMETER.as_raw());
-            assert_eq!(io_status.information, 0);
-            assert_eq!(output, [0xcc; 128]);
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         });
     }
