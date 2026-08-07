@@ -384,22 +384,8 @@ fn python_runner(unique_name: &str) -> Runner {
 
                 if source_path.is_dir() {
                     let python_lib_dst = out_dir.join(source_path.strip_prefix("/").unwrap());
-                    let source_encodings = source_path.join("encodings/__init__.py");
-                    let staged_encodings = python_lib_dst.join("encodings/__init__.py");
-                    if python_lib_dst.exists() && source_encodings.exists() && !staged_encodings.exists() {
-                        eprintln!(
-                            "Warning: Python lib directory {} already exists, but encodings/__init__.py is missing. \
-                            This may cause Python to fail to find the encodings package. \
-                            Consider removing the existing directory and re-running the test.",
-                            python_lib_dst.display()
-                        );
-                    }
-                    eprintln!(
-                        "Staging python3 lib from {} to {}",
-                        source_path.display(),
-                        python_lib_dst.display()
-                    );
-                    if !python_lib_dst.exists() {
+                    let stage_marker = python_lib_dst.join(".stage-complete.cache-checksum");
+                    if !stage_marker.exists() {
                         std::fs::create_dir_all(&python_lib_dst).unwrap();
                         println!(
                             "Copying python3 lib from {} to {}",
@@ -423,6 +409,7 @@ fn python_runner(unique_name: &str) -> Runner {
                                 std::str::from_utf8(output.stderr.as_slice()).unwrap_or("");
                             eprintln!("Warning: cp finished with errors (non-critical):\n{stderr}");
                         }
+                        std::fs::write(&stage_marker, b"").unwrap();
                     }
 
                     // Rewrite shared objects (.so, .so.1, .so.1.2.3, etc.) under the python lib directory.
