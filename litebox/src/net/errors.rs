@@ -5,8 +5,6 @@
 
 use core::net::SocketAddr;
 
-use super::local_ports::LocalPortAllocationError;
-
 #[expect(
     unused_imports,
     reason = "used for doc string links to work out, but not for code"
@@ -63,8 +61,6 @@ pub enum ConnectError {
     InvalidFd,
     #[error("Unsupported address {0}")]
     UnsupportedAddress(SocketAddr),
-    #[error("Port allocation failed: {0}")]
-    PortAllocationFailure(#[from] LocalPortAllocationError),
     #[error("Invalid address")]
     Unaddressable,
     #[error("Connection is still in progress")]
@@ -123,8 +119,6 @@ pub enum ListenError {
     InvalidAddress,
     #[error("Socket is in invalid state")]
     InvalidState,
-    #[error("No available free ephemeral ports")]
-    NoAvailableFreeEphemeralPorts,
     #[error("Listening is unsupported for this socket")]
     UnsupportedOperation,
     #[error("Socket operation failed: {0:?}")]
@@ -161,8 +155,6 @@ pub enum SendError {
     BufferFull,
     #[error("Datagram is too large")]
     MessageTooLong,
-    #[error("port allocation failed: {0}")]
-    PortAllocationFailure(#[from] LocalPortAllocationError),
     #[error("unnecessary destination address provided")]
     UnnecessaryDestinationAddress,
     #[error("destination address required but not provided")]

@@ -1654,7 +1654,7 @@ mod tests {
         use crate::syscalls::tests::init_platform;
         use litebox_common_linux::ArchPrctlArg;
 
-        let task = init_platform(None);
+        let task = init_platform();
 
         // Save old FS base
         let mut old_fs_base: usize = 0;
@@ -1683,7 +1683,7 @@ mod tests {
 
     #[test]
     fn test_sched_getaffinity() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         let cpuset = task.sys_sched_getaffinity(None);
         assert_eq!(cpuset.bits.len(), super::NR_CPUS);
@@ -1698,7 +1698,7 @@ mod tests {
 
     #[test]
     fn test_prctl_set_get_name() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         // Prepare a null-terminated name to set
         let name: &[u8] = b"litebox-test\0";
@@ -1754,7 +1754,7 @@ mod tests {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
         let callback_addr = 0x1000usize; // dummy non-null address for the callback
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let act = SigAction {
                 sigaction: callback_addr,
@@ -1823,7 +1823,7 @@ mod tests {
         use litebox::platform::{Instant as _, TimeProvider};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let platform = task.global.platform;
 
@@ -1882,7 +1882,7 @@ mod tests {
     fn test_alarm_cancel_prevents_signal() {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             assert_eq!(task.sys_alarm(1).unwrap(), 0);
             // Cancel before it fires.
@@ -1918,7 +1918,7 @@ mod tests {
             signal::{SigSet, SigmaskHow, Signal},
         };
 
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let block_set = SigSet::empty().with(Signal::SIGUSR1);
             task.sys_rt_sigprocmask(
@@ -1965,7 +1965,7 @@ mod tests {
         use litebox_common_linux::signal::{SIG_IGN, SaFlags, SigAction, SigSet, Signal};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             // Install SIG_IGN for SIGALRM.
             let act = SigAction {
@@ -2021,7 +2021,7 @@ mod tests {
         use litebox_common_linux::signal::Signal;
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let platform = task.global.platform;
 

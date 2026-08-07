@@ -2920,7 +2920,7 @@ mod tests {
 
     #[test]
     fn getcwd_and_chdir() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         // Default CWD is root.
         let mut buf = [0u8; 256];
@@ -2963,7 +2963,7 @@ mod tests {
 
     #[test]
     fn chdir_relative_path() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         // Create nested dirs: /rel_parent/rel_child
         task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/rel_parent", 0o777)
@@ -2995,7 +2995,7 @@ mod tests {
     fn mknodat_regular_file_does_not_consume_fd_limit() {
         use litebox_common_linux::{Rlimit, RlimitResource};
 
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
         let old_limit = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
         task.do_prlimit(
             RlimitResource::NOFILE,
@@ -3023,7 +3023,7 @@ mod tests {
 
     #[test]
     fn empty_pathnames_return_enoent() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         assert_eq!(
             task.sys_open("", OFlags::RDONLY, Mode::empty())
@@ -3069,7 +3069,7 @@ mod tests {
     fn all_path_syscalls_respect_chdir() {
         use litebox_common_linux::{AccessFlags, AtFlags};
 
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         // Set up: mkdir + chdir into /cwd_test/.
         task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/cwd_test", 0o777)

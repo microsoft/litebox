@@ -653,31 +653,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
                     let proxy = self.get_proxy(fd)?;
-                    let is_broker_stream = match proxy.as_ref() {
-                        NetworkProxy::Stream(_) => false,
-                        NetworkProxy::BrokerStream(_) => true,
-                        NetworkProxy::Datagram(_)
-                        | NetworkProxy::Raw
-                        | NetworkProxy::BrokerDatagram(_) => return Err(Errno::ENOPROTOOPT),
+                    let NetworkProxy::BrokerStream(_) = proxy.as_ref() else {
+                        return Err(Errno::ENOPROTOOPT);
                     };
                     drop(proxy);
                     let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
-                    if matches!(to, TcpOption::CORK) && is_broker_stream {
+                    if matches!(to, TcpOption::CORK) {
                         return Err(Errno::EOPNOTSUPP);
                     }
-                    // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
-                    // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
-                    // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
-                    // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle's Algorithm.
-                    let on = if let TcpOption::NODELAY = to {
-                        val != 0
-                    } else {
-                        // CORK is the opposite of NODELAY
-                        val == 0
-                    };
                     self.net
                         .lock()
-                        .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))?;
+                        .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(val != 0))?;
                 }
                 TcpOption::KEEPINTVL => {
                     const MAX_TCP_KEEPINTVL: u32 = 32767;
@@ -966,38 +952,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
     ) -> Result<usize, Errno> {
         let proxy = self.get_proxy(fd)?;
 
-        // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
-        // UDP socket implicitly binds it to an ephemeral port before sending).
-        // This is mostly lock-free: we only take the network lock if we need to allocate a port.
-        if let NetworkProxy::Datagram(proxy) = proxy.as_ref()
-            && proxy.local_port() == 0
-        {
-            // UDP socket is unbound - bind to an ephemeral port
-            let mut net = self.net.lock();
-            // Bind with port 0 to get an ephemeral port
-            if let Err(err) = net.bind(
-                fd,
-                &SocketAddr::V4(core::net::SocketAddrV4::new(
-                    core::net::Ipv4Addr::UNSPECIFIED,
-                    0,
-                )),
-            ) {
-                match err {
-                    litebox::net::errors::BindError::AlreadyBound => {
-                        // Another thread bound it in the meantime - that's fine
-                    }
-                    litebox::net::errors::BindError::InvalidFd => return Err(Errno::EBADF),
-                    litebox::net::errors::BindError::UnsupportedAddress(_)
-                    | litebox::net::errors::BindError::PortAlreadyInUse(_) => unreachable!(),
-                    _ => unimplemented!(),
-                }
-            }
-            // Get the assigned port
-            let local_addr = net.get_local_addr(fd).map_err(Errno::from)?;
-            // If another thread already set a port, that's fine - we'll use theirs
-            let _ = proxy.set_local_port(local_addr.port());
-        }
-
         // Convert `SendFlags` to `litebox::net::SendFlags`
         // `DONTWAIT` is handled in this function and `NOSIGNAL` should be handled by caller,
         // so we don't convert them.
@@ -1015,11 +969,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
-        let is_empty_stream = buf.is_empty()
-            && matches!(
-                proxy.as_ref(),
-                NetworkProxy::Stream(_) | NetworkProxy::BrokerStream(_)
-            );
+        let is_empty_stream =
+            buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::BrokerStream(_));
 
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -1153,12 +1104,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let wait_all = flags.contains(ReceiveFlags::WAITALL)
             && matches!(socket_type, SockType::Stream)
             && !is_nonblock;
-        if buf.is_empty()
-            && matches!(
-                socket.proxy.as_ref(),
-                NetworkProxy::Stream(_) | NetworkProxy::BrokerStream(_)
-            )
-        {
+        if buf.is_empty() && matches!(socket.proxy.as_ref(), NetworkProxy::BrokerStream(_)) {
             return Ok(0);
         }
 
@@ -2916,7 +2862,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn dropping_inet_socket_pin_reaps_deferred_close() {
-        let task = init_platform(None);
+        let task = init_platform();
         let fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .unwrap();
@@ -2943,7 +2889,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn socket_io_pin_keeps_backend_alive_for_send_after_close() {
-        let task = init_platform(None);
+        let task = init_platform();
         let fd = task
             .do_socket(
                 AddressFamily::INET,
@@ -2985,7 +2931,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn raw_inet_socket_pin_does_not_follow_dup2_replacement() {
-        let task = init_platform(None);
+        let task = init_platform();
         let old_fd = task
             .do_socket(
                 AddressFamily::INET,
@@ -3055,7 +3001,7 @@ mod tests {
 
     #[test]
     fn recvmmsg_lock_wakes_contended_waiter() {
-        let task = init_platform(None);
+        let task = init_platform();
         let lock = alloc::sync::Arc::new(super::RecvmmsgLock::new());
         let guard = lock.try_lock().unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -3083,7 +3029,7 @@ mod tests {
 
     #[test]
     fn recvmmsg_lock_honors_wait_deadline() {
-        let task = init_platform(None);
+        let task = init_platform();
         let lock = super::RecvmmsgLock::new();
         let guard = lock.try_lock().unwrap();
         let wait_cx = task
@@ -3100,7 +3046,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn inet_socket_returns_emfile_at_raw_fd_limit() {
-        let task = init_platform(None);
+        let task = init_platform();
         let fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .unwrap();
@@ -3358,7 +3304,7 @@ mod tests {
     }
 
     fn test_tcp_socket_with_external_client(is_nonblocking: bool, test_trunc: bool) {
-        let task = init_platform(None);
+        let task = init_platform();
         test_tcp_socket_as_server(
             &task,
             LOOPBACK_IP_ADDR,
@@ -3378,7 +3324,7 @@ mod tests {
     }
 
     fn test_tcp_socket_send(is_nonblocking: bool, test_trunc: bool) {
-        let task = init_platform(None);
+        let task = init_platform();
         test_tcp_socket_as_server(
             &task,
             LOOPBACK_IP_ADDR,
@@ -3430,7 +3376,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_tcp_connection_refused() {
-        let task = init_platform(None);
+        let task = init_platform();
         let port = find_free_tcp_port();
         let socket_fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
@@ -3461,7 +3407,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_tcp_socket_as_client() {
-        let task = init_platform(None);
+        let task = init_platform();
         let port = find_free_tcp_port();
 
         let child_handle = std::thread::spawn(move || {
@@ -3658,7 +3604,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_blocking_udp_server_socket() {
-        let task = init_platform(None);
+        let task = init_platform();
         blocking_udp_server_socket(&task, false, false, false, "recvfrom");
         blocking_udp_server_socket(&task, false, false, false, "recvmsg");
     }
@@ -3666,7 +3612,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_nonblocking_udp_server_socket() {
-        let task = init_platform(None);
+        let task = init_platform();
         blocking_udp_server_socket(&task, false, false, true, "recvfrom");
         blocking_udp_server_socket(&task, false, false, true, "recvmsg");
     }
@@ -3674,7 +3620,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_blocking_udp_server_socket_with_truncation() {
-        let task = init_platform(None);
+        let task = init_platform();
         blocking_udp_server_socket(&task, true, true, false, "recvfrom");
         blocking_udp_server_socket(&task, true, true, false, "recvmsg");
         blocking_udp_server_socket(&task, true, false, false, "recvmsg");
@@ -3683,7 +3629,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_udp_client_socket_without_server() {
-        let task = init_platform(None);
+        let task = init_platform();
         let server_port = find_free_udp_port();
 
         // Client socket and explicit bind
@@ -3734,7 +3680,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_tcp_keepalive_sockopt() {
-        let task = init_platform(None);
+        let task = init_platform();
         let sockfd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
@@ -3768,7 +3714,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_socket_dup_and_close() {
-        let task = init_platform(None);
+        let task = init_platform();
         let socket_fd = task
             .do_socket(
                 litebox_common_linux::AddressFamily::INET,
@@ -3854,7 +3800,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_datagram_socket() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         for _ in 0..10 {
             let server_path = "/unix_stream_socket_server.sock";
@@ -3931,7 +3877,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_socket() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         for _ in 0..10 {
             let addr = "/unix_stream_socket.sock";
@@ -3987,7 +3933,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_socket_refused() {
-        let task = init_platform(None);
+        let task = init_platform();
         let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
         let addr = "/unix_stream_socket_refused.sock";
         let result = task.do_connect(
@@ -4035,7 +3981,7 @@ mod unix_tests {
     }
 
     fn test_multiple_unix_stream_connections(is_nonblocking: bool) {
-        let task = init_platform(None);
+        let task = init_platform();
         let addr = "/unix_multi_stream_socket.sock";
         let server_fd = create_unix_server_socket(
             &task,
@@ -4134,7 +4080,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_socket_on_same_addr() {
-        let task = init_platform(None);
+        let task = init_platform();
         for _ in 0..10 {
             let addr = "/unix_stream_socket_server.sock";
             let server1_fd = create_unix_server_socket(&task, addr, SockFlags::NONBLOCK).unwrap();
@@ -4185,7 +4131,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_datagram_socket_on_same_addr() {
-        let task = init_platform(None);
+        let task = init_platform();
         for _ in 0..10 {
             let addr = "/unix_datagram_socket_server.sock";
             let server_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
@@ -4219,7 +4165,7 @@ mod unix_tests {
     }
 
     fn unix_socketpair_bidirectional(ty: SockType, is_nonblocking: bool) {
-        let task = init_platform(None);
+        let task = init_platform();
         let mut sv_ptr = alloc::vec![0u32; 2];
         let sv_mut_ptr = UserPtrMut::from_usize(sv_ptr.as_mut_ptr() as usize);
 
@@ -4286,7 +4232,7 @@ mod unix_tests {
 
     #[test]
     fn pinned_receive_does_not_follow_dup2_replacement() {
-        let task = init_platform(None);
+        let task = init_platform();
         let (old_sender, old_receiver) = task
             .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
             .unwrap();
@@ -4335,7 +4281,7 @@ mod unix_tests {
     }
 
     fn unix_socket_recv_timeout(ty: SockType) {
-        let task = init_platform(None);
+        let task = init_platform();
         let (sock1, _sock2) = task
             .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
             .expect("socketpair failed");
@@ -4372,7 +4318,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_addr() {
-        let task = init_platform(None);
+        let task = init_platform();
         let server_path = "/unix_stream_sockname.sock";
         let server_fd = create_unix_server_socket(&task, server_path, SockFlags::empty()).unwrap();
 
@@ -4440,7 +4386,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_datagram_addr() {
-        let task = init_platform(None);
+        let task = init_platform();
         let server_path = "/unix_datagram_sockname_server.sock";
         let client_path = "/unix_datagram_sockname_client.sock";
 

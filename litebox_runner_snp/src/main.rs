@@ -300,31 +300,6 @@ pub extern "C" fn do_syscall_64(pt_regs: &mut litebox_common_linux::PtRegs) -> !
     litebox_platform_linux_kernel::host::snp::snp_impl::handle_syscall(pt_regs);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn sandbox_tun_read_write() {
-    // wait until shim is initialized
-    let shim = loop {
-        if let Some(shim) = SHIM.get() {
-            break shim;
-        }
-        core::hint::spin_loop();
-    };
-    #[cfg(debug_assertions)]
-    litebox_util_log::debug!("sandbox_tun_read_write started");
-    while !litebox_platform_linux_kernel::host::snp::snp_impl::all_threads_exited() {
-        let _timeout = loop {
-            match shim
-                .perform_network_interaction() {
-                    litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {},
-                    litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => break timeout,
-                }
-        };
-        // TODO: use timeout to wait on host events
-    }
-
-    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::return_to_host();
-}
-
 /// This function is called on panic.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {

@@ -285,7 +285,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_nine_p_create_and_read_file() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         let server = DiodServer::start();
         let fs = connect_9p(&task, &server);
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_nine_p_host_files_visible() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         let server = DiodServer::start();
 

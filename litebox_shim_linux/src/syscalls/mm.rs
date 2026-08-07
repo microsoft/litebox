@@ -1136,7 +1136,7 @@ mod tests {
 
     #[test]
     fn test_anonymous_mmap() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         let addr = task
             .sys_mmap(
@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     fn test_file_backed_mmap() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         let content = b"Hello, world!";
         let fd = task
@@ -1186,7 +1186,7 @@ mod tests {
 
     #[test]
     fn test_mremap() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         let addr = task
             .sys_mmap(
@@ -1224,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_mmap_fixed_noreplace() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         // First, create an initial mapping at a specific address away from boundaries
         let base_addr = 0x1000_0000usize; // 256 MiB - safe middle ground
@@ -1334,7 +1334,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn test_collision_with_global_allocator() {
-        let task = init_platform(None);
+        let task = init_platform();
         let platform = task.global.platform;
         let mut data = alloc::vec::Vec::new();
         // Find an address that is allocated to the global allocator but not in reserved regions.
@@ -1428,7 +1428,7 @@ mod tests {
 
     #[test]
     fn test_map_shared_anonymous() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         // MAP_SHARED | MAP_ANON with PROT_READ should succeed
         let addr = task
@@ -1463,7 +1463,7 @@ mod tests {
 
     #[test]
     fn test_map_shared_anonymous_writable() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         // MAP_SHARED | MAP_ANON with PROT_WRITE should succeed
         let addr = task
@@ -1486,7 +1486,7 @@ mod tests {
 
     #[test]
     fn test_map_shared_readonly_file() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         let content = b"Hello, shared!";
         let fd = task
@@ -1520,7 +1520,7 @@ mod tests {
 
     #[test]
     fn test_madvise() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         let addr = task
             .sys_mmap(
@@ -1566,7 +1566,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn test_fallible_read() {
-        let _ = init_platform(None);
+        let _ = init_platform();
 
         let ptr = UserPtrMut::<u8>::from_usize(0xdeadbeef);
         let result = ptr.read_at_offset::<Platform>(0);

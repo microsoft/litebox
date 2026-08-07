@@ -7,10 +7,6 @@ use litebox_platform_multiplex::{Platform, set_platform};
 static INIT_FUNC: spin::Once = spin::Once::new();
 
 #[must_use]
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(unused_variables, reason = "ignored parameter on non-linux platforms")
-)]
 pub(crate) fn init_platform() -> crate::Task {
     INIT_FUNC.call_once(|| {
         #[cfg(target_os = "linux")]

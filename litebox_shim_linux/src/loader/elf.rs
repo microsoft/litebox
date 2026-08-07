@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn et_exec_interpreter_loads_top_down_above_low_heap() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
         write_file(&task, "/main", &minimal_elf(ET_EXEC, Some(INTERP_PATH)));
         write_file(&task, "/ld.so", &minimal_elf(ET_DYN, None));
 

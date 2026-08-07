@@ -388,7 +388,6 @@ impl From<litebox::net::errors::ConnectError> for Errno {
         match value {
             litebox::net::errors::ConnectError::InvalidFd => Errno::EBADF,
             litebox::net::errors::ConnectError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
-            litebox::net::errors::ConnectError::PortAllocationFailure(_) => Errno::EADDRINUSE,
             litebox::net::errors::ConnectError::Unaddressable => Errno::ECONNREFUSED,
             litebox::net::errors::ConnectError::InProgress => Errno::EINPROGRESS,
             litebox::net::errors::ConnectError::InvalidState => Errno::ECONNREFUSED,
@@ -482,24 +481,10 @@ impl From<litebox::net::errors::ListenError> for Errno {
             litebox::net::errors::ListenError::InvalidFd => Errno::EBADF,
             litebox::net::errors::ListenError::InvalidAddress => Errno::EINVAL,
             litebox::net::errors::ListenError::InvalidState => Errno::EINVAL,
-            litebox::net::errors::ListenError::NoAvailableFreeEphemeralPorts => Errno::ENOSPC,
             litebox::net::errors::ListenError::UnsupportedOperation => Errno::EOPNOTSUPP,
             litebox::net::errors::ListenError::OperationFailed(error) => error.into(),
 
             _ => unimplemented!(),
-        }
-    }
-}
-
-impl From<litebox::net::local_ports::LocalPortAllocationError> for Errno {
-    fn from(value: litebox::net::local_ports::LocalPortAllocationError) -> Self {
-        match value {
-            litebox::net::local_ports::LocalPortAllocationError::AlreadyInUse(_) => {
-                Errno::EADDRINUSE
-            }
-            litebox::net::local_ports::LocalPortAllocationError::NoAvailableFreePorts => {
-                Errno::EAGAIN
-            }
         }
     }
 }
@@ -512,7 +497,6 @@ impl From<litebox::net::errors::SendError> for Errno {
             litebox::net::errors::SendError::Unaddressable => Errno::EINVAL,
             litebox::net::errors::SendError::BufferFull => Errno::EAGAIN,
             litebox::net::errors::SendError::MessageTooLong => Errno::EMSGSIZE,
-            litebox::net::errors::SendError::PortAllocationFailure(e) => e.into(),
             litebox::net::errors::SendError::UnnecessaryDestinationAddress => Errno::EISCONN,
             litebox::net::errors::SendError::DestinationAddressRequired => Errno::EDESTADDRREQ,
             _ => unimplemented!(),

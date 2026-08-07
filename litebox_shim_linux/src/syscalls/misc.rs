@@ -171,7 +171,7 @@ mod tests {
     fn test_getrandom() {
         use litebox_common_linux::RngFlags;
 
-        let task = init_platform(None);
+        let task = init_platform();
 
         let mut buf = [0u8; 16];
         let ptr = UserPtrMut::from_ptr(buf.as_mut_ptr());
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_uname() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         let mut utsname = litebox_common_linux::Utsname::new_zeroed();
         let ptr = UserPtrMut::from_ptr(&raw mut utsname);

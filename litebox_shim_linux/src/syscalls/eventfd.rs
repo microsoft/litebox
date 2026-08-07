@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn test_eventfd_requires_broker_control() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         assert!(matches!(
             task.global.create_linux_eventfd(0, EfdFlags::NONBLOCK),

@@ -90,7 +90,6 @@ pub trait ShimPlatform:
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
     + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
-    + litebox::platform::IPInterfaceProvider
     + 'static
 {
 }
@@ -109,7 +108,6 @@ impl<T> ShimPlatform for T where
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
-        + litebox::platform::IPInterfaceProvider
         + 'static
 {
 }
@@ -230,8 +228,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
 
     /// Build the shim.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
-        let mut net = Network::new(&self.litebox);
-        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        let net = Network::new(&self.litebox);
         let global = Arc::new(GlobalState {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
@@ -323,15 +320,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// Get the global page manager
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
-    }
-
-    /// Perform queued network interactions with the outside world.
-    ///
-    /// This function should be invoked in a loop, based on the returned advice.
-    pub fn perform_network_interaction(
-        &self,
-    ) -> litebox::net::PlatformInteractionReinvocationAdvice {
-        self.0.net.lock().perform_platform_interaction()
     }
 
     /// Establish a TCP connection to the given address.
