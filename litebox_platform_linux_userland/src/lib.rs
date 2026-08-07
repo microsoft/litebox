@@ -9,7 +9,6 @@
 
 use std::cell::Cell;
 use std::io::IsTerminal as _;
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
@@ -94,7 +93,6 @@ macro_rules! saved_tls {
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
 pub struct LinuxUserland {
-    tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
@@ -122,115 +120,13 @@ struct CowRegionInfo {
     file_length: usize,
 }
 
-const IF_NAMESIZE: usize = 16;
-/// Use TUN device
-const IFF_TUN: i32 = 0x0001;
-/// Do not provide packet information
-const IFF_NO_PI: i32 = 0x1000;
-/// libc `ifreq` structure, used for TUN/TAP devices.
-#[repr(C)]
-struct Ifreq {
-    /// interface name, e.g. "en0"
-    pub ifr_name: [i8; IF_NAMESIZE],
-    pub ifr_ifru: Ifru,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Ifmap {
-    mem_start: usize,
-    mem_end: usize,
-    base_addr: u16,
-    irq: u8,
-    dma: u8,
-    port: u8,
-}
-
-/// libc `ifreq.ifr_ifru` union, used for TUN/TAP devices.
-///
-/// We only need `ifru_flags` for now; `ifru_map` is to ensure the size of the union
-/// matches libc.
-#[repr(C)]
-pub union Ifru {
-    // pub ifru_addr: crate::sockaddr,
-    // pub ifru_dstaddr: crate::sockaddr,
-    // pub ifru_broadaddr: crate::sockaddr,
-    // pub ifru_netmask: crate::sockaddr,
-    // pub ifru_hwaddr: crate::sockaddr,
-    ifru_flags: i16,
-    // pub ifru_ifindex: i32,
-    // pub ifru_metric: i32,
-    // pub ifru_mtu: i32,
-    ifru_map: Ifmap,
-    // pub ifru_slave: [i8; IF_NAMESIZE],
-    // pub ifru_newname: [i8; IF_NAMESIZE],
-    // pub ifru_data: *mut i8,
-}
-
 impl LinuxUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
-    ///
-    /// Takes an optional tun device name (such as `"tun0"` or `"tun99"`) to connect networking (if
-    /// not specified, networking is disabled).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tun device could not be successfully opened.
-    pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+    pub fn new() -> &'static Self {
         register_exception_handlers();
-
-        let tun_socket_fd = tun_device_name
-            .map(|tun_device_name| {
-                let tun_path = b"/dev/net/tun\0";
-                let tun_fd = unsafe {
-                    syscalls::syscall3(
-                        syscalls::Sysno::open,
-                        tun_path.as_ptr() as usize,
-                        (litebox::fs::OFlags::RDWR
-                            | litebox::fs::OFlags::CLOEXEC
-                            | litebox::fs::OFlags::NONBLOCK)
-                            .bits() as usize,
-                        litebox::fs::Mode::empty().bits() as usize,
-                    )
-                }
-                .expect("failed to open tun device");
-
-                let tunsetiff = |fd: usize, ifreq: *const Ifreq| {
-                    let cmd =
-                        litebox_common_linux::iow!(b'T', 202, size_of::<::core::ffi::c_int>());
-                    unsafe {
-                        syscalls::syscall3(syscalls::Sysno::ioctl, fd, cmd as usize, ifreq as usize)
-                    }
-                    .expect("failed to set TUN interface flags");
-                };
-                let ifreq = Ifreq {
-                    ifr_name: {
-                        let mut name = [0i8; 16];
-                        assert!(tun_device_name.len() < 16); // Note: strictly-less-than 16, to ensure it fits
-                        for (i, b) in tun_device_name.char_indices() {
-                            let b = b as u32;
-                            assert!(b < 128);
-                            name[i] = i8::try_from(b).unwrap();
-                        }
-                        name
-                    },
-                    ifr_ifru: Ifru {
-                        // IFF_NO_PI: no tun header
-                        // IFF_TUN: create tun (i.e., IP)
-                        ifru_flags: i16::try_from(IFF_TUN | IFF_NO_PI).unwrap(),
-                    },
-                };
-                tunsetiff(tun_fd, &raw const ifreq);
-
-                // By taking ownership, we are letting the drop handler automatically run `libc::close`
-                // when necessary.
-                unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().trunc()) }
-            })
-            .into();
 
         let reserved_pages = Self::read_maps();
         let platform = Self {
-            tun_socket_fd,
             reserved_pages,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
@@ -393,30 +289,6 @@ impl LinuxUserland {
         }
     }
 
-    /// Wait until there is data available on the TUN device.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the TUN device is not initialized.
-    pub fn wait_on_tun(&self, timeout: Option<Duration>) {
-        let tun_fd = self.tun_socket_fd.read().unwrap();
-        let mut pfd = libc::pollfd {
-            fd: tun_fd.as_ref().unwrap().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let _ = unsafe {
-            libc::poll(
-                &raw mut pfd,
-                1,
-                timeout.map_or(-1, |t| {
-                    let ms = t.as_millis();
-                    i32::try_from(ms).unwrap_or(i32::MAX)
-                }),
-            )
-        };
-    }
-
     #[cfg(target_arch = "x86_64")]
     #[allow(
         clippy::missing_panics_doc,
@@ -435,7 +307,7 @@ impl LinuxUserland {
         };
 
         let mut rules = vec![
-            // TUN and terminal
+            // Terminal and broker I/O
             (libc::SYS_read, vec![]),
             (libc::SYS_write, vec![]),
             (libc::SYS_poll, vec![]),
@@ -1261,58 +1133,6 @@ impl litebox::platform::RawMutex for RawMutex {
         timeout: Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         self.block_or_maybe_timeout(val, Some(timeout))
-    }
-}
-
-impl litebox::platform::IPInterfaceProvider for LinuxUserland {
-    fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        let tun_fd = self.tun_socket_fd.read().unwrap();
-        let Some(tun_socket_fd) = tun_fd.as_ref() else {
-            unimplemented!("networking without tun is unimplemented")
-        };
-        match unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::write,
-                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
-                packet.as_ptr() as usize,
-                packet.len(),
-            )
-        } {
-            Ok(n) => {
-                if n != packet.len() {
-                    unimplemented!("unexpected size {n}")
-                }
-                Ok(())
-            }
-            Err(errno) => {
-                unimplemented!("unexpected error {errno}")
-            }
-        }
-    }
-
-    fn receive_ip_packet(
-        &self,
-        packet: &mut [u8],
-    ) -> Result<usize, litebox::platform::ReceiveError> {
-        let tun_fd = self.tun_socket_fd.read().unwrap();
-        let Some(tun_socket_fd) = tun_fd.as_ref() else {
-            unimplemented!("networking without tun is unimplemented")
-        };
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::read,
-                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
-                packet.as_mut_ptr() as usize,
-                packet.len(),
-            )
-        }
-        .map_err(|errno| match errno {
-            #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
-            syscalls::Errno::EWOULDBLOCK | syscalls::Errno::EAGAIN => {
-                litebox::platform::ReceiveError::WouldBlock
-            }
-            _ => unimplemented!("unexpected error {errno}"),
-        })
     }
 }
 
@@ -2541,7 +2361,7 @@ mod tests {
 
     #[test]
     fn test_reserved_pages() {
-        let platform = LinuxUserland::new(None);
+        let platform = LinuxUserland::new();
         let reserved_pages: Vec<_> =
             <LinuxUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
 
@@ -2565,7 +2385,7 @@ mod tests {
             unsafe { OwnedFd::from_raw_fd(fd) }
         }
 
-        let _platform: &LinuxUserland = LinuxUserland::new(None);
+        let _platform: &LinuxUserland = LinuxUserland::new();
         let allowed = test_memfd(c"seccomp-allowed-positional-io");
         let denied = test_memfd(c"seccomp-denied-positional-io");
         let (allowed_shutdown, _allowed_peer) = UnixStream::pair().unwrap();

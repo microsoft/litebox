@@ -10,10 +10,9 @@ use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelIn
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
-    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
-    ImmediatelyWokenUp, PageManagementProvider, RawMutex as _, RawMutexProvider,
-    RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
-    page_mgmt::DeallocationError,
+    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, ImmediatelyWokenUp,
+    PageManagementProvider, RawMutex as _, RawMutexProvider, RawPointerProvider, StdioProvider,
+    TimeProvider, UnblockedOrTimedOut, page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -881,34 +880,6 @@ impl litebox::platform::SystemTime for SystemTime {
     }
 }
 
-impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
-    fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        match Host::send_ip_packet(packet) {
-            Ok(n) => {
-                if n != packet.len() {
-                    unimplemented!()
-                }
-                Ok(())
-            }
-            Err(e) => {
-                unimplemented!("Error: {:?}", e)
-            }
-        }
-    }
-
-    fn receive_ip_packet(
-        &self,
-        packet: &mut [u8],
-    ) -> Result<usize, litebox::platform::ReceiveError> {
-        match Host::receive_ip_packet(packet) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                unimplemented!("Error: {:?}", e)
-            }
-        }
-    }
-}
-
 /// Platform-Host Interface
 pub trait HostInterface: 'static {
     /// Page allocation from host.
@@ -953,11 +924,6 @@ pub trait HostInterface: 'static {
         val: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<(), Errno>;
-
-    /// For Network
-    fn send_ip_packet(packet: &[u8]) -> Result<usize, Errno>;
-
-    fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, Errno>;
 
     /// For Debugging
     fn log(msg: &str);

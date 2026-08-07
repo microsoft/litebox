@@ -432,26 +432,6 @@ impl HostSnpInterface {
 }
 
 impl HostInterface for HostSnpInterface {
-    fn send_ip_packet(packet: &[u8]) -> Result<usize, Errno> {
-        let mut req = bindings::SnpVmplRequestArgs::new_request(
-            bindings::SNP_VMPL_TUN_WRITE_REQ,
-            3,
-            [packet.as_ptr() as u64, packet.len() as u64, 0, 0, 0, 0],
-        );
-        Self::request(&mut req);
-        Self::parse_result(req.ret)
-    }
-
-    fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, Errno> {
-        let mut req = bindings::SnpVmplRequestArgs::new_request(
-            bindings::SNP_VMPL_TUN_READ_REQ,
-            3,
-            [packet.as_ptr() as u64, packet.len() as u64, 0, 0, 0, 0],
-        );
-        Self::request(&mut req);
-        Self::parse_result(req.ret)
-    }
-
     fn log(msg: &str) {
         ghcb_prints(msg);
     }

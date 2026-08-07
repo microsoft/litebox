@@ -263,14 +263,6 @@ pub struct HostLvbsInterface;
 impl HostLvbsInterface {}
 
 impl HostInterface for HostLvbsInterface {
-    fn send_ip_packet(_packet: &[u8]) -> Result<usize, Errno> {
-        unimplemented!()
-    }
-
-    fn receive_ip_packet(_packet: &mut [u8]) -> Result<usize, Errno> {
-        unimplemented!()
-    }
-
     fn log(msg: &str) {
         serial_print_string(msg);
     }

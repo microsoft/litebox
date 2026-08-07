@@ -27,7 +27,7 @@ pub use page_mgmt::PageManagementProvider;
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider + IPInterfaceProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
+    RawMutexProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
 {
 }
 
@@ -230,36 +230,6 @@ pub enum UnblockedOrTimedOut {
     Unblocked,
     /// Sufficient time elapsed without a wake call
     TimedOut,
-}
-
-/// An IP packet interface to the outside world.
-///
-/// This could be implemented via a `read`/`write` to a TUN device.
-pub trait IPInterfaceProvider {
-    /// Send the IP packet.
-    ///
-    /// Returns `Ok(())` when entire packet is sent, or a [`SendError`] if it is unable to send the
-    /// entire packet.
-    fn send_ip_packet(&self, packet: &[u8]) -> Result<(), SendError>;
-
-    /// Receive an IP packet into `packet`.
-    ///
-    /// Returns size of packet received, or a [`ReceiveError`] if unable to receive an entire
-    /// packet.
-    fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
-}
-
-/// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
-#[derive(Error, Debug)]
-#[non_exhaustive]
-pub enum SendError {}
-
-/// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::receive_ip_packet`].
-#[derive(Error, Debug)]
-#[non_exhaustive]
-pub enum ReceiveError {
-    #[error("Receive operation would block")]
-    WouldBlock,
 }
 
 /// An interface to understanding time.

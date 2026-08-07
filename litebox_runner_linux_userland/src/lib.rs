@@ -60,13 +60,6 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub rewrite_syscalls: bool,
-    /// Connect to a TUN device with this name
-    #[arg(
-        long = "tun-device-name",
-        requires = "unstable",
-        help_heading = "Unstable Options"
-    )]
-    pub tun_device_name: Option<String>,
     /// Load the program binary from the tar file instead of from the host filesystem.
     ///
     /// When set, the program path refers to a path inside the tar filesystem.
@@ -211,7 +204,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
-    let platform = Platform::new(cli_args.tun_device_name.as_deref());
+    let platform = Platform::new();
 
     for file in cow_eligible_regions {
         platform.register_cow_region(file.data, file.abs_path);

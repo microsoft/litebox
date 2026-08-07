@@ -79,7 +79,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
-    let platform = Platform::new(None);
+    let platform = Platform::new();
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
     let _litebox = shim_builder.litebox();

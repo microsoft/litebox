@@ -26,14 +26,12 @@ use super::*;
 ///
 /// - Full determinism
 ///   + time moves at one millisecond per "now" call
-///   + IP packets are placed into a deterministic ring buffer and spin back around
 /// - Debuging output goes to stderr
 /// - Can pre-fill stdin and check stdout easily between invocations (see [`Self::stdin_queue`],
 ///   [`Self::stdout_queue`], and [`Self::stderr_queue`])
 /// - It will not mock you for using it during tests
 pub(crate) struct MockPlatform {
     current_time: AtomicU64,
-    ip_packets: RwLock<VecDeque<Vec<u8>>>,
     random: Mutex<crate::utils::rng::FastRng>,
     pub(crate) stdin_queue: RwLock<VecDeque<Vec<u8>>>,
     pub(crate) stdout_queue: RwLock<VecDeque<Vec<u8>>>,
@@ -46,7 +44,6 @@ impl MockPlatform {
         //  order to give ourselves a statically lived platform easily.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(MockPlatform {
             current_time: AtomicU64::new(0),
-            ip_packets: RwLock::new(VecDeque::new()),
             random: Mutex::new(crate::utils::rng::FastRng::new_from_seed(
                 core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
             )),
@@ -187,25 +184,6 @@ impl RawMutex for MockRawMutex {
 
 impl RawMutexProvider for MockPlatform {
     type RawMutex = MockRawMutex;
-}
-
-impl IPInterfaceProvider for MockPlatform {
-    fn send_ip_packet(&self, packet: &[u8]) -> Result<(), SendError> {
-        self.ip_packets.write().unwrap().push_back(packet.into());
-        Ok(())
-    }
-
-    fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError> {
-        if self.ip_packets.read().unwrap().is_empty() {
-            Err(ReceiveError::WouldBlock)
-        } else {
-            let mut ipp = self.ip_packets.write().unwrap();
-            let v = ipp.pop_front().unwrap();
-            assert!(v.len() <= packet.len());
-            packet[..v.len()].copy_from_slice(&v);
-            Ok(v.len())
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

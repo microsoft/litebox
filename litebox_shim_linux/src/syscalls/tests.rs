@@ -27,7 +27,7 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
     PLATFORM.get_or_init(|| {
         #[cfg(target_os = "linux")]
         {
-            TestPlatform::new(None)
+            TestPlatform::new()
         }
         #[cfg(target_os = "windows")]
         {

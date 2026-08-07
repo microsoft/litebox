@@ -1375,25 +1375,6 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 }
 
-impl litebox::platform::IPInterfaceProvider for WindowsUserland {
-    fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        unimplemented!(
-            "send_ip_packet is not implemented for Windows yet. packet length: {}",
-            packet.len()
-        );
-    }
-
-    fn receive_ip_packet(
-        &self,
-        packet: &mut [u8],
-    ) -> Result<usize, litebox::platform::ReceiveError> {
-        unimplemented!(
-            "receive_ip_packet is not implemented for Windows yet. packet length: {}",
-            packet.len()
-        );
-    }
-}
-
 impl litebox::platform::TimeProvider for WindowsUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;

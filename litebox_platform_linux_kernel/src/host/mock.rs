@@ -58,14 +58,6 @@ impl HostInterface for MockHostInterface {
         todo!()
     }
 
-    fn send_ip_packet(_packet: &[u8]) -> Result<usize, crate::Errno> {
-        todo!()
-    }
-
-    fn receive_ip_packet(_packet: &mut [u8]) -> Result<usize, crate::Errno> {
-        todo!()
-    }
-
     fn log(msg: &str) {
         let _ = unsafe {
             syscalls::syscall3(

@@ -16,12 +16,8 @@ struct TestLauncher {
 }
 
 impl TestLauncher {
-    fn init_platform(
-        tar_data: &'static [u8],
-        initial_files: &[&str],
-        tun_device_name: Option<&str>,
-    ) -> Self {
-        let platform = Platform::new(tun_device_name);
+    fn init_platform(tar_data: &'static [u8], initial_files: &[&str]) -> Self {
+        let platform = Platform::new();
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
         let litebox = shim_builder.litebox();
 
@@ -129,7 +125,6 @@ fn test_load_exec_dynamic() {
             .iter()
             .map(std::string::String::as_str)
             .collect::<Vec<_>>(),
-        None,
     );
     launcher.install_file(executable_data, executable_path);
     launcher.test_load_exec_common(executable_path);
@@ -143,7 +138,7 @@ fn test_load_exec_static() {
     let executable_path = "/hello_exec";
     let executable_data = std::fs::read(path).unwrap();
 
-    let mut launcher = TestLauncher::init_platform(&[], &[], None);
+    let mut launcher = TestLauncher::init_platform(&[], &[]);
 
     launcher.install_file(executable_data, executable_path);
 
@@ -256,7 +251,7 @@ fn test_syscall_rewriter() {
     let executable_path = "/hello_exec_nolibc.hooked";
     let executable_data = std::fs::read(hooked_path).unwrap();
 
-    let mut launcher = TestLauncher::init_platform(&[], &[], None);
+    let mut launcher = TestLauncher::init_platform(&[], &[]);
     launcher.install_file(executable_data, executable_path);
     launcher.test_load_exec_common(executable_path);
 }

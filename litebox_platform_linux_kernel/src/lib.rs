@@ -13,9 +13,8 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
-    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
-    ImmediatelyWokenUp, PageManagementProvider, Provider, RawMutexProvider, TimeProvider,
-    UnblockedOrTimedOut,
+    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, ImmediatelyWokenUp,
+    PageManagementProvider, Provider, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox_common_linux::errno::Errno;
 
@@ -285,47 +284,6 @@ impl litebox::platform::SystemTime for SystemTime {
     }
 }
 
-impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
-    fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        match Host::send_ip_packet(packet) {
-            Ok(n) => {
-                if n != packet.len() {
-                    unimplemented!()
-                }
-                Ok(())
-            }
-            Err(e) => {
-                // Avoid allocation for error message
-                crate::print_str_and_int!(
-                    "Error sending IP packet: ",
-                    u64::from(e.as_neg().unsigned_abs()),
-                    16
-                );
-                unimplemented!()
-            }
-        }
-    }
-
-    fn receive_ip_packet(
-        &self,
-        packet: &mut [u8],
-    ) -> Result<usize, litebox::platform::ReceiveError> {
-        match Host::receive_ip_packet(packet) {
-            Ok(n) => Ok(n),
-            Err(Errno::EAGAIN) => Err(litebox::platform::ReceiveError::WouldBlock),
-            Err(e) => {
-                // Avoid allocation for error message
-                crate::print_str_and_int!(
-                    "Error receiving IP packet: ",
-                    u64::from(e.as_neg().unsigned_abs()),
-                    16
-                );
-                unimplemented!()
-            }
-        }
-    }
-}
-
 impl<Host: HostInterface> litebox::platform::StdioProvider for LinuxKernel<Host> {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
         Host::read_from_stdin(buf).map_err(|err| match err {
@@ -384,11 +342,6 @@ pub trait HostInterface: 'static {
 
     /// Terminate the current process.
     fn terminate_process(code: i32) -> !;
-
-    /// For Network
-    fn send_ip_packet(packet: &[u8]) -> Result<usize, Errno>;
-
-    fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, Errno>;
 
     // For Stdio
     fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno>;
