@@ -2019,6 +2019,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 new_protect,
                 old_protect,
             ),
+            SyscallRequest::NtReadVirtualMemory {
+                process_handle,
+                base_address,
+                buffer,
+                number_of_bytes_to_read,
+                number_of_bytes_read,
+            } => Self::sys_nt_read_virtual_memory(
+                process_handle,
+                base_address,
+                buffer,
+                number_of_bytes_to_read,
+                number_of_bytes_read,
+            ),
             SyscallRequest::NtQueryVirtualMemory {
                 process_handle,
                 base_address,

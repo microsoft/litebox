@@ -653,6 +653,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
+    pub(crate) fn sys_nt_read_virtual_memory(
+        process_handle: ProcessHandle,
+        base_address: ConstPtr<Platform, u8>,
+        buffer: MutPtr<Platform, u8>,
+        number_of_bytes_to_read: usize,
+        number_of_bytes_read: Option<MutPtr<Platform, usize>>,
+    ) -> NtStatus {
+        if !process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+        if number_of_bytes_to_read != 0
+            && (base_address.as_usize() == 0
+                || buffer.as_usize() == 0
+                || base_address
+                    .as_usize()
+                    .checked_add(number_of_bytes_to_read)
+                    .is_none()
+                || buffer
+                    .as_usize()
+                    .checked_add(number_of_bytes_to_read)
+                    .is_none())
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        let Some(bytes) = base_address.to_owned_slice(number_of_bytes_to_read) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if buffer.copy_from_slice(0, &bytes).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if number_of_bytes_read.is_some_and(|bytes_read| {
+            bytes_read
+                .write_at_offset(0, number_of_bytes_to_read)
+                .is_none()
+        }) {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        NtStatus::SUCCESS
+    }
+
     pub(crate) fn sys_nt_query_virtual_memory(
         &self,
         process_handle: ProcessHandle,
@@ -1560,7 +1602,9 @@ fn private_page_state_and_protect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{mut_byte_ptr, mut_ptr, run_with_test_platform_pointers};
+    use crate::tests::{
+        mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr, run_with_test_platform_pointers,
+    };
 
     extern crate std;
 
@@ -1614,6 +1658,100 @@ mod tests {
         );
         assert_eq!(return_length, size_of::<MemoryBasicInformation>());
         info
+    }
+
+    #[test]
+    fn read_virtual_memory_copies_current_process_bytes() {
+        run_with_test_platform_pointers(|| {
+            let source = [0x12u8, 0x34, 0x56, 0x78];
+            let mut destination = [0u8; 4];
+            let mut bytes_read = usize::MAX;
+
+            assert_eq!(
+                TestTask::sys_nt_read_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    ConstPtr::<TestPlatform, u8>::from_usize(source.as_ptr() as usize),
+                    mut_byte_ptr(&mut destination),
+                    source.len(),
+                    Some(mut_ptr(&mut bytes_read)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(destination, source);
+            assert_eq!(bytes_read, source.len());
+        });
+    }
+
+    #[test]
+    fn read_virtual_memory_validates_handle_and_buffers() {
+        run_with_test_platform_pointers(|| {
+            let source = 0x5au8;
+            let mut destination = 0u8;
+            let mut bytes_read = usize::MAX;
+
+            assert_eq!(
+                TestTask::sys_nt_read_virtual_memory(
+                    ProcessHandle::from_raw(0x1234),
+                    ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(&source) as usize,),
+                    mut_byte_ptr(&mut destination),
+                    1,
+                    Some(mut_ptr(&mut bytes_read)),
+                ),
+                NtStatus::INVALID_HANDLE
+            );
+            assert_eq!(destination, 0);
+            assert_eq!(bytes_read, usize::MAX);
+
+            assert_eq!(
+                TestTask::sys_nt_read_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    null_const_ptr(),
+                    mut_byte_ptr(&mut destination),
+                    1,
+                    Some(mut_ptr(&mut bytes_read)),
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+            assert_eq!(
+                TestTask::sys_nt_read_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(&source) as usize,),
+                    null_mut_ptr(),
+                    1,
+                    Some(mut_ptr(&mut bytes_read)),
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+        });
+    }
+
+    #[test]
+    fn read_virtual_memory_allows_zero_length_and_optional_count() {
+        run_with_test_platform_pointers(|| {
+            let mut bytes_read = usize::MAX;
+
+            assert_eq!(
+                TestTask::sys_nt_read_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    null_const_ptr(),
+                    null_mut_ptr(),
+                    0,
+                    Some(mut_ptr(&mut bytes_read)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(bytes_read, 0);
+            assert_eq!(
+                TestTask::sys_nt_read_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    null_const_ptr(),
+                    null_mut_ptr(),
+                    0,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+        });
     }
 
     #[test]
