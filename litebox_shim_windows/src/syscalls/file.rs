@@ -67,18 +67,33 @@ bitflags::bitflags! {
     }
 }
 
-#[repr(usize)]
-#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileCreateInformation {
     /// An existing file was deleted and a new file was created in its place.
-    Superseded = 0,
+    Superseded,
     /// An existing file was opened.
-    Opened = 1,
-    Created = 2,
+    Opened,
+    Created,
     /// An existing file was overwritten.
-    Overwritten = 3,
-    Exists = 4,
-    DoesNotExist = 5,
+    Overwritten,
+    Exists,
+    DoesNotExist,
+    /// A value whose semantics are not described by the standard FILE_* results.
+    Raw(usize),
+}
+
+impl From<FileCreateInformation> for usize {
+    fn from(information: FileCreateInformation) -> Self {
+        match information {
+            FileCreateInformation::Superseded => 0,
+            FileCreateInformation::Opened => 1,
+            FileCreateInformation::Created => 2,
+            FileCreateInformation::Overwritten => 3,
+            FileCreateInformation::Exists => 4,
+            FileCreateInformation::DoesNotExist => 5,
+            FileCreateInformation::Raw(information) => information,
+        }
+    }
 }
 
 // TODO: NtSetVolumeInformationFile and sibling query classes
@@ -1538,11 +1553,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 CondrvStreamDirection::Input => FileAccess::READ_DATA,
                 CondrvStreamDirection::Output => FileAccess::WRITE_DATA,
             };
+            // Native ConDrv applies FILE_CREATE to the logical stream, not its transport.
             let backing_disposition = match create_disposition {
                 CreateDisposition::Create => CreateDisposition::Open,
                 disposition => disposition,
             };
-            let (fd, _, information) = self.open_backing_fd(
+            let (fd, _, _) = self.open_backing_fd(
                 &path,
                 backing_access,
                 backing_disposition,
@@ -1555,7 +1571,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     stream_object,
                     fd,
                 },
-                information,
+                // TODO(condrv-create-information): Determine the meaning of native ConDrv's
+                // opaque IoStatusBlock.Information values and model them if guests require them.
+                FileCreateInformation::Raw(0),
             )
         } else {
             self.check_file_sharing(
@@ -1770,8 +1788,10 @@ fn write_file_result<Platform: RawPointerProvider>(
             NtStatus::SUCCESS
         }
         Err(status) => {
-            let _ = io_status_block
-                .write_at_offset(0, IoStatusBlock::new(status, failure_information(status)));
+            let _ = io_status_block.write_at_offset(
+                0,
+                IoStatusBlock::new(status, failure_information(status).into()),
+            );
             status
         }
     }
@@ -1789,13 +1809,13 @@ fn write_file_success<Platform: RawPointerProvider>(
     file_handle.write_at_offset(0, handle)
 }
 
-fn failure_information(status: NtStatus) -> usize {
+fn failure_information(status: NtStatus) -> FileCreateInformation {
     match status {
-        NtStatus::OBJECT_NAME_COLLISION => FileCreateInformation::Exists.into(),
+        NtStatus::OBJECT_NAME_COLLISION => FileCreateInformation::Exists,
         NtStatus::OBJECT_NAME_NOT_FOUND | NtStatus::OBJECT_PATH_NOT_FOUND => {
-            FileCreateInformation::DoesNotExist.into()
+            FileCreateInformation::DoesNotExist
         }
-        _ => 0,
+        _ => FileCreateInformation::Raw(0),
     }
 }
 
@@ -2511,7 +2531,7 @@ mod tests {
                 0,
             )
             .expect("ConDrv stream creation must open its existing host backing");
-        assert_eq!(created_information, FileCreateInformation::Opened);
+        assert_eq!(created_information, FileCreateInformation::Raw(0));
         assert_eq!(
             task.file_entry(created_handle)
                 .unwrap()
@@ -3537,7 +3557,11 @@ mod tests {
             NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
         }
 
-        fn host_create_file(root: Handle, name: &str) -> (NtStatus, *mut c_void) {
+        fn host_create_file(
+            root: Handle,
+            name: &str,
+            create_disposition: u32,
+        ) -> (NtStatus, *mut c_void, IoStatusBlock) {
             let path = utf16(name);
             let name = unicode_string(&path);
             let mut attributes = host_object_attributes(&name);
@@ -3554,13 +3578,13 @@ mod tests {
                     core::ptr::null(),
                     0,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    FILE_OPEN,
+                    create_disposition,
                     FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
                     core::ptr::null(),
                     0,
                 )
             };
-            (host_status(status), handle)
+            (host_status(status), handle, io_status)
         }
 
         #[test]
@@ -3613,7 +3637,7 @@ mod tests {
                 (r"\Connect", invalid_handle.as_slice()),
                 (r"\Bogus", not_found.as_slice()),
             ] {
-                let (status, handle) = host_create_file(console_handle, name);
+                let (status, handle, _) = host_create_file(console_handle, name, FILE_OPEN);
                 assert!(
                     expected.contains(&status),
                     "{name:?} under console handle {:#x}: expected one of {expected:?}, got {status:?}",
