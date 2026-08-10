@@ -10,21 +10,22 @@ extern crate alloc;
 
 use litebox::fs::Mode;
 use litebox::fs::OFlags;
-use litebox::platform::{RawConstPointer, RawMutPointer};
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo, InitThread};
 
 use crate::context::{
     ExecutionContext, GuestAction, GuestApi, GuestRequest, PlatformResponse, Syscall,
-    SyscallResult, ThreadEntryPoint, UserConstPtr, UserMutPtr,
+    SyscallResult, ThreadEntryPoint,
 };
 use crate::kernel::HarnessKernel;
 use crate::platform::HarnessPlatform;
+use crate::process_memory::ProcessPointer;
 
 pub struct HarnessShim {
     platform: Arc<HarnessPlatform>,
     kernel: Arc<HarnessKernel>,
 
     read_scratch: RefCell<Vec<u8>>,
+    process_memory: Arc<crate::process_memory::ProcessMemory>,
 }
 
 impl EnterShim for HarnessShim {
@@ -41,6 +42,7 @@ impl EnterShim for HarnessShim {
             Arc::clone(&self.platform),
             self as &dyn EnterShim<ExecutionContext = ExecutionContext>,
             Arc::clone(&self.kernel),
+            Arc::clone(&self.process_memory),
         );
         body(&api);
 
@@ -89,13 +91,13 @@ impl HarnessShim {
     fn do_openat(
         &self,
         _dirfd: i32,
-        pathname: UserConstPtr<i8>,
+        pathname: ProcessPointer<i8>,
         flags: OFlags,
         mode: Mode,
     ) -> Result<i32, litebox::fs::errors::OpenError> {
-        let c_path = pathname
-            .get()
-            .to_cstring()
+        let c_path = self
+            .process_memory
+            .read_c_string(&self.platform, pathname)
             .expect("HarnessShim::do_openat: invalid pathname pointer");
         let path = c_path
             .to_str()
@@ -107,7 +109,7 @@ impl HarnessShim {
     fn do_read(
         &self,
         fd: i32,
-        buf: UserMutPtr<u8>,
+        buf: ProcessPointer<u8>,
         count: usize,
     ) -> Result<usize, litebox::fs::errors::ReadError> {
         let mut scratch = self.read_scratch.borrow_mut();
@@ -116,8 +118,8 @@ impl HarnessShim {
         }
         let n = self.kernel.read(fd, &mut scratch[..count])?;
         if n > 0 {
-            buf.get()
-                .copy_from_slice(0, &scratch[..n])
+            self.process_memory
+                .write(&self.platform, buf, &scratch[..n])
                 .expect("HarnessShim::do_read: invalid buffer pointer");
         }
         Ok(n)
@@ -126,12 +128,12 @@ impl HarnessShim {
     fn do_write(
         &self,
         fd: i32,
-        buf: UserConstPtr<u8>,
+        buf: ProcessPointer<u8>,
         count: usize,
     ) -> Result<usize, litebox::fs::errors::WriteError> {
-        let bytes = buf
-            .get()
-            .to_owned_slice(count)
+        let bytes = self
+            .process_memory
+            .read(&self.platform, buf, count)
             .expect("HarnessShim::do_write: invalid buffer pointer");
         self.kernel.write(fd, &bytes)
     }
@@ -140,6 +142,7 @@ impl HarnessShim {
 pub struct HarnessInitThread {
     pub(crate) platform: Arc<HarnessPlatform>,
     pub(crate) kernel: Arc<HarnessKernel>,
+    pub(crate) process_memory: Arc<crate::process_memory::ProcessMemory>,
 }
 
 impl InitThread for HarnessInitThread {
@@ -150,6 +153,7 @@ impl InitThread for HarnessInitThread {
             platform: self.platform,
             kernel: self.kernel,
             read_scratch: RefCell::new(Vec::new()),
+            process_memory: self.process_memory,
         })
     }
 }

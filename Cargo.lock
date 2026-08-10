@@ -1592,6 +1592,7 @@ name = "litebox_e2e_harness"
 version = "0.1.0"
 dependencies = [
  "litebox",
+ "true-tales",
  "zerocopy",
 ]
 

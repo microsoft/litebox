@@ -15,6 +15,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 
 extern crate alloc;
 
+use litebox::foreign_memory::domains::ForeignMemoryRuntime;
 use litebox::platform::{
     ImmediatelyWokenUp, RawMutex, RawMutexProvider, RawPointerProvider, ThreadProvider,
     UnblockedOrTimedOut,
@@ -63,6 +64,7 @@ pub struct HarnessPlatform {
     /// raw-pointer lifetime extension. Always [`OnceLock::get`]-able after
     /// [`Self::new_arc`] returns.
     weak_self: OnceLock<Weak<HarnessPlatform>>,
+    foreign_memory: Option<ForeignMemoryRuntime>,
 }
 
 impl HarnessPlatform {
@@ -71,11 +73,19 @@ impl HarnessPlatform {
         let arc = Arc::new(Self {
             spawned: Mutex::new(Vec::new()),
             weak_self: OnceLock::new(),
+            foreign_memory: Some(ForeignMemoryRuntime::new()),
         });
         arc.weak_self
             .set(Arc::downgrade(&arc))
             .expect("weak_self was already set");
         arc
+    }
+
+    pub(crate) fn foreign_memory(&self) -> ForeignMemoryRuntime {
+        self.foreign_memory
+            .as_ref()
+            .expect("foreign-memory runtime was already shut down")
+            .clone()
     }
 
     /// Recover an `Arc<Self>` from `&self`, using the weak back-pointer
@@ -108,6 +118,14 @@ impl HarnessPlatform {
 
     fn register_join_handle(&self, handle: std::thread::JoinHandle<()>) {
         self.spawned.lock().unwrap().push(handle);
+    }
+}
+
+impl Drop for HarnessPlatform {
+    fn drop(&mut self) {
+        self.foreign_memory
+            .take()
+            .expect("foreign-memory runtime was already shut down");
     }
 }
 
@@ -186,6 +204,24 @@ impl RawMutexProvider for HarnessPlatform {
 impl RawPointerProvider for HarnessPlatform {
     type RawConstPointer<T: zerocopy::FromBytes> = TransparentConstPtr<T>;
     type RawMutPointer<T: zerocopy::FromBytes + zerocopy::IntoBytes> = TransparentMutPtr<T>;
+}
+
+std::thread_local! {
+    static HARDWARE_THREAD: RefCell<
+        true_tales::amd64::Amd64Thread<true_tales::rmem::rmem_stack::RmemNil>
+    > = RefCell::new(true_tales::amd64::Amd64Thread::new());
+}
+
+impl litebox::foreign_memory::thread::HardwareThreadProvider for HarnessPlatform {
+    type HardwareThread = true_tales::amd64::Amd64Thread<true_tales::rmem::rmem_stack::RmemNil>;
+
+    fn with_thread<C, R>(
+        &self,
+        context: C,
+        operation: impl FnOnce(C, &mut Self::HardwareThread) -> R,
+    ) -> R {
+        HARDWARE_THREAD.with(|thread| operation(context, &mut thread.borrow_mut()))
+    }
 }
 
 /// A thread handle returned by [`HarnessPlatform::current_thread`].

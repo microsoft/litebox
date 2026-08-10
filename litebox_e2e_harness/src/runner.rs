@@ -1,10 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! An end-to-end harness runner, wiring up [`shim`] and [`platform`] into a
-//! LiteBox environment that runs entirely within the Rust Abstract Machine and
-//! can be used for Miri tests.
-
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
@@ -16,6 +12,7 @@ use litebox::LiteBox;
 use crate::context::{ExecutionContext, GuestApi};
 use crate::kernel::HarnessKernel;
 use crate::platform::{HarnessPlatform, spawn_guest_thread};
+use crate::process_memory::ProcessMemory;
 use crate::shim::HarnessInitThread;
 
 pub struct HarnessRunner {
@@ -24,21 +21,28 @@ pub struct HarnessRunner {
     litebox: ManuallyDrop<LiteBox<HarnessPlatform>>,
 
     kernel: ManuallyDrop<Arc<HarnessKernel>>,
+    process_memory: ManuallyDrop<Arc<ProcessMemory>>,
 }
 
 impl HarnessRunner {
     pub fn new() -> Self {
+        Self::with_process_memory(Vec::new())
+    }
+
+    pub fn with_process_memory(backing: Vec<u8>) -> Self {
         let platform = HarnessPlatform::new_arc();
 
         let platform_static: &'static HarnessPlatform = unsafe { &*Arc::as_ptr(&platform) };
 
         let litebox = LiteBox::new(platform_static);
         let kernel = HarnessKernel::new(&litebox);
+        let process_memory = ProcessMemory::new(platform.foreign_memory(), backing);
 
         Self {
             platform: ManuallyDrop::new(platform),
             litebox: ManuallyDrop::new(litebox),
             kernel: ManuallyDrop::new(kernel),
+            process_memory: ManuallyDrop::new(process_memory),
         }
     }
 
@@ -58,6 +62,7 @@ impl HarnessRunner {
         let init_thread = Box::new(HarnessInitThread {
             platform: Arc::clone(&self.platform),
             kernel: Arc::clone(&self.kernel),
+            process_memory: Arc::clone(&self.process_memory),
         });
         spawn_guest_thread(Arc::clone(&self.platform), init_thread, ctx);
         self.platform.join_all_spawned();
@@ -82,6 +87,12 @@ impl Drop for HarnessRunner {
             "HarnessRunner shutdown: extra strong references to HarnessKernel survived; \
              a guest thread or GuestApi was leaked past shutdown."
         );
+
+        let process_memory = unsafe { ManuallyDrop::take(&mut self.process_memory) };
+        let Some(process_memory) = Arc::into_inner(process_memory) else {
+            panic!("HarnessRunner shutdown: extra strong references to ProcessMemory survived");
+        };
+        drop(process_memory);
 
         let platform = unsafe { ManuallyDrop::take(&mut self.platform) };
 

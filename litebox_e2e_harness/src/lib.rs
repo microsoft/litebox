@@ -18,10 +18,12 @@
 pub mod context;
 pub mod kernel;
 pub mod platform;
+pub mod process_memory;
 pub mod runner;
 pub mod shim;
 
 pub use context::{ExecutionContext, GuestAction, GuestApi};
 pub use platform::HarnessPlatform;
+pub use process_memory::ProcessPointer;
 pub use runner::HarnessRunner;
 pub use shim::{HarnessInitThread, HarnessShim};
