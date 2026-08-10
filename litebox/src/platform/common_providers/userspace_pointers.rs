@@ -55,6 +55,7 @@ pub trait ValidateAccess {
     /// userspace address but will deterministically cause a fault on
     /// access.
     fn validate<T>(ptr: *mut T) -> Option<*mut T>;
+
     /// Validate that the given slice pointer is a valid userspace pointer.
     ///
     /// Returns as in `validate`. Note that only the starting pointer is
