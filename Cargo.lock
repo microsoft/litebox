@@ -1564,6 +1564,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_e2e_harness"
+version = "0.1.0"
+dependencies = [
+ "litebox",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_packager"
 version = "0.1.0"
 dependencies = [
