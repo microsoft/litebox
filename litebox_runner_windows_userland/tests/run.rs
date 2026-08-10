@@ -236,10 +236,7 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
 ///
 /// This drives the frontier forward while asserting the deliverable: staging
 /// must reach transitive depth the old hardcoded list missed (`cryptbase.dll`),
-/// and the closure walk plus run must complete without panicking. The guest
-/// reaching a not-yet-implemented syscall or runtime limit is expected while
-/// the CRT/registry/mm frontier is still being built out, so the guest's own
-/// exit status is reported rather than asserted.
+/// and the guest must complete the benchmark successfully.
 ///
 /// Marked `#[ignore]` so it never reports a misleading `PASS` on the default
 /// gate (it downloads an external binary); run it explicitly with
@@ -307,6 +304,11 @@ fn run_7za_benchmark_pe() {
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "7za benchmark failed");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Compressing"),
+        "7za benchmark output was missing the result table"
     );
 }
 
