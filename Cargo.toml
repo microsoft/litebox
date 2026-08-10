@@ -52,6 +52,11 @@ default-members = [
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because it requires
 # a custom target and `-Z build-std`, which requires a nightly toolchain.
+exclude = [
+    # true-tales is a project that just happens to live in this repository, but
+    # doesn't necessarily follow the same lints, checks, and formatting
+    "dev_tools/true-tales"
+]
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy
@@ -65,3 +70,7 @@ needless_pass_by_value = "allow"
 redundant_else = "allow"
 must_use_candidate = "allow"
 too_many_lines = "allow"
+
+[workspace.lints.rust]
+# `verus_only` is set by the Verus verifier:
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }
