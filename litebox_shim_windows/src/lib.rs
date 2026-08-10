@@ -29,8 +29,8 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
-use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::PAGE_SIZE;
+use litebox_common_windows::{NtSysno, Win32Sysno};
 
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
@@ -411,6 +411,7 @@ where
 pub struct WindowsShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
+    nt_gdi_init2: Option<fn(usize) -> usize>,
 }
 
 impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
@@ -422,7 +423,20 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     /// Creates a builder backed by an existing LiteBox instance.
     #[must_use]
     pub fn new_with_litebox(platform: &'static Platform, litebox: LiteBox<Platform>) -> Self {
-        Self { platform, litebox }
+        Self {
+            platform,
+            litebox,
+            nt_gdi_init2: None,
+        }
+    }
+
+    /// Configures the host-backed implementation used for `NtGdiInit2`.
+    ///
+    /// The callback receives the address of the guest process environment block.
+    #[must_use]
+    pub fn with_nt_gdi_init2(mut self, callback: fn(usize) -> usize) -> Self {
+        self.nt_gdi_init2 = Some(callback);
+        self
     }
 
     #[must_use]
@@ -455,6 +469,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
             mui_generation: AtomicU32::new(1),
             qpc_boot_instant: TimeProvider::now(self.platform),
             litebox: self.litebox,
+            nt_gdi_init2: self.nt_gdi_init2,
             _fs: PhantomData,
         });
         WindowsShim(global)
@@ -574,6 +589,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
     litebox: LiteBox<Platform>,
+    nt_gdi_init2: Option<fn(usize) -> usize>,
     _fs: PhantomData<FS>,
 }
 
@@ -972,6 +988,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if let Some(syscall) = Win32Sysno::from_raw(ctx.orig_rax) {
+            ctx.rax = match syscall {
+                Win32Sysno::NtGdiInit2 => self
+                    .global
+                    .nt_gdi_init2
+                    .map_or(0, |callback| callback(self.process.peb_address)),
+            };
+            return;
+        }
+
+        if NtSysno::from_raw(ctx.orig_rax).is_none() {
+            let caller = if ctx.rsp == 0 {
+                0
+            } else {
+                ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
+                    .read_at_offset(0)
+                    .unwrap_or_default()
+            };
+            litebox_util_log::error!(
+                syscall_number:% = format_args!("{:#x}", ctx.orig_rax),
+                rip:% = format_args!("{:#x}", ctx.rip),
+                caller:% = format_args!("{caller:#x}");
+                "Unsupported Windows syscall"
+            );
+            ctx.rax = NtStatus::NOT_SUPPORTED.as_raw().cast_unsigned() as usize;
+            return;
+        }
+
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
                 .read_at_offset(0)
