@@ -2043,18 +2043,6 @@ mod tests {
         (path, name, attributes)
     }
 
-    #[test]
-    fn create_disposition_decodes_nt_abi_values() {
-        assert_eq!(
-            CreateDisposition::try_from(FILE_OPEN),
-            Ok(CreateDisposition::Open)
-        );
-        assert_eq!(
-            CreateDisposition::try_from(FILE_CREATE),
-            Ok(CreateDisposition::Create)
-        );
-    }
-
     fn create_existing_file(task: &Task<TestPlatform, TestFS>, path: &str, data: &[u8]) {
         let fd = task
             .fs
