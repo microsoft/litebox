@@ -188,7 +188,7 @@ impl GlobalState {
     }
 
     /// Get the TA binary associated with the given TA UUID.
-    pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+    pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         if let Some(ta_bin) = ta_uuid_map().get(ta_uuid) {
             Some(ta_bin)
         } else {
@@ -220,15 +220,13 @@ impl GlobalState {
     /// to avoid repeated RPCs and memory transfers. We remove it lazily if there is
     /// a memory pressure.
     ///
-    /// TODO: Use something like `Arc` to to ensure no active ldelf/TA holds a handle to
-    /// this TA binary
     #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
         let _ = ta_uuid_map().remove(ta_uuid);
     }
 
     /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
-    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         None
     }
 }
@@ -316,7 +314,7 @@ impl OpteeShim {
     }
 
     /// Get the TA binary associated with the given TA UUID.
-    pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+    pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
     }
 
@@ -1325,7 +1323,7 @@ impl TaHandleMap {
 /// Entry in the TA UUID map containing binary data and parsed flags.
 struct TaInfo {
     /// The raw TA binary
-    binary: alloc::boxed::Box<[u8]>,
+    binary: Arc<[u8]>,
     /// Parsed TA flags from .ta_head section
     flags: TaFlags,
 }
@@ -1342,7 +1340,7 @@ impl TaUuidMap {
         }
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) -> bool {
+    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: Arc<[u8]>) -> bool {
         // Parse TA head from the binary's .ta_head section
         let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
             return false;
@@ -1363,7 +1361,7 @@ impl TaUuidMap {
         true
     }
 
-    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.inner.read().get(uuid).map(|info| info.binary.clone())
     }
 
@@ -1373,7 +1371,7 @@ impl TaUuidMap {
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
-    pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+    pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.inner.write().remove(uuid).map(|info| info.binary)
     }
 }

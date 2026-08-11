@@ -1367,7 +1367,7 @@ fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim) {
 fn find_ta_binary(
     shim: &litebox_shim_optee::OpteeShim,
     ta_uuid: &litebox_common_optee::TeeUuid,
-) -> Option<Box<[u8]>> {
+) -> Option<alloc::sync::Arc<[u8]>> {
     shim.get_ta_bin(ta_uuid)
 }
 
