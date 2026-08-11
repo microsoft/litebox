@@ -1379,11 +1379,9 @@ impl TaUuidMap {
 }
 
 /// Get the global TA UUID map.
-fn ta_uuid_map() -> Arc<TaUuidMap> {
-    static TA_UUID_MAP: once_cell::race::OnceBox<Arc<TaUuidMap>> = once_cell::race::OnceBox::new();
-    TA_UUID_MAP
-        .get_or_init(|| alloc::boxed::Box::new(Arc::new(TaUuidMap::new())))
-        .clone()
+fn ta_uuid_map() -> &'static TaUuidMap {
+    static TA_UUID_MAP: once_cell::race::OnceBox<TaUuidMap> = once_cell::race::OnceBox::new();
+    TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
 }
 
 /// Per-instance TA state which can be shared between sessions if it is
