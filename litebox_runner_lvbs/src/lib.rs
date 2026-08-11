@@ -1344,6 +1344,8 @@ fn write_rpc_args_to_normal_world(
 
 // use include_bytes! to include ldelf
 const LDELF_BINARY: &[u8] = &[0u8; 0];
+const TA_BINARY: &[u8] = &[0u8; 0];
+const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 
 /// Register a TA binary embedded in the runner image.
 fn register_embedded_ta(shim: &litebox_shim_optee::OpteeShim, ta_binary: &'static [u8]) -> bool {
@@ -1355,16 +1357,9 @@ fn register_embedded_ta(shim: &litebox_shim_optee::OpteeShim, ta_binary: &'stati
 
 /// Register all TA binaries embedded in the runner image.
 fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim) {
-    static REGISTERED: spin::Once<()> = spin::Once::new();
-    REGISTERED.call_once(|| {
-        assert!(register_embedded_ta(
-            shim,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf"
-            ))
-        ));
-    });
+    for ta_binary in TA_BINARIES {
+        assert!(register_embedded_ta(shim, ta_binary));
+    }
 }
 
 /// Look up TA binary by UUID.
