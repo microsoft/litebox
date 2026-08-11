@@ -44,28 +44,6 @@ use zerocopy::{FromBytes, IntoBytes};
 type MapInfoOf<V, const ALIGN: usize> =
     <<V as GlobalVmapManager<ALIGN>>::Manager as VmapManager<ALIGN>>::MapInfo;
 
-/// Allocate a zeroed `Box<T>` on the heap.
-///
-/// # Panics
-///
-/// Panics if `T` is a zero-sized type, since `alloc_zeroed` with a zero-sized
-/// layout is undefined behavior.
-fn box_new_zeroed<T: FromBytes>() -> alloc::boxed::Box<T> {
-    assert!(
-        core::mem::size_of::<T>() > 0,
-        "box_new_zeroed does not support zero-sized types"
-    );
-    let layout = core::alloc::Layout::new::<T>();
-    // Safety: layout has a non-zero size and correct alignment for T.
-    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<T>();
-    if ptr.is_null() {
-        alloc::alloc::handle_alloc_error(layout);
-    }
-    // Safety: ptr is a valid, zeroed, properly aligned heap allocation for T.
-    // T: FromBytes guarantees all-zero is a valid bit pattern.
-    unsafe { alloc::boxed::Box::from_raw(ptr) }
-}
-
 #[inline]
 fn align_down(address: usize, align: usize) -> usize {
     address & !(align - 1)
@@ -216,7 +194,13 @@ where
             core::mem::size_of::<T>(),
             PhysPageMapPermissions::READ,
         )?;
-        let mut boxed = box_new_zeroed::<T>();
+        let mut boxed = <T as zerocopy::FromZeros>::new_box_zeroed().map_err(
+            |_err: zerocopy::AllocError| {
+                // zerocopy::AllocError is a ZST and carries no other information we
+                // could forward
+                PhysPointerError::AllocError
+            },
+        )?;
         // SAFETY: `boxed` is a freshly allocated `T` and is thus valid for writes
         // of `size_of::<T>()` bytes, which is the guard's mapped size.
         unsafe { guard.copy_out(core::ptr::from_mut::<T>(boxed.as_mut()).cast::<u8>())? };
