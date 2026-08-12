@@ -31,8 +31,11 @@ use rustix::net::{
 };
 
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, WaitableSharedMemory, memory_permits_byte_range, memory_permits_u32,
-    memory_permits_u64,
+    CONTROL_RING_MEMORY_SIZE, MemoryAccessPolicy, WaitableSharedMemory,
+};
+#[cfg(test)]
+use litebox_broker_transport::control_ring::{
+    memory_permits_byte_range, memory_permits_u32, memory_permits_u64,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 
@@ -53,39 +56,6 @@ pub struct MemfdSharedMemory {
 struct MappedRegion {
     address: NonNull<u8>,
     length: usize,
-}
-
-/// Restricts each memfd to one non-overlapping portable access model.
-///
-/// Shared-buffer memfds permit only byte copies. Control-ring memfds permit
-/// byte and typed-word operations only at offsets defined by the ring ABI.
-#[derive(Clone, Copy)]
-enum MemoryAccessPolicy {
-    Bytes,
-    ControlRing,
-}
-
-impl MemoryAccessPolicy {
-    const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
-        match self {
-            Self::Bytes => true,
-            Self::ControlRing => memory_permits_byte_range(offset, length),
-        }
-    }
-
-    const fn permits_u32(self, offset: usize) -> bool {
-        match self {
-            Self::Bytes => false,
-            Self::ControlRing => memory_permits_u32(offset),
-        }
-    }
-
-    const fn permits_u64(self, offset: usize) -> bool {
-        match self {
-            Self::Bytes => false,
-            Self::ControlRing => memory_permits_u64(offset),
-        }
-    }
 }
 
 // SAFETY: Moving or sharing this owner does not move or invalidate its OS

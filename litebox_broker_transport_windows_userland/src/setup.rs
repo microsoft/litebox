@@ -1,179 +1,289 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
-use std::sync::mpsc::{RecvTimeoutError, TryRecvError, channel};
-use std::thread;
+use std::io::{Error, ErrorKind, Result as IoResult};
 use std::time::Instant;
 
 use litebox_broker_protocol::wire::WireError;
 use litebox_broker_transport::control_ring::ControlRingError;
+use litebox_broker_transport::setup_frame::{SetupFrameError, read_setup_frame, write_setup_frame};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NOT_FOUND, HANDLE,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_PIPE_NOT_CONNECTED,
+    HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::System::IO::CancelSynchronousIo;
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+};
 
-const MAX_FRAME_LEN: usize = 64 * 1024;
-
-pub(crate) struct OwnedThreadHandle(pub(crate) HANDLE);
-
-pub(crate) fn read_frame(
-    stream: &mut impl Read,
-    deadline: Option<Instant>,
-) -> IoResult<Option<Vec<u8>>> {
-    let mut length = [0; 4];
-    let mut completed = 0;
-    while completed < length.len() {
-        match with_io_deadline(deadline, || stream.read(&mut length[completed..])) {
-            Ok(0) if completed == 0 => return Ok(None),
-            Ok(0) => return Err(invalid_data("truncated broker frame length")),
-            Ok(read) => completed += read,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    let length = u32::from_le_bytes(length) as usize;
-    if length == 0 || length > MAX_FRAME_LEN {
-        return Err(invalid_data("invalid broker frame length"));
-    }
-    let mut frame = vec![0; length];
-    let mut completed = 0;
-    while completed < frame.len() {
-        match with_io_deadline(deadline, || stream.read(&mut frame[completed..])) {
-            Ok(0) => return Err(invalid_data("truncated broker frame")),
-            Ok(read) => completed += read,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(Some(frame))
+pub(crate) struct OverlappedOperation {
+    state: Box<OVERLAPPED>,
+    event: OwnedEvent,
 }
 
-pub(crate) fn write_frame(
-    stream: &mut impl Write,
-    frame: &[u8],
-    deadline: Option<Instant>,
-) -> IoResult<()> {
-    if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
-        return Err(invalid_data("invalid broker frame length"));
-    }
-    let length = u32::try_from(frame.len()).map_err(|_| invalid_data("broker frame too large"))?;
-    write_all_with_deadline(stream, &length.to_le_bytes(), deadline)?;
-    write_all_with_deadline(stream, frame, deadline)
+pub(crate) struct OwnedEvent(HANDLE);
+
+pub(crate) fn read_frame(stream: HANDLE, deadline: Option<Instant>) -> IoResult<Option<Vec<u8>>> {
+    read_setup_frame(
+        |buffer| read_pipe(stream, buffer, deadline),
+        |error| error.kind() == ErrorKind::Interrupted,
+    )
+    .map_err(frame_error)
 }
 
-fn write_all_with_deadline(
-    stream: &mut impl Write,
-    mut bytes: &[u8],
-    deadline: Option<Instant>,
-) -> IoResult<()> {
-    while !bytes.is_empty() {
-        match with_io_deadline(deadline, || stream.write(bytes)) {
-            Ok(0) => {
-                return Err(Error::new(
-                    ErrorKind::WriteZero,
-                    "failed to write broker frame",
-                ));
-            }
-            Ok(written) => bytes = &bytes[written..],
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+pub(crate) fn write_frame(stream: HANDLE, frame: &[u8], deadline: Option<Instant>) -> IoResult<()> {
+    write_setup_frame(
+        frame,
+        |buffer| write_pipe(stream, buffer, deadline),
+        |error| error.kind() == ErrorKind::Interrupted,
+    )
+    .map_err(frame_error)
+}
+
+fn frame_error(error: SetupFrameError<Error>) -> Error {
+    match error {
+        SetupFrameError::Io(error) => error,
+        SetupFrameError::TruncatedLength => invalid_data("truncated broker frame length"),
+        SetupFrameError::InvalidLength => invalid_data("invalid broker frame length"),
+        SetupFrameError::TruncatedFrame => invalid_data("truncated broker frame"),
+        SetupFrameError::WriteZero => {
+            Error::new(ErrorKind::WriteZero, "failed to write broker frame")
         }
+        SetupFrameError::InvalidIoCount => Error::other("invalid broker frame I/O count"),
     }
-    Ok(())
 }
 
-fn with_io_deadline<T>(
+pub(crate) fn read_pipe(
+    stream: HANDLE,
+    buffer: &mut [u8],
     deadline: Option<Instant>,
-    operation: impl FnOnce() -> IoResult<T>,
-) -> IoResult<T> {
-    let Some(deadline) = deadline else {
-        return operation();
+) -> IoResult<usize> {
+    read_pipe_inner(stream, buffer, deadline, None)
+}
+
+pub(crate) fn read_pipe_until_cancelled(
+    stream: HANDLE,
+    buffer: &mut [u8],
+    cancellation: HANDLE,
+) -> IoResult<usize> {
+    read_pipe_inner(stream, buffer, None, Some(cancellation))
+}
+
+fn read_pipe_inner(
+    stream: HANDLE,
+    buffer: &mut [u8],
+    deadline: Option<Instant>,
+    cancellation: Option<HANDLE>,
+) -> IoResult<usize> {
+    reject_expired_deadline(deadline)?;
+    let length = u32::try_from(buffer.len())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "pipe read buffer is too large"))?;
+    let mut operation = OverlappedOperation::new()?;
+    // SAFETY: `stream` is an overlapped named-pipe handle, `buffer` remains live until completion,
+    // and `operation` owns stable OVERLAPPED storage until the operation completes or is canceled.
+    let started = unsafe {
+        ReadFile(
+            stream,
+            buffer.as_mut_ptr(),
+            length,
+            std::ptr::null_mut(),
+            operation.as_mut_ptr(),
+        )
     };
+    finish_io(stream, &operation, started, deadline, cancellation).or_else(pipe_read_eof)
+}
+
+pub(crate) fn write_pipe(
+    stream: HANDLE,
+    buffer: &[u8],
+    deadline: Option<Instant>,
+) -> IoResult<usize> {
+    reject_expired_deadline(deadline)?;
+    let length = u32::try_from(buffer.len())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "pipe write buffer is too large"))?;
+    let mut operation = OverlappedOperation::new()?;
+    // SAFETY: `stream` is an overlapped named-pipe handle, `buffer` remains live until completion,
+    // and `operation` owns stable OVERLAPPED storage until the operation completes or is canceled.
+    let started = unsafe {
+        WriteFile(
+            stream,
+            buffer.as_ptr(),
+            length,
+            std::ptr::null_mut(),
+            operation.as_mut_ptr(),
+        )
+    };
+    finish_io(stream, &operation, started, deadline, None)
+}
+
+fn finish_io(
+    stream: HANDLE,
+    operation: &OverlappedOperation,
+    started: i32,
+    deadline: Option<Instant>,
+    cancellation: Option<HANDLE>,
+) -> IoResult<usize> {
+    if started == 0 {
+        let error = Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_IO_PENDING.cast_signed()) {
+            return Err(error);
+        }
+    }
+
+    let timeout = deadline.map_or(INFINITE, deadline_timeout);
+    // SAFETY: Each supplied event remains live for the wait. The operation event is signaled on
+    // I/O completion, and the optional manual-reset event is signaled on association shutdown.
+    let wait = unsafe {
+        match cancellation {
+            Some(cancellation) => {
+                let events = [operation.event(), cancellation];
+                WaitForMultipleObjects(2, events.as_ptr(), 0, timeout)
+            }
+            None => WaitForSingleObject(operation.event(), timeout),
+        }
+    };
+    match wait {
+        WAIT_OBJECT_0 => operation.result(stream, false).map(|bytes| bytes as usize),
+        wait if cancellation.is_some() && wait == WAIT_OBJECT_0 + 1 => {
+            operation.cancel_and_wait(stream)?;
+            Err(Error::new(
+                ErrorKind::ConnectionAborted,
+                "broker association shut down",
+            ))
+        }
+        WAIT_TIMEOUT => {
+            operation.cancel_and_wait(stream)?;
+            Err(Error::new(
+                ErrorKind::TimedOut,
+                "broker setup deadline elapsed",
+            ))
+        }
+        WAIT_FAILED => {
+            let error = Error::last_os_error();
+            operation.cancel_and_wait(stream)?;
+            Err(error)
+        }
+        _ => unreachable!("WaitForSingleObject returned an unknown status"),
+    }
+}
+
+fn deadline_timeout(deadline: Instant) -> u32 {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    let milliseconds =
+        remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+    u32::try_from(milliseconds.min(u128::from(INFINITE - 1)))
+        .expect("deadline timeout is clamped to u32")
+}
+
+fn reject_expired_deadline(deadline: Option<Instant>) -> IoResult<()> {
+    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
         return Err(Error::new(
             ErrorKind::TimedOut,
             "broker setup deadline elapsed",
         ));
     }
+    Ok(())
+}
 
-    let io_thread = duplicate_current_thread()?;
-    let (completed, wait_for_completion) = channel();
-    let watchdog = thread::Builder::new()
-        .name("litebox-setup-deadline".to_owned())
-        .spawn(move || match wait_for_completion.recv_timeout(remaining) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => Ok::<bool, Error>(false),
-            Err(RecvTimeoutError::Timeout) => loop {
-                if io_thread.cancel_synchronous_io()? {
-                    return Ok(true);
-                }
-                match wait_for_completion.try_recv() {
-                    Ok(()) | Err(TryRecvError::Disconnected) => return Ok(true),
-                    Err(TryRecvError::Empty) => thread::yield_now(),
-                }
-            },
-        })?;
-    let result = operation();
-    let _ = completed.send(());
-    let timed_out = watchdog
-        .join()
-        .map_err(|_| Error::other("broker setup deadline watchdog panicked"))??;
-    if timed_out {
-        Err(Error::new(
-            ErrorKind::TimedOut,
-            "broker setup deadline elapsed",
-        ))
-    } else {
-        result
+fn pipe_read_eof(error: Error) -> IoResult<usize> {
+    match error.raw_os_error() {
+        Some(code)
+            if code == ERROR_BROKEN_PIPE.cast_signed()
+                || code == ERROR_PIPE_NOT_CONNECTED.cast_signed() =>
+        {
+            Ok(0)
+        }
+        _ => Err(error),
     }
 }
 
-pub(crate) fn duplicate_current_thread() -> IoResult<OwnedThreadHandle> {
-    let mut duplicate = std::ptr::null_mut();
-    // SAFETY: Both process pseudo-handles and the current-thread pseudo-handle are valid, and the
-    // output points to writable storage for a new real thread handle.
-    if unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            GetCurrentThread(),
-            GetCurrentProcess(),
-            &raw mut duplicate,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        )
-    } == 0
-    {
-        return Err(Error::last_os_error());
+impl OverlappedOperation {
+    pub(crate) fn new() -> IoResult<Self> {
+        let event = OwnedEvent::manual_reset()?;
+        let mut state = Box::<OVERLAPPED>::default();
+        state.hEvent = event.0;
+        Ok(Self { state, event })
     }
-    Ok(OwnedThreadHandle(duplicate))
-}
 
-impl OwnedThreadHandle {
-    fn cancel_synchronous_io(&self) -> IoResult<bool> {
-        // SAFETY: This is a live duplicate of the thread performing synchronous I/O.
-        if unsafe { CancelSynchronousIo(self.0) } == 0 {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut OVERLAPPED {
+        self.state.as_mut()
+    }
+
+    pub(crate) fn result(&self, stream: HANDLE, wait: bool) -> IoResult<u32> {
+        let mut bytes = 0;
+        // SAFETY: `stream` and this OVERLAPPED describe the same live operation, and `bytes` is
+        // writable for the duration of the call.
+        if unsafe { GetOverlappedResult(stream, self.state.as_ref(), &raw mut bytes, wait.into()) }
+            == 0
+        {
+            return Err(Error::last_os_error());
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn cancel_and_wait(&self, stream: HANDLE) -> IoResult<()> {
+        // SAFETY: `stream` and this OVERLAPPED describe the same live operation.
+        let cancel_error = if unsafe { CancelIoEx(stream, self.state.as_ref()) } == 0 {
             let error = Error::last_os_error();
             if error.raw_os_error() == Some(ERROR_NOT_FOUND.cast_signed()) {
-                return Ok(false);
+                None
+            } else {
+                Some(error)
             }
+        } else {
+            None
+        };
+        let _ = self.result(stream, true);
+        if let Some(error) = cancel_error {
             return Err(error);
         }
-        Ok(true)
+        Ok(())
+    }
+
+    fn event(&self) -> HANDLE {
+        self.event.0
     }
 }
 
-impl Drop for OwnedThreadHandle {
+impl OwnedEvent {
+    pub(crate) fn manual_reset() -> IoResult<Self> {
+        // SAFETY: The event is unnamed and uses no security descriptor.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(Error::last_os_error());
+        }
+        Ok(Self(event))
+    }
+
+    pub(crate) fn set(&self) -> IoResult<()> {
+        // SAFETY: This is a live event handle returned by CreateEventW.
+        if unsafe { SetEvent(self.0) } == 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn handle(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for OwnedEvent {
     fn drop(&mut self) {
-        // SAFETY: This is a live thread handle returned by DuplicateHandle.
+        // SAFETY: This is a live event handle returned by CreateEventW.
         unsafe { CloseHandle(self.0) };
     }
 }
 
-// SAFETY: Windows thread handles can be canceled and closed from any process thread.
-unsafe impl Send for OwnedThreadHandle {}
+// SAFETY: The event and heap-stable OVERLAPPED state may be completed or canceled from any
+// process thread, and ownership prevents concurrent Rust access to the operation object.
+unsafe impl Send for OverlappedOperation {}
+
+// SAFETY: Windows event handles may be signaled and waited on from any process thread.
+unsafe impl Send for OwnedEvent {}
+// SAFETY: Shared access only passes the immutable handle value to thread-safe Windows APIs.
+unsafe impl Sync for OwnedEvent {}
 
 pub(crate) fn invalid_data(message: &'static str) -> Error {
     Error::new(ErrorKind::InvalidData, message)
@@ -198,19 +308,4 @@ pub(crate) fn ring_error(error: ControlRingError) -> Error {
         ErrorKind::InvalidData,
         format!("invalid broker control ring: {error:?}"),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn frames_round_trip() {
-        let mut bytes = Vec::new();
-        write_frame(&mut bytes, b"frame", None).unwrap();
-        assert_eq!(
-            read_frame(&mut bytes.as_slice(), None).unwrap(),
-            Some(b"frame".to_vec())
-        );
-    }
 }

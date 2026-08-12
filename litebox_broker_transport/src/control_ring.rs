@@ -61,6 +61,38 @@ const PRODUCER_EPOCH_OFFSET: usize = 0;
 const CONSUMER_EPOCH_OFFSET: usize = 4;
 const CONSUMER_HEAD_OFFSET: usize = 8;
 
+/// Access model enforced by a concrete shared-memory mapping.
+///
+/// This keeps byte-copy memory from exposing typed control-ring operations and
+/// constrains control-ring accesses to the disjoint regions defined by its ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryAccessPolicy {
+    /// General shared memory supporting only byte copies.
+    Bytes,
+    /// Control-ring memory supporting its ABI-defined byte and word accesses.
+    ControlRing,
+}
+
+impl MemoryAccessPolicy {
+    /// Returns whether this policy permits a byte-copy range.
+    pub const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
+        match self {
+            Self::Bytes => true,
+            Self::ControlRing => memory_permits_byte_range(offset, length),
+        }
+    }
+
+    /// Returns whether this policy permits a `u32` access at `offset`.
+    pub const fn permits_u32(self, offset: usize) -> bool {
+        matches!(self, Self::ControlRing) && memory_permits_u32(offset)
+    }
+
+    /// Returns whether this policy permits a `u64` access at `offset`.
+    pub const fn permits_u64(self, offset: usize) -> bool {
+        matches!(self, Self::ControlRing) && memory_permits_u64(offset)
+    }
+}
+
 /// Returns whether the control-ring ABI permits a byte-copy range.
 ///
 /// Concrete shared-memory implementations use this together with

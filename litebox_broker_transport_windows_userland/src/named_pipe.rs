@@ -6,6 +6,7 @@
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Result as IoResult};
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::time::{Duration, Instant};
 
@@ -19,15 +20,15 @@ use litebox_broker_transport::channel::{
 };
 use litebox_broker_transport::control_ring::ControlRing;
 use windows_sys::Win32::Foundation::{
-    ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, HANDLE, INVALID_HANDLE_VALUE,
+    ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
-    PIPE_TYPE_BYTE, PIPE_WAIT, SetNamedPipeHandleState,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 
-use crate::setup::{invalid_data, read_frame, wire_error, write_frame};
+use crate::setup::{OverlappedOperation, invalid_data, read_frame, wire_error, write_frame};
 use crate::shared_memory::{TransferredSharedMemory, WindowsSharedMemory};
 
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -35,19 +36,23 @@ const TRANSFER_FRAME_TAG: u8 = 0xa1;
 
 /// One server-side named-pipe instance waiting for a single broker peer.
 pub struct WindowsNamedPipeListener {
-    stream: Option<File>,
+    stream: Option<WindowsNamedPipeStream>,
+    connect: Option<OverlappedOperation>,
 }
+
+/// One connected named-pipe stream opened for overlapped I/O.
+pub struct WindowsNamedPipeStream(File);
 
 /// Local-side broker setup channel over a Windows named pipe.
 pub struct WindowsNamedPipeLocalSetupChannel {
-    stream: File,
+    stream: WindowsNamedPipeStream,
     setup_deadline: Option<Instant>,
     negotiated: bool,
 }
 
 /// Host-side broker setup channel over a Windows named pipe.
 pub struct WindowsNamedPipeHostSetupChannel {
-    stream: File,
+    stream: WindowsNamedPipeStream,
     peer_credential: PeerCredential,
     setup_deadline: Option<Instant>,
     negotiated: bool,
@@ -57,16 +62,13 @@ impl WindowsNamedPipeListener {
     /// Creates one duplex byte-mode named-pipe instance.
     pub fn bind(name: &OsStr) -> IoResult<Self> {
         let name = wide_string(name)?;
-        // SAFETY: `name` is NUL-terminated. The pipe is synchronous, byte-mode, initially
-        // nonblocking for bounded accept, and uses the process token's default security descriptor
-        // until the deployment supplies a tighter ACL.
+        // SAFETY: `name` is NUL-terminated. The pipe is overlapped and byte-mode, and uses the
+        // process token's default security descriptor until the deployment supplies a tighter ACL.
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE
-                    | PIPE_READMODE_BYTE
-                    | windows_sys::Win32::System::Pipes::PIPE_NOWAIT,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 1,
                 64 * 1024,
                 64 * 1024,
@@ -78,42 +80,47 @@ impl WindowsNamedPipeListener {
             return Err(Error::last_os_error());
         }
         // SAFETY: CreateNamedPipeW returned a newly owned handle compatible with File I/O.
-        let stream = unsafe { File::from_raw_handle(handle) };
+        let stream = WindowsNamedPipeStream(unsafe { File::from_raw_handle(handle) });
+        let mut connect = OverlappedOperation::new()?;
+        // SAFETY: `stream` owns an overlapped pipe, and `connect` remains live while the connect is
+        // pending.
+        let connected = unsafe { ConnectNamedPipe(stream.handle(), connect.as_mut_ptr()) } != 0;
+        let connect = if connected {
+            None
+        } else {
+            let error = Error::last_os_error();
+            match error.raw_os_error() {
+                Some(code) if code == ERROR_IO_PENDING.cast_signed() => Some(connect),
+                Some(code) if code == ERROR_PIPE_CONNECTED.cast_signed() => None,
+                _ => return Err(error),
+            }
+        };
         Ok(Self {
             stream: Some(stream),
+            connect,
         })
     }
 
     /// Tries to accept one client without blocking.
-    pub fn try_accept(&mut self) -> IoResult<File> {
+    pub fn try_accept(&mut self) -> IoResult<WindowsNamedPipeStream> {
         let stream = self.stream.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
                 "named-pipe client already accepted",
             )
         })?;
-        let handle = file_handle(stream);
-        // SAFETY: `handle` names a synchronous, nonblocking listening named-pipe instance.
-        if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } == 0 {
-            let error = Error::last_os_error();
-            match error.raw_os_error() {
-                Some(code) if code == ERROR_PIPE_CONNECTED.cast_signed() => {}
-                Some(code) if code == ERROR_PIPE_LISTENING.cast_signed() => {
+        if let Some(connect) = &self.connect {
+            match connect.result(stream.handle(), false) {
+                Ok(_) => {}
+                Err(error) if error.raw_os_error() == Some(ERROR_IO_INCOMPLETE.cast_signed()) => {
                     return Err(Error::new(
                         ErrorKind::WouldBlock,
                         "named-pipe listener has no pending client",
                     ));
                 }
-                _ => return Err(error),
+                Err(error) => return Err(error),
             }
-        }
-        let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
-        // SAFETY: `handle` names the connected server pipe and `mode` remains live for the call.
-        if unsafe {
-            SetNamedPipeHandleState(handle, &raw const mode, std::ptr::null(), std::ptr::null())
-        } == 0
-        {
-            return Err(Error::last_os_error());
+            self.connect = None;
         }
         self.stream.take().ok_or_else(|| {
             Error::new(
@@ -124,14 +131,33 @@ impl WindowsNamedPipeListener {
     }
 }
 
+impl Drop for WindowsNamedPipeListener {
+    fn drop(&mut self) {
+        if let (Some(stream), Some(connect)) = (&self.stream, &self.connect) {
+            let _ = connect.cancel_and_wait(stream.handle());
+        }
+    }
+}
+
+impl WindowsNamedPipeStream {
+    pub(crate) fn handle(&self) -> HANDLE {
+        self.0.as_raw_handle()
+    }
+}
+
 impl WindowsNamedPipeLocalSetupChannel {
     /// Connects to a broker setup pipe until `deadline` expires.
     pub fn connect_with_setup_deadline(name: &OsStr, deadline: Instant) -> IoResult<Self> {
         loop {
-            match OpenOptions::new().read(true).write(true).open(name) {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .open(name)
+            {
                 Ok(stream) => {
                     return Ok(Self {
-                        stream,
+                        stream: WindowsNamedPipeStream(stream),
                         setup_deadline: Some(deadline),
                         negotiated: false,
                     });
@@ -152,12 +178,13 @@ impl WindowsNamedPipeLocalSetupChannel {
         &mut self,
         expected_length: usize,
     ) -> IoResult<WindowsSharedMemory> {
-        let frame = read_frame(&mut self.stream, self.setup_deadline)?.ok_or_else(|| {
-            Error::new(
-                ErrorKind::UnexpectedEof,
-                "broker closed before transferring shared memory",
-            )
-        })?;
+        let frame =
+            read_frame(file_handle(&self.stream), self.setup_deadline)?.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "broker closed before transferring shared memory",
+                )
+            })?;
         let transfer = decode_transfer(&frame)?;
         if transfer.length != expected_length {
             return Err(invalid_data("transferred shared-memory length mismatch"));
@@ -169,12 +196,13 @@ impl WindowsNamedPipeLocalSetupChannel {
 
     /// Receives and maps the shared control ring duplicated into this process.
     pub fn receive_control_ring(&mut self) -> IoResult<WindowsSharedMemory> {
-        let frame = read_frame(&mut self.stream, self.setup_deadline)?.ok_or_else(|| {
-            Error::new(
-                ErrorKind::UnexpectedEof,
-                "broker closed before transferring control-ring memory",
-            )
-        })?;
+        let frame =
+            read_frame(file_handle(&self.stream), self.setup_deadline)?.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "broker closed before transferring control-ring memory",
+                )
+            })?;
         let transfer = decode_transfer(&frame)?;
         // SAFETY: The authenticated broker duplicated these handles into this process and encoded
         // their target-process values in the setup frame.
@@ -195,7 +223,10 @@ impl WindowsNamedPipeLocalSetupChannel {
 
 impl WindowsNamedPipeHostSetupChannel {
     /// Creates a host setup channel after the deployment has authenticated the client.
-    pub const fn from_host_guaranteed(stream: File, setup_deadline: Instant) -> Self {
+    pub const fn from_host_guaranteed(
+        stream: WindowsNamedPipeStream,
+        setup_deadline: Instant,
+    ) -> Self {
         Self {
             stream,
             peer_credential: PeerCredential::HostGuaranteed,
@@ -212,7 +243,7 @@ impl WindowsNamedPipeHostSetupChannel {
     ) -> IoResult<()> {
         let transfer = memory.duplicate_to_process(runner_process)?;
         write_frame(
-            &mut self.stream,
+            file_handle(&self.stream),
             &encode_transfer(&transfer)?,
             self.setup_deadline,
         )
@@ -237,14 +268,14 @@ impl LocalSetupChannel for WindowsNamedPipeLocalSetupChannel {
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
         write_frame(
-            &mut self.stream,
+            file_handle(&self.stream),
             &encode_handshake_request(request.clone()),
             self.setup_deadline,
         )
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
-        let response = read_frame(&mut self.stream, self.setup_deadline)?
+        let response = read_frame(file_handle(&self.stream), self.setup_deadline)?
             .map(|frame| decode_handshake_response(&frame).map_err(wire_error))
             .transpose()?;
         self.negotiated = matches!(response, Some(BrokerHandshakeResponse::Negotiated { .. }));
@@ -260,7 +291,7 @@ impl HostSetupChannel for WindowsNamedPipeHostSetupChannel {
     }
 
     fn recv_handshake_request(&mut self) -> IoResult<HostReceive<BrokerHandshakeRequest>> {
-        let Some(frame) = read_frame(&mut self.stream, self.setup_deadline)? else {
+        let Some(frame) = read_frame(file_handle(&self.stream), self.setup_deadline)? else {
             return Ok(HostReceive::PeerClosed);
         };
         match decode_handshake_request(&frame) {
@@ -272,7 +303,7 @@ impl HostSetupChannel for WindowsNamedPipeHostSetupChannel {
 
     fn send_handshake_response(&mut self, response: &BrokerHandshakeResponse) -> IoResult<()> {
         write_frame(
-            &mut self.stream,
+            file_handle(&self.stream),
             &encode_handshake_response(response.clone()),
             self.setup_deadline,
         )?;
@@ -282,7 +313,10 @@ impl HostSetupChannel for WindowsNamedPipeHostSetupChannel {
 }
 
 /// Validates that a connected named-pipe client belongs to `expected_process_id`.
-pub fn validate_client_process(stream: &File, expected_process_id: u32) -> IoResult<()> {
+pub fn validate_client_process(
+    stream: &WindowsNamedPipeStream,
+    expected_process_id: u32,
+) -> IoResult<()> {
     let mut process_id = 0;
     // SAFETY: `stream` is a connected named pipe and `process_id` is writable.
     if unsafe { GetNamedPipeClientProcessId(file_handle(stream), &raw mut process_id) } == 0 {
@@ -359,8 +393,8 @@ fn wide_string(value: &OsStr) -> IoResult<Vec<u16>> {
     Ok(value)
 }
 
-fn file_handle(file: &File) -> HANDLE {
-    file.as_raw_handle()
+fn file_handle(stream: &WindowsNamedPipeStream) -> HANDLE {
+    stream.handle()
 }
 
 #[cfg(test)]
@@ -368,6 +402,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 
+    use crate::setup::{OwnedEvent, read_pipe_until_cancelled};
     use litebox_broker_protocol::message::{
         BrokerNotification, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
         ReadinessNotification,
@@ -409,7 +444,7 @@ mod tests {
         )
     }
 
-    fn accept_stream_guaranteed(mut listener: WindowsNamedPipeListener) -> File {
+    fn accept_stream_guaranteed(mut listener: WindowsNamedPipeListener) -> WindowsNamedPipeStream {
         loop {
             match listener.try_accept() {
                 Ok(stream) => {
@@ -460,6 +495,48 @@ mod tests {
             panic!("silent setup client must not outlive the setup deadline");
         };
         assert_eq!(error.kind(), ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn expired_setup_deadline_rejects_ready_io() {
+        let name = pipe_name("expired-setup-deadline");
+        let listener = WindowsNamedPipeListener::bind(&name).unwrap();
+        let client = std::thread::spawn(move || {
+            WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(
+                &name,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap()
+        });
+        let stream = accept_stream_guaranteed(listener);
+        let local = client.join().unwrap();
+        write_frame(file_handle(&local.stream), b"ready", None).unwrap();
+        let mut host =
+            WindowsNamedPipeHostSetupChannel::from_host_guaranteed(stream, Instant::now());
+
+        let error = host.recv_handshake_request().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn presignaled_shutdown_cancels_liveness_read() {
+        let name = pipe_name("presignaled-shutdown");
+        let listener = WindowsNamedPipeListener::bind(&name).unwrap();
+        let client = std::thread::spawn(move || {
+            WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(
+                &name,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap()
+        });
+        let stream = accept_stream_guaranteed(listener);
+        let _client = client.join().unwrap();
+        let shutdown = OwnedEvent::manual_reset().unwrap();
+        shutdown.set().unwrap();
+
+        let error =
+            read_pipe_until_cancelled(stream.handle(), &mut [0], shutdown.handle()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
     }
 
     #[test]

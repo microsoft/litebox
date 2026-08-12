@@ -3,10 +3,7 @@
 
 //! Active Windows-userland broker endpoints over a shared control ring.
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Error, ErrorKind, Read, Result as IoResult};
-use std::os::windows::io::AsRawHandle;
+use std::io::{Error, ErrorKind, Result as IoResult};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -23,14 +20,14 @@ use litebox_broker_transport::control_ring::{
     CONTROL_RING_READY, ControlRing, ControlRingConsumer, ControlRingProducer,
     ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
 };
-use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_PIPE_NOT_CONNECTED, HANDLE};
-use windows_sys::Win32::System::IO::CancelSynchronousIo;
+use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
 use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
 
+use crate::named_pipe::WindowsNamedPipeStream;
 use crate::pending_calls::{PendingCalls, pending_calls_error};
 use crate::setup::{
-    OwnedThreadHandle, copy_io_error, duplicate_current_thread, invalid_data, read_frame,
-    ring_error, wire_error, write_frame,
+    OwnedEvent, copy_io_error, invalid_data, read_frame, read_pipe_until_cancelled, ring_error,
+    wire_error, write_frame,
 };
 use crate::shared_memory::WindowsSharedMemory;
 
@@ -94,23 +91,17 @@ struct LocalRingAssociation {
 
 struct PipeLiveness {
     server: bool,
+    shutdown_event: OwnedEvent,
     state: Mutex<PipeLivenessState>,
 }
 
 struct PipeLivenessState {
-    stream: Option<File>,
+    stream: Option<Arc<WindowsNamedPipeStream>>,
     shutdown: bool,
-    next_id: u64,
-    threads: HashMap<u64, OwnedThreadHandle>,
-}
-
-struct PipeIoGuard<'association> {
-    liveness: &'association PipeLiveness,
-    id: u64,
 }
 
 pub(crate) fn activate_host(
-    mut stream: File,
+    stream: WindowsNamedPipeStream,
     negotiated: bool,
     setup_deadline: Option<Instant>,
     ring: ControlRing<WindowsSharedMemory>,
@@ -125,7 +116,7 @@ pub(crate) fn activate_host(
             "broker host setup channel activated before negotiation completed",
         ));
     }
-    let ready = read_frame(&mut stream, setup_deadline)?.ok_or_else(|| {
+    let ready = read_frame(file_handle(&stream), setup_deadline)?.ok_or_else(|| {
         Error::new(
             ErrorKind::UnexpectedEof,
             "runner closed before control-ring setup acknowledgement",
@@ -136,15 +127,16 @@ pub(crate) fn activate_host(
             "runner sent an invalid control-ring setup acknowledgement",
         ));
     }
-    write_frame(&mut stream, CONTROL_RING_READY, setup_deadline)?;
+    write_frame(file_handle(&stream), CONTROL_RING_READY, setup_deadline)?;
 
     let litebox_broker_transport::control_ring::BrokerControlRingEndpoints {
         request_consumer,
         response_producer,
         notification_producer,
     } = ring.into_broker();
+    let stream = Arc::new(stream);
     let association = Arc::new(HostRingAssociation {
-        liveness: PipeLiveness::new(stream.try_clone()?, true),
+        liveness: PipeLiveness::new(Arc::clone(&stream), true)?,
         status: Mutex::new(HostAssociationStatus::Live),
         request_wake: request_consumer.wake_handle(),
         response_wake: response_producer.wake_handle(),
@@ -153,7 +145,7 @@ pub(crate) fn activate_host(
     let monitor_association = Arc::clone(&association);
     thread::Builder::new()
         .name("litebox-runner-liveness".to_owned())
-        .spawn(move || monitor_host_pipe(&mut stream, &monitor_association))?;
+        .spawn(move || monitor_host_pipe(&stream, &monitor_association))?;
     Ok((
         WindowsControlRingHostRequestSource {
             consumer: request_consumer,
@@ -172,7 +164,7 @@ pub(crate) fn activate_host(
 }
 
 pub(crate) fn activate_local(
-    mut stream: File,
+    stream: WindowsNamedPipeStream,
     negotiated: bool,
     setup_deadline: Option<Instant>,
     ring: ControlRing<WindowsSharedMemory>,
@@ -185,8 +177,8 @@ pub(crate) fn activate_local(
             "broker local setup channel activated before negotiation completed",
         ));
     }
-    write_frame(&mut stream, CONTROL_RING_READY, setup_deadline)?;
-    let ready = read_frame(&mut stream, setup_deadline)?.ok_or_else(|| {
+    write_frame(file_handle(&stream), CONTROL_RING_READY, setup_deadline)?;
+    let ready = read_frame(file_handle(&stream), setup_deadline)?.ok_or_else(|| {
         Error::new(
             ErrorKind::UnexpectedEof,
             "broker closed before control-ring setup acknowledgement",
@@ -204,8 +196,9 @@ pub(crate) fn activate_local(
         notification_consumer,
     } = ring.into_local();
     let pending_calls = Arc::new(PendingCalls::new());
+    let stream = Arc::new(stream);
     let association = Arc::new(LocalRingAssociation {
-        liveness: PipeLiveness::new(stream.try_clone()?, false),
+        liveness: PipeLiveness::new(Arc::clone(&stream), false)?,
         request_wake: request_producer.wake_handle(),
         request_producer: Mutex::new(request_producer),
         response_wake: response_consumer.wake_handle(),
@@ -219,7 +212,7 @@ pub(crate) fn activate_local(
     let monitor_association = Arc::clone(&association);
     thread::Builder::new()
         .name("litebox-broker-liveness".to_owned())
-        .spawn(move || monitor_local_pipe(&mut stream, &monitor_association))?;
+        .spawn(move || monitor_local_pipe(&stream, &monitor_association))?;
     Ok((
         WindowsControlRingLocalCallChannel {
             association: Arc::clone(&association),
@@ -631,38 +624,19 @@ fn dispatch_responses(
 }
 
 impl PipeLiveness {
-    fn new(stream: File, server: bool) -> Self {
-        Self {
+    fn new(stream: Arc<WindowsNamedPipeStream>, server: bool) -> IoResult<Self> {
+        Ok(Self {
             server,
+            shutdown_event: OwnedEvent::manual_reset()?,
             state: Mutex::new(PipeLivenessState {
                 stream: Some(stream),
                 shutdown: false,
-                next_id: 0,
-                threads: HashMap::new(),
             }),
-        }
-    }
-
-    fn register_io(&self) -> IoResult<PipeIoGuard<'_>> {
-        let thread = duplicate_current_thread()?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::other("broker pipe liveness mutex poisoned"))?;
-        if state.shutdown {
-            return Err(Error::new(
-                ErrorKind::ConnectionAborted,
-                "broker association shut down",
-            ));
-        }
-        let id = state.next_id;
-        state.next_id = state.next_id.wrapping_add(1);
-        state.threads.insert(id, thread);
-        Ok(PipeIoGuard { liveness: self, id })
+        })
     }
 
     fn shutdown(&self) -> IoResult<()> {
-        let (stream, threads) = {
+        let stream = {
             let mut state = self
                 .state
                 .lock()
@@ -671,28 +645,10 @@ impl PipeLiveness {
                 return Ok(());
             }
             state.shutdown = true;
-            (
-                state.stream.take(),
-                state
-                    .threads
-                    .values()
-                    .map(|thread| thread.0)
-                    .collect::<Vec<_>>(),
-            )
+            state.stream.take()
         };
 
-        let mut first_error = None;
-        for thread in threads {
-            // SAFETY: The handle is a live duplicate of a thread blocked on the liveness pipe.
-            if unsafe { CancelSynchronousIo(thread) } == 0 {
-                let error = Error::last_os_error();
-                if error.raw_os_error() != Some(ERROR_NOT_FOUND.cast_signed())
-                    && first_error.is_none()
-                {
-                    first_error = Some(error);
-                }
-            }
-        }
+        let mut first_error = self.shutdown_event.set().err();
         if self.server
             && let Some(stream) = &stream
         {
@@ -721,61 +677,44 @@ impl PipeLiveness {
     }
 }
 
-impl Drop for PipeIoGuard<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.liveness.state.lock() {
-            state.threads.remove(&self.id);
+fn monitor_host_pipe(stream: &WindowsNamedPipeStream, association: &HostRingAssociation) {
+    let mut byte = [0];
+    match read_pipe_until_cancelled(
+        file_handle(stream),
+        &mut byte,
+        association.liveness.shutdown_event.handle(),
+    ) {
+        Ok(0) => association.peer_closed(),
+        Ok(_) => {
+            let _ = association.fail(invalid_data(
+                "runner sent unexpected active control-pipe data",
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::ConnectionAborted => {}
+        Err(error) => {
+            let _ = association.fail(error);
         }
     }
 }
 
-fn monitor_host_pipe(stream: &mut File, association: &HostRingAssociation) {
-    let Ok(_io) = association.liveness.register_io() else {
-        return;
-    };
+fn monitor_local_pipe(stream: &WindowsNamedPipeStream, association: &LocalRingAssociation) {
     let mut byte = [0];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => {
-                association.peer_closed();
-                return;
-            }
-            Ok(_) => {
-                let _ = association.fail(invalid_data(
-                    "runner sent unexpected active control-pipe data",
-                ));
-                return;
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => {
-                let _ = association.fail(error);
-                return;
-            }
-        }
-    }
-}
-
-fn monitor_local_pipe(stream: &mut File, association: &LocalRingAssociation) {
-    let Ok(_io) = association.liveness.register_io() else {
-        return;
-    };
-    let mut byte = [0];
-    let error = loop {
-        match stream.read(&mut byte) {
-            Ok(0) => {
-                break Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "broker closed the active association",
-                );
-            }
-            Ok(_) => break invalid_data("broker sent unexpected active control-pipe data"),
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => break error,
-        }
+    let error = match read_pipe_until_cancelled(
+        file_handle(stream),
+        &mut byte,
+        association.liveness.shutdown_event.handle(),
+    ) {
+        Ok(0) => Error::new(
+            ErrorKind::UnexpectedEof,
+            "broker closed the active association",
+        ),
+        Ok(_) => invalid_data("broker sent unexpected active control-pipe data"),
+        Err(error) if error.kind() == ErrorKind::ConnectionAborted => return,
+        Err(error) => error,
     };
     let _ = association.fail(error);
 }
 
-fn file_handle(file: &File) -> HANDLE {
-    file.as_raw_handle()
+fn file_handle(stream: &WindowsNamedPipeStream) -> windows_sys::Win32::Foundation::HANDLE {
+    stream.handle()
 }

@@ -9,8 +9,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, ControlRingDirection, WaitableSharedMemory,
-    memory_permits_byte_range, memory_permits_u32, memory_permits_u64,
+    CONTROL_RING_MEMORY_SIZE, ControlRingDirection, MemoryAccessPolicy, WaitableSharedMemory,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use windows_sys::Win32::Foundation::{
@@ -117,29 +116,6 @@ pub struct WindowsSharedMemory {
     view: NonNull<u8>,
     length: usize,
     policy: MemoryAccessPolicy,
-}
-
-#[derive(Clone, Copy)]
-enum MemoryAccessPolicy {
-    Bytes,
-    ControlRing,
-}
-
-impl MemoryAccessPolicy {
-    const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
-        match self {
-            Self::Bytes => true,
-            Self::ControlRing => memory_permits_byte_range(offset, length),
-        }
-    }
-
-    const fn permits_u32(self, offset: usize) -> bool {
-        matches!(self, Self::ControlRing) && memory_permits_u32(offset)
-    }
-
-    const fn permits_u64(self, offset: usize) -> bool {
-        matches!(self, Self::ControlRing) && memory_permits_u64(offset)
-    }
 }
 
 // SAFETY: The mapping address remains stable until drop. Access is performed by Windows APIs or
