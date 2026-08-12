@@ -150,6 +150,7 @@ impl OpteeShimBuilder {
             boot_instant: TimeProvider::now(self.platform),
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
+            ta_uuid_map: ta_uuid_map(),
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
         });
         OpteeShim(global)
@@ -168,6 +169,8 @@ struct GlobalState {
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The LiteBox instance used throughout the shim.
     _litebox: litebox::LiteBox<Platform>,
+    /// The TA UUID to binary map for TA loading.
+    ta_uuid_map: &'static TaUuidMap,
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
     /// rather than queued.
@@ -184,12 +187,12 @@ impl GlobalState {
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
     pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        ta_uuid_map().insert(*ta_uuid, ta_bin.into())
+        self.ta_uuid_map.insert(*ta_uuid, ta_bin.into())
     }
 
     /// Get the TA binary associated with the given TA UUID.
     pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        if let Some(ta_bin) = ta_uuid_map().get(ta_uuid) {
+        if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
             Some(ta_bin)
         } else {
             let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
@@ -202,7 +205,7 @@ impl GlobalState {
 
     /// Get the TA flags associated with the given TA UUID.
     pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
-        ta_uuid_map().get_flags(ta_uuid).unwrap_or_default()
+        self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
     }
 
     /// Monotonic time elapsed since this instance was created, used as GP
@@ -222,7 +225,7 @@ impl GlobalState {
     ///
     #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
-        let _ = ta_uuid_map().remove(ta_uuid);
+        let _ = self.ta_uuid_map.remove(ta_uuid);
     }
 
     /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
