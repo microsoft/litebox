@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 pub mod pty;
 
+#[cfg(target_arch = "x86_64")]
+const MULTIARCH: &str = "x86_64-linux-gnu";
+#[cfg(target_arch = "aarch64")]
+const MULTIARCH: &str = "aarch64-linux-gnu";
+
 /// Find all dependencies of a given binary via `ldd`
 #[allow(dead_code, reason = "not used by loader.rs for x86")]
 pub fn find_dependencies(prog: &str) -> Vec<String> {
@@ -55,18 +60,31 @@ pub fn find_dependencies(prog: &str) -> Vec<String> {
     // libgcc_s.so.1 is not always a direct link-time dependency (ldd won't list it), but
     // glibc's pthread_cancel needs it at runtime for forced stack unwinding. Without it the
     // we get SIGABRTs.
-    let libgcc_s: Option<String> = [
-        "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
-        "/lib/x86_64-linux-gnu/libgcc_s.so.1",
-        "/usr/lib64/libgcc_s.so.1",
-        "/lib64/libgcc_s.so.1",
-    ]
-    .into_iter()
-    .map(String::from)
-    .find(|p| Path::new(p).exists());
-    if let Some(libgcc_s) = libgcc_s
-        && !paths.contains(&libgcc_s)
-    {
+    let libgcc_s = std::process::Command::new("gcc")
+        .arg("-print-file-name=libgcc_s.so.1")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|path| PathBuf::from(path.trim()))
+        .filter(|path| path.is_absolute() && path.is_file())
+        .or_else(|| {
+            [
+                format!("/usr/lib/{MULTIARCH}/libgcc_s.so.1"),
+                format!("/lib/{MULTIARCH}/libgcc_s.so.1"),
+                String::from("/usr/lib64/libgcc_s.so.1"),
+                String::from("/lib64/libgcc_s.so.1"),
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+        })
+        .expect("libgcc_s.so.1 not found via gcc or known library paths")
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    if !paths.contains(&libgcc_s) {
         paths.push(libgcc_s);
     }
 
@@ -112,11 +130,13 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
     if nolibc {
         args.push("-nostdlib");
     }
-    args.push(match std::env::consts::ARCH {
-        "x86_64" => "-m64",
-        "x86" => "-m32",
-        _ => unimplemented!(),
-    });
+    // Select the x86 ABI explicitly; AArch64 gcc rejects both x86 flags.
+    match std::env::consts::ARCH {
+        "x86_64" => args.push("-m64"),
+        "x86" => args.push("-m32"),
+        "aarch64" => (),
+        arch => unimplemented!("no gcc ABI flag known for {arch}"),
+    }
 
     // Create command string for caching
     let mut command_parts = vec!["gcc"];

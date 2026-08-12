@@ -171,4 +171,12 @@ static inline void expect_poll_lacks(int fd, short events_mask, short forbidden,
     }
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+#define SPIN_HINT() __asm__ __volatile__("pause")
+#elif defined(__aarch64__)
+#define SPIN_HINT() __asm__ __volatile__("yield")
+#else
+#define SPIN_HINT() __asm__ __volatile__("")
+#endif
+
 #endif // LITEBOX_TESTS_HELPERS_H

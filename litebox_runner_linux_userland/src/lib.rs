@@ -370,7 +370,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    #[cfg(target_arch = "x86_64")]
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
         &broker_positional_io_fds,
         &broker_shutdown_fds,

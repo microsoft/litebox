@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#include "helpers.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -19,7 +21,7 @@ void* yield_thread(void* arg) {
 
 void* spin_thread(void* arg) {
     for (;;) {
-        __asm__ __volatile__("pause");
+        SPIN_HINT();
     }
 }
 
