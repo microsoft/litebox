@@ -16,9 +16,7 @@ use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_transport::channel::{HostNotificationChannel, HostReceive};
-use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing,
-};
+use litebox_broker_transport::control_ring::{CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing};
 use litebox_broker_transport::shared_memory::SharedBufferPool;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -55,7 +53,7 @@ fn spawn_host(
         .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
-        let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let control_memory = MemfdSharedMemory::create_control_ring().unwrap();
         let control_ring = ControlRing::new(control_memory).unwrap();
         let mut control = UnixStreamHostSetupChannel::from_accepted(stream);
         let association = setup_connection(
@@ -96,7 +94,7 @@ fn negotiate_local(
         UnixStreamLocalSetupChannel::from_connected(stream),
         |mut setup| {
             let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
-            let control_memory = setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, None)?;
+            let control_memory = setup.receive_control_ring(None)?;
             let control_ring = ControlRing::new(control_memory).map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -139,7 +137,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let host_shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
     let host_shared_buffers =
         SharedBufferPool::new(host_shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
-    let host_control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+    let host_control_memory = MemfdSharedMemory::create_control_ring().unwrap();
     let host_control_ring = ControlRing::new(host_control_memory).unwrap();
     let notification = BrokerNotification::Readiness(ReadinessNotification {
         handle: ObjectHandle(7),
@@ -181,7 +179,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         UnixStreamLocalSetupChannel::from_connected(local_control),
         |mut setup| {
             let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
-            let control_memory = setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, None)?;
+            let control_memory = setup.receive_control_ring(None)?;
             let control_ring = ControlRing::new(control_memory).map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,

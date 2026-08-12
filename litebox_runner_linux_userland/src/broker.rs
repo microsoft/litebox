@@ -15,7 +15,7 @@ use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
+use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
     UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
@@ -51,8 +51,7 @@ pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
         BrokerLocal::negotiate(setup_channel, |mut setup| {
             let shared_memory =
                 setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
-            let control_memory =
-                setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, Some(setup_deadline))?;
+            let control_memory = setup.receive_control_ring(Some(setup_deadline))?;
             let positional_io_fds = [
                 shared_memory.as_fd().as_raw_fd(),
                 control_memory.as_fd().as_raw_fd(),
@@ -271,10 +270,9 @@ mod tests {
         UnixControlRingHostNotificationChannel,
         UnixControlRingHostShutdown,
     ) {
-        let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
-        let host_memory = MemfdSharedMemory::from_received_fd(
+        let local_memory = MemfdSharedMemory::create_control_ring().unwrap();
+        let host_memory = MemfdSharedMemory::control_ring_from_received_fd(
             local_memory.as_fd().try_clone_to_owned().unwrap(),
-            CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
         let local_ring = ControlRing::new(local_memory).unwrap();

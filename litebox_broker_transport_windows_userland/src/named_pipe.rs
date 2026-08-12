@@ -167,6 +167,20 @@ impl WindowsNamedPipeLocalSetupChannel {
         unsafe { WindowsSharedMemory::from_transferred(transfer) }
     }
 
+    /// Receives and maps the shared control ring duplicated into this process.
+    pub fn receive_control_ring(&mut self) -> IoResult<WindowsSharedMemory> {
+        let frame = read_frame(&mut self.stream, self.setup_deadline)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnexpectedEof,
+                "broker closed before transferring control-ring memory",
+            )
+        })?;
+        let transfer = decode_transfer(&frame)?;
+        // SAFETY: The authenticated broker duplicated these handles into this process and encoded
+        // their target-process values in the setup frame.
+        unsafe { WindowsSharedMemory::control_ring_from_transferred(transfer) }
+    }
+
     /// Activates calls and notifications over the transferred shared control ring.
     pub fn into_active(
         self,
@@ -363,7 +377,7 @@ mod tests {
     use litebox_broker_transport::channel::{
         HostNotificationChannel, LocalCallChannel, LocalNotificationChannel,
     };
-    use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
+    use litebox_broker_transport::control_ring::ControlRing;
     use litebox_broker_transport::shared_memory::SharedMemory as _;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 
@@ -378,7 +392,7 @@ mod tests {
         ControlRing<WindowsSharedMemory>,
         ControlRing<WindowsSharedMemory>,
     ) {
-        let local_memory = WindowsSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let local_memory = WindowsSharedMemory::create_control_ring().unwrap();
         let host_memory = local_memory.try_clone_view().unwrap();
         (
             ControlRing::new(local_memory).unwrap(),

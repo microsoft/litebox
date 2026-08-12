@@ -8,13 +8,10 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
-use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
-    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError,
-};
+use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
-use litebox_broker_protocol::socket::{Ipv4Address, Port};
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::channel::HostReceive;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -23,8 +20,8 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 };
 
 use super::{
-    AllowedTcpDestination, HostAssociationShutdown, HostRequestSource, HostResponseSink,
-    SETUP_TIMEOUT,
+    HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
+    configured_socket_policy,
 };
 
 impl HostRequestSource for UnixControlRingHostRequestSource {
@@ -69,31 +66,6 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     )
 }
 
-fn configured_socket_policy(
-    allowed_destinations: &[AllowedTcpDestination],
-) -> Result<SocketPolicy, SocketPolicyError> {
-    if allowed_destinations.is_empty() {
-        return Ok(SocketPolicy::Ipv4Loopback);
-    }
-    let rules = allowed_destinations
-        .iter()
-        .map(|allowed| {
-            DestinationRule::new(
-                CallerCredential::HostGuaranteed,
-                allowed.destination,
-                allowed.ports,
-            )
-        })
-        .collect::<Vec<_>>();
-    let udp_loopback = DestinationRule::new(
-        CallerCredential::HostGuaranteed,
-        Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).expect("the IPv4 loopback CIDR is canonical"),
-        DestinationPortRange::new(Port(1), Port(u16::MAX))
-            .expect("the full nonzero UDP port range is valid"),
-    );
-    SocketPolicy::from_tcp_udp_destination_rules(&rules, &[udp_loopback])
-}
-
 fn serve_runner(
     broker: &BrokerCore,
     control_listener: &UnixListener,
@@ -110,7 +82,8 @@ fn serve_runner(
     crate::serve_runner(
         broker,
         control_channel,
-        MemfdSharedMemory::create,
+        || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
+        MemfdSharedMemory::create_control_ring,
         |channel, shared_memory, control_memory| {
             channel.send_memfd(shared_memory, Some(setup_deadline))?;
             channel.send_memfd(control_memory, Some(setup_deadline))?;
@@ -118,38 +91,4 @@ fn serve_runner(
         },
         UnixStreamHostSetupChannel::into_active,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tcp_destination_arguments_replace_the_loopback_default() {
-        assert_eq!(
-            configured_socket_policy(&[]).unwrap(),
-            SocketPolicy::Ipv4Loopback
-        );
-
-        let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
-        let policy = configured_socket_policy(&[allowed]).unwrap();
-        let rules = policy.tcp_destination_rules().unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(
-            rules[0],
-            DestinationRule::new(
-                CallerCredential::HostGuaranteed,
-                allowed.destination,
-                allowed.ports,
-            )
-        );
-        assert_eq!(
-            policy.udp_destination_rules().unwrap(),
-            &[DestinationRule::new(
-                CallerCredential::HostGuaranteed,
-                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-            )]
-        );
-    }
 }

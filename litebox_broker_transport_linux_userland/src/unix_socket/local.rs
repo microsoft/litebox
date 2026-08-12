@@ -123,6 +123,14 @@ impl UnixStreamLocalSetupChannel {
         crate::memfd::receive_memfd(&mut self.stream, expected_len, deadline)
     }
 
+    /// Receives the control-ring memfd offered by the broker during setup.
+    pub fn receive_control_ring(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> IoResult<MemfdSharedMemory> {
+        crate::memfd::receive_control_ring_memfd(&mut self.stream, deadline)
+    }
+
     /// Consumes a negotiated setup channel into independently usable active
     /// call, notification, and shutdown handles, starting the response
     /// dispatcher and liveness monitor.
@@ -644,7 +652,6 @@ mod control_ring_tests {
     };
     use litebox_broker_protocol::{ObjectHandle, RequestId};
     use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
-    use litebox_broker_transport::control_ring::CONTROL_RING_MEMORY_SIZE;
     use rustix::fs::{OFlags, fcntl_getfl};
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
@@ -706,10 +713,9 @@ mod control_ring_tests {
         ControlRing<MemfdSharedMemory>,
         ControlRing<MemfdSharedMemory>,
     ) {
-        let first = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
-        let second = MemfdSharedMemory::from_received_fd(
+        let first = MemfdSharedMemory::create_control_ring().unwrap();
+        let second = MemfdSharedMemory::control_ring_from_received_fd(
             first.as_fd().try_clone_to_owned().unwrap(),
-            CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
         (

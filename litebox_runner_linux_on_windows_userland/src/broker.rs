@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
+use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_windows_userland::control_ring::{
     WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
 };
@@ -34,7 +34,7 @@ pub(crate) fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
             })?;
     let (local, notifications) = BrokerLocal::negotiate(setup, |mut setup| {
         let shared_memory = Arc::new(setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?);
-        let control_memory = setup.receive_shared_memory(CONTROL_RING_MEMORY_SIZE)?;
+        let control_memory = setup.receive_control_ring()?;
         let control_ring = ControlRing::new(control_memory).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

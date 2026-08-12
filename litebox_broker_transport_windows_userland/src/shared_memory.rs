@@ -15,7 +15,7 @@ use litebox_broker_transport::control_ring::{
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
-    WAIT_OBJECT_0,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{
@@ -23,8 +23,10 @@ use windows_sys::Win32::System::Memory::{
     PAGE_READWRITE, UnmapViewOfFile,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, INFINITE, SetEvent, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject,
 };
+
+const CONTROL_RING_WAIT_RECHECK_TIMEOUT_MS: u32 = 100;
 
 const CONTROL_RING_WAKE_OFFSETS: [usize; 6] = [
     ControlRingDirection::Requests.producer_epoch_offset(),
@@ -124,14 +126,6 @@ enum MemoryAccessPolicy {
 }
 
 impl MemoryAccessPolicy {
-    const fn for_length(length: usize) -> Self {
-        if length == CONTROL_RING_MEMORY_SIZE {
-            Self::ControlRing
-        } else {
-            Self::Bytes
-        }
-    }
-
     const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
         match self {
             Self::Bytes => true,
@@ -156,8 +150,17 @@ unsafe impl Send for WindowsSharedMemory {}
 unsafe impl Sync for WindowsSharedMemory {}
 
 impl WindowsSharedMemory {
-    /// Creates and maps one anonymous page-file-backed shared-memory object.
+    /// Creates and maps one byte-copy shared-memory object.
     pub fn create(length: usize) -> IoResult<Self> {
+        Self::create_with_policy(length, MemoryAccessPolicy::Bytes)
+    }
+
+    /// Creates and maps shared memory for one control ring.
+    pub fn create_control_ring() -> IoResult<Self> {
+        Self::create_with_policy(CONTROL_RING_MEMORY_SIZE, MemoryAccessPolicy::ControlRing)
+    }
+
+    fn create_with_policy(length: usize, policy: MemoryAccessPolicy) -> IoResult<Self> {
         if length == 0 {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -188,12 +191,11 @@ impl WindowsSharedMemory {
         if mapping.is_null() {
             return Err(Error::last_os_error());
         }
-        let wake_handles = if length == CONTROL_RING_MEMORY_SIZE {
-            Some(Arc::new(create_wake_handles()?))
-        } else {
-            None
+        let wake_handles = match policy {
+            MemoryAccessPolicy::Bytes => None,
+            MemoryAccessPolicy::ControlRing => Some(Arc::new(create_wake_handles()?)),
         };
-        Self::map(Arc::new(OwnedHandle(mapping)), wake_handles, length)
+        Self::map(Arc::new(OwnedHandle(mapping)), wake_handles, length, policy)
     }
 
     /// Creates another view of the same mapping.
@@ -202,6 +204,7 @@ impl WindowsSharedMemory {
             Arc::clone(&self.mapping),
             self.wake_handles.clone(),
             self.length,
+            self.policy,
         )
     }
 
@@ -209,6 +212,7 @@ impl WindowsSharedMemory {
         mapping: Arc<OwnedHandle>,
         wake_handles: Option<Arc<[OwnedHandle; CONTROL_RING_WAKE_OFFSETS.len()]>>,
         length: usize,
+        policy: MemoryAccessPolicy,
     ) -> IoResult<Self> {
         // SAFETY: `mapping` is a live file-mapping handle and `length` is its creation size.
         let view = unsafe { MapViewOfFile(mapping.0, FILE_MAP_ALL_ACCESS, 0, 0, length) };
@@ -218,7 +222,7 @@ impl WindowsSharedMemory {
             wake_handles,
             view,
             length,
-            policy: MemoryAccessPolicy::for_length(length),
+            policy,
         })
     }
 
@@ -244,18 +248,44 @@ impl WindowsSharedMemory {
         })
     }
 
-    /// Reconstructs a mapping from handles duplicated into the current process.
+    /// Reconstructs byte-copy memory from a mapping handle duplicated into this process.
     ///
     /// # Safety
     ///
     /// Every handle must be live, owned by the caller, and valid in the current process. The first
-    /// handle must name a mapping of exactly `length` bytes. Control-ring mappings must additionally
-    /// contain the six event handles in the transport-defined order.
+    /// handle must name a mapping of exactly `length` bytes.
     pub(crate) unsafe fn from_transferred(transfer: TransferredSharedMemory) -> IoResult<Self> {
-        let expected_handles = if transfer.length == CONTROL_RING_MEMORY_SIZE {
-            1 + CONTROL_RING_WAKE_OFFSETS.len()
-        } else {
-            1
+        // SAFETY: The caller upholds the handle validity requirements documented above.
+        unsafe { Self::from_transferred_with_policy(transfer, MemoryAccessPolicy::Bytes) }
+    }
+
+    /// Reconstructs control-ring memory from handles duplicated into the current process.
+    ///
+    /// # Safety
+    ///
+    /// Every handle must be live, owned by the caller, and valid in the current process. The first
+    /// handle must name a mapping of exactly [`CONTROL_RING_MEMORY_SIZE`] bytes, followed by the six
+    /// event handles in the transport-defined order.
+    pub(crate) unsafe fn control_ring_from_transferred(
+        transfer: TransferredSharedMemory,
+    ) -> IoResult<Self> {
+        if transfer.length != CONTROL_RING_MEMORY_SIZE {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "invalid transferred control-ring length",
+            ));
+        }
+        // SAFETY: The caller upholds the handle validity requirements documented above.
+        unsafe { Self::from_transferred_with_policy(transfer, MemoryAccessPolicy::ControlRing) }
+    }
+
+    unsafe fn from_transferred_with_policy(
+        transfer: TransferredSharedMemory,
+        policy: MemoryAccessPolicy,
+    ) -> IoResult<Self> {
+        let expected_handles = match policy {
+            MemoryAccessPolicy::Bytes => 1,
+            MemoryAccessPolicy::ControlRing => 1 + CONTROL_RING_WAKE_OFFSETS.len(),
         };
         if transfer.length == 0 || transfer.handles.len() != expected_handles {
             return Err(Error::new(
@@ -285,7 +315,7 @@ impl WindowsSharedMemory {
                 )
             })?))
         };
-        Self::map(mapping, wake_handles, transfer.length)
+        Self::map(mapping, wake_handles, transfer.length, policy)
     }
 
     fn checked_address(
@@ -504,8 +534,8 @@ impl WaitableSharedMemory for WindowsSharedMemory {
             return Ok(());
         }
         // SAFETY: `event` is a live event handle owned by this memory object.
-        match unsafe { WaitForSingleObject(event, INFINITE) } {
-            WAIT_OBJECT_0 => Ok(()),
+        match unsafe { WaitForSingleObject(event, CONTROL_RING_WAIT_RECHECK_TIMEOUT_MS) } {
+            WAIT_OBJECT_0 | WAIT_TIMEOUT => Ok(()),
             WAIT_FAILED => Err(Error::last_os_error()),
             _ => Err(Error::other("unexpected control-ring wait result")),
         }
@@ -530,7 +560,7 @@ mod tests {
 
     #[test]
     fn cloned_views_share_control_ring_messages() {
-        let local_memory = WindowsSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let local_memory = WindowsSharedMemory::create_control_ring().unwrap();
         let broker_memory = local_memory.try_clone_view().unwrap();
         let mut local = ControlRing::new(local_memory).unwrap().into_local();
         let mut broker = ControlRing::new(broker_memory).unwrap().into_broker();
@@ -549,7 +579,7 @@ mod tests {
 
     #[test]
     fn cloned_views_wake_blocked_control_ring_consumer() {
-        let local_memory = WindowsSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let local_memory = WindowsSharedMemory::create_control_ring().unwrap();
         let broker_memory = local_memory.try_clone_view().unwrap();
         let mut local = ControlRing::new(local_memory).unwrap().into_local();
         let mut broker = ControlRing::new(broker_memory).unwrap().into_broker();
@@ -579,14 +609,43 @@ mod tests {
     }
 
     #[test]
+    fn event_wait_returns_without_peer_cooperation() {
+        let memory = WindowsSharedMemory::create_control_ring().unwrap();
+        let epoch_offset = CONTROL_RING_WAKE_OFFSETS[0];
+        let start = std::time::Instant::now();
+
+        memory.wait_while_equal(epoch_offset, 0).unwrap();
+
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn byte_memory_does_not_infer_control_ring_from_length() {
+        let memory = WindowsSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let epoch_offset = CONTROL_RING_WAKE_OFFSETS[0];
+
+        assert_eq!(
+            memory.wake_one(epoch_offset).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        let transfer = memory
+            .duplicate_to_process(unsafe { GetCurrentProcess() })
+            .unwrap();
+        assert_eq!(transfer.handles.len(), 1);
+        // SAFETY: DuplicateHandle created the transferred mapping handle in this process.
+        unsafe { WindowsSharedMemory::from_transferred(transfer) }.unwrap();
+    }
+
+    #[test]
     fn duplicated_handles_reconstruct_control_ring_view() {
-        let local_memory = WindowsSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let local_memory = WindowsSharedMemory::create_control_ring().unwrap();
         let transfer = local_memory
             .duplicate_to_process(unsafe { GetCurrentProcess() })
             .unwrap();
         // SAFETY: DuplicateHandle created every transferred handle in this process, and the source
         // mapping remains alive for the duration of the reconstructed view.
-        let broker_memory = unsafe { WindowsSharedMemory::from_transferred(transfer) }.unwrap();
+        let broker_memory =
+            unsafe { WindowsSharedMemory::control_ring_from_transferred(transfer) }.unwrap();
         let mut local = ControlRing::new(local_memory).unwrap().into_local();
         let mut broker = ControlRing::new(broker_memory).unwrap().into_broker();
 

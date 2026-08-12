@@ -5,7 +5,7 @@
 
 use std::error::Error;
 use std::ffi::OsString;
-use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::io::Result as IoResult;
 use std::os::windows::io::AsRawHandle;
 use std::process::Child;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use std::time::Instant;
 use litebox_broker_core::socket::UnsupportedSocketProvider;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::channel::HostReceive;
 use litebox_broker_transport_windows_userland::control_ring::{
     WindowsControlRingHostRequestSource, WindowsControlRingHostResponseSink,
@@ -24,7 +25,10 @@ use litebox_broker_transport_windows_userland::named_pipe::{
 };
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 
-use super::{HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT};
+use super::{
+    HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
+    configured_socket_policy,
+};
 
 impl HostRequestSource for WindowsControlRingHostRequestSource {
     fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
@@ -45,17 +49,11 @@ impl HostAssociationShutdown for WindowsControlRingHostShutdown {
 }
 
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
-    if !args.allow_tcp_destination.is_empty() {
-        return Err(IoError::new(
-            ErrorKind::Unsupported,
-            "--allow-tcp-destination is not supported on Windows",
-        )
-        .into());
-    }
     let control_pipe = unique_control_pipe_name();
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
     let broker = BrokerCore::new(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
+        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+            .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
         Arc::new(UnsupportedSocketProvider),
     )?;
 
@@ -81,7 +79,8 @@ fn serve_runner(
     crate::serve_runner(
         broker,
         control_channel,
-        WindowsSharedMemory::create,
+        || WindowsSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
+        WindowsSharedMemory::create_control_ring,
         |channel, shared_memory, control_memory| {
             channel.send_shared_memory(shared_memory, runner_process)?;
             channel.send_shared_memory(control_memory, runner_process)

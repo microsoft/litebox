@@ -16,13 +16,16 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use litebox_broker_core::{BrokerCore, DestinationPortRange, Ipv4Cidr};
+use litebox_broker_core::{
+    BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
+    SocketPolicyError,
+};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
-use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
 use litebox_broker_transport::channel::{HostNotificationChannel, HostReceive, HostSetupChannel};
-use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
+use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
 
 use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
@@ -120,10 +123,36 @@ fn run_runner_process(
     Ok(())
 }
 
+fn configured_socket_policy(
+    allowed_destinations: &[AllowedTcpDestination],
+) -> Result<SocketPolicy, SocketPolicyError> {
+    if allowed_destinations.is_empty() {
+        return Ok(SocketPolicy::Ipv4Loopback);
+    }
+    let rules = allowed_destinations
+        .iter()
+        .map(|allowed| {
+            DestinationRule::new(
+                CallerCredential::HostGuaranteed,
+                allowed.destination,
+                allowed.ports,
+            )
+        })
+        .collect::<Vec<_>>();
+    let udp_loopback = DestinationRule::new(
+        CallerCredential::HostGuaranteed,
+        Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).expect("the IPv4 loopback CIDR is canonical"),
+        DestinationPortRange::new(Port(1), Port(u16::MAX))
+            .expect("the full nonzero UDP port range is valid"),
+    );
+    SocketPolicy::from_tcp_udp_destination_rules(&rules, &[udp_loopback])
+}
+
 fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
     broker: &BrokerCore,
     mut control_channel: SetupChannel,
-    create_memory: impl Fn(usize) -> IoResult<Memory>,
+    create_shared_memory: impl FnOnce() -> IoResult<Memory>,
+    create_control_memory: impl FnOnce() -> IoResult<Memory>,
     send_shared_memory: impl FnOnce(&mut SetupChannel, &Memory, &Memory) -> IoResult<()>,
     activate: impl FnOnce(
         SetupChannel,
@@ -138,9 +167,9 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown + Send + Sync,
 {
-    let shared_memory = create_memory(SHARED_BUFFER_POOL_SIZE)?;
+    let shared_memory = create_shared_memory()?;
     let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)?;
-    let control_memory = create_memory(CONTROL_RING_MEMORY_SIZE)?;
+    let control_memory = create_control_memory()?;
     let control_ring = ControlRing::new(control_memory)
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let readiness = Arc::new(ReadinessPublisherRuntime::new());
@@ -185,35 +214,6 @@ where
         shutdown,
     )?;
     Ok(())
-}
-
-fn accept_runner_channel<Channel>(
-    runner: &mut Child,
-    deadline: Instant,
-    channel_name: &'static str,
-    mut try_accept: impl FnMut() -> IoResult<Channel>,
-) -> IoResult<Channel> {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(IoError::new(
-                ErrorKind::TimedOut,
-                format!("timed out waiting for runner {channel_name} channel"),
-            ));
-        }
-        if let Some(status) = runner.try_wait()? {
-            return Err(IoError::new(
-                ErrorKind::BrokenPipe,
-                format!("runner exited with {status} before connecting its {channel_name} channel"),
-            ));
-        }
-        match try_accept() {
-            Ok(channel) => return Ok(channel),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
-        std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
-    }
 }
 
 trait HostRequestSource {
@@ -504,6 +504,35 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
     }
 }
 
+fn accept_runner_channel<Channel>(
+    runner: &mut Child,
+    deadline: Instant,
+    channel_name: &'static str,
+    mut try_accept: impl FnMut() -> IoResult<Channel>,
+) -> IoResult<Channel> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                format!("timed out waiting for runner {channel_name} channel"),
+            ));
+        }
+        if let Some(status) = runner.try_wait()? {
+            return Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                format!("runner exited with {status} before connecting its {channel_name} channel"),
+            ));
+        }
+        match try_accept() {
+            Ok(channel) => return Ok(channel),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     linux::run(CliArgs::parse())
@@ -556,6 +585,35 @@ mod cli_tests {
         );
         assert!("203.0.113.0/24:0".parse::<AllowedTcpDestination>().is_err());
     }
+
+    #[test]
+    fn tcp_destination_arguments_replace_the_loopback_default() {
+        assert_eq!(
+            configured_socket_policy(&[]).unwrap(),
+            SocketPolicy::Ipv4Loopback
+        );
+
+        let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
+        let policy = configured_socket_policy(&[allowed]).unwrap();
+        let rules = policy.tcp_destination_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0],
+            DestinationRule::new(
+                CallerCredential::HostGuaranteed,
+                allowed.destination,
+                allowed.ports,
+            )
+        );
+        assert_eq!(
+            policy.udp_destination_rules().unwrap(),
+            &[DestinationRule::new(
+                CallerCredential::HostGuaranteed,
+                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            )]
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -576,7 +634,7 @@ mod tests {
     use litebox_broker_transport::channel::{
         HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
     };
-    use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
+    use litebox_broker_transport::control_ring::ControlRing;
     use litebox_broker_transport::shared_memory::SharedBufferPool;
     use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
     use litebox_broker_transport_linux_userland::unix_socket::{
@@ -614,10 +672,9 @@ mod tests {
             })
             .unwrap();
         local_setup.recv_handshake_response().unwrap().unwrap();
-        let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
-        let host_memory = MemfdSharedMemory::from_received_fd(
+        let local_memory = MemfdSharedMemory::create_control_ring().unwrap();
+        let host_memory = MemfdSharedMemory::control_ring_from_received_fd(
             local_memory.as_fd().try_clone_to_owned().unwrap(),
-            CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
         let local_ring = ControlRing::new(local_memory).unwrap();
@@ -657,7 +714,7 @@ mod tests {
             UnixStreamLocalSetupChannel::from_connected(stream),
             |mut setup| {
                 let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
-                let control_memory = setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, None)?;
+                let control_memory = setup.receive_control_ring(None)?;
                 let control_ring = ControlRing::new(control_memory).map_err(|error| {
                     IoError::new(
                         ErrorKind::InvalidData,
@@ -698,7 +755,7 @@ mod tests {
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
             let shared_buffers =
                 SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
-            let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+            let control_memory = MemfdSharedMemory::create_control_ring().unwrap();
             let control_ring = ControlRing::new(control_memory).unwrap();
             let mut control = UnixStreamHostSetupChannel::from_host_guaranteed(
                 host_stream,
