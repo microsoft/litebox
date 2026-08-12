@@ -7,11 +7,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result as IoResult};
 use std::os::windows::io::AsRawHandle;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use litebox_broker_protocol::RequestId;
 use litebox_broker_protocol::message::{BrokerNotification, BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::wire::{
     WireError, decode_notification, decode_request, decode_response, encode_notification,
@@ -28,14 +27,12 @@ use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_PIPE_NOT_CONNECTED, 
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
 
+use crate::pending_calls::{PendingCalls, pending_calls_error};
 use crate::setup::{
     OwnedThreadHandle, copy_io_error, duplicate_current_thread, invalid_data, read_frame,
     ring_error, wire_error, write_frame,
 };
 use crate::shared_memory::WindowsSharedMemory;
-
-/// Maximum number of active calls waiting for broker responses.
-pub const MAX_PENDING_CALLS: usize = 64;
 
 /// Request-reading endpoint of an active host control-ring association.
 pub struct WindowsControlRingHostRequestSource {
@@ -93,26 +90,6 @@ struct LocalRingAssociation {
     request_wake: ControlRingWakeHandle<WindowsSharedMemory>,
     response_wake: ControlRingWakeHandle<WindowsSharedMemory>,
     notification_wake: ControlRingWakeHandle<WindowsSharedMemory>,
-}
-
-struct PendingCalls {
-    state: Mutex<PendingCallsState>,
-    capacity_available: Condvar,
-}
-
-struct PendingCallsState {
-    calls: HashMap<RequestId, Arc<PendingCall>>,
-    failure: Option<Arc<Error>>,
-}
-
-struct PendingCall {
-    result: Mutex<Option<PendingCallResult>>,
-    result_ready: Condvar,
-}
-
-enum PendingCallResult {
-    Response(BrokerResponse),
-    Failure(Arc<Error>),
 }
 
 struct PipeLiveness {
@@ -486,7 +463,10 @@ impl LocalCallChannel for WindowsControlRingLocalCallChannel {
     fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
         let association = &self.association;
         let request_id = request.request_id;
-        let pending_call = association.pending_calls.register(request_id)?;
+        let pending_call = association
+            .pending_calls
+            .register(request_id)
+            .map_err(pending_calls_error)?;
         let frame = encode_request(request);
         let write_result = {
             let mut producer = association
@@ -496,7 +476,8 @@ impl LocalCallChannel for WindowsControlRingLocalCallChannel {
             loop {
                 let status = association
                     .pending_calls
-                    .run_if_live(|| producer.try_write(&frame).map_err(ring_error));
+                    .run_if_live(|| producer.try_write(&frame).map_err(ring_error))
+                    .map_err(pending_calls_error);
                 match status {
                     Ok(ControlRingWriteStatus::Written) => {
                         break producer.wake_consumer();
@@ -513,7 +494,7 @@ impl LocalCallChannel for WindowsControlRingLocalCallChannel {
         if let Err(error) = write_result {
             let _ = association.fail(error);
         }
-        pending_call.wait()
+        pending_call.wait().map_err(|error| copy_io_error(&error))
     }
 }
 
@@ -567,128 +548,6 @@ impl LocalNotificationChannel for WindowsControlRingLocalNotificationChannel {
     }
 }
 
-impl PendingCall {
-    fn new() -> Self {
-        Self {
-            result: Mutex::new(None),
-            result_ready: Condvar::new(),
-        }
-    }
-
-    fn resolve(&self, result: PendingCallResult) {
-        let mut stored = self
-            .result
-            .lock()
-            .expect("broker pending-call result mutex poisoned");
-        assert!(stored.is_none(), "broker pending call already resolved");
-        *stored = Some(result);
-        self.result_ready.notify_one();
-    }
-
-    fn wait(&self) -> IoResult<BrokerResponse> {
-        let mut result = self
-            .result
-            .lock()
-            .expect("broker pending-call result mutex poisoned");
-        loop {
-            if let Some(result) = result.take() {
-                return match result {
-                    PendingCallResult::Response(response) => Ok(response),
-                    PendingCallResult::Failure(error) => Err(copy_io_error(&error)),
-                };
-            }
-            result = self
-                .result_ready
-                .wait(result)
-                .expect("broker pending-call result mutex poisoned");
-        }
-    }
-}
-
-impl PendingCalls {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(PendingCallsState {
-                calls: HashMap::new(),
-                failure: None,
-            }),
-            capacity_available: Condvar::new(),
-        }
-    }
-
-    fn register(&self, request_id: RequestId) -> IoResult<Arc<PendingCall>> {
-        let pending_call = Arc::new(PendingCall::new());
-        let mut state = self.state.lock().expect("broker pending mutex poisoned");
-        while state.calls.len() == MAX_PENDING_CALLS && state.failure.is_none() {
-            state = self
-                .capacity_available
-                .wait(state)
-                .expect("broker pending mutex poisoned");
-        }
-        if let Some(error) = state.failure.as_ref() {
-            return Err(copy_io_error(error));
-        }
-        match state.calls.entry(request_id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Arc::clone(&pending_call));
-            }
-            std::collections::hash_map::Entry::Occupied(_) => {
-                return Err(invalid_data("duplicate broker request ID"));
-            }
-        }
-        Ok(pending_call)
-    }
-
-    fn complete(&self, response: BrokerResponse) -> IoResult<()> {
-        let pending_call = {
-            let mut state = self.state.lock().expect("broker pending mutex poisoned");
-            if let Some(error) = state.failure.as_ref() {
-                return Err(copy_io_error(error));
-            }
-            let Some(pending_call) = state.calls.remove(&response.request_id) else {
-                return Err(invalid_data("broker returned an unknown response ID"));
-            };
-            self.capacity_available.notify_one();
-            pending_call
-        };
-        pending_call.resolve(PendingCallResult::Response(response));
-        Ok(())
-    }
-
-    fn record_failure(&self, error: Arc<Error>) {
-        let pending_calls = {
-            let mut state = self.state.lock().expect("broker pending mutex poisoned");
-            if state.failure.is_some() {
-                return;
-            }
-            state.failure = Some(Arc::clone(&error));
-            let pending_calls = core::mem::take(&mut state.calls);
-            self.capacity_available.notify_all();
-            pending_calls
-        };
-        for pending_call in pending_calls.into_values() {
-            pending_call.resolve(PendingCallResult::Failure(Arc::clone(&error)));
-        }
-    }
-
-    fn current_failure(&self) -> Option<Arc<Error>> {
-        self.state
-            .lock()
-            .expect("broker pending mutex poisoned")
-            .failure
-            .as_ref()
-            .map(Arc::clone)
-    }
-
-    fn run_if_live<T>(&self, operation: impl FnOnce() -> IoResult<T>) -> IoResult<T> {
-        let state = self.state.lock().expect("broker pending mutex poisoned");
-        if let Some(error) = state.failure.as_ref() {
-            return Err(copy_io_error(error));
-        }
-        operation()
-    }
-}
-
 impl LocalRingAssociation {
     fn acknowledge_notification(
         &self,
@@ -701,12 +560,15 @@ impl LocalRingAssociation {
         &self,
         consumer: &mut ControlRingConsumer<WindowsSharedMemory>,
     ) -> IoResult<()> {
-        let result = self.pending_calls.run_if_live(|| {
-            consumer
-                .publish_head()
-                .map_err(ring_error)
-                .and_then(|()| consumer.wake_producer())
-        });
+        let result = self
+            .pending_calls
+            .run_if_live(|| {
+                consumer
+                    .publish_head()
+                    .map_err(ring_error)
+                    .and_then(|()| consumer.wake_producer())
+            })
+            .map_err(pending_calls_error);
         if let Err(error) = result {
             let result = Err(copy_io_error(&error));
             let _ = self.fail(error);
@@ -736,7 +598,12 @@ fn dispatch_responses(
                     .publish_head()
                     .map_err(ring_error)
                     .and_then(|()| consumer.wake_producer())
-                    .and_then(|()| association.pending_calls.complete(response))
+                    .and_then(|()| {
+                        association
+                            .pending_calls
+                            .complete(response)
+                            .map_err(pending_calls_error)
+                    })
                 {
                     let _ = association.fail(error);
                     return;

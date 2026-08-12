@@ -19,6 +19,7 @@
 
 #![cfg(target_os = "linux")]
 
+mod pending_calls;
 mod setup;
 
 pub mod memfd;

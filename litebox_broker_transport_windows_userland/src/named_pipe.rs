@@ -668,7 +668,7 @@ mod tests {
                 setup.into_active(host_ring).unwrap();
 
             let mut published = Vec::new();
-            for _ in 0..crate::control_ring::MAX_PENDING_CALLS {
+            for _ in 0..litebox_broker_transport::pending_calls::MAX_PENDING_CALLS {
                 let HostReceive::Message(request) = requests.recv_request().unwrap() else {
                     panic!("expected pending request");
                 };
@@ -699,8 +699,10 @@ mod tests {
         setup.recv_handshake_response().unwrap().unwrap();
         let (calls, _notifications) = setup.into_active(local_ring).unwrap();
         let calls = Arc::new(calls);
-        let start = Arc::new(Barrier::new(crate::control_ring::MAX_PENDING_CALLS + 2));
-        let callers = (0..=crate::control_ring::MAX_PENDING_CALLS)
+        let start = Arc::new(Barrier::new(
+            litebox_broker_transport::pending_calls::MAX_PENDING_CALLS + 2,
+        ));
+        let callers = (0..=litebox_broker_transport::pending_calls::MAX_PENDING_CALLS)
             .map(|id| {
                 let calls = Arc::clone(&calls);
                 let start = Arc::clone(&start);

@@ -9,6 +9,7 @@
 #![cfg(all(windows, target_arch = "x86_64"))]
 
 pub mod control_ring;
+mod pending_calls;
 mod setup;
 pub mod shared_memory;
 
