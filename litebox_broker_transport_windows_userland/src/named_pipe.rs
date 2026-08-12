@@ -3,11 +3,8 @@
 
 //! Broker setup channels over Windows named pipes.
 
-mod host;
-mod local;
-
-pub use host::{WindowsNamedPipeHostSetupChannel, validate_client_process};
-pub use local::WindowsNamedPipeLocalSetupChannel;
+pub use crate::host::{WindowsNamedPipeHostSetupChannel, validate_client_process};
+pub use crate::local::WindowsNamedPipeLocalSetupChannel;
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -22,6 +19,8 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 use crate::setup::OverlappedOperation;
+
+pub(crate) const TRANSFER_FRAME_TAG: u8 = 0xa1;
 
 /// One server-side named-pipe instance waiting for a single broker peer.
 pub struct WindowsNamedPipeListener {
@@ -114,6 +113,10 @@ impl Drop for WindowsNamedPipeListener {
 }
 
 impl WindowsNamedPipeStream {
+    pub(crate) const fn from_file(file: File) -> Self {
+        Self(file)
+    }
+
     pub(crate) fn handle(&self) -> HANDLE {
         self.0.as_raw_handle()
     }
@@ -130,10 +133,6 @@ fn wide_string(value: &OsStr) -> IoResult<Vec<u16>> {
     }
     value.push(0);
     Ok(value)
-}
-
-fn file_handle(stream: &WindowsNamedPipeStream) -> HANDLE {
-    stream.handle()
 }
 
 #[cfg(test)]
@@ -254,7 +253,7 @@ mod tests {
         });
         let stream = accept_stream_guaranteed(listener);
         let local = client.join().unwrap();
-        write_frame(file_handle(&local.stream), b"ready", None).unwrap();
+        write_frame(local.stream.handle(), b"ready", None).unwrap();
         let mut host =
             WindowsNamedPipeHostSetupChannel::from_host_guaranteed(stream, Instant::now());
 

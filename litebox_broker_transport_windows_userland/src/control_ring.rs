@@ -3,16 +3,13 @@
 
 //! Active Windows-userland broker endpoints over a shared control ring.
 
-mod host;
-mod local;
-
-pub(crate) use host::activate_host;
-pub use host::{
+pub use crate::host::{
     WindowsControlRingHostNotificationChannel, WindowsControlRingHostRequestSource,
     WindowsControlRingHostResponseSink, WindowsControlRingHostShutdown,
 };
-pub(crate) use local::activate_local;
-pub use local::{WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel};
+pub use crate::local::{
+    WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
+};
 
 use std::io::{Error, Result as IoResult};
 use std::sync::{Arc, Mutex};
@@ -22,7 +19,7 @@ use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
 use crate::named_pipe::WindowsNamedPipeStream;
 use crate::setup::OwnedEvent;
 
-struct PipeLiveness {
+pub(crate) struct PipeLiveness {
     server: bool,
     shutdown_event: OwnedEvent,
     state: Mutex<PipeLivenessState>,
@@ -34,7 +31,7 @@ struct PipeLivenessState {
 }
 
 impl PipeLiveness {
-    fn new(stream: Arc<WindowsNamedPipeStream>, server: bool) -> IoResult<Self> {
+    pub(crate) fn new(stream: Arc<WindowsNamedPipeStream>, server: bool) -> IoResult<Self> {
         Ok(Self {
             server,
             shutdown_event: OwnedEvent::manual_reset()?,
@@ -45,7 +42,7 @@ impl PipeLiveness {
         })
     }
 
-    fn shutdown(&self) -> IoResult<()> {
+    pub(crate) fn shutdown(&self) -> IoResult<()> {
         let stream = {
             let mut state = self
                 .state
@@ -79,11 +76,15 @@ impl PipeLiveness {
         }
     }
 
-    fn peer_closed(&self) {
+    pub(crate) fn peer_closed(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.shutdown = true;
             state.stream.take();
         }
+    }
+
+    pub(crate) fn shutdown_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.shutdown_event.handle()
     }
 }
 
