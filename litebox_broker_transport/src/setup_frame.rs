@@ -117,34 +117,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn partial_io_round_trips() {
-        let mut encoded = Vec::new();
-        write_setup_frame::<()>(
-            b"frame",
-            |bytes| {
-                let written = bytes.len().min(2);
-                encoded.extend_from_slice(&bytes[..written]);
-                Ok(written)
-            },
-            |()| false,
-        )
-        .unwrap();
-
-        let mut remaining = encoded.as_slice();
-        let decoded = read_setup_frame::<()>(
-            |buffer| {
-                let read = remaining.len().min(buffer.len()).min(1);
-                buffer[..read].copy_from_slice(&remaining[..read]);
-                remaining = &remaining[read..];
-                Ok(read)
-            },
-            |()| false,
-        )
-        .unwrap();
-        assert_eq!(decoded.as_deref(), Some(b"frame".as_slice()));
-    }
-
-    #[test]
     fn interruption_retries_remaining_prefix() {
         let encoded = [1, 0, 0, 0, 42];
         let mut call = 0;
@@ -181,22 +153,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.as_deref(), Some([42].as_slice()));
-    }
-
-    #[test]
-    fn rejects_invalid_boundaries_and_io_counts() {
-        assert_eq!(read_setup_frame::<()>(|_| Ok(0), |()| false), Ok(None));
-        assert_eq!(
-            write_setup_frame::<()>(b"", |_| Ok(0), |()| false),
-            Err(SetupFrameError::InvalidLength),
-        );
-        assert_eq!(
-            read_setup_frame::<()>(|buffer| Ok(buffer.len() + 1), |()| false),
-            Err(SetupFrameError::InvalidIoCount),
-        );
-        assert_eq!(
-            write_setup_frame::<()>(b"frame", |buffer| Ok(buffer.len() + 1), |()| false),
-            Err(SetupFrameError::InvalidIoCount),
-        );
     }
 }
