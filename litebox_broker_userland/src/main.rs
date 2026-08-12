@@ -27,7 +27,7 @@ use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
 use litebox_broker_transport::channel::HostReceive;
-use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
+use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -180,7 +180,7 @@ fn serve_runner(
     )?;
     let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE)?;
     let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)?;
-    let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE)?;
+    let control_memory = MemfdSharedMemory::create_control_ring()?;
     let control_ring = ControlRing::new(control_memory)
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let mut control_channel =
@@ -616,10 +616,9 @@ mod tests {
             })
             .unwrap();
         local_setup.recv_handshake_response().unwrap().unwrap();
-        let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
-        let host_memory = MemfdSharedMemory::from_received_fd(
+        let local_memory = MemfdSharedMemory::create_control_ring().unwrap();
+        let host_memory = MemfdSharedMemory::control_ring_from_received_fd(
             local_memory.as_fd().try_clone_to_owned().unwrap(),
-            CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
         let local_ring = ControlRing::new(local_memory).unwrap();
@@ -662,7 +661,7 @@ mod tests {
             UnixStreamLocalSetupChannel::from_connected(stream),
             |mut setup| {
                 let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
-                let control_memory = setup.receive_memfd(CONTROL_RING_MEMORY_SIZE, None)?;
+                let control_memory = setup.receive_control_ring(None)?;
                 let control_ring = ControlRing::new(control_memory).map_err(|error| {
                     IoError::new(
                         ErrorKind::InvalidData,
@@ -705,7 +704,7 @@ mod tests {
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
             let shared_buffers =
                 SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
-            let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+            let control_memory = MemfdSharedMemory::create_control_ring().unwrap();
             let control_ring = ControlRing::new(control_memory).unwrap();
             let mut control = UnixStreamHostSetupChannel::from_host_guaranteed(
                 host_stream,

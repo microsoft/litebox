@@ -13,7 +13,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
-use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
+use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
@@ -123,10 +123,8 @@ fn run_fake_runner(args: &[OsString]) {
             SHARED_BUFFER_POOL_SIZE,
             Some(Instant::now() + Duration::from_secs(5)),
         )?;
-        let control_memory = setup.receive_memfd(
-            CONTROL_RING_MEMORY_SIZE,
-            Some(Instant::now() + Duration::from_secs(5)),
-        )?;
+        let control_memory =
+            setup.receive_control_ring(Some(Instant::now() + Duration::from_secs(5)))?;
         let control_ring = ControlRing::new(control_memory).map_err(|error| {
             std::io::Error::new(
                 ErrorKind::InvalidData,
