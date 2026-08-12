@@ -18,13 +18,15 @@ use std::time::Instant;
 
 use litebox_broker_protocol::wire::WireError;
 use litebox_broker_transport::control_ring::ControlRingError;
+#[cfg(test)]
+use litebox_broker_transport::setup_frame::MAX_SETUP_FRAME_LEN;
+use litebox_broker_transport::setup_frame::{
+    SetupFrameError, read_setup_frame as read_frame, write_setup_frame as write_frame,
+};
 
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
 };
-
-/// Largest setup frame either endpoint accepts or produces.
-const MAX_SETUP_FRAME_LEN: usize = 64 * 1024;
 
 /// Reads one length-prefixed setup frame, bounded by `deadline`.
 ///
@@ -34,36 +36,14 @@ pub(crate) fn read_setup_frame(
     deadline: Option<Instant>,
 ) -> IoResult<Option<Vec<u8>>> {
     with_read_deadline(stream, deadline, |stream, deadline| {
-        let mut len_buf = [0; 4];
-        let mut read = 0;
-        while read < len_buf.len() {
-            refresh_read_deadline(stream, deadline)?;
-            match stream.read(&mut len_buf[read..]) {
-                Ok(0) if read == 0 => return Ok(None),
-                Ok(0) => return Err(invalid_data("truncated broker setup frame length")),
-                Ok(len) => read += len,
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > MAX_SETUP_FRAME_LEN {
-            return Err(invalid_data("invalid broker setup frame length"));
-        }
-
-        let mut frame = vec![0; len];
-        let mut read = 0;
-        while read < frame.len() {
-            refresh_read_deadline(stream, deadline)?;
-            match stream.read(&mut frame[read..]) {
-                Ok(0) => return Err(invalid_data("truncated broker setup frame")),
-                Ok(len) => read += len,
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(Some(frame))
+        read_frame(
+            |buffer| {
+                refresh_read_deadline(stream, deadline)?;
+                stream.read(buffer)
+            },
+            |error| error.kind() == ErrorKind::Interrupted,
+        )
+        .map_err(frame_error)
     })
 }
 
@@ -74,36 +54,29 @@ pub(crate) fn write_setup_frame(
     deadline: Option<Instant>,
 ) -> IoResult<()> {
     with_write_deadline(stream, deadline, |stream, deadline| {
-        if frame.is_empty() || frame.len() > MAX_SETUP_FRAME_LEN {
-            return Err(invalid_data("invalid broker setup frame length"));
-        }
-        let len =
-            u32::try_from(frame.len()).map_err(|_| invalid_data("broker setup frame too large"))?;
-        write_all_with_deadline(stream, &len.to_le_bytes(), deadline)?;
-        write_all_with_deadline(stream, frame, deadline)
+        write_frame(
+            frame,
+            |buffer| {
+                refresh_write_deadline(stream, deadline)?;
+                stream.write(buffer)
+            },
+            |error| error.kind() == ErrorKind::Interrupted,
+        )
+        .map_err(frame_error)
     })
 }
 
-fn write_all_with_deadline(
-    stream: &mut UnixStream,
-    mut buffer: &[u8],
-    deadline: Option<Instant>,
-) -> IoResult<()> {
-    while !buffer.is_empty() {
-        refresh_write_deadline(stream, deadline)?;
-        match stream.write(buffer) {
-            Ok(0) => {
-                return Err(Error::new(
-                    ErrorKind::WriteZero,
-                    "failed to write broker setup frame",
-                ));
-            }
-            Ok(written) => buffer = &buffer[written..],
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+fn frame_error(error: SetupFrameError<Error>) -> Error {
+    match error {
+        SetupFrameError::Io(error) => error,
+        SetupFrameError::TruncatedLength => invalid_data("truncated broker setup frame length"),
+        SetupFrameError::InvalidLength => invalid_data("invalid broker setup frame length"),
+        SetupFrameError::TruncatedFrame => invalid_data("truncated broker setup frame"),
+        SetupFrameError::WriteZero => {
+            Error::new(ErrorKind::WriteZero, "failed to write broker setup frame")
         }
+        SetupFrameError::InvalidIoCount => Error::other("invalid broker setup frame I/O count"),
     }
-    Ok(())
 }
 
 /// Shuts down both directions of an association socket, tolerating a peer that

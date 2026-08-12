@@ -30,4 +30,6 @@ extern crate std;
 
 pub mod channel;
 pub mod control_ring;
+pub mod pending_calls;
+pub mod setup_frame;
 pub mod shared_memory;
