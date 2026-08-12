@@ -80,7 +80,8 @@ pub struct PlatformDatagramReceive {
 pub trait SocketProvider: Send + Sync {
     /// Creates one nonblocking socket resource for an authenticated session.
     ///
-    /// The returned socket must not retain authority beyond its `Arc` lifetime.
+    /// Any provider-retained clones must become inert when
+    /// [`PlatformSocket::retire`] is called.
     fn create(
         &self,
         session_id: SessionId,
@@ -95,8 +96,8 @@ pub trait SocketProvider: Send + Sync {
 /// One nonblocking socket resource created by [`SocketProvider`].
 ///
 /// The broker retains this resource in an `Arc`, allowing an operation already
-/// in flight to finish after its object handle closes. Dropping the final `Arc`
-/// releases the platform socket.
+/// in flight to finish after its object handle closes. Before releasing its
+/// portable authority, core explicitly retires the platform socket.
 pub trait PlatformSocket: Send + Sync {
     /// Binds this socket to a local address.
     fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>>;
@@ -178,6 +179,9 @@ pub trait PlatformSocket: Send + Sync {
     /// `Connected`, or `Failed`. Datagram sockets return `Unconnected` or
     /// `Connected` and may change between those states through peer updates.
     fn status(&self) -> Result<SocketStatusResponse>;
+
+    /// Synchronously and idempotently ends this socket's platform authority.
+    fn retire(&self);
 
     /// Returns the current readiness snapshot.
     fn readiness(&self) -> ReadinessFlags;
@@ -1105,6 +1109,9 @@ const fn is_udp(request: CreateSocketRequest) -> bool {
 
 impl Drop for SocketResource {
     fn drop(&mut self) {
+        if let Some(platform_socket) = self.platform_socket.get() {
+            platform_socket.retire();
+        }
         self.readiness.retire();
     }
 }
@@ -1183,7 +1190,10 @@ pub(crate) mod tests {
         listens: StdMutex<std::vec::Vec<u32>>,
         listen_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         shutdown_calls: AtomicUsize,
+        retired_sockets: AtomicUsize,
         dropped_sockets: AtomicUsize,
+        retained_platform_sockets: StdMutex<std::vec::Vec<Arc<TestPlatformSocket>>>,
+        retain_next_socket: core::sync::atomic::AtomicBool,
         fail_create: core::sync::atomic::AtomicBool,
         fail_connect: core::sync::atomic::AtomicBool,
         fail_connect_indeterminate: core::sync::atomic::AtomicBool,
@@ -1211,6 +1221,10 @@ pub(crate) mod tests {
         fn fail_next_shutdown(&self) {
             self.state.fail_shutdown.store(true, Ordering::Relaxed);
         }
+
+        fn retain_next_socket(&self) {
+            self.state.retain_next_socket.store(true, Ordering::Relaxed);
+        }
     }
 
     impl SocketProvider for TestSocketProvider {
@@ -1230,12 +1244,21 @@ pub(crate) mod tests {
                 return Err(BrokerError::OutOfMemory);
             }
             *self.state.live_readiness.lock().unwrap() = Some(readiness.clone());
-            Ok(Arc::new(TestPlatformSocket {
+            let socket = Arc::new(TestPlatformSocket {
                 state: Arc::clone(&self.state),
                 readiness,
                 create_request: request,
                 tcp_options: StdMutex::new(TestTcpOptions::default()),
-            }))
+                active: core::sync::atomic::AtomicBool::new(true),
+            });
+            if self.state.retain_next_socket.swap(false, Ordering::Relaxed) {
+                self.state
+                    .retained_platform_sockets
+                    .lock()
+                    .unwrap()
+                    .push(Arc::clone(&socket));
+            }
+            Ok(socket)
         }
 
         fn close_session(&self, session_id: SessionId) {
@@ -1248,6 +1271,7 @@ pub(crate) mod tests {
         readiness: ReadinessRegistration,
         create_request: CreateSocketRequest,
         tcp_options: StdMutex<TestTcpOptions>,
+        active: core::sync::atomic::AtomicBool,
     }
 
     #[derive(Default)]
@@ -1404,6 +1428,12 @@ pub(crate) mod tests {
             Ok(response)
         }
 
+        fn retire(&self) {
+            if self.active.swap(false, Ordering::AcqRel) {
+                self.state.retired_sockets.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         fn readiness(&self) -> ReadinessFlags {
             ReadinessFlags::READ | ReadinessFlags::WRITE
         }
@@ -1411,6 +1441,7 @@ pub(crate) mod tests {
 
     impl Drop for TestPlatformSocket {
         fn drop(&mut self) {
+            self.retire();
             self.state.dropped_sockets.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1428,7 +1459,52 @@ pub(crate) mod tests {
         check_concurrent_status_preserves_terminal_state(broker, provider);
         check_failed_status_preserves_local_address(broker, provider);
         check_quota_waits_for_deferred_retirement(broker, provider);
+        check_platform_socket_retires_before_last_arc_drop(broker, provider);
         check_socket_quotas(broker);
+    }
+
+    fn check_platform_socket_retires_before_last_arc_drop(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+        let dropped_before = provider.state.dropped_sockets.load(Ordering::Relaxed);
+
+        provider.retain_next_socket();
+        let handle = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        session.close_object_reference(handle).unwrap();
+
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        assert_eq!(
+            provider.state.dropped_sockets.load(Ordering::Relaxed),
+            dropped_before
+        );
+
+        provider
+            .state
+            .retained_platform_sockets
+            .lock()
+            .unwrap()
+            .clear();
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        assert_eq!(
+            provider.state.dropped_sockets.load(Ordering::Relaxed),
+            dropped_before + 1
+        );
     }
 
     fn check_failed_create_rolls_back(broker: &BrokerCore, provider: &TestSocketProvider) {

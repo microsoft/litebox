@@ -275,6 +275,12 @@ impl PlatformSocket for LinuxSocket {
         })
     }
 
+    fn retire(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.reactor.close_socket(self.id);
+        }
+    }
+
     fn readiness(&self) -> ReadinessFlags {
         self.snapshot
             .lock()
@@ -285,9 +291,7 @@ impl PlatformSocket for LinuxSocket {
 
 impl Drop for LinuxSocket {
     fn drop(&mut self) {
-        if self.active.swap(false, Ordering::AcqRel) {
-            self.reactor.close_socket(self.id);
-        }
+        self.retire();
     }
 }
 
