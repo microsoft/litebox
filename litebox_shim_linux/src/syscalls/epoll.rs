@@ -692,7 +692,7 @@ mod test {
             .unwrap();
 
         // spawn a thread to write to the eventfd
-        {
+        let writer = {
             let global = task.global.clone();
             let files = Arc::clone(&files);
             std::thread::spawn(move || {
@@ -707,11 +707,12 @@ mod test {
                     .with_entry(&typed, |entry| {
                         entry.write(&WaitState::new(platform()).context(), 1)
                     });
-            });
-        }
+            })
+        };
         epoll
             .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
+        writer.join().unwrap();
     }
 
     #[test]
@@ -737,7 +738,7 @@ mod test {
 
         // spawn a thread to write to the pipe
         let global = task.global.clone();
-        std::thread::spawn(move || {
+        let writer = std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(100));
             assert_eq!(
                 global
@@ -756,6 +757,7 @@ mod test {
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);
+        writer.join().unwrap();
     }
 
     #[test]
@@ -835,7 +837,7 @@ mod test {
         // spawn a thread to write to the eventfd
         let global = task.global.clone();
         let fds_for_thread = Arc::clone(&fds);
-        std::thread::spawn(move || {
+        let writer = std::thread::spawn(move || {
             let typed = fds_for_thread
                 .raw_descriptor_store
                 .read()
@@ -855,6 +857,7 @@ mod test {
         set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
+        writer.join().unwrap();
     }
 
     #[test]
@@ -867,7 +870,7 @@ mod test {
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
 
-        task.spawn_clone_for_test(move |task| {
+        let writer = task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
             // write a byte
             let buf = [0x41u8];
@@ -894,6 +897,7 @@ mod test {
 
         let _ = task.sys_close(rfd);
         let _ = task.sys_close(wfd);
+        writer.join().unwrap();
     }
 
     #[test]
@@ -906,7 +910,7 @@ mod test {
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
 
-        task.spawn_clone_for_test(move |task| {
+        let closer = task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
             task.sys_close(wfd).expect("close writer failed");
         });
@@ -935,6 +939,7 @@ mod test {
         assert_eq!(n, 0, "read should return 0 on EOF");
 
         let _ = task.sys_close(rfd);
+        closer.join().unwrap();
     }
 
     #[test]

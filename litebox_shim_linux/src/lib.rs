@@ -1295,6 +1295,7 @@ mod test_utils {
         ///
         /// # Panics
         /// Panics if the test process is already terminating.
+        #[must_use]
         pub(crate) fn spawn_clone_for_test<R>(
             &self,
             f: impl 'static + Send + FnOnce(Task<Platform, FS>) -> R,
