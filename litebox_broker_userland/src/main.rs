@@ -2,10 +2,9 @@
 // Licensed under the MIT license.
 
 use std::error::Error;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::Ipv4Addr;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::str::FromStr;
@@ -18,24 +17,23 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
-    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError,
+    BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
+    SocketPolicyError,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
-use litebox_broker_platform_linux_userland::LinuxSocketProvider;
-use litebox_broker_protocol::message::BrokerRequest;
-use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
+use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
-use litebox_broker_transport::channel::HostReceive;
+use litebox_broker_transport::channel::{HostNotificationChannel, HostReceive, HostSetupChannel};
 use litebox_broker_transport::control_ring::ControlRing;
-use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
-use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
-use litebox_broker_transport_linux_userland::unix_socket::{
-    UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
-    UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
-    validate_peer_process,
-};
+use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
+
 use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod windows;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -101,33 +99,19 @@ struct CliArgs {
     runner_arguments: Vec<OsString>,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args = CliArgs::parse();
-    let socket_dir = tempfile::Builder::new()
-        .prefix("litebox-broker-userland-")
-        .tempdir()?;
-    let control_socket_path = socket_dir.path().join("broker.sock");
-    let control_listener = UnixListener::bind(&control_socket_path)?;
-    control_listener.set_nonblocking(true)?;
-    let limits = BrokerCoreLimits::DEFAULT;
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
-            .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
-        limits,
-        Arc::new(LinuxSocketProvider::new(limits.max_sockets)?),
-    )?;
-
-    let mut runner_command = Command::new(&args.runner);
-    runner_command
+fn run_runner_process(
+    args: &CliArgs,
+    control_channel: &OsStr,
+    serve: impl FnOnce(&mut Child, u32) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    let mut runner = Command::new(&args.runner)
         .arg("--unstable")
-        .arg("--broker-control-socket")
-        .arg(&control_socket_path)
-        .args(&args.runner_arguments);
-    let mut runner = runner_command.spawn()?;
+        .arg("--broker-control-channel")
+        .arg(control_channel)
+        .args(&args.runner_arguments)
+        .spawn()?;
     let runner_process_id = runner.id();
-
-    let association_result =
-        serve_runner(&broker, &control_listener, &mut runner, runner_process_id);
+    let association_result = serve(&mut runner, runner_process_id);
     if association_result.is_err() {
         let _ = runner.kill();
     }
@@ -164,38 +148,37 @@ fn configured_socket_policy(
     SocketPolicy::from_tcp_udp_destination_rules(&rules, &[udp_loopback])
 }
 
-fn serve_runner(
+fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
     broker: &BrokerCore,
-    control_listener: &UnixListener,
-    runner: &mut Child,
-    runner_process_id: u32,
-) -> Result<(), Box<dyn Error>> {
-    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_stream = accept_runner_stream(
-        control_listener,
-        runner,
-        runner_process_id,
-        setup_deadline,
-        "control",
-    )?;
-    let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE)?;
+    mut control_channel: SetupChannel,
+    create_shared_memory: impl FnOnce() -> IoResult<Memory>,
+    create_control_memory: impl FnOnce() -> IoResult<Memory>,
+    send_shared_memory: impl FnOnce(&mut SetupChannel, &Memory, &Memory) -> IoResult<()>,
+    activate: impl FnOnce(
+        SetupChannel,
+        ControlRing<Memory>,
+    ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
+) -> Result<(), Box<dyn Error>>
+where
+    Memory: ControlRingMemory,
+    SetupChannel: HostSetupChannel<Error = IoError>,
+    RequestSource: HostRequestSource,
+    ResponseSink: HostResponseSink + Clone + Send,
+    NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
+    Shutdown: HostAssociationShutdown + Send + Sync,
+{
+    let shared_memory = create_shared_memory()?;
     let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)?;
-    let control_memory = MemfdSharedMemory::create_control_ring()?;
+    let control_memory = create_control_memory()?;
     let control_ring = ControlRing::new(control_memory)
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
-    let mut control_channel =
-        UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
     let readiness = Arc::new(ReadinessPublisherRuntime::new());
     let association = match setup_connection(
         broker,
         &mut control_channel,
         &shared_buffers,
         readiness.clone(),
-        |channel| {
-            channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
-            channel.send_memfd(control_ring.memory(), Some(setup_deadline))?;
-            Ok(())
-        },
+        |channel| send_shared_memory(channel, shared_buffers.memory(), control_ring.memory()),
     )? {
         Ok(association) => association,
         Err(ConnectionTermination::PeerClosed) => {
@@ -221,7 +204,7 @@ fn serve_runner(
         }
     };
     let (request_source, response_sink, notification_channel, shutdown) =
-        control_channel.into_active(control_ring)?;
+        activate(control_channel, control_ring)?;
     dispatch_requests(
         association,
         readiness,
@@ -233,19 +216,31 @@ fn serve_runner(
     Ok(())
 }
 
+trait HostRequestSource {
+    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>>;
+}
+
+trait HostResponseSink {
+    fn send_response(&self, response: &BrokerResponse) -> IoResult<()>;
+}
+
+trait HostAssociationShutdown {
+    fn shutdown(&self) -> IoResult<()>;
+}
+
 /// Records the first failure of an association and ends its transport.
 ///
 /// Every thread serving an association reports through this, and the endpoints
 /// they block on are released by ending the transport, so it is what the
 /// teardown guards below reach for.
-struct HostAssociationFailureCoordinator {
+struct HostAssociationFailureCoordinator<Shutdown> {
     failed: AtomicBool,
     error: Mutex<Option<IoError>>,
-    shutdown: UnixControlRingHostShutdown,
+    shutdown: Shutdown,
 }
 
-impl HostAssociationFailureCoordinator {
-    const fn new(shutdown: UnixControlRingHostShutdown) -> Self {
+impl<Shutdown: HostAssociationShutdown> HostAssociationFailureCoordinator<Shutdown> {
+    const fn new(shutdown: Shutdown) -> Self {
         Self {
             failed: AtomicBool::new(false),
             error: Mutex::new(None),
@@ -270,8 +265,8 @@ impl HostAssociationFailureCoordinator {
 
     /// Ends the association transport without recording a failure.
     ///
-    /// Teardown uses this to release endpoints blocked on the control ring
-    /// without turning a shutdown that reported nothing into a reported error.
+    /// Teardown uses this to release blocked endpoints without turning a
+    /// shutdown that reported nothing into a reported error.
     fn shutdown(&self) {
         let _ = self.shutdown.shutdown();
     }
@@ -292,11 +287,11 @@ impl HostAssociationFailureCoordinator {
 /// a reported failure is reached only once the reader has returned, and a peer
 /// that is waiting for a readiness change it will never be told about does not
 /// return it. Failing the association here ends that wait instead.
-struct PublisherPanicGuard<'association> {
-    failure_coordinator: &'association HostAssociationFailureCoordinator,
+struct PublisherPanicGuard<'association, Shutdown: HostAssociationShutdown> {
+    failure_coordinator: &'association HostAssociationFailureCoordinator<Shutdown>,
 }
 
-impl Drop for PublisherPanicGuard<'_> {
+impl<Shutdown: HostAssociationShutdown> Drop for PublisherPanicGuard<'_, Shutdown> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.failure_coordinator
@@ -314,12 +309,12 @@ impl Drop for PublisherPanicGuard<'_> {
 /// that a local endpoint stopped draining. The failure coordinator owns the
 /// association until `dispatch_requests` returns, which is after that join, so
 /// an unwind cannot leave ending the transport to dropping it.
-struct ReadinessPublicationGuard<'association> {
+struct ReadinessPublicationGuard<'association, Shutdown: HostAssociationShutdown> {
     readiness: &'association ReadinessPublisherRuntime,
-    failure_coordinator: &'association HostAssociationFailureCoordinator,
+    failure_coordinator: &'association HostAssociationFailureCoordinator<Shutdown>,
 }
 
-impl Drop for ReadinessPublicationGuard<'_> {
+impl<Shutdown: HostAssociationShutdown> Drop for ReadinessPublicationGuard<'_, Shutdown> {
     fn drop(&mut self) {
         self.readiness.close();
         self.failure_coordinator.shutdown();
@@ -329,16 +324,23 @@ impl Drop for ReadinessPublicationGuard<'_> {
 /// Serves one association until it ends, then reports its first failure.
 ///
 /// `readiness` is created by the caller rather than here so readiness sources
-/// can record into the same runtime this publishes from. Nothing publishes into
-/// it in production yet; the Linux network reactor is its first source.
-fn dispatch_requests<Memory: SharedMemory>(
+/// can record into the same runtime this publishes from. The Linux network
+/// reactor is currently its production source.
+fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
     association: BrokerHostAssociation<'_, Memory>,
     readiness: Arc<ReadinessPublisherRuntime>,
-    mut request_source: UnixControlRingHostRequestSource,
-    response_sink: UnixControlRingHostResponseSink,
-    mut notification_channel: UnixControlRingHostNotificationChannel,
-    shutdown: UnixControlRingHostShutdown,
-) -> IoResult<()> {
+    mut request_source: RequestSource,
+    response_sink: ResponseSink,
+    mut notification_channel: NotificationChannel,
+    shutdown: Shutdown,
+) -> IoResult<()>
+where
+    Memory: SharedMemory,
+    RequestSource: HostRequestSource,
+    ResponseSink: HostResponseSink + Clone + Send,
+    NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
+    Shutdown: HostAssociationShutdown + Send + Sync,
+{
     let association = Arc::new(association);
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
@@ -372,8 +374,8 @@ fn dispatch_requests<Memory: SharedMemory>(
 
         // Publication must end on every exit, including an unwind: the scope
         // joins the publisher before it propagates a panic, and a publisher
-        // still parked or still blocked on ring capacity would never return,
-        // hanging teardown instead.
+        // still parked or still blocked on transport capacity would never
+        // return, hanging teardown instead.
         let publication = ReadinessPublicationGuard {
             readiness: &readiness,
             failure_coordinator: &failure_coordinator,
@@ -431,11 +433,14 @@ fn dispatch_requests<Memory: SharedMemory>(
     }
 }
 
-fn read_requests(
-    request_source: &mut UnixControlRingHostRequestSource,
+fn read_requests<RequestSource, Shutdown>(
+    request_source: &mut RequestSource,
     request_sender: SyncSender<BrokerRequest>,
-    failure_coordinator: &HostAssociationFailureCoordinator,
-) {
+    failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
+) where
+    RequestSource: HostRequestSource,
+    Shutdown: HostAssociationShutdown,
+{
     loop {
         if failure_coordinator.failed() {
             break;
@@ -466,12 +471,16 @@ fn read_requests(
     }
 }
 
-fn run_worker<Memory: SharedMemory>(
+fn run_worker<Memory, ResponseSink, Shutdown>(
     association: &BrokerHostAssociation<'_, Memory>,
     request_receiver: &Mutex<Receiver<BrokerRequest>>,
-    response_sink: &UnixControlRingHostResponseSink,
-    failure_coordinator: &HostAssociationFailureCoordinator,
-) {
+    response_sink: &ResponseSink,
+    failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
+) where
+    Memory: SharedMemory,
+    ResponseSink: HostResponseSink,
+    Shutdown: HostAssociationShutdown,
+{
     loop {
         let request = request_receiver
             .lock()
@@ -495,13 +504,12 @@ fn run_worker<Memory: SharedMemory>(
     }
 }
 
-fn accept_runner_stream(
-    listener: &UnixListener,
+fn accept_runner_channel<Channel>(
     runner: &mut Child,
-    runner_process_id: u32,
     deadline: Instant,
     channel_name: &'static str,
-) -> IoResult<UnixStream> {
+    mut try_accept: impl FnMut() -> IoResult<Channel>,
+) -> IoResult<Channel> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -516,12 +524,8 @@ fn accept_runner_stream(
                 format!("runner exited with {status} before connecting its {channel_name} channel"),
             ));
         }
-
-        match listener.accept() {
-            Ok((stream, _)) => {
-                validate_peer_process(&stream, runner_process_id)?;
-                return Ok(stream);
-            }
+        match try_accept() {
+            Ok(channel) => return Ok(channel),
             Err(error) if error.kind() == ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
@@ -529,18 +533,37 @@ fn accept_runner_stream(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    linux::run(CliArgs::parse())
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    windows::run(CliArgs::parse())
+}
+
+#[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+fn main() {}
+
 #[cfg(test)]
-mod tests {
+mod cli_tests {
     use super::*;
-    use litebox_broker_core::socket::UnsupportedSocketProvider;
-    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::message::BrokerHandshakeResponse;
-    use litebox_broker_transport::channel::{HostSetupChannel, LocalSetupChannel};
-    use litebox_broker_transport_linux_userland::unix_socket::{
-        UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
-        UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
-    };
-    use std::os::fd::AsFd;
+
+    #[test]
+    fn cli_accepts_tcp_destination_argument() {
+        let args = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--allow-tcp-destination",
+            "127.0.0.0/8:80",
+            "--runner",
+            "runner",
+            "guest",
+        ])
+        .unwrap();
+
+        assert_eq!(args.allow_tcp_destination.len(), 1);
+    }
 
     #[test]
     fn tcp_destination_argument_parses_canonical_cidr_and_ports() {
@@ -591,6 +614,39 @@ mod tests {
             )]
         );
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::mpsc::{Receiver, sync_channel};
+    use std::time::{Duration, Instant};
+
+    use litebox_broker_core::socket::UnsupportedSocketProvider;
+    use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+    use litebox_broker_host::setup_connection;
+    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
+    use litebox_broker_protocol::message::{BrokerHandshakeResponse, BrokerNotification};
+    use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
+    use litebox_broker_transport::channel::{
+        HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
+    };
+    use litebox_broker_transport::control_ring::ControlRing;
+    use litebox_broker_transport::shared_memory::SharedBufferPool;
+    use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
+    use litebox_broker_transport_linux_userland::unix_socket::{
+        UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
+        UnixControlRingHostResponseSink, UnixControlRingHostShutdown,
+        UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
+        UnixControlRingLocalShutdown, UnixStreamHostSetupChannel, UnixStreamLocalSetupChannel,
+    };
+
+    use super::*;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// One live host association: the endpoints teardown acts on, and the rest
     /// held open so the association stays up for the duration of a test.
@@ -639,13 +695,10 @@ mod tests {
     /// A notification channel that accepts every send and keeps nothing.
     struct DiscardingChannel;
 
-    impl litebox_broker_transport::channel::HostNotificationChannel for DiscardingChannel {
+    impl HostNotificationChannel for DiscardingChannel {
         type Error = IoError;
 
-        fn send_notification(
-            &mut self,
-            _notification: &litebox_broker_protocol::message::BrokerNotification,
-        ) -> IoResult<()> {
+        fn send_notification(&mut self, _notification: &BrokerNotification) -> IoResult<()> {
             Ok(())
         }
     }
@@ -676,12 +729,10 @@ mod tests {
         .unwrap()
     }
 
-    /// One association served by `dispatch_requests` exactly as production
-    /// serves it.
+    /// One association served by `dispatch_requests` exactly as production serves it.
     ///
-    /// The guard tests above cover what the teardown guards do; only this
-    /// covers that `dispatch_requests` installs them and starts a publisher at
-    /// all, because its single production caller is unreachable from a test.
+    /// The guard tests below cover what the teardown guards do; only this covers
+    /// that `dispatch_requests` installs them and starts a publisher at all.
     /// Dispatch starts only once the local half has finished negotiating, so a
     /// publisher that fails immediately cannot race activation.
     fn spawn_dispatch(
@@ -708,7 +759,7 @@ mod tests {
             let control_ring = ControlRing::new(control_memory).unwrap();
             let mut control = UnixStreamHostSetupChannel::from_host_guaranteed(
                 host_stream,
-                Instant::now() + SETUP_TIMEOUT,
+                Instant::now() + TEST_TIMEOUT,
             );
             let association = setup_connection(
                 &broker,
@@ -754,10 +805,10 @@ mod tests {
                 .unwrap();
         });
 
-        // The publisher parks on an empty queue, so only closing publication
-        // ends it. An unwind past the explicit close leaves the guard as the
-        // only thing that can, and the scope joins the publisher before it
-        // propagates the panic.
+        // The publisher parks on an empty queue, so only closing publication ends
+        // it. An unwind past the explicit close leaves the guard as the only thing
+        // that can, and the scope joins the publisher before it propagates the
+        // panic.
         std::thread::sleep(Duration::from_millis(20));
         drop(ReadinessPublicationGuard {
             readiness: &readiness,
@@ -765,7 +816,7 @@ mod tests {
         });
 
         finish
-            .recv_timeout(SETUP_TIMEOUT)
+            .recv_timeout(TEST_TIMEOUT)
             .expect("dropping the guard must end the parked publisher")
             .unwrap();
         publisher.join().unwrap();
@@ -784,8 +835,8 @@ mod tests {
 
         // The local endpoint never drains, so the ring fills and the publisher
         // ends up blocked on capacity rather than parked for work. Closing
-        // publication cannot reach it there, and an unwind reaches the scope
-        // join before anything else ends the transport.
+        // publication cannot reach it there, and an unwind reaches the scope join
+        // before anything else ends the transport.
         for handle in 0..CONTROL_RING_NOTIFICATION_SLOT_COUNT * 3 {
             readiness
                 .publish(ObjectHandle(handle), ReadinessFlags::READ)
@@ -804,7 +855,7 @@ mod tests {
         });
 
         let outcome = finish
-            .recv_timeout(SETUP_TIMEOUT)
+            .recv_timeout(TEST_TIMEOUT)
             .expect("dropping the guard must end a publisher blocked on capacity");
         publisher.join().unwrap();
         assert_eq!(
@@ -825,13 +876,13 @@ mod tests {
         let mut request_source = association.request_source;
         let failure_coordinator =
             Arc::new(HostAssociationFailureCoordinator::new(association.shutdown));
-        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = sync_channel(1);
         let reader = std::thread::spawn(move || {
             result_sender.send(request_source.recv_request()).unwrap();
         });
 
-        // The peer sends nothing and never closes, so the reader returns only
-        // if the publisher's unwind fails the association.
+        // The peer sends nothing and never closes, so the reader returns only if
+        // the publisher's unwind fails the association.
         let publisher_failure_coordinator = Arc::clone(&failure_coordinator);
         let publisher = std::thread::spawn(move || {
             let _panicking = PublisherPanicGuard {
@@ -841,7 +892,7 @@ mod tests {
         });
 
         let receive_result = result_receiver
-            .recv_timeout(SETUP_TIMEOUT)
+            .recv_timeout(TEST_TIMEOUT)
             .expect("a panicking publisher must end a blocked request reader");
         assert!(matches!(
             receive_result,
@@ -857,14 +908,14 @@ mod tests {
         let association = live_association();
         let mut request_source = association.request_source;
         let failure_coordinator = HostAssociationFailureCoordinator::new(association.shutdown);
-        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = sync_channel(1);
         let reader = std::thread::spawn(move || {
             result_sender.send(request_source.recv_request()).unwrap();
         });
 
         failure_coordinator.report(IoError::new(ErrorKind::TimedOut, "first failure"));
         failure_coordinator.report(IoError::other("second failure"));
-        let receive_result = result_receiver.recv_timeout(Duration::from_secs(1));
+        let receive_result = result_receiver.recv_timeout(TEST_TIMEOUT);
         reader.join().unwrap();
 
         assert!(matches!(
@@ -879,8 +930,9 @@ mod tests {
     #[test]
     fn dispatching_requests_publishes_readiness_until_the_association_ends() {
         use litebox_broker_protocol::ObjectHandle;
-        use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
+        use litebox_broker_protocol::message::ReadinessNotification;
         use litebox_broker_protocol::readiness::ReadinessFlags;
+        use litebox_broker_transport::channel::LocalNotificationChannel;
 
         const HANDLE: ObjectHandle = ObjectHandle(11);
         let expected = ReadinessFlags::READ | ReadinessFlags::WRITE;
@@ -893,14 +945,12 @@ mod tests {
         // never started has to fail the test rather than hang it.
         let (notified, notifications_seen) = sync_channel(1);
         let receiver = std::thread::spawn(move || {
-            use litebox_broker_transport::channel::LocalNotificationChannel;
-
             let notification = notifications.recv_notification().unwrap();
             notified.send(notification).unwrap();
             notifications
         });
         let notification = notifications_seen
-            .recv_timeout(SETUP_TIMEOUT)
+            .recv_timeout(TEST_TIMEOUT)
             .expect("dispatch must publish readiness recorded in its runtime");
         assert_eq!(
             notification,
@@ -911,12 +961,12 @@ mod tests {
         );
         let notifications = receiver.join().unwrap();
 
-        // A publisher parked for work outlives a clean local close unless
-        // dispatch ends publication, so this deadline covers that too.
+        // A publisher parked for work outlives a clean local close unless dispatch
+        // ends publication, so this deadline covers that too.
         drop(local);
         drop(notifications);
         outcome
-            .recv_timeout(SETUP_TIMEOUT)
+            .recv_timeout(TEST_TIMEOUT)
             .expect("a clean local close must end dispatch")
             .unwrap();
         host.join().unwrap();
@@ -933,9 +983,8 @@ mod tests {
         // The local half stays connected and idle, so nothing but the panic can
         // release the request reader that owns association termination.
         let (local, _notifications, outcome, host) = spawn_dispatch(Arc::clone(&readiness));
-
         let error = outcome
-            .recv_timeout(SETUP_TIMEOUT)
+            .recv_timeout(TEST_TIMEOUT)
             .expect("a panicking publisher must end dispatch")
             .expect_err("a panicking publisher must fail the association");
         assert_eq!(error.to_string(), "broker readiness publisher panicked");

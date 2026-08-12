@@ -195,6 +195,86 @@ fn test_static_linked_prog_with_rewriter() {
     launcher.test_load_exec_common(&executable_path);
 }
 
+#[test]
+fn test_programs_with_windows_broker() {
+    run_prog_with_windows_broker("hello_world_static", &[]);
+    run_prog_with_windows_broker("pipe_broker", &[]);
+    run_prog_with_windows_broker("hello_world_dyn", &DYNAMIC_LIBS);
+    run_prog_with_windows_broker("hello_thread", &DYNAMIC_LIBS);
+}
+
+const DYNAMIC_LIBS: [(&str, &str); 2] = [
+    ("libc.so.6", "/lib/x86_64-linux-gnu"),
+    ("ld-linux-x86-64.so.2", "/lib64"),
+];
+
+fn run_prog_with_windows_broker(exec_name: &str, libs: &[(&str, &str)]) {
+    let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
+    let tar_path =
+        std::path::Path::new(env!("OUT_DIR")).join(format!("broker_{exec_name}_rootfs.tar"));
+    let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
+    let exec_path = format!("bin/{exec_name}.hooked");
+    append_rewritten_file(&mut tar, &test_dir.join(exec_name), &exec_path);
+    for (file, prefix) in libs {
+        append_rewritten_file(
+            &mut tar,
+            &test_dir.join(file),
+            &format!("{}/{file}", prefix.trim_start_matches('/')),
+        );
+    }
+    tar.finish().unwrap();
+    drop(tar);
+
+    let runner = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
+        .unwrap_or_else(|_| {
+            env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
+        });
+    let mut arguments = Vec::new();
+    if !libs.is_empty() {
+        arguments.extend(["--env".into(), "LD_LIBRARY_PATH=/lib64:/lib32:/lib".into()]);
+    }
+    arguments.extend([
+        "--initial-files".into(),
+        tar_path.into_os_string(),
+        format!("/{exec_path}").into(),
+    ]);
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .args([
+            "run",
+            "-p",
+            "litebox_broker_userland",
+            "--bin",
+            "litebox-broker-userland",
+            "--",
+            "--runner",
+        ])
+        .arg(runner)
+        .args(arguments)
+        .status()
+        .expect("failed to run litebox-broker-userland");
+    assert!(status.success(), "litebox-broker-userland failed: {status}");
+}
+
+fn append_rewritten_file(
+    tar: &mut tar::Builder<std::fs::File>,
+    source: &std::path::Path,
+    archive_path: &str,
+) {
+    let rewritten =
+        litebox_syscall_rewriter::rewrite_binary(&std::fs::read(source).unwrap(), None).unwrap();
+    let mut header = tar::Header::new_ustar();
+    header.set_size(rewritten.len() as u64);
+    header.set_mode(0o755);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_cksum();
+    tar.append_data(&mut header, archive_path, rewritten.as_slice())
+        .unwrap();
+}
+
 fn run_dynamic_linked_prog_with_rewriter(
     libs_to_rewrite: &[(&str, &str)],
     exec_name: &str,
