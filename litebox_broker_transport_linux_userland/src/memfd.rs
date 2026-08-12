@@ -943,6 +943,23 @@ mod tests {
     }
 
     #[test]
+    fn byte_memory_does_not_infer_control_ring_from_length() {
+        let memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
+            .find(|offset| memory_permits_u32(*offset))
+            .unwrap();
+
+        assert_eq!(
+            memory.load_u32_acquire(epoch_offset),
+            Err(SharedMemoryError::InvalidRange)
+        );
+        assert_eq!(
+            memory.wake_one(epoch_offset).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn rejects_missing_multiple_and_truncated_descriptors() {
         let length = 8;
 
