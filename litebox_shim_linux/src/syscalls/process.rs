@@ -122,6 +122,8 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     pub(crate) limits: ResourceLimits,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
 }
 
 pub(crate) struct Alarm<Platform: ShimPlatform> {
@@ -182,6 +184,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 handle: None,
                 deadline: None,
             }),
+            #[cfg(target_arch = "aarch64")]
+            sigreturn_trampoline: Mutex::new(None),
         }
     }
 
@@ -520,7 +524,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 ///
 /// On `x86_64`, this is represented as a `*mut u8`. The TLS pointer can point to
 /// an arbitrary-sized memory region.
-#[cfg(target_arch = "x86_64")]
+/// On AArch64, it is the `TPIDR_EL0` value.
 type ThreadLocalDescriptor = UserPtrMut<u8>;
 
 struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
@@ -639,21 +643,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        let tls = if flags.contains(CloneFlags::SETTLS) {
+        let explicit_tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
+            // Validate the user-controlled TLS base before spawning the thread.
             #[cfg(target_arch = "x86_64")]
-            {
-                // Validate the user-controlled TLS base before spawning the thread.
-                if !litebox_common_linux::arch::is_valid_user_fs_base(addr) {
-                    return Err(Errno::EPERM);
-                }
+            let valid = litebox_common_linux::arch::is_valid_user_fs_base(addr);
+            #[cfg(target_arch = "aarch64")]
+            let valid = litebox_common_linux::arch::is_valid_user_tls_base(addr);
+            if !valid {
+                return Err(Errno::EPERM);
             }
-            #[cfg(target_arch = "x86_64")]
-            let desc = UserPtrMut::from_usize(addr);
-            Some(desc)
+            Some(addr)
         } else {
             None
         };
+        // AArch64 inherits live TPIDR_EL0 unless CLONE_SETTLS replaces it.
+        #[cfg(target_arch = "aarch64")]
+        let tls_value = Some(match explicit_tls {
+            Some(addr) => addr,
+            None => self
+                .global
+                .platform
+                .get_arch_specific_register(&ArchSpecificRegister::TpidrEl0)
+                .map_err(|_| Errno::EPERM)?,
+        });
+        #[cfg(target_arch = "x86_64")]
+        let tls_value = explicit_tls;
+        let tls: Option<ThreadLocalDescriptor> = tls_value.map(UserPtrMut::from_usize);
 
         let child_tid = if child_tid == 0 {
             None
@@ -1454,19 +1470,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
-        pathname: UserPtr<i8>,
-        argv: UserPtr<UserPtr<i8>>,
-        envp: UserPtr<UserPtr<i8>>,
+        pathname: UserPtr<core::ffi::c_char>,
+        argv: UserPtr<UserPtr<core::ffi::c_char>>,
+        envp: UserPtr<UserPtr<core::ffi::c_char>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         fn copy_vector<Platform: ShimPlatform>(
-            mut base: UserPtr<UserPtr<i8>>,
+            mut base: UserPtr<UserPtr<core::ffi::c_char>>,
             _which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
-                let p: UserPtr<i8> = {
+                let p: UserPtr<core::ffi::c_char> = {
                     // read pointer-sized entries
                     match base.read_at_offset::<Platform>(0) {
                         Some(ptr) => ptr,
@@ -1532,14 +1548,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.signals.reset_for_exec();
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            *self.process().sigreturn_trampoline.lock() = None;
+        }
+
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
         unsafe { self.global.pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
+        // AArch64 patch state contains addresses from the discarded image.
+        // TODO: clear x86-64 patch state here too; it also contains addresses
+        // from the discarded image.
+        #[cfg(target_arch = "aarch64")]
+        self.global.elf_patch_cache.lock().clear();
+
+        // TODO: on AArch64, clear the platform's cached outbound stub and PC
+        // here. They address the discarded image, but the core platform API
+        // exposes no address-space-reset hook for transition metadata.
+
+        #[cfg(target_arch = "x86_64")]
+        let tls_reg = ArchSpecificRegister::FsBase;
+        #[cfg(target_arch = "aarch64")]
+        let tls_reg = ArchSpecificRegister::TpidrEl0;
         self.global
             .platform
-            .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0)
+            .set_arch_specific_register(&tls_reg, 0)
             .expect("failed to clear guest TLS on execve");
 
         self.load_program(loader, argv_vec, envp_vec)
@@ -1609,6 +1644,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         ss: 0x2b, // __USER_DS
                     };
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // The arm64 kernel's `start_thread` zeroes every GPR and
+                    // PSTATE (EL0t, all interrupts unmasked) before entering the
+                    // new image; only PC and SP carry information.
+                    *ctx = litebox_common_linux::PtRegs {
+                        regs: [0; litebox_common_linux::AARCH64_GENERAL_REGISTER_COUNT],
+                        sp: load_info.user_stack_top,
+                        pc: load_info.entry_point,
+                        pstate: 0,
+                        orig_x0: 0,
+                        syscallno: litebox_common_linux::arch::NO_SYSCALL,
+                        unused2: 0,
+                    };
+                }
             }
             ThreadInitState::NewThread {
                 tls,
@@ -1623,6 +1673,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                     ctx.rax = 0;
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.sp = stack;
+                    }
+                    ctx.regs[0] = 0;
+                }
 
                 // Set the TLS for the new thread.
                 if let Some(tls) = tls {
@@ -1630,6 +1687,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     {
                         self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
                             .unwrap();
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        self.global
+                            .platform
+                            .set_arch_specific_register(
+                                &ArchSpecificRegister::TpidrEl0,
+                                tls.as_usize(),
+                            )
+                            .expect("failed to set guest TLS for the new thread");
                     }
                 }
 
@@ -1803,9 +1870,11 @@ mod tests {
             );
 
              // `process_signals` is called when about to switch back to userspace, so simulate that here.
-             let mut stack = [0u8; 4096];
+            let mut stack = [0u8; 2 * litebox::mm::linux::PAGE_SIZE];
              #[cfg(target_arch = "x86_64")]
              let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
+             #[cfg(target_arch = "aarch64")]
+             let mut regs = litebox_common_linux::PtRegs { sp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
              task.process_signals(&mut regs);
             assert_eq!(
                 regs.get_ip(), callback_addr,

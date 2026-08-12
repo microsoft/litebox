@@ -5,7 +5,7 @@
 //! host anchor; the guest thread pointer is virtualized in memory.
 
 use super::*;
-use litebox_syscall_rewriter::arm64::{
+use litebox_syscall_rewriter::aarch64::{
     GATE_ALIGNMENT, GateMetadata, MRS_SLOT_BYTES, MSR_FRAME_BYTES, MSR_SLOT_BYTES, SVC_FRAME_BYTES,
     SVC_GATE_BYTES, SVC_SLOT_BYTES,
 };
@@ -130,7 +130,7 @@ pub(super) fn guest_thread_pointer_tp_offset() -> u16 {
     let offset = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_THREAD_POINTER;
     u16::try_from(offset)
         .ok()
-        .filter(|off| litebox_syscall_rewriter::arm64::is_patchable_guest_tpidr_offset(*off))
+        .filter(|off| litebox_syscall_rewriter::aarch64::is_patchable_guest_tpidr_offset(*off))
         .expect(
             "guest_thread_pointer must sit at a thread-pointer offset a rewriter gate can reach",
         )
@@ -290,7 +290,7 @@ pub(super) unsafe extern "C-unwind" fn run_thread_arch(
 
     // Entered by `BR X16` from a rewriter-emitted SVC slot when the
     // guest issues a syscall. State on entry (rewriter ABI, see
-    // `litebox_syscall_rewriter::arm64` module docs):
+    // `litebox_syscall_rewriter::aarch64` module docs):
     //
     //   | Item                     | Value                                  |
     //   | ------------------------ | -------------------------------------- |
@@ -443,8 +443,8 @@ interrupt_callback:
     IN_GUEST = const tls_offset::IN_GUEST,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
-    SVC_FRAME_BYTES = const litebox_syscall_rewriter::arm64::SVC_FRAME_BYTES,
-    SVC_FRAME_OFF_STUB = const litebox_syscall_rewriter::arm64::SVC_FRAME_OFF_STUB,
+    SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
+    SVC_FRAME_OFF_STUB = const litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_STUB,
     ENOSYS = const libc::ENOSYS,
     init_handler = sym init_handler,
     reenter_handler = sym reenter_handler,
@@ -457,8 +457,8 @@ interrupt_callback:
 /// `ldp x0, x1, [sp]` in `syscall_callback` reads the gate frame's two fields
 /// as a pair, which only works at these offsets.
 const _: () = assert!(
-    litebox_syscall_rewriter::arm64::SVC_FRAME_OFF_X16 == 0
-        && litebox_syscall_rewriter::arm64::SVC_FRAME_OFF_RETADDR == 8
+    litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_X16 == 0
+        && litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_RETADDR == 8
 );
 
 /// The kernel's `struct rt_sigframe`, synthesized by the runtime so that an
@@ -968,8 +968,8 @@ switch_to_guest_via_outbound_stub_end:
     IN_GUEST = const tls_offset::IN_GUEST,
     INTERRUPT = const tls_offset::INTERRUPT,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
-    SVC_FRAME_BYTES = const litebox_syscall_rewriter::arm64::SVC_FRAME_BYTES,
-    SVC_FRAME_OFF_X16 = const litebox_syscall_rewriter::arm64::SVC_FRAME_OFF_X16,
+    SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
+    SVC_FRAME_OFF_X16 = const litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_X16,
     );
 }
 
@@ -1144,7 +1144,7 @@ pub(super) fn canonicalize_aarch64_gate_signal_context(
             if !read(slot_end - 4, &mut metadata_bytes) {
                 continue;
             }
-            let Some(metadata) = litebox_syscall_rewriter::arm64::decode_gate_metadata_word(
+            let Some(metadata) = litebox_syscall_rewriter::aarch64::decode_gate_metadata_word(
                 u32::from_le_bytes(metadata_bytes),
             ) else {
                 continue;
@@ -1165,7 +1165,7 @@ pub(super) fn canonicalize_aarch64_gate_signal_context(
             // covers a PC in a real gate's padding or metadata: that code never
             // ran the prologue, so the interrupted registers are the guest's
             // own and delivering the signal unchanged is correct.
-            let Some(classified) = litebox_syscall_rewriter::arm64::classify_copied_gate_slot(
+            let Some(classified) = litebox_syscall_rewriter::aarch64::classify_copied_gate_slot(
                 &slot[..slot_size],
                 slot_start as u64,
                 pc,
@@ -1196,7 +1196,7 @@ pub(super) fn canonicalize_aarch64_gate_signal_context(
         return Aarch64GateSignalResult::NotGate;
     }
     let original = u32::from_le_bytes(original);
-    if litebox_syscall_rewriter::arm64::decode_branch_target(original, site)
+    if litebox_syscall_rewriter::aarch64::decode_branch_target(original, site)
         != Some(slot_start as u64)
     {
         return Aarch64GateSignalResult::NotGate;
@@ -1469,14 +1469,14 @@ mod tests {
     fn test_gate_patching_lands_in_the_runtime_tls_block() {
         const IMM12_SHIFT: u32 = 10;
         const IMM12_MASK: u32 = 0x003F_FC00;
-        const ALIGN: u16 = litebox_syscall_rewriter::arm64::GUEST_TPIDR_OFFSET_ALIGN;
+        const ALIGN: u16 = litebox_syscall_rewriter::aarch64::GUEST_TPIDR_OFFSET_ALIGN;
 
         let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
         let (mut tramp, trapped) =
             litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0).unwrap();
         assert!(trapped.is_empty());
         assert_eq!(
-            litebox_syscall_rewriter::arm64::find_guest_tpidr_placeholder(&tramp),
+            litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
             Some(16 + 4),
             "the emitted gate must be in the unpatched state, or everything below \
              passes vacuously"
@@ -1489,21 +1489,22 @@ mod tests {
         );
         let offset = u16::try_from(offset).expect("the guest slot must sit within a gate's reach");
         assert_eq!(
-            litebox_syscall_rewriter::arm64::patch_guest_tpidr_offset(&mut tramp, offset).unwrap(),
+            litebox_syscall_rewriter::aarch64::patch_guest_tpidr_offset(&mut tramp, offset)
+                .unwrap(),
             1
         );
         assert_eq!(
-            litebox_syscall_rewriter::arm64::find_guest_tpidr_placeholder(&tramp),
+            litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
             None,
             "no gate may still hold the placeholder once the loader has staged the trampoline"
         );
         let classified =
-            litebox_syscall_rewriter::arm64::classify_gate_pc(&tramp, 0x400000, 0x400010)
+            litebox_syscall_rewriter::aarch64::classify_gate_pc(&tramp, 0x400000, 0x400010)
                 .expect("finalized emitted MRS slot must validate");
         assert_eq!(classified.slot_offset(), 16);
         assert!(matches!(
             classified.metadata(),
-            litebox_syscall_rewriter::arm64::GateMetadata::MrsTpidr { destination: 9, .. }
+            litebox_syscall_rewriter::aarch64::GateMetadata::MrsTpidr { destination: 9, .. }
         ));
 
         let patched = u32::from_le_bytes(tramp[16 + 4..16 + 8].try_into().unwrap());

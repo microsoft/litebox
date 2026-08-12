@@ -154,6 +154,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
+        #[cfg(target_arch = "x86_64")]
         if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
             if unsafe {
                 self.task
@@ -167,6 +168,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             } else {
                 return ContinueOperation::Terminate;
             }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if info.kernel_mode
+            && (info.exception == litebox::shim::Exception::DATA_ABORT_CURRENT_EL
+                || info.exception == litebox::shim::Exception::INSTRUCTION_ABORT_CURRENT_EL)
+        {
+            unimplemented!(
+                "aarch64: kernel-mode demand paging needs the ESR_EL1 ISS access bits, \
+                 which no aarch64 platform currently supplies (esr={:#x}, far={:#x})",
+                info.esr,
+                info.fault_address
+            );
         }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
@@ -565,6 +578,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             ctx.rax = return_value;
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            ctx.regs[0] = return_value;
+        }
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
@@ -577,6 +594,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+        // AArch64 syscall ABI: `w8`, mirrored in `pt_regs::syscallno`.
+        #[cfg(target_arch = "aarch64")]
+        let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
         match request {
@@ -1010,7 +1030,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }),
-            #[cfg(target_arch = "x86_64")]
             SyscallRequest::Newfstatat {
                 dirfd,
                 pathname,
@@ -1066,11 +1085,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
             SyscallRequest::SetThreadArea { user_desc } => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let _ = user_desc;
-                    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
-                }
+                // Neither x86-64 nor AArch64 supports `set_thread_area`.
+                let _ = user_desc;
+                Err(Errno::ENOSYS)
             }
             SyscallRequest::SetTidAddress { tidptr } => {
                 Ok(self.sys_set_tid_address(tidptr).reinterpret_as_unsigned() as usize)

@@ -3075,10 +3075,7 @@ mod tests {
     }
 
     fn epoll_add(task: &TestTask, epfd: i32, target_fd: u32, events: litebox::event::Events) {
-        let ev = litebox_common_linux::EpollEvent {
-            events: events.bits(),
-            data: u64::from(target_fd),
-        };
+        let ev = litebox_common_linux::EpollEvent::new(events.bits(), u64::from(target_fd));
         let ev_ptr = (&raw const ev).cast::<litebox_common_linux::EpollEvent>();
         let ev_const = UserPtr::from_usize(ev_ptr as usize);
         task.sys_epoll_ctl(
@@ -3162,7 +3159,7 @@ mod tests {
 
         if is_nonblocking {
             // wait on epoll for server to be readable (incoming connection)
-            let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+            let mut events = [litebox_common_linux::EpollEvent::new(0, 0); 2];
             let n = epoll_wait(task, epfd, &mut events);
             assert_eq!(n, 1);
             for ev in &events[..n] {
@@ -3238,7 +3235,7 @@ mod tests {
             "recvfrom" | "recvmsg" => {
                 if is_nonblocking {
                     epoll_add(task, epfd, client_fd, litebox::event::Events::IN);
-                    let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+                    let mut events = [litebox_common_linux::EpollEvent::new(0, 0); 2];
                     let n = epoll_wait(task, epfd, &mut events);
                     for ev in &events[..n] {
                         assert!(ev.events & litebox::event::Events::IN.bits() != 0);
@@ -3524,7 +3521,7 @@ mod tests {
             recv_flags.insert(ReceiveFlags::TRUNC);
         }
         if is_nonblocking {
-            let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
+            let mut events = [litebox_common_linux::EpollEvent::new(0, 0); 2];
             let n = epoll_wait(task, epfd, &mut events);
             assert_eq!(n, 1);
             for ev in &events[..n] {

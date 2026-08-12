@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(target_arch = "x86_64")]
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BROKER_ONLY_C_TESTS: &[&str] = &[
     "eventfd.c",

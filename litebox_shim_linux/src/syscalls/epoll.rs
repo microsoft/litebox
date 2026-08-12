@@ -391,10 +391,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
         if events.is_empty() {
             Some((None, false))
         } else {
-            let event = Some(EpollEvent {
-                events: events.bits(),
-                data: inner.data,
-            });
+            let event = Some(EpollEvent::new(events.bits(), inner.data));
 
             // keep the entry in the ready list if it is not edge-triggered or one-shot
             let is_still_ready = event.is_some()
@@ -680,10 +677,7 @@ mod test {
                 &task.global,
                 10,
                 &reader,
-                EpollEvent {
-                    events: Events::IN.bits(),
-                    data: 0,
-                },
+                EpollEvent::new(Events::IN.bits(), 0),
             )
             .unwrap();
 

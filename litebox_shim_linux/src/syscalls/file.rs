@@ -1390,7 +1390,14 @@ where
         st_gid: 0,
         st_rdev: 0,
         st_size: 0,
+        #[cfg(target_arch = "x86_64")]
         st_blksize: blksize,
+        #[cfg(target_arch = "aarch64")]
+        st_blksize: {
+            // The asm-generic ABI uses signed `st_blksize`.
+            let blksize: u32 = blksize.trunc();
+            blksize.reinterpret_as_signed()
+        },
         st_blocks: 0,
         ..Default::default()
     };

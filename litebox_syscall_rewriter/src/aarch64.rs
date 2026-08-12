@@ -258,6 +258,7 @@ impl EncodedGateMetadata {
 
 /// First scratch register (IP0).
 const X16: u8 = 16;
+const X8: u8 = 8;
 /// Second scratch register (IP1).
 const X17: u8 = 17;
 /// Stack pointer (encoded as register 31 in a base-register field).
@@ -344,6 +345,65 @@ pub const SVC_FRAME_OFF_RETADDR: u16 = 8;
 /// Address of this site's outbound stub. ABI: the runtime's syscall callback
 /// branches here to resume at the original syscall site.
 pub const SVC_FRAME_OFF_STUB: u16 = 16;
+
+pub const RT_SIGRETURN_TRAMPOLINE_BYTES: usize = 48;
+
+/// Emits a synthetic AArch64 `rt_sigreturn` restorer that dispatches through
+/// `callback` using the rewriter's SVC frame ABI.
+pub fn emit_rt_sigreturn_trampoline(
+    callback: usize,
+) -> Result<[u8; RT_SIGRETURN_TRAMPOLINE_BYTES]> {
+    const NR_RT_SIGRETURN: u16 = 139;
+    const CALLBACK_OFFSET: usize = 40;
+    const CONTINUATION_OFFSET: i64 = 32;
+    const ADR_OFFSET: i64 = 12;
+    const LDR_OFFSET: i64 = 24;
+    let instructions = [
+        Insn::Movz {
+            rd: X8,
+            imm16: NR_RT_SIGRETURN,
+        },
+        Insn::SubSp(SVC_FRAME_BYTES),
+        Insn::StrUimm {
+            rt: X16,
+            rn: SP,
+            imm_bytes: SVC_FRAME_OFF_X16,
+        },
+        Insn::Adr {
+            rd: X16,
+            byte_off: CONTINUATION_OFFSET - ADR_OFFSET,
+        },
+        Insn::StrUimm {
+            rt: X16,
+            rn: SP,
+            imm_bytes: SVC_FRAME_OFF_RETADDR,
+        },
+        Insn::StrUimm {
+            rt: XZR,
+            rn: SP,
+            imm_bytes: SVC_FRAME_OFF_STUB,
+        },
+        Insn::LdrLiteral {
+            rt: X16,
+            off: i64::try_from(CALLBACK_OFFSET).map_err(|_| {
+                Error::AddressOverflow("callback offset does not fit in i64".into())
+            })? - LDR_OFFSET,
+        },
+        Insn::Br(X16),
+        Insn::Nop,
+        Insn::Nop,
+    ];
+
+    let mut out = [0; RT_SIGRETURN_TRAMPOLINE_BYTES];
+    for (index, instruction) in instructions.into_iter().enumerate() {
+        let word = instruction.encode().ok_or_else(|| {
+            Error::AddressOverflow("rt_sigreturn trampoline instruction is not encodable".into())
+        })?;
+        out[index * INSN_BYTES..][..INSN_BYTES].copy_from_slice(&word.to_le_bytes());
+    }
+    out[CALLBACK_OFFSET..].copy_from_slice(&callback.to_ne_bytes());
+    Ok(out)
+}
 
 // The gate carves the frame out of the guest stack with `SUB SP`, so the frame
 // must keep `SP` 16-byte aligned, and it must be large enough for the three
@@ -488,6 +548,7 @@ enum Opcode {
     Adr = 0x1000_0000,
     Adrp = 0x9000_0000,
     Br = 0xD61F_0000,
+    Movz = 0xD280_0000,
     SubImm = 0xD100_0000,
     AddImm = 0x9100_0000,
     StrUimm = 0xF900_0000,
@@ -610,23 +671,50 @@ enum Insn {
     /// `B` (unconditional branch), PC-relative, ±128MB, 4-byte aligned.
     B(i64),
     /// `ADR Xd, #byte_off` — PC-relative address, ±1MB (byte granularity).
-    Adr { rd: u8, byte_off: i64 },
+    Adr {
+        rd: u8,
+        byte_off: i64,
+    },
     /// `ADRP Xd, #page_off` — page-relative address, ±4GB (in 4KB pages).
-    Adrp { rd: u8, page_off: i64 },
+    Adrp {
+        rd: u8,
+        page_off: i64,
+    },
     /// `LDR Xt, <literal>` (PC-relative literal load), ±1MB, 4-byte aligned.
-    LdrLiteral { rt: u8, off: i64 },
+    LdrLiteral {
+        rt: u8,
+        off: i64,
+    },
     /// `BR Xn` (branch to register).
     Br(u8),
+    /// `MOVZ Xd, #imm16`.
+    Movz {
+        rd: u8,
+        imm16: u16,
+    },
+    Nop,
     /// `SUB SP, SP, #imm12`.
     SubSp(u16),
     /// `ADD SP, SP, #imm12`.
     AddSp(u16),
     /// `ADD Xd, Xn, #imm12`.
-    AddImm { rd: u8, rn: u8, imm12: u16 },
+    AddImm {
+        rd: u8,
+        rn: u8,
+        imm12: u16,
+    },
     /// `STR Xt, [Xn, #imm_bytes]` (unsigned scaled; `imm_bytes` multiple of 8).
-    StrUimm { rt: u8, rn: u8, imm_bytes: u16 },
+    StrUimm {
+        rt: u8,
+        rn: u8,
+        imm_bytes: u16,
+    },
     /// `LDR Xt, [Xn, #imm_bytes]` (unsigned scaled; `imm_bytes` multiple of 8).
-    LdrUimm { rt: u8, rn: u8, imm_bytes: u16 },
+    LdrUimm {
+        rt: u8,
+        rn: u8,
+        imm_bytes: u16,
+    },
     /// `STP Xt, Xt2, [Xn, #imm_bytes]` (signed scaled; `imm_bytes` multiple of 8).
     Stp {
         rt: u8,
@@ -657,6 +745,10 @@ impl Insn {
             Insn::Adrp { rd, page_off } => pcrel_imm21(Opcode::Adrp, rd, page_off),
             Insn::LdrLiteral { rt, off } => pcrel_imm19(Opcode::LdrLiteral, off, u32::from(rt)),
             Insn::Br(rn) => Some(Opcode::Br.bits() | (u32::from(rn) << RN_SHIFT)),
+            Insn::Movz { rd, imm16 } => {
+                Some(Opcode::Movz.bits() | (u32::from(imm16) << RN_SHIFT) | u32::from(rd))
+            }
+            Insn::Nop => Some(NOP),
             Insn::SubSp(imm12) => data_imm12(Opcode::SubImm, SP, SP, imm12),
             Insn::AddSp(imm12) => data_imm12(Opcode::AddImm, SP, SP, imm12),
             Insn::AddImm { rd, rn, imm12 } => data_imm12(Opcode::AddImm, rd, rn, imm12),
@@ -2096,6 +2188,15 @@ impl Asm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rt_sigreturn_trampoline_uses_the_svc_gate_frame_abi() {
+        let callback = 0x1122_3344_5566_7788usize;
+        let code = emit_rt_sigreturn_trampoline(callback).unwrap();
+
+        assert_eq!(&code[code.len() - 8..], &callback.to_ne_bytes());
+        assert_eq!(code.len(), 48);
+    }
     use alloc::vec;
 
     // The emitters append each gate at `trampoline_data.len()`, so these sizes

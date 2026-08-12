@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::ShimPlatform;
-use crate::UserPtrMut;
 use crate::syscalls::signal::{DeliverFault, SignalState};
+use crate::{ShimFS, ShimPlatform, Task, UserPtrMut};
 use core::mem::offset_of;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
@@ -44,6 +43,17 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     frame_addr
 }
 
+/// Requires the guest's own `sa_restorer`; LiteBox has no x86-64 vDSO fallback.
+pub(super) fn sigreturn_trampoline<Platform: ShimPlatform, FS: ShimFS>(
+    _task: &Task<Platform, FS>,
+    action: &SigAction,
+) -> Result<usize, DeliverFault> {
+    if !action.flags.contains(SaFlags::RESTORER) {
+        return Err(DeliverFault);
+    }
+    Ok(action.restorer)
+}
+
 impl<Platform: ShimPlatform> SignalState<Platform> {
     pub(super) fn write_signal_frame(
         &self,
@@ -51,14 +61,11 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        sigreturn_trampoline: usize,
     ) -> Result<(), DeliverFault> {
-        if !action.flags.contains(SaFlags::RESTORER) {
-            return Err(DeliverFault);
-        }
-
         let last_exception = self.last_exception.get();
         let frame = SignalFrame {
-            return_address: action.restorer,
+            return_address: sigreturn_trampoline,
             ucontext: Ucontext {
                 flags: 0,
                 link: 0, // core::ptr::null_mut(),
