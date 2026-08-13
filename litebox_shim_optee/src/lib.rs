@@ -255,7 +255,6 @@ impl OpteeShim {
         &self,
         ldelf_bin: &[u8],
         ta_uuid: TeeUuid,
-        ta_bin: Option<&[u8]>,
     ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
@@ -275,11 +274,6 @@ impl OpteeShim {
                 tls_base_addr: Cell::new(0),
             },
         };
-        if let Some(ta_bin) = ta_bin
-            && !entrypoints.task.global.store_ta_bin(&ta_uuid, ta_bin)
-        {
-            return Err(loader::elf::ElfLoaderError::InvalidUuid);
-        }
         let elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin, true)?;
         entrypoints.task.load_ldelf(elf_loader, ta_uuid)?;
         let params_address = if entrypoints.task.get_ta_stack_base_addr().is_some() {

@@ -784,13 +784,13 @@ fn open_session_new_instance(
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
-    let Some(ta_bin) = find_ta_binary(&shim, &ta_uuid) else {
+    if shim.get_ta_bin(&ta_uuid).is_none() {
         msg_args.session = 0;
         msg_args.ret = TeeResult::ItemNotFound;
         msg_args.ret_origin = TeeOrigin::Tee;
         write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
         return Ok(());
-    };
+    }
 
     // Token is declared before `task_pt_guard` so it drops AFTER it.
     // Marker only releases once CR3 is back to base. See
@@ -807,15 +807,12 @@ fn open_session_new_instance(
     })?;
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
-    let loaded_program = Box::new(
-        shim.load_ldelf(LDELF_BINARY, ta_uuid, Some(&ta_bin))
-            .map_err(|_| {
-                // Safety: We are about to tear down this TA instance;
-                // no references to user-space memory will be held afterwards.
-                unsafe { teardown_ta_page_table(&shim, task_pt_id) };
-                OpteeSmcReturnCode::ENomem
-            })?,
-    );
+    let loaded_program = Box::new(shim.load_ldelf(LDELF_BINARY, ta_uuid).map_err(|_| {
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+        OpteeSmcReturnCode::ENomem
+    })?);
 
     let ta_flags = loaded_program.ta_flags;
 
