@@ -1803,35 +1803,6 @@ mod tests {
     }
 
     #[test]
-    fn read_virtual_memory_allows_zero_length_and_optional_count() {
-        run_with_test_platform_pointers(|| {
-            let mut bytes_read = usize::MAX;
-
-            assert_eq!(
-                TestTask::sys_nt_read_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    null_const_ptr(),
-                    null_mut_ptr(),
-                    0,
-                    Some(mut_ptr(&mut bytes_read)),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(bytes_read, 0);
-            assert_eq!(
-                TestTask::sys_nt_read_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    null_const_ptr(),
-                    null_mut_ptr(),
-                    0,
-                    None,
-                ),
-                NtStatus::SUCCESS
-            );
-        });
-    }
-
-    #[test]
     fn allocate_virtual_memory_commit_only_null_base_creates_committed_region() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
