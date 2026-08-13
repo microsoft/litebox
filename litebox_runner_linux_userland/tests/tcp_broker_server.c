@@ -50,11 +50,38 @@ struct blocking_accept {
     int error;
 };
 
+struct client_exchange {
+    struct sockaddr_in server;
+    struct sockaddr_in local;
+    unsigned char request;
+    unsigned char expected_response;
+};
+
 static void *blocking_accept_thread(void *argument) {
     struct blocking_accept *accept = argument;
     errno = 0;
     accept->result = accept4(accept->fd, NULL, NULL, 0);
     accept->error = errno;
+    return NULL;
+}
+
+static void *client_exchange_thread(void *argument) {
+    struct client_exchange *exchange = argument;
+    usleep(100 * 1000);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    assert(connect(fd, (const struct sockaddr *)&exchange->server,
+                   sizeof(exchange->server)) == 0);
+    socklen_t length = sizeof(exchange->local);
+    assert(getsockname(fd, (struct sockaddr *)&exchange->local, &length) == 0);
+    assert(length == sizeof(exchange->local));
+    assert(write(fd, &exchange->request, sizeof(exchange->request)) ==
+           sizeof(exchange->request));
+    unsigned char response = 0;
+    assert(read(fd, &response, sizeof(response)) == sizeof(response));
+    assert(response == exchange->expected_response);
+    assert(close(fd) == 0);
     return NULL;
 }
 
@@ -82,6 +109,19 @@ int main(void) {
     assert(errno == EAGAIN);
     printf("LISTEN %u\n", (unsigned int)ntohs(local.sin_port));
 
+    int first_client = socket(AF_INET, SOCK_STREAM, 0);
+    assert(first_client >= 0);
+    assert(connect(first_client, (const struct sockaddr *)&local, sizeof(local)) ==
+           0);
+    struct sockaddr_in first_client_local;
+    length = sizeof(first_client_local);
+    assert(getsockname(first_client, (struct sockaddr *)&first_client_local,
+                       &length) == 0);
+    assert(length == sizeof(first_client_local));
+    unsigned char first_request = 0x31;
+    assert(write(first_client, &first_request, sizeof(first_request)) ==
+           sizeof(first_request));
+
     struct pollfd ready = {.fd = listener, .events = POLLIN};
     assert(poll(&ready, 1, 5000) == 1);
     assert((ready.revents & POLLIN) != 0);
@@ -95,6 +135,13 @@ int main(void) {
     assert((fcntl(first, F_GETFD) & FD_CLOEXEC) != 0);
     verify_endpoints(first, &local, &first_peer);
     exchange_byte(first, 0x31, 0x41);
+    unsigned char first_response = 0;
+    assert(read(first_client, &first_response, sizeof(first_response)) ==
+           sizeof(first_response));
+    assert(first_response == 0x41);
+    assert(first_peer.sin_addr.s_addr == first_client_local.sin_addr.s_addr);
+    assert(first_peer.sin_port == first_client_local.sin_port);
+    assert(close(first_client) == 0);
     printf("FIRST %u\n", (unsigned int)ntohs(first_peer.sin_port));
 
     int listener_flags = fcntl(listener, F_GETFL);
@@ -102,6 +149,14 @@ int main(void) {
     assert(fcntl(listener, F_SETFL, listener_flags & ~O_NONBLOCK) == 0);
     printf("BLOCKING\n");
 
+    struct client_exchange second_exchange = {
+        .server = local,
+        .request = 0x32,
+        .expected_response = 0x42,
+    };
+    pthread_t client_thread;
+    assert(pthread_create(&client_thread, NULL, client_exchange_thread,
+                          &second_exchange) == 0);
     struct sockaddr_in second_peer;
     length = sizeof(second_peer);
     int second =
@@ -112,6 +167,10 @@ int main(void) {
     assert((fcntl(second, F_GETFD) & FD_CLOEXEC) == 0);
     verify_endpoints(second, &local, &second_peer);
     exchange_byte(second, 0x32, 0x42);
+    assert(pthread_join(client_thread, NULL) == 0);
+    assert(second_peer.sin_addr.s_addr ==
+           second_exchange.local.sin_addr.s_addr);
+    assert(second_peer.sin_port == second_exchange.local.sin_port);
     printf("SECOND %u\n", (unsigned int)ntohs(second_peer.sin_port));
 
     struct blocking_accept accept = {

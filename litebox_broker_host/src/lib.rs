@@ -766,6 +766,7 @@ mod tests {
             Ok(Arc::new(TestPlatformSocket {
                 readiness,
                 create_request: request,
+                local_address: Mutex::new(None),
             }))
         }
 
@@ -775,6 +776,7 @@ mod tests {
     struct TestPlatformSocket {
         readiness: ReadinessRegistration,
         create_request: CreateSocketRequest,
+        local_address: Mutex<Option<SocketAddrV4>>,
     }
 
     impl PlatformSocket for TestPlatformSocket {
@@ -782,11 +784,16 @@ mod tests {
             &self,
             address: SocketAddrV4,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            if self.create_request.socket_type == SocketType::Stream {
+                *self.local_address.lock().unwrap() = Some(address);
+                return Ok(SocketOutcome::Completed(address));
+            }
             let address = if address.port() == 0 {
                 SocketAddrV4::new(*address.ip(), 49152)
             } else {
                 address
             };
+            *self.local_address.lock().unwrap() = Some(address);
             Ok(SocketOutcome::Completed(address))
         }
 
@@ -794,10 +801,11 @@ mod tests {
             &self,
             _backlog: u32,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
-            Ok(SocketOutcome::Completed(SocketAddrV4::new(
-                Ipv4Addr::LOCALHOST,
-                49152,
-            )))
+            self.local_address
+                .lock()
+                .unwrap()
+                .ok_or(litebox_broker_core::BrokerError::Internal)
+                .map(SocketOutcome::Completed)
         }
 
         fn accept(
@@ -1365,7 +1373,7 @@ mod tests {
             ),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: None,
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
                 pending_error: None,
             }))
         );
