@@ -43,10 +43,27 @@ use litebox_broker_core::readiness::ReadinessRegistration;
 const WAKE_TOKEN: u64 = 0;
 const MAX_QUEUED_SOCKET_COMMANDS: usize = 64;
 const MAX_EPOLL_EVENTS: usize = 64;
-const SOCKET_PENDING: u8 = 0;
-const SOCKET_ACTIVE: u8 = 1;
-const SOCKET_RETIRING: u8 = 2;
-const SOCKET_RETIRED: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum SocketLifecycleState {
+    Pending = 0,
+    Active = 1,
+    Retiring = 2,
+    Retired = 3,
+}
+
+impl SocketLifecycleState {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            0 => Self::Pending,
+            1 => Self::Active,
+            2 => Self::Retiring,
+            3 => Self::Retired,
+            _ => unreachable!("invalid Linux socket lifecycle state"),
+        }
+    }
+}
 
 struct SocketLifecycle {
     state: AtomicU8,
@@ -55,15 +72,19 @@ struct SocketLifecycle {
 impl SocketLifecycle {
     fn pending() -> Self {
         Self {
-            state: AtomicU8::new(SOCKET_PENDING),
+            state: AtomicU8::new(SocketLifecycleState::Pending as u8),
         }
+    }
+
+    fn load(&self) -> SocketLifecycleState {
+        SocketLifecycleState::from_raw(self.state.load(Ordering::Acquire))
     }
 
     fn activate(&self) -> bool {
         self.state
             .compare_exchange(
-                SOCKET_PENDING,
-                SOCKET_ACTIVE,
+                SocketLifecycleState::Pending as u8,
+                SocketLifecycleState::Active as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -73,13 +94,13 @@ impl SocketLifecycle {
     fn retire(&self, close: impl FnOnce()) {
         let mut close = Some(close);
         loop {
-            match self.state.load(Ordering::Acquire) {
-                SOCKET_PENDING => {
+            match self.load() {
+                SocketLifecycleState::Pending => {
                     if self
                         .state
                         .compare_exchange(
-                            SOCKET_PENDING,
-                            SOCKET_RETIRED,
+                            SocketLifecycleState::Pending as u8,
+                            SocketLifecycleState::Retired as u8,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
@@ -88,36 +109,37 @@ impl SocketLifecycle {
                         return;
                     }
                 }
-                SOCKET_ACTIVE => {
+                SocketLifecycleState::Active => {
                     if self
                         .state
                         .compare_exchange(
-                            SOCKET_ACTIVE,
-                            SOCKET_RETIRING,
+                            SocketLifecycleState::Active as u8,
+                            SocketLifecycleState::Retiring as u8,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
                         .is_ok()
                     {
                         close.take().expect("socket close action missing")();
-                        self.state.store(SOCKET_RETIRED, Ordering::Release);
+                        self.state
+                            .store(SocketLifecycleState::Retired as u8, Ordering::Release);
                         return;
                     }
                 }
-                SOCKET_RETIRING => {
-                    while self.state.load(Ordering::Acquire) != SOCKET_RETIRED {
+                SocketLifecycleState::Retiring => {
+                    while self.load() != SocketLifecycleState::Retired {
                         thread::yield_now();
                     }
                     return;
                 }
-                SOCKET_RETIRED => return,
-                _ => unreachable!("invalid Linux socket lifecycle state"),
+                SocketLifecycleState::Retired => return,
             }
         }
     }
 
     fn reactor_removed(&self) {
-        self.state.store(SOCKET_RETIRED, Ordering::Release);
+        self.state
+            .store(SocketLifecycleState::Retired as u8, Ordering::Release);
     }
 }
 
@@ -2143,7 +2165,7 @@ mod tests {
         let lifecycle = SocketLifecycle::pending();
         lifecycle.retire(|| panic!("pending sockets have no reactor resource to close"));
         assert!(!lifecycle.activate());
-        assert_eq!(lifecycle.state.load(Ordering::Acquire), SOCKET_RETIRED);
+        assert_eq!(lifecycle.load(), SocketLifecycleState::Retired);
     }
 
     #[test]
@@ -2180,7 +2202,7 @@ mod tests {
         first.join().unwrap();
         second_finished_receive.recv_timeout(TEST_TIMEOUT).unwrap();
         second.join().unwrap();
-        assert_eq!(lifecycle.state.load(Ordering::Acquire), SOCKET_RETIRED);
+        assert_eq!(lifecycle.load(), SocketLifecycleState::Retired);
     }
 
     fn send_bytes(
