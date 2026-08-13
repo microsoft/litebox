@@ -891,6 +891,8 @@ mod tests {
             })
         }
 
+        fn retire(&self) {}
+
         fn readiness(&self) -> litebox_broker_protocol::readiness::ReadinessFlags {
             litebox_broker_protocol::readiness::ReadinessFlags::READ
                 | litebox_broker_protocol::readiness::ReadinessFlags::WRITE

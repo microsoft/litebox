@@ -9,7 +9,7 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use std::mem::size_of;
 use std::net::SocketAddrV4;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -44,6 +44,105 @@ const WAKE_TOKEN: u64 = 0;
 const MAX_QUEUED_SOCKET_COMMANDS: usize = 64;
 const MAX_EPOLL_EVENTS: usize = 64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum SocketLifecycleState {
+    Pending = 0,
+    Active = 1,
+    Retiring = 2,
+    Retired = 3,
+}
+
+impl SocketLifecycleState {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            0 => Self::Pending,
+            1 => Self::Active,
+            2 => Self::Retiring,
+            3 => Self::Retired,
+            _ => unreachable!("invalid Linux socket lifecycle state"),
+        }
+    }
+}
+
+struct SocketLifecycle {
+    state: AtomicU8,
+}
+
+impl SocketLifecycle {
+    fn pending() -> Self {
+        Self {
+            state: AtomicU8::new(SocketLifecycleState::Pending as u8),
+        }
+    }
+
+    fn load(&self) -> SocketLifecycleState {
+        SocketLifecycleState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    fn activate(&self) -> bool {
+        self.state
+            .compare_exchange(
+                SocketLifecycleState::Pending as u8,
+                SocketLifecycleState::Active as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn retire(&self, close: impl FnOnce()) {
+        let mut close = Some(close);
+        loop {
+            match self.load() {
+                SocketLifecycleState::Pending => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            SocketLifecycleState::Pending as u8,
+                            SocketLifecycleState::Retired as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                SocketLifecycleState::Active => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            SocketLifecycleState::Active as u8,
+                            SocketLifecycleState::Retiring as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        close.take().expect("socket close action missing")();
+                        self.state
+                            .store(SocketLifecycleState::Retired as u8, Ordering::Release);
+                        return;
+                    }
+                }
+                SocketLifecycleState::Retiring => {
+                    while self.load() != SocketLifecycleState::Retired {
+                        thread::yield_now();
+                    }
+                    return;
+                }
+                SocketLifecycleState::Retired => return,
+            }
+        }
+    }
+
+    fn reactor_removed(&self) {
+        self.state
+            .store(SocketLifecycleState::Retired as u8, Ordering::Release);
+    }
+}
+
 /// Linux-userland socket provider.
 ///
 /// One reactor thread owns every socket descriptor and all epoll state.
@@ -75,21 +174,21 @@ impl SocketProvider for LinuxSocketProvider {
 
         let id = self.reactor.allocate_socket_id()?;
         let snapshot = Arc::new(Mutex::new(SocketSnapshot::default()));
-        let active = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(SocketLifecycle::pending());
         // Allocate the provider object before the reactor creates an external
         // resource, so successful creation has no remaining Arc allocation.
         let socket = Arc::new(LinuxSocket {
             id,
             reactor: Arc::clone(&self.reactor),
             snapshot: Arc::clone(&snapshot),
-            active: Arc::clone(&active),
+            lifecycle: Arc::clone(&lifecycle),
         });
         self.reactor.request(|response| ReactorCommand::Create {
             id,
             request,
             readiness,
             snapshot,
-            active,
+            lifecycle,
             response,
         })?;
         Ok(socket)
@@ -106,7 +205,7 @@ struct LinuxSocket {
     id: u64,
     reactor: Arc<ReactorClient>,
     snapshot: Arc<Mutex<SocketSnapshot>>,
-    active: Arc<AtomicBool>,
+    lifecycle: Arc<SocketLifecycle>,
 }
 
 impl PlatformSocket for LinuxSocket {
@@ -132,19 +231,19 @@ impl PlatformSocket for LinuxSocket {
     ) -> BrokerResult<SocketOutcome<AcceptedPlatformSocket>> {
         let id = self.reactor.allocate_socket_id()?;
         let snapshot = Arc::new(Mutex::new(SocketSnapshot::default()));
-        let active = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(SocketLifecycle::pending());
         let socket = Arc::new(LinuxSocket {
             id,
             reactor: Arc::clone(&self.reactor),
             snapshot: Arc::clone(&snapshot),
-            active: Arc::clone(&active),
+            lifecycle: Arc::clone(&lifecycle),
         });
         match self.reactor.request(|response| ReactorCommand::Accept {
             listener_id: self.id,
             accepted_id: id,
             readiness,
             snapshot,
-            active,
+            lifecycle,
             response,
         })? {
             SocketOutcome::Completed(accepted) => {
@@ -275,6 +374,10 @@ impl PlatformSocket for LinuxSocket {
         })
     }
 
+    fn retire(&self) {
+        self.lifecycle.retire(|| self.reactor.close_socket(self.id));
+    }
+
     fn readiness(&self) -> ReadinessFlags {
         self.snapshot
             .lock()
@@ -285,9 +388,7 @@ impl PlatformSocket for LinuxSocket {
 
 impl Drop for LinuxSocket {
     fn drop(&mut self) {
-        if self.active.swap(false, Ordering::AcqRel) {
-            self.reactor.close_socket(self.id);
-        }
+        self.retire();
     }
 }
 
@@ -482,7 +583,7 @@ enum ReactorCommand {
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
         snapshot: Arc<Mutex<SocketSnapshot>>,
-        active: Arc<AtomicBool>,
+        lifecycle: Arc<SocketLifecycle>,
         response: SyncSender<BrokerResult<()>>,
     },
     Connect {
@@ -505,7 +606,7 @@ enum ReactorCommand {
         accepted_id: u64,
         readiness: ReadinessRegistration,
         snapshot: Arc<Mutex<SocketSnapshot>>,
-        active: Arc<AtomicBool>,
+        lifecycle: Arc<SocketLifecycle>,
         response: SyncSender<BrokerResult<SocketOutcome<AcceptedEndpoints>>>,
     },
     Send {
@@ -720,16 +821,14 @@ impl Reactor {
                     request,
                     readiness,
                     snapshot,
-                    active,
+                    lifecycle,
                     response,
                 } => {
-                    let outcome = self.create_socket(id, request, readiness, snapshot);
+                    let outcome = self.create_socket(id, request, readiness, snapshot, &lifecycle);
                     let created = outcome.is_ok();
-                    if created {
-                        active.store(true, Ordering::Release);
-                    }
                     if response.send(outcome).is_err() && created {
                         self.sockets.remove(&id);
+                        lifecycle.reactor_removed();
                     }
                 }
                 ReactorCommand::Connect {
@@ -774,19 +873,23 @@ impl Reactor {
                     accepted_id,
                     readiness,
                     snapshot,
-                    active,
+                    lifecycle,
                     response,
                 } => {
-                    let outcome = self.accept_socket(listener_id, accepted_id, readiness, snapshot);
+                    let outcome = self.accept_socket(
+                        listener_id,
+                        accepted_id,
+                        readiness,
+                        snapshot,
+                        &lifecycle,
+                    );
                     let accepted = matches!(
                         &outcome,
                         Ok(SocketOutcome::Completed(AcceptedEndpoints { .. }))
                     );
-                    if accepted {
-                        active.store(true, Ordering::Release);
-                    }
                     if response.send(outcome).is_err() && accepted {
                         self.sockets.remove(&accepted_id);
+                        lifecycle.reactor_removed();
                     }
                 }
                 ReactorCommand::Send { id, data, response } => {
@@ -915,6 +1018,7 @@ impl Reactor {
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
         snapshot: Arc<Mutex<SocketSnapshot>>,
+        lifecycle: &SocketLifecycle,
     ) -> BrokerResult<()> {
         if self.sockets.len() >= self.max_sockets {
             return Err(BrokerError::ResourceExhausted);
@@ -958,6 +1062,9 @@ impl Reactor {
                 .readiness = initial_readiness;
             readiness.publish(initial_readiness)?;
         }
+        if !lifecycle.activate() {
+            return Err(BrokerError::Internal);
+        }
         self.sockets.insert(
             id,
             SocketEntry {
@@ -980,6 +1087,7 @@ impl Reactor {
         accepted_id: u64,
         readiness: ReadinessRegistration,
         snapshot: Arc<Mutex<SocketSnapshot>>,
+        lifecycle: &SocketLifecycle,
     ) -> BrokerResult<SocketOutcome<AcceptedEndpoints>> {
         if self.sockets.len() >= self.max_sockets {
             return Err(BrokerError::ResourceExhausted);
@@ -1047,6 +1155,9 @@ impl Reactor {
             snapshot.readiness = ReadinessFlags::WRITE;
         }
         readiness.publish(ReadinessFlags::WRITE)?;
+        if !lifecycle.activate() {
+            return Err(BrokerError::Internal);
+        }
         self.sockets.insert(
             accepted_id,
             SocketEntry {
@@ -2047,6 +2158,51 @@ mod tests {
         received: usize,
         datagram_length: usize,
         source_address: SocketAddrV4,
+    }
+
+    #[test]
+    fn pending_socket_retirement_prevents_reactor_activation() {
+        let lifecycle = SocketLifecycle::pending();
+        lifecycle.retire(|| panic!("pending sockets have no reactor resource to close"));
+        assert!(!lifecycle.activate());
+        assert_eq!(lifecycle.load(), SocketLifecycleState::Retired);
+    }
+
+    #[test]
+    fn concurrent_socket_retirement_waits_for_close_acknowledgement() {
+        let lifecycle = Arc::new(SocketLifecycle::pending());
+        assert!(lifecycle.activate());
+        let (close_started, close_started_receive) = sync_channel(1);
+        let (release_close, release_close_receive) = sync_channel(1);
+        let first_lifecycle = Arc::clone(&lifecycle);
+        let first = thread::spawn(move || {
+            first_lifecycle.retire(|| {
+                close_started.send(()).unwrap();
+                release_close_receive.recv_timeout(TEST_TIMEOUT).unwrap();
+            });
+        });
+        close_started_receive.recv_timeout(TEST_TIMEOUT).unwrap();
+
+        let (second_started, second_started_receive) = sync_channel(1);
+        let (second_finished, second_finished_receive) = sync_channel(1);
+        let second_lifecycle = Arc::clone(&lifecycle);
+        let second = thread::spawn(move || {
+            second_started.send(()).unwrap();
+            second_lifecycle.retire(|| panic!("only the active caller may close the socket"));
+            second_finished.send(()).unwrap();
+        });
+        second_started_receive.recv_timeout(TEST_TIMEOUT).unwrap();
+        assert!(
+            second_finished_receive
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+
+        release_close.send(()).unwrap();
+        first.join().unwrap();
+        second_finished_receive.recv_timeout(TEST_TIMEOUT).unwrap();
+        second.join().unwrap();
+        assert_eq!(lifecycle.load(), SocketLifecycleState::Retired);
     }
 
     fn send_bytes(
