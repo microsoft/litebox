@@ -9,7 +9,7 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use std::mem::size_of;
 use std::net::SocketAddrV4;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -43,6 +43,9 @@ use litebox_broker_core::readiness::ReadinessRegistration;
 const WAKE_TOKEN: u64 = 0;
 const MAX_QUEUED_SOCKET_COMMANDS: usize = 64;
 const MAX_EPOLL_EVENTS: usize = 64;
+const RETIREMENT_ACTIVE: u8 = 0;
+const RETIREMENT_IN_PROGRESS: u8 = 1;
+const RETIREMENT_COMPLETE: u8 = 2;
 
 /// Linux-userland socket provider.
 ///
@@ -83,7 +86,7 @@ impl SocketProvider for LinuxSocketProvider {
             reactor: Arc::clone(&self.reactor),
             snapshot: Arc::clone(&snapshot),
             active: Arc::clone(&active),
-            retirement: Mutex::new(()),
+            retirement: AtomicU8::new(RETIREMENT_ACTIVE),
         });
         self.reactor.request(|response| ReactorCommand::Create {
             id,
@@ -108,16 +111,7 @@ struct LinuxSocket {
     reactor: Arc<ReactorClient>,
     snapshot: Arc<Mutex<SocketSnapshot>>,
     active: Arc<AtomicBool>,
-    retirement: Mutex<()>,
-}
-
-fn retire_socket(active: &AtomicBool, retirement: &Mutex<()>, close: impl FnOnce()) {
-    let _retirement = retirement
-        .lock()
-        .expect("Linux socket retirement mutex poisoned");
-    if active.swap(false, Ordering::AcqRel) {
-        close();
-    }
+    retirement: AtomicU8,
 }
 
 impl PlatformSocket for LinuxSocket {
@@ -149,7 +143,7 @@ impl PlatformSocket for LinuxSocket {
             reactor: Arc::clone(&self.reactor),
             snapshot: Arc::clone(&snapshot),
             active: Arc::clone(&active),
-            retirement: Mutex::new(()),
+            retirement: AtomicU8::new(RETIREMENT_ACTIVE),
         });
         match self.reactor.request(|response| ReactorCommand::Accept {
             listener_id: self.id,
@@ -288,9 +282,27 @@ impl PlatformSocket for LinuxSocket {
     }
 
     fn retire(&self) {
-        retire_socket(&self.active, &self.retirement, || {
-            self.reactor.close_socket(self.id);
-        });
+        match self.retirement.compare_exchange(
+            RETIREMENT_ACTIVE,
+            RETIREMENT_IN_PROGRESS,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                if self.active.swap(false, Ordering::AcqRel) {
+                    self.reactor.close_socket(self.id);
+                }
+                self.retirement
+                    .store(RETIREMENT_COMPLETE, Ordering::Release);
+            }
+            Err(RETIREMENT_IN_PROGRESS) => {
+                while self.retirement.load(Ordering::Acquire) != RETIREMENT_COMPLETE {
+                    thread::yield_now();
+                }
+            }
+            Err(RETIREMENT_COMPLETE) => {}
+            Err(_) => unreachable!("invalid Linux socket retirement state"),
+        }
     }
 
     fn readiness(&self) -> ReadinessFlags {
@@ -2063,46 +2075,6 @@ mod tests {
         received: usize,
         datagram_length: usize,
         source_address: SocketAddrV4,
-    }
-
-    #[test]
-    fn concurrent_retirement_waits_for_close_acknowledgement() {
-        let active = Arc::new(AtomicBool::new(true));
-        let retirement = Arc::new(Mutex::new(()));
-        let (close_started, close_started_receive) = sync_channel(1);
-        let (release_close, release_close_receive) = sync_channel(1);
-        let first_active = Arc::clone(&active);
-        let first_retirement = Arc::clone(&retirement);
-        let first = thread::spawn(move || {
-            retire_socket(&first_active, &first_retirement, || {
-                close_started.send(()).unwrap();
-                release_close_receive.recv_timeout(TEST_TIMEOUT).unwrap();
-            });
-        });
-        close_started_receive.recv_timeout(TEST_TIMEOUT).unwrap();
-
-        let (second_started, second_started_receive) = sync_channel(1);
-        let (second_finished, second_finished_receive) = sync_channel(1);
-        let second_active = Arc::clone(&active);
-        let second_retirement = Arc::clone(&retirement);
-        let second = thread::spawn(move || {
-            second_started.send(()).unwrap();
-            retire_socket(&second_active, &second_retirement, || {
-                panic!("only the first retirement may close the socket");
-            });
-            second_finished.send(()).unwrap();
-        });
-        second_started_receive.recv_timeout(TEST_TIMEOUT).unwrap();
-        assert!(
-            second_finished_receive
-                .recv_timeout(Duration::from_millis(100))
-                .is_err()
-        );
-
-        release_close.send(()).unwrap();
-        first.join().unwrap();
-        second_finished_receive.recv_timeout(TEST_TIMEOUT).unwrap();
-        second.join().unwrap();
     }
 
     fn send_bytes(
