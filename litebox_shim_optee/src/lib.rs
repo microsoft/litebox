@@ -288,8 +288,13 @@ pub type TaMemrefAddresses = [Option<usize>; litebox_common_optee::UteeParams::T
 
 type MutPtr<Platform, T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-#[derive(Clone)]
 pub struct OpteeShim<Platform: OpteeShimPlatform>(Arc<GlobalState<Platform>>);
+
+impl<Platform: OpteeShimPlatform> Clone for OpteeShim<Platform> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// Load the given `ldelf` binary into memory while making it ready to load the TA binary specified
