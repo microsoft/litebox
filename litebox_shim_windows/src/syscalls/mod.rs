@@ -746,6 +746,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         new_protect: u32,
         old_protect: Platform::RawMutPointer<u32>,
     },
+    NtReadVirtualMemory {
+        process_handle: ProcessHandle,
+        base_address: Platform::RawConstPointer<u8>,
+        buffer: Platform::RawMutPointer<u8>,
+        number_of_bytes_to_read: usize,
+        number_of_bytes_read: Option<Platform::RawMutPointer<usize>>,
+    },
     NtQueryVirtualMemory {
         process_handle: ProcessHandle,
         base_address: usize,
@@ -1457,6 +1464,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 region_size:*,
                 new_protect,
                 old_protect:*,
+            })),
+            NtSysno::NtReadVirtualMemory => Some(sys_req!(NtReadVirtualMemory {
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                buffer:*,
+                number_of_bytes_to_read,
+                number_of_bytes_read:*,
             })),
             NtSysno::NtQueryVirtualMemory => Some(sys_req!(NtQueryVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },

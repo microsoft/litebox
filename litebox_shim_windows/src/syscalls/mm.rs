@@ -21,6 +21,7 @@ pub(super) const ALLOCATION_GRANULARITY: usize = 0x1_0000;
 const ALLOCATION_SEARCH_ATTEMPTS: usize = 8;
 const MEMORY_WORKING_SET_LIST_MIN_SIZE: usize = 16;
 const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;
+const READ_VIRTUAL_MEMORY_CHUNK_BYTES: usize = 4 * 1024;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -492,6 +493,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         free_type: u32,
     ) -> NtStatus {
         if !process_handle.is_current() {
+            litebox_util_log::debug!(
+                process_handle:? = process_handle;
+                "Unsupported NtFreeVirtualMemory process handle"
+            );
             return NtStatus::INVALID_HANDLE;
         }
 
@@ -566,6 +571,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         old_protect: MutPtr<Platform, u32>,
     ) -> NtStatus {
         if !process_handle.is_current() {
+            litebox_util_log::debug!(
+                process_handle:? = process_handle;
+                "Unsupported NtProtectVirtualMemory process handle"
+            );
             return NtStatus::INVALID_HANDLE;
         }
 
@@ -649,6 +658,70 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             old_protect:% = format_args!("{:#x}", old_protect_value);
             "Handled NtProtectVirtualMemory syscall"
         );
+
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_read_virtual_memory(
+        process_handle: ProcessHandle,
+        base_address: ConstPtr<Platform, u8>,
+        buffer: MutPtr<Platform, u8>,
+        number_of_bytes_to_read: usize,
+        number_of_bytes_read: Option<MutPtr<Platform, usize>>,
+    ) -> NtStatus {
+        fn write_bytes_read<Platform: ShimPlatform>(
+            number_of_bytes_read: Option<MutPtr<Platform, usize>>,
+            bytes_copied: usize,
+        ) -> Result<(), NtStatus> {
+            if number_of_bytes_read
+                .is_some_and(|bytes_read| bytes_read.write_at_offset(0, bytes_copied).is_none())
+            {
+                Err(NtStatus::ACCESS_VIOLATION)
+            } else {
+                Ok(())
+            }
+        }
+
+        if !process_handle.is_current() {
+            litebox_util_log::debug!(
+                process_handle:? = process_handle;
+                "Unsupported NtReadVirtualMemory process handle"
+            );
+            return NtStatus::INVALID_HANDLE;
+        }
+        if base_address
+            .as_usize()
+            .checked_add(number_of_bytes_to_read)
+            .is_none()
+            || buffer
+                .as_usize()
+                .checked_add(number_of_bytes_to_read)
+                .is_none()
+        {
+            return write_bytes_read::<Platform>(number_of_bytes_read, 0)
+                .map_or_else(|status| status, |()| NtStatus::PARTIAL_COPY);
+        }
+
+        let mut bytes_copied = 0;
+        while bytes_copied < number_of_bytes_to_read {
+            let chunk_address = base_address.as_usize() + bytes_copied;
+            let remaining = number_of_bytes_to_read - bytes_copied;
+            let Some(copied) = copy_virtual_memory_array::<Platform>(
+                chunk_address,
+                buffer,
+                bytes_copied,
+                remaining,
+            ) else {
+                return write_bytes_read::<Platform>(number_of_bytes_read, bytes_copied)
+                    .map_or_else(|status| status, |()| NtStatus::PARTIAL_COPY);
+            };
+            bytes_copied += copied;
+        }
+        if let Err(status) =
+            write_bytes_read::<Platform>(number_of_bytes_read, number_of_bytes_to_read)
+        {
+            return status;
+        }
 
         NtStatus::SUCCESS
     }
@@ -864,6 +937,95 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         NtStatus::SUCCESS
     }
+}
+
+fn copy_virtual_memory_array<Platform: ShimPlatform>(
+    source_address: usize,
+    destination: MutPtr<Platform, u8>,
+    destination_offset: usize,
+    remaining: usize,
+) -> Option<usize> {
+    match remaining {
+        READ_VIRTUAL_MEMORY_CHUNK_BYTES.. => copy_virtual_memory_array_exact::<
+            Platform,
+            READ_VIRTUAL_MEMORY_CHUNK_BYTES,
+        >(
+            source_address, destination, destination_offset
+        ),
+        2048.. => copy_virtual_memory_array_exact::<Platform, 2048>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        1024.. => copy_virtual_memory_array_exact::<Platform, 1024>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        512.. => copy_virtual_memory_array_exact::<Platform, 512>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        256.. => copy_virtual_memory_array_exact::<Platform, 256>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        128.. => copy_virtual_memory_array_exact::<Platform, 128>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        64.. => copy_virtual_memory_array_exact::<Platform, 64>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        32.. => copy_virtual_memory_array_exact::<Platform, 32>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        16.. => copy_virtual_memory_array_exact::<Platform, 16>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        8.. => copy_virtual_memory_array_exact::<Platform, 8>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        4.. => copy_virtual_memory_array_exact::<Platform, 4>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        2.. => copy_virtual_memory_array_exact::<Platform, 2>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+        _ => copy_virtual_memory_array_exact::<Platform, 1>(
+            source_address,
+            destination,
+            destination_offset,
+        ),
+    }
+}
+
+fn copy_virtual_memory_array_exact<Platform: ShimPlatform, const N: usize>(
+    source_address: usize,
+    destination: MutPtr<Platform, u8>,
+    destination_offset: usize,
+) -> Option<usize>
+where
+    [u8; N]: FromBytes,
+{
+    let bytes = ConstPtr::<Platform, [u8; N]>::from_usize(source_address).read_at_offset(0)?;
+    destination.copy_from_slice(destination_offset, &bytes)?;
+    Some(N)
 }
 
 fn check_and_write_length<Platform: ShimPlatform>(
@@ -1614,6 +1776,28 @@ mod tests {
         );
         assert_eq!(return_length, size_of::<MemoryBasicInformation>());
         info
+    }
+
+    #[test]
+    fn read_virtual_memory_copies_across_chunks() {
+        run_with_test_platform_pointers(|| {
+            let source = std::vec![0x5au8; READ_VIRTUAL_MEMORY_CHUNK_BYTES + 1];
+            let mut destination = std::vec![0u8; source.len()];
+            let mut bytes_read = 0usize;
+
+            assert_eq!(
+                TestTask::sys_nt_read_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    ConstPtr::<TestPlatform, u8>::from_usize(source.as_ptr() as usize),
+                    MutPtr::<TestPlatform, u8>::from_usize(destination.as_mut_ptr() as usize),
+                    source.len(),
+                    Some(mut_ptr(&mut bytes_read)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(destination, source);
+            assert_eq!(bytes_read, source.len());
+        });
     }
 
     #[test]
