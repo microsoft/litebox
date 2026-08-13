@@ -190,17 +190,9 @@ impl GlobalState {
         self.ta_uuid_map.insert(*ta_uuid, ta_bin.into())
     }
 
-    /// Get the TA binary associated with the given TA UUID.
+    /// Get the cached TA binary associated with the given TA UUID.
     pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
-            Some(ta_bin)
-        } else {
-            let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
-            if !self.store_ta_bin(ta_uuid, &ta_bin) {
-                return None;
-            }
-            Some(ta_bin)
-        }
+        self.ta_uuid_map.get(ta_uuid)
     }
 
     /// Return whether a TA binary is cached for the given UUID.
@@ -231,11 +223,6 @@ impl GlobalState {
     #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
         let _ = self.ta_uuid_map.remove(ta_uuid);
-    }
-
-    /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
-    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        None
     }
 }
 
@@ -315,7 +302,7 @@ impl OpteeShim {
         self.0.store_ta_bin(ta_uuid, ta_bin)
     }
 
-    /// Get the TA binary associated with the given TA UUID.
+    /// Get the cached TA binary associated with the given TA UUID.
     pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
     }
