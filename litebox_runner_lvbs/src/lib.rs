@@ -1359,15 +1359,6 @@ fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim) {
     }
 }
 
-/// Look up TA binary by UUID.
-/// TODO: Handle PTA UUIDs
-fn find_ta_binary(
-    shim: &litebox_shim_optee::OpteeShim,
-    ta_uuid: &litebox_common_optee::TeeUuid,
-) -> Option<alloc::sync::Arc<[u8]>> {
-    shim.get_ta_bin(ta_uuid)
-}
-
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("{}", info);
