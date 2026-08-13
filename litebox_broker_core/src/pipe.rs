@@ -62,7 +62,9 @@ pub fn read(session: &BrokerSession, handle: ObjectHandle, length: u32) -> Resul
     let object = object.read();
     match &*object {
         ObjectEntry::Pipe(pipe) => pipe.read(length as usize),
-        ObjectEntry::Event(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
+        ObjectEntry::Event(_) | ObjectEntry::Socket(_) | ObjectEntry::Timer(_) => {
+            Err(BrokerError::InvalidRights)
+        }
         ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }
@@ -76,7 +78,9 @@ pub fn write(session: &BrokerSession, handle: ObjectHandle, data: &[u8]) -> Resu
     let object = object.read();
     match &*object {
         ObjectEntry::Pipe(pipe) => pipe.write(data),
-        ObjectEntry::Event(_) | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
+        ObjectEntry::Event(_) | ObjectEntry::Socket(_) | ObjectEntry::Timer(_) => {
+            Err(BrokerError::InvalidRights)
+        }
         ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }

@@ -31,6 +31,7 @@ mod event;
 mod pipe;
 mod primitive;
 mod socket;
+mod timer;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
@@ -38,6 +39,7 @@ const REQUEST_TAG_CLOSE_OBJECT: u8 = 2;
 const REQUEST_TAG_PIPE: u8 = 3;
 const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 const REQUEST_TAG_SOCKET: u8 = 5;
+const REQUEST_TAG_TIMERFD: u8 = 6;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
@@ -48,11 +50,15 @@ const RESPONSE_TAG_PIPE: u8 = 5;
 const RESPONSE_TAG_READINESS: u8 = 6;
 const RESPONSE_TAG_ERROR: u8 = 7;
 const RESPONSE_TAG_SOCKET: u8 = 8;
+const RESPONSE_TAG_TIMERFD: u8 = 9;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 38;
+///
+/// Bound by the timerfd set-time request: 1 (request tag) + 8 (request id) +
+/// 1 (timerfd op tag) + 8 (handle) + 4 (flags) + 32 (itimerspec) = 54 bytes.
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 54;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -96,7 +102,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_CLOSE_OBJECT
         | REQUEST_TAG_PIPE
         | REQUEST_TAG_CHECK_READINESS
-        | REQUEST_TAG_SOCKET => {
+        | REQUEST_TAG_SOCKET
+        | REQUEST_TAG_TIMERFD => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -141,6 +148,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             socket::encode_socket_request(&mut encoder, request);
         }
+        BrokerOperation::Timer(request) => {
+            encoder.u8(REQUEST_TAG_TIMERFD);
+            encoder.request_id(request_id);
+            timer::encode_timer_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -155,7 +167,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_CHECK_READINESS
         | REQUEST_TAG_EVENT
         | REQUEST_TAG_PIPE
-        | REQUEST_TAG_SOCKET => {}
+        | REQUEST_TAG_SOCKET
+        | REQUEST_TAG_TIMERFD => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -165,6 +178,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
+        REQUEST_TAG_TIMERFD => BrokerOperation::Timer(timer::decode_timer_request(&mut decoder)?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -214,7 +228,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_PIPE
         | RESPONSE_TAG_READINESS
         | RESPONSE_TAG_ERROR
-        | RESPONSE_TAG_SOCKET => {
+        | RESPONSE_TAG_SOCKET
+        | RESPONSE_TAG_TIMERFD => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -262,6 +277,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             socket::encode_socket_response(&mut encoder, response);
         }
+        BrokerResult::Timer(response) => {
+            encoder.u8(RESPONSE_TAG_TIMERFD);
+            encoder.request_id(request_id);
+            timer::encode_timer_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -284,7 +304,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_PIPE
         | RESPONSE_TAG_READINESS
         | RESPONSE_TAG_ERROR
-        | RESPONSE_TAG_SOCKET => {}
+        | RESPONSE_TAG_SOCKET
+        | RESPONSE_TAG_TIMERFD => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -292,6 +313,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_EVENT => BrokerResult::Event(event::decode_event_response(&mut decoder)?),
         RESPONSE_TAG_PIPE => BrokerResult::Pipe(pipe::decode_pipe_response(&mut decoder)?),
         RESPONSE_TAG_SOCKET => BrokerResult::Socket(socket::decode_socket_response(&mut decoder)?),
+        RESPONSE_TAG_TIMERFD => BrokerResult::Timer(timer::decode_timer_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerResult::Error(error)
@@ -344,6 +366,7 @@ mod tests {
     };
     use crate::message::{
         EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest, SocketResponse,
+        TimerRequest, TimerResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -360,6 +383,10 @@ mod tests {
         SendToSocketRequest, SendToSocketResponse, SetTcpOptionRequest, ShutdownMode,
         ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
         SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
+    };
+    use crate::timer::{
+        CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse,
+        ReadTimerRequest, ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
@@ -531,6 +558,19 @@ mod tests {
                 name: TcpOptionName::KeepAlive,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
+            BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest { clock_id: 1 })),
+            BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
+                handle,
+                flags: 1,
+                specification: TimerSpec {
+                    value_seconds: 0x0102_0304_0506_0708,
+                    value_nanoseconds: 999_999_999,
+                    interval_seconds: 0x1112_1314_1516_1718,
+                    interval_nanoseconds: 123_456_789,
+                },
+            })),
+            BrokerOperation::Timer(TimerRequest::Get(GetTimerRequest { handle })),
+            BrokerOperation::Timer(TimerRequest::Read(ReadTimerRequest { handle })),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -760,6 +800,29 @@ mod tests {
                 SocketConnectionStatus::Failed(SocketError::TimedOut),
             ))),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
+            BrokerResult::Timer(TimerResponse::Create(CreateTimerResponse { handle })),
+            BrokerResult::Timer(TimerResponse::Set(SetTimerResponse {
+                readiness: ReadinessFlags::READ,
+                previous: TimerSpec {
+                    value_seconds: 7,
+                    value_nanoseconds: 8,
+                    interval_seconds: 9,
+                    interval_nanoseconds: 10,
+                },
+            })),
+            BrokerResult::Timer(TimerResponse::Get(GetTimerResponse {
+                current: TimerSpec {
+                    value_seconds: 1,
+                    value_nanoseconds: 2,
+                    interval_seconds: 3,
+                    interval_nanoseconds: 4,
+                },
+            })),
+            BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse {
+                expirations: 42,
+                cancelled: false,
+                readiness: ReadinessFlags::default(),
+            })),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),

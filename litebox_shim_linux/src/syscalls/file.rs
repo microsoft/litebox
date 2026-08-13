@@ -19,8 +19,8 @@ use litebox::{
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
-    signal::Signal,
+    InodeType, IoReadVec, IoWriteVec, IoctlArg, Itimerspec, Statx, StatxMask, TfdFlags,
+    TfdTimerFlags, TimeParam, errno::Errno, signal::Signal,
 };
 use thiserror::Error;
 
@@ -177,6 +177,32 @@ impl FsPath {
     }
 }
 
+fn itimerspec_to_spec(value: Itimerspec) -> Result<litebox::event::timer::TimerSpec, Errno> {
+    const NANOS_PER_SEC: u64 = 1_000_000_000;
+    if value.it_value.tv_nsec >= NANOS_PER_SEC || value.it_interval.tv_nsec >= NANOS_PER_SEC {
+        return Err(Errno::EINVAL);
+    }
+    Ok(litebox::event::timer::TimerSpec {
+        value_seconds: u64::try_from(value.it_value.tv_sec).map_err(|_| Errno::EINVAL)?,
+        value_nanoseconds: value.it_value.tv_nsec,
+        interval_seconds: u64::try_from(value.it_interval.tv_sec).map_err(|_| Errno::EINVAL)?,
+        interval_nanoseconds: value.it_interval.tv_nsec,
+    })
+}
+
+fn spec_to_itimerspec(value: litebox::event::timer::TimerSpec) -> Result<Itimerspec, Errno> {
+    Ok(Itimerspec {
+        it_interval: litebox_common_linux::Timespec {
+            tv_sec: i64::try_from(value.interval_seconds).map_err(|_| Errno::EOVERFLOW)?,
+            tv_nsec: value.interval_nanoseconds,
+        },
+        it_value: litebox_common_linux::Timespec {
+            tv_sec: i64::try_from(value.value_seconds).map_err(|_| Errno::EOVERFLOW)?,
+            tv_nsec: value.value_nanoseconds,
+        },
+    })
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
@@ -299,6 +325,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
                 |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -428,6 +455,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         Ok(size_of::<u64>())
                     })
                 },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    espipe_for_non_seekable_offset(offset)?;
+                    handle.with_entry(|file| {
+                        let buf = &mut buf.borrow_mut();
+                        if buf.len() < size_of::<u64>() {
+                            return Err(Errno::EINVAL);
+                        }
+                        let value = file.read(&self.wait_cx())?;
+                        buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+                        Ok(size_of::<u64>())
+                    })
+                },
                 |_fd| Err(Errno::EINVAL),
                 |fd| {
                     let handle = self
@@ -508,6 +553,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     })
                 },
                 |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
                 |fd| {
                     let handle = self
                         .global
@@ -564,6 +610,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
             )
             .flatten()
     }
@@ -612,6 +659,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .run_on_raw_fd(
                         in_raw_fd,
                         |fd| files.fs.read(fd, buf_slice, cur_off).map_err(Errno::from),
+                        |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
                         |_fd| Err(non_fs_err),
@@ -722,6 +770,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
             )
             .flatten()
     }
@@ -763,6 +812,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
             Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
             Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
+            Timerfd(alloc::sync::Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
             Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
             Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>>),
         }
@@ -791,6 +841,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Eventfd(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
+                {
+                    ConsumedFd::Timerfd(fd)
                 } else if let Ok(fd) =
                     rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(raw_fd)
                 {
@@ -827,6 +881,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ConsumedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             ConsumedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
             ConsumedFd::Eventfd(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
+            }
+            ConsumedFd::Timerfd(fd) => {
                 let entry = {
                     let mut dt = self.global.litebox.descriptor_table_mut();
                     dt.remove(&fd)
@@ -1423,6 +1486,7 @@ where
                 )))
             },
             |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
+            |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
             |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
         )
@@ -1454,6 +1518,7 @@ pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
     )
 }
 
@@ -1476,6 +1541,7 @@ fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
 
     files.run_on_raw_fd(
         raw_fd,
+        |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
@@ -1654,6 +1720,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
+                        |fd| getfl_from_handle!(fd),
                     )
                     .flatten()?
                     .bits())
@@ -1731,6 +1798,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         toggle_flags!(fd);
                         Ok(())
                     },
+                    |fd| {
+                        toggle_flags!(fd);
+                        Ok(())
+                    },
                     |_fd| todo!("epoll"),
                     |fd| {
                         toggle_flags!(fd);
@@ -1765,6 +1836,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
                     )
                     .flatten()
             }
@@ -1784,6 +1856,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         },
                         |_fd| todo!("net"),
                         |_fd| todo!("pipes"),
+                        |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
@@ -1917,6 +1990,113 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(raw_fd.try_into().unwrap())
     }
 
+    pub fn sys_timerfd_create(&self, clockid: i32, flags: TfdFlags) -> Result<u32, Errno> {
+        if flags.intersects((TfdFlags::CLOEXEC | TfdFlags::NONBLOCK).complement()) {
+            return Err(Errno::EINVAL);
+        }
+
+        let timerfd = self.global.create_linux_timerfd(clockid, flags)?;
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<super::timerfd::TimerfdSubsystem<Platform>>(timerfd);
+        if flags.contains(TfdFlags::CLOEXEC) {
+            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        drop(dt);
+        let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+            self.global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&typed)
+                .unwrap();
+            Errno::EMFILE
+        })?;
+        Ok(raw_fd.try_into().unwrap())
+    }
+
+    pub fn sys_timerfd_settime(
+        &self,
+        fd: i32,
+        flags: TfdTimerFlags,
+        new_value: UserPtr<Itimerspec>,
+        old_value: UserPtrMut<Itimerspec>,
+    ) -> Result<u32, Errno> {
+        if flags.intersects((TfdTimerFlags::ABSTIME | TfdTimerFlags::CANCEL_ON_SET).complement()) {
+            return Err(Errno::EINVAL);
+        }
+        let spec = itimerspec_to_spec(
+            new_value
+                .read_at_offset::<Platform>(0)
+                .ok_or(Errno::EFAULT)?,
+        )?;
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        let previous = files
+            .run_on_raw_fd(
+                raw_fd,
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|timerfd| timerfd.settime(spec, flags.bits()))
+                },
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()?;
+        if !old_value.is_null() {
+            old_value
+                .write_at_offset::<Platform>(0, spec_to_itimerspec(previous)?)
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(0)
+    }
+
+    pub fn sys_timerfd_gettime(
+        &self,
+        fd: i32,
+        curr_value: UserPtrMut<Itimerspec>,
+    ) -> Result<u32, Errno> {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let files = self.files.borrow();
+        let spec = files
+            .run_on_raw_fd(
+                raw_fd,
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(super::timerfd::TimerFile::gettime)
+                },
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()?;
+        curr_value
+            .write_at_offset::<Platform>(0, spec_to_itimerspec(spec)?)
+            .ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
     fn stdio_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
         match arg {
             IoctlArg::TCGETS(termios) => {
@@ -2048,6 +2228,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             });
                             Ok(())
                         },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                file.set_status(OFlags::NONBLOCK, val != 0);
+                            });
+                            Ok(())
+                        },
                     )
                     .flatten()?;
                 Ok(0)
@@ -2064,6 +2256,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
                 |_fd| todo!("net"),
                 |_fd| todo!("pipes"),
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
                 |fd| {
                     let _old = self
                         .global
@@ -2120,6 +2320,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         Err(Errno::ENOTTY)
                     }
                 },
+                |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
@@ -2573,6 +2774,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |fd| dup(self, &files, fd, close_on_exec, target),
                 |fd| dup(self, &files, fd, close_on_exec, target),
                 |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
             )
             .map_err(|_| DupFdError::BadFd)?
     }
@@ -2728,6 +2930,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
         )?
     }
 }
@@ -2740,6 +2943,71 @@ mod tests {
     use litebox::fs::Mode;
 
     extern crate std;
+
+    #[test]
+    fn itimerspec_rejects_out_of_range_nanoseconds() {
+        use litebox_common_linux::Timespec;
+
+        let bad_value = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: Timespec {
+                tv_sec: 1,
+                tv_nsec: 1_000_000_000,
+            },
+        };
+        assert_eq!(itimerspec_to_spec(bad_value), Err(Errno::EINVAL));
+
+        let bad_interval = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 0,
+                tv_nsec: 2_000_000_000,
+            },
+            it_value: Timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            },
+        };
+        assert_eq!(itimerspec_to_spec(bad_interval), Err(Errno::EINVAL));
+
+        let negative_seconds = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: Timespec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            },
+        };
+        assert_eq!(itimerspec_to_spec(negative_seconds), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn itimerspec_round_trips_valid_values() {
+        use litebox_common_linux::Timespec;
+
+        let value = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 7,
+                tv_nsec: 123,
+            },
+            it_value: Timespec {
+                tv_sec: 3,
+                tv_nsec: 999_999_999,
+            },
+        };
+        let spec = itimerspec_to_spec(value).unwrap();
+        assert_eq!(spec.value_seconds, 3);
+        assert_eq!(spec.value_nanoseconds, 999_999_999);
+        assert_eq!(spec.interval_seconds, 7);
+        assert_eq!(spec.interval_nanoseconds, 123);
+
+        let restored = spec_to_itimerspec(spec).unwrap();
+        assert_eq!(restored, value);
+    }
 
     #[test]
     fn write_to_iovec_returns_partial_after_later_error() {

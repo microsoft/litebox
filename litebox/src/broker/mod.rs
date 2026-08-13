@@ -20,6 +20,7 @@ use litebox_broker_protocol::socket::{
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
     SocketConnectionStatus, SocketOutcome, SocketStatusResponse, TcpOptionName, TcpOptionValue,
 };
+use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::event::{Events, polling::Pollee};
@@ -144,6 +145,26 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError>;
+
+    fn create_timer(&self, clock_id: i32)
+    -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn set_timer(
+        &self,
+        handle: ObjectHandle,
+        specification: TimerSpec,
+        flags: u32,
+    ) -> core::result::Result<(TimerSpec, ReadinessFlags), BrokerControlError>;
+
+    fn get_timer(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<TimerSpec, BrokerControlError>;
+
+    fn read_timer(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<(u64, bool, ReadinessFlags), BrokerControlError>;
 
     fn create_pipe(
         &self,
@@ -512,6 +533,36 @@ where
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError> {
         self.request(|local| local.consume_event(handle, mode))
+    }
+
+    fn create_timer(
+        &self,
+        clock_id: i32,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_timer(clock_id))
+    }
+
+    fn set_timer(
+        &self,
+        handle: ObjectHandle,
+        specification: TimerSpec,
+        flags: u32,
+    ) -> core::result::Result<(TimerSpec, ReadinessFlags), BrokerControlError> {
+        self.request(|local| local.set_timer(handle, specification, flags))
+    }
+
+    fn get_timer(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<TimerSpec, BrokerControlError> {
+        self.request(|local| local.get_timer(handle))
+    }
+
+    fn read_timer(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<(u64, bool, ReadinessFlags), BrokerControlError> {
+        self.request(|local| local.read_timer(handle))
     }
 
     fn create_pipe(

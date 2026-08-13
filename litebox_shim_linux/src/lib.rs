@@ -475,6 +475,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
         eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem<Platform>>) -> R,
+        timerfd: impl FnOnce(&TypedFd<syscalls::timerfd::TimerfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<Platform, FS>>) -> R,
         unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<Platform, FS>>) -> R,
     ) -> Result<R, Errno> {
@@ -494,6 +495,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(eventfd(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(timerfd(&fd));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
@@ -1070,6 +1075,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
+            }
+            SyscallRequest::TimerfdCreate { clockid, flags } => {
+                syscall!(sys_timerfd_create(clockid, flags))
+            }
+            SyscallRequest::TimerfdSettime {
+                fd,
+                flags,
+                new_value,
+                old_value,
+            } => syscall!(sys_timerfd_settime(fd, flags, new_value, old_value)),
+            SyscallRequest::TimerfdGettime { fd, curr_value } => {
+                syscall!(sys_timerfd_gettime(fd, curr_value))
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {

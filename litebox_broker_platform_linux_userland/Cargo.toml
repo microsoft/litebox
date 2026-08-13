@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
-rustix = { version = "1.1.2", default-features = false, features = ["event", "net", "std"] }
+rustix = { version = "1.1.2", default-features = false, features = ["event", "net", "std", "time"] }
 
 [lints]
 workspace = true

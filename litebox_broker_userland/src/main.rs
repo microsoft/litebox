@@ -22,7 +22,7 @@ use litebox_broker_core::{
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
-use litebox_broker_platform_linux_userland::LinuxSocketProvider;
+use litebox_broker_platform_linux_userland::{LinuxSocketProvider, LinuxTimerProvider};
 use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
@@ -115,7 +115,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
         limits,
         Arc::new(LinuxSocketProvider::new(limits.max_sockets)?),
-    )?;
+    )?
+    .with_timer_provider(Arc::new(LinuxTimerProvider::new(limits.max_references)?));
 
     let mut runner_command = Command::new(&args.runner);
     runner_command

@@ -683,6 +683,26 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct TfdFlags: core::ffi::c_uint {
+        const CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
+        const NONBLOCK = litebox::fs::OFlags::NONBLOCK.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct TfdTimerFlags: core::ffi::c_uint {
+        const ABSTIME = 1;
+        const CANCEL_ON_SET = 2;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
@@ -906,6 +926,14 @@ pub struct Timespec {
 
     /// Nanoseconds. Must be less than 1_000_000_000.
     pub tv_nsec: u64,
+}
+
+/// itimerspec from Linux uapi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default)]
+#[repr(C)]
+pub struct Itimerspec {
+    pub it_interval: Timespec,
+    pub it_value: Timespec,
 }
 
 impl TryFrom<Timespec> for Duration {
@@ -2300,6 +2328,20 @@ pub enum SyscallRequest {
         initval: u32,
         flags: EfdFlags,
     },
+    TimerfdCreate {
+        clockid: i32,
+        flags: TfdFlags,
+    },
+    TimerfdSettime {
+        fd: i32,
+        flags: TfdTimerFlags,
+        new_value: UserPtr<Itimerspec>,
+        old_value: UserPtrMut<Itimerspec>,
+    },
+    TimerfdGettime {
+        fd: i32,
+        curr_value: UserPtrMut<Itimerspec>,
+    },
     Pipe2 {
         pipefd: UserPtrMut<u32>,
         flags: litebox::fs::OFlags,
@@ -2879,6 +2921,11 @@ impl SyscallRequest {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::timerfd_create => sys_req!(TimerfdCreate { clockid, flags }),
+            Sysno::timerfd_settime => {
+                sys_req!(TimerfdSettime { fd, flags, new_value:*, old_value:* })
+            }
+            Sysno::timerfd_gettime => sys_req!(TimerfdGettime { fd, curr_value:* }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
                 let args = CloneArgs {
@@ -3419,6 +3466,8 @@ reinterpret_truncated_from_usize_for! {
         ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
+        TfdFlags,
+        TfdTimerFlags,
         RngFlags,
         TimerFlags,
         StatxMask,

@@ -13,6 +13,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
+use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
 
@@ -227,7 +228,74 @@ fn run_fake_runner(args: &[OsString]) {
         )
         .unwrap();
     assert_eq!(&received[..read], data);
+
+    exercise_timerfd(&local);
+
     drop(local);
+}
+
+/// Drives a broker-owned timerfd through its full lifecycle against the real
+/// broker binary: create, arm a short one-shot timer, observe host-delegated
+/// expiry surface as READ readiness, drain the accumulated expiration count,
+/// and confirm the drained timer is no longer readable.
+fn exercise_timerfd<Channel: litebox_broker_transport::channel::LocalCallChannel>(
+    local: &BrokerLocal<Channel>,
+) where
+    Channel::Error: std::fmt::Debug,
+{
+    const CLOCK_MONOTONIC: i32 = 1;
+
+    let timer = local.create_timer(CLOCK_MONOTONIC).unwrap();
+    // A freshly created, disarmed timer never fires, so it is not yet readable.
+    assert!(
+        !local
+            .check_readiness(timer)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+    );
+
+    let specification = TimerSpec {
+        value_seconds: 0,
+        value_nanoseconds: 5_000_000,
+        interval_seconds: 0,
+        interval_nanoseconds: 0,
+    };
+    let (previous, _readiness) = local.set_timer(timer, specification, 0).unwrap();
+    // Arming a previously disarmed timer reports an all-zero prior setting.
+    assert_eq!(previous.value_seconds, 0);
+    assert_eq!(previous.value_nanoseconds, 0);
+    assert_eq!(previous.interval_seconds, 0);
+    assert_eq!(previous.interval_nanoseconds, 0);
+
+    // The host timerfd fires asynchronously; poll the broker-authoritative
+    // readiness snapshot until the reactor publishes the expiry.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if local
+            .check_readiness(timer)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timerfd did not expire within the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let (expirations, cancelled, _readiness) = local.read_timer(timer).unwrap();
+    assert!(
+        !cancelled,
+        "a normally expired timer must not report cancellation"
+    );
+    assert!(
+        expirations >= 1,
+        "expected at least one expiration, got {expirations}"
+    );
+
+    local.close_object(timer).unwrap();
 }
 
 struct ChildGuard {

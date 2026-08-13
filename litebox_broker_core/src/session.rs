@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
+use crate::timer::TimerObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -55,6 +56,7 @@ pub(crate) enum ObjectEntry {
     Event(EventObject),
     Pipe(PipeObject),
     Socket(SocketObject),
+    Timer(TimerObject),
 }
 
 struct SessionReferences {
@@ -322,6 +324,7 @@ impl BrokerSession {
                 ObjectEntry::Event(event) => return Ok(event.readiness()),
                 ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
                 ObjectEntry::Socket(socket) => socket.resource(),
+                ObjectEntry::Timer(timerfd) => return Ok(timerfd.resource().readiness()),
                 ObjectEntry::Reserved => return Err(BrokerError::Internal),
             }
         };
@@ -497,6 +500,7 @@ impl Drop for BrokerSession {
             drop(reference);
         }
         self.core.socket_provider.close_session(self.session_id);
+        self.core.timer_provider.close_session(self.session_id);
     }
 }
 
@@ -539,13 +543,15 @@ mod tests {
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
+        let timer_provider = Arc::new(crate::timer::tests::TestTimerProvider::default());
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::Ipv4Loopback),
             BrokerCoreLimits::new_with_all_limits(2, 4, 2, 1),
             socket_provider.clone(),
         )
-        .unwrap();
+        .unwrap()
+        .with_timer_provider(timer_provider.clone());
 
         check_event_reference_lifecycle(&broker);
         check_session_drop_releases_references(&broker);
@@ -554,6 +560,7 @@ mod tests {
         check_corrupt_index_fails_without_mutation(&broker);
         check_corrupt_index_does_not_break_teardown(&broker);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
+        crate::timer::tests::check_timer_lifecycle(&broker, &timer_provider);
         check_pair_handle_exhaustion(&broker);
 
         assert!(broker.references.read().is_empty());

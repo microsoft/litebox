@@ -44,6 +44,7 @@ bitflags::bitflags! {
 
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
+    Timerfd(Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
     Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
     File(Arc<crate::FileFd<FS>>),
     Socket(Arc<super::net::SocketFd<Platform>>),
@@ -68,6 +69,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
         {
             return Ok(EpollDescriptor::Eventfd(fd));
         }
+        if let Ok(fd) =
+            rds.fd_from_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
+        {
+            return Ok(EpollDescriptor::Timerfd(fd));
+        }
         if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<Platform, FS>>(raw_fd) {
             return Ok(EpollDescriptor::Epoll(fd));
         }
@@ -82,6 +88,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
 
 enum DescriptorRef<Platform: ShimPlatform, FS: ShimFS> {
     Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
+    Timerfd(Weak<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
     Epoll(Weak<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
     File(Weak<crate::FileFd<FS>>),
     Socket(Weak<super::net::SocketFd<Platform>>),
@@ -93,6 +100,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> DescriptorRef<Platform, FS> {
     fn from(value: &EpollDescriptor<Platform, FS>) -> Self {
         match value {
             EpollDescriptor::Eventfd(file) => Self::Eventfd(Arc::downgrade(file)),
+            EpollDescriptor::Timerfd(file) => Self::Timerfd(Arc::downgrade(file)),
             EpollDescriptor::Epoll(file) => Self::Epoll(Arc::downgrade(file)),
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
@@ -104,6 +112,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> DescriptorRef<Platform, FS> {
     fn upgrade(&self) -> Option<EpollDescriptor<Platform, FS>> {
         match self {
             DescriptorRef::Eventfd(eventfd) => eventfd.upgrade().map(EpollDescriptor::Eventfd),
+            DescriptorRef::Timerfd(timerfd) => timerfd.upgrade().map(EpollDescriptor::Timerfd),
             DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
             DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
@@ -130,6 +139,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
         };
         match self {
             EpollDescriptor::Eventfd(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
+            EpollDescriptor::Timerfd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
@@ -335,6 +348,7 @@ impl EpollEntryKey {
     ) -> Self {
         let ptr = match desc {
             EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).addr(),
+            EpollDescriptor::Timerfd(file) => Arc::as_ptr(file).addr(),
             EpollDescriptor::Epoll(file) => Arc::as_ptr(file).addr(),
             EpollDescriptor::File(file) => Arc::as_ptr(file).addr(),
             EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),

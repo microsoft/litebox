@@ -10,5 +10,7 @@
 #![cfg(target_os = "linux")]
 
 mod socket;
+mod timer;
 
 pub use socket::LinuxSocketProvider;
+pub use timer::LinuxTimerProvider;

@@ -20,6 +20,10 @@ use crate::socket::{
     SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
     SocketStatusRequest, SocketStatusResponse,
 };
+use crate::timer::{
+    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
+    ReadTimerResponse, SetTimerRequest, SetTimerResponse,
+};
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
 /// Broker handshake request sent before the control channel is active.
@@ -42,6 +46,8 @@ pub enum BrokerOperation {
     Pipe(PipeRequest),
     /// Socket object request family.
     Socket(SocketRequest),
+    /// Timer object request family.
+    Timer(TimerRequest),
 }
 
 /// Request sent over an active broker control channel.
@@ -130,6 +136,19 @@ pub enum SocketRequest {
     Status(SocketStatusRequest),
 }
 
+/// Broker-owned timerfd object request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimerRequest {
+    /// Create a broker-owned timerfd.
+    Create(CreateTimerRequest),
+    /// Arm or disarm a timerfd.
+    Set(SetTimerRequest),
+    /// Read a timerfd's current setting.
+    Get(GetTimerRequest),
+    /// Drain a timerfd's expiration count.
+    Read(ReadTimerRequest),
+}
+
 /// Result returned for an active broker operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResult {
@@ -143,6 +162,8 @@ pub enum BrokerResult {
     Pipe(PipeResponse),
     /// Socket object response family.
     Socket(SocketResponse),
+    /// Timer object response family.
+    Timer(TimerResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -216,6 +237,19 @@ pub enum SocketResponse {
     ///
     /// [`SocketConnectionStatus`]: crate::socket::SocketConnectionStatus
     Failed(SocketError),
+}
+
+/// Broker-owned timerfd object response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimerResponse {
+    /// Create operation response.
+    Create(CreateTimerResponse),
+    /// Set-time operation response.
+    Set(SetTimerResponse),
+    /// Get-time operation response.
+    Get(GetTimerResponse),
+    /// Read operation response.
+    Read(ReadTimerResponse),
 }
 
 /// Broker-initiated asynchronous notification.

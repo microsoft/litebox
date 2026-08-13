@@ -30,6 +30,7 @@ use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest, SocketResponse,
+    TimerRequest, TimerResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -110,7 +111,8 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
                 | SocketRequest::SetTcpOption(_)
                 | SocketRequest::GetTcpOption(_)
                 | SocketRequest::Status(_),
-            ) => None,
+            )
+            | BrokerOperation::Timer(_) => None,
         };
 
         {
@@ -353,6 +355,9 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::Socket(request) => {
             handle_socket_request(session, request, shared_buffers, readiness_sink)
                 .map(BrokerResult::Socket)
+        }
+        BrokerOperation::Timer(request) => {
+            handle_timer_request(session, request, readiness_sink).map(BrokerResult::Timer)
         }
     }
 }
@@ -676,6 +681,51 @@ fn handle_event_request(
             litebox_broker_core::event::consume(session, request.handle, request.mode)
                 .map(EventResponse::Consume)
                 .map_err(RequestFailure::from)
+        }
+    }
+}
+
+fn handle_timer_request(
+    session: &BrokerSession,
+    request: TimerRequest,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<TimerResponse> {
+    use litebox_broker_protocol::timer::{
+        CreateTimerResponse, GetTimerResponse, ReadTimerResponse, SetTimerResponse,
+    };
+    match request {
+        TimerRequest::Create(request) => {
+            let handle =
+                litebox_broker_core::timer::create(session, request, Arc::clone(readiness_sink))
+                    .map_err(RequestFailure::from)?;
+            Ok(TimerResponse::Create(CreateTimerResponse { handle }))
+        }
+        TimerRequest::Set(request) => {
+            let (previous, readiness) = litebox_broker_core::timer::set(
+                session,
+                request.handle,
+                request.specification,
+                request.flags,
+            )
+            .map_err(RequestFailure::from)?;
+            Ok(TimerResponse::Set(SetTimerResponse {
+                previous,
+                readiness,
+            }))
+        }
+        TimerRequest::Get(request) => {
+            let current = litebox_broker_core::timer::get(session, request.handle)
+                .map_err(RequestFailure::from)?;
+            Ok(TimerResponse::Get(GetTimerResponse { current }))
+        }
+        TimerRequest::Read(request) => {
+            let (outcome, readiness) = litebox_broker_core::timer::read(session, request.handle)
+                .map_err(RequestFailure::from)?;
+            Ok(TimerResponse::Read(ReadTimerResponse {
+                expirations: outcome.expirations,
+                cancelled: outcome.cancelled,
+                readiness,
+            }))
         }
     }
 }

@@ -271,6 +271,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| None,
                 |_| None,
                 |_| None,
+                |_| None,
             )
             .ok()??;
 
