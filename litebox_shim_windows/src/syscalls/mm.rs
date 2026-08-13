@@ -669,6 +669,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         number_of_bytes_to_read: usize,
         number_of_bytes_read: Option<MutPtr<Platform, usize>>,
     ) -> NtStatus {
+        fn write_bytes_read<Platform: ShimPlatform>(
+            number_of_bytes_read: Option<MutPtr<Platform, usize>>,
+            bytes_copied: usize,
+        ) -> Result<(), NtStatus> {
+            if number_of_bytes_read
+                .is_some_and(|bytes_read| bytes_read.write_at_offset(0, bytes_copied).is_none())
+            {
+                Err(NtStatus::ACCESS_VIOLATION)
+            } else {
+                Ok(())
+            }
+        }
+
         if !process_handle.is_current() {
             litebox_util_log::debug!(
                 process_handle:? = process_handle;
@@ -685,7 +698,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .checked_add(number_of_bytes_to_read)
                 .is_none()
         {
-            return write_virtual_memory_bytes_read::<Platform>(number_of_bytes_read, 0)
+            return write_bytes_read::<Platform>(number_of_bytes_read, 0)
                 .map_or_else(|status| status, |()| NtStatus::PARTIAL_COPY);
         }
 
@@ -699,18 +712,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 bytes_copied,
                 remaining,
             ) else {
-                return write_virtual_memory_bytes_read::<Platform>(
-                    number_of_bytes_read,
-                    bytes_copied,
-                )
-                .map_or_else(|status| status, |()| NtStatus::PARTIAL_COPY);
+                return write_bytes_read::<Platform>(number_of_bytes_read, bytes_copied)
+                    .map_or_else(|status| status, |()| NtStatus::PARTIAL_COPY);
             };
             bytes_copied += copied;
         }
-        if let Err(status) = write_virtual_memory_bytes_read::<Platform>(
-            number_of_bytes_read,
-            number_of_bytes_to_read,
-        ) {
+        if let Err(status) =
+            write_bytes_read::<Platform>(number_of_bytes_read, number_of_bytes_to_read)
+        {
             return status;
         }
 
@@ -927,19 +936,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
 
         NtStatus::SUCCESS
-    }
-}
-
-fn write_virtual_memory_bytes_read<Platform: ShimPlatform>(
-    number_of_bytes_read: Option<MutPtr<Platform, usize>>,
-    bytes_copied: usize,
-) -> Result<(), NtStatus> {
-    if number_of_bytes_read
-        .is_some_and(|bytes_read| bytes_read.write_at_offset(0, bytes_copied).is_none())
-    {
-        Err(NtStatus::ACCESS_VIOLATION)
-    } else {
-        Ok(())
     }
 }
 
