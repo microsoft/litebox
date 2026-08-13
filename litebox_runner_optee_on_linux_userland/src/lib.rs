@@ -3,7 +3,7 @@
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
+use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::session::session_manager;
 use std::path::PathBuf;
@@ -109,6 +109,10 @@ fn run_ta_with_default_commands(
     ldelf_bin: &[u8],
     ta_bin: &[u8],
 ) {
+    let ta_uuid = litebox_common_optee::parse_ta_head(ta_bin)
+        .expect("Failed to parse TA header from ta_bin")
+        .uuid;
+    assert!(shim.store_ta_bin(&ta_uuid, ta_bin));
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
@@ -116,7 +120,7 @@ fn run_ta_with_default_commands(
             let session_token = session_manager().try_acquire_open_session_token().unwrap();
             let session_id = session_token.session_id().unwrap();
             let loaded_program = shim
-                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin))
+                .load_ldelf(ldelf_bin, ta_uuid)
                 .map_err(|_| {
                     panic!("Failed to load ldelf");
                 })
