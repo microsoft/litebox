@@ -1722,9 +1722,7 @@ fn private_page_state_and_protect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{
-        mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr, run_with_test_platform_pointers,
-    };
+    use crate::tests::{mut_byte_ptr, mut_ptr, run_with_test_platform_pointers};
 
     extern crate std;
 
