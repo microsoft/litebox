@@ -3991,7 +3991,7 @@ mod unix_tests {
         )
         .unwrap();
 
-        task.spawn_clone_for_test(move |task| {
+        let client = task.spawn_clone_for_test(move |task| {
             let mut client_fds = Vec::new();
             for _ in 0..10 {
                 let client_fd = create_unix_socket(
@@ -4063,6 +4063,7 @@ mod unix_tests {
             close_socket(&task, server_conn_fd);
         }
         close_socket(&task, server_fd);
+        client.join().unwrap();
     }
 
     #[test]
@@ -4178,7 +4179,7 @@ mod unix_tests {
         let sock2 = sv_ptr[1];
 
         // Receive on sock2 (from sock1)
-        task.spawn_clone_for_test(move |task| {
+        let receiver2 = task.spawn_clone_for_test(move |task| {
             let mut buf = [0u8; 64];
             if is_nonblocking {
                 ppoll(&task, sock2, Events::IN);
@@ -4195,7 +4196,7 @@ mod unix_tests {
         task.do_sendto(sock1, msg1.as_bytes(), SendFlags::empty(), None)
             .expect("sendto failed");
 
-        task.spawn_clone_for_test(move |task| {
+        let receiver1 = task.spawn_clone_for_test(move |task| {
             // Receive on sock1 (from sock2)
             let mut buf = [0u8; 64];
             if is_nonblocking {
@@ -4216,6 +4217,8 @@ mod unix_tests {
         std::thread::sleep(core::time::Duration::from_millis(500));
         close_socket(&task, sock1);
         close_socket(&task, sock2);
+        receiver2.join().unwrap();
+        receiver1.join().unwrap();
     }
 
     #[test]
