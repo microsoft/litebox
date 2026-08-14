@@ -1450,6 +1450,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_broker_transport_windows_userland"
+version = "0.1.0"
+dependencies = [
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "litebox_broker_userland"
 version = "0.1.0"
 dependencies = [
