@@ -157,38 +157,11 @@ fn test_static_linked_prog_with_rewriter() {
 
     let prog_name = "hello_world_static";
     let prog_name_hooked = format!("{prog_name}.hooked");
-
     let path = test_dir.join(prog_name);
-    let hooked_path = test_dir.join(&prog_name_hooked);
-
-    // rewrite the target ELF executable file
-    let _ = std::fs::remove_file(hooked_path.clone());
-    println!(
-        "Running `cargo run -p litebox_syscall_rewriter -- -o {} {}`",
-        hooked_path.to_str().unwrap(),
-        path.to_str().unwrap()
-    );
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let output = std::process::Command::new(cargo)
-        .args([
-            "run",
-            "-p",
-            "litebox_syscall_rewriter",
-            "--",
-            path.to_str().unwrap(),
-            "-o",
-            hooked_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to run syscall rewriter");
-    assert!(
-        output.status.success(),
-        "failed to run syscall rewriter {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
+    let executable_data =
+        litebox_syscall_rewriter::rewrite_binary(&std::fs::read(path).unwrap(), None).unwrap();
 
     let executable_path = format!("/{prog_name_hooked}");
-    let executable_data = std::fs::read(hooked_path).unwrap();
 
     let mut launcher = common::TestLauncher::init_platform(&[], &[], &[]);
     launcher.install_file(executable_data, &executable_path);
@@ -314,30 +287,9 @@ fn run_dynamic_linked_prog_with_rewriter(
     let prog_name_hooked = format!("{prog_name}.hooked");
 
     let path = test_dir.join(prog_name);
-    let hooked_path = test_dir.join(&prog_name_hooked);
 
     let out_path = std::env::var("OUT_DIR").unwrap();
-
-    // Rewrite the target ELF executable file
-    let _ = std::fs::remove_file(hooked_path.clone());
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let output = std::process::Command::new(&cargo)
-        .args([
-            "run",
-            "-p",
-            "litebox_syscall_rewriter",
-            "--",
-            path.to_str().unwrap(),
-            "-o",
-            hooked_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to run syscall rewriter");
-    assert!(
-        output.status.success(),
-        "failed to run syscall rewriter {:?}",
-        std::str::from_utf8(output.stderr.as_slice()).unwrap()
-    );
 
     // Create tar file containing all dependencies
     let tar_src_path = std::path::Path::new(&out_path).join("test_program_tar");
@@ -382,17 +334,13 @@ fn run_dynamic_linked_prog_with_rewriter(
     // Install the required files (e.g., scripts) to tar directory's /out
     install_files(tar_src_path.join("out"));
 
-    // Copy the hooked binary into the tar source directory
-    let hooked_tar_dir = tar_src_path.join("bin");
-    std::fs::create_dir_all(&hooked_tar_dir).unwrap();
-    std::fs::copy(&hooked_path, hooked_tar_dir.join(&prog_name_hooked)).unwrap();
-
     let tar_target_file = std::path::Path::new(&out_path).join("rootfs_rewriter.tar");
     let mut tar = tar::Builder::new(std::fs::File::create(&tar_target_file).unwrap());
-    for directory in ["bin", "lib", "lib64", "out"] {
+    for directory in ["lib", "lib64", "out"] {
         tar.append_dir_all(directory, tar_src_path.join(directory))
             .unwrap();
     }
+    append_rewritten_file(&mut tar, &path, &format!("bin/{prog_name_hooked}"));
     tar.finish().unwrap();
     println!("Tar file created at: {}", tar_target_file.to_str().unwrap());
 
