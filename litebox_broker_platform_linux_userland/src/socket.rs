@@ -865,16 +865,14 @@ enum SocketKind {
 }
 
 impl ReactorTcpState {
-    fn reserve_binding(&mut self) -> BrokerResult<()> {
-        self.bindings
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)
-    }
-
-    fn insert_binding(&mut self, port: u16, binding: ReactorTcpBinding) -> BrokerResult<()> {
-        if binding.guest_address.port() != port || self.bindings.contains_key(&port) {
+    fn insert_binding(&mut self, binding: ReactorTcpBinding) -> BrokerResult<()> {
+        let port = binding.guest_address.port();
+        if port == 0 || self.bindings.contains_key(&port) {
             return Err(BrokerError::Internal);
         }
+        self.bindings
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
         self.bindings.insert(port, binding);
         Ok(())
     }
@@ -1304,21 +1302,13 @@ impl Reactor {
         if already_bound {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
-        let guest_port = requested_address.port();
-        if guest_port == 0 {
-            return Err(BrokerError::Internal);
-        }
-        self.tcp.reserve_binding()?;
-        let guest_address = SocketAddrV4::new(*requested_address.ip(), guest_port);
-        self.tcp.insert_binding(
-            guest_port,
-            ReactorTcpBinding {
-                socket_id: id,
-                guest_address,
-                host_address: None,
-                listening: false,
-            },
-        )?;
+        let guest_address = requested_address;
+        self.tcp.insert_binding(ReactorTcpBinding {
+            socket_id: id,
+            guest_address,
+            host_address: None,
+            listening: false,
+        })?;
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
         socket.guest_local_address = Some(guest_address);
         socket
