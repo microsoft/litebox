@@ -2117,8 +2117,18 @@ impl Reactor {
             drop(socket);
             unmatched_accept_count += 1;
             if unmatched_accept_count >= MAX_UNMATCHED_ACCEPTS_PER_COMMAND {
-                // Keep cached READ readiness: edge-triggered epoll will not
-                // report connections that remain queued on the listener.
+                let listener = self
+                    .sockets
+                    .get(&listener_id)
+                    .ok_or(BrokerError::Internal)?;
+                let readiness = listener
+                    .snapshot
+                    .lock()
+                    .expect("Linux socket snapshot mutex poisoned")
+                    .readiness;
+                // Edge-triggered epoll will not report connections that remain
+                // queued, so wake a blocking accept waiter to continue draining.
+                listener.readiness.republish(readiness)?;
                 return Err(BrokerError::WouldBlock);
             }
         };
@@ -2804,11 +2814,15 @@ fn shutdown_socket(
             socket.listening = false;
             socket.read_shutdown = true;
             socket.peek_waitall_threshold = None;
-            update_snapshot(
+            // The native transition is complete and the cached terminal
+            // snapshot is authoritative even if its notification cannot be
+            // published. Acknowledge completion so core listener state cannot
+            // diverge from the platform.
+            let _ = update_snapshot(
                 socket,
                 Some(SocketConnectionStatus::Failed(SocketError::NotConnected)),
                 ReadinessFlags::WRITE | ReadinessFlags::HANGUP,
-            )?;
+            );
             return Ok(SocketOutcome::Completed(()));
         }
         socket.read_shutdown |= shuts_down_read;
@@ -4324,16 +4338,17 @@ mod tests {
             litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
             Ok(SocketOutcome::Completed(guest_address))
         );
+        let unmatched_connection_count = MAX_UNMATCHED_ACCEPTS_PER_COMMAND;
         assert_eq!(
             litebox_broker_core::socket::listen(
                 &listener_session,
                 listener,
-                u32::try_from(MAX_UNMATCHED_ACCEPTS_PER_COMMAND + 2).unwrap(),
+                u32::try_from(unmatched_connection_count + 2).unwrap(),
             ),
             Ok(SocketOutcome::Completed(guest_address))
         );
         let private_address = provider.reactor.host_address(guest_address.port()).unwrap();
-        let _unmatched_connections = (0..MAX_UNMATCHED_ACCEPTS_PER_COMMAND)
+        let _unmatched_connections = (0..unmatched_connection_count)
             .map(|_| TcpStream::connect(private_address).unwrap())
             .collect::<Vec<_>>();
 
@@ -4361,6 +4376,7 @@ mod tests {
                 .unwrap()
                 .contains(ReadinessFlags::READ)
         );
+        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
         let accepted =
             match litebox_broker_core::socket::accept(&listener_session, listener, readiness)
                 .unwrap()
@@ -4597,10 +4613,14 @@ mod tests {
                 listener,
                 ShutdownMode::StopListening,
             ),
-            Err(BrokerError::ResourceExhausted)
+            Ok(SocketOutcome::Completed(()))
         );
         assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
         assert_eq!(provider.reactor.retained_connector_count(), 0);
+        assert_eq!(
+            litebox_broker_core::socket::listen(&listener_session, listener, 1),
+            Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
+        );
 
         listener_session.close_object_reference(listener).unwrap();
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
