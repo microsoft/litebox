@@ -479,7 +479,7 @@ bitflags::bitflags! {
     /// Generic-right mappings and create/open disposition behavior follow
     /// Microsoft Learn's `NtCreateFile` documentation.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FileAccess: u32 {
+    pub(crate) struct FileAccess: u32 {
         const READ_DATA = 0x0001;
         const LIST_DIRECTORY = Self::READ_DATA.bits();
         const WRITE_DATA = 0x0002;
@@ -613,7 +613,7 @@ impl FileAccess {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FileShareAccess: u32 {
+    pub(crate) struct FileShareAccess: u32 {
         const READ = FILE_SHARE_READ;
         const WRITE = FILE_SHARE_WRITE;
         const DELETE = FILE_SHARE_DELETE;
@@ -634,7 +634,7 @@ impl FileShareAccess {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FileCreateOptions: u32 {
+    pub(crate) struct FileCreateOptions: u32 {
         const DIRECTORY_FILE = 0x0000_0001;
         const WRITE_THROUGH = 0x0000_0002;
         const SEQUENTIAL_ONLY = 0x0000_0004;
@@ -715,6 +715,25 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             handle,
         )
         .ok_or(NtStatus::INVALID_HANDLE)
+    }
+
+    pub(crate) fn image_section_file_path(&self, handle: Handle) -> Result<String, NtStatus> {
+        let entry = self.typed_handle_entry_with_access::<FileObjectSubsystem<FS>>(
+            handle,
+            FileAccess::EXECUTE.bits(),
+        )?;
+        entry.with_entry(|file| match &file.backing {
+            FileObjectBacking::Filesystem {
+                is_directory: false,
+                ..
+            } => Ok(file.path.clone()),
+            FileObjectBacking::Filesystem {
+                is_directory: true, ..
+            } => Err(NtStatus::INVALID_FILE_FOR_SECTION),
+            FileObjectBacking::CondrvStream { .. } | FileObjectBacking::CondrvControl(_) => {
+                Err(NtStatus::INVALID_FILE_FOR_SECTION)
+            }
+        })
     }
 
     fn insert_file_handle(&self, file: FileObject<FS>) -> Result<Handle, NtStatus> {

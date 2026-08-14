@@ -264,18 +264,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some((protection, _)) = parse_page_protection(section_page_protection) else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
-        // NtCreateSection currently supports only pagefile-backed sections. File-backed image
-        // sections are synthesized by NtOpenSection for KnownDlls; accepting a file handle here
-        // requires section lifetime/sharing to be keyed by the underlying file object identity.
         if !file_handle.is_null() {
-            litebox_util_log::debug!(
-                file_handle = file_handle.as_raw(),
-                allocation_attributes:% = format_args!("{allocation_attributes:#x}"),
-                section_page_protection:% = format_args!("{section_page_protection:#x}"),
-                desired_access:% = format_args!("{desired_access:#x}");
-                "Unsupported file-backed NtCreateSection"
+            return self.create_file_backed_section(
+                section_handle,
+                granted_access,
+                object_attributes,
+                SectionAllocationAttributes::from_bits_retain(allocation_attributes),
+                file_handle,
             );
-            return NtStatus::INVALID_HANDLE;
         }
         let allocation_attributes =
             SectionAllocationAttributes::from_bits_retain(allocation_attributes);
@@ -309,10 +305,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER;
         }
 
-        let name = match self.read_section_name(object_attributes) {
-            Ok(name) => name,
-            Err(status) => return status,
-        };
         let attributes = if allocation_attributes.contains(SectionAllocationAttributes::SEC_RESERVE)
         {
             SectionAllocationAttributes::SEC_RESERVE
@@ -328,6 +320,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             pagefile_view_active: AtomicBool::new(false),
             _platform: PhantomData,
         });
+        self.register_and_publish_section(
+            section_handle,
+            granted_access,
+            object_attributes,
+            section,
+        )
+    }
+
+    fn create_file_backed_section(
+        &self,
+        section_handle: MutPtr<Platform, Handle>,
+        granted_access: SectionAccess,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        allocation_attributes: SectionAllocationAttributes,
+        file_handle: Handle,
+    ) -> NtStatus {
+        if allocation_attributes != SectionAllocationAttributes::SEC_IMAGE {
+            // TODO(section-data-file): Add SEC_COMMIT data-file sections when the
+            // page manager can preserve shared file-backed view semantics.
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw(),
+                allocation_attributes:% = format_args!("{:#x}", allocation_attributes.bits());
+                "Rejected unsupported file-backed section allocation attributes"
+            );
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let fs_path = match self.image_section_file_path(file_handle) {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        let metadata = match crate::loader::image_section_metadata(Arc::clone(&self.fs), &fs_path) {
+            Ok(metadata) => metadata,
+            Err(crate::loader::WindowsLoadError::Access(_)) => {
+                return NtStatus::INVALID_FILE_FOR_SECTION;
+            }
+            Err(_) => return NtStatus::INVALID_FILE_FOR_SECTION,
+        };
+        let section = Arc::new(SectionObject {
+            fs_path: Some(fs_path),
+            size: metadata.file_size as usize,
+            attributes: SectionAllocationAttributes::SEC_FILE
+                | SectionAllocationAttributes::SEC_IMAGE,
+            protection: PageProtection::PAGE_EXECUTE_WRITECOPY,
+            backing: SectionBacking::ImageFile,
+            pagefile_view_active: AtomicBool::new(false),
+            _platform: PhantomData,
+        });
+        self.register_and_publish_section(
+            section_handle,
+            granted_access,
+            object_attributes,
+            section,
+        )
+    }
+
+    fn register_and_publish_section(
+        &self,
+        section_handle: MutPtr<Platform, Handle>,
+        granted_access: SectionAccess,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        section: Arc<SectionObject<Platform>>,
+    ) -> NtStatus {
+        let name = match self.read_section_name(object_attributes) {
+            Ok(name) => name,
+            Err(status) => return status,
+        };
         if let Some(name) = &name {
             let status = self.process.object_manager.create_section(name, &section);
             if status != NtStatus::SUCCESS {
@@ -522,7 +580,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 section_offset,
                 page_protection,
             ),
-            SectionBacking::ImageFile => self.map_image_section(request, &section, page_protection),
+            SectionBacking::ImageFile => {
+                self.map_image_section(request, &section, section_offset, page_protection)
+            }
         }
     }
 
@@ -836,11 +896,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         request: MapViewOfSectionParameters<Platform>,
         section: &SectionObject<Platform>,
+        section_offset: usize,
         page_protection: PageProtection,
     ) -> NtStatus {
         let Some(fs_path) = &section.fs_path else {
             return NtStatus::INVALID_FILE_FOR_SECTION;
         };
+        if section_offset != 0 {
+            litebox_util_log::debug!(fs_path:% = fs_path, section_offset; "Rejected image section view with a nonzero offset");
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        // TODO(section-subsystem): Handle images containing shared PE sections.
         if required_map_access(page_protection).contains(SectionAccess::MAP_WRITE) {
             litebox_util_log::debug!(
                 page_protection:% = format_args!("{:#x}", page_protection.bits()),
@@ -1279,6 +1345,27 @@ mod tests {
         .expect("host kernel32.dll is readable")
     }
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn open_image_file(task: &Task<TestPlatform, TestFS>, path: &str) -> Handle {
+        let name = wide(path);
+        let unicode = unicode(&name);
+        let attrs = object_attributes(&unicode);
+        let mut handle = Handle::default();
+        let mut io_status = crate::nt_types::IoStatusBlock::default();
+        assert_eq!(
+            task.sys_nt_open_file(
+                mut_ptr(&mut handle),
+                crate::syscalls::file::FileAccess::EXECUTE.bits(),
+                Some(const_ptr(&attrs)),
+                mut_ptr(&mut io_status),
+                crate::syscalls::file::FileShareAccess::READ.bits(),
+                crate::syscalls::file::FileCreateOptions::empty().bits(),
+            ),
+            NtStatus::SUCCESS
+        );
+        handle
+    }
+
     #[test]
     fn nt_create_section_creates_queryable_pagefile_section() {
         let task = test_task();
@@ -1386,6 +1473,71 @@ mod tests {
             NtStatus::INFO_LENGTH_MISMATCH
         );
         assert_eq!(return_length, 0x5555_5555);
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn nt_create_section_maps_file_backed_image() {
+        let image = host_kernel32_image();
+        let task = crate::tests::test_task_with_nls_files(&[("/tmp/kernel32.dll", &image)]);
+        let file_handle = open_image_file(&task, r"\Device\HarddiskVolume1\tmp\kernel32.dll");
+        let mut section_handle = Handle::default();
+
+        assert_eq!(
+            task.sys_nt_create_section(
+                mut_ptr(&mut section_handle),
+                (SectionAccess::QUERY | SectionAccess::MAP_READ | SectionAccess::MAP_EXECUTE)
+                    .bits(),
+                None,
+                None,
+                PageProtection::PAGE_EXECUTE.bits(),
+                SectionAllocationAttributes::SEC_IMAGE.bits(),
+                file_handle,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut info = SectionBasicInformation {
+            base_address: usize::MAX,
+            attributes: 0,
+            _padding: 0,
+            size: 0,
+        };
+        assert_eq!(
+            task.sys_nt_query_section(
+                section_handle,
+                SectionInformationClass::Basic as u32,
+                mut_byte_ptr(&mut info),
+                size_of::<SectionBasicInformation>(),
+                None,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            info.attributes,
+            (SectionAllocationAttributes::SEC_FILE | SectionAllocationAttributes::SEC_IMAGE).bits()
+        );
+        assert_eq!(info.size, i64::try_from(image.len()).unwrap());
+
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_EXECUTE_READ.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_ne!(base, 0);
+        assert_ne!(view_size, 0);
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
