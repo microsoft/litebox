@@ -835,8 +835,8 @@ struct ReactorTcpState {
 /// Sessions are ownership domains, not guest network namespaces.
 #[derive(Default)]
 struct ReactorSessionState {
-    live_sockets: usize,
-    pending_guest_connections: usize,
+    live_socket_count: usize,
+    pending_guest_connection_count: usize,
     retained_connector_count: usize,
     closing: bool,
 }
@@ -938,8 +938,8 @@ impl ReactorTcpState {
 
 fn retain_session_state(state: &ReactorSessionState) -> bool {
     !state.closing
-        || state.live_sockets != 0
-        || state.pending_guest_connections != 0
+        || state.live_socket_count != 0
+        || state.pending_guest_connection_count != 0
         || state.retained_connector_count != 0
 }
 
@@ -993,7 +993,7 @@ impl Reactor {
             .ok_or(BrokerError::Internal)?;
         // Pending records can outlive connector descriptors, so bound this
         // metadata independently using the configured socket budgets.
-        if session.pending_guest_connections >= self.max_sockets_per_session
+        if session.pending_guest_connection_count >= self.max_sockets_per_session
             || self.tcp.pending_guest_connections.len() >= self.max_sockets
         {
             return Err(BrokerError::ResourceExhausted);
@@ -1009,8 +1009,8 @@ impl Reactor {
             .sessions
             .get_mut(&connection.session_id)
             .expect("pending guest connection session state missing");
-        session.pending_guest_connections = session
-            .pending_guest_connections
+        session.pending_guest_connection_count = session
+            .pending_guest_connection_count
             .checked_sub(1)
             .expect("session pending guest connection count underflow");
         if connection.retained_connector.is_some() {
@@ -1039,8 +1039,8 @@ impl Reactor {
             .sessions
             .get_mut(&session_id)
             .ok_or(BrokerError::Internal)?;
-        session.pending_guest_connections = session
-            .pending_guest_connections
+        session.pending_guest_connection_count = session
+            .pending_guest_connection_count
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         self.tcp.pending_guest_connections.insert(
@@ -1089,8 +1089,8 @@ impl Reactor {
                 let session = sessions
                     .get_mut(&connection.session_id)
                     .expect("pending guest connection session state missing");
-                session.pending_guest_connections = session
-                    .pending_guest_connections
+                session.pending_guest_connection_count = session
+                    .pending_guest_connection_count
                     .checked_sub(1)
                     .expect("session pending guest connection count underflow");
                 if connection.retained_connector.is_some() {
@@ -1161,8 +1161,8 @@ impl Reactor {
                 let session = sessions
                     .get_mut(&connection.session_id)
                     .expect("pending guest connection session state missing");
-                session.pending_guest_connections = session
-                    .pending_guest_connections
+                session.pending_guest_connection_count = session
+                    .pending_guest_connection_count
                     .checked_sub(1)
                     .expect("session pending guest connection count underflow");
                 if connection.retained_connector.is_some() {
@@ -1215,7 +1215,7 @@ impl Reactor {
             .get(&listener_session_id)
             .ok_or(BrokerError::Internal)?;
         let session_at_limit = listener_session
-            .live_sockets
+            .live_socket_count
             .checked_add(listener_session.retained_connector_count)
             .is_none_or(|count| count >= self.max_sockets_per_session);
         if !global_at_limit && !session_at_limit {
@@ -1537,8 +1537,8 @@ impl Reactor {
         }
         drop(socket);
         if let Some(session) = self.sessions.get_mut(&session_id) {
-            session.live_sockets = session
-                .live_sockets
+            session.live_socket_count = session
+                .live_socket_count
                 .checked_sub(1)
                 .expect("session socket count underflow");
         }
@@ -1916,7 +1916,7 @@ impl Reactor {
             return Err(BrokerError::UnknownObject);
         }
         if session
-            .live_sockets
+            .live_socket_count
             .checked_add(session.retained_connector_count)
             .is_none_or(|count| count >= self.max_sockets_per_session)
         {
@@ -1979,8 +1979,8 @@ impl Reactor {
                 tcp_keep_alive: false,
             },
         );
-        session.live_sockets = session
-            .live_sockets
+        session.live_socket_count = session
+            .live_socket_count
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         Ok(())
@@ -2065,7 +2065,7 @@ impl Reactor {
                 .sessions
                 .get(&listener_session_id)
                 .ok_or(BrokerError::Internal)?
-                .live_sockets
+                .live_socket_count
                 .checked_add(
                     self.sessions
                         .get(&listener_session_id)
@@ -2139,8 +2139,8 @@ impl Reactor {
             .sessions
             .get_mut(&listener_session_id)
             .ok_or(BrokerError::Internal)?;
-        session.live_sockets = session
-            .live_sockets
+        session.live_socket_count = session
+            .live_socket_count
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         Ok(SocketOutcome::Completed(AcceptedEndpoints {
