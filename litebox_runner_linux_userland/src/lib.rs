@@ -74,14 +74,14 @@ pub struct CliArgs {
     pub program_from_tar: bool,
     /// Broker-supplied Unix socket path for the local control channel.
     #[arg(
-        long = "broker-control-socket",
+        long = "broker-control-channel",
         value_name = "PATH",
         value_hint = clap::ValueHint::FilePath,
         hide = true,
         requires = "unstable",
         help_heading = "Unstable Options"
     )]
-    pub broker_control_socket: Option<PathBuf>,
+    pub broker_control_channel: Option<PathBuf>,
 }
 
 struct MmappedFile {
@@ -142,7 +142,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
 
-    let broker_connection = match cli_args.broker_control_socket.as_deref() {
+    let broker_connection = match cli_args.broker_control_channel.as_deref() {
         Some(control_socket_path) => Some(broker::connect(control_socket_path)?),
         None => None,
     };

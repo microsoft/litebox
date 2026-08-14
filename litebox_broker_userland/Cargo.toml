@@ -7,11 +7,16 @@ edition = "2024"
 clap = { version = "4.5.33", features = ["derive"] }
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
-litebox_broker_platform_linux_userland = { path = "../litebox_broker_platform_linux_userland", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+litebox_broker_platform_linux_userland = { path = "../litebox_broker_platform_linux_userland", version = "0.1.0" }
 litebox_broker_transport_linux_userland = { path = "../litebox_broker_transport_linux_userland", version = "0.1.0" }
 tempfile = { version = "3", default-features = false }
+
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+litebox_broker_transport_windows_userland = { path = "../litebox_broker_transport_windows_userland", version = "0.1.0" }
 
 [[bin]]
 name = "litebox-broker-userland"

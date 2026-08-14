@@ -12,6 +12,8 @@ use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
 use std::path::PathBuf;
 
+mod broker;
+
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///
 /// The program binary and all its dependencies must be provided inside a tar
@@ -35,6 +37,15 @@ pub struct CliArgs {
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
+    /// Broker-supplied Windows named-pipe path for the local control channel.
+    #[arg(
+        long = "broker-control-channel",
+        value_name = "PIPE_NAME",
+        hide = true,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_control_channel: Option<std::ffi::OsString>,
     /// Tar archive containing the program and its shared libraries.
     ///
     /// All ELF binaries should be pre-rewritten with the syscall rewriter
@@ -69,7 +80,26 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
 
     let platform = Platform::new();
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+    let broker_connection = cli_args
+        .broker_control_channel
+        .as_deref()
+        .map(broker::connect)
+        .transpose()?;
+    let shim_builder = if let Some(broker_connection) = broker_connection {
+        let broker::BrokerConnection {
+            local,
+            notifications,
+        } = broker_connection;
+        let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+        broker::start_notification_receiver(
+            notifications,
+            litebox.broker_notification_dispatcher(),
+            litebox.broker_failure_dispatcher(),
+        )?;
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox)
+    } else {
+        litebox_shim_linux::LinuxShimBuilder::new(platform)
+    };
     let litebox = shim_builder.litebox();
 
     // The program path is a Unix-style path inside the tar archive.

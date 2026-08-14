@@ -140,7 +140,7 @@ impl Runner {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn broker_socket(&mut self, control_socket_path: &Path) -> &mut Self {
         self.command
-            .arg("--broker-control-socket")
+            .arg("--broker-control-channel")
             .arg(control_socket_path);
         self
     }
