@@ -536,7 +536,13 @@ impl ElfParsedFile {
 
         if self.trampoline.is_some() {
             self.load_trampoline(mapper, mem, &mut info)?;
-        } else if reserve_trampoline.is_some() {
+        } else if let Some(size) = reserve_trampoline {
+            #[cfg(target_arch = "x86_64")]
+            {
+                info.brk = page_align_up(info.brk) + page_align_up(size);
+            }
+            #[cfg(target_arch = "aarch64")]
+            let _ = size;
             // The runtime patcher places its trampoline beyond the heap growth
             // reserve. Advancing brk over an unmapped gap would make the guest
             // allocator treat that gap as memory it already owns.
@@ -964,7 +970,7 @@ mod reserve_regions_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "aarch64"))]
 mod trampoline_policy_tests {
     extern crate std;
 

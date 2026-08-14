@@ -1,5 +1,5 @@
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+/* Copyright (c) Microsoft Corporation.
+   Licensed under the MIT license. */
 
 .equ __NR_write, 64
 .equ __NR_exit, 93

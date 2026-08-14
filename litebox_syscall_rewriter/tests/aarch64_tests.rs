@@ -232,6 +232,128 @@ fn trampoline_header(out: &[u8]) -> (u64, u64, u64) {
     )
 }
 
+fn synthetic_x18_et_dyn(site_count: usize, gap_start: u64, gap_size: u64) -> Vec<u8> {
+    const ELF_HEADER_BYTES: usize = 64;
+    const PROGRAM_HEADER_BYTES: usize = 56;
+    const SECTION_HEADER_BYTES: usize = 64;
+    const SECTION_NAMES: &[u8] = b"\0.text\0.shstrtab\0";
+    const TEXT_OFFSET: usize = 0x1000;
+    const TEXT_VADDR: u64 = 0x1000;
+    const MOV_X18_X0: u32 = 0xAA00_03F2;
+
+    let text_size = site_count * size_of::<u32>();
+    let section_table = (TEXT_OFFSET + text_size).next_multiple_of(8);
+    let names_offset = section_table + 3 * SECTION_HEADER_BYTES;
+    let mut elf = vec![0u8; names_offset + SECTION_NAMES.len()];
+    elf[..4].copy_from_slice(b"\x7fELF");
+    elf[4] = object::elf::ELFCLASS64;
+    elf[5] = object::elf::ELFDATA2LSB;
+    elf[6] = 1;
+    elf[16..18].copy_from_slice(&object::elf::ET_DYN.to_le_bytes());
+    elf[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_le_bytes());
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    elf[32..40].copy_from_slice(&(ELF_HEADER_BYTES as u64).to_le_bytes());
+    elf[40..48].copy_from_slice(&(section_table as u64).to_le_bytes());
+    elf[52..54].copy_from_slice(&(ELF_HEADER_BYTES as u16).to_le_bytes());
+    elf[54..56].copy_from_slice(&(PROGRAM_HEADER_BYTES as u16).to_le_bytes());
+    elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+    elf[58..60].copy_from_slice(&(SECTION_HEADER_BYTES as u16).to_le_bytes());
+    elf[60..62].copy_from_slice(&3u16.to_le_bytes());
+    elf[62..64].copy_from_slice(&2u16.to_le_bytes());
+
+    let first = ELF_HEADER_BYTES;
+    elf[first..first + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
+    elf[first + 4..first + 8]
+        .copy_from_slice(&(object::elf::PF_R | object::elf::PF_X).to_le_bytes());
+    let first_segment_size = elf.len() as u64;
+    elf[first + 32..first + 40].copy_from_slice(&first_segment_size.to_le_bytes());
+    elf[first + 40..first + 48].copy_from_slice(&gap_start.to_le_bytes());
+    elf[first + 48..first + 56].copy_from_slice(&0x10000u64.to_le_bytes());
+
+    let second = first + PROGRAM_HEADER_BYTES;
+    elf[second..second + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
+    elf[second + 4..second + 8]
+        .copy_from_slice(&(object::elf::PF_R | object::elf::PF_W).to_le_bytes());
+    elf[second + 16..second + 24].copy_from_slice(&(gap_start + gap_size).to_le_bytes());
+    elf[second + 24..second + 32].copy_from_slice(&(gap_start + gap_size).to_le_bytes());
+    elf[second + 40..second + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+    elf[second + 48..second + 56].copy_from_slice(&0x10000u64.to_le_bytes());
+
+    for at in (TEXT_OFFSET..TEXT_OFFSET + text_size).step_by(4) {
+        elf[at..at + 4].copy_from_slice(&MOV_X18_X0.to_le_bytes());
+    }
+    let text = section_table + SECTION_HEADER_BYTES;
+    elf[text..text + 4].copy_from_slice(&1u32.to_le_bytes());
+    elf[text + 4..text + 8].copy_from_slice(&object::elf::SHT_PROGBITS.to_le_bytes());
+    elf[text + 8..text + 16].copy_from_slice(
+        &u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR).to_le_bytes(),
+    );
+    elf[text + 16..text + 24].copy_from_slice(&TEXT_VADDR.to_le_bytes());
+    elf[text + 24..text + 32].copy_from_slice(&(TEXT_OFFSET as u64).to_le_bytes());
+    elf[text + 32..text + 40].copy_from_slice(&(text_size as u64).to_le_bytes());
+    elf[text + 48..text + 56].copy_from_slice(&4u64.to_le_bytes());
+    let names = text + SECTION_HEADER_BYTES;
+    elf[names..names + 4].copy_from_slice(&7u32.to_le_bytes());
+    elf[names + 4..names + 8].copy_from_slice(&object::elf::SHT_STRTAB.to_le_bytes());
+    elf[names + 24..names + 32].copy_from_slice(&(names_offset as u64).to_le_bytes());
+    elf[names + 32..names + 40].copy_from_slice(&(SECTION_NAMES.len() as u64).to_le_bytes());
+    elf[names + 48..names + 56].copy_from_slice(&1u64.to_le_bytes());
+    elf[names_offset..].copy_from_slice(SECTION_NAMES);
+    elf
+}
+
+#[test]
+fn ubuntu_geometry_x18_trampoline_fits_reserved_et_dyn_gap() {
+    const GAP_START: u64 = 0x19A000;
+    const GAP_SIZE: u64 = 0x13000;
+    let elf = synthetic_x18_et_dyn(1280, GAP_START, GAP_SIZE);
+
+    let rewritten = hook_syscalls_in_elf_with_options(
+        &elf,
+        Some(0),
+        RewriteOptions::new(TargetHost::Linux, true),
+    )
+    .unwrap();
+    let (_, vaddr, size) = trampoline_header(&rewritten);
+
+    assert_eq!(
+        vaddr, GAP_START,
+        "must use the object-reserved load-span gap"
+    );
+    assert!(
+        size <= GAP_SIZE,
+        "trampoline {size:#x} exceeds {GAP_SIZE:#x}"
+    );
+}
+
+#[test]
+fn et_dyn_x18_rewrite_rejects_an_insufficient_reserved_gap() {
+    let elf = synthetic_x18_et_dyn(128, 0x2000, 0x1000);
+
+    assert!(matches!(
+        hook_syscalls_in_elf_with_options(
+            &elf,
+            Some(0),
+            RewriteOptions::new(TargetHost::Linux, true),
+        ),
+        Err(Error::TrampolineTooLarge { .. })
+    ));
+}
+
+#[test]
+fn et_dyn_x18_rewrite_rejects_past_last_segment_placement() {
+    let elf = synthetic_x18_et_dyn(1, 0x2000, 0);
+
+    assert!(matches!(
+        hook_syscalls_in_elf_with_options(
+            &elf,
+            Some(0),
+            RewriteOptions::new(TargetHost::Linux, true),
+        ),
+        Err(Error::UnsupportedExecutable(reason)) if reason.contains("reserved trampoline gap")
+    ));
+}
+
 #[test]
 fn aarch64_hello_world_is_hooked() {
     let original_sites = svc_sites(HELLO_AARCH64);

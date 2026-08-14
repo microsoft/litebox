@@ -351,6 +351,7 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
+#[cfg(target_arch = "aarch64")]
 fn mprotect_page_range(addr: usize, len: usize) -> Option<Range<usize>> {
     let start = align_down(addr, PAGE_SIZE);
     if len == 0 {
@@ -857,9 +858,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        let range = mprotect_page_range(addr.as_usize(), len).ok_or(Errno::ENOMEM)?;
-        let addr = UserPtrMut::<u8>::from_usize(range.start);
-        let len = range.len();
+        #[cfg(target_arch = "aarch64")]
+        let (addr, len) = {
+            let range = mprotect_page_range(addr.as_usize(), len).ok_or(Errno::ENOMEM)?;
+            (UserPtrMut::<u8>::from_usize(range.start), range.len())
+        };
         // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
         if prot.contains(ProtFlags::PROT_EXEC) {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
@@ -1271,6 +1274,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ) else {
                 return false;
             };
+            #[cfg(target_arch = "aarch64")]
             let Some(offset) =
                 offset.checked_add(litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE as u64)
             else {
@@ -2108,6 +2112,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn mprotect_page_range_covers_every_touched_page_and_rejects_overflow() {
         assert_eq!(super::mprotect_page_range(0x1fff, 2), Some(0x1000..0x3000));

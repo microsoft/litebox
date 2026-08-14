@@ -337,7 +337,7 @@ pub fn hook_syscalls_in_elf_with_options(
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, text_sections, placement) = {
+    let (arch, text_sections, placement, elf_type) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -366,7 +366,11 @@ pub fn hook_syscalls_in_elf_with_options(
 
         let placement = find_addr_for_trampoline_code(&file)?;
 
-        (arch, text_sections, placement)
+        let elf_type = match file {
+            object::File::Elf64(ref elf) => elf.elf_header().e_type.get(elf.endian()),
+            _ => unreachable!(),
+        };
+        (arch, text_sections, placement, elf_type)
     };
 
     // AArch64 uses a fully separate rewriting strategy (single-instruction
@@ -381,6 +385,7 @@ pub fn hook_syscalls_in_elf_with_options(
             placement,
             trampoline.unwrap_or(0),
             options,
+            elf_type,
         );
     }
 
@@ -924,7 +929,16 @@ fn hook_aarch64_elf(
     placement: TrampolinePlacement,
     callback: u64,
     options: RewriteOptions,
+    elf_type: u16,
 ) -> Result<Vec<u8>> {
+    if matches!(placement, TrampolinePlacement::PastLastSegment { .. })
+        && elf_type == object::elf::ET_DYN
+        && options.effective_virtualize_x18()
+    {
+        return Err(Error::UnsupportedExecutable(
+            "AArch64 ET_DYN x18 rewrite has no reserved trampoline gap".into(),
+        ));
+    }
     if let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement {
         let mut attempt = buf.to_vec();
         let out = hook_aarch64_elf_at(
@@ -944,6 +958,9 @@ fn hook_aarch64_elf(
             Err(Error::TrampolineTooLarge { .. } | Error::UnpatchableSyscalls(_))
         ) {
             buf.copy_from_slice(&attempt);
+            return out;
+        }
+        if elf_type == object::elf::ET_DYN && options.effective_virtualize_x18() {
             return out;
         }
         // Fall through to retry at the fallback address. `buf` is still
@@ -3285,6 +3302,7 @@ mod tests {
             placement,
             0,
             RewriteOptions::default(),
+            object::elf::ET_EXEC,
         )
         .expect("the reachable fallback address must be retried");
     }
@@ -3311,6 +3329,7 @@ mod tests {
             placement,
             0,
             RewriteOptions::new(TargetHost::Linux, true),
+            object::elf::ET_EXEC,
         )
         .expect("production rewrite must also select the fallback");
         let header = &output[output.len() - size_of::<TrampolineHeader64>()..];
@@ -3342,6 +3361,7 @@ mod tests {
             placement,
             0,
             RewriteOptions::new(TargetHost::Linux, true),
+            object::elf::ET_EXEC,
         )
         .expect("production rewrite must retry at the reachable fallback");
         let header = &output[output.len() - size_of::<TrampolineHeader64>()..];
@@ -3461,6 +3481,7 @@ mod tests {
             placement,
             0,
             RewriteOptions::default(),
+            object::elf::ET_EXEC,
         )
         .unwrap_err();
         assert!(

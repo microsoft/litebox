@@ -177,13 +177,15 @@ pub const SVC_SLOT_BYTES: usize = 64;
 /// Byte size of one shared x18 setup record, including pair metadata.
 pub const X18_SETUP_BYTES: usize = 32;
 /// Byte size of one per-site x18 gate slot.
-pub const X18_SLOT_BYTES: usize = 64;
+pub const X18_SLOT_BYTES: usize = 48;
+/// Byte size of one per-site PC-relative x18 gate slot.
+pub const X18_PCREL_SLOT_BYTES: usize = 64;
 /// Byte size of one per-site x18 CBZ/CBNZ gate slot.
 pub const X18_CONDITIONAL_SLOT_BYTES: usize = 80;
 /// Byte size of one terminal `BR X18` emulation slot.
 pub const X18_BR_SLOT_BYTES: usize = 16;
 /// First byte past the executable instructions in an x18 site slot.
-pub const X18_GATE_BYTES: usize = 48;
+pub const X18_GATE_BYTES: usize = 40;
 const NOP: u32 = 0xD503_201F;
 const X18_BR_BRK_IMM: u16 = 0xB18;
 
@@ -210,6 +212,7 @@ enum GateKind {
     X18 = 3,
     X18Conditional = 4,
     X18Br = 5,
+    X18Pcrel = 6,
 }
 
 impl GateKind {
@@ -225,6 +228,7 @@ impl GateKind {
             Self::X18,
             Self::X18Conditional,
             Self::X18Br,
+            Self::X18Pcrel,
         ]
         .into_iter()
         .find(|kind| kind.bits() == bits)
@@ -264,6 +268,11 @@ pub enum GateMetadata {
         /// Register used to hold the host per-thread anchor.
         anchor_scratch: u8,
         /// Register used to hold the virtualized x18 value.
+        value_scratch: u8,
+    },
+    /// An ADR/ADRP x18 destination requiring two materialization instructions.
+    X18Pcrel {
+        anchor_scratch: u8,
         value_scratch: u8,
     },
     /// A typed CBZ/CBNZ x18/w18 gate using the same scratch-pair payload.
@@ -325,6 +334,13 @@ impl EncodedGateMetadata {
                 GateKind::X18,
                 encode_x18_scratch_pair(anchor_scratch, value_scratch)?,
             ),
+            GateMetadata::X18Pcrel {
+                anchor_scratch,
+                value_scratch,
+            } => (
+                GateKind::X18Pcrel,
+                encode_x18_scratch_pair(anchor_scratch, value_scratch)?,
+            ),
             GateMetadata::X18Conditional {
                 anchor_scratch,
                 value_scratch,
@@ -334,7 +350,11 @@ impl EncodedGateMetadata {
             ),
             GateMetadata::X18Br => (GateKind::X18Br, 0),
         };
-        if !matches!(kind, GateKind::X18 | GateKind::X18Conditional) && register > MAX_REGISTER {
+        if !matches!(
+            kind,
+            GateKind::X18 | GateKind::X18Pcrel | GateKind::X18Conditional
+        ) && register > MAX_REGISTER
+        {
             return None;
         }
         Some(Self(
@@ -357,7 +377,11 @@ impl EncodedGateMetadata {
         let kind =
             GateKind::from_bits((word & GATE_METADATA_KIND_MASK) >> GATE_METADATA_KIND_SHIFT)?;
         let register = ((word & GATE_METADATA_REGISTER_MASK) >> GATE_METADATA_REGISTER_SHIFT) as u8;
-        if !matches!(kind, GateKind::X18 | GateKind::X18Conditional) && register > MAX_REGISTER {
+        if !matches!(
+            kind,
+            GateKind::X18 | GateKind::X18Pcrel | GateKind::X18Conditional
+        ) && register > MAX_REGISTER
+        {
             return None;
         }
         match kind {
@@ -369,6 +393,13 @@ impl EncodedGateMetadata {
             GateKind::X18 => {
                 let (anchor_scratch, value_scratch) = decode_x18_scratch_pair(register)?;
                 Some(GateMetadata::X18 {
+                    anchor_scratch,
+                    value_scratch,
+                })
+            }
+            GateKind::X18Pcrel => {
+                let (anchor_scratch, value_scratch) = decode_x18_scratch_pair(register)?;
+                Some(GateMetadata::X18Pcrel {
                     anchor_scratch,
                     value_scratch,
                 })
@@ -777,6 +808,7 @@ enum Opcode {
     StrUimm = 0xF900_0000,
     LdrUimm = 0xF940_0000,
     Stp = 0xA900_0000,
+    StpPreIndex = 0xA980_0000,
     Ldp = 0xA940_0000,
     MrsTpidrEl0 = MRS_TPIDR_EL0_BITS,
     Brk = 0xD420_0000,
@@ -967,6 +999,13 @@ enum Insn {
         rn: u8,
         imm_bytes: i16,
     },
+    /// `STP Xt, Xt2, [Xn, #imm_bytes]!` (signed scaled pre-index form).
+    StpPreIndex {
+        rt: u8,
+        rt2: u8,
+        rn: u8,
+        imm_bytes: i16,
+    },
     /// `LDP Xt, Xt2, [Xn, #imm_bytes]` (signed scaled; `imm_bytes` multiple of 8).
     Ldp {
         rt: u8,
@@ -1051,6 +1090,12 @@ impl Insn {
                 rn,
                 imm_bytes,
             } => ldst_pair(Opcode::Stp, rt, rt2, rn, imm_bytes),
+            Insn::StpPreIndex {
+                rt,
+                rt2,
+                rn,
+                imm_bytes,
+            } => ldst_pair(Opcode::StpPreIndex, rt, rt2, rn, imm_bytes),
             Insn::Ldp {
                 rt,
                 rt2,
@@ -2102,7 +2147,11 @@ fn x18_layout_envelope_reachable(
     let (pair, return_offsets, targets): ((u8, u8), &[usize], &[u64]) = match site.kind {
         PatchKind::X18(X18TransformResult::Supported(transformation)) => (
             (transformation.anchor_scratch, transformation.value_scratch),
-            &[40],
+            if transformation.pcrel.is_some() {
+                &[40]
+            } else {
+                &[36]
+            },
             &[checked_add_u64(site.vaddr, INSN_BYTES_U64, "x18 return")?],
         ),
         PatchKind::X18Conditional(branch) => (
@@ -2211,7 +2260,13 @@ const fn maximum_site_slot_size(site: &PatchSite) -> usize {
         PatchKind::Svc => SVC_SLOT_BYTES,
         PatchKind::MsrTpidr(_) => MSR_SLOT_BYTES,
         PatchKind::MrsTpidr(_) => MRS_SLOT_BYTES,
-        PatchKind::X18(X18TransformResult::Supported(_)) => X18_SLOT_BYTES,
+        PatchKind::X18(X18TransformResult::Supported(transformation)) => {
+            if transformation.pcrel.is_some() {
+                X18_PCREL_SLOT_BYTES
+            } else {
+                X18_SLOT_BYTES
+            }
+        }
         PatchKind::X18Conditional(_) => X18_CONDITIONAL_SLOT_BYTES,
         PatchKind::X18Br => X18_BR_SLOT_BYTES,
         PatchKind::X18(X18TransformResult::Unsupported(_)) => 0,
@@ -2382,12 +2437,11 @@ fn emit_x18_gate(
     let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "x18 gate")?;
     let setup_vaddr = checked_add_u64(trampoline_base_addr, setup_offset as u64, "x18 setup")?;
     let mut asm = Asm::new(gate_vaddr);
-    asm.emit(Insn::SubSp(32));
-    asm.emit(Insn::Stp {
+    asm.emit(Insn::StpPreIndex {
         rt: transformation.anchor_scratch,
         rt2: transformation.value_scratch,
         rn: SP,
-        imm_bytes: 0,
+        imm_bytes: -32,
     });
     asm.emit(Insn::StrUimm {
         rt: 30,
@@ -2403,7 +2457,7 @@ fn emit_x18_gate(
         imm_bytes: 16,
     });
     asm.emit(Insn::AddSp(32));
-    if let Some(pcrel) = transformation.pcrel {
+    let metadata = if let Some(pcrel) = transformation.pcrel {
         let target = match pcrel {
             X18Pcrel::Adr(displacement) => site.vaddr.checked_add_signed(displacement),
             X18Pcrel::Adrp(displacement) => {
@@ -2426,10 +2480,17 @@ fn emit_x18_gate(
             },
             X18Pcrel::Adrp(_) => Insn::Nop,
         });
+        GateMetadata::X18Pcrel {
+            anchor_scratch: transformation.anchor_scratch,
+            value_scratch: transformation.value_scratch,
+        }
     } else {
         asm.push_word(transformation.word);
-        asm.emit(Insn::Nop);
-    }
+        GateMetadata::X18 {
+            anchor_scratch: transformation.anchor_scratch,
+            value_scratch: transformation.value_scratch,
+        }
+    };
     asm.emit(Insn::StrUimm {
         rt: transformation.value_scratch,
         rn: transformation.anchor_scratch,
@@ -2457,11 +2518,8 @@ fn emit_x18_gate(
         asm.finish(),
         trampoline_base_addr,
         gate_vaddr,
-        GateMetadata::X18 {
-            anchor_scratch: transformation.anchor_scratch,
-            value_scratch: transformation.value_scratch,
-        },
-        X18_SLOT_BYTES,
+        metadata,
+        metadata.slot_size(),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3145,83 +3203,117 @@ fn validate_gate_slot_inner(
         GateMetadata::X18 {
             anchor_scratch,
             value_scratch,
+        }
+        | GateMetadata::X18Pcrel {
+            anchor_scratch,
+            value_scratch,
         } => {
+            let pcrel = matches!(metadata, GateMetadata::X18Pcrel { .. });
+            let instruction_offset = 20;
+            let materialization_tail_offset = 24;
+            let teardown_offset = if pcrel { 28 } else { 24 };
+            let return_offset = if pcrel { 40 } else { 36 };
+            let descriptor_offset = if pcrel { 44 } else { 40 };
             let offsets = [
-                x18_access_offset(word(32), Opcode::StrUimm, value_scratch, anchor_scratch),
-                x18_access_offset(word(36), Opcode::LdrUimm, value_scratch, anchor_scratch),
-                x18_access_offset(word(40), Opcode::LdrUimm, anchor_scratch, anchor_scratch),
+                x18_access_offset(
+                    word(teardown_offset),
+                    Opcode::StrUimm,
+                    value_scratch,
+                    anchor_scratch,
+                ),
+                x18_access_offset(
+                    word(teardown_offset + 4),
+                    Opcode::LdrUimm,
+                    value_scratch,
+                    anchor_scratch,
+                ),
+                x18_access_offset(
+                    word(teardown_offset + 8),
+                    Opcode::LdrUimm,
+                    anchor_scratch,
+                    anchor_scratch,
+                ),
             ];
-            let setup_target = decode_branch_link_target(word(12), anchor + 12);
+            let setup_target = decode_branch_link_target(word(8), anchor + 8);
             let return_is_valid = match addressing {
-                SlotAddressing::Unplaced { .. } => word(44) & OPCODE_TOP6_MASK == Opcode::B.bits(),
-                SlotAddressing::Placed { .. } => decode_branch_target(word(44), anchor + 44)
-                    .is_some_and(|target| {
-                        target.is_multiple_of(INSN_BYTES_U64)
-                            && !(anchor..anchor + X18_SLOT_BYTES as u64).contains(&target)
-                    }),
+                SlotAddressing::Unplaced { .. } => {
+                    word(return_offset) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                }
+                SlotAddressing::Placed { .. } => {
+                    decode_branch_target(word(return_offset), anchor + return_offset as u64)
+                        .is_some_and(|target| {
+                            target.is_multiple_of(INSN_BYTES_U64)
+                                && !(anchor..anchor + slot_size as u64).contains(&target)
+                        })
+                }
             };
-            exact(0, Insn::SubSp(32))
-                && exact(
-                    4,
-                    Insn::Stp {
-                        rt: anchor_scratch,
-                        rt2: value_scratch,
-                        rn: SP,
-                        imm_bytes: 0,
-                    },
-                )
-                && exact(
-                    8,
-                    Insn::StrUimm {
-                        rt: 30,
-                        rn: SP,
-                        imm_bytes: 16,
-                    },
-                )
-                && setup_target.is_some_and(|target| {
-                    target.is_multiple_of(GATE_ALIGNMENT as u64) && target < anchor
-                })
-                && exact(
-                    16,
-                    Insn::LdrUimm {
-                        rt: 30,
-                        rn: SP,
-                        imm_bytes: 16,
-                    },
-                )
-                && exact(20, Insn::AddSp(32))
+            exact(
+                0,
+                Insn::StpPreIndex {
+                    rt: anchor_scratch,
+                    rt2: value_scratch,
+                    rn: SP,
+                    imm_bytes: -32,
+                },
+            ) && exact(
+                4,
+                Insn::StrUimm {
+                    rt: 30,
+                    rn: SP,
+                    imm_bytes: 16,
+                },
+            ) && setup_target.is_some_and(|target| {
+                target.is_multiple_of(GATE_ALIGNMENT as u64) && target < anchor
+            }) && exact(
+                12,
+                Insn::LdrUimm {
+                    rt: 30,
+                    rn: SP,
+                    imm_bytes: 16,
+                },
+            ) && exact(16, Insn::AddSp(32))
                 && match addressing {
                     SlotAddressing::Placed { .. } => exact_x18_transformation(
-                        word(48),
-                        word(24),
-                        word(28),
+                        word(descriptor_offset),
+                        word(instruction_offset),
+                        if pcrel {
+                            word(materialization_tail_offset)
+                        } else {
+                            NOP
+                        },
                         anchor_scratch,
                         value_scratch,
-                        decode_branch_target(word(44), anchor + 44)
+                        decode_branch_target(word(return_offset), anchor + return_offset as u64)
                             .and_then(|return_target| return_target.checked_sub(INSN_BYTES_U64)),
-                        anchor + 24,
+                        anchor + instruction_offset as u64,
                     ),
                     SlotAddressing::Unplaced { slot_offset } => exact_x18_unplaced_transformation(
-                        word(48),
-                        word(24),
-                        word(28),
+                        word(descriptor_offset),
+                        word(instruction_offset),
+                        if pcrel {
+                            word(materialization_tail_offset)
+                        } else {
+                            NOP
+                        },
                         anchor_scratch,
                         value_scratch,
                         i64::try_from(slot_offset)
                             .ok()
-                            .and_then(|offset| offset.checked_add(44))
-                            .and_then(|pc| branch_local_target(word(44), pc))
+                            .and_then(|offset| {
+                                offset.checked_add(i64::try_from(return_offset).ok()?)
+                            })
+                            .and_then(|pc| branch_local_target(word(return_offset), pc))
                             .and_then(|return_target| {
                                 return_target.checked_sub(INSN_BYTES_U64.cast_signed())
                             }),
-                        i64::try_from(slot_offset)
-                            .ok()
-                            .and_then(|offset| offset.checked_add(24)),
+                        i64::try_from(slot_offset).ok().and_then(|offset| {
+                            offset.checked_add(i64::try_from(instruction_offset).ok()?)
+                        }),
                     ),
                 }
                 && exact_x18_site_offsets(offsets)
                 && return_is_valid
-                && padding_is_nops(52)
+                && padding_is_nops(descriptor_offset + 4)
         }
         GateMetadata::X18Conditional {
             anchor_scratch,
@@ -3306,20 +3398,41 @@ fn validate_gate_slot_inner(
 }
 
 impl GateMetadata {
+    /// Possible `X30` offsets after a site calls the shared x18 setup.
+    pub const X18_SETUP_RETURN_OFFSETS: [usize; 2] = [12, 16];
+
+    /// Offset named by `X30` while this gate is executing shared x18 setup.
+    pub const fn x18_setup_return_offset(self) -> Option<usize> {
+        match self {
+            Self::X18 { .. } | Self::X18Pcrel { .. } => Some(Self::X18_SETUP_RETURN_OFFSETS[0]),
+            Self::X18Conditional { .. } => Some(Self::X18_SETUP_RETURN_OFFSETS[1]),
+            _ => None,
+        }
+    }
+
+    /// Offset of this gate's `BL` to shared x18 setup.
+    pub const fn x18_setup_call_offset(self) -> Option<usize> {
+        match self {
+            Self::X18 { .. } | Self::X18Pcrel { .. } => Some(8),
+            Self::X18Conditional { .. } => Some(12),
+            _ => None,
+        }
+    }
+
     pub fn anchor_scratch(self) -> Option<u8> {
         match self {
-            Self::X18 { anchor_scratch, .. } | Self::X18Conditional { anchor_scratch, .. } => {
-                Some(anchor_scratch)
-            }
+            Self::X18 { anchor_scratch, .. }
+            | Self::X18Pcrel { anchor_scratch, .. }
+            | Self::X18Conditional { anchor_scratch, .. } => Some(anchor_scratch),
             _ => None,
         }
     }
 
     pub fn value_scratch(self) -> Option<u8> {
         match self {
-            Self::X18 { value_scratch, .. } | Self::X18Conditional { value_scratch, .. } => {
-                Some(value_scratch)
-            }
+            Self::X18 { value_scratch, .. }
+            | Self::X18Pcrel { value_scratch, .. }
+            | Self::X18Conditional { value_scratch, .. } => Some(value_scratch),
             _ => None,
         }
     }
@@ -3331,6 +3444,7 @@ impl GateMetadata {
             GateMetadata::MrsTpidr { .. } => MRS_SLOT_BYTES,
             GateMetadata::MsrTpidr { .. } => MSR_SLOT_BYTES,
             GateMetadata::X18 { .. } => X18_SLOT_BYTES,
+            GateMetadata::X18Pcrel { .. } => X18_PCREL_SLOT_BYTES,
             GateMetadata::X18Conditional { .. } => X18_CONDITIONAL_SLOT_BYTES,
             GateMetadata::X18Br => X18_BR_SLOT_BYTES,
         }
@@ -3345,6 +3459,8 @@ impl GateMetadata {
         match self {
             // The `B` back to the original site at 44 is the last instruction.
             GateMetadata::Svc => 48,
+            // The return `B` at 40 is followed by a provenance descriptor.
+            GateMetadata::X18Pcrel { .. } => 44,
             // `MRS`, the guest-TLS `LDR`, then the `B` back.
             GateMetadata::MrsTpidr { .. } => 12,
             // Frame teardown ends at 28, then the `B` back at 32. The second
@@ -3360,10 +3476,11 @@ impl GateMetadata {
     /// original site.
     pub(crate) const fn return_offset(self) -> usize {
         match self {
-            GateMetadata::Svc | GateMetadata::X18 { .. } => 44,
+            GateMetadata::Svc => 44,
+            GateMetadata::X18Pcrel { .. } | GateMetadata::X18Conditional { .. } => 40,
+            GateMetadata::X18 { .. } => 36,
             GateMetadata::MrsTpidr { .. } => 8,
             GateMetadata::MsrTpidr { .. } => 32,
-            GateMetadata::X18Conditional { .. } => 40,
             GateMetadata::X18Br => 4,
         }
     }
@@ -3383,6 +3500,7 @@ impl GateMetadata {
             // need undoing.
             GateMetadata::Svc
             | GateMetadata::X18 { .. }
+            | GateMetadata::X18Pcrel { .. }
             | GateMetadata::X18Conditional { .. }
             | GateMetadata::X18Br => 0,
             // The guest-TLS load.
@@ -3451,16 +3569,20 @@ impl ClassifiedX18Gate {
         self.saved_value_scratch_offset
     }
     pub const fn setup_call_offset(self) -> u8 {
-        12
+        8
     }
     pub const fn post_setup_offset(self) -> u8 {
-        16
+        12
     }
     pub const fn transformed_instruction_offset(self) -> u8 {
-        24
+        20
     }
-    pub const fn return_offset(self) -> u8 {
-        40
+    pub fn return_offset(self) -> u8 {
+        if self.original_is_adr() || self.original_is_adrp() {
+            40
+        } else {
+            36
+        }
     }
     pub fn fallthrough(self) -> u64 {
         self.fallthrough
@@ -3568,6 +3690,7 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
         GateMetadata::MrsTpidr { .. }
         | GateMetadata::MsrTpidr { .. }
         | GateMetadata::X18 { .. }
+        | GateMetadata::X18Pcrel { .. }
         | GateMetadata::X18Conditional { .. }
         | GateMetadata::X18Br => 0,
     };
@@ -3713,6 +3836,7 @@ fn parse_validated_trampoline(
                 EncodedGateMetadata(u32::from_le_bytes(word.try_into().unwrap())).decode(),
                 Some(
                     GateMetadata::X18 { .. }
+                        | GateMetadata::X18Pcrel { .. }
                         | GateMetadata::X18Conditional { .. }
                         | GateMetadata::X18Br
                 )
@@ -3779,6 +3903,7 @@ fn parse_validated_trampoline(
             x18_shaped |= matches!(
                 metadata,
                 GateMetadata::X18 { .. }
+                    | GateMetadata::X18Pcrel { .. }
                     | GateMetadata::X18Conditional { .. }
                     | GateMetadata::X18Br
             );
@@ -3802,10 +3927,17 @@ fn parse_validated_trampoline(
         };
         if matches!(
             metadata,
-            GateMetadata::X18 { .. } | GateMetadata::X18Conditional { .. }
+            GateMetadata::X18 { .. }
+                | GateMetadata::X18Pcrel { .. }
+                | GateMetadata::X18Conditional { .. }
         ) {
-            let target = copied_word(trampoline, cursor + 12)
-                .zip(i64::try_from(cursor + 12).ok())
+            let call_offset = if matches!(metadata, GateMetadata::X18Conditional { .. }) {
+                12
+            } else {
+                8
+            };
+            let target = copied_word(trampoline, cursor + call_offset)
+                .zip(i64::try_from(cursor + call_offset).ok())
                 .and_then(|(word, pc)| branch_link_local_target(word, pc))
                 .and_then(|target| usize::try_from(target).ok());
             let Some(setup) = target.and_then(|target| {
@@ -3891,25 +4023,46 @@ fn classified_gate_from_validated_slot(
         slot_vaddr + return_offset as u64,
     )?;
     let x18 = match metadata {
-        GateMetadata::X18 { .. } | GateMetadata::X18Conditional { .. } => Some(ClassifiedX18Gate {
+        GateMetadata::X18 { .. }
+        | GateMetadata::X18Pcrel { .. }
+        | GateMetadata::X18Conditional { .. } => Some(ClassifiedX18Gate {
             original_instruction: copied_word(
                 slot,
-                if matches!(metadata, GateMetadata::X18Conditional { .. }) {
-                    60
-                } else {
-                    48
+                match metadata {
+                    GateMetadata::X18 { .. } => 40,
+                    GateMetadata::X18Pcrel { .. } => 44,
+                    GateMetadata::X18Conditional { .. } => 60,
+                    _ => unreachable!(),
                 },
             )?,
-            transformed_instruction: copied_word(slot, 24)?,
-            materialization_tail: copied_word(slot, 28)?,
-            setup_handler: decode_branch_link_target(copied_word(slot, 12)?, slot_vaddr + 12)?,
+            transformed_instruction: copied_word(
+                slot,
+                if matches!(metadata, GateMetadata::X18Conditional { .. }) {
+                    24
+                } else {
+                    20
+                },
+            )?,
+            materialization_tail: if matches!(metadata, GateMetadata::X18Pcrel { .. }) {
+                copied_word(slot, 24)?
+            } else {
+                NOP
+            },
+            setup_handler: {
+                let offset = if matches!(metadata, GateMetadata::X18Conditional { .. }) {
+                    12
+                } else {
+                    8
+                };
+                decode_branch_link_target(copied_word(slot, offset)?, slot_vaddr + offset as u64)?
+            },
             guest_x18_offset: x18_access_offset(
                 copied_word(
                     slot,
-                    if matches!(metadata, GateMetadata::X18 { .. }) {
-                        32
-                    } else {
-                        28
+                    match metadata {
+                        GateMetadata::X18 { .. } => 24,
+                        GateMetadata::X18Pcrel { .. } | GateMetadata::X18Conditional { .. } => 28,
+                        _ => unreachable!(),
                     },
                 )?,
                 Opcode::StrUimm,
@@ -3919,10 +4072,10 @@ fn classified_gate_from_validated_slot(
             saved_anchor_scratch_offset: x18_access_offset(
                 copied_word(
                     slot,
-                    if matches!(metadata, GateMetadata::X18 { .. }) {
-                        40
-                    } else {
-                        36
+                    match metadata {
+                        GateMetadata::X18 { .. } => 32,
+                        GateMetadata::X18Pcrel { .. } | GateMetadata::X18Conditional { .. } => 36,
+                        _ => unreachable!(),
                     },
                 )?,
                 Opcode::LdrUimm,
@@ -3932,10 +4085,10 @@ fn classified_gate_from_validated_slot(
             saved_value_scratch_offset: x18_access_offset(
                 copied_word(
                     slot,
-                    if matches!(metadata, GateMetadata::X18 { .. }) {
-                        36
-                    } else {
-                        32
+                    match metadata {
+                        GateMetadata::X18 { .. } => 28,
+                        GateMetadata::X18Pcrel { .. } | GateMetadata::X18Conditional { .. } => 32,
+                        _ => unreachable!(),
                     },
                 )?,
                 Opcode::LdrUimm,
@@ -4516,6 +4669,7 @@ fn validate_trampoline_and_collect_patches(
             GateMetadata::MsrTpidr { .. } => Some(slot.offset + 20),
             GateMetadata::Svc
             | GateMetadata::X18 { .. }
+            | GateMetadata::X18Pcrel { .. }
             | GateMetadata::X18Conditional { .. }
             | GateMetadata::X18Br => None,
         };
@@ -4538,18 +4692,22 @@ fn validate_trampoline_and_collect_patches(
             anchor_scratch,
             value_scratch,
         }
+        | GateMetadata::X18Pcrel {
+            anchor_scratch,
+            value_scratch,
+        }
         | GateMetadata::X18Conditional {
             anchor_scratch,
             value_scratch,
         } = slot.metadata
         {
             let offsets = x18_offsets.expect("x18 offsets checked above");
-            let teardown_starts: &[usize] =
-                if matches!(slot.metadata, GateMetadata::X18Conditional { .. }) {
-                    &[28, 44]
-                } else {
-                    &[32]
-                };
+            let teardown_starts: &[usize] = match slot.metadata {
+                GateMetadata::X18 { .. } => &[24],
+                GateMetadata::X18Pcrel { .. } => &[28],
+                GateMetadata::X18Conditional { .. } => &[28, 44],
+                _ => unreachable!(),
+            };
             for path in teardown_starts {
                 for (relative, opcode, rt, placeholder, replacement) in [
                     (
@@ -4666,29 +4824,42 @@ pub fn find_guest_tpidr_placeholder(trampoline: &[u8]) -> Option<usize> {
 }
 
 fn is_valid_x18_guest_instruction_word(trampoline: &[u8], offset: usize) -> bool {
-    [24usize, 48].into_iter().any(|word_offset| {
+    [20usize, 24, 40, 44, 60].into_iter().any(|word_offset| {
         let Some(start) = offset.checked_sub(word_offset) else {
             return false;
         };
         if !start.is_multiple_of(GATE_ALIGNMENT) {
             return false;
         }
-        let Some(slot) = trampoline.get(start..start + X18_SLOT_BYTES) else {
-            return false;
-        };
-        let Some(metadata) = copied_word(slot, X18_SLOT_BYTES - GATE_METADATA_BYTES)
-            .and_then(|word| EncodedGateMetadata(word).decode())
-        else {
-            return false;
-        };
-        matches!(metadata, GateMetadata::X18 { .. })
-            && validate_gate_slot_inner(
-                slot,
-                SlotAddressing::Unplaced {
-                    slot_offset: start as u64,
-                },
+        [
+            X18_SLOT_BYTES,
+            X18_PCREL_SLOT_BYTES,
+            X18_CONDITIONAL_SLOT_BYTES,
+        ]
+        .into_iter()
+        .any(|slot_size| {
+            let Some(slot) = trampoline.get(start..start + slot_size) else {
+                return false;
+            };
+            let Some(metadata) = copied_word(slot, slot_size - GATE_METADATA_BYTES)
+                .and_then(|word| EncodedGateMetadata(word).decode())
+            else {
+                return false;
+            };
+            matches!(
                 metadata,
-            )
+                GateMetadata::X18 { .. }
+                    | GateMetadata::X18Pcrel { .. }
+                    | GateMetadata::X18Conditional { .. }
+            ) && offset < start + metadata.slot_size() - GATE_METADATA_BYTES
+                && validate_gate_slot_inner(
+                    slot,
+                    SlotAddressing::Unplaced {
+                        slot_offset: start as u64,
+                    },
+                    metadata,
+                )
+        })
     })
 }
 
@@ -5168,7 +5339,7 @@ mod tests {
         );
         let outcome = outcome.unwrap();
         let slot = GATES_START_OFFSET + X18_SETUP_BYTES;
-        let relocated = word_at(&outcome.trampoline, slot + 24);
+        let relocated = word_at(&outcome.trampoline, slot + 20);
 
         assert!(outcome.trapped_sites.is_empty());
         assert_eq!(
@@ -5176,7 +5347,7 @@ mod tests {
             Some(TRAMPOLINE_BASE + slot as u64)
         );
         assert_eq!(
-            decode_adrp_target(relocated, TRAMPOLINE_BASE + (slot + 24) as u64, 17),
+            decode_adrp_target(relocated, TRAMPOLINE_BASE + (slot + 20) as u64, 17),
             PcrelTarget::Target {
                 displacement: -0xec000,
                 address: 0x114000,
@@ -5197,18 +5368,18 @@ mod tests {
         );
         let outcome = outcome.unwrap();
         let slot = GATES_START_OFFSET + X18_SETUP_BYTES;
-        let relocated_pc = TRAMPOLINE_BASE + (slot + 24) as u64;
+        let relocated_pc = TRAMPOLINE_BASE + (slot + 20) as u64;
 
         assert!(outcome.trapped_sites.is_empty());
-        assert_eq!(outcome.trampoline.len(), slot + X18_SLOT_BYTES);
+        assert_eq!(outcome.trampoline.len(), slot + X18_PCREL_SLOT_BYTES);
         assert_eq!(
             decode_branch_target(word_at(&patched, 0), SITE),
             Some(TRAMPOLINE_BASE + slot as u64)
         );
         assert_eq!(
             decode_adrp_add_target_for_rd(
+                word_at(&outcome.trampoline, slot + 20),
                 word_at(&outcome.trampoline, slot + 24),
-                word_at(&outcome.trampoline, slot + 28),
                 relocated_pc,
                 17,
             ),
@@ -5235,7 +5406,7 @@ mod tests {
         );
         let outcome = outcome.unwrap();
         let slot = GATES_START_OFFSET + X18_SETUP_BYTES;
-        let materialization_pc = TRAMPOLINE_BASE + (slot + 24) as u64;
+        let materialization_pc = TRAMPOLINE_BASE + (slot + 20) as u64;
 
         assert!(outcome.trapped_sites.is_empty());
         assert_eq!(
@@ -5244,8 +5415,8 @@ mod tests {
         );
         assert_eq!(
             decode_adrp_add_target_for_rd(
+                word_at(&outcome.trampoline, slot + 20),
                 word_at(&outcome.trampoline, slot + 24),
-                word_at(&outcome.trampoline, slot + 28),
                 materialization_pc,
                 17,
             ),
@@ -5275,8 +5446,8 @@ mod tests {
             let trampoline = outcome.unwrap().trampoline;
             let slot = GATES_START_OFFSET + X18_SETUP_BYTES;
             [
+                word_at(&trampoline, slot + 20),
                 word_at(&trampoline, slot + 24),
-                word_at(&trampoline, slot + 28),
             ]
         };
 
@@ -5289,7 +5460,7 @@ mod tests {
             decode_adrp_add_target_for_rd(
                 pair[0],
                 pair[1],
-                TRAMPOLINE_BASE + (GATES_START_OFFSET + X18_SETUP_BYTES + 24) as u64,
+                TRAMPOLINE_BASE + (GATES_START_OFFSET + X18_SETUP_BYTES + 20) as u64,
                 17,
             ),
             Some(SITE + 0x10)
@@ -5843,7 +6014,11 @@ mod tests {
         );
         assert_eq!(
             outcome.trampoline.len(),
-            GATES_START_OFFSET + X18_SETUP_BYTES + 6 * X18_SLOT_BYTES + X18_CONDITIONAL_SLOT_BYTES
+            GATES_START_OFFSET
+                + X18_SETUP_BYTES
+                + 5 * X18_SLOT_BYTES
+                + X18_PCREL_SLOT_BYTES
+                + X18_CONDITIONAL_SLOT_BYTES
         );
     }
 
@@ -5888,21 +6063,17 @@ mod tests {
         }
 
         let expected_site = [
-            0xd100_83ff, // sub sp, sp, #32
-            0xa900_47f0, // stp x16, x17, [sp]
+            0xa9be_47f0, // stp x16, x17, [sp, #-32]!
             0xf900_0bfe, // str x30, [sp, #16]
-            0x97ff_fff5, // bl setup (-44 bytes)
+            0x97ff_fff6, // bl setup (-40 bytes)
             0xf940_0bfe, // ldr x30, [sp, #16]
             0x9100_83ff, // add sp, sp, #32
             0xaa00_03f1, // mov x17, x0
-            0xd503_201f, // second materialization word
             0xf93f_fa11, // str x17, [x16, #32752]
             0xf97f_f211, // ldr x17, [x16, #32736]
             0xf97f_f610, // ldr x16, [x16, #32744]
-            0x17f8_03ea, // b 0x1004 from 0x20005c
+            0x17f8_03ec, // b 0x1004 from 0x200054
             0xaa00_03f2, // original instruction descriptor
-            0xd503_201f, // nop padding
-            0xd503_201f, // nop padding
             0x0031_b807, // X18 metadata: anchor x16, value x17
         ];
         for (index, expected) in expected_site.into_iter().enumerate() {
@@ -5910,8 +6081,8 @@ mod tests {
         }
         assert_eq!(
             decode_branch_target(
-                word_at(&trampoline, slot + 44),
-                trampoline_base + (slot + 44) as u64
+                word_at(&trampoline, slot + 36),
+                trampoline_base + (slot + 36) as u64
             ),
             Some(base + 4)
         );
@@ -5930,16 +6101,15 @@ mod tests {
         let slot = GATES_START_OFFSET + X18_SETUP_BYTES;
 
         assert_eq!(
-            (6..=11)
+            (5..=9)
                 .map(|index| word_at(&trampoline, slot + index * INSN_BYTES))
                 .collect::<Vec<_>>(),
             [
                 0xfa5e_1224, // ccmp x17, x30, #4, ne
-                0xd503_201f, // second materialization word
                 0xf93f_fa11, // str x17, [x16, #32752]
                 0xf97f_f211, // ldr x17, [x16, #32736]
                 0xf97f_f610, // ldr x16, [x16, #32744]
-                0x17f8_03ea, // b 0x1004
+                0x17f8_03ec, // b 0x1004
             ]
         );
     }
@@ -6267,7 +6437,7 @@ mod tests {
         for index in 0..words.len() {
             let slot = first_slot + index * X18_SLOT_BYTES;
             assert_eq!(
-                word_at(&trampoline, slot + 16),
+                word_at(&trampoline, slot + 12),
                 Insn::LdrUimm {
                     rt: 30,
                     rn: SP,
@@ -6277,16 +6447,16 @@ mod tests {
                 .unwrap()
             );
             assert_eq!(
-                word_at(&trampoline, slot + 20),
+                word_at(&trampoline, slot + 16),
                 Insn::AddSp(32).encode().unwrap()
             );
         }
         assert_eq!(
-            word_at(&trampoline, first_slot + X18_SLOT_BYTES + 24),
+            word_at(&trampoline, first_slot + X18_SLOT_BYTES + 20),
             0xaa1e_03f1
         );
         assert_eq!(
-            word_at(&trampoline, first_slot + 2 * X18_SLOT_BYTES + 24),
+            word_at(&trampoline, first_slot + 2 * X18_SLOT_BYTES + 20),
             0xaa11_03fe
         );
     }
@@ -6312,8 +6482,8 @@ mod tests {
 
         assert_eq!(GATE_ALIGNMENT, 16);
         assert_eq!(X18_SETUP_BYTES, 32);
-        assert_eq!(X18_SLOT_BYTES, 64);
-        assert_eq!(X18_GATE_BYTES, 48);
+        assert_eq!(X18_SLOT_BYTES, 48);
+        assert_eq!(X18_GATE_BYTES, 40);
 
         let preferred = hook(&[PREFERRED]);
         let same_pair = hook(&[PREFERRED, SAME_PAIR]);
@@ -6360,21 +6530,17 @@ mod tests {
 
         let site = GATES_START_OFFSET + 2 * X18_SETUP_BYTES + 2 * X18_SLOT_BYTES;
         let expected_site = [
-            0xd100_83ff, // sub sp, sp, #32
-            0xa900_3fee, // stp x14, x15, [sp]
+            0xa9be_3fee, // stp x14, x15, [sp, #-32]!
             0xf900_0bfe, // str x30, [sp, #16]
-            0x97ff_ffd5, // bl alternate setup (-172 bytes)
+            0x97ff_ffde, // bl alternate setup (-136 bytes)
             0xf940_0bfe, // ldr x30, [sp, #16]
             0x9100_83ff, // add sp, sp, #32
             0x8b10_022f, // add x15, x17, x16
-            0xd503_201f, // second materialization word
             0xf93f_f9cf, // str x15, [x14, #32752]
             0xf97f_f1cf, // ldr x15, [x14, #32736]
             0xf97f_f5ce, // ldr x14, [x14, #32744]
-            0x17f8_03c4, // b 0x100c from 0x2000fc
+            0x17f8_03ce, // b 0x100c from 0x2000d4
             0x8b10_0232, // original instruction descriptor
-            0xd503_201f, // nop padding
-            0xd503_201f, // nop padding
             0x1331_b807, // X18 metadata: anchor x14, value x15
         ];
         for (index, expected) in expected_site.into_iter().enumerate() {
@@ -7300,7 +7466,7 @@ mod tests {
                 );
             }
         }
-        for kind in 5..16 {
+        for kind in 7..16 {
             let invalid = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(invalid).decode(), None, "kind {kind}");
         }
@@ -7468,7 +7634,7 @@ mod tests {
             .unwrap()
         );
         assert_eq!(
-            word_at(&trampoline, slot + 32),
+            word_at(&trampoline, slot + 24),
             Insn::StrUimm {
                 rt: 17,
                 rn: 16,
@@ -7478,7 +7644,7 @@ mod tests {
             .unwrap()
         );
         assert_eq!(
-            word_at(&trampoline, slot + 36),
+            word_at(&trampoline, slot + 28),
             Insn::LdrUimm {
                 rt: 17,
                 rn: 16,
@@ -7488,7 +7654,7 @@ mod tests {
             .unwrap()
         );
         assert_eq!(
-            word_at(&trampoline, slot + 40),
+            word_at(&trampoline, slot + 32),
             Insn::LdrUimm {
                 rt: 16,
                 rn: 16,
@@ -7617,7 +7783,7 @@ mod tests {
                 );
             }
         }
-        for kind in 5..16 {
+        for kind in 7..16 {
             let word = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(word).decode(), None, "kind {kind}");
         }
@@ -7669,6 +7835,7 @@ mod tests {
                             GateMetadata::MrsTpidr { .. } => 4,
                             GateMetadata::MsrTpidr { .. } => 20,
                             GateMetadata::X18 { .. }
+                            | GateMetadata::X18Pcrel { .. }
                             | GateMetadata::X18Conditional { .. }
                             | GateMetadata::X18Br => unreachable!(),
                         },
@@ -7678,6 +7845,7 @@ mod tests {
                                 GateMetadata::MsrTpidr { .. } => 4,
                                 GateMetadata::Svc => 8,
                                 GateMetadata::X18 { .. }
+                                | GateMetadata::X18Pcrel { .. }
                                 | GateMetadata::X18Conditional { .. }
                                 | GateMetadata::X18Br => unreachable!(),
                             },
@@ -7784,10 +7952,10 @@ mod tests {
             assert_eq!(details.original_instruction(), 0xaa00_03f2);
             assert_eq!(details.transformed_instruction(), 0xaa00_03f1);
             assert_eq!(details.setup_handler(), base + GATES_START_OFFSET as u64);
-            assert_eq!(details.setup_call_offset(), 12);
-            assert_eq!(details.post_setup_offset(), 16);
-            assert_eq!(details.transformed_instruction_offset(), 24);
-            assert_eq!(details.return_offset(), 40);
+            assert_eq!(details.setup_call_offset(), 8);
+            assert_eq!(details.post_setup_offset(), 12);
+            assert_eq!(details.transformed_instruction_offset(), 20);
+            assert_eq!(details.return_offset(), 36);
         }
         for offset in (X18_GATE_BYTES..X18_SLOT_BYTES).step_by(INSN_BYTES) {
             assert_eq!(
@@ -7804,6 +7972,57 @@ mod tests {
             classify_copied_gate_slot(slot, base + site_slot as u64, base + site_slot as u64 + 1),
             None
         );
+    }
+
+    #[test]
+    fn x18_pcrel_classifier_accepts_only_the_executable_body() {
+        let (_code, outcome) = hook_words_opt_with_config(
+            &[0x1000_0092], // adr x18, +0x10
+            0x1000,
+            0x200000,
+            RewriteConfig::new(Host::Linux, true),
+        );
+        let mut trampoline = outcome.unwrap().trampoline;
+        finalize_trampoline_gates_with_offsets(
+            &mut trampoline,
+            Aarch64GateOffsets::new(96, 104, 112, 120).unwrap(),
+        )
+        .unwrap();
+        let start = GATES_START_OFFSET + X18_SETUP_BYTES;
+        let slot = &trampoline[start..start + X18_PCREL_SLOT_BYTES];
+
+        for offset in (0..44).step_by(INSN_BYTES) {
+            assert!(
+                classify_copied_gate_slot(
+                    slot,
+                    0x200000 + start as u64,
+                    0x200000 + (start + offset) as u64,
+                )
+                .is_some(),
+                "rejected executable PC +{offset}"
+            );
+            assert!(
+                classify_gate_pc(&trampoline, 0x200000, 0x200000 + (start + offset) as u64,)
+                    .is_some(),
+                "whole-trampoline classifier rejected executable PC +{offset}"
+            );
+        }
+        for offset in (44..X18_PCREL_SLOT_BYTES).step_by(INSN_BYTES) {
+            assert_eq!(
+                classify_copied_gate_slot(
+                    slot,
+                    0x200000 + start as u64,
+                    0x200000 + (start + offset) as u64,
+                ),
+                None,
+                "accepted descriptor, padding, or metadata PC +{offset}"
+            );
+            assert_eq!(
+                classify_gate_pc(&trampoline, 0x200000, 0x200000 + (start + offset) as u64,),
+                None,
+                "whole-trampoline classifier accepted non-executable PC +{offset}"
+            );
+        }
     }
 
     #[test]
