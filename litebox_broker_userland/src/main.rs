@@ -646,8 +646,6 @@ mod tests {
 
     use super::*;
 
-    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-
     /// One live host association: the endpoints teardown acts on, and the rest
     /// held open so the association stays up for the duration of a test.
     struct LiveAssociation {
@@ -759,7 +757,7 @@ mod tests {
             let control_ring = ControlRing::new(control_memory).unwrap();
             let mut control = UnixStreamHostSetupChannel::from_host_guaranteed(
                 host_stream,
-                Instant::now() + TEST_TIMEOUT,
+                Instant::now() + SETUP_TIMEOUT,
             );
             let association = setup_connection(
                 &broker,
@@ -816,7 +814,7 @@ mod tests {
         });
 
         finish
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(SETUP_TIMEOUT)
             .expect("dropping the guard must end the parked publisher")
             .unwrap();
         publisher.join().unwrap();
@@ -855,7 +853,7 @@ mod tests {
         });
 
         let outcome = finish
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(SETUP_TIMEOUT)
             .expect("dropping the guard must end a publisher blocked on capacity");
         publisher.join().unwrap();
         assert_eq!(
@@ -892,7 +890,7 @@ mod tests {
         });
 
         let receive_result = result_receiver
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(SETUP_TIMEOUT)
             .expect("a panicking publisher must end a blocked request reader");
         assert!(matches!(
             receive_result,
@@ -915,7 +913,7 @@ mod tests {
 
         failure_coordinator.report(IoError::new(ErrorKind::TimedOut, "first failure"));
         failure_coordinator.report(IoError::other("second failure"));
-        let receive_result = result_receiver.recv_timeout(TEST_TIMEOUT);
+        let receive_result = result_receiver.recv_timeout(SETUP_TIMEOUT);
         reader.join().unwrap();
 
         assert!(matches!(
@@ -950,7 +948,7 @@ mod tests {
             notifications
         });
         let notification = notifications_seen
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(SETUP_TIMEOUT)
             .expect("dispatch must publish readiness recorded in its runtime");
         assert_eq!(
             notification,
@@ -966,7 +964,7 @@ mod tests {
         drop(local);
         drop(notifications);
         outcome
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(SETUP_TIMEOUT)
             .expect("a clean local close must end dispatch")
             .unwrap();
         host.join().unwrap();
@@ -984,7 +982,7 @@ mod tests {
         // release the request reader that owns association termination.
         let (local, _notifications, outcome, host) = spawn_dispatch(Arc::clone(&readiness));
         let error = outcome
-            .recv_timeout(TEST_TIMEOUT)
+            .recv_timeout(SETUP_TIMEOUT)
             .expect("a panicking publisher must end dispatch")
             .expect_err("a panicking publisher must fail the association");
         assert_eq!(error.to_string(), "broker readiness publisher panicked");
