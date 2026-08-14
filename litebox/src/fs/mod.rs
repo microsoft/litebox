@@ -20,6 +20,7 @@ pub mod in_mem;
 pub(crate) mod inode_allocator;
 pub mod layered;
 pub mod nine_p;
+pub mod overlay;
 pub mod resolver;
 pub mod tar_ro;
 
