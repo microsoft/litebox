@@ -30,6 +30,7 @@ pub struct ElfParsedFile {
     header: FileHeader<Endian>,
     phdrs: Vec<u8>,
     trampoline: Option<TrampolineInfo>,
+    aarch64_rewrite_policy: Option<Aarch64RewritePolicy>,
 }
 
 /// Information about the mapped ELF file. This is used to set up the process
@@ -72,6 +73,16 @@ struct TrampolineInfo {
 /// The magic number used to identify the LiteBox trampoline.
 /// This must match `TRAMPOLINE_MAGIC` in `litebox_syscall_rewriter`.
 const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
+const AARCH64_X18_TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX1");
+
+/// Persisted AArch64 rewrite policy recorded by a LiteBox footer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aarch64RewritePolicy {
+    /// Standard syscall/thread-pointer rewriting without x18 virtualization.
+    Default,
+    /// The complete executable was scanned with x18 virtualization enabled.
+    X18,
+}
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
@@ -128,6 +139,8 @@ pub enum ElfParseError<E> {
     BadTrampoline,
     #[error("Invalid trampoline version")]
     BadTrampolineVersion,
+    #[error("AArch64 trampoline rewrite policy does not match this build")]
+    TrampolinePolicyMismatch,
     #[error("Binary not patched for syscall rewriting")]
     UnpatchedBinary,
     #[error("Unsupported ELF type")]
@@ -143,6 +156,7 @@ impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
             | ElfParseError::BadFormat
             | ElfParseError::BadTrampoline
             | ElfParseError::BadTrampolineVersion
+            | ElfParseError::TrampolinePolicyMismatch
             | ElfParseError::UnpatchedBinary
             | ElfParseError::BadInterp
             | ElfParseError::UnsupportedType => Errno::ENOEXEC,
@@ -218,12 +232,18 @@ impl ElfParsedFile {
             header,
             phdrs,
             trampoline: None,
+            aarch64_rewrite_policy: None,
         })
     }
 
     /// Returns `true` if a trampoline was parsed and will be mapped by `load()`.
     pub fn has_trampoline(&self) -> bool {
         self.trampoline.is_some()
+    }
+
+    /// Returns the persisted AArch64 rewrite policy recognized in the footer.
+    pub fn aarch64_rewrite_policy(&self) -> Option<Aarch64RewritePolicy> {
+        self.aarch64_rewrite_policy
     }
 
     /// Parse the LiteBox trampoline data, if any.
@@ -234,14 +254,24 @@ impl ElfParsedFile {
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "cannot panic: array slices are always the correct size"
-    )]
     pub fn parse_trampoline<F: ReadAt>(
         &mut self,
         file: &mut F,
         syscall_entry_point: usize,
+    ) -> Result<(), ElfParseError<F::Error>> {
+        self.parse_trampoline_for_policy(file, syscall_entry_point, None)
+    }
+
+    /// Parse LiteBox trampoline data for an explicit AArch64 rewrite policy.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "cannot panic: array slices are always the correct size"
+    )]
+    pub fn parse_trampoline_for_policy<F: ReadAt>(
+        &mut self,
+        file: &mut F,
+        syscall_entry_point: usize,
+        aarch64_policy: Option<Aarch64RewritePolicy>,
     ) -> Result<(), ElfParseError<F::Error>> {
         if syscall_entry_point == 0 {
             // Platform running in kernel mode does not need trampoline
@@ -269,16 +299,28 @@ impl ElfParsedFile {
         file.read_at(header_offset, &mut header_buf[..header_size])
             .map_err(ElfParseError::Io)?;
 
-        // Check magic and version. Format: "LITEBOX" + version byte.
+        // Check magic and persisted AArch64 rewrite policy.
         let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
-        if magic != TRAMPOLINE_MAGIC {
-            // If the prefix matches but the version differs, fail explicitly.
-            if &header_buf[0..7] == b"LITEBOX" {
+        let trampoline_size = u64::from_le_bytes(header_buf[24..32].try_into().unwrap());
+        match (aarch64_policy, magic, trampoline_size) {
+            (None | Some(Aarch64RewritePolicy::Default), TRAMPOLINE_MAGIC, _)
+            | (Some(Aarch64RewritePolicy::X18), AARCH64_X18_TRAMPOLINE_MAGIC, _) => {}
+            (Some(Aarch64RewritePolicy::X18), TRAMPOLINE_MAGIC, 0) => {
+                return Err(ElfParseError::UnpatchedBinary);
+            }
+            (Some(_), TRAMPOLINE_MAGIC | AARCH64_X18_TRAMPOLINE_MAGIC, _) => {
+                return Err(ElfParseError::TrampolinePolicyMismatch);
+            }
+            _ if &header_buf[0..7] == b"LITEBOX" => {
                 return Err(ElfParseError::BadTrampolineVersion);
             }
-            // No trampoline found.
-            return Err(ElfParseError::UnpatchedBinary);
+            _ => return Err(ElfParseError::UnpatchedBinary),
         }
+        self.aarch64_rewrite_policy = match magic {
+            TRAMPOLINE_MAGIC => Some(Aarch64RewritePolicy::Default),
+            AARCH64_X18_TRAMPOLINE_MAGIC => Some(Aarch64RewritePolicy::X18),
+            _ => None,
+        };
 
         let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {
             let header = TrampolineHeader64::read_from_bytes(&header_buf)
@@ -494,11 +536,10 @@ impl ElfParsedFile {
 
         if self.trampoline.is_some() {
             self.load_trampoline(mapper, mem, &mut info)?;
-        } else if let Some(size) = reserve_trampoline {
-            // Reserve space for a runtime trampoline so brk starts past it.
-            // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
-            // will allocate the actual trampoline in this region via MAP_FIXED.
-            info.brk = page_align_up(info.brk) + page_align_up(size);
+        } else if reserve_trampoline.is_some() {
+            // The runtime patcher places its trampoline beyond the heap growth
+            // reserve. Advancing brk over an unmapped gap would make the guest
+            // allocator treat that gap as memory it already owns.
         }
 
         Ok(info)
@@ -919,6 +960,106 @@ mod reserve_regions_tests {
             let tail = r.tail_unmap.map_or(0, |(_, s)| s);
             assert_eq!(head + tail, align - PAGE_SIZE);
             assert_page_aligned(&r);
+        }
+    }
+}
+
+#[cfg(test)]
+mod trampoline_policy_tests {
+    extern crate std;
+
+    use super::{Aarch64RewritePolicy, ElfParseError, ElfParsedFile, ReadAt};
+
+    struct Bytes(std::vec::Vec<u8>);
+
+    impl ReadAt for Bytes {
+        type Error = ();
+
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            let start = usize::try_from(offset).map_err(|_| ())?;
+            let end = start.checked_add(buf.len()).ok_or(())?;
+            buf.copy_from_slice(self.0.get(start..end).ok_or(())?);
+            Ok(())
+        }
+
+        fn size(&mut self) -> Result<u64, Self::Error> {
+            Ok(self.0.len() as u64)
+        }
+    }
+
+    fn fixture(magic: [u8; 8], size: u64) -> Bytes {
+        let mut bytes =
+            include_bytes!("../../litebox_syscall_rewriter/tests/hello-aarch64").to_vec();
+        bytes.extend_from_slice(&magic);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&size.to_le_bytes());
+        Bytes(bytes)
+    }
+
+    fn parsed() -> ElfParsedFile {
+        ElfParsedFile::parse(&mut Bytes(
+            include_bytes!("../../litebox_syscall_rewriter/tests/hello-aarch64").to_vec(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn x18_policy_accepts_x18_zero_sentinel() {
+        let mut parsed = parsed();
+        parsed
+            .parse_trampoline_for_policy(
+                &mut fixture(*b"LITEBOX1", 0),
+                1,
+                Some(Aarch64RewritePolicy::X18),
+            )
+            .unwrap();
+        assert_eq!(
+            parsed.aarch64_rewrite_policy(),
+            Some(Aarch64RewritePolicy::X18)
+        );
+    }
+
+    #[test]
+    fn x18_policy_treats_default_zero_sentinel_as_unpatched() {
+        assert!(matches!(
+            parsed().parse_trampoline_for_policy(
+                &mut fixture(*b"LITEBOX0", 0),
+                1,
+                Some(Aarch64RewritePolicy::X18),
+            ),
+            Err(ElfParseError::UnpatchedBinary)
+        ));
+    }
+
+    #[test]
+    fn opposite_nonempty_policy_is_rejected_both_directions() {
+        for (magic, policy) in [
+            (b"LITEBOX0", Aarch64RewritePolicy::X18),
+            (b"LITEBOX1", Aarch64RewritePolicy::Default),
+        ] {
+            assert!(matches!(
+                parsed().parse_trampoline_for_policy(&mut fixture(*magic, 1), 1, Some(policy),),
+                Err(ElfParseError::TrampolinePolicyMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn both_policy_magics_obey_footer_bounds() {
+        for magic in [b"LITEBOX0", b"LITEBOX1"] {
+            assert!(matches!(
+                parsed().parse_trampoline_for_policy(
+                    &mut fixture(*magic, u64::MAX),
+                    1,
+                    Some(if magic == b"LITEBOX0" {
+                        Aarch64RewritePolicy::Default
+                    } else {
+                        Aarch64RewritePolicy::X18
+                    }),
+                ),
+                Err(ElfParseError::BadTrampoline)
+            ));
         }
     }
 }

@@ -12,6 +12,52 @@ const MULTIARCH: &str = "x86_64-linux-gnu";
 #[cfg(target_arch = "aarch64")]
 const MULTIARCH: &str = "aarch64-linux-gnu";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RewritePolicy {
+    Default,
+    X18,
+}
+
+impl RewritePolicy {
+    #[allow(
+        dead_code,
+        reason = "the shared helper is compiled into test binaries that do not rewrite"
+    )]
+    pub const CURRENT: Self = if cfg!(all(
+        target_arch = "aarch64",
+        feature = "aarch64_virtualize_x18"
+    )) {
+        Self::X18
+    } else {
+        Self::Default
+    };
+}
+
+pub fn rewrite_policy_name(unique_name: &str, policy: RewritePolicy) -> String {
+    let suffix = match policy {
+        RewritePolicy::Default => "default",
+        RewritePolicy::X18 => "x18",
+    };
+    format!("{unique_name}_{suffix}")
+}
+
+fn rewrite_command_args<'a>(
+    input_path: &'a Path,
+    output_path: &'a Path,
+    policy: RewritePolicy,
+    extra_args: &'a [&'a str],
+) -> Vec<&'a str> {
+    let mut args = vec!["run", "-p", "litebox_syscall_rewriter", "--"];
+    if policy == RewritePolicy::X18 {
+        args.push("--virtualize-x18");
+    }
+    args.extend_from_slice(extra_args);
+    args.push("-o");
+    args.push(output_path.to_str().unwrap());
+    args.push(input_path.to_str().unwrap());
+    args
+}
+
 /// Find all dependencies of a given binary via `ldd`
 #[allow(dead_code, reason = "not used by loader.rs for x86")]
 pub fn find_dependencies(prog: &str) -> Vec<String> {
@@ -129,6 +175,8 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
     }
     if nolibc {
         args.push("-nostdlib");
+        #[cfg(target_arch = "aarch64")]
+        args.push("-Wl,-z,separate-code");
     }
     // Select the x86 ABI explicitly; AArch64 gcc rejects both x86 flags.
     match std::env::consts::ARCH {
@@ -184,7 +232,12 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
 }
 
 /// Run syscall rewriter with caching
-pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&str]) -> bool {
+pub fn rewrite_with_cache(
+    input_path: &Path,
+    output_path: &Path,
+    policy: RewritePolicy,
+    extra_args: &[&str],
+) -> bool {
     // Include both the input file and all rewriter source files in the cache key
     let mut input_paths = vec![input_path];
     let rewriter_sources = find_rewriter_source_files();
@@ -194,11 +247,7 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
         .collect();
     input_paths.extend(rewriter_paths);
 
-    let mut args = vec!["run", "-p", "litebox_syscall_rewriter", "--"];
-    args.extend_from_slice(extra_args);
-    args.push("-o");
-    args.push(output_path.to_str().unwrap());
-    args.push(input_path.to_str().unwrap());
+    let args = rewrite_command_args(input_path, output_path, policy, extra_args);
 
     // Create command string for caching
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());

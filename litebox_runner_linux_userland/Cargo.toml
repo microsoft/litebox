@@ -30,6 +30,9 @@ litebox_broker_platform_linux_userland = { version = "0.1.0", path = "../litebox
 litebox_broker_userland = { version = "0.1.0", path = "../litebox_broker_userland" }
 
 [features]
+aarch64_virtualize_x18 = [
+    "litebox_platform_linux_userland/aarch64_virtualize_x18",
+]
 lock_tracing = ["litebox/lock_tracing"]
 
 [lints]

@@ -13,6 +13,8 @@
 )]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
@@ -20,6 +22,16 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use core::cell::{Cell, RefCell};
+
+#[cfg(target_arch = "aarch64")]
+const fn aarch64_rewrite_options<
+    Platform: litebox_syscall_rewriter::aarch64::Aarch64GatePlatform,
+>() -> litebox_syscall_rewriter::RewriteOptions {
+    litebox_syscall_rewriter::RewriteOptions::new(
+        litebox_syscall_rewriter::TargetHost::Linux,
+        Platform::VIRTUALIZE_X18,
+    )
+}
 use litebox::{
     LiteBox,
     fd::TypedFd,
@@ -90,6 +102,7 @@ pub trait ShimPlatform:
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
     + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
+    + litebox_syscall_rewriter::aarch64::Aarch64GatePlatform
     + 'static
 {
 }
@@ -108,6 +121,7 @@ impl<T> ShimPlatform for T where
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
+        + litebox_syscall_rewriter::aarch64::Aarch64GatePlatform
         + 'static
 {
 }
@@ -240,6 +254,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     }
 
     /// Build the shim.
+    ///
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
         let net = Network::new(&self.litebox);
         let global = Arc::new(GlobalState {
@@ -252,7 +267,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
-            elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            elf_patch_cache: litebox::sync::Mutex::new(syscalls::mm::ElfPatchCache::new()),
+            #[cfg(test)]
+            test_exec_publication_events: std::sync::Mutex::new(alloc::vec::Vec::new()),
         });
         LinuxShim(global)
     }
@@ -1206,7 +1223,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
-    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache<Platform>>,
+    #[cfg(test)]
+    test_exec_publication_events:
+        std::sync::Mutex<alloc::vec::Vec<syscalls::mm::TestExecPublicationEvent>>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {

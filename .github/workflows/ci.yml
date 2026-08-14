@@ -122,7 +122,14 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $AARCH64_CRATES
-      - run: ./.github/tools/github_actions_run_cargo nextest $AARCH64_CRATES
+      - name: Test default AArch64 configuration
+        run: ./.github/tools/github_actions_run_cargo nextest $AARCH64_CRATES
+      - name: Test AArch64 x18 virtualization
+        run: |
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_virtualize_x18 --test run -E 'test(=test_dynamic_lib_with_rewriter) or test(=test_static_exec_with_rewriter) or test(=test_runner_with_ls) or test(=test_runner_with_python) or test(=test_runner_with_python_repl_pty)'
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_virtualize_x18 --test loader -E 'test(=test_load_exec_dynamic) or test(=test_load_exec_static)'
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_virtualize_x18 --test rewritten_guests -E 'test(=test_guest_x18_virtualization) or test(=test_guest_x18_virtualization_signal_stress) or test(=test_aot_x18_guest_survives_signal_stress) or test(=test_guest_x18_conditional_branches) or test(=test_guest_x18_adr_and_terminal_br)'
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_platform_linux_userland --features litebox_platform_linux_userland/aarch64_virtualize_x18 --lib -E 'test(/^aarch64::(resume_frame::tests|tests)::/) or test(/aarch64_gate_interruption_classification_matrix/)'
       # Nextest does not run doctests.
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc $AARCH64_CRATES

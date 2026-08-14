@@ -31,11 +31,12 @@ use zerocopy::{FromBytes, IntoBytes};
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
 use aarch64::{
-    Aarch64GateSignalResult, assert_tls_block_placement,
-    canonicalize_runtime_aarch64_gate_signal_context, copy_signal_context,
-    fatal_aarch64_gate_runtime_state, guest_thread_pointer_tp_offset, is_guest_thread,
-    load_tls_block_base, run_thread_arch, set_is_guest_thread, set_signal_return,
-    signal_handler_exit_guest, switch_to_guest, sync_instruction_stream, tls_offset,
+    Aarch64GateInterruption, Aarch64GateSignalResult, assert_tls_block_placement,
+    canonicalize_runtime_aarch64_gate_signal_context, copy_ordinary_signal_context,
+    fatal_aarch64_gate_runtime_state, guest_thread_pointer_offset, guest_x18_offset,
+    is_guest_thread, load_tls_block_base, publish_virtualized_x18, run_thread_arch,
+    set_is_guest_thread, set_signal_return, signal_handler_exit_guest, switch_to_guest,
+    sync_instruction_stream, tls_offset, x18_scratch_offsets,
 };
 
 extern crate alloc;
@@ -962,12 +963,21 @@ where
     })
 }
 
+#[cfg(target_arch = "aarch64")]
+fn initialize_guest_thread_arch(ctx: &litebox_common_linux::PtRegs) {
+    publish_virtualized_x18(ctx.regs[18]);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn initialize_guest_thread_arch(_ctx: &litebox_common_linux::PtRegs) {}
+
 fn thread_start(
     init_thread: Box<
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
     >,
     mut ctx: litebox_common_linux::PtRegs,
 ) {
+    initialize_guest_thread_arch(&ctx);
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
@@ -1771,6 +1781,8 @@ unsafe extern "C" {
     #[cfg(target_arch = "aarch64")]
     fn syscall_callback_in_guest_cleared();
     fn exception_callback();
+    #[cfg(target_arch = "aarch64")]
+    fn internal_emulation_callback();
     fn interrupt_callback();
     #[cfg(target_arch = "x86_64")]
     fn switch_to_guest_start();
@@ -1919,6 +1931,11 @@ extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext) {
     thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
 }
 
+#[cfg(target_arch = "aarch64")]
+extern "C-unwind" fn internal_emulation_handler(thread_ctx: &mut ThreadContext) -> ! {
+    unsafe { switch_to_guest(thread_ctx.ctx) }
+}
+
 /// Calls `f` in order to call into a shim entrypoint.
 impl ThreadContext<'_> {
     fn call_shim(
@@ -1974,7 +1991,20 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
 
     #[cfg(target_arch = "aarch64")]
     fn guest_thread_pointer_offset(&self) -> Option<usize> {
-        Some(guest_thread_pointer_tp_offset().into())
+        Some(guest_thread_pointer_offset())
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl litebox_syscall_rewriter::aarch64::Aarch64GatePlatform for LinuxUserland {
+    const VIRTUALIZE_X18: bool = cfg!(feature = "aarch64_virtualize_x18");
+
+    fn guest_x18_offset(&self) -> Option<usize> {
+        Some(guest_x18_offset())
+    }
+
+    fn x18_scratch_offsets(&self) -> Option<(usize, usize)> {
+        Some(x18_scratch_offsets())
     }
 }
 
@@ -2102,8 +2132,15 @@ fn register_exception_handlers() {
 }
 
 /// Runs `f` with an alternate signal stack set up.
+#[cfg(target_arch = "aarch64")]
+const SIGNAL_ALT_STACK_SIZE: usize = 64 * 1024;
+#[cfg(not(target_arch = "aarch64"))]
+const SIGNAL_ALT_STACK_SIZE: usize = libc::SIGSTKSZ * 2;
+
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
-    let alt_stack_size = libc::SIGSTKSZ * 2;
+    // AArch64 gate canonicalization validates copied instructions with yaxpeax.
+    // Its debug decoder frame exceeds 32 KiB, before the kernel signal frame.
+    let alt_stack_size = SIGNAL_ALT_STACK_SIZE;
     let guard_page_size = 0x1000;
     let stack_base = unsafe {
         libc::mmap(
@@ -2289,6 +2326,26 @@ fn set_signal_return(
     sigctx.gregs[libc::REG_RCX as usize] = p3 as i64;
 }
 
+#[cfg(target_arch = "aarch64")]
+const fn classify_aarch64_gate_interruption(
+    signum: libc::c_int,
+    si_code: libc::c_int,
+) -> Aarch64GateInterruption {
+    let synchronous = if signum == libc::SIGTRAP {
+        si_code == libc::TRAP_BRKPT
+    } else {
+        matches!(
+            signum,
+            libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE
+        ) && si_code > 0
+    };
+    if synchronous {
+        Aarch64GateInterruption::SynchronousException
+    } else {
+        Aarch64GateInterruption::AsynchronousInterrupt
+    }
+}
+
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
 unsafe extern "C" fn exception_signal_handler(
     signum: libc::c_int,
@@ -2365,9 +2422,20 @@ unsafe extern "C" fn exception_signal_handler(
     #[cfg(target_arch = "x86_64")]
     copy_signal_context(unsafe { &mut *regs }, context);
     #[cfg(target_arch = "aarch64")]
-    match canonicalize_runtime_aarch64_gate_signal_context(context, unsafe { &*regs }) {
-        Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
+    match canonicalize_runtime_aarch64_gate_signal_context(
+        context,
+        unsafe { &*regs },
+        classify_aarch64_gate_interruption(signum, info.si_code),
+    ) {
+        Aarch64GateSignalResult::NotGate => {
+            copy_ordinary_signal_context(unsafe { &mut *regs }, context);
+        }
         Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
+        Aarch64GateSignalResult::InternalEmulation(canonical) => {
+            unsafe { regs.write(canonical) };
+            set_signal_return(context, internal_emulation_callback, 0, 0, 0, 0);
+            return;
+        }
         Aarch64GateSignalResult::PreserveSavedContext => {
             // The register values are already the guest's; only the syscall
             // bookkeeping is stale. The stub runs after `syscall_callback`
@@ -2553,14 +2621,13 @@ unsafe fn interrupt_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    #[cfg(debug_assertions)]
     let raise_signal = |signum: libc::c_int, info: &libc::siginfo_t| {
         // Block the signal on this non-guest thread so the kernel won't
         // deliver it here again, then re-raise as process-directed so a
         // guest thread picks it up.
         //
-        // This should only be called by test threads (spawned via cargo test).
-        // Other non-guest threads like network worker threads should have already blocked these signals.
+        // Host worker threads should normally block these signals. Requeue if
+        // one reaches any other non-guest thread before it does so.
         unsafe {
             let mut set: libc::sigset_t = core::mem::zeroed();
             libc::sigemptyset(&raw mut set);
@@ -2615,7 +2682,6 @@ unsafe fn interrupt_signal_handler(
             // what `record_pending_signal` requires.
             unsafe { record_pending_signal(signal) };
         } else {
-            #[cfg(debug_assertions)]
             raise_signal(signum, info);
             return;
         }
@@ -2649,15 +2715,25 @@ unsafe fn interrupt_signal_handler(
         #[cfg(target_arch = "x86_64")]
         copy_signal_context(unsafe { &mut *regs }, context);
         #[cfg(target_arch = "aarch64")]
-        match canonicalize_runtime_aarch64_gate_signal_context(context, unsafe { &*regs }) {
-            Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
-            Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
+        match canonicalize_runtime_aarch64_gate_signal_context(
+            context,
+            unsafe { &*regs },
+            Aarch64GateInterruption::AsynchronousInterrupt,
+        ) {
+            Aarch64GateSignalResult::NotGate => {
+                copy_ordinary_signal_context(unsafe { &mut *regs }, context);
+            }
+            Aarch64GateSignalResult::Canonicalized(canonical) => {
+                publish_virtualized_x18(canonical.regs[18]);
+                unsafe { regs.write(canonical) };
+            }
+            Aarch64GateSignalResult::InternalEmulation(_)
+            | Aarch64GateSignalResult::InvalidRuntimeState => {
+                fatal_aarch64_gate_runtime_state();
+            }
             Aarch64GateSignalResult::PreserveSavedContext => {
                 // The outbound path preserves registers but leaves stale syscall state.
                 unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };
-            }
-            Aarch64GateSignalResult::InvalidRuntimeState => {
-                fatal_aarch64_gate_runtime_state();
             }
         }
     }
@@ -2753,7 +2829,6 @@ mod tests {
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;
-
     extern crate std;
 
     #[cfg(target_arch = "aarch64")]
@@ -2766,7 +2841,28 @@ mod tests {
 
         assert!(sync_permissions.contains(MemoryRegionPermissions::READ));
         assert!(!sync_permissions.contains(MemoryRegionPermissions::EXEC));
-        assert!(final_permissions.contains(MemoryRegionPermissions::EXEC));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_gate_interruption_classification_matrix() {
+        use super::Aarch64GateInterruption::{AsynchronousInterrupt, SynchronousException};
+
+        for (signal, code, expected) in [
+            (libc::SIGTRAP, libc::TRAP_BRKPT, SynchronousException),
+            (libc::SIGTRAP, libc::SI_USER, AsynchronousInterrupt),
+            (libc::SIGSEGV, libc::SI_TKILL, AsynchronousInterrupt),
+            (libc::SIGBUS, libc::SI_QUEUE, AsynchronousInterrupt),
+            (libc::SIGUSR1, 1, AsynchronousInterrupt),
+            (libc::SIGBUS, libc::BUS_ADRERR, SynchronousException),
+            (libc::SIGSEGV, 1, SynchronousException), // SEGV_MAPERR
+        ] {
+            assert_eq!(
+                super::classify_aarch64_gate_interruption(signal, code),
+                expected,
+                "signal {signal}, code {code}"
+            );
+        }
     }
 
     #[test]

@@ -229,7 +229,19 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         // (UnpatchedBinary error), the runtime patching during mmap will patch
         // code segments as they are mapped.
         if parse_entry_point != 0 {
-            match parsed.parse_trampoline(&mut &file, parse_entry_point) {
+            #[cfg(target_arch = "aarch64")]
+            let parse_result = parsed.parse_trampoline_for_policy(
+                &mut &file,
+                parse_entry_point,
+                Some(if Platform::VIRTUALIZE_X18 {
+                    litebox_common_linux::loader::Aarch64RewritePolicy::X18
+                } else {
+                    litebox_common_linux::loader::Aarch64RewritePolicy::Default
+                }),
+            );
+            #[cfg(target_arch = "x86_64")]
+            let parse_result = parsed.parse_trampoline(&mut &file, parse_entry_point);
+            match parse_result {
                 Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {
                     // Ok: pre-patched trampoline found, or unpatched binary
                     // that the runtime mmap hook will handle.
@@ -264,8 +276,9 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
                 .global
                 .elf_patch_cache
                 .lock()
+                .by_fd
                 .get(&self.file.fd)
-                .is_some_and(crate::syscalls::mm::ElfPatchState::trampoline_is_populated)
+                .is_some_and(|state| state.lock().trampoline_is_populated())
         {
             litebox_util_log::error!(fd:? = self.file.fd; "AArch64 trampoline was not populated while loading the ELF");
             return Err(ElfLoaderError::LoadError(
@@ -415,6 +428,9 @@ mod tests {
     const EXEC_LOAD_ADDR: u64 = 0x400000;
     const INTERP_PATH_OFFSET: usize = 0x200;
     const INTERP_PATH: &[u8] = b"/ld.so\0";
+    const SECTION_HEADER_SIZE: usize = 64;
+    const SECTION_HEADER_SIZE_U16: u16 = 64;
+    const SECTION_NAMES: &[u8] = b"\0.text\0.shstrtab\0";
 
     #[derive(Clone, Copy)]
     struct ProgramHeader {
@@ -514,6 +530,28 @@ mod tests {
         if let Some(interp) = interp {
             buf[INTERP_PATH_OFFSET..INTERP_PATH_OFFSET + interp.len()].copy_from_slice(interp);
         }
+        let section_table = PAGE_SIZE - 3 * SECTION_HEADER_SIZE;
+        let section_names = section_table - SECTION_NAMES.len();
+        buf[section_names..section_table].copy_from_slice(SECTION_NAMES);
+        buf[40..48].copy_from_slice(&(section_table as u64).to_le_bytes());
+        buf[58..60].copy_from_slice(&SECTION_HEADER_SIZE_U16.to_le_bytes());
+        buf[60..62].copy_from_slice(&3u16.to_le_bytes());
+        buf[62..64].copy_from_slice(&2u16.to_le_bytes());
+        let text = section_table + SECTION_HEADER_SIZE;
+        buf[text..text + 4].copy_from_slice(&1u32.to_le_bytes()); // .text
+        buf[text + 4..text + 8].copy_from_slice(&1u32.to_le_bytes()); // SHT_PROGBITS
+        buf[text + 8..text + 16].copy_from_slice(&6u64.to_le_bytes()); // SHF_ALLOC | SHF_EXECINSTR
+        buf[text + 16..text + 24].copy_from_slice(&entry.to_le_bytes());
+        buf[text + 24..text + 32].copy_from_slice(&0x300u64.to_le_bytes());
+        buf[text + 32..text + 40].copy_from_slice(&4u64.to_le_bytes());
+        buf[text + 48..text + 56].copy_from_slice(&4u64.to_le_bytes());
+        buf[0x300..0x304].copy_from_slice(&0xd503_201fu32.to_le_bytes()); // NOP
+        let names = text + SECTION_HEADER_SIZE;
+        buf[names..names + 4].copy_from_slice(&7u32.to_le_bytes()); // .shstrtab
+        buf[names + 4..names + 8].copy_from_slice(&3u32.to_le_bytes()); // SHT_STRTAB
+        buf[names + 24..names + 32].copy_from_slice(&(section_names as u64).to_le_bytes());
+        buf[names + 32..names + 40].copy_from_slice(&(SECTION_NAMES.len() as u64).to_le_bytes());
+        buf[names + 48..names + 56].copy_from_slice(&1u64.to_le_bytes());
         buf
     }
 

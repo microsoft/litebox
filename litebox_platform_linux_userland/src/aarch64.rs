@@ -7,7 +7,7 @@
 use super::*;
 use litebox_syscall_rewriter::aarch64::{
     GATE_ALIGNMENT, GateMetadata, MRS_SLOT_BYTES, MSR_FRAME_BYTES, MSR_SLOT_BYTES, SVC_FRAME_BYTES,
-    SVC_GATE_BYTES, SVC_SLOT_BYTES,
+    SVC_GATE_BYTES, SVC_SLOT_BYTES, X18_CONDITIONAL_SLOT_BYTES, X18_SETUP_BYTES, X18_SLOT_BYTES,
 };
 
 /// Overwrites the destination with the TLS control-block address derived from
@@ -69,8 +69,12 @@ struct TlsBlock {
     ///
     /// Also part of the `litebox_syscall_rewriter` ABI, but dynamically: the
     /// loader patches each rewritten binary's gates with this slot's measured
-    /// address (see [`guest_thread_pointer_tp_offset`]).
+    /// address.
     guest_thread_pointer: usize,
+    guest_x18: usize,
+    saved_anchor_scratch: usize,
+    saved_value_scratch: usize,
+    host_x18: usize,
     host_sp: usize,
     guest_context_top: usize,
     in_guest: u8,
@@ -90,6 +94,10 @@ pub(super) mod tls_offset {
     use core::mem::offset_of;
 
     pub(crate) const GUEST_THREAD_POINTER: usize = offset_of!(TlsBlock, guest_thread_pointer);
+    pub(crate) const GUEST_X18: usize = offset_of!(TlsBlock, guest_x18);
+    pub(crate) const SAVED_ANCHOR_SCRATCH: usize = offset_of!(TlsBlock, saved_anchor_scratch);
+    pub(crate) const SAVED_VALUE_SCRATCH: usize = offset_of!(TlsBlock, saved_value_scratch);
+    pub(crate) const HOST_X18: usize = offset_of!(TlsBlock, host_x18);
     pub(crate) const HOST_SP: usize = offset_of!(TlsBlock, host_sp);
     pub(crate) const GUEST_CONTEXT_TOP: usize = offset_of!(TlsBlock, guest_context_top);
     pub(crate) const IN_GUEST: usize = offset_of!(TlsBlock, in_guest);
@@ -116,8 +124,8 @@ core::arch::global_asm!(
     size = const core::mem::size_of::<TlsBlock>(),
 );
 
-/// Byte offset of this thread's `guest_thread_pointer` slot from the thread
-/// pointer (TP) — `TPIDR_EL0` — as fixed by this binary's link.
+/// Byte offset of the guest thread-pointer slot from `TPIDR_EL0`, as fixed by
+/// this binary's link.
 ///
 /// The loader patches this into every rewritten guest binary's thread-pointer
 /// gates. The linker decides it per embedder, but it is the same on every
@@ -126,14 +134,21 @@ core::arch::global_asm!(
 /// # Panics
 ///
 /// Panics if the offset is not one a gate can be patched to reach.
-pub(super) fn guest_thread_pointer_tp_offset() -> u16 {
-    let offset = tprel_offset!(litebox_tls_block) + tls_offset::GUEST_THREAD_POINTER;
-    u16::try_from(offset)
-        .ok()
-        .filter(|off| litebox_syscall_rewriter::aarch64::is_patchable_guest_tpidr_offset(*off))
-        .expect(
-            "guest_thread_pointer must sit at a thread-pointer offset a rewriter gate can reach",
-        )
+pub(super) fn guest_thread_pointer_offset() -> usize {
+    let base = tprel_offset!(litebox_tls_block);
+    base + tls_offset::GUEST_THREAD_POINTER
+}
+
+pub(super) fn guest_x18_offset() -> usize {
+    tprel_offset!(litebox_tls_block) + tls_offset::GUEST_X18
+}
+
+pub(super) fn x18_scratch_offsets() -> (usize, usize) {
+    let base = tprel_offset!(litebox_tls_block);
+    (
+        base + tls_offset::SAVED_ANCHOR_SCRATCH,
+        base + tls_offset::SAVED_VALUE_SCRATCH,
+    )
 }
 
 /// Verifies the resume-frame alignment and rewriter-gate reach invariants.
@@ -149,7 +164,27 @@ pub(super) fn assert_tls_block_placement() {
          reject, failing every asynchronous guest resume",
     );
 
-    let _ = guest_thread_pointer_tp_offset();
+    let (saved_anchor_scratch, saved_value_scratch) = x18_scratch_offsets();
+    let values = [
+        guest_thread_pointer_offset(),
+        guest_x18_offset(),
+        saved_anchor_scratch,
+        saved_value_scratch,
+    ];
+    assert!(values.iter().all(|offset| offset.is_multiple_of(8)));
+    assert!(
+        values
+            .iter()
+            .enumerate()
+            .all(|(index, offset)| !values[..index].contains(offset))
+    );
+    litebox_syscall_rewriter::aarch64::Aarch64GateOffsets::new(
+        u16::try_from(values[0]).expect("guest_tpidr offset is too large for a gate"),
+        u16::try_from(values[1]).expect("guest_x18 offset is too large for a gate"),
+        u16::try_from(values[2]).expect("saved_anchor_scratch offset is too large for a gate"),
+        u16::try_from(values[3]).expect("saved_value_scratch offset is too large for a gate"),
+    )
+    .expect("AArch64 TLS runtime slots must be distinct, aligned, and encodable");
 }
 
 pub(super) fn set_guest_thread_pointer(value: usize) {
@@ -177,6 +212,52 @@ pub(super) fn set_is_guest_thread(value: bool) {
             off = const tls_offset::IS_GUEST_THREAD,
             options(nostack, preserves_flags)
         }
+    }
+}
+
+#[cfg(feature = "aarch64_virtualize_x18")]
+fn virtualized_x18() -> usize {
+    let value: usize;
+    // SAFETY: an own-thread [`tls_offset`] slot access.
+    unsafe {
+        core::arch::asm! {
+            load_tls_block_base!("{block}"),
+            "ldr {value}, [{block}, #{value_off}]",
+            block = out(reg) _,
+            value = out(reg) value,
+            value_off = const tls_offset::GUEST_X18,
+            options(nostack, readonly, preserves_flags)
+        }
+    }
+    value
+}
+
+#[cfg(feature = "aarch64_virtualize_x18")]
+pub(super) fn publish_virtualized_x18(value: usize) {
+    // SAFETY: an own-thread [`tls_offset`] slot access.
+    unsafe {
+        core::arch::asm! {
+            load_tls_block_base!("{block}"),
+            "str {value}, [{block}, #{value_off}]",
+            block = out(reg) _,
+            value = in(reg) value,
+            value_off = const tls_offset::GUEST_X18,
+            options(nostack, preserves_flags)
+        }
+    }
+}
+
+#[cfg(not(feature = "aarch64_virtualize_x18"))]
+pub(super) fn publish_virtualized_x18(_value: usize) {}
+
+pub(super) fn copy_ordinary_signal_context(
+    regs: &mut litebox_common_linux::PtRegs,
+    context: &libc::ucontext_t,
+) {
+    copy_signal_context(regs, context);
+    #[cfg(feature = "aarch64_virtualize_x18")]
+    {
+        regs.regs[18] = virtualized_x18();
     }
 }
 
@@ -278,6 +359,7 @@ pub(super) unsafe extern "C-unwind" fn run_thread_arch(
     str x9, [x8, #{HOST_SP}]
     add x9, x1, #{GUEST_CONTEXT_SIZE}
     str x9, [x8, #{GUEST_CONTEXT_TOP}]
+    str x18, [x8, #{HOST_X18}]
 
     // AAPCS64 leaves the upper bits of a `u8` parameter undefined.
     tst  w2, #0xff
@@ -332,7 +414,17 @@ syscall_callback_in_guest_cleared:
     ldp  x0,  x1,  [sp]
     str  x0,  [x16, #128]         // regs[16] = guest x16
     str  x17, [x16, #136]
+    // Preserve the historical physical guest x18 ABI unless this build
+    // virtualizes x18. Virtualized builds expose the logical TLS slot.
+    .if {VIRTUALIZE_X18}
+    ",
+    load_tls_block_base!("x0"),
+    "
+    ldr  x0,  [x0, #{GUEST_X18}]
+    str  x0,  [x16, #144]
+    .else
     str  x18, [x16, #144]
+    .endif
     stp  x19, x20, [x16, #152]
     stp  x21, x22, [x16, #168]
     stp  x23, x24, [x16, #184]
@@ -402,6 +494,18 @@ exception_callback:
     bl {exception_handler}
     b .Ldone_aarch64
 
+    .globl internal_emulation_callback
+internal_emulation_callback:
+    ",
+    load_tls_block_base!("x9"),
+    "
+    ldr x9, [x9, #{HOST_SP}]
+    mov sp, x9
+    add x29, sp, #16
+    ldr x0, [sp]
+    bl {internal_emulation_handler}
+    brk #0
+
     // Entered either from `interrupt_signal_handler` via `set_signal_return`
     // (all four arguments are placeholders) or by a direct branch from
     // `switch_to_guest` when the `interrupt` byte was already set.
@@ -440,9 +544,12 @@ interrupt_callback:
     GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
     HOST_SP = const tls_offset::HOST_SP,
     GUEST_CONTEXT_TOP = const tls_offset::GUEST_CONTEXT_TOP,
+    HOST_X18 = const tls_offset::HOST_X18,
     IN_GUEST = const tls_offset::IN_GUEST,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
+    GUEST_X18 = const tls_offset::GUEST_X18,
+    VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
     SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
     SVC_FRAME_OFF_STUB = const litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_STUB,
     ENOSYS = const libc::ENOSYS,
@@ -450,6 +557,7 @@ interrupt_callback:
     reenter_handler = sym reenter_handler,
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
+    internal_emulation_handler = sym internal_emulation_handler,
     interrupt_handler = sym interrupt_handler,
     );
 }
@@ -641,6 +749,14 @@ pub(super) mod resume_frame {
         for (dst, src) in mcontext.regs.iter_mut().zip(ctx.regs.iter()) {
             *dst = *src as u64;
         }
+        #[cfg(feature = "aarch64_virtualize_x18")]
+        {
+            let block: usize;
+            unsafe {
+                core::arch::asm!(load_tls_block_base!("{block}"), block = out(reg) block, options(nostack, preserves_flags));
+            }
+            mcontext.regs[18] = unsafe { *((block + super::tls_offset::HOST_X18) as *const u64) };
+        }
         mcontext.sp = ctx.sp as u64;
         mcontext.pc = ctx.pc as u64;
         // `rt_sigreturn` hands the whole word to the kernel, and
@@ -781,6 +897,41 @@ pub(super) mod resume_frame {
             assert_eq!(pstate, litebox_common_linux::arch::SAFE_USER_PSTATE);
             assert_eq!(pstate & (1 << 4), 0, "PSR_MODE32_BIT must never be set");
         }
+
+        #[cfg(feature = "aarch64_virtualize_x18")]
+        #[test]
+        fn virtualized_resume_frame_preserves_host_x18_not_logical_x18() {
+            const LOGICAL_X18: usize = 0x1818_0000_0000_0033;
+            const HOST_X18: usize = 0x1818_0000_0000_0055;
+            let mut ctx = PtRegs::default();
+            ctx.regs[18] = LOGICAL_X18;
+            super::super::publish_virtualized_x18(LOGICAL_X18);
+            let block: usize;
+            unsafe {
+                core::arch::asm!(load_tls_block_base!("{block}"), block = out(reg) block, options(nostack, preserves_flags));
+                *((block + super::super::tls_offset::HOST_X18) as *mut usize) = HOST_X18;
+            }
+
+            let frame = super::prepare(&ctx);
+            let physical_x18 = unsafe { (*frame).ucontext.mcontext.regs[18] };
+
+            assert_eq!(physical_x18, HOST_X18 as u64);
+            assert_ne!(physical_x18, LOGICAL_X18 as u64);
+        }
+
+        #[cfg(not(feature = "aarch64_virtualize_x18"))]
+        #[test]
+        fn nonvirtualized_resume_frame_restores_ptregs_x18_physically() {
+            const GUEST_X18: usize = 0x1818_0000_0000_0044;
+            let mut ctx = PtRegs::default();
+            ctx.regs[18] = GUEST_X18;
+            let frame = super::prepare(&ctx);
+
+            assert_eq!(
+                unsafe { (*frame).ucontext.mcontext.regs[18] },
+                GUEST_X18 as u64
+            );
+        }
     }
 }
 
@@ -800,6 +951,7 @@ pub(super) mod resume_frame {
 /// The choice happens here, before `in_guest` is set, so the frame stores cannot
 /// be attributed to the guest.
 pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+    publish_virtualized_x18(ctx.regs[18]);
     if outbound_stub_is_current(ctx) {
         // SAFETY: the caller's contract, plus the stub's own: a stub is
         // recorded and `ctx.pc` is the PC it branches to, checked above.
@@ -951,8 +1103,12 @@ switch_to_guest_stage_x16_fixup:
     ldp  x10, x11, [x0, #80]
     ldp  x12, x13, [x0, #96]
     ldp  x14, x15, [x0, #112]
-    ldr  x17, [x0, #136]
+    .if {VIRTUALIZE_X18}
+    ldr  x18, [x17, #{HOST_X18}]
+    .else
     ldr  x18, [x0, #144]
+    .endif
+    ldr  x17, [x0, #136]
     ldp  x19, x20, [x0, #152]
     ldp  x21, x22, [x0, #168]
     ldp  x23, x24, [x0, #184]
@@ -968,6 +1124,8 @@ switch_to_guest_via_outbound_stub_end:
     IN_GUEST = const tls_offset::IN_GUEST,
     INTERRUPT = const tls_offset::INTERRUPT,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
+    VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
+    HOST_X18 = const tls_offset::HOST_X18,
     SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
     SVC_FRAME_OFF_X16 = const litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_X16,
     );
@@ -1086,13 +1244,406 @@ pub(super) fn sync_instruction_stream(range: core::ops::Range<usize>) {
 pub(super) enum Aarch64GateSignalResult {
     NotGate,
     Canonicalized(litebox_common_linux::PtRegs),
+    InternalEmulation(litebox_common_linux::PtRegs),
     PreserveSavedContext,
     InvalidRuntimeState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Aarch64GateInterruption {
+    SynchronousException,
+    AsynchronousInterrupt,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Aarch64GateRuntimeSlots {
+    guest_tpidr: usize,
+    guest_x18: usize,
+    saved_anchor: usize,
+    saved_value: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ClassifiedX18SignalPc {
+    pub site: litebox_syscall_rewriter::aarch64::ClassifiedGate,
+    pub site_start: usize,
+    pub instruction_offset: u8,
+    pub setup_instruction_offset: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateDiscovery<T> {
+    None,
+    Unique(T),
+    Ambiguous,
+}
+
+impl<T> CandidateDiscovery<T> {
+    fn add(&mut self, candidate: T) {
+        *self = match core::mem::replace(self, Self::None) {
+            Self::None => Self::Unique(candidate),
+            Self::Unique(_) | Self::Ambiguous => Self::Ambiguous,
+        };
+    }
+}
+
+fn classify_x18_signal_pc(
+    context: &libc::ucontext_t,
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> CandidateDiscovery<ClassifiedX18SignalPc> {
+    let Ok(pc) = usize::try_from(context.uc_mcontext.pc) else {
+        return CandidateDiscovery::None;
+    };
+    if !pc.is_multiple_of(4) {
+        return CandidateDiscovery::None;
+    }
+    let aligned = pc & !(GATE_ALIGNMENT - 1);
+    let mut found = CandidateDiscovery::None;
+    for index in 0..(X18_CONDITIONAL_SLOT_BYTES / GATE_ALIGNMENT) {
+        let Some(start) = aligned.checked_sub(index * GATE_ALIGNMENT) else {
+            continue;
+        };
+        let mut storage = [0u8; X18_CONDITIONAL_SLOT_BYTES];
+        for slot_size in [X18_SLOT_BYTES, X18_CONDITIONAL_SLOT_BYTES] {
+            let slot = &mut storage[..slot_size];
+            if read(start, slot)
+                && let Some(site) = litebox_syscall_rewriter::aarch64::classify_copied_gate_slot(
+                    slot,
+                    start as u64,
+                    pc as u64,
+                )
+                && site.x18().is_some()
+            {
+                let Ok(instruction_offset) = u8::try_from(pc - start) else {
+                    continue;
+                };
+                found.add(ClassifiedX18SignalPc {
+                    site,
+                    site_start: start,
+                    instruction_offset,
+                    setup_instruction_offset: None,
+                });
+            }
+        }
+    }
+
+    for index in 0..(X18_SETUP_BYTES / GATE_ALIGNMENT) {
+        let Some(setup_start) = aligned.checked_sub(index * GATE_ALIGNMENT) else {
+            continue;
+        };
+        let mut setup = [0u8; X18_SETUP_BYTES];
+        let Some(classified_setup) = read(setup_start, &mut setup)
+            .then(|| {
+                litebox_syscall_rewriter::aarch64::classify_copied_x18_setup_record(
+                    &setup,
+                    setup_start as u64,
+                    pc as u64,
+                )
+            })
+            .flatten()
+        else {
+            continue;
+        };
+        let Some(site_start) = usize::try_from(context.uc_mcontext.regs[30])
+            .ok()
+            .and_then(|link| link.checked_sub(16))
+            .filter(|start| start.is_multiple_of(GATE_ALIGNMENT))
+        else {
+            continue;
+        };
+        let mut storage = [0u8; X18_CONDITIONAL_SLOT_BYTES];
+        let site = [X18_SLOT_BYTES, X18_CONDITIONAL_SLOT_BYTES]
+            .into_iter()
+            .find_map(|slot_size| {
+                let slot = &mut storage[..slot_size];
+                read(site_start, slot)
+                    .then(|| {
+                        litebox_syscall_rewriter::aarch64::classify_copied_gate_slot(
+                            slot,
+                            site_start as u64,
+                            (site_start + 12) as u64,
+                        )
+                    })
+                    .flatten()
+            });
+        let Some(site) = site else { continue };
+        let Some(details) = site.x18() else { continue };
+        if details.setup_handler() != setup_start as u64
+            || site.metadata().anchor_scratch() != classified_setup.metadata().anchor_scratch()
+            || site.metadata().value_scratch() != classified_setup.metadata().value_scratch()
+            || details.guest_x18_offset() != classified_setup.guest_x18_offset()
+            || details.saved_anchor_scratch_offset()
+                != classified_setup.saved_anchor_scratch_offset()
+            || details.saved_value_scratch_offset() != classified_setup.saved_value_scratch_offset()
+        {
+            continue;
+        }
+        found.add(ClassifiedX18SignalPc {
+            site,
+            site_start,
+            instruction_offset: 12,
+            setup_instruction_offset: Some(classified_setup.instruction_offset()),
+        });
+    }
+    found
 }
 
 fn read_usize(read: &mut impl FnMut(usize, &mut [u8]) -> bool, address: usize) -> Option<usize> {
     let mut bytes = [0u8; size_of::<usize>()];
     read(address, &mut bytes).then(|| usize::from_ne_bytes(bytes))
+}
+
+fn canonicalize_x18_gate(
+    context: &libc::ucontext_t,
+    saved: &litebox_common_linux::PtRegs,
+    classified: ClassifiedX18SignalPc,
+    interruption: Aarch64GateInterruption,
+    slots: Aarch64GateRuntimeSlots,
+    read: &mut impl FnMut(usize, &mut [u8]) -> bool,
+) -> Aarch64GateSignalResult {
+    const FRAME_BYTES: usize = 32;
+    let Some(details) = classified.site.x18() else {
+        return Aarch64GateSignalResult::NotGate;
+    };
+    let (GateMetadata::X18 {
+        anchor_scratch,
+        value_scratch,
+    }
+    | GateMetadata::X18Conditional {
+        anchor_scratch,
+        value_scratch,
+    }) = classified.site.metadata()
+    else {
+        return Aarch64GateSignalResult::NotGate;
+    };
+    let conditional = matches!(
+        classified.site.metadata(),
+        GateMetadata::X18Conditional { .. }
+    );
+    let (anchor, value) = (usize::from(anchor_scratch), usize::from(value_scratch));
+    let slot_matches = |address: usize, offset: u16| {
+        slots
+            .guest_x18
+            .checked_sub(usize::from(details.guest_x18_offset()))
+            .and_then(|anchor| anchor.checked_add(usize::from(offset)))
+            == Some(address)
+    };
+    if slots.guest_x18 == 0
+        || !slot_matches(slots.saved_anchor, details.saved_anchor_scratch_offset())
+        || !slot_matches(slots.saved_value, details.saved_value_scratch_offset())
+    {
+        return Aarch64GateSignalResult::InvalidRuntimeState;
+    }
+
+    let mut canonical = saved.clone();
+    copy_signal_context(&mut canonical, context);
+    let Ok(site) = usize::try_from(classified.site.original_site()) else {
+        return Aarch64GateSignalResult::NotGate;
+    };
+    let setup_offset = classified.setup_instruction_offset.map(usize::from);
+    let site_offset = usize::from(classified.instruction_offset);
+    if interruption == Aarch64GateInterruption::SynchronousException
+        && setup_offset.map_or(
+            matches!(site_offset, 32 | 36 | 40 | 48 | 52 | 56),
+            |offset| matches!(offset, 8 | 16 | 20),
+        )
+    {
+        return Aarch64GateSignalResult::InvalidRuntimeState;
+    }
+    let frame_sp = if setup_offset.is_some() || (4..24).contains(&site_offset) {
+        canonical.sp
+    } else if site_offset > 24 {
+        let Some(frame_sp) = canonical.sp.checked_sub(FRAME_BYTES) else {
+            return Aarch64GateSignalResult::NotGate;
+        };
+        frame_sp
+    } else {
+        0
+    };
+    let read_frame = |read: &mut _, index: usize| {
+        frame_sp
+            .checked_add(index * size_of::<usize>())
+            .and_then(|address| read_usize(read, address))
+    };
+    let read_slot = |read: &mut _, address| read_usize(read, address);
+
+    if let Some(offset) = setup_offset {
+        let Some(frame_anchor) = read_frame(read, 0) else {
+            return Aarch64GateSignalResult::NotGate;
+        };
+        let Some(frame_value) = read_frame(read, 1) else {
+            return Aarch64GateSignalResult::NotGate;
+        };
+        let Some(frame_x30) = read_frame(read, 2) else {
+            return Aarch64GateSignalResult::NotGate;
+        };
+        let restored_anchor = if offset >= 12 {
+            let Some(slot) = read_slot(read, slots.saved_anchor) else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            if slot != frame_anchor {
+                return Aarch64GateSignalResult::NotGate;
+            }
+            slot
+        } else {
+            frame_anchor
+        };
+        let restored_value = if offset >= 20 {
+            let Some(slot) = read_slot(read, slots.saved_value) else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            if slot != frame_value {
+                return Aarch64GateSignalResult::NotGate;
+            }
+            slot
+        } else {
+            frame_value
+        };
+        canonical.regs[anchor] = restored_anchor;
+        canonical.regs[value] = restored_value;
+        canonical.regs[30] = frame_x30;
+        let Some(sp) = canonical.sp.checked_add(FRAME_BYTES) else {
+            return Aarch64GateSignalResult::NotGate;
+        };
+        canonical.sp = sp;
+        canonical.pc = site;
+    } else if site_offset < 16 {
+        if site_offset >= 8 {
+            let Some(frame_anchor) = read_frame(read, 0) else {
+                return Aarch64GateSignalResult::NotGate;
+            };
+            let Some(frame_value) = read_frame(read, 1) else {
+                return Aarch64GateSignalResult::NotGate;
+            };
+            canonical.regs[anchor] = frame_anchor;
+            canonical.regs[value] = frame_value;
+        }
+        if site_offset >= 4 {
+            let Some(sp) = canonical.sp.checked_add(FRAME_BYTES) else {
+                return Aarch64GateSignalResult::NotGate;
+            };
+            canonical.sp = sp;
+        }
+        canonical.pc = site;
+    } else if conditional && site_offset >= 24 {
+        if site_offset == 24 {
+            let (Some(restored_anchor), Some(restored_value)) = (
+                read_slot(read, slots.saved_anchor),
+                read_slot(read, slots.saved_value),
+            ) else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            canonical.regs[anchor] = restored_anchor;
+            canonical.regs[value] = restored_value;
+            canonical.pc = site;
+        } else {
+            let path_start = if site_offset >= 44 { 44 } else { 28 };
+            canonical.regs[anchor] = if site_offset >= path_start + 12 {
+                canonical.regs[anchor]
+            } else {
+                let Some(restored) = read_slot(read, slots.saved_anchor) else {
+                    return Aarch64GateSignalResult::InvalidRuntimeState;
+                };
+                restored
+            };
+            canonical.regs[value] = if site_offset >= path_start + 8 {
+                canonical.regs[value]
+            } else {
+                let Some(restored) = read_slot(read, slots.saved_value) else {
+                    return Aarch64GateSignalResult::InvalidRuntimeState;
+                };
+                restored
+            };
+            canonical.pc = if path_start == 44 {
+                let Some(taken) = details
+                    .taken()
+                    .and_then(|target| usize::try_from(target).ok())
+                else {
+                    return Aarch64GateSignalResult::NotGate;
+                };
+                taken
+            } else {
+                let Ok(fallthrough) = usize::try_from(details.fallthrough()) else {
+                    return Aarch64GateSignalResult::NotGate;
+                };
+                fallthrough
+            };
+        }
+    } else {
+        let pre_instruction_frame = if site_offset < 24 {
+            let (Some(frame_anchor), Some(frame_value), Some(frame_x30)) = (
+                read_frame(read, 0),
+                read_frame(read, 1),
+                read_frame(read, 2),
+            ) else {
+                return Aarch64GateSignalResult::NotGate;
+            };
+            Some((frame_anchor, frame_value, frame_x30))
+        } else {
+            None
+        };
+        let restored_anchor = if site_offset >= 44 {
+            canonical.regs[anchor]
+        } else {
+            let Some(slot) = read_slot(read, slots.saved_anchor) else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            slot
+        };
+        let restored_value = if site_offset >= 40 {
+            canonical.regs[value]
+        } else {
+            let Some(slot) = read_slot(read, slots.saved_value) else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            slot
+        };
+        canonical.regs[anchor] = restored_anchor;
+        canonical.regs[value] = restored_value;
+        if let Some((frame_anchor, frame_value, frame_x30)) = pre_instruction_frame {
+            if restored_anchor != frame_anchor || restored_value != frame_value {
+                return Aarch64GateSignalResult::NotGate;
+            }
+            if site_offset == 16 {
+                canonical.regs[30] = frame_x30;
+            } else if canonical.regs[30] != frame_x30 {
+                return Aarch64GateSignalResult::NotGate;
+            }
+        }
+        if site_offset < 24 {
+            let Some(sp) = canonical.sp.checked_add(FRAME_BYTES) else {
+                return Aarch64GateSignalResult::NotGate;
+            };
+            canonical.sp = sp;
+        }
+        let materialization_complete = if details.original_is_adr() {
+            site_offset > 28
+        } else {
+            site_offset > 24
+        };
+        canonical.pc = if materialization_complete {
+            site + 4
+        } else {
+            site
+        };
+    }
+    canonical.regs[18] = if !conditional
+        && setup_offset.is_none()
+        && ((details.original_is_adr() && site_offset == 32)
+            || (!details.original_is_adr() && matches!(site_offset, 28 | 32)))
+    {
+        let Ok(result) = usize::try_from(context.uc_mcontext.regs[value]) else {
+            return Aarch64GateSignalResult::InvalidRuntimeState;
+        };
+        result
+    } else {
+        let Some(guest_x18) = read_slot(read, slots.guest_x18) else {
+            return Aarch64GateSignalResult::InvalidRuntimeState;
+        };
+        guest_x18
+    };
+    canonical.orig_x0 = canonical.regs[0];
+    Aarch64GateSignalResult::Canonicalized(canonical)
 }
 
 /// Recognizes and canonicalizes an interrupted compact gate using only bounded,
@@ -1103,10 +1654,11 @@ fn read_usize(read: &mut impl FnMut(usize, &mut [u8]) -> bool, address: usize) -
 /// template, and the inbound branch at its original site all agree. That is
 /// what makes a range registry unnecessary. A guest that forges all three
 /// changes only its own libOS semantics under LiteBox's threat model.
-pub(super) fn canonicalize_aarch64_gate_signal_context(
+fn canonicalize_aarch64_gate_signal_context_with_interruption(
     context: &libc::ucontext_t,
     saved: &litebox_common_linux::PtRegs,
-    guest_thread_pointer_addr: usize,
+    interruption: Aarch64GateInterruption,
+    runtime_slots: Aarch64GateRuntimeSlots,
     expected_outbound_stub: usize,
     expected_outbound_pc: usize,
     mut read: impl FnMut(usize, &mut [u8]) -> bool,
@@ -1118,7 +1670,6 @@ pub(super) fn canonicalize_aarch64_gate_signal_context(
     // The widest slot spans this many `GATE_ALIGNMENT` steps, so the aligned PC
     // is at most one step short of this many steps past the slot start.
     const MAX_CANDIDATES: usize = SVC_SLOT_BYTES / GATE_ALIGNMENT;
-
     let pc = context.uc_mcontext.pc;
     let Ok(pc_usize) = usize::try_from(pc) else {
         return Aarch64GateSignalResult::NotGate;
@@ -1127,8 +1678,10 @@ pub(super) fn canonicalize_aarch64_gate_signal_context(
         return Aarch64GateSignalResult::NotGate;
     }
 
+    let x18 = classify_x18_signal_pc(context, &mut read);
+
     let aligned = pc_usize & !(GATE_ALIGNMENT - 1);
-    let mut found = None;
+    let mut found = CandidateDiscovery::None;
     for candidate_index in 0..MAX_CANDIDATES {
         let Some(slot_start) = aligned.checked_sub(candidate_index * GATE_ALIGNMENT) else {
             continue;
@@ -1172,14 +1725,47 @@ pub(super) fn canonicalize_aarch64_gate_signal_context(
             ) else {
                 continue;
             };
-            if found.is_some() {
-                return Aarch64GateSignalResult::InvalidRuntimeState;
+            if matches!(
+                classified.metadata(),
+                GateMetadata::X18 { .. } | GateMetadata::X18Conditional { .. }
+            ) {
+                continue;
             }
-            found = Some((slot_start, classified));
+            found.add((slot_start, classified));
         }
     }
-    let Some((slot_start, gate)) = found else {
-        return Aarch64GateSignalResult::NotGate;
+
+    let (slot_start, gate) = match (x18, found) {
+        (CandidateDiscovery::Unique(x18), CandidateDiscovery::None) => {
+            let site = x18.site.original_site();
+            let Ok(site_usize) = usize::try_from(site) else {
+                return Aarch64GateSignalResult::NotGate;
+            };
+            let mut original = [0u8; 4];
+            if !read(site_usize, &mut original)
+                || litebox_syscall_rewriter::aarch64::decode_branch_target(
+                    u32::from_le_bytes(original),
+                    site,
+                ) != Some(x18.site_start as u64)
+            {
+                return Aarch64GateSignalResult::NotGate;
+            }
+            return canonicalize_x18_gate(
+                context,
+                saved,
+                x18,
+                interruption,
+                runtime_slots,
+                &mut read,
+            );
+        }
+        (CandidateDiscovery::None, CandidateDiscovery::Unique(legacy)) => legacy,
+        (CandidateDiscovery::None, CandidateDiscovery::None)
+        | (CandidateDiscovery::Ambiguous, _)
+        | (_, CandidateDiscovery::Ambiguous)
+        | (CandidateDiscovery::Unique(_), CandidateDiscovery::Unique(_)) => {
+            return Aarch64GateSignalResult::NotGate;
+        }
     };
 
     // Guest-derived provenance failures are `NotGate`; only unreadable
@@ -1226,7 +1812,7 @@ pub(super) fn canonicalize_aarch64_gate_signal_context(
         GateMetadata::MrsTpidr { destination, .. } => {
             let destination = usize::from(destination);
             if offset == 4 {
-                let Some(guest_tp) = read_usize(&mut read, guest_thread_pointer_addr) else {
+                let Some(guest_tp) = read_usize(&mut read, runtime_slots.guest_tpidr) else {
                     return Aarch64GateSignalResult::InvalidRuntimeState;
                 };
                 canonical.regs[destination] = guest_tp;
@@ -1296,14 +1882,49 @@ pub(super) fn canonicalize_aarch64_gate_signal_context(
                 canonical.sp = sp;
             }
         }
+        GateMetadata::X18Br => {
+            let Some(guest_x18) = read_usize(&mut read, runtime_slots.guest_x18) else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            canonical.regs[18] = guest_x18;
+            if interruption == Aarch64GateInterruption::SynchronousException {
+                canonical.pc = guest_x18;
+                canonical.orig_x0 = canonical.regs[0];
+                return Aarch64GateSignalResult::InternalEmulation(canonical);
+            }
+        }
+        GateMetadata::X18 { .. } | GateMetadata::X18Conditional { .. } => {
+            return Aarch64GateSignalResult::PreserveSavedContext;
+        }
     }
     canonical.orig_x0 = canonical.regs[0];
     Aarch64GateSignalResult::Canonicalized(canonical)
 }
 
+#[cfg(test)]
+pub(super) fn canonicalize_aarch64_gate_signal_context(
+    context: &libc::ucontext_t,
+    saved: &litebox_common_linux::PtRegs,
+    runtime_slots: Aarch64GateRuntimeSlots,
+    expected_outbound_stub: usize,
+    expected_outbound_pc: usize,
+    read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> Aarch64GateSignalResult {
+    canonicalize_aarch64_gate_signal_context_with_interruption(
+        context,
+        saved,
+        Aarch64GateInterruption::AsynchronousInterrupt,
+        runtime_slots,
+        expected_outbound_stub,
+        expected_outbound_pc,
+        read,
+    )
+}
+
 pub(super) fn canonicalize_runtime_aarch64_gate_signal_context(
     context: &libc::ucontext_t,
     saved: &litebox_common_linux::PtRegs,
+    interruption: Aarch64GateInterruption,
 ) -> Aarch64GateSignalResult {
     let block: usize;
     let expected_outbound_stub: usize;
@@ -1326,10 +1947,16 @@ pub(super) fn canonicalize_runtime_aarch64_gate_signal_context(
             options(nostack, readonly, preserves_flags)
         );
     }
-    canonicalize_aarch64_gate_signal_context(
+    canonicalize_aarch64_gate_signal_context_with_interruption(
         context,
         saved,
-        block + tls_offset::GUEST_THREAD_POINTER,
+        interruption,
+        Aarch64GateRuntimeSlots {
+            guest_tpidr: block + tls_offset::GUEST_THREAD_POINTER,
+            guest_x18: block + tls_offset::GUEST_X18,
+            saved_anchor: block + tls_offset::SAVED_ANCHOR_SCRATCH,
+            saved_value: block + tls_offset::SAVED_VALUE_SCRATCH,
+        },
         expected_outbound_stub,
         expected_outbound_pc,
         |address, output| {
@@ -1356,8 +1983,9 @@ pub(super) fn canonicalize_runtime_aarch64_gate_signal_context(
     )
 }
 
-/// Terminates after gate canonicalization reports an invalid runtime state,
-/// such as ambiguous valid candidates or unreadable runtime-owned TLS.
+/// Terminates after gate canonicalization reports unreadable or inconsistent
+/// runtime-owned TLS state. Candidate discovery reads guest memory, so even
+/// multiple exact forged candidates are `NotGate`, never fatal.
 pub(super) fn fatal_aarch64_gate_runtime_state() -> ! {
     // SAFETY: `getpid`, `gettid`, `tgkill` and `exit_group` are
     // async-signal-safe, are admitted by this platform's seccomp filter, and
@@ -1464,6 +2092,23 @@ mod tests {
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::signal::{SigSet, Signal};
+
+    #[cfg(feature = "aarch64_virtualize_x18")]
+    #[test]
+    fn ordinary_guest_pc_uses_virtual_x18() {
+        const PHYSICAL_X18: u64 = 0x1818_0000_0000_0001;
+        const VIRTUAL_X18: usize = 0x1818_0000_0000_0002;
+        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+        let mut regs = PtRegs::default();
+        context.uc_mcontext.pc = 0x1234;
+        context.uc_mcontext.regs[18] = PHYSICAL_X18;
+
+        publish_virtualized_x18(VIRTUAL_X18);
+        copy_ordinary_signal_context(&mut regs, &context);
+
+        assert_eq!(regs.regs[18], VIRTUAL_X18);
+        assert_ne!(regs.regs[18], usize::try_from(PHYSICAL_X18).unwrap());
+    }
 
     #[test]
     fn test_gate_patching_lands_in_the_runtime_tls_block() {
@@ -1583,6 +2228,835 @@ mod tests {
         (code, trampoline, context, saved)
     }
 
+    fn x18_gate_fixture_for(original: u32) -> (Vec<u8>, Vec<u8>, libc::ucontext_t, PtRegs) {
+        let mut code = original.to_le_bytes().to_vec();
+        let (mut trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
+            &mut code,
+            0x1000,
+            0x400000,
+            0,
+            litebox_syscall_rewriter::RewriteOptions::new(
+                litebox_syscall_rewriter::TargetHost::Linux,
+                true,
+            ),
+        )
+        .unwrap();
+        assert!(trapped.is_empty());
+        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates_with_offsets(
+            &mut trampoline,
+            litebox_syscall_rewriter::aarch64::Aarch64GateOffsets::new(96, 104, 112, 120).unwrap(),
+        )
+        .unwrap();
+        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+        context.uc_mcontext.sp = 0x8000;
+        let saved = PtRegs::default();
+        (code, trampoline, context, saved)
+    }
+
+    fn x18_gate_fixture() -> (Vec<u8>, Vec<u8>, libc::ucontext_t, PtRegs) {
+        x18_gate_fixture_for(0xaa00_03f2)
+    }
+
+    #[test]
+    fn br_x18_gate_distinguishes_async_rewind_from_sync_internal_emulation() {
+        let (code, trampoline, mut context, saved) = x18_gate_fixture_for(0xd61f_0240);
+        let slots = Aarch64GateRuntimeSlots {
+            guest_tpidr: 0x500000,
+            guest_x18: 0x500008,
+            saved_anchor: 0x500010,
+            saved_value: 0x500018,
+        };
+        let mut runtime = [0u8; 32];
+        context.uc_mcontext.pc = 0x400010;
+        context.uc_mcontext.sp = 0x8120;
+        context.uc_mcontext.pstate = 0xa000_0000;
+        for (index, reg) in context.uc_mcontext.regs.iter_mut().enumerate() {
+            *reg = 0xfeed_0000_0000_0000 | index as u64;
+        }
+
+        let physical_x18 = context.uc_mcontext.regs[18];
+
+        for target in [0, 0x1818_1818_1818_1818usize] {
+            runtime[8..16].copy_from_slice(&target.to_ne_bytes());
+            let asynchronous = canonicalize_aarch64_gate_signal_context_with_interruption(
+                &context,
+                &saved,
+                super::classify_aarch64_gate_interruption(libc::SIGTRAP, libc::SI_USER),
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &runtime),
+            );
+            let Aarch64GateSignalResult::Canonicalized(asynchronous) = asynchronous else {
+                panic!("async BR x18 did not rewind");
+            };
+            assert_eq!(asynchronous.pc, 0x1000);
+            assert_eq!(asynchronous.regs[18], target);
+
+            let synchronous = canonicalize_aarch64_gate_signal_context_with_interruption(
+                &context,
+                &saved,
+                Aarch64GateInterruption::SynchronousException,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &runtime),
+            );
+            let Aarch64GateSignalResult::InternalEmulation(emulated) = synchronous else {
+                panic!("synchronous BRK was not internal emulation");
+            };
+            let mut expected = expected_signal_regs(&saved, &context);
+            expected.regs[18] = target;
+            expected.pc = target;
+            assert_ptregs_eq(&emulated, &expected, "BR x18 emulation");
+            assert_eq!(context.uc_mcontext.regs[18], physical_x18);
+        }
+    }
+
+    #[test]
+    fn x18_conditional_taken_path_canonicalizes_to_original_target() {
+        const SLOT: usize = 0x400030;
+        let (code, trampoline, mut context, saved) = x18_gate_fixture_for(0x3400_0092);
+        let slots = Aarch64GateRuntimeSlots {
+            guest_tpidr: 0x500000,
+            guest_x18: 0x500008,
+            saved_anchor: 0x500010,
+            saved_value: 0x500018,
+        };
+        let mut runtime = [0u8; 32];
+        runtime[8..16].copy_from_slice(&0x1818usize.to_ne_bytes());
+        runtime[16..24].copy_from_slice(&0x1616usize.to_ne_bytes());
+        runtime[24..32].copy_from_slice(&0x1717usize.to_ne_bytes());
+        context.uc_mcontext.pc = (SLOT + 44) as u64;
+        context.uc_mcontext.sp = 0x8020;
+        context.uc_mcontext.regs[16] = 0x500000;
+        context.uc_mcontext.regs[17] = 0;
+        context.uc_mcontext.regs[30] = 0x3030;
+        context.uc_mcontext.pstate = 0xa000_0000;
+
+        let result = canonicalize_aarch64_gate_signal_context(
+            &context,
+            &saved,
+            slots,
+            0,
+            0,
+            fixture_reader(&code, &trampoline, &[], &runtime),
+        );
+        let Aarch64GateSignalResult::Canonicalized(canonical) = result else {
+            panic!("taken conditional path did not canonicalize");
+        };
+        assert_eq!(canonical.pc, 0x1010);
+        assert_eq!(canonical.regs[18], 0x1818);
+        assert_eq!(canonical.regs[16], 0x1616);
+        assert_eq!(canonical.regs[17], 0x1717);
+        assert_eq!(canonical.regs[30], 0x3030);
+        assert_eq!(canonical.sp, 0x8020);
+        assert_eq!(canonical.pstate, 0xa000_0000);
+    }
+
+    fn test_runtime_slots(guest_tpidr: usize) -> Aarch64GateRuntimeSlots {
+        Aarch64GateRuntimeSlots {
+            guest_tpidr,
+            guest_x18: 0,
+            saved_anchor: 0,
+            saved_value: 0,
+        }
+    }
+
+    #[test]
+    fn x18_site_boundaries_restore_guest_state_by_completed_phase() {
+        const SITE: usize = 0x400030;
+        const ORIGINAL: usize = 0x1000;
+        const FRAME_SP: usize = 0x8000;
+        const GUEST_SP: usize = FRAME_SP + 32;
+        const GUEST_XA: usize = 0xaaaa_aaaa_aaaa_aaaa;
+        const GUEST_XV: usize = 0xbbbb_bbbb_bbbb_bbbb;
+        const GUEST_X30: usize = 0x3030_3030_3030_3030;
+        const LIVE_X30: usize = 0x3030_3030_3030_2424;
+        const LIVE_SP: usize = 0x9090;
+        const PRE_X18: usize = 0x1818_1818_1818_1818;
+        const LIVE_RESULT_X18: usize = 0xeeee_eeee_eeee_eeee;
+        const COMMITTED_X18: usize = 0xc0c0_c0c0_c0c0_c0c0;
+        const PHYSICAL_X18: usize = 0xdead_dead_dead_dead;
+        const HOST_ANCHOR: usize = 0xfafa_fafa_fafa_fafa;
+        let (code, trampoline, mut context, saved) = x18_gate_fixture();
+        let slots = Aarch64GateRuntimeSlots {
+            guest_tpidr: 0x500000,
+            guest_x18: 0x500008,
+            saved_anchor: 0x500010,
+            saved_value: 0x500018,
+        };
+        let mut frame = [0u8; 32];
+        frame[0..8].copy_from_slice(&GUEST_XA.to_ne_bytes());
+        frame[8..16].copy_from_slice(&GUEST_XV.to_ne_bytes());
+        frame[16..24].copy_from_slice(&GUEST_X30.to_ne_bytes());
+        let mut runtime = [0u8; 32];
+        runtime[8..16].copy_from_slice(&PRE_X18.to_ne_bytes());
+        runtime[16..24].copy_from_slice(&GUEST_XA.to_ne_bytes());
+        runtime[24..32].copy_from_slice(&GUEST_XV.to_ne_bytes());
+
+        for offset in (0usize..=40).step_by(4) {
+            context.uc_mcontext.pc = (SITE + offset) as u64;
+            context.uc_mcontext.sp = if offset == 24 {
+                LIVE_SP as u64
+            } else if offset == 0 || offset > 24 {
+                GUEST_SP as u64
+            } else {
+                FRAME_SP as u64
+            };
+            context.uc_mcontext.regs[16] = if (16..40).contains(&offset) {
+                HOST_ANCHOR as u64
+            } else {
+                GUEST_XA as u64
+            };
+            context.uc_mcontext.regs[17] = if offset == 28 || offset == 32 {
+                LIVE_RESULT_X18 as u64
+            } else if (16..32).contains(&offset) {
+                PRE_X18 as u64
+            } else {
+                GUEST_XV as u64
+            };
+            context.uc_mcontext.regs[18] = PHYSICAL_X18 as u64;
+            context.uc_mcontext.regs[30] = match offset {
+                16 => (SITE + 16) as u64,
+                24 => LIVE_X30 as u64,
+                _ => GUEST_X30 as u64,
+            };
+            if offset >= 36 {
+                runtime[8..16].copy_from_slice(&COMMITTED_X18.to_ne_bytes());
+            } else {
+                runtime[8..16].copy_from_slice(&PRE_X18.to_ne_bytes());
+            }
+
+            let result = canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                slots,
+                0,
+                0,
+                fixture_reader(
+                    &code,
+                    &trampoline,
+                    if offset == 24 { &[] } else { &frame },
+                    &runtime,
+                ),
+            );
+            let Aarch64GateSignalResult::Canonicalized(regs) = result else {
+                panic!("x18 site +{offset} did not canonicalize");
+            };
+            assert_eq!(regs.regs[16], GUEST_XA, "+{offset}: anchor scratch");
+            assert_eq!(regs.regs[17], GUEST_XV, "+{offset}: value scratch");
+            assert_eq!(
+                regs.regs[30],
+                if offset == 24 { LIVE_X30 } else { GUEST_X30 },
+                "+{offset}: x30"
+            );
+            assert_eq!(
+                regs.sp,
+                if offset == 24 { LIVE_SP } else { GUEST_SP },
+                "+{offset}: SP"
+            );
+            assert_eq!(
+                regs.pc,
+                if offset <= 24 { ORIGINAL } else { ORIGINAL + 4 },
+                "+{offset}: PC"
+            );
+            assert_eq!(
+                regs.regs[18],
+                match offset {
+                    0..=24 => PRE_X18,
+                    28 | 32 => LIVE_RESULT_X18,
+                    _ => COMMITTED_X18,
+                },
+                "+{offset}: x18"
+            );
+            assert_eq!(regs.orig_x0, regs.regs[0], "+{offset}: orig_x0");
+        }
+    }
+
+    #[test]
+    fn x18_setup_boundaries_restore_guest_frame_and_flags() {
+        const SETUP: usize = 0x400010;
+        const SITE: usize = 0x400030;
+        const GUEST_XA: usize = 0xaaaa_aaaa_aaaa_aaaa;
+        const GUEST_XV: usize = 0xbbbb_bbbb_bbbb_bbbb;
+        const GUEST_X30: usize = 0x3030_3030_3030_3030;
+        const PRE_X18: usize = 0x1818_1818_1818_1818;
+        const PHYSICAL_X18: usize = 0xdead_dead_dead_dead;
+        const HOST_ANCHOR: usize = 0xfafa_fafa_fafa_fafa;
+        let (code, trampoline, mut context, saved) = x18_gate_fixture();
+        let slots = Aarch64GateRuntimeSlots {
+            guest_tpidr: 0x500000,
+            guest_x18: 0x500008,
+            saved_anchor: 0x500010,
+            saved_value: 0x500018,
+        };
+        let mut frame = [0u8; 32];
+        frame[0..8].copy_from_slice(&GUEST_XA.to_ne_bytes());
+        frame[8..16].copy_from_slice(&GUEST_XV.to_ne_bytes());
+        frame[16..24].copy_from_slice(&GUEST_X30.to_ne_bytes());
+        let mut runtime = [0u8; 32];
+        runtime[8..16].copy_from_slice(&PRE_X18.to_ne_bytes());
+        runtime[16..24].copy_from_slice(&GUEST_XA.to_ne_bytes());
+        runtime[24..32].copy_from_slice(&GUEST_XV.to_ne_bytes());
+
+        for offset in (0usize..=24).step_by(4) {
+            context.uc_mcontext.pc = (SETUP + offset) as u64;
+            context.uc_mcontext.sp = 0x8000;
+            context.uc_mcontext.regs[16] = if offset >= 4 {
+                HOST_ANCHOR as u64
+            } else {
+                GUEST_XA as u64
+            };
+            context.uc_mcontext.regs[17] = match offset {
+                8..=12 => GUEST_XA as u64,
+                24 => 0x1818,
+                _ => GUEST_XV as u64,
+            };
+            context.uc_mcontext.regs[30] = (SITE + 16) as u64;
+            context.uc_mcontext.regs[18] = PHYSICAL_X18 as u64;
+            context.uc_mcontext.pstate = 0xa000_0000;
+            let result = canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &frame, &runtime),
+            );
+            let Aarch64GateSignalResult::Canonicalized(regs) = result else {
+                panic!("x18 setup +{offset} did not canonicalize");
+            };
+            assert_eq!(regs.regs[16], GUEST_XA, "+{offset}: anchor scratch");
+            assert_eq!(regs.regs[17], GUEST_XV, "+{offset}: value scratch");
+            assert_eq!(regs.regs[30], GUEST_X30, "+{offset}: x30");
+            assert_eq!(regs.sp, 0x8020, "+{offset}: SP");
+            assert_eq!(regs.pc, 0x1000, "+{offset}: PC");
+            assert_eq!(regs.regs[18], PRE_X18, "+{offset}: x18");
+            assert_eq!(regs.pstate, 0xa000_0000, "+{offset}: NZCV");
+        }
+    }
+
+    #[test]
+    fn x18_gate_read_failures_follow_guest_and_runtime_ownership() {
+        let (code, trampoline, mut context, saved) = x18_gate_fixture();
+        let slots = Aarch64GateRuntimeSlots {
+            guest_tpidr: 0x500000,
+            guest_x18: 0x500008,
+            saved_anchor: 0x500010,
+            saved_value: 0x500018,
+        };
+        context.uc_mcontext.sp = 0x8000;
+        context.uc_mcontext.regs[30] = 0x400040;
+        context.uc_mcontext.pc = 0x400010;
+        assert!(matches!(
+            canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &[]),
+            ),
+            Aarch64GateSignalResult::NotGate
+        ));
+
+        let mut frame = [0u8; 32];
+        frame[0..8].copy_from_slice(&context.uc_mcontext.regs[16].to_ne_bytes());
+        frame[8..16].copy_from_slice(&context.uc_mcontext.regs[17].to_ne_bytes());
+        frame[16..24].copy_from_slice(&0x3030usize.to_ne_bytes());
+        assert!(matches!(
+            canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &frame, &[]),
+            ),
+            Aarch64GateSignalResult::InvalidRuntimeState
+        ));
+
+        context.uc_mcontext.pc = 0x400030;
+        context.uc_mcontext.sp = 0x8020;
+        assert!(matches!(
+            canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &[]),
+            ),
+            Aarch64GateSignalResult::InvalidRuntimeState
+        ));
+
+        context.uc_mcontext.pc = 0x400030 + 24;
+        context.uc_mcontext.sp = 0x8020;
+        assert!(matches!(
+            canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &[]),
+            ),
+            Aarch64GateSignalResult::InvalidRuntimeState
+        ));
+
+        frame[0..8].copy_from_slice(&context.uc_mcontext.regs[16].to_ne_bytes());
+        frame[8..16].copy_from_slice(&context.uc_mcontext.regs[17].to_ne_bytes());
+        frame[16..24].copy_from_slice(&context.uc_mcontext.regs[30].to_ne_bytes());
+        assert!(matches!(
+            canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &frame, &[]),
+            ),
+            Aarch64GateSignalResult::InvalidRuntimeState
+        ));
+    }
+
+    #[test]
+    fn x18_post_instruction_preserves_width_x30_and_nzcv_results() {
+        const SITE: usize = 0x400030;
+        const RESULT_FLAGS: u64 = 0x9000_0000;
+        for (original, result_x18, result_x30, label) in [
+            (0x2a00_03f2, 0x0000_0000_89ab_cdef, 0x3030, "w18 result"),
+            (0xaa1e_03f2, 0x3030, 0x3030, "x30 input"),
+            (0xaa12_03fe, 0x1818, 0x1818, "x30 output"),
+            (0xab01_0012, 0x4242, 0x3030, "flag-setting x18 output"),
+        ] {
+            let (code, trampoline, mut context, saved) = x18_gate_fixture_for(original);
+            let slots = Aarch64GateRuntimeSlots {
+                guest_tpidr: 0x500000,
+                guest_x18: 0x500008,
+                saved_anchor: 0x500010,
+                saved_value: 0x500018,
+            };
+            let mut runtime = [0u8; 32];
+            runtime[16..24].copy_from_slice(&0x1616usize.to_ne_bytes());
+            runtime[24..32].copy_from_slice(&0x1717usize.to_ne_bytes());
+            context.uc_mcontext.pc = (SITE + 28) as u64;
+            context.uc_mcontext.sp = 0x8020;
+            context.uc_mcontext.regs[16] = 0xfafa;
+            context.uc_mcontext.regs[17] = result_x18 as u64;
+            context.uc_mcontext.regs[30] = result_x30 as u64;
+            context.uc_mcontext.pstate = RESULT_FLAGS;
+            context.uc_mcontext.regs[0] = 0x0101;
+            let result = canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &runtime),
+            );
+            let Aarch64GateSignalResult::Canonicalized(regs) = result else {
+                panic!("{label} did not canonicalize");
+            };
+            assert_eq!(regs.regs[18], result_x18, "{label}: x18");
+            assert_eq!(regs.regs[30], result_x30, "{label}: x30");
+            assert_eq!(regs.pstate, RESULT_FLAGS, "{label}: NZCV");
+            assert_eq!(regs.orig_x0, 0x0101, "{label}: orig_x0");
+        }
+    }
+
+    #[test]
+    fn x18_gate_signal_sync_and_async_runtime_boundaries_diverge() {
+        const SETUP: usize = 0x400010;
+        const SITE: usize = 0x400030;
+        let (code, trampoline, mut context, saved) = x18_gate_fixture();
+        let slots = Aarch64GateRuntimeSlots {
+            guest_tpidr: 0x500000,
+            guest_x18: 0x500008,
+            saved_anchor: 0x500010,
+            saved_value: 0x500018,
+        };
+        let mut runtime = [0u8; 32];
+        runtime[8..16].copy_from_slice(&0x1818usize.to_ne_bytes());
+        runtime[16..24].copy_from_slice(&0x1616usize.to_ne_bytes());
+        runtime[24..32].copy_from_slice(&0x1717usize.to_ne_bytes());
+        context.uc_mcontext.sp = 0x8020;
+        context.uc_mcontext.regs[16] = 0xfafa;
+        context.uc_mcontext.regs[17] = 0x2828;
+        context.uc_mcontext.regs[30] = 0x3030;
+
+        for offset in [24usize, 28, 32] {
+            context.uc_mcontext.pc = (SITE + offset) as u64;
+            let asynchronous = canonicalize_aarch64_gate_signal_context_with_interruption(
+                &context,
+                &saved,
+                Aarch64GateInterruption::AsynchronousInterrupt,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &runtime),
+            );
+            let Aarch64GateSignalResult::Canonicalized(asynchronous) = asynchronous else {
+                panic!("async site +{offset} did not canonicalize");
+            };
+            assert_eq!(asynchronous.pc, if offset == 24 { 0x1000 } else { 0x1004 });
+            assert_eq!(
+                asynchronous.regs[18],
+                if offset == 24 { 0x1818 } else { 0x2828 }
+            );
+
+            let synchronous = canonicalize_aarch64_gate_signal_context_with_interruption(
+                &context,
+                &saved,
+                Aarch64GateInterruption::SynchronousException,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &runtime),
+            );
+            if offset == 32 {
+                assert!(matches!(
+                    synchronous,
+                    Aarch64GateSignalResult::InvalidRuntimeState
+                ));
+            } else {
+                assert!(matches!(
+                    synchronous,
+                    Aarch64GateSignalResult::Canonicalized(_)
+                ));
+            }
+        }
+
+        for offset in [8usize, 16, 20] {
+            context.uc_mcontext.pc = (SETUP + offset) as u64;
+            context.uc_mcontext.regs[30] = (SITE + 16) as u64;
+            assert!(matches!(
+                canonicalize_aarch64_gate_signal_context_with_interruption(
+                    &context,
+                    &saved,
+                    Aarch64GateInterruption::SynchronousException,
+                    slots,
+                    0,
+                    0,
+                    fixture_reader(&code, &trampoline, &[], &runtime),
+                ),
+                Aarch64GateSignalResult::InvalidRuntimeState
+            ));
+        }
+
+        for offset in [36usize, 40] {
+            context.uc_mcontext.pc = (SITE + offset) as u64;
+            context.uc_mcontext.regs[30] = 0x3030;
+            assert!(matches!(
+                canonicalize_aarch64_gate_signal_context_with_interruption(
+                    &context,
+                    &saved,
+                    Aarch64GateInterruption::SynchronousException,
+                    slots,
+                    0,
+                    0,
+                    fixture_reader(&code, &trampoline, &[], &runtime),
+                ),
+                Aarch64GateSignalResult::InvalidRuntimeState
+            ));
+        }
+
+        context.uc_mcontext.pc = (SITE + 44) as u64;
+        context.uc_mcontext.regs[16] = 0x1616;
+        context.uc_mcontext.regs[17] = 0x1717;
+        assert!(matches!(
+            canonicalize_aarch64_gate_signal_context_with_interruption(
+                &context,
+                &saved,
+                Aarch64GateInterruption::SynchronousException,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &runtime),
+            ),
+            Aarch64GateSignalResult::Canonicalized(_)
+        ));
+    }
+
+    #[test]
+    fn x18_gate_signal_guest_frame_mismatch_is_not_gate() {
+        const SETUP: usize = 0x400010;
+        const SITE: usize = 0x400030;
+        let (code, trampoline, mut context, saved) = x18_gate_fixture();
+        let slots = Aarch64GateRuntimeSlots {
+            guest_tpidr: 0x500000,
+            guest_x18: 0x500008,
+            saved_anchor: 0x500010,
+            saved_value: 0x500018,
+        };
+        let mut frame = [0u8; 32];
+        frame[0..8].copy_from_slice(&0xaaaausize.to_ne_bytes());
+        frame[8..16].copy_from_slice(&0xbbbbusize.to_ne_bytes());
+        frame[16..24].copy_from_slice(&0x3030usize.to_ne_bytes());
+        let mut runtime = [0u8; 32];
+        runtime[8..16].copy_from_slice(&0x1818usize.to_ne_bytes());
+        runtime[16..24].copy_from_slice(&0xddddusize.to_ne_bytes());
+        runtime[24..32].copy_from_slice(&0xbbbbusize.to_ne_bytes());
+
+        for pc in [SETUP + 12, SITE + 20] {
+            context.uc_mcontext.pc = pc as u64;
+            context.uc_mcontext.sp = 0x8000;
+            context.uc_mcontext.regs[30] = if pc < SITE {
+                (SITE + 16) as u64
+            } else {
+                0x3030
+            };
+            assert!(matches!(
+                canonicalize_aarch64_gate_signal_context(
+                    &context,
+                    &saved,
+                    slots,
+                    0,
+                    0,
+                    fixture_reader(&code, &trampoline, &frame, &runtime),
+                ),
+                Aarch64GateSignalResult::NotGate
+            ));
+        }
+    }
+
+    #[test]
+    fn x18_pcrel_signal_completion_is_form_aware() {
+        const SITE: usize = 0x400030;
+        let slots = Aarch64GateRuntimeSlots {
+            guest_tpidr: 0x500000,
+            guest_x18: 0x500008,
+            saved_anchor: 0x500010,
+            saved_value: 0x500018,
+        };
+        for (original, offset, expected_pc, expected_x18) in [
+            (0x1000_0092, 28usize, 0x1000usize, 0x1818usize), // ADR: ADD pending
+            (0x1000_0092, 32, 0x1004, 0x2828),                // ADR: ADD complete
+            (0x9000_0012, 28, 0x1004, 0x2828),                // ADRP complete
+        ] {
+            let (code, trampoline, mut context, saved) = x18_gate_fixture_for(original);
+            let mut runtime = [0u8; 32];
+            runtime[8..16].copy_from_slice(&0x1818usize.to_ne_bytes());
+            runtime[16..24].copy_from_slice(&0x1616usize.to_ne_bytes());
+            runtime[24..32].copy_from_slice(&0x1717usize.to_ne_bytes());
+            context.uc_mcontext.pc = (SITE + offset) as u64;
+            context.uc_mcontext.sp = 0x8020;
+            context.uc_mcontext.regs[16] = 0xfafa;
+            context.uc_mcontext.regs[17] = 0x2828;
+            context.uc_mcontext.regs[30] = 0x3030;
+
+            let result = canonicalize_aarch64_gate_signal_context_with_interruption(
+                &context,
+                &saved,
+                Aarch64GateInterruption::AsynchronousInterrupt,
+                slots,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &runtime),
+            );
+            let Aarch64GateSignalResult::Canonicalized(regs) = result else {
+                panic!("PC-relative gate +{offset} did not canonicalize");
+            };
+            assert_eq!(regs.pc, expected_pc);
+            assert_eq!(regs.regs[18], expected_x18);
+        }
+    }
+
+    #[test]
+    fn x18_site_and_setup_pcs_require_exact_site_provenance() {
+        let (code, trampoline, mut context, saved) = x18_gate_fixture();
+        let setup = 0x400010usize;
+        let site_slot = setup + X18_SETUP_BYTES;
+
+        for (pc, setup_offset) in [(site_slot + 24, None), (setup + 4, Some(4))] {
+            context.uc_mcontext.pc = pc as u64;
+            context.uc_mcontext.regs[30] = (site_slot + 16) as u64;
+            let classified =
+                classify_x18_signal_pc(&context, fixture_reader(&code, &trampoline, &[], &[]));
+            let CandidateDiscovery::Unique(classified) = classified else {
+                panic!("x18 PC {pc:#x} did not classify uniquely");
+            };
+            assert_eq!(classified.site.original_site(), 0x1000);
+            assert_eq!(
+                classified.instruction_offset,
+                if setup_offset.is_some() { 12 } else { 24 }
+            );
+            assert_eq!(classified.setup_instruction_offset, setup_offset);
+        }
+
+        context.uc_mcontext.pc = setup as u64 + 4;
+        for x30 in [0, site_slot + 12, site_slot + 20] {
+            context.uc_mcontext.regs[30] = x30 as u64;
+            assert!(matches!(
+                canonicalize_aarch64_gate_signal_context(
+                    &context,
+                    &saved,
+                    test_runtime_slots(0x500000),
+                    0,
+                    0,
+                    fixture_reader(&code, &trampoline, &[], &[]),
+                ),
+                Aarch64GateSignalResult::NotGate
+            ));
+        }
+
+        let mut wrong_inbound = code.clone();
+        wrong_inbound.copy_from_slice(&0x1400_0000u32.to_le_bytes());
+        context.uc_mcontext.regs[30] = (site_slot + 16) as u64;
+        assert!(matches!(
+            canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                test_runtime_slots(0x500000),
+                0,
+                0,
+                fixture_reader(&wrong_inbound, &trampoline, &[], &[]),
+            ),
+            Aarch64GateSignalResult::NotGate
+        ));
+    }
+
+    #[test]
+    fn multiple_x18_site_candidates_are_ambiguous() {
+        let make_slot = |start: usize| {
+            let mut code = 0xaa00_03f2u32.to_le_bytes().to_vec();
+            let (mut trampoline, trapped) =
+                litebox_syscall_rewriter::patch_code_segment_with_options(
+                    &mut code,
+                    0x1000,
+                    (start - 48) as u64,
+                    0,
+                    litebox_syscall_rewriter::RewriteOptions::new(
+                        litebox_syscall_rewriter::TargetHost::Linux,
+                        true,
+                    ),
+                )
+                .unwrap();
+            assert!(trapped.is_empty());
+            litebox_syscall_rewriter::aarch64::finalize_trampoline_gates_with_offsets(
+                &mut trampoline,
+                litebox_syscall_rewriter::aarch64::Aarch64GateOffsets::new(96, 104, 112, 120)
+                    .unwrap(),
+            )
+            .unwrap();
+            trampoline[48..112].to_vec()
+        };
+        let first_start = 0x400010usize;
+        let second_start = 0x400020usize;
+        let first = make_slot(first_start);
+        let second = make_slot(second_start);
+        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+        let pc = second_start + 8;
+        context.uc_mcontext.pc = pc as u64;
+
+        let discovery = classify_x18_signal_pc(&context, move |address, output| {
+            let source = if address == first_start && output.len() == 64 {
+                Some(first.as_slice())
+            } else if address == second_start && output.len() == 64 {
+                Some(second.as_slice())
+            } else {
+                None
+            };
+            source.is_some_and(|source| {
+                output.copy_from_slice(source);
+                true
+            })
+        });
+
+        assert!(matches!(discovery, CandidateDiscovery::Ambiguous));
+    }
+
+    #[test]
+    fn concurrent_multiple_x18_setup_candidates_are_ambiguous() {
+        let (_code, trampoline, mut context, _saved) = x18_gate_fixture();
+        let first_setup = 0x400010usize;
+        let second_setup = 0x400020usize;
+        let site_start = 0x500000usize;
+        let setup = trampoline[16..48].to_vec();
+        let pristine_site = trampoline[48..112].to_vec();
+        let site_for = |target: usize| {
+            let mut site = pristine_site.clone();
+            let displacement =
+                i64::try_from(target).unwrap() - i64::try_from(site_start + 12).unwrap();
+            assert_eq!(displacement % 4, 0);
+            let immediate = i32::try_from(displacement >> 2).unwrap().cast_unsigned();
+            let bl = 0x9400_0000 | (immediate & 0x03ff_ffff);
+            site[12..16].copy_from_slice(&bl.to_le_bytes());
+            site
+        };
+        let first_site = site_for(first_setup);
+        let second_site = site_for(second_setup);
+        let mut site_reads = 0;
+        context.uc_mcontext.pc = (second_setup + 4) as u64;
+        context.uc_mcontext.regs[30] = (site_start + 16) as u64;
+
+        let discovery = classify_x18_signal_pc(&context, move |address, output| {
+            let source =
+                if (address == first_setup || address == second_setup) && output.len() == 32 {
+                    Some(setup.as_slice())
+                } else if address == site_start && output.len() == 64 {
+                    site_reads += 1;
+                    Some(if site_reads == 1 {
+                        second_site.as_slice()
+                    } else {
+                        first_site.as_slice()
+                    })
+                } else {
+                    None
+                };
+            source.is_some_and(|source| {
+                output.copy_from_slice(source);
+                true
+            })
+        });
+
+        assert!(matches!(discovery, CandidateDiscovery::Ambiguous));
+    }
+
+    #[test]
+    fn cross_kind_candidate_ambiguity_returns_not_gate() {
+        let (x18_code, x18_trampoline, mut context, saved) = x18_gate_fixture();
+        let x18_slot = x18_trampoline[48..112].to_vec();
+        let mut svc_code = 0xd400_0001u32.to_le_bytes();
+        let (svc_trampoline, trapped) =
+            litebox_syscall_rewriter::patch_code_segment(&mut svc_code, 0x2000, 0x400010, 0)
+                .unwrap();
+        assert!(trapped.is_empty());
+        let svc_slot = svc_trampoline[16..80].to_vec();
+        let pc = 0x400038usize;
+        context.uc_mcontext.pc = pc as u64;
+
+        let result = canonicalize_aarch64_gate_signal_context(
+            &context,
+            &saved,
+            test_runtime_slots(0x500000),
+            0,
+            0,
+            move |address, output| {
+                let source = if address == 0x400030 && output.len() == 64 {
+                    Some(x18_slot.as_slice())
+                } else if address == 0x400020 && output.len() == 64 {
+                    Some(svc_slot.as_slice())
+                } else if address == 0x40005c && output.len() == 4 {
+                    Some(&svc_slot[60..64])
+                } else if address == 0x1000 && output.len() == 4 {
+                    Some(x18_code.as_slice())
+                } else if address == 0x2000 && output.len() == 4 {
+                    Some(svc_code.as_slice())
+                } else {
+                    None
+                };
+                source.is_some_and(|source| {
+                    output.copy_from_slice(source);
+                    true
+                })
+            },
+        );
+
+        assert!(matches!(result, Aarch64GateSignalResult::NotGate));
+    }
+
     fn fixture_reader<'a>(
         code: &'a [u8],
         trampoline: &'a [u8],
@@ -1688,7 +3162,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 move |address, output| {
@@ -1740,7 +3214,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 move |address, output| {
@@ -1782,7 +3256,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0x400010 + 36,
                 0x1004,
                 fixture_reader(&code, &trampoline, &frame, &guest_tp),
@@ -1817,7 +3291,7 @@ mod tests {
                 let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                     &context,
                     &saved,
-                    0x500000,
+                    test_runtime_slots(0x500000),
                     stub,
                     pc,
                     fixture_reader(&code, &trampoline, &frame, &guest_tp),
@@ -1849,7 +3323,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 move |address, output| address != denied_address && reader(address, output),
@@ -1866,7 +3340,7 @@ mod tests {
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
-            0x500000,
+            test_runtime_slots(0x500000),
             0,
             0,
             fixture_reader(&wrong_branch, &trampoline, &frame, &[]),
@@ -1879,7 +3353,7 @@ mod tests {
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
-            0x500000,
+            test_runtime_slots(0x500000),
             0,
             0,
             fixture_reader(&code, &wrong_template, &frame, &[]),
@@ -1891,7 +3365,7 @@ mod tests {
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
-            0x500000,
+            test_runtime_slots(0x500000),
             0,
             0,
             fixture_reader(&code, &trampoline, &frame, &[]),
@@ -1903,7 +3377,7 @@ mod tests {
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
-            0x500000,
+            test_runtime_slots(0x500000),
             0,
             0,
             fixture_reader(&code, &trampoline, &[], &[]),
@@ -1949,7 +3423,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 fixture_reader(&code, &trampoline, &frame, &[]),
@@ -1974,7 +3448,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 fixture_reader(&code, &mutated, &frame, &[]),
@@ -1987,7 +3461,7 @@ mod tests {
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
-            0x500000,
+            test_runtime_slots(0x500000),
             0,
             0,
             fixture_reader(&code, &bad_metadata, &frame, &[]),
@@ -2003,7 +3477,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 fixture_reader(&wrong_code, &trampoline, &frame, &[]),
@@ -2033,7 +3507,7 @@ mod tests {
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
-            0x500000,
+            test_runtime_slots(0x500000),
             0,
             0,
             move |address, output| {
@@ -2056,7 +3530,7 @@ mod tests {
                 }
             },
         );
-        assert_failure(result, true, "ambiguous candidates");
+        assert_failure(result, false, "ambiguous guest-derived candidates");
 
         // SP restoration arithmetic must be checked before publishing a result.
         // `sp` is a guest register, so a value that cannot be restored means
@@ -2066,7 +3540,7 @@ mod tests {
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
-            0x500000,
+            test_runtime_slots(0x500000),
             0,
             0,
             fixture_reader(&code, &trampoline, &frame, &[]),
@@ -2082,7 +3556,7 @@ mod tests {
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
-            0x500000,
+            test_runtime_slots(0x500000),
             0,
             0,
             fixture_reader(&code, &trampoline, &[], &[]),
@@ -2118,7 +3592,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 fixture_reader(
@@ -2151,7 +3625,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 fixture_reader(&msr_code, &msr_slot, &[], &[]),
@@ -2171,7 +3645,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 fixture_reader(&msr_code, &msr_slot, &msr_frame, &[]),
@@ -2189,7 +3663,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 fixture_reader(&svc_code, &svc_slot, &[], &[]),
@@ -2220,7 +3694,7 @@ mod tests {
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
-            0x500000,
+            test_runtime_slots(0x500000),
             0,
             0,
             fixture_reader(&code, &trampoline, &[], &[]),
@@ -2245,7 +3719,7 @@ mod tests {
             let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
-                0x500000,
+                test_runtime_slots(0x500000),
                 0,
                 0,
                 fixture_reader(&code, &trampoline, &frame, &[]),

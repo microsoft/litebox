@@ -1821,6 +1821,8 @@ dependencies = [
  "similar",
  "tempfile",
  "thiserror",
+ "yaxpeax-arch",
+ "yaxpeax-arm",
  "zerocopy",
 ]
 
@@ -3732,6 +3734,25 @@ name = "xshell-macros"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32ac00cd3f8ec9c1d33fb3e7958a82df6989c42d747bd326c822b1d625283547"
+
+[[package]]
+name = "yaxpeax-arch"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36274fcc5403da2a7636ffda4d02eca12a1b2b8267b9d2e04447bd2ccfc72082"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "yaxpeax-arm"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8aa9155f0d727d10e91e5a94f68f415ec24c7a5faab4eac2386a1069e4a02d7"
+dependencies = [
+ "bitvec",
+ "yaxpeax-arch",
+]
 
 [[package]]
 name = "yoke"

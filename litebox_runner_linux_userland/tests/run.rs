@@ -1,6 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![cfg_attr(
+    all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"),
+    allow(dead_code)
+)]
+
 mod cache;
 mod common;
 
@@ -49,9 +54,10 @@ struct Runner {
 impl Runner {
     fn new(target: &Path, unique_name: &str) -> Self {
         let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let policy_name = common::rewrite_policy_name(unique_name, common::RewritePolicy::CURRENT);
 
         // create tar file containing the rewritten executable and all dependencies
-        let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
+        let tar_dir = dir_path.join(format!("tar_files_{policy_name}"));
         let dirs_to_create = ["lib64", MULTIARCH_LIB_DIR, "lib32"];
         for dir in dirs_to_create {
             std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
@@ -60,14 +66,24 @@ impl Runner {
 
         let target_guest_path = std::path::absolute(target).unwrap();
         let target_dest_path = tar_dir.join(target_guest_path.strip_prefix("/").unwrap());
-        let success = common::rewrite_with_cache(target, &target_dest_path, &[]);
+        let success = common::rewrite_with_cache(
+            target,
+            &target_dest_path,
+            common::RewritePolicy::CURRENT,
+            &[],
+        );
         assert!(success, "failed to run litebox_syscall_rewriter");
 
         let libs = common::find_dependencies(target.to_str().unwrap());
         for file in &libs {
             let file_path = std::path::Path::new(file.as_str());
             let dest_path = tar_dir.join(&file[1..]);
-            let success = common::rewrite_with_cache(file_path, &dest_path, &[]);
+            let success = common::rewrite_with_cache(
+                file_path,
+                &dest_path,
+                common::RewritePolicy::CURRENT,
+                &[],
+            );
             assert!(
                 success,
                 "failed to run litebox_syscall_rewriter for {}",
@@ -100,7 +116,7 @@ impl Runner {
             cmd_path: target_guest_path,
             cmd_args: Vec::new(),
             has_run: false,
-            unique_name: unique_name.to_owned(),
+            unique_name: policy_name,
         }
     }
 
@@ -1063,7 +1079,12 @@ fn python_runner(unique_name: &str) -> Runner {
                             so_file.display(),
                             so_file_dest.display()
                         );
-                        let success = common::rewrite_with_cache(so_file, &so_file_dest, &[]);
+                        let success = common::rewrite_with_cache(
+                            so_file,
+                            &so_file_dest,
+                            common::RewritePolicy::CURRENT,
+                            &[],
+                        );
                         assert!(success, "failed to rewrite {} file", so_file.display());
                     }
                 }

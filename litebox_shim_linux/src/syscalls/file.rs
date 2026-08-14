@@ -807,6 +807,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
 
+        // Detach the raw-fd lookup before this slot can be reused. Mappings
+        // retain their own Arc to the patch state.
+        if matches!(consumed, ConsumedFd::Fs(_))
+            && let Ok(raw_fd) = i32::try_from(raw_fd)
+        {
+            self.finalize_elf_patch(raw_fd);
+        }
+
         // Insert the replacement into the now-vacated slot while still holding the lock.
         if let Some(new_fd) = replace {
             let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
@@ -818,12 +826,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         drop(rds);
 
         match consumed {
-            ConsumedFd::Fs(fd) => {
-                if let Ok(raw_fd) = i32::try_from(raw_fd) {
-                    self.finalize_elf_patch(raw_fd);
-                }
-                files.fs.close(&fd).map_err(Errno::from)
-            }
+            ConsumedFd::Fs(fd) => files.fs.close(&fd).map_err(Errno::from),
             ConsumedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             ConsumedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
             ConsumedFd::Eventfd(fd) => {

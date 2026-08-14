@@ -5,6 +5,8 @@ use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_linux_userland::LinuxUserland as Platform;
+#[cfg(target_arch = "aarch64")]
+use litebox_syscall_rewriter::aarch64::Aarch64GatePlatform as _;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -117,6 +119,7 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
         .with_env_filter(
@@ -184,6 +187,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .collect();
         let file = mmapped_file(&prog)?;
         let data = if cli_args.rewrite_syscalls {
+            #[cfg(target_arch = "aarch64")]
+            let rewritten = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
+                file.data,
+                None,
+                litebox_syscall_rewriter::RewriteOptions::new(
+                    litebox_syscall_rewriter::TargetHost::Linux,
+                    Platform::VIRTUALIZE_X18,
+                ),
+            )
+            .with_context(|| format!("failed to rewrite {}", prog.display()))?;
+            #[cfg(not(target_arch = "aarch64"))]
             let rewritten = litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
                 .with_context(|| format!("failed to rewrite {}", prog.display()))?;
             rewritten.into()

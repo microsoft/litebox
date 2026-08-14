@@ -267,9 +267,12 @@ fn test_syscall_rewriter() {
     );
 
     // rewrite the hello_exec_nolibc
-    let hooked_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.hooked");
+    let hooked_name =
+        common::rewrite_policy_name("hello_exec_nolibc.hooked", common::RewritePolicy::Default);
+    let hooked_path = std::path::Path::new(dir_path.as_str()).join(hooked_name);
     let _ = std::fs::remove_file(hooked_path.clone());
-    let rewrite_success = common::rewrite_with_cache(&path, &hooked_path, &[]);
+    let rewrite_success =
+        common::rewrite_with_cache(&path, &hooked_path, common::RewritePolicy::Default, &[]);
     assert!(rewrite_success, "failed to run syscall rewriter");
 
     let executable_path = "/hello_exec_nolibc.hooked";
@@ -277,5 +280,29 @@ fn test_syscall_rewriter() {
 
     let mut launcher = TestLauncher::init_platform(&[], &[]);
     launcher.install_file(executable_data, executable_path);
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+    {
+        let argv = vec![CString::new(executable_path).unwrap()];
+        let result = launcher.shim_builder.build().load_program(
+            std::sync::Arc::new(launcher.fs),
+            launcher.platform.init_task(),
+            executable_path,
+            argv,
+            Vec::new(),
+        );
+        let Err(error) = result else {
+            panic!("x18 build accepted default-policy AOT binary");
+        };
+        assert!(
+            matches!(
+                error,
+                litebox_shim_linux::loader::elf::ElfLoaderError::ParseError(
+                    litebox_common_linux::loader::ElfParseError::TrampolinePolicyMismatch
+                )
+            ),
+            "unexpected default-AOT/x18-build error: {error:?}"
+        );
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18")))]
     launcher.test_load_exec_common(executable_path);
 }

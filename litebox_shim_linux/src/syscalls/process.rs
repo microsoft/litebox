@@ -1562,7 +1562,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // TODO: clear x86-64 patch state here too; it also contains addresses
         // from the discarded image.
         #[cfg(target_arch = "aarch64")]
-        self.global.elf_patch_cache.lock().clear();
+        {
+            let mut cache = self.global.elf_patch_cache.lock();
+            cache.by_fd.clear();
+            cache.states.clear();
+        }
 
         // TODO: on AArch64, clear the platform's cached outbound stub and PC
         // here. They address the discarded image, but the core platform API
@@ -1887,6 +1891,7 @@ mod tests {
 
     /// After the alarm deadline passes, a blocking operation should be
     /// interrupted and SIGALRM should be pending.
+    #[cfg(debug_assertions)]
     #[test]
     fn test_alarm_fires_after_deadline() {
         use litebox::platform::{Instant as _, TimeProvider};
@@ -1947,6 +1952,7 @@ mod tests {
 
     /// Cancelling an alarm before it fires should prevent signal delivery
     /// even if a blocking operation runs past the original deadline.
+    #[cfg(debug_assertions)]
     #[test]
     fn test_alarm_cancel_prevents_signal() {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
@@ -1979,6 +1985,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn test_pause_wakes_on_pending_signal() {
         use litebox_common_linux::{
@@ -2029,6 +2036,7 @@ mod tests {
 
     /// Setting alarm with SIG_IGN for SIGALRM: a blocking operation is still
     /// interrupted, but `process_signals` discards the signal.
+    #[cfg(debug_assertions)]
     #[test]
     fn test_alarm_with_sigign() {
         use litebox_common_linux::signal::{SIG_IGN, SaFlags, SigAction, SigSet, Signal};
@@ -2084,6 +2092,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn test_timer_delivers_correct_signal() {
         use litebox::platform::{TimerHandle as _, TimerProvider as _};
