@@ -565,14 +565,6 @@ impl PeParsedFile {
         self.image.dll_characteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE != 0
     }
 
-    /// Returns whether any image section requests shared memory semantics.
-    #[must_use]
-    pub fn has_shared_sections(&self) -> bool {
-        self.sections
-            .iter()
-            .any(|section| section.characteristics.get(LE) & pe::IMAGE_SCN_MEM_SHARED != 0)
-    }
-
     #[must_use]
     pub fn subsystem(&self) -> u16 {
         self.image.subsystem

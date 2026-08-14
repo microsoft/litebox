@@ -960,7 +960,6 @@ pub(crate) fn load_image_section<Platform: crate::ShimPlatform, FS: ShimFS>(
 pub(crate) struct ImageSectionMetadata {
     pub(crate) transfer_address: usize,
     pub(crate) file_size: u32,
-    pub(crate) has_shared_sections: bool,
     pub(crate) subsystem: u32,
     pub(crate) subsystem_major_version: u16,
     pub(crate) subsystem_minor_version: u16,
@@ -988,7 +987,6 @@ pub(crate) fn image_section_metadata<FS: ShimFS>(
             .checked_add(parsed.entry_point_rva())
             .ok_or(PeImageAccessError::AddressOverflow)?,
         file_size,
-        has_shared_sections: parsed.has_shared_sections(),
         subsystem: u32::from(parsed.subsystem()),
         subsystem_major_version: parsed.major_subsystem_version(),
         subsystem_minor_version: parsed.minor_subsystem_version(),
