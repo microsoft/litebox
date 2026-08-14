@@ -289,6 +289,51 @@ static int test_blocking_read(void) {
     return close(fd) == 0 ? 0 : 4;
 }
 
+// Phase 10: consecutive blocking reads of an interval timer, with no poll in
+// between, must each be woken by their own expiration. This is the end-to-end
+// form of finding #1: after the first blocking read drains the count, the
+// second must still be woken by the next expiration rather than hanging. If it
+// hangs, the process alarm fires and the test fails.
+static int test_blocking_interval_reads(void) {
+    int fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (fd < 0) {
+        return 1;
+    }
+    if (arm_relative(fd, 15 * NS_PER_MS, 15 * NS_PER_MS) != 0) {
+        return 2;
+    }
+    for (int i = 0; i < 3; i++) {
+        uint64_t count = 0;
+        // A blocking read: no poll(), so it must be woken by the expiration.
+        if (read_count(fd, &count) != 0 || count < 1) {
+            return 3;
+        }
+    }
+    if (disarm(fd) != 0) {
+        return 4;
+    }
+    return close(fd) == 0 ? 0 : 5;
+}
+
+// Phase 11: CLOCK_BOOTTIME is a valid timerfd clock and must be accepted.
+static int test_boottime_clock(void) {
+    int fd = timerfd_create(CLOCK_BOOTTIME, TFD_NONBLOCK);
+    if (fd < 0) {
+        return 1;
+    }
+    if (arm_relative(fd, 15 * NS_PER_MS, 0) != 0) {
+        return 2;
+    }
+    if (poll_in(fd, 1000) != 0) {
+        return 3;
+    }
+    uint64_t count = 0;
+    if (read_count(fd, &count) != 0 || count != 1) {
+        return 4;
+    }
+    return close(fd) == 0 ? 0 : 5;
+}
+
 int main(void) {
     alarm(30);
 
@@ -318,6 +363,12 @@ int main(void) {
     }
     if (test_blocking_read() != 0) {
         return 90;
+    }
+    if (test_blocking_interval_reads() != 0) {
+        return 100;
+    }
+    if (test_boottime_clock() != 0) {
+        return 110;
     }
 
     alarm(0);

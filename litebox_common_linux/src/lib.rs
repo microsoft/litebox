@@ -49,6 +49,7 @@ pub const FUTEX_REQUEUE: i32 = 3;
 // linux/time.h
 pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
+pub const CLOCK_BOOTTIME: i32 = 7;
 pub const CLOCK_REALTIME_COARSE: i32 = 5;
 pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 

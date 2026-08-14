@@ -571,10 +571,10 @@ fn test_runner_broker_timerfd_with_rewriter() {
     Runner::new(&target, "broker_timerfd_rewriter")
         .broker_socket(&control_socket_path)
         .run();
-    // timerfd.c creates eight timer objects: one per phase that reaches
+    // timerfd.c creates ten timer objects: one per phase that reaches
     // timerfd_create. The invalid-clock phase creates none, and the dup phase
     // shares the original object, so neither adds to the count.
-    assert_eq!(broker_thread.next_close_object_count(), 8);
+    assert_eq!(broker_thread.next_close_object_count(), 10);
 
     broker_thread.join();
 }

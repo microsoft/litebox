@@ -79,8 +79,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         clockid: i32,
         flags: TfdFlags,
     ) -> Result<TimerFile<Platform>, Errno> {
+        // CLOCK_BOOTTIME behaves like CLOCK_MONOTONIC but also counts time spent
+        // suspended; it needs no capability and is a valid timerfd clock. The
+        // *_ALARM clocks are deliberately not accepted: they require
+        // CAP_WAKE_ALARM and can wake a suspended system, which is outside the
+        // sandbox's authority.
         if clockid != litebox_common_linux::CLOCK_REALTIME
             && clockid != litebox_common_linux::CLOCK_MONOTONIC
+            && clockid != litebox_common_linux::CLOCK_BOOTTIME
         {
             return Err(Errno::EINVAL);
         }
@@ -95,7 +101,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
 
 #[cfg(test)]
 mod tests {
-    use litebox_common_linux::{TfdFlags, errno::Errno};
+    use litebox_common_linux::{
+        CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, TfdFlags, errno::Errno,
+    };
 
     #[test]
     fn test_timerfd_requires_broker_control() {
@@ -104,6 +112,35 @@ mod tests {
         assert!(matches!(
             task.global.create_linux_timerfd(1, TfdFlags::empty()),
             Err(Errno::EIO)
+        ));
+    }
+
+    /// A supported clock passes validation and only then fails because the test
+    /// platform has no broker (EIO). CLOCK_BOOTTIME is a valid Linux timerfd
+    /// clock and must not be rejected with EINVAL. Reproduces finding #4.
+    #[test]
+    fn test_timerfd_accepts_supported_clocks() {
+        let task = crate::syscalls::tests::init_platform();
+
+        for clock in [CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME] {
+            assert!(
+                matches!(
+                    task.global.create_linux_timerfd(clock, TfdFlags::empty()),
+                    Err(Errno::EIO)
+                ),
+                "clock {clock} should be accepted (EIO without a broker), not rejected"
+            );
+        }
+    }
+
+    /// An unknown clock id is still rejected with EINVAL.
+    #[test]
+    fn test_timerfd_rejects_unknown_clock() {
+        let task = crate::syscalls::tests::init_platform();
+
+        assert!(matches!(
+            task.global.create_linux_timerfd(99, TfdFlags::empty()),
+            Err(Errno::EINVAL)
         ));
     }
 }

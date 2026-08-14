@@ -371,15 +371,21 @@ impl TimerReactor {
                 } else if let Some(timer) = self.timers.get(&id)
                     && flags.contains(epoll::EventFlags::IN)
                 {
-                    // The host timer expired: publish readable and cache it for
-                    // subsequent readiness queries until the guest drains it.
+                    // The host timer expired: cache readable for readiness
+                    // queries and wake any parked reader. Each expiration is a
+                    // fresh edge, but a reader that already drained the previous
+                    // one left the level at READ, so `publish` would coalesce
+                    // against the ring's unchanged value and never wake it.
+                    // `republish` forces the wakeup, exactly as the socket
+                    // reactor does when a readable-byte count grows without a
+                    // level change.
                     *timer
                         .snapshot
                         .lock()
                         .expect("Linux timerfd snapshot mutex poisoned") = ReadinessFlags::READ;
                     timer
                         .readiness
-                        .publish(ReadinessFlags::READ)
+                        .republish(ReadinessFlags::READ)
                         .map_err(ReactorFailure::Broker)?;
                 }
             }
@@ -567,6 +573,9 @@ fn clock_from_raw(clock_id: i32) -> BrokerResult<TimerfdClockId> {
     match clock_id {
         id if id == TimerfdClockId::Realtime as i32 => Ok(TimerfdClockId::Realtime),
         id if id == TimerfdClockId::Monotonic as i32 => Ok(TimerfdClockId::Monotonic),
+        id if id == TimerfdClockId::Boottime as i32 => Ok(TimerfdClockId::Boottime),
+        // The *_ALARM clocks require CAP_WAKE_ALARM and can wake a suspended
+        // system; they are intentionally not offered to sandboxed guests.
         _ => Err(BrokerError::UnsupportedOperation),
     }
 }
@@ -625,6 +634,8 @@ mod tests {
     fn clock_mapping_accepts_supported_clocks_and_rejects_others() {
         assert!(matches!(clock_from_raw(0), Ok(TimerfdClockId::Realtime)));
         assert!(matches!(clock_from_raw(1), Ok(TimerfdClockId::Monotonic)));
+        // CLOCK_BOOTTIME (7) is a valid Linux timerfd clock. Reproduces #4.
+        assert!(matches!(clock_from_raw(7), Ok(TimerfdClockId::Boottime)));
         // CLOCK_PROCESS_CPUTIME_ID (2) is not a supported timerfd clock here.
         assert_eq!(clock_from_raw(2), Err(BrokerError::UnsupportedOperation));
         assert_eq!(clock_from_raw(-1), Err(BrokerError::UnsupportedOperation));
