@@ -74,6 +74,7 @@ pub(crate) struct SectionHandleObject<Platform: ShimPlatform> {
 pub(crate) struct SectionObject<Platform: ShimPlatform> {
     fs_path: Option<String>,
     size: usize,
+    has_shared_image_sections: bool,
     attributes: SectionAllocationAttributes,
     protection: PageProtection,
     backing: SectionBacking,
@@ -305,10 +306,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER;
         }
 
-        let name = match self.read_section_name(object_attributes) {
-            Ok(name) => name,
-            Err(status) => return status,
-        };
         let attributes = if allocation_attributes.contains(SectionAllocationAttributes::SEC_RESERVE)
         {
             SectionAllocationAttributes::SEC_RESERVE
@@ -318,19 +315,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let section = Arc::new(SectionObject {
             fs_path: None,
             size,
+            has_shared_image_sections: false,
             attributes,
             protection,
             backing: SectionBacking::Pagefile,
             pagefile_view_active: AtomicBool::new(false),
             _platform: PhantomData,
         });
-        if let Some(name) = &name {
-            let status = self.process.object_manager.create_section(name, &section);
-            if status != NtStatus::SUCCESS {
-                return status;
-            }
-        }
-        self.publish_section_handle(section_handle, section, granted_access)
+        self.register_and_publish_section(
+            section_handle,
+            granted_access,
+            object_attributes,
+            section,
+        )
     }
 
     fn create_file_backed_section(
@@ -344,6 +341,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if allocation_attributes != SectionAllocationAttributes::SEC_IMAGE {
             // TODO(section-data-file): Add SEC_COMMIT data-file sections when the
             // page manager can preserve shared file-backed view semantics.
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw(),
+                allocation_attributes:% = format_args!("{:#x}", allocation_attributes.bits());
+                "Rejected unsupported file-backed section allocation attributes"
+            );
             return NtStatus::INVALID_PARAMETER;
         }
         let fs_path = match self.image_section_file_path(file_handle) {
@@ -357,13 +359,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             Err(_) => return NtStatus::INVALID_FILE_FOR_SECTION,
         };
-        let name = match self.read_section_name(object_attributes) {
-            Ok(name) => name,
-            Err(status) => return status,
-        };
         let section = Arc::new(SectionObject {
             fs_path: Some(fs_path),
             size: metadata.file_size as usize,
+            has_shared_image_sections: metadata.has_shared_sections,
             attributes: SectionAllocationAttributes::SEC_FILE
                 | SectionAllocationAttributes::SEC_IMAGE,
             protection: PageProtection::PAGE_EXECUTE_WRITECOPY,
@@ -371,6 +370,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             pagefile_view_active: AtomicBool::new(false),
             _platform: PhantomData,
         });
+        self.register_and_publish_section(
+            section_handle,
+            granted_access,
+            object_attributes,
+            section,
+        )
+    }
+
+    fn register_and_publish_section(
+        &self,
+        section_handle: MutPtr<Platform, Handle>,
+        granted_access: SectionAccess,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        section: Arc<SectionObject<Platform>>,
+    ) -> NtStatus {
+        let name = match self.read_section_name(object_attributes) {
+            Ok(name) => name,
+            Err(status) => return status,
+        };
         if let Some(name) = &name {
             let status = self.process.object_manager.create_section(name, &section);
             if status != NtStatus::SUCCESS {
@@ -454,12 +472,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             fs_path:% = fs_path;
             "NtOpenSection: creating section for KnownDlls image"
         );
-        let Ok(file_status) = self.fs.file_status(&fs_path) else {
-            return NtStatus::OBJECT_NAME_NOT_FOUND;
+        let metadata = match crate::loader::image_section_metadata(Arc::clone(&self.fs), &fs_path) {
+            Ok(metadata) => metadata,
+            Err(crate::loader::WindowsLoadError::Access(_)) => {
+                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            }
+            Err(_) => return NtStatus::INVALID_FILE_FOR_SECTION,
         };
         let section = Arc::new(SectionObject {
             fs_path: Some(fs_path),
-            size: file_status.size,
+            size: metadata.file_size as usize,
+            has_shared_image_sections: metadata.has_shared_sections,
             attributes: SectionAllocationAttributes::SEC_FILE
                 | SectionAllocationAttributes::SEC_IMAGE,
             protection: PageProtection::PAGE_EXECUTE_WRITECOPY,
@@ -565,7 +588,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 section_offset,
                 page_protection,
             ),
-            SectionBacking::ImageFile => self.map_image_section(request, &section, page_protection),
+            SectionBacking::ImageFile => {
+                self.map_image_section(request, &section, section_offset, page_protection)
+            }
         }
     }
 
@@ -879,11 +904,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         request: MapViewOfSectionParameters<Platform>,
         section: &SectionObject<Platform>,
+        section_offset: usize,
         page_protection: PageProtection,
     ) -> NtStatus {
         let Some(fs_path) = &section.fs_path else {
             return NtStatus::INVALID_FILE_FOR_SECTION;
         };
+        if section_offset != 0 {
+            litebox_util_log::debug!(fs_path:% = fs_path, section_offset; "Rejected image section view with a nonzero offset");
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        if section.has_shared_image_sections {
+            litebox_util_log::debug!(fs_path:% = fs_path; "Rejected image containing shared sections");
+            return NtStatus::NOT_SUPPORTED;
+        }
         if required_map_access(page_protection).contains(SectionAccess::MAP_WRITE) {
             litebox_util_log::debug!(
                 page_protection:% = format_args!("{:#x}", page_protection.bits()),
@@ -1012,6 +1046,7 @@ pub(crate) fn load_time_windows_shared_section<Platform: ShimPlatform>(
     Arc::new(SectionObject {
         fs_path: None,
         size: WINDOWS_SHARED_SECTION_SIZE,
+        has_shared_image_sections: false,
         attributes: SectionAllocationAttributes::SEC_COMMIT,
         protection: PageProtection::PAGE_READWRITE,
         backing: SectionBacking::CsrSharedSection { base },
