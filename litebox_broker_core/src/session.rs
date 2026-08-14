@@ -317,18 +317,29 @@ impl BrokerSession {
 
     /// Returns the current readiness of a broker-owned object.
     pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
+        // Event and pipe readiness are cheap atomic loads, so they resolve under
+        // the object lock. Socket and timer readiness reach into platform state
+        // behind their own mutexes, so their resources are cloned here and read
+        // after the object lock is released, matching the socket path.
+        enum DeferredReadiness {
+            Socket(Arc<crate::socket::SocketResource>),
+            Timer(Arc<crate::timer::TimerResource>),
+        }
         let object = self.authorized_object(handle, ObjectRights::WAIT)?;
-        let socket = {
+        let deferred = {
             let object = object.read();
             match &*object {
                 ObjectEntry::Event(event) => return Ok(event.readiness()),
                 ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
-                ObjectEntry::Socket(socket) => socket.resource(),
-                ObjectEntry::Timer(timerfd) => return Ok(timerfd.resource().readiness()),
+                ObjectEntry::Socket(socket) => DeferredReadiness::Socket(socket.resource()),
+                ObjectEntry::Timer(timer) => DeferredReadiness::Timer(timer.resource()),
                 ObjectEntry::Reserved => return Err(BrokerError::Internal),
             }
         };
-        Ok(socket.readiness())
+        Ok(match deferred {
+            DeferredReadiness::Socket(socket) => socket.readiness(),
+            DeferredReadiness::Timer(timer) => timer.readiness(),
+        })
     }
 
     /// Closes one object reference owned by this session.
