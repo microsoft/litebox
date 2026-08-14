@@ -576,8 +576,12 @@ impl From<litebox::event::counter::EventCounterError> for Errno {
     fn from(value: litebox::event::counter::EventCounterError) -> Self {
         match value {
             litebox::event::counter::EventCounterError::InvalidInput => Errno::EINVAL,
-            litebox::event::counter::EventCounterError::WouldBlock
-            | litebox::event::counter::EventCounterError::ResourceExhausted => Errno::EAGAIN,
+            litebox::event::counter::EventCounterError::WouldBlock => Errno::EAGAIN,
+            // A resource limit or allocation failure is not retryable; EAGAIN
+            // would tell a caller to spin on `eventfd2`/read/write against a
+            // permanent condition. ENOMEM is the documented eventfd2 exhaustion
+            // errno and honestly covers the folded out-of-memory case.
+            litebox::event::counter::EventCounterError::ResourceExhausted => Errno::ENOMEM,
             litebox::event::counter::EventCounterError::PermissionDenied => Errno::EACCES,
             litebox::event::counter::EventCounterError::Io
             | litebox::event::counter::EventCounterError::Unavailable => Errno::EIO,
