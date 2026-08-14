@@ -3388,8 +3388,15 @@ mod tests {
                 .get(&reused)
                 .is_none_or(|state| !alloc::sync::Arc::ptr_eq(state, &original))
         );
+        // AArch64 retains code-range metadata so a mapping can be rewritten if
+        // it gains execute permission after its fd closes. The common portion
+        // above still verifies state lifetime and fd-reuse isolation on every
+        // architecture.
+        #[cfg(target_arch = "aarch64")]
         task.sys_mprotect(mapped, 1, ProtFlags::PROT_READ_EXEC)
             .unwrap();
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = mapped;
     }
 
     #[test]
