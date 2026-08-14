@@ -23,7 +23,7 @@ impl Task {
     ///
     /// OP-TEE chooses user VAs bottom-up. Matching that order matters because
     /// `ldelf`'s sequential segment allocations with padding rely on it, while
-    /// LiteBox's default VA placement is top-down.
+    /// LiteBox's `get_unmmaped_area` searches for free VAs top-down by default.
     fn find_bottom_up_gap(&self, len: usize) -> Option<usize> {
         debug_assert!(len.is_multiple_of(PAGE_SIZE));
         let task_addr_min = <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN;
