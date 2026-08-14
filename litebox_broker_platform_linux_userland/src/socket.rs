@@ -991,6 +991,8 @@ impl Reactor {
             .sessions
             .get(&session_id)
             .ok_or(BrokerError::Internal)?;
+        // Pending records can outlive connector descriptors, so bound this
+        // metadata independently using the configured socket budgets.
         if session.pending_guest_connections >= self.max_sockets_per_session
             || self.tcp.pending_guest_connections.len() >= self.max_sockets
         {
