@@ -576,6 +576,19 @@ impl ReactorClient {
         receive.recv().unwrap()
     }
 
+    #[cfg(test)]
+    fn expire_pending_guest_connections(&self) {
+        let (response, receive) = sync_channel(1);
+        self.commands
+            .send(ReactorCommand::ExpireDeadlinedState {
+                now: Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME + Duration::from_secs(1),
+                response,
+            })
+            .unwrap();
+        self.signal().unwrap();
+        receive.recv().unwrap();
+    }
+
     fn close_session(&self, session_id: SessionId) {
         let (response, receive) = sync_channel(1);
         if self
@@ -733,6 +746,11 @@ enum ReactorCommand {
     #[cfg(test)]
     RetainedConnectorCount {
         response: SyncSender<usize>,
+    },
+    #[cfg(test)]
+    ExpireDeadlinedState {
+        now: Instant,
+        response: SyncSender<()>,
     },
     Stop {
         response: SyncSender<()>,
@@ -1091,6 +1109,7 @@ impl Reactor {
     }
 
     fn retire_session_connectors(&mut self, session_id: SessionId) {
+        let discard_deadline = Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME;
         let mut released = 0;
         for connection in self
             .tcp
@@ -1102,7 +1121,7 @@ impl Reactor {
                 let _ = sockopt::set_socket_linger(&connector, None);
                 drop(connector);
                 connection.discard_on_accept = true;
-                connection.discard_deadline = None;
+                connection.discard_deadline = Some(discard_deadline);
                 released += 1;
             }
         }
@@ -1854,6 +1873,11 @@ impl Reactor {
                 #[cfg(test)]
                 ReactorCommand::RetainedConnectorCount { response } => {
                     let _ = response.send(self.retained_connectors);
+                }
+                #[cfg(test)]
+                ReactorCommand::ExpireDeadlinedState { now, response } => {
+                    self.expire_deadlined_state(now);
+                    let _ = response.send(());
                 }
                 ReactorCommand::Stop { response } => {
                     self.sockets.clear();
@@ -4008,13 +4032,14 @@ mod tests {
         drop(connector_session);
         assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
         assert_eq!(provider.reactor.retained_connector_count(), 0);
+        provider.reactor.expire_pending_guest_connections();
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
         wait_for_readiness(&publications, listener, ReadinessFlags::READ);
         assert!(matches!(
             litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone(),),
             Err(BrokerError::WouldBlock)
         ));
         assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
-        assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
 
         let final_connector_session = broker
             .create_session(CallerCredential::Unauthenticated)
