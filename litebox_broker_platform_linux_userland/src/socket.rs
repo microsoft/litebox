@@ -434,7 +434,7 @@ impl ReactorClient {
                     wake: reactor_wake,
                     commands: receiver,
                     sockets,
-                    tcp: BrokerTcpState::default(),
+                    tcp: ReactorTcpState::default(),
                     sessions: HashMap::new(),
                     max_sockets,
                     max_sockets_per_session,
@@ -789,8 +789,8 @@ struct Reactor {
     wake: Arc<OwnedFd>,
     commands: Receiver<ReactorCommand>,
     sockets: HashMap<u64, SocketEntry>,
-    tcp: BrokerTcpState,
-    sessions: HashMap<SessionId, SessionSocketState>,
+    tcp: ReactorTcpState,
+    sessions: HashMap<SessionId, ReactorSessionState>,
     max_sockets: usize,
     max_sockets_per_session: usize,
     retained_connectors: usize,
@@ -823,18 +823,18 @@ struct SocketEntry {
     tcp_keep_alive: bool,
 }
 
-/// The broker-wide guest TCP namespace and pending guest-to-guest connections.
+/// Reactor-owned realization of guest TCP bindings and pending connections.
 #[derive(Default)]
-struct BrokerTcpState {
-    bindings: HashMap<u16, GuestPortBinding>,
+struct ReactorTcpState {
+    bindings: HashMap<u16, ReactorTcpBinding>,
     pending_guest_connections: HashMap<(SocketAddrV4, SocketAddrV4), PendingGuestTcpConnection>,
 }
 
-/// Per-session socket ownership, quota, and teardown state.
+/// Reactor-side per-session socket, retained-descriptor, and teardown state.
 ///
 /// Sessions are ownership domains, not guest network namespaces.
 #[derive(Default)]
-struct SessionSocketState {
+struct ReactorSessionState {
     live_sockets: usize,
     pending_guest_connections: usize,
     retained_connectors: usize,
@@ -851,7 +851,7 @@ struct PendingGuestTcpConnection {
 }
 
 #[derive(Clone, Copy)]
-struct GuestPortBinding {
+struct ReactorTcpBinding {
     socket_id: u64,
     guest_address: SocketAddrV4,
     host_address: Option<SocketAddrV4>,
@@ -864,14 +864,14 @@ enum SocketKind {
     Udp,
 }
 
-impl BrokerTcpState {
+impl ReactorTcpState {
     fn reserve_binding(&mut self) -> BrokerResult<()> {
         self.bindings
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)
     }
 
-    fn insert_binding(&mut self, port: u16, binding: GuestPortBinding) -> BrokerResult<()> {
+    fn insert_binding(&mut self, port: u16, binding: ReactorTcpBinding) -> BrokerResult<()> {
         if binding.guest_address.port() != port || self.bindings.contains_key(&port) {
             return Err(BrokerError::Internal);
         }
@@ -889,7 +889,7 @@ impl BrokerTcpState {
         }
     }
 
-    fn guest_binding(&self, address: SocketAddrV4) -> Option<GuestPortBinding> {
+    fn guest_binding(&self, address: SocketAddrV4) -> Option<ReactorTcpBinding> {
         if !address.ip().is_loopback() {
             return None;
         }
@@ -938,7 +938,7 @@ impl BrokerTcpState {
     }
 }
 
-fn retain_session_state(state: &SessionSocketState) -> bool {
+fn retain_session_state(state: &ReactorSessionState) -> bool {
     !state.closing
         || state.live_sockets != 0
         || state.pending_guest_connections != 0
@@ -1312,7 +1312,7 @@ impl Reactor {
         let guest_address = SocketAddrV4::new(*requested_address.ip(), guest_port);
         self.tcp.insert_binding(
             guest_port,
-            GuestPortBinding {
+            ReactorTcpBinding {
                 socket_id: id,
                 guest_address,
                 host_address: None,
@@ -3303,7 +3303,7 @@ mod tests {
         let second_listener = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5001);
         let first_guest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1000);
         let second_guest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1001);
-        let mut tcp = BrokerTcpState::default();
+        let mut tcp = ReactorTcpState::default();
         for (listener, guest) in [
             (first_listener, first_guest),
             (second_listener, second_guest),
