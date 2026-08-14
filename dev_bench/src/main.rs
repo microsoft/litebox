@@ -422,7 +422,6 @@ const BENCHMARKS: &[(&str, BenchFn)] = benchtable![
     rewriter_node,
     run_rewritten_node,
     rewriter_iperf3,
-    run_rewritten_iperf3,
     //
 ];
 
@@ -650,6 +649,10 @@ fn rewriter_iperf3(ctx: BenchCtx) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    dead_code,
+    reason = "requires explicit broker TCP publication from a later PR"
+)]
 fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
     let BenchCtx {
         sh,
