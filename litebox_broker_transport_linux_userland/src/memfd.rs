@@ -30,10 +30,12 @@ use rustix::net::{
     SendAncillaryMessage, SendFlags,
 };
 
-use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, WaitableSharedMemory, memory_permits_byte_range, memory_permits_u32,
-    memory_permits_u64,
+    CONTROL_RING_MEMORY_SIZE, MemoryAccessPolicy, WaitableSharedMemory,
+};
+#[cfg(test)]
+use litebox_broker_transport::control_ring::{
+    memory_permits_byte_range, memory_permits_u32, memory_permits_u64,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 
@@ -44,8 +46,6 @@ use crate::unix_io::{
 const REQUIRED_MEMFD_SEALS: SealFlags = SealFlags::from_bits_retain(
     SealFlags::GROW.bits() | SealFlags::SHRINK.bits() | SealFlags::SEAL.bits(),
 );
-const _: () = assert!(SHARED_BUFFER_POOL_SIZE != CONTROL_RING_MEMORY_SIZE);
-
 /// Linux memfd-backed shared memory usable by broker transports.
 pub struct MemfdSharedMemory {
     fd: OwnedFd,
@@ -56,47 +56,6 @@ pub struct MemfdSharedMemory {
 struct MappedRegion {
     address: NonNull<u8>,
     length: usize,
-}
-
-/// Restricts each memfd to one non-overlapping portable access model.
-///
-/// Shared-buffer memfds permit only byte copies. Control-ring memfds permit
-/// byte and typed-word operations only at offsets defined by the ring ABI.
-#[derive(Clone, Copy)]
-enum MemoryAccessPolicy {
-    Bytes,
-    ControlRing,
-}
-
-impl MemoryAccessPolicy {
-    const fn for_length(length: usize) -> Self {
-        if length == CONTROL_RING_MEMORY_SIZE {
-            Self::ControlRing
-        } else {
-            Self::Bytes
-        }
-    }
-
-    const fn permits_byte_range(self, offset: usize, length: usize) -> bool {
-        match self {
-            Self::Bytes => true,
-            Self::ControlRing => memory_permits_byte_range(offset, length),
-        }
-    }
-
-    const fn permits_u32(self, offset: usize) -> bool {
-        match self {
-            Self::Bytes => false,
-            Self::ControlRing => memory_permits_u32(offset),
-        }
-    }
-
-    const fn permits_u64(self, offset: usize) -> bool {
-        match self {
-            Self::Bytes => false,
-            Self::ControlRing => memory_permits_u64(offset),
-        }
-    }
 }
 
 // SAFETY: Moving or sharing this owner does not move or invalidate its OS
@@ -282,8 +241,17 @@ fn futex_wake_one(address: *mut u32) -> IoResult<()> {
 }
 
 impl MemfdSharedMemory {
-    /// Creates and maps a sealed memfd with `length` bytes.
+    /// Creates and maps a sealed byte-copy memfd with `length` bytes.
     pub fn create(length: usize) -> IoResult<Self> {
+        Self::create_with_policy(length, MemoryAccessPolicy::Bytes)
+    }
+
+    /// Creates and maps a sealed memfd for one control ring.
+    pub fn create_control_ring() -> IoResult<Self> {
+        Self::create_with_policy(CONTROL_RING_MEMORY_SIZE, MemoryAccessPolicy::ControlRing)
+    }
+
+    fn create_with_policy(length: usize, policy: MemoryAccessPolicy) -> IoResult<Self> {
         if length == 0 {
             return Err(invalid_data("shared memory cannot be empty"));
         }
@@ -298,14 +266,31 @@ impl MemfdSharedMemory {
                 .map_err(|_| invalid_data("shared-memory length exceeds u64"))?,
         )?;
         fcntl_add_seals(&fd, REQUIRED_MEMFD_SEALS)?;
-        Self::map(fd, length)
+        Self::map(fd, length, policy)
     }
 
-    /// Validates and maps a received memfd with `expected_length` bytes.
+    /// Validates and maps a received byte-copy memfd with `expected_length` bytes.
     ///
     /// The descriptor must have the expected nonzero size sealed against
     /// changes.
     pub fn from_received_fd(fd: OwnedFd, expected_length: usize) -> IoResult<Self> {
+        Self::from_received_fd_with_policy(fd, expected_length, MemoryAccessPolicy::Bytes)
+    }
+
+    /// Validates and maps a received control-ring memfd.
+    pub fn control_ring_from_received_fd(fd: OwnedFd) -> IoResult<Self> {
+        Self::from_received_fd_with_policy(
+            fd,
+            CONTROL_RING_MEMORY_SIZE,
+            MemoryAccessPolicy::ControlRing,
+        )
+    }
+
+    fn from_received_fd_with_policy(
+        fd: OwnedFd,
+        expected_length: usize,
+        policy: MemoryAccessPolicy,
+    ) -> IoResult<Self> {
         if expected_length == 0 {
             return Err(invalid_data("shared memory cannot be empty"));
         }
@@ -322,10 +307,10 @@ impl MemfdSharedMemory {
                 "shared-memory length does not match expected size",
             ));
         }
-        Self::map(fd, length)
+        Self::map(fd, length, policy)
     }
 
-    fn map(fd: OwnedFd, length: usize) -> IoResult<Self> {
+    fn map(fd: OwnedFd, length: usize, policy: MemoryAccessPolicy) -> IoResult<Self> {
         if length > isize::MAX as usize {
             return Err(invalid_data(
                 "shared-memory length exceeds pointer offset range",
@@ -349,7 +334,7 @@ impl MemfdSharedMemory {
         Ok(Self {
             fd,
             mapping: MappedRegion { address, length },
-            policy: MemoryAccessPolicy::for_length(length),
+            policy,
         })
     }
 }
@@ -482,6 +467,15 @@ pub fn receive_memfd(
 ) -> IoResult<MemfdSharedMemory> {
     let fd = with_read_deadline(stream, deadline, receive_fd)?;
     MemfdSharedMemory::from_received_fd(fd, expected_length)
+}
+
+/// Receives, validates, and maps one control-ring memfd.
+pub fn receive_control_ring_memfd(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+) -> IoResult<MemfdSharedMemory> {
+    let fd = with_read_deadline(stream, deadline, receive_fd)?;
+    MemfdSharedMemory::control_ring_from_received_fd(fd)
 }
 
 fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
@@ -644,10 +638,9 @@ mod tests {
 
     #[test]
     fn mappings_enforce_control_ring_typed_access() {
-        let first = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
-        let second = MemfdSharedMemory::from_received_fd(
+        let first = MemfdSharedMemory::create_control_ring().unwrap();
+        let second = MemfdSharedMemory::control_ring_from_received_fd(
             first.fd.as_fd().try_clone_to_owned().unwrap(),
-            CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
         let sequence_offset = (0..CONTROL_RING_MEMORY_SIZE)
@@ -727,7 +720,7 @@ mod tests {
 
     #[test]
     fn futex_wait_returns_without_peer_cooperation() {
-        let memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let memory = MemfdSharedMemory::create_control_ring().unwrap();
         let epoch_offset = (0..CONTROL_RING_MEMORY_SIZE)
             .find(|offset| memory_permits_u32(*offset))
             .unwrap();
@@ -740,7 +733,7 @@ mod tests {
 
     #[test]
     fn peer_descriptor_writes_are_read_as_untrusted_snapshots() {
-        let memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let memory = MemfdSharedMemory::create_control_ring().unwrap();
         let peer_fd = memory.as_fd().try_clone_to_owned().unwrap();
         let sequence_offset = (0..CONTROL_RING_MEMORY_SIZE)
             .find(|offset| memory_permits_u64(*offset))
@@ -802,7 +795,7 @@ mod tests {
 
         let fd = memfd_create("litebox-broker-shm-test", MemfdFlags::CLOEXEC).unwrap();
         assert_eq!(
-            MemfdSharedMemory::map(fd, isize::MAX as usize + 1)
+            MemfdSharedMemory::map(fd, isize::MAX as usize + 1, MemoryAccessPolicy::Bytes,)
                 .err()
                 .expect("oversized mapping should fail")
                 .kind(),
@@ -840,12 +833,12 @@ mod tests {
 
     #[test]
     fn transfers_exact_sealed_control_ring_mapping() {
-        let memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
+        let memory = MemfdSharedMemory::create_control_ring().unwrap();
         let ring = ControlRing::new(memory).unwrap();
         let (mut receiver, mut sender) = UnixStream::pair().unwrap();
 
         send_memfd(&mut sender, ring.memory(), None).unwrap();
-        let mapped = receive_memfd(&mut receiver, CONTROL_RING_MEMORY_SIZE, None).unwrap();
+        let mapped = receive_control_ring_memfd(&mut receiver, None).unwrap();
         let mapped_ring = ControlRing::new(mapped).unwrap();
         ring.memory().write(13, &[1, 2, 3]).unwrap();
         let mut bytes = [0; 3];
@@ -861,10 +854,9 @@ mod tests {
 
     #[test]
     fn shared_futex_wakeup_prevents_missed_cross_mapping_work() {
-        let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
-        let broker_memory = MemfdSharedMemory::from_received_fd(
+        let local_memory = MemfdSharedMemory::create_control_ring().unwrap();
+        let broker_memory = MemfdSharedMemory::control_ring_from_received_fd(
             local_memory.fd.as_fd().try_clone_to_owned().unwrap(),
-            CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
         let mut producer = ControlRing::new(local_memory)

@@ -527,8 +527,7 @@ mod tests {
         LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
     };
     use litebox_broker_transport::control_ring::{
-        CONTROL_RING_MEMORY_SIZE, CONTROL_RING_NOTIFICATION_SLOT_COUNT, CONTROL_RING_SLOT_COUNT,
-        LocalControlRingEndpoints,
+        CONTROL_RING_NOTIFICATION_SLOT_COUNT, CONTROL_RING_SLOT_COUNT, LocalControlRingEndpoints,
     };
 
     use crate::unix_socket::local::{
@@ -546,10 +545,9 @@ mod tests {
         ControlRing<MemfdSharedMemory>,
         ControlRing<MemfdSharedMemory>,
     ) {
-        let first = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
-        let second = MemfdSharedMemory::from_received_fd(
+        let first = MemfdSharedMemory::create_control_ring().unwrap();
+        let second = MemfdSharedMemory::control_ring_from_received_fd(
             first.as_fd().try_clone_to_owned().unwrap(),
-            CONTROL_RING_MEMORY_SIZE,
         )
         .unwrap();
         (
