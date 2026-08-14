@@ -20,6 +20,10 @@ use p384::{
     elliptic_curve::sec1::ToEncodedPoint,
 };
 use spin::Once;
+use zerocopy::{
+    Immutable, IntoBytes,
+    byteorder::{LittleEndian, U32},
+};
 use zeroize::Zeroizing;
 
 const IDENTITY_SIGNING_PRIVATE_KEY_LEN: usize = 48;
@@ -29,6 +33,7 @@ const KEY_VARIANT_MASK: u64 = 0xff;
 const KEY_ALGORITHM_VALUE_MASK: u64 = KEY_ALGORITHM_MASK | KEY_VARIANT_MASK;
 const MAX_KEYGEN_ATTEMPT: usize = 256;
 const IDKS_ENDORSEMENT_DATA_MAX_SIZE: usize = 8 * 1024 * 1024;
+const IDKS_NONCE_MAX_SIZE: usize = 64;
 const IDKS_ENDORSEMENT_MAGIC: &[u8; 4] = b"IDKS";
 const IDKS_ENDORSEMENT_VERSION: u32 = 1;
 #[cfg(not(feature = "idks-production"))]
@@ -36,6 +41,13 @@ const IDKS_DEBUG_FLAG: u8 = 1;
 #[cfg(feature = "idks-production")]
 const IDKS_DEBUG_FLAG: u8 = 0;
 const ISOLATION_SOLUTION: &[u8] = b"LVBS";
+const TRUSTLET_PROPERTY_UUID: &[u8] = b"TRUSTLET_PROPERTY_UUID";
+const TRUSTLET_PROPERTY_SVN: &[u8] = b"TRUSTLET_PROPERTY_SVN";
+const TRUSTLET_PROPERTY_TA_DIGEST: &[u8] = b"TRUSTLET_PROPERTY_TA_DIGEST";
+const TRUSTLET_PROPERTY_DEBUGGED: &[u8] = b"TRUSTLET_PROPERTY_DEBUGGED";
+const TRUSTLET_PROPERTY_ISOLATION_SOLUTION: &[u8] = b"TRUSTLET_PROPERTY_ISOLATION_SOLUTION";
+const KEYISO_SIGNATURE_ALGORITHM_ID: &[u8] = b"ECDSA_P384";
+const KEYISO_SIGNATURE_HASH_ALGORITHM: &[u8] = b"SHA384";
 pub(crate) const IDKS_ENDORSEMENT_SIGNATURE_LEN: usize = 96;
 const IDKS_ENDORSEMENT_METADATA_LEN: usize = IDKS_ENDORSEMENT_MAGIC.len()
     + size_of::<u32>()
@@ -45,6 +57,107 @@ const IDKS_ENDORSEMENT_METADATA_LEN: usize = IDKS_ENDORSEMENT_MAGIC.len()
     + size_of::<u8>()
     + ISOLATION_SOLUTION.len();
 pub(crate) struct IdksPta;
+
+type LeU32 = U32<LittleEndian>;
+
+const _: () = assert!(size_of::<TeeUuid>() == 16);
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum KeyIsoMagic {
+    AttestationStatement = 0x4d53_414b,
+    KeyAttestationHeader = 0x4841_4b4b,
+    TrustletReport = 0x4d52_544b,
+    TrustletInformation = 0x4954_414b,
+    TrustletProperty = 0x5054_414b,
+    SignatureParams = 0x5053_414b,
+    EccSignatureParams = 0x5045_414b,
+    Signature = 0x5353_414b,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum KeyIsoVersion {
+    V1 = 1,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum KeyIsoClaimType {
+    KeyAttestation = 0x8000_0001,
+}
+
+#[derive(Immutable, IntoBytes)]
+#[repr(C)]
+struct KeyIsoAttestationStatement {
+    magic: LeU32,
+    version: LeU32,
+    claim_type: LeU32,
+}
+
+#[derive(Immutable, IntoBytes)]
+#[repr(C)]
+struct KeyIsoKeyAttestationHeader {
+    magic: LeU32,
+    version: LeU32,
+    cb_ta_data: LeU32,
+    cb_nonce: LeU32,
+    cb_report: LeU32,
+    c_signature_parameters: LeU32,
+    c_signatures: LeU32,
+}
+
+#[derive(Immutable, IntoBytes)]
+#[repr(C)]
+struct KeyIsoTrustletReport {
+    magic: LeU32,
+    report_size: LeU32,
+    offset_to_var_data: LeU32,
+    version: LeU32,
+    cb_trustlet_information: LeU32,
+}
+
+#[derive(Immutable, IntoBytes)]
+#[repr(C)]
+struct KeyIsoAttestationTrustletInformation {
+    magic: LeU32,
+    version: LeU32,
+    c_properties: LeU32,
+}
+
+#[derive(Immutable, IntoBytes)]
+#[repr(C)]
+struct KeyIsoAttestationTrustletProperty {
+    magic: LeU32,
+    version: LeU32,
+    cb_property_name: LeU32,
+    cb_property: LeU32,
+}
+
+#[derive(Immutable, IntoBytes)]
+#[repr(C)]
+struct KeyIsoAttestationSignatureParams {
+    magic: LeU32,
+    version: LeU32,
+    cb_alg_id: LeU32,
+    cb_alg_params: LeU32,
+    cb_hash_alg: LeU32,
+}
+
+#[derive(Immutable, IntoBytes)]
+#[repr(C)]
+struct KeyIsoAttestationEccSignatureParams {
+    magic: LeU32,
+    version: LeU32,
+}
+
+#[derive(Immutable, IntoBytes)]
+#[repr(C)]
+struct KeyIsoAttestationSignature {
+    magic: LeU32,
+    version: LeU32,
+    cb_signature: LeU32,
+}
 
 #[derive(Clone, Copy, TryFromPrimitive)]
 #[repr(u32)]
@@ -80,7 +193,7 @@ impl IdksPta {
     fn endorse_data(task: &Task, params: &mut UteeParams) -> Result<(), TeeResult> {
         use TeeParamType::{MemrefInput, MemrefOutput, None};
 
-        if !params.has_types([MemrefInput, MemrefOutput, None, None]) {
+        if !params.has_types([MemrefInput, MemrefInput, MemrefOutput, None]) {
             return Err(TeeResult::BadParameters);
         }
 
@@ -96,19 +209,31 @@ impl IdksPta {
             return Err(TeeResult::BadParameters);
         }
 
-        let (endorsement_addr, endorsement_size) = params
+        let (nonce_addr, nonce_size) = params
             .get_values(1)
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
-        let required_endorsement_size = ta_data_size
-            .checked_add(IDKS_ENDORSEMENT_METADATA_LEN)
+        let nonce_size = usize::try_from(nonce_size).map_err(|_| TeeResult::BadParameters)?;
+        if nonce_size > IDKS_NONCE_MAX_SIZE {
+            return Err(TeeResult::BadParameters);
+        }
+        if nonce_size > 0 && nonce_addr == 0 {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let (endorsement_addr, endorsement_size) = params
+            .get_values(2)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let required_endorsement_size = KeyIsoClaimLayout::new(ta_data_size, nonce_size)
+            .map(|layout| layout.claim)
             .and_then(|size| size.checked_add(IDKS_ENDORSEMENT_SIGNATURE_LEN))
             .ok_or(TeeResult::BadParameters)?;
         let required_endorsement_size_u64 =
             u64::try_from(required_endorsement_size).map_err(|_| TeeResult::BadParameters)?;
         if endorsement_size < required_endorsement_size_u64 {
             params
-                .set_values(1, endorsement_addr, required_endorsement_size_u64)
+                .set_values(2, endorsement_addr, required_endorsement_size_u64)
                 .map_err(|_| TeeResult::BadParameters)?;
             return Err(TeeResult::ShortBuffer);
         }
@@ -125,24 +250,43 @@ impl IdksPta {
             .to_owned_slice(ta_data_size)
             .ok_or(TeeResult::BadParameters)?
         };
-        let mut endorsement =
-            build_endorsement_data(&ta_data, &task.ta_app_id, task.ta_svn, &task.ta_digest)
-                .ok_or(TeeResult::BadParameters)?;
+        let nonce = if nonce_size == 0 {
+            Vec::new().into_boxed_slice()
+        } else {
+            UserConstPtr::<u8>::from_usize(
+                usize::try_from(nonce_addr).map_err(|_| TeeResult::BadParameters)?,
+            )
+            .to_owned_slice(nonce_size)
+            .ok_or(TeeResult::BadParameters)?
+        };
+        let mut endorsement = build_keyiso_claim(
+            &ta_data,
+            &nonce,
+            &task.ta_app_id,
+            task.ta_svn,
+            &task.ta_digest,
+        )
+        .ok_or(TeeResult::GenericError)?;
         let key_pair = get_identity_signing_key_pair().map_err(|_| TeeResult::GenericError)?;
         let signature = endorse_data_with(&endorsement, &key_pair.private_key)
             .map_err(|_| TeeResult::GenericError)?;
         endorsement.extend_from_slice(&signature);
+        if endorsement.len() != required_endorsement_size {
+            return Err(TeeResult::GenericError);
+        }
         UserMutPtr::<u8>::from_usize(
             usize::try_from(endorsement_addr).map_err(|_| TeeResult::BadParameters)?,
         )
         .copy_from_slice(0, &endorsement)
         .ok_or(TeeResult::AccessDenied)?;
         params
-            .set_values(1, endorsement_addr, required_endorsement_size_u64)
+            .set_values(2, endorsement_addr, required_endorsement_size_u64)
             .map_err(|_| TeeResult::BadParameters)
     }
 }
 
+// TODO: drop this if we decide to use the KeyIso claim structure
+#[allow(dead_code)]
 fn build_endorsement_data(
     ta_data: &[u8],
     ta_uuid: &TeeUuid,
@@ -160,6 +304,167 @@ fn build_endorsement_data(
     endorsement.extend_from_slice(ta_digest);
     endorsement.push(IDKS_DEBUG_FLAG);
     endorsement.extend_from_slice(ISOLATION_SOLUTION);
+    Some(endorsement)
+}
+
+struct KeyIsoClaimLayout {
+    trustlet_information: usize,
+    report: usize,
+    claim: usize,
+}
+
+impl KeyIsoClaimLayout {
+    fn new(ta_data_len: usize, nonce_len: usize) -> Option<Self> {
+        let property_names_size = TRUSTLET_PROPERTY_UUID
+            .len()
+            .checked_add(TRUSTLET_PROPERTY_SVN.len())?
+            .checked_add(TRUSTLET_PROPERTY_TA_DIGEST.len())?
+            .checked_add(TRUSTLET_PROPERTY_DEBUGGED.len())?
+            .checked_add(TRUSTLET_PROPERTY_ISOLATION_SOLUTION.len())?;
+        let property_values_size = size_of::<TeeUuid>()
+            .checked_add(size_of::<u32>())?
+            .checked_add(TA_DIGEST_LEN)?
+            .checked_add(size_of::<u8>())?
+            .checked_add(ISOLATION_SOLUTION.len())?;
+        let properties_size = 5usize
+            .checked_mul(size_of::<KeyIsoAttestationTrustletProperty>())?
+            .checked_add(property_names_size)?
+            .checked_add(property_values_size)?;
+        let trustlet_information_size =
+            size_of::<KeyIsoAttestationTrustletInformation>().checked_add(properties_size)?;
+        let report_size =
+            size_of::<KeyIsoTrustletReport>().checked_add(trustlet_information_size)?;
+        let claim_size = size_of::<KeyIsoAttestationStatement>()
+            .checked_add(size_of::<KeyIsoKeyAttestationHeader>())?
+            .checked_add(ta_data_len)?
+            .checked_add(nonce_len)?
+            .checked_add(report_size)?
+            .checked_add(size_of::<KeyIsoAttestationSignatureParams>())?
+            .checked_add(KEYISO_SIGNATURE_ALGORITHM_ID.len())?
+            .checked_add(size_of::<KeyIsoAttestationEccSignatureParams>())?
+            .checked_add(KEYISO_SIGNATURE_HASH_ALGORITHM.len())?
+            .checked_add(size_of::<KeyIsoAttestationSignature>())?;
+        Some(Self {
+            trustlet_information: trustlet_information_size,
+            report: report_size,
+            claim: claim_size,
+        })
+    }
+}
+
+/// Serializes the KeyIso claim prefix covered by the identity-key signature.
+///
+/// Variable data immediately follows its C-compatible zerocopy header. The signature header is
+/// included in this returned prefix; only the signature bytes are appended after signing.
+fn build_keyiso_claim(
+    ta_data: &[u8],
+    nonce: &[u8],
+    ta_uuid: &TeeUuid,
+    ta_svn: u32,
+    ta_digest: &TaDigest,
+) -> Option<Vec<u8>> {
+    let uuid = ta_uuid.to_le_bytes();
+    let svn = ta_svn.to_le_bytes();
+    let debugged = [IDKS_DEBUG_FLAG];
+    let properties: [(&[u8], &[u8]); 5] = [
+        (TRUSTLET_PROPERTY_UUID, &uuid),
+        (TRUSTLET_PROPERTY_SVN, &svn),
+        (TRUSTLET_PROPERTY_TA_DIGEST, ta_digest),
+        (TRUSTLET_PROPERTY_DEBUGGED, &debugged),
+        (TRUSTLET_PROPERTY_ISOLATION_SOLUTION, ISOLATION_SOLUTION),
+    ];
+    let layout = KeyIsoClaimLayout::new(ta_data.len(), nonce.len())?;
+
+    let mut endorsement = Vec::with_capacity(layout.claim);
+    endorsement.extend_from_slice(
+        KeyIsoAttestationStatement {
+            magic: LeU32::new(KeyIsoMagic::AttestationStatement as u32),
+            version: LeU32::new(KeyIsoVersion::V1 as u32),
+            claim_type: LeU32::new(KeyIsoClaimType::KeyAttestation as u32),
+        }
+        .as_bytes(),
+    );
+    endorsement.extend_from_slice(
+        KeyIsoKeyAttestationHeader {
+            magic: LeU32::new(KeyIsoMagic::KeyAttestationHeader as u32),
+            version: LeU32::new(KeyIsoVersion::V1 as u32),
+            cb_ta_data: LeU32::new(ta_data.len().try_into().ok()?),
+            cb_nonce: LeU32::new(nonce.len().try_into().ok()?),
+            cb_report: LeU32::new(layout.report.try_into().ok()?),
+            c_signature_parameters: LeU32::new(1),
+            c_signatures: LeU32::new(1),
+        }
+        .as_bytes(),
+    );
+    endorsement.extend_from_slice(ta_data);
+    endorsement.extend_from_slice(nonce);
+    endorsement.extend_from_slice(
+        KeyIsoTrustletReport {
+            magic: LeU32::new(KeyIsoMagic::TrustletReport as u32),
+            report_size: LeU32::new(layout.report.try_into().ok()?),
+            offset_to_var_data: LeU32::new(size_of::<KeyIsoTrustletReport>().try_into().ok()?),
+            version: LeU32::new(KeyIsoVersion::V1 as u32),
+            cb_trustlet_information: LeU32::new(layout.trustlet_information.try_into().ok()?),
+        }
+        .as_bytes(),
+    );
+    endorsement.extend_from_slice(
+        KeyIsoAttestationTrustletInformation {
+            magic: LeU32::new(KeyIsoMagic::TrustletInformation as u32),
+            version: LeU32::new(KeyIsoVersion::V1 as u32),
+            c_properties: LeU32::new(properties.len().try_into().ok()?),
+        }
+        .as_bytes(),
+    );
+
+    for (name, value) in properties {
+        endorsement.extend_from_slice(
+            KeyIsoAttestationTrustletProperty {
+                magic: LeU32::new(KeyIsoMagic::TrustletProperty as u32),
+                version: LeU32::new(KeyIsoVersion::V1 as u32),
+                cb_property_name: LeU32::new(name.len().try_into().ok()?),
+                cb_property: LeU32::new(value.len().try_into().ok()?),
+            }
+            .as_bytes(),
+        );
+        endorsement.extend_from_slice(name);
+        endorsement.extend_from_slice(value);
+    }
+
+    endorsement.extend_from_slice(
+        KeyIsoAttestationSignatureParams {
+            magic: LeU32::new(KeyIsoMagic::SignatureParams as u32),
+            version: LeU32::new(KeyIsoVersion::V1 as u32),
+            cb_alg_id: LeU32::new(KEYISO_SIGNATURE_ALGORITHM_ID.len().try_into().ok()?),
+            cb_alg_params: LeU32::new(
+                size_of::<KeyIsoAttestationEccSignatureParams>()
+                    .try_into()
+                    .ok()?,
+            ),
+            cb_hash_alg: LeU32::new(KEYISO_SIGNATURE_HASH_ALGORITHM.len().try_into().ok()?),
+        }
+        .as_bytes(),
+    );
+    endorsement.extend_from_slice(KEYISO_SIGNATURE_ALGORITHM_ID);
+    endorsement.extend_from_slice(
+        KeyIsoAttestationEccSignatureParams {
+            magic: LeU32::new(KeyIsoMagic::EccSignatureParams as u32),
+            version: LeU32::new(KeyIsoVersion::V1 as u32),
+        }
+        .as_bytes(),
+    );
+    endorsement.extend_from_slice(KEYISO_SIGNATURE_HASH_ALGORITHM);
+    endorsement.extend_from_slice(
+        KeyIsoAttestationSignature {
+            magic: LeU32::new(KeyIsoMagic::Signature as u32),
+            version: LeU32::new(KeyIsoVersion::V1 as u32),
+            cb_signature: LeU32::new(IDKS_ENDORSEMENT_SIGNATURE_LEN.try_into().ok()?),
+        }
+        .as_bytes(),
+    );
+    if endorsement.len() != layout.claim {
+        return None;
+    }
     Some(endorsement)
 }
 
@@ -305,6 +610,152 @@ fn identity_signing_public_key_from_private_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_u32(bytes: &[u8], offset: &mut usize) -> u32 {
+        let value = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap());
+        *offset += 4;
+        value
+    }
+
+    fn assert_property(bytes: &[u8], offset: &mut usize, name: &[u8], value: &[u8]) {
+        assert_eq!(read_u32(bytes, offset), 0x5054_414b);
+        assert_eq!(read_u32(bytes, offset), 1);
+        assert_eq!(read_u32(bytes, offset), u32::try_from(name.len()).unwrap());
+        assert_eq!(read_u32(bytes, offset), u32::try_from(value.len()).unwrap());
+        assert_eq!(&bytes[*offset..*offset + name.len()], name);
+        *offset += name.len();
+        assert_eq!(&bytes[*offset..*offset + value.len()], value);
+        *offset += value.len();
+    }
+
+    #[test]
+    fn keyiso_claim_has_expected_layout() {
+        let ta_data = b"TA data";
+        let nonce = [0x5a; 32];
+        let ta_uuid = TeeUuid {
+            time_low: 0x1122_3344,
+            time_mid: 0x5566,
+            time_hi_and_version: 0x7788,
+            clock_seq_and_node: [0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00],
+        };
+        let ta_svn = 7u32;
+        let ta_digest = [0xa5; TA_DIGEST_LEN];
+
+        let endorsement =
+            build_keyiso_claim(ta_data, &nonce, &ta_uuid, ta_svn, &ta_digest).unwrap();
+        let mut offset = 0;
+
+        assert_eq!(read_u32(&endorsement, &mut offset), 0x4d53_414b);
+        assert_eq!(read_u32(&endorsement, &mut offset), 1);
+        assert_eq!(read_u32(&endorsement, &mut offset), 0x8000_0001);
+
+        assert_eq!(read_u32(&endorsement, &mut offset), 0x4841_4b4b);
+        assert_eq!(read_u32(&endorsement, &mut offset), 1);
+        assert_eq!(
+            read_u32(&endorsement, &mut offset),
+            u32::try_from(ta_data.len()).unwrap()
+        );
+        assert_eq!(
+            read_u32(&endorsement, &mut offset),
+            u32::try_from(nonce.len()).unwrap()
+        );
+        let report_size = read_u32(&endorsement, &mut offset) as usize;
+        assert_eq!(read_u32(&endorsement, &mut offset), 1);
+        assert_eq!(read_u32(&endorsement, &mut offset), 1);
+        assert_eq!(&endorsement[offset..offset + ta_data.len()], ta_data);
+        offset += ta_data.len();
+        assert_eq!(&endorsement[offset..offset + nonce.len()], nonce);
+        offset += nonce.len();
+
+        let report_start = offset;
+        assert_eq!(read_u32(&endorsement, &mut offset), 0x4d52_544b);
+        assert_eq!(read_u32(&endorsement, &mut offset) as usize, report_size);
+        assert_eq!(read_u32(&endorsement, &mut offset), 20);
+        assert_eq!(read_u32(&endorsement, &mut offset), 1);
+        let trustlet_information_size = read_u32(&endorsement, &mut offset) as usize;
+
+        let trustlet_information_start = offset;
+        assert_eq!(read_u32(&endorsement, &mut offset), 0x4954_414b);
+        assert_eq!(read_u32(&endorsement, &mut offset), 1);
+        assert_eq!(read_u32(&endorsement, &mut offset), 5);
+        assert_property(
+            &endorsement,
+            &mut offset,
+            b"TRUSTLET_PROPERTY_UUID",
+            &ta_uuid.to_le_bytes(),
+        );
+        assert_property(
+            &endorsement,
+            &mut offset,
+            b"TRUSTLET_PROPERTY_SVN",
+            &ta_svn.to_le_bytes(),
+        );
+        assert_property(
+            &endorsement,
+            &mut offset,
+            b"TRUSTLET_PROPERTY_TA_DIGEST",
+            &ta_digest,
+        );
+        assert_property(
+            &endorsement,
+            &mut offset,
+            b"TRUSTLET_PROPERTY_DEBUGGED",
+            &[IDKS_DEBUG_FLAG],
+        );
+        assert_property(
+            &endorsement,
+            &mut offset,
+            b"TRUSTLET_PROPERTY_ISOLATION_SOLUTION",
+            b"LVBS",
+        );
+        assert_eq!(
+            offset - trustlet_information_start,
+            trustlet_information_size
+        );
+        assert_eq!(offset - report_start, report_size);
+
+        assert_eq!(read_u32(&endorsement, &mut offset), 0x5053_414b);
+        assert_eq!(read_u32(&endorsement, &mut offset), 1);
+        assert_eq!(read_u32(&endorsement, &mut offset), 10);
+        assert_eq!(read_u32(&endorsement, &mut offset), 8);
+        assert_eq!(read_u32(&endorsement, &mut offset), 6);
+        assert_eq!(&endorsement[offset..offset + 10], b"ECDSA_P384");
+        offset += 10;
+        assert_eq!(read_u32(&endorsement, &mut offset), 0x5045_414b);
+        assert_eq!(read_u32(&endorsement, &mut offset), 1);
+        assert_eq!(&endorsement[offset..offset + 6], b"SHA384");
+        offset += 6;
+
+        assert_eq!(read_u32(&endorsement, &mut offset), 0x5353_414b);
+        assert_eq!(read_u32(&endorsement, &mut offset), 1);
+        assert_eq!(read_u32(&endorsement, &mut offset), 96);
+
+        assert_eq!(offset, endorsement.len());
+    }
+
+    #[test]
+    fn keyiso_signature_covers_entire_claim_prefix() {
+        use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+
+        let mut private_key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
+        private_key[IDENTITY_SIGNING_PRIVATE_KEY_LEN - 1] = 1;
+        let nonce = [0x5a; 32];
+        let ta_uuid = TeeUuid::NIL;
+        let ta_digest = [0xa5; TA_DIGEST_LEN];
+        let mut endorsement =
+            build_keyiso_claim(b"TA data", &nonce, &ta_uuid, 7, &ta_digest).unwrap();
+        let signed_len = endorsement.len();
+        let signature = endorse_data_with(&endorsement, &private_key).unwrap();
+
+        endorsement.extend_from_slice(&signature);
+
+        let public_key = identity_signing_public_key_from_private_key(&private_key).unwrap();
+        let verifying_key = VerifyingKey::from_sec1_bytes(&public_key).unwrap();
+        let parsed_signature = Signature::from_slice(&endorsement[signed_len..]).unwrap();
+        verifying_key
+            .verify(&endorsement[..signed_len], &parsed_signature)
+            .unwrap();
+    }
 
     #[test]
     fn endorsement_signature_covers_plaintext_layout() {
