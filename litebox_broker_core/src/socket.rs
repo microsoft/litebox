@@ -423,12 +423,16 @@ pub fn connect(
             }
         };
         match binding {
-            SocketOutcome::Completed((local_address, reservation)) => {
+            ReserveAndBindOutcome::Completed(local_address, reservation) => {
                 attach_binding(&object, local_address, reservation);
             }
-            SocketOutcome::Failed(error) => {
+            ReserveAndBindOutcome::Failed(error) => {
                 finish_connect(&object, SocketConnectionStatus::Unconnected);
                 return Ok(SocketOutcome::Failed(error));
+            }
+            ReserveAndBindOutcome::Retired => {
+                finish_connect(&object, SocketConnectionStatus::Failed(SocketError::Other));
+                return Err(BrokerError::Internal);
             }
         }
     }
@@ -491,11 +495,15 @@ pub fn bind(
     }
     let outcome = if is_tcp(create_request) {
         match reserve_and_bind(session, create_request, &resource, address) {
-            Ok(SocketOutcome::Completed((local_address, reservation))) => {
+            Ok(ReserveAndBindOutcome::Completed(local_address, reservation)) => {
                 finish_configuration(&object, Some(local_address), Some(reservation), false);
                 return Ok(SocketOutcome::Completed(local_address));
             }
-            Ok(SocketOutcome::Failed(error)) => Ok(SocketOutcome::Failed(error)),
+            Ok(ReserveAndBindOutcome::Failed(error)) => Ok(SocketOutcome::Failed(error)),
+            Ok(ReserveAndBindOutcome::Retired) => {
+                finish_retired_configuration(&object, None, None);
+                return Err(BrokerError::Internal);
+            }
             Err(error) => Err(error),
         }
     } else {
@@ -580,13 +588,17 @@ pub fn listen(
             }
         };
         match binding {
-            SocketOutcome::Completed((address, reservation)) => {
+            ReserveAndBindOutcome::Completed(address, reservation) => {
                 local_address = Some(address);
                 port_reservation = Some(reservation);
             }
-            SocketOutcome::Failed(error) => {
+            ReserveAndBindOutcome::Failed(error) => {
                 finish_configuration(&object, None, None, false);
                 return Ok(SocketOutcome::Failed(error));
+            }
+            ReserveAndBindOutcome::Retired => {
+                finish_retired_configuration(&object, None, None);
+                return Err(BrokerError::Internal);
             }
         }
     }
@@ -1035,26 +1047,35 @@ fn socket_state(
     ))
 }
 
+enum ReserveAndBindOutcome {
+    Completed(SocketAddrV4, GuestPortReservation),
+    Failed(SocketError),
+    Retired,
+}
+
 fn reserve_and_bind(
     session: &BrokerSession,
     create_request: CreateSocketRequest,
     resource: &SocketResource,
     requested_address: SocketAddrV4,
-) -> Result<SocketOutcome<(SocketAddrV4, GuestPortReservation)>> {
+) -> Result<ReserveAndBindOutcome> {
     let (local_address, reservation) = match session
         .core
         .socket_ports
         .reserve(create_request, requested_address)?
     {
         SocketOutcome::Completed(binding) => binding,
-        SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
+        SocketOutcome::Failed(error) => return Ok(ReserveAndBindOutcome::Failed(error)),
     };
     match resource.bind(local_address)? {
         SocketOutcome::Completed(bound_address) if bound_address == local_address => {
-            Ok(SocketOutcome::Completed((local_address, reservation)))
+            Ok(ReserveAndBindOutcome::Completed(local_address, reservation))
         }
-        SocketOutcome::Completed(_) => Err(BrokerError::Internal),
-        SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
+        SocketOutcome::Completed(_) => {
+            resource.retire();
+            Ok(ReserveAndBindOutcome::Retired)
+        }
+        SocketOutcome::Failed(error) => Ok(ReserveAndBindOutcome::Failed(error)),
     }
 }
 
@@ -1457,6 +1478,7 @@ pub(crate) mod tests {
         fail_create: core::sync::atomic::AtomicBool,
         fail_connect: core::sync::atomic::AtomicBool,
         fail_connect_indeterminate: core::sync::atomic::AtomicBool,
+        invalid_bind_address: core::sync::atomic::AtomicBool,
         fail_shutdown: core::sync::atomic::AtomicBool,
         tcp_option_sets: StdMutex<std::vec::Vec<TcpOptionValue>>,
         failed_readiness: StdMutex<Option<ReadinessRegistration>>,
@@ -1475,6 +1497,12 @@ pub(crate) mod tests {
         fn fail_next_connect_indeterminate(&self) {
             self.state
                 .fail_connect_indeterminate
+                .store(true, Ordering::Relaxed);
+        }
+
+        fn return_invalid_bind_address_once(&self) {
+            self.state
+                .invalid_bind_address
                 .store(true, Ordering::Relaxed);
         }
 
@@ -1546,8 +1574,24 @@ pub(crate) mod tests {
         fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>> {
             self.state.binds.lock().unwrap().push(address);
             if is_tcp(self.create_request) {
-                *self.guest_local_address.lock().unwrap() = Some(address);
-                return Ok(SocketOutcome::Completed(address));
+                let bound_address = if self
+                    .state
+                    .invalid_bind_address
+                    .swap(false, Ordering::Relaxed)
+                {
+                    SocketAddrV4::new(
+                        *address.ip(),
+                        if address.port() == u16::MAX {
+                            address.port() - 1
+                        } else {
+                            address.port() + 1
+                        },
+                    )
+                } else {
+                    address
+                };
+                *self.guest_local_address.lock().unwrap() = Some(bound_address);
+                return Ok(SocketOutcome::Completed(bound_address));
             }
             let address = if address.port() == 0 {
                 SocketAddrV4::new(*address.ip(), 49152)
@@ -1728,6 +1772,7 @@ pub(crate) mod tests {
         check_quota_waits_for_deferred_retirement(broker, provider);
         check_platform_socket_retires_before_last_arc_drop(broker, provider);
         check_socket_quotas(broker);
+        check_invalid_bind_response_retires_socket(broker, provider);
     }
 
     fn check_platform_socket_retires_before_last_arc_drop(
@@ -1798,6 +1843,93 @@ pub(crate) mod tests {
         assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
         assert_eq!(session.reserved_sockets.load(Ordering::Relaxed), 0);
+    }
+
+    fn check_invalid_bind_response_retires_socket(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let first_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let readiness = Arc::new(TestReadinessSink::default());
+        let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42000);
+
+        let invalid = create(&first_session, create_request(), readiness.clone()).unwrap();
+        provider.return_invalid_bind_address_once();
+        assert_eq!(
+            bind(&first_session, invalid, address),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        assert_eq!(
+            status(&first_session, invalid),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::Other),
+                local_address: None,
+                pending_error: None,
+            })
+        );
+        assert_eq!(
+            bind(&first_session, invalid, address),
+            Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
+        );
+
+        let replacement = create(&second_session, create_request(), readiness.clone()).unwrap();
+        assert_eq!(
+            bind(&second_session, replacement, address),
+            Ok(SocketOutcome::Completed(address))
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        first_session.close_object_reference(invalid).unwrap();
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        second_session.close_object_reference(replacement).unwrap();
+
+        let invalid_connect = create(&first_session, create_request(), readiness).unwrap();
+        let retired_before_connect = provider.state.retired_sockets.load(Ordering::Relaxed);
+        provider.return_invalid_bind_address_once();
+        assert_eq!(
+            connect(&first_session, invalid_connect, loopback_address()),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before_connect + 1
+        );
+        assert_eq!(
+            status(&first_session, invalid_connect),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::Other),
+                local_address: None,
+                pending_error: None,
+            })
+        );
+        assert_eq!(
+            connect(&first_session, invalid_connect, loopback_address()),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
+                SocketError::Other
+            )))
+        );
+        first_session
+            .close_object_reference(invalid_connect)
+            .unwrap();
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before_connect + 1
+        );
     }
 
     fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocketProvider) {
