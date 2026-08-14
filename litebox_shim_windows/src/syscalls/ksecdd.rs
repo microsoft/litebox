@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::string::String;
 use alloc::vec;
 use core::mem::size_of;
 
@@ -35,6 +36,7 @@ pub(crate) const KSEC_CNG_DERIVE_KEY: u32 = 0x0001_0500;
 pub(crate) const KSEC_CNG_RESOLVE_PROVIDERS: u32 = 0x0002_0000;
 const KSEC_CNG_REQUEST_MAGIC: u32 = 0x1a2b_3c4d;
 const KSEC_CNG_OUTPUT_SIZE: usize = size_of::<usize>();
+const KSEC_RANDOM_CHUNK_SIZE: usize = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable)]
@@ -151,15 +153,37 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
             let Some(output_buffer) = output_buffer.filter(|_| output_length != 0) else {
                 return complete_ioctl::<Platform>(io_status_block, NtStatus::INVALID_PARAMETER, 0);
             };
+            let output_address = output_buffer.as_usize();
+            if output_address.checked_add(output_length).is_none() {
+                return complete_ioctl::<Platform>(
+                    io_status_block,
+                    NtStatus::ACCESS_VIOLATION,
+                    0,
+                );
+            }
             if let Err(status) = probe_guest_output_buffer::<Platform>(output_buffer, output_length)
             {
                 return complete_ioctl::<Platform>(io_status_block, status, 0);
             }
 
-            let mut random = vec![0; output_length];
-            platform.fill_bytes_crng(&mut random);
-            if write_slice::<Platform, u8>(output_buffer.as_usize(), &random).is_none() {
-                return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
+            let mut random = [0; KSEC_RANDOM_CHUNK_SIZE];
+            let mut offset = 0;
+            while offset < output_length {
+                let chunk_length = (output_length - offset).min(random.len());
+                platform.fill_bytes_crng(&mut random[..chunk_length]);
+                if write_slice::<Platform, u8>(
+                    output_address + offset,
+                    &random[..chunk_length],
+                )
+                .is_none()
+                {
+                    return complete_ioctl::<Platform>(
+                        io_status_block,
+                        NtStatus::ACCESS_VIOLATION,
+                        0,
+                    );
+                }
+                offset += chunk_length;
             }
             complete_ioctl::<Platform>(io_status_block, NtStatus::SUCCESS, output_length)
         }
@@ -260,20 +284,26 @@ fn handle_cng_resolve_providers<Platform: crate::ShimPlatform>(
     if input_length < size_of::<KsecCngResolveProvidersRequest>() {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::INFO_LENGTH_MISMATCH, 0);
     }
-    let Some(input) = input_buffer.to_owned_slice(input_length) else {
-        return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
-    };
     let request =
         ConstPtr::<Platform, KsecCngResolveProvidersRequest>::from_usize(input_buffer.as_usize());
     let Some(request) = request.read_at_offset(0) else {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
     };
 
+    let function_name = (request.interface == 0
+        && request.function_name_offset != usize::MAX)
+        .then(|| {
+            read_utf16_at_offset::<Platform>(
+                input_buffer,
+                input_length,
+                request.function_name_offset,
+                "RNG".len(),
+            )
+        })
+        .flatten();
     let resolves_rng = (request.interface == KSEC_CNG_INTERFACE_RNG
         && request.function_name_offset == usize::MAX)
-        || (request.interface == 0
-            && request.function_name_offset != usize::MAX
-            && matches_utf16_at_offset(&input, request.function_name_offset, "RNG"));
+        || function_name.as_deref() == Some("RNG");
     if request.provider_type != usize::MAX
         || !resolves_rng
         || request.provider_name_offset != usize::MAX
@@ -365,23 +395,31 @@ fn write_utf16(buffer: &mut [u8], offset: usize, value: &str) {
     }
 }
 
-fn matches_utf16_at_offset(buffer: &[u8], offset: usize, expected: &str) -> bool {
+fn read_utf16_at_offset<Platform: crate::ShimPlatform>(
+    buffer: ConstPtr<Platform, u8>,
+    buffer_length: usize,
+    offset: usize,
+    maximum_characters: usize,
+) -> Option<String> {
     if !offset.is_multiple_of(size_of::<u16>()) {
-        return false;
+        return None;
     }
-    let expected = expected.encode_utf16().chain(core::iter::once(0));
-    expected.enumerate().all(|(index, expected)| {
-        let Some(start) = index
-            .checked_mul(size_of::<u16>())
-            .and_then(|index| offset.checked_add(index))
-        else {
-            return false;
-        };
-        let Some(bytes) = buffer.get(start..start + size_of::<u16>()) else {
-            return false;
-        };
-        u16::from_le_bytes(bytes.try_into().unwrap()) == expected
-    })
+    let byte_length = maximum_characters
+        .checked_add(1)
+        .and_then(|units| units.checked_mul(size_of::<u16>()))
+        ?;
+    let end = offset.checked_add(byte_length)?;
+    if end > buffer_length {
+        return None;
+    }
+    let address = buffer.as_usize().checked_add(offset)?;
+    let bytes = ConstPtr::<Platform, u8>::from_usize(address).to_owned_slice(byte_length)?;
+    let units = bytes
+        .chunks_exact(size_of::<u16>())
+        .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<alloc::vec::Vec<_>>();
+    let terminator = units.iter().position(|&unit| unit == 0)?;
+    String::from_utf16(&units[..terminator]).ok()
 }
 
 fn complete_ioctl<Platform: crate::ShimPlatform>(
@@ -397,4 +435,31 @@ fn complete_ioctl<Platform: crate::ShimPlatform>(
         return NtStatus::ACCESS_VIOLATION;
     }
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{TestPlatform, run_with_test_platform_pointers};
+
+    #[test]
+    fn utf16_read_handles_valid_and_overflowing_offsets() {
+        run_with_test_platform_pointers(|| {
+            let input = b"R\0N\0G\0\0\0";
+            let input_ptr = ConstPtr::<TestPlatform, u8>::from_usize(input.as_ptr() as usize);
+            assert_eq!(
+                read_utf16_at_offset::<TestPlatform>(input_ptr, input.len(), 0, 3).as_deref(),
+                Some("RNG")
+            );
+            assert_eq!(
+                read_utf16_at_offset::<TestPlatform>(
+                    input_ptr,
+                    input.len(),
+                    usize::MAX - 1,
+                    3,
+                ),
+                None
+            );
+        });
+    }
 }

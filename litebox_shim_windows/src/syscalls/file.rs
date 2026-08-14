@@ -2258,6 +2258,25 @@ mod tests {
             }
             assert_ne!(first, second, "successive random fills must differ");
 
+            let mut chunked = [0u8; 4097];
+            assert_eq!(
+                task.sys_nt_device_io_control_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    ksecdd::IOCTL_KSEC_RANDOM_FILL_BUFFER,
+                    None,
+                    0,
+                    Some(mut_byte_ptr(&mut chunked)),
+                    chunked.len().try_into().unwrap(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(io_status.information, chunked.len());
+            assert!(chunked.iter().any(|&byte| byte != 0));
+
             let mut scratch = [0xa5; 8];
             assert_eq!(
                 task.sys_nt_device_io_control_file(
