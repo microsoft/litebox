@@ -197,10 +197,11 @@ fn test_static_linked_prog_with_rewriter() {
 
 #[test]
 fn test_programs_with_windows_broker() {
-    run_prog_with_windows_broker("hello_world_static", &[]);
-    run_prog_with_windows_broker("pipe_broker", &[]);
-    run_prog_with_windows_broker("hello_world_dyn", &DYNAMIC_LIBS);
-    run_prog_with_windows_broker("hello_thread", &DYNAMIC_LIBS);
+    let (broker, runner) = build_windows_broker();
+    run_prog_with_windows_broker(&broker, &runner, "hello_world_static", &[]);
+    run_prog_with_windows_broker(&broker, &runner, "pipe_broker", &[]);
+    run_prog_with_windows_broker(&broker, &runner, "hello_world_dyn", &DYNAMIC_LIBS);
+    run_prog_with_windows_broker(&broker, &runner, "hello_thread", &DYNAMIC_LIBS);
 }
 
 const DYNAMIC_LIBS: [(&str, &str); 2] = [
@@ -208,7 +209,44 @@ const DYNAMIC_LIBS: [(&str, &str); 2] = [
     ("ld-linux-x86-64.so.2", "/lib64"),
 ];
 
-fn run_prog_with_windows_broker(exec_name: &str, libs: &[(&str, &str)]) {
+fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
+    let runner = std::env::var_os("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
+        .map_or_else(
+            || {
+                std::path::PathBuf::from(env!(
+                    "CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland"
+                ))
+            },
+            std::path::PathBuf::from,
+        );
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .args([
+            "build",
+            "-p",
+            "litebox_broker_userland",
+            "--bin",
+            "litebox-broker-userland",
+        ])
+        .status()
+        .expect("failed to build litebox-broker-userland");
+    assert!(status.success(), "failed to build litebox-broker-userland");
+
+    let broker = runner.with_file_name("litebox-broker-userland.exe");
+    assert!(
+        broker.is_file(),
+        "broker executable not found at {}",
+        broker.display()
+    );
+    (broker, runner)
+}
+
+fn run_prog_with_windows_broker(
+    broker: &std::path::Path,
+    runner: &std::path::Path,
+    exec_name: &str,
+    libs: &[(&str, &str)],
+) {
     let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
     let tar_path =
         std::path::Path::new(env!("OUT_DIR")).join(format!("broker_{exec_name}_rootfs.tar"));
@@ -225,10 +263,6 @@ fn run_prog_with_windows_broker(exec_name: &str, libs: &[(&str, &str)]) {
     tar.finish().unwrap();
     drop(tar);
 
-    let runner = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
-        .unwrap_or_else(|_| {
-            env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
-        });
     let mut arguments = Vec::new();
     if !libs.is_empty() {
         arguments.extend(["--env".into(), "LD_LIBRARY_PATH=/lib64:/lib32:/lib".into()]);
@@ -238,17 +272,8 @@ fn run_prog_with_windows_broker(exec_name: &str, libs: &[(&str, &str)]) {
         tar_path.into_os_string(),
         format!("/{exec_path}").into(),
     ]);
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = std::process::Command::new(cargo)
-        .args([
-            "run",
-            "-p",
-            "litebox_broker_userland",
-            "--bin",
-            "litebox-broker-userland",
-            "--",
-            "--runner",
-        ])
+    let status = std::process::Command::new(broker)
+        .arg("--runner")
         .arg(runner)
         .args(arguments)
         .status()
@@ -362,25 +387,13 @@ fn run_dynamic_linked_prog_with_rewriter(
     std::fs::create_dir_all(&hooked_tar_dir).unwrap();
     std::fs::copy(&hooked_path, hooked_tar_dir.join(&prog_name_hooked)).unwrap();
 
-    // tar
     let tar_target_file = std::path::Path::new(&out_path).join("rootfs_rewriter.tar");
-    let tar_data = std::process::Command::new("tar")
-        .args([
-            "-cvf",
-            tar_target_file.to_str().unwrap(),
-            "bin",
-            "lib",
-            "lib64",
-            "out",
-        ])
-        .current_dir(&tar_src_path)
-        .output()
-        .expect("Failed to create tar file");
-    assert!(
-        tar_data.status.success(),
-        "failed to create tar file {:?}",
-        std::str::from_utf8(tar_data.stderr.as_slice()).unwrap()
-    );
+    let mut tar = tar::Builder::new(std::fs::File::create(&tar_target_file).unwrap());
+    for directory in ["bin", "lib", "lib64", "out"] {
+        tar.append_dir_all(directory, tar_src_path.join(directory))
+            .unwrap();
+    }
+    tar.finish().unwrap();
     println!("Tar file created at: {}", tar_target_file.to_str().unwrap());
 
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
