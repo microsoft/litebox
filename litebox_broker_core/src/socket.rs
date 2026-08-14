@@ -119,7 +119,9 @@ impl Drop for GuestPortReservation {
 pub struct AcceptedPlatformSocket {
     /// Accepted nonblocking platform socket.
     pub socket: Arc<dyn PlatformSocket>,
-    /// Remote endpoint of the accepted connection.
+    /// Guest-visible remote endpoint of the accepted connection.
+    ///
+    /// Platforms must translate private backend endpoints before returning.
     pub remote_address: SocketAddrV4,
 }
 
@@ -195,6 +197,7 @@ pub trait PlatformSocket: Send + Sync {
     /// nonzero port and must echo it unchanged; the host endpoint backing the
     /// socket is chosen privately by the platform. A datagram socket receives
     /// the address requested by the guest and returns the host-assigned one.
+    /// Returning an error must leave the socket unbound and retryable.
     fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Makes this socket listen for incoming connections.
@@ -424,7 +427,7 @@ pub fn connect(
         };
         match binding {
             ReserveAndBindOutcome::Completed(local_address, reservation) => {
-                attach_binding(&object, local_address, reservation);
+                attach_binding(&object, local_address, reservation)?;
             }
             ReserveAndBindOutcome::Failed(error) => {
                 finish_connect(&object, SocketConnectionStatus::Unconnected);
@@ -438,6 +441,7 @@ pub fn connect(
     }
     let status = match resource.connect(address) {
         Ok(SocketConnectionStatus::Unconnected) => {
+            resource.retire();
             finish_connect(&object, SocketConnectionStatus::Failed(SocketError::Other));
             return Err(BrokerError::Internal);
         }
@@ -447,6 +451,7 @@ pub fn connect(
             return Err(error);
         }
         Err(PlatformConnectError::PeerIndeterminate(error)) => {
+            resource.retire();
             finish_connect(&object, SocketConnectionStatus::Failed(SocketError::Other));
             return Err(error);
         }
@@ -485,23 +490,23 @@ pub fn bind(
     ) {
         Ok(()) => {}
         Err(BrokerError::PolicyDenied) => {
-            finish_configuration(&object, None, None, false);
+            finish_configuration(&object, None, None, false)?;
             return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
         }
         Err(error) => {
-            finish_configuration(&object, None, None, false);
+            finish_configuration(&object, None, None, false)?;
             return Err(error);
         }
     }
     let outcome = if is_tcp(create_request) {
         match reserve_and_bind(session, create_request, &resource, address) {
             Ok(ReserveAndBindOutcome::Completed(local_address, reservation)) => {
-                finish_configuration(&object, Some(local_address), Some(reservation), false);
+                finish_configuration(&object, Some(local_address), Some(reservation), false)?;
                 return Ok(SocketOutcome::Completed(local_address));
             }
             Ok(ReserveAndBindOutcome::Failed(error)) => Ok(SocketOutcome::Failed(error)),
             Ok(ReserveAndBindOutcome::Retired) => {
-                finish_retired_configuration(&object, None, None);
+                finish_retired_configuration(&object, None, None)?;
                 return Err(BrokerError::Internal);
             }
             Err(error) => Err(error),
@@ -511,15 +516,15 @@ pub fn bind(
     };
     match outcome {
         Ok(SocketOutcome::Completed(local_address)) => {
-            finish_configuration(&object, Some(local_address), None, false);
+            finish_configuration(&object, Some(local_address), None, false)?;
             Ok(SocketOutcome::Completed(local_address))
         }
         Ok(SocketOutcome::Failed(error)) => {
-            finish_configuration(&object, None, None, false);
+            finish_configuration(&object, None, None, false)?;
             Ok(SocketOutcome::Failed(error))
         }
         Err(error) => {
-            finish_configuration(&object, None, None, false);
+            finish_configuration(&object, None, None, false)?;
             Err(error)
         }
     }
@@ -567,11 +572,11 @@ pub fn listen(
         ) {
             Ok(()) => {}
             Err(BrokerError::PolicyDenied) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, false)?;
                 return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
             }
             Err(error) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, false)?;
                 return Err(error);
             }
         }
@@ -583,7 +588,7 @@ pub fn listen(
         ) {
             Ok(binding) => binding,
             Err(error) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, false)?;
                 return Err(error);
             }
         };
@@ -593,11 +598,11 @@ pub fn listen(
                 port_reservation = Some(reservation);
             }
             ReserveAndBindOutcome::Failed(error) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, false)?;
                 return Ok(SocketOutcome::Failed(error));
             }
             ReserveAndBindOutcome::Retired => {
-                finish_retired_configuration(&object, None, None);
+                finish_retired_configuration(&object, None, None)?;
                 return Err(BrokerError::Internal);
             }
         }
@@ -607,18 +612,18 @@ pub fn listen(
         Ok(SocketOutcome::Completed(address)) => {
             if local_address != Some(address) {
                 resource.retire();
-                finish_retired_configuration(&object, local_address, port_reservation);
+                finish_retired_configuration(&object, local_address, port_reservation)?;
                 return Err(BrokerError::Internal);
             }
-            finish_configuration(&object, local_address, port_reservation, true);
+            finish_configuration(&object, local_address, port_reservation, true)?;
             Ok(SocketOutcome::Completed(address))
         }
         Ok(SocketOutcome::Failed(error)) => {
-            finish_configuration(&object, local_address, port_reservation, false);
+            finish_configuration(&object, local_address, port_reservation, false)?;
             Ok(SocketOutcome::Failed(error))
         }
         Err(error) => {
-            finish_configuration(&object, local_address, port_reservation, false);
+            finish_configuration(&object, local_address, port_reservation, false)?;
             Err(error)
         }
     }
@@ -1157,12 +1162,30 @@ fn attach_binding(
     object: &spin::RwLock<ObjectEntry>,
     local_address: SocketAddrV4,
     port_reservation: GuestPortReservation,
-) {
-    let mut object = object.write();
-    if let ObjectEntry::Socket(socket) = &mut *object {
-        socket.local_address = Some(local_address);
-        socket.resource.set_port_reservation(port_reservation);
+) -> Result<()> {
+    let duplicate = {
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::Internal);
+        };
+        match socket.resource.set_port_reservation(port_reservation) {
+            Ok(()) => {
+                socket.local_address = Some(local_address);
+                None
+            }
+            Err(port_reservation) => {
+                socket.connect_in_flight = false;
+                socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+                Some((Arc::clone(&socket.resource), port_reservation))
+            }
+        }
+    };
+    if let Some((resource, port_reservation)) = duplicate {
+        resource.retire();
+        drop(port_reservation);
+        return Err(BrokerError::Internal);
     }
+    Ok(())
 }
 
 fn finish_configuration(
@@ -1170,33 +1193,50 @@ fn finish_configuration(
     local_address: Option<SocketAddrV4>,
     port_reservation: Option<GuestPortReservation>,
     listening: bool,
-) {
-    let mut object = object.write();
-    if let ObjectEntry::Socket(socket) = &mut *object {
+) -> Result<()> {
+    let duplicate = {
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::Internal);
+        };
         socket.configuration_in_flight = false;
-        socket.local_address = socket.local_address.or(local_address);
-        if let Some(port_reservation) = port_reservation {
-            socket.resource.set_port_reservation(port_reservation);
+        let duplicate = port_reservation.and_then(|port_reservation| {
+            socket
+                .resource
+                .set_port_reservation(port_reservation)
+                .err()
+                .map(|port_reservation| (Arc::clone(&socket.resource), port_reservation))
+        });
+        if duplicate.is_some() {
+            socket.listening = false;
+            socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+        } else {
+            socket.local_address = socket.local_address.or(local_address);
+            socket.listening |= listening;
         }
-        socket.listening |= listening;
+        duplicate
+    };
+    if let Some((resource, port_reservation)) = duplicate {
+        resource.retire();
+        drop(port_reservation);
+        return Err(BrokerError::Internal);
     }
+    Ok(())
 }
 
 fn finish_retired_configuration(
     object: &spin::RwLock<ObjectEntry>,
     local_address: Option<SocketAddrV4>,
     port_reservation: Option<GuestPortReservation>,
-) {
+) -> Result<()> {
+    finish_configuration(object, local_address, port_reservation, false)?;
     let mut object = object.write();
-    if let ObjectEntry::Socket(socket) = &mut *object {
-        socket.configuration_in_flight = false;
-        socket.local_address = socket.local_address.or(local_address);
-        if let Some(port_reservation) = port_reservation {
-            socket.resource.set_port_reservation(port_reservation);
-        }
-        socket.listening = false;
-        socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-    }
+    let ObjectEntry::Socket(socket) = &mut *object else {
+        return Err(BrokerError::Internal);
+    };
+    socket.listening = false;
+    socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+    Ok(())
 }
 
 pub(crate) struct SocketObject {
@@ -1254,12 +1294,16 @@ pub(crate) struct SocketResource {
 }
 
 impl SocketResource {
-    fn set_port_reservation(&self, reservation: GuestPortReservation) {
+    fn set_port_reservation(
+        &self,
+        reservation: GuestPortReservation,
+    ) -> core::result::Result<(), GuestPortReservation> {
         let mut slot = self.port_reservation.lock();
-        debug_assert!(slot.is_none());
-        if slot.is_none() {
-            *slot = Some(reservation);
+        if slot.is_some() {
+            return Err(reservation);
         }
+        *slot = Some(reservation);
+        Ok(())
     }
 
     fn platform_socket(&self) -> &dyn PlatformSocket {
@@ -1478,6 +1522,7 @@ pub(crate) mod tests {
         fail_create: core::sync::atomic::AtomicBool,
         fail_connect: core::sync::atomic::AtomicBool,
         fail_connect_indeterminate: core::sync::atomic::AtomicBool,
+        return_unconnected_connect: core::sync::atomic::AtomicBool,
         invalid_bind_address: core::sync::atomic::AtomicBool,
         fail_shutdown: core::sync::atomic::AtomicBool,
         tcp_option_sets: StdMutex<std::vec::Vec<TcpOptionValue>>,
@@ -1497,6 +1542,12 @@ pub(crate) mod tests {
         fn fail_next_connect_indeterminate(&self) {
             self.state
                 .fail_connect_indeterminate
+                .store(true, Ordering::Relaxed);
+        }
+
+        fn return_unconnected_connect_once(&self) {
+            self.state
+                .return_unconnected_connect
                 .store(true, Ordering::Relaxed);
         }
 
@@ -1639,6 +1690,13 @@ pub(crate) mod tests {
                     BrokerError::Internal,
                 ));
             }
+            if self
+                .state
+                .return_unconnected_connect
+                .swap(false, Ordering::Relaxed)
+            {
+                return Ok(SocketConnectionStatus::Unconnected);
+            }
             self.readiness
                 .publish(ReadinessFlags::WRITE)
                 .map_err(PlatformConnectError::PeerIndeterminate)?;
@@ -1773,6 +1831,7 @@ pub(crate) mod tests {
         check_platform_socket_retires_before_last_arc_drop(broker, provider);
         check_socket_quotas(broker);
         check_invalid_bind_response_retires_socket(broker, provider);
+        check_duplicate_port_reservation_retires_socket(broker, provider);
     }
 
     fn check_platform_socket_retires_before_last_arc_drop(
@@ -1929,6 +1988,65 @@ pub(crate) mod tests {
         assert_eq!(
             provider.state.retired_sockets.load(Ordering::Relaxed),
             retired_before_connect + 1
+        );
+    }
+
+    fn check_duplicate_port_reservation_retires_socket(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        let original_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42001);
+        assert_eq!(
+            bind(&session, handle, original_address),
+            Ok(SocketOutcome::Completed(original_address))
+        );
+
+        let duplicate_ports = BrokerSocketPorts::default();
+        let duplicate_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42002);
+        let SocketOutcome::Completed((duplicate_address, duplicate_reservation)) = duplicate_ports
+            .reserve(create_request(), duplicate_address)
+            .unwrap()
+        else {
+            panic!("duplicate-reservation test could not reserve a port");
+        };
+        let object = session
+            .authorized_object(handle, ObjectRights::WRITE)
+            .unwrap();
+        let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+        assert_eq!(
+            attach_binding(&object, duplicate_address, duplicate_reservation),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        assert_eq!(
+            status(&session, handle),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::Other),
+                local_address: Some(original_address),
+                pending_error: None,
+            })
+        );
+        assert!(matches!(
+            duplicate_ports.reserve(create_request(), duplicate_address),
+            Ok(SocketOutcome::Completed(_))
+        ));
+
+        session.close_object_reference(handle).unwrap();
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
         );
     }
 
@@ -2666,10 +2784,15 @@ pub(crate) mod tests {
             Arc::new(TestReadinessSink::default()),
         )
         .unwrap();
+        let retired_before_poisoned = provider.state.retired_sockets.load(Ordering::Relaxed);
         provider.fail_next_connect_indeterminate();
         assert_eq!(
             connect(&session, poisoned, loopback_address()),
             Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before_poisoned + 1
         );
         let poisoned_local_address = *provider
             .state
@@ -2692,9 +2815,40 @@ pub(crate) mod tests {
                 pending_error: None,
             })
         );
+        session.close_object_reference(poisoned).unwrap();
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before_poisoned + 1
+        );
+
+        let invalid_status = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        let retired_before_invalid_status = provider.state.retired_sockets.load(Ordering::Relaxed);
+        provider.return_unconnected_connect_once();
+        assert_eq!(
+            connect(&session, invalid_status, loopback_address()),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before_invalid_status + 1
+        );
+        assert_eq!(
+            status(&session, invalid_status).unwrap().status,
+            SocketConnectionStatus::Failed(SocketError::Other)
+        );
+        session.close_object_reference(invalid_status).unwrap();
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before_invalid_status + 1
+        );
         assert_eq!(
             provider.state.connect_calls.load(Ordering::Relaxed),
-            calls_before + 3
+            calls_before + 4
         );
     }
 
