@@ -225,10 +225,11 @@ impl IdksPta {
             .get_values(2)
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
-        let required_endorsement_size = KeyIsoClaimLayout::new(ta_data_size, nonce_size)
-            .map(|layout| layout.claim)
-            .and_then(|size| size.checked_add(IDKS_ENDORSEMENT_SIGNATURE_LEN))
-            .ok_or(TeeResult::BadParameters)?;
+        let required_endorsement_size =
+            KeyIsoClaimLayout::new(ta_data_size, nonce_size, TA_DIGEST_LEN)
+                .map(|layout| layout.claim)
+                .and_then(|size| size.checked_add(IDKS_ENDORSEMENT_SIGNATURE_LEN))
+                .ok_or(TeeResult::BadParameters)?;
         let required_endorsement_size_u64 =
             u64::try_from(required_endorsement_size).map_err(|_| TeeResult::BadParameters)?;
         if endorsement_size < required_endorsement_size_u64 {
@@ -264,7 +265,7 @@ impl IdksPta {
             &nonce,
             &task.ta_app_id,
             task.ta_svn,
-            &task.ta_digest,
+            Some(&task.ta_digest),
         )
         .ok_or(TeeResult::GenericError)?;
         let key_pair = get_identity_signing_key_pair().map_err(|_| TeeResult::GenericError)?;
@@ -314,7 +315,7 @@ struct KeyIsoClaimLayout {
 }
 
 impl KeyIsoClaimLayout {
-    fn new(ta_data_len: usize, nonce_len: usize) -> Option<Self> {
+    fn new(ta_data_len: usize, nonce_len: usize, ta_digest_len: usize) -> Option<Self> {
         let property_names_size = TRUSTLET_PROPERTY_UUID
             .len()
             .checked_add(TRUSTLET_PROPERTY_SVN.len())?
@@ -323,7 +324,7 @@ impl KeyIsoClaimLayout {
             .checked_add(TRUSTLET_PROPERTY_ISOLATION_SOLUTION.len())?;
         let property_values_size = size_of::<TeeUuid>()
             .checked_add(size_of::<u32>())?
-            .checked_add(TA_DIGEST_LEN)?
+            .checked_add(ta_digest_len)?
             .checked_add(size_of::<u8>())?
             .checked_add(ISOLATION_SOLUTION.len())?;
         let properties_size = 5usize
@@ -361,7 +362,7 @@ fn build_keyiso_claim(
     nonce: &[u8],
     ta_uuid: &TeeUuid,
     ta_svn: u32,
-    ta_digest: &TaDigest,
+    ta_digest: Option<&TaDigest>,
 ) -> Option<Vec<u8>> {
     let uuid = ta_uuid.to_le_bytes();
     let svn = ta_svn.to_le_bytes();
@@ -369,11 +370,18 @@ fn build_keyiso_claim(
     let properties: [(&[u8], &[u8]); 5] = [
         (TRUSTLET_PROPERTY_UUID, &uuid),
         (TRUSTLET_PROPERTY_SVN, &svn),
-        (TRUSTLET_PROPERTY_TA_DIGEST, ta_digest),
+        (
+            TRUSTLET_PROPERTY_TA_DIGEST,
+            ta_digest.map_or(&[][..], TaDigest::as_slice),
+        ),
         (TRUSTLET_PROPERTY_DEBUGGED, &debugged),
         (TRUSTLET_PROPERTY_ISOLATION_SOLUTION, ISOLATION_SOLUTION),
     ];
-    let layout = KeyIsoClaimLayout::new(ta_data.len(), nonce.len())?;
+    let layout = KeyIsoClaimLayout::new(
+        ta_data.len(),
+        nonce.len(),
+        ta_digest.map_or(0, |_| TA_DIGEST_LEN),
+    )?;
 
     let mut endorsement = Vec::with_capacity(layout.claim);
     endorsement.extend_from_slice(
@@ -642,7 +650,7 @@ mod tests {
         let ta_digest = [0xa5; TA_DIGEST_LEN];
 
         let endorsement =
-            build_keyiso_claim(ta_data, &nonce, &ta_uuid, ta_svn, &ta_digest).unwrap();
+            build_keyiso_claim(ta_data, &nonce, &ta_uuid, ta_svn, Some(&ta_digest)).unwrap();
         let mut offset = 0;
 
         assert_eq!(read_u32(&endorsement, &mut offset), 0x4d53_414b);
@@ -743,7 +751,7 @@ mod tests {
         let ta_uuid = TeeUuid::NIL;
         let ta_digest = [0xa5; TA_DIGEST_LEN];
         let mut endorsement =
-            build_keyiso_claim(b"TA data", &nonce, &ta_uuid, 7, &ta_digest).unwrap();
+            build_keyiso_claim(b"TA data", &nonce, &ta_uuid, 7, Some(&ta_digest)).unwrap();
         let signed_len = endorsement.len();
         let signature = endorse_data_with(&endorsement, &private_key).unwrap();
 
