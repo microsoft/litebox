@@ -315,36 +315,37 @@ struct KeyIsoClaimLayout {
 }
 
 impl KeyIsoClaimLayout {
+    const PROPERTY_NAMES_SIZE: usize = TRUSTLET_PROPERTY_UUID.len()
+        + TRUSTLET_PROPERTY_SVN.len()
+        + TRUSTLET_PROPERTY_TA_DIGEST.len()
+        + TRUSTLET_PROPERTY_DEBUGGED.len()
+        + TRUSTLET_PROPERTY_ISOLATION_SOLUTION.len();
+    const PROPERTIES_FIXED_SIZE: usize = 5 * size_of::<KeyIsoAttestationTrustletProperty>()
+        + Self::PROPERTY_NAMES_SIZE
+        + size_of::<TeeUuid>()
+        + size_of::<u32>()
+        + size_of::<u8>()
+        + ISOLATION_SOLUTION.len();
+    const TRUSTLET_INFORMATION_FIXED_SIZE: usize =
+        size_of::<KeyIsoAttestationTrustletInformation>() + Self::PROPERTIES_FIXED_SIZE;
+    const REPORT_FIXED_SIZE: usize =
+        size_of::<KeyIsoTrustletReport>() + Self::TRUSTLET_INFORMATION_FIXED_SIZE;
+    const CLAIM_FIXED_SIZE: usize = size_of::<KeyIsoAttestationStatement>()
+        + size_of::<KeyIsoKeyAttestationHeader>()
+        + Self::REPORT_FIXED_SIZE
+        + size_of::<KeyIsoAttestationSignatureParams>()
+        + KEYISO_SIGNATURE_ALGORITHM_ID.len()
+        + size_of::<KeyIsoAttestationEccSignatureParams>()
+        + KEYISO_SIGNATURE_HASH_ALGORITHM.len()
+        + size_of::<KeyIsoAttestationSignature>();
+
     fn new(ta_data_len: usize, nonce_len: usize, ta_digest_len: usize) -> Option<Self> {
-        let property_names_size = TRUSTLET_PROPERTY_UUID
-            .len()
-            .checked_add(TRUSTLET_PROPERTY_SVN.len())?
-            .checked_add(TRUSTLET_PROPERTY_TA_DIGEST.len())?
-            .checked_add(TRUSTLET_PROPERTY_DEBUGGED.len())?
-            .checked_add(TRUSTLET_PROPERTY_ISOLATION_SOLUTION.len())?;
-        let property_values_size = size_of::<TeeUuid>()
-            .checked_add(size_of::<u32>())?
-            .checked_add(ta_digest_len)?
-            .checked_add(size_of::<u8>())?
-            .checked_add(ISOLATION_SOLUTION.len())?;
-        let properties_size = 5usize
-            .checked_mul(size_of::<KeyIsoAttestationTrustletProperty>())?
-            .checked_add(property_names_size)?
-            .checked_add(property_values_size)?;
-        let trustlet_information_size =
-            size_of::<KeyIsoAttestationTrustletInformation>().checked_add(properties_size)?;
-        let report_size =
-            size_of::<KeyIsoTrustletReport>().checked_add(trustlet_information_size)?;
-        let claim_size = size_of::<KeyIsoAttestationStatement>()
-            .checked_add(size_of::<KeyIsoKeyAttestationHeader>())?
+        let trustlet_information_size = Self::TRUSTLET_INFORMATION_FIXED_SIZE + ta_digest_len;
+        let report_size = Self::REPORT_FIXED_SIZE + ta_digest_len;
+        let claim_size = Self::CLAIM_FIXED_SIZE
             .checked_add(ta_data_len)?
             .checked_add(nonce_len)?
-            .checked_add(report_size)?
-            .checked_add(size_of::<KeyIsoAttestationSignatureParams>())?
-            .checked_add(KEYISO_SIGNATURE_ALGORITHM_ID.len())?
-            .checked_add(size_of::<KeyIsoAttestationEccSignatureParams>())?
-            .checked_add(KEYISO_SIGNATURE_HASH_ALGORITHM.len())?
-            .checked_add(size_of::<KeyIsoAttestationSignature>())?;
+            .checked_add(ta_digest_len)?;
         Some(Self {
             trustlet_information: trustlet_information_size,
             report: report_size,
