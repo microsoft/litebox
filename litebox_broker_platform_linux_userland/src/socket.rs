@@ -6711,7 +6711,7 @@ mod tests {
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let (published, publications) = channel();
-        let (retired, _retirements) = channel();
+        let (retired, retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
 
         let shadowed_host_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -6796,6 +6796,8 @@ mod tests {
             }))
         );
         assert_eq!(&response, b"response");
+        sender_session.close_object_reference(sender).unwrap();
+        assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), sender);
 
         assert_eq!(
             shadowed_host_socket
@@ -6831,6 +6833,14 @@ mod tests {
         let receiver_private_address =
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_source.port());
         let probe = create_udp_socket(&sender_session, readiness);
+        let probe_guest_port = (1_u16..=u16::MAX)
+            .find(|port| *port != receiver_guest_address.port() && *port != receiver_source.port())
+            .unwrap();
+        let probe_guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, probe_guest_port);
+        assert_eq!(
+            litebox_broker_core::socket::bind(&sender_session, probe, probe_guest_address,),
+            Ok(SocketOutcome::Completed(probe_guest_address))
+        );
         assert_eq!(
             send_datagram(
                 &sender_session,
@@ -6863,7 +6873,7 @@ mod tests {
         assert_eq!(
             send_datagram(
                 &sender_session,
-                sender,
+                probe,
                 b"guest",
                 SendFlags::NONE,
                 Some(receiver_guest_address),
@@ -6911,7 +6921,7 @@ mod tests {
             Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
                 received: 5,
                 datagram_length: 5,
-                source_address: sender_source_address,
+                source_address: probe_guest_address,
             }))
         );
         assert_eq!(&reply, b"guest");
