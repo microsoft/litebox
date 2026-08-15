@@ -479,7 +479,7 @@ impl Reactor {
             let Some(destination) = self.sockets.get(&destination_id) else {
                 return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
             };
-            if destination.kind != SocketKind::Udp || destination.read_shutdown {
+            if destination.kind() != SocketKind::Udp || destination.read_shutdown {
                 return Ok(SocketOutcome::Completed(payload.len()));
             }
             let udp = destination.udp_state()?;

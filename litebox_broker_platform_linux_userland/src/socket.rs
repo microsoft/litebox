@@ -901,49 +901,75 @@ struct PeekCache {
     data: Vec<u8>,
 }
 
-/// Reactor-owned descriptor and its broker-facing readiness state.
-#[allow(clippy::struct_excessive_bools)] // Independent cached socket attributes.
-struct SocketEntry {
-    socket: Option<OwnedFd>,
-    session_id: SessionId,
-    kind: SocketKind,
-    readiness: ReadinessRegistration,
-    snapshot: Arc<Mutex<SocketSnapshot>>,
-    connection_status: SocketConnectionStatus,
+/// Reactor-owned TCP descriptor and transport-specific lifecycle state.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "TCP lifecycle and option flags are independent"
+)]
+struct TcpSocketState {
+    socket: OwnedFd,
     untracked_guest_listener_id: Option<u64>,
-    read_shutdown: bool,
-    write_shutdown: bool,
     peek_waitall_threshold: Option<usize>,
     listening: bool,
     was_listener: bool,
     abortive_close: bool,
-    guest_local_address: Option<SocketAddrV4>,
     host_connection: Option<(SocketAddrV4, SocketAddrV4)>,
-    udp: Option<UdpSocketState>,
-    tcp_no_delay: bool,
-    tcp_keep_alive: bool,
+    no_delay: bool,
+    keep_alive: bool,
+}
+
+/// Exactly one transport-specific payload for a live reactor socket.
+enum SocketTransportState {
+    Tcp(TcpSocketState),
+    Udp(UdpSocketState),
+}
+
+/// Reactor-owned shared socket state and transport-specific payload.
+struct SocketEntry {
+    session_id: SessionId,
+    transport: SocketTransportState,
+    readiness: ReadinessRegistration,
+    snapshot: Arc<Mutex<SocketSnapshot>>,
+    connection_status: SocketConnectionStatus,
+    read_shutdown: bool,
+    write_shutdown: bool,
+    guest_local_address: Option<SocketAddrV4>,
 }
 
 impl SocketEntry {
-    fn tcp_socket(&self) -> BrokerResult<&OwnedFd> {
-        if self.kind != SocketKind::Tcp {
-            return Err(BrokerError::Internal);
+    fn kind(&self) -> SocketKind {
+        match &self.transport {
+            SocketTransportState::Tcp(_) => SocketKind::Tcp,
+            SocketTransportState::Udp(_) => SocketKind::Udp,
         }
-        self.socket.as_ref().ok_or(BrokerError::Internal)
+    }
+
+    fn tcp_state(&self) -> BrokerResult<&TcpSocketState> {
+        match &self.transport {
+            SocketTransportState::Tcp(tcp) => Ok(tcp),
+            SocketTransportState::Udp(_) => Err(BrokerError::Internal),
+        }
+    }
+
+    fn tcp_state_mut(&mut self) -> BrokerResult<&mut TcpSocketState> {
+        match &mut self.transport {
+            SocketTransportState::Tcp(tcp) => Ok(tcp),
+            SocketTransportState::Udp(_) => Err(BrokerError::Internal),
+        }
     }
 
     fn udp_state(&self) -> BrokerResult<&UdpSocketState> {
-        if self.kind != SocketKind::Udp {
-            return Err(BrokerError::Internal);
+        match &self.transport {
+            SocketTransportState::Udp(udp) => Ok(udp),
+            SocketTransportState::Tcp(_) => Err(BrokerError::Internal),
         }
-        self.udp.as_ref().ok_or(BrokerError::Internal)
     }
 
     fn udp_state_mut(&mut self) -> BrokerResult<&mut UdpSocketState> {
-        if self.kind != SocketKind::Udp {
-            return Err(BrokerError::Internal);
+        match &mut self.transport {
+            SocketTransportState::Udp(udp) => Ok(udp),
+            SocketTransportState::Tcp(_) => Err(BrokerError::Internal),
         }
-        self.udp.as_mut().ok_or(BrokerError::Internal)
     }
 }
 
@@ -1156,10 +1182,13 @@ fn listener_backlog_is_nonempty(sockets: &HashMap<u64, SocketEntry>, listener_id
     let Some(listener) = sockets.get(&listener_id) else {
         return false;
     };
-    if !listener.listening {
+    let Ok(tcp) = listener.tcp_state() else {
+        return false;
+    };
+    if !tcp.listening {
         return false;
     }
-    listener.tcp_socket().is_ok_and(socket_backlog_is_nonempty)
+    socket_backlog_is_nonempty(&tcp.socket)
 }
 
 fn socket_backlog_is_nonempty(socket: &OwnedFd) -> bool {
@@ -1228,7 +1257,9 @@ impl Reactor {
             matches!(socket.connection_status, SocketConnectionStatus::Failed(_))
                 .then(|| {
                     socket
-                        .host_connection
+                        .tcp_state()
+                        .ok()
+                        .and_then(|tcp| tcp.host_connection)
                         .map(|connection| (connection, socket.session_id))
                 })
                 .flatten()
@@ -1582,7 +1613,7 @@ impl Reactor {
         let (kind, already_bound) = self
             .sockets
             .get(&id)
-            .map(|socket| (socket.kind, socket.guest_local_address.is_some()))
+            .map(|socket| (socket.kind(), socket.guest_local_address.is_some()))
             .ok_or(BrokerError::Internal)?;
         if kind == SocketKind::Udp {
             if already_bound {
@@ -1642,17 +1673,19 @@ impl Reactor {
         let (kind, guest_address) = self
             .sockets
             .get(&id)
-            .map(|socket| (socket.kind, socket.guest_local_address))
+            .map(|socket| (socket.kind(), socket.guest_local_address))
             .ok_or(BrokerError::Internal)?;
         if kind != SocketKind::Tcp {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         let guest_address = guest_address.ok_or(BrokerError::Internal)?;
         let needs_host_bind = local_socket_address(
-            self.sockets
+            &self
+                .sockets
                 .get(&id)
                 .ok_or(BrokerError::Internal)?
-                .tcp_socket()?,
+                .tcp_state()?
+                .socket,
         )?
         .port()
             == 0;
@@ -1685,7 +1718,7 @@ impl Reactor {
         id: u64,
         guest_address: SocketAddrV4,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        let kind = self.sockets.get(&id).map(|socket| socket.kind).ok_or(
+        let kind = self.sockets.get(&id).map(SocketEntry::kind).ok_or(
             PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
         )?;
         if kind == SocketKind::Udp {
@@ -1839,13 +1872,15 @@ impl Reactor {
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ) {
             let host_address = local_socket_address(
-                self.sockets
+                &self
+                    .sockets
                     .get(&id)
                     .ok_or(PlatformConnectError::PeerIndeterminate(
                         BrokerError::Internal,
                     ))?
-                    .tcp_socket()
-                    .map_err(PlatformConnectError::PeerIndeterminate)?,
+                    .tcp_state()
+                    .map_err(PlatformConnectError::PeerIndeterminate)?
+                    .socket,
             )
             .map_err(PlatformConnectError::PeerIndeterminate)?;
             self.tcp
@@ -1863,6 +1898,8 @@ impl Reactor {
                         .ok_or(PlatformConnectError::PeerIndeterminate(
                             BrokerError::Internal,
                         ))?
+                        .tcp_state_mut()
+                        .map_err(PlatformConnectError::PeerIndeterminate)?
                         .untracked_guest_listener_id = None;
                     return Err(PlatformConnectError::PeerIndeterminate(
                         BrokerError::ResourceExhausted,
@@ -1881,8 +1918,11 @@ impl Reactor {
                         .ok_or(PlatformConnectError::PeerIndeterminate(
                             BrokerError::Internal,
                         ))?;
-                socket.host_connection = Some(connection);
-                socket.untracked_guest_listener_id = None;
+                let tcp = socket
+                    .tcp_state_mut()
+                    .map_err(PlatformConnectError::PeerIndeterminate)?;
+                tcp.host_connection = Some(connection);
+                tcp.untracked_guest_listener_id = None;
             }
         }
         if let Err(error) = update_snapshot(
@@ -1897,7 +1937,7 @@ impl Reactor {
             if let Some(connection) = self
                 .sockets
                 .get(&id)
-                .and_then(|socket| socket.host_connection)
+                .and_then(|socket| socket.tcp_state().ok().and_then(|tcp| tcp.host_connection))
             {
                 self.discard_pending_guest_connection(connection, session_id);
             }
@@ -1914,7 +1954,7 @@ impl Reactor {
     ) -> BrokerResult<SocketOutcome<usize>> {
         let (peer, authorize_external_reply) = {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
-            if socket.kind != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+            if socket.kind() != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
                 return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
             }
             if socket.write_shutdown {
@@ -1994,7 +2034,7 @@ impl Reactor {
         let kind = self
             .sockets
             .get(&socket_id)
-            .map(|socket| socket.kind)
+            .map(SocketEntry::kind)
             .ok_or(BrokerError::Internal)?;
         if kind == SocketKind::Tcp {
             return shutdown_tcp_socket(
@@ -2044,7 +2084,7 @@ impl Reactor {
         let kind = self
             .sockets
             .get(&socket_id)
-            .map(|socket| socket.kind)
+            .map(SocketEntry::kind)
             .ok_or(BrokerError::Internal)?;
         let response = status_socket(
             self.sockets
@@ -2134,7 +2174,7 @@ impl Reactor {
         let Some((kind, session_id)) = self
             .sockets
             .get(&id)
-            .map(|socket| (socket.kind, socket.session_id))
+            .map(|socket| (socket.kind(), socket.session_id))
         else {
             return;
         };
@@ -2177,15 +2217,22 @@ impl Reactor {
             .remove(&id)
             .expect("checked TCP socket missing");
         let SocketEntry {
-            socket,
+            transport,
             connection_status,
+            guest_local_address,
+            ..
+        } = socket;
+        let SocketTransportState::Tcp(TcpSocketState {
+            socket,
             untracked_guest_listener_id,
             was_listener,
             abortive_close,
-            guest_local_address,
             host_connection,
             ..
-        } = socket;
+        }) = transport
+        else {
+            unreachable!("checked TCP socket changed transport");
+        };
         let guest_connector = untracked_guest_listener_id.is_some()
             || host_connection.is_some_and(|connection| {
                 self.tcp
@@ -2200,7 +2247,7 @@ impl Reactor {
             self.tcp.remove_binding(address.port(), id);
         }
 
-        let mut socket = socket;
+        let mut socket = Some(socket);
         if !abortive_close
             && guest_connector
             && matches!(
@@ -2312,7 +2359,9 @@ impl Reactor {
                             .map_err(ReactorFailure::Broker)?
                         {
                             socket
-                                .host_connection
+                                .tcp_state()
+                                .ok()
+                                .and_then(|tcp| tcp.host_connection)
                                 .map(|connection| (connection, socket.session_id))
                         } else {
                             None
@@ -2490,16 +2539,17 @@ impl Reactor {
                         self.peek_cache = None;
                     }
                     let was_listening = mode == ShutdownMode::StopListening
-                        && self.sockets.get(&id).is_some_and(|socket| socket.listening);
+                        && self.sockets.get(&id).is_some_and(|socket| {
+                            socket.tcp_state().is_ok_and(|tcp| tcp.listening)
+                        });
                     let was_connecting = self.sockets.get(&id).is_some_and(|socket| {
                         socket.connection_status == SocketConnectionStatus::Connecting
                     });
                     let mut outcome = self.shutdown_socket(id, mode);
                     let stopped_listening = was_listening
-                        && self
-                            .sockets
-                            .get(&id)
-                            .is_some_and(|socket| !socket.listening);
+                        && self.sockets.get(&id).is_some_and(|socket| {
+                            socket.tcp_state().is_ok_and(|tcp| !tcp.listening)
+                        });
                     if stopped_listening {
                         self.remove_pending_guest_connections_for_listener(id);
                         let update = self
@@ -2710,7 +2760,7 @@ impl Reactor {
         {
             return Err(BrokerError::ResourceExhausted);
         }
-        let (socket, udp, initial_readiness) = match kind {
+        let (transport, initial_readiness) = match kind {
             SocketKind::Tcp => {
                 let socket = socket_with(
                     LinuxAddressFamily::INET,
@@ -2726,9 +2776,25 @@ impl Reactor {
                     idle_epoll_events(),
                 )
                 .map_err(broker_error_from_errno)?;
-                (Some(socket), None, ReadinessFlags::default())
+                (
+                    SocketTransportState::Tcp(TcpSocketState {
+                        socket,
+                        untracked_guest_listener_id: None,
+                        peek_waitall_threshold: None,
+                        listening: false,
+                        was_listener: false,
+                        abortive_close: false,
+                        host_connection: None,
+                        no_delay: false,
+                        keep_alive: false,
+                    }),
+                    ReadinessFlags::default(),
+                )
             }
-            SocketKind::Udp => (None, Some(UdpSocketState::default()), ReadinessFlags::WRITE),
+            SocketKind::Udp => (
+                SocketTransportState::Udp(UdpSocketState::default()),
+                ReadinessFlags::WRITE,
+            ),
         };
         if initial_readiness != ReadinessFlags::default() {
             snapshot
@@ -2743,24 +2809,14 @@ impl Reactor {
         self.sockets.insert(
             id,
             SocketEntry {
-                socket,
                 session_id,
-                kind,
+                transport,
                 readiness,
                 snapshot,
                 connection_status: SocketConnectionStatus::Unconnected,
-                untracked_guest_listener_id: None,
                 read_shutdown: false,
                 write_shutdown: false,
-                peek_waitall_threshold: None,
-                listening: false,
-                was_listener: false,
-                abortive_close: false,
                 guest_local_address: None,
-                host_connection: None,
-                udp,
-                tcp_no_delay: false,
-                tcp_keep_alive: false,
             },
         );
         session.live_socket_count = session
@@ -2791,14 +2847,14 @@ impl Reactor {
                 .sockets
                 .get(&listener_id)
                 .ok_or(BrokerError::Internal)?;
-            if listener.kind != SocketKind::Tcp || !listener.listening {
+            if listener.kind() != SocketKind::Tcp || !listener.tcp_state()?.listening {
                 return Ok(SocketOutcome::Failed(SocketError::NotConnected));
             }
             (
                 listener.session_id,
                 listener.guest_local_address.ok_or(BrokerError::Internal)?,
-                listener.tcp_no_delay,
-                listener.tcp_keep_alive,
+                listener.tcp_state()?.no_delay,
+                listener.tcp_state()?.keep_alive,
             )
         };
         self.expire_deadlined_state(Instant::now());
@@ -2813,7 +2869,7 @@ impl Reactor {
                     .get_mut(&listener_id)
                     .ok_or(BrokerError::Internal)?;
                 match acceptfrom_with(
-                    listener.tcp_socket()?,
+                    &listener.tcp_state()?.socket,
                     LinuxSocketFlags::CLOEXEC | LinuxSocketFlags::NONBLOCK,
                 ) {
                     Ok((socket, address)) => break (socket, address),
@@ -2886,7 +2942,7 @@ impl Reactor {
                 tv_nsec: 0,
             };
             loop {
-                let mut poll_fd = [PollFd::new(listener.tcp_socket()?, PollFlags::IN)];
+                let mut poll_fd = [PollFd::new(&listener.tcp_state()?.socket, PollFlags::IN)];
                 match poll(&mut poll_fd, Some(&no_wait)) {
                     Ok(_) if poll_fd[0].revents().contains(PollFlags::IN) => break false,
                     Ok(_) => {
@@ -2923,24 +2979,24 @@ impl Reactor {
         self.sockets.insert(
             accepted_id,
             SocketEntry {
-                socket: Some(socket),
                 session_id: listener_session_id,
-                kind: SocketKind::Tcp,
+                transport: SocketTransportState::Tcp(TcpSocketState {
+                    socket,
+                    untracked_guest_listener_id: None,
+                    peek_waitall_threshold: None,
+                    listening: false,
+                    was_listener: false,
+                    abortive_close: false,
+                    host_connection: None,
+                    no_delay: listener_tcp_no_delay,
+                    keep_alive: listener_tcp_keep_alive,
+                }),
                 readiness,
                 snapshot,
                 connection_status: SocketConnectionStatus::Connected,
-                untracked_guest_listener_id: None,
                 read_shutdown: false,
                 write_shutdown: false,
-                peek_waitall_threshold: None,
-                listening: false,
-                was_listener: false,
-                abortive_close: false,
                 guest_local_address: Some(listener_guest_address),
-                host_connection: None,
-                udp: None,
-                tcp_no_delay: listener_tcp_no_delay,
-                tcp_keep_alive: listener_tcp_keep_alive,
             },
         );
         let session = self
@@ -2989,9 +3045,10 @@ fn connect_tcp_socket(
 ) -> core::result::Result<(SocketConnectionStatus, ReadinessFlags), PlatformConnectError> {
     if let Err(error) = epoll::modify(
         epoll_fd,
-        socket
-            .tcp_socket()
-            .map_err(PlatformConnectError::PeerUnchanged)?,
+        &socket
+            .tcp_state()
+            .map_err(PlatformConnectError::PeerUnchanged)?
+            .socket,
         epoll::EventData::new_u64(id),
         active_epoll_events(),
     ) {
@@ -3006,12 +3063,16 @@ fn connect_tcp_socket(
     // later failure can then be settled or conservatively retired without
     // reconstructing whether a SYN may have reached a guest listener.
     socket.connection_status = SocketConnectionStatus::Connecting;
-    socket.untracked_guest_listener_id = guest_listener_id;
+    socket
+        .tcp_state_mut()
+        .map_err(PlatformConnectError::PeerUnchanged)?
+        .untracked_guest_listener_id = guest_listener_id;
     let status = loop {
         match connect(
-            socket
-                .tcp_socket()
-                .map_err(PlatformConnectError::PeerIndeterminate)?,
+            &socket
+                .tcp_state()
+                .map_err(PlatformConnectError::PeerIndeterminate)?
+                .socket,
             &address,
         ) {
             Ok(()) | Err(Errno::ISCONN) => break SocketConnectionStatus::Connected,
@@ -3040,7 +3101,10 @@ fn connect_tcp_socket(
     };
     socket.connection_status = status;
     if matches!(status, SocketConnectionStatus::Failed(_)) {
-        socket.untracked_guest_listener_id = None;
+        socket
+            .tcp_state_mut()
+            .map_err(PlatformConnectError::PeerIndeterminate)?
+            .untracked_guest_listener_id = None;
     }
     let readiness = match status {
         SocketConnectionStatus::Connected | SocketConnectionStatus::Connecting => {
@@ -3071,9 +3135,9 @@ fn bind_host_socket(
     address: SocketAddrV4,
 ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
     loop {
-        match bind(socket.tcp_socket()?, &address) {
+        match bind(&socket.tcp_state()?.socket, &address) {
             Ok(()) => {
-                let local_address = local_socket_address(socket.tcp_socket()?)?;
+                let local_address = local_socket_address(&socket.tcp_state()?.socket)?;
                 return Ok(SocketOutcome::Completed(local_address));
             }
             Err(Errno::INTR) => {}
@@ -3092,29 +3156,29 @@ fn listen_tcp_socket(
     socket: &mut SocketEntry,
     backlog: u32,
 ) -> BrokerResult<SocketOutcome<()>> {
-    if socket.kind != SocketKind::Tcp {
+    if socket.kind() != SocketKind::Tcp {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     let backlog = i32::try_from(backlog).map_err(|_| BrokerError::UnsupportedOperation)?;
-    let was_listening = socket.listening;
+    let was_listening = socket.tcp_state()?.listening;
     if !was_listening {
         epoll::modify(
             epoll_fd,
-            socket.tcp_socket()?,
+            &socket.tcp_state()?.socket,
             epoll::EventData::new_u64(id),
             active_epoll_events(),
         )
         .map_err(broker_error_from_errno)?;
     }
     loop {
-        match listen(socket.tcp_socket()?, backlog) {
+        match listen(&socket.tcp_state()?.socket, backlog) {
             Ok(()) => break,
             Err(Errno::INTR) => {}
             Err(error) => {
                 if !was_listening {
                     epoll::modify(
                         epoll_fd,
-                        socket.tcp_socket()?,
+                        &socket.tcp_state()?.socket,
                         epoll::EventData::new_u64(id),
                         idle_epoll_events(),
                     )
@@ -3126,8 +3190,9 @@ fn listen_tcp_socket(
             }
         }
     }
-    socket.listening = true;
-    socket.was_listener = true;
+    let tcp = socket.tcp_state_mut()?;
+    tcp.listening = true;
+    tcp.was_listener = true;
     let mut snapshot = socket
         .snapshot
         .lock()
@@ -3139,14 +3204,14 @@ fn listen_tcp_socket(
 }
 
 fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutcome<usize>> {
-    if socket.kind != SocketKind::Tcp {
+    if socket.kind() != SocketKind::Tcp {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     if socket.write_shutdown {
         return Ok(SocketOutcome::Failed(SocketError::Other));
     }
     loop {
-        match send(socket.tcp_socket()?, data, LinuxSendFlags::NOSIGNAL) {
+        match send(&socket.tcp_state()?.socket, data, LinuxSendFlags::NOSIGNAL) {
             Ok(sent) => {
                 if sent != 0 {
                     confirm_tcp_connected(socket)?;
@@ -3177,7 +3242,7 @@ fn receive_socket(
     peek_offset: usize,
     peek_length: usize,
 ) -> BrokerResult<ReactorReceiveOutcome> {
-    if socket.kind != SocketKind::Tcp {
+    if socket.kind() != SocketKind::Tcp {
         return Ok(ReactorReceiveOutcome::Failed(SocketError::InvalidArgument));
     }
     let peek = flags.contains(ReceiveFlags::PEEK);
@@ -3217,12 +3282,12 @@ fn receive_socket(
             || snapshot.readiness.contains(ReadinessFlags::ERROR);
         if socket.connection_status == SocketConnectionStatus::Connected
             && !terminal
-            && ioctl_fionread(socket.tcp_socket()?).map_err(broker_error_from_errno)?
+            && ioctl_fionread(&socket.tcp_state()?.socket).map_err(broker_error_from_errno)?
                 < peek_length.try_into().map_err(|_| BrokerError::Internal)?
         {
-            socket.peek_waitall_threshold = Some(
-                socket
-                    .peek_waitall_threshold
+            let tcp = socket.tcp_state_mut()?;
+            tcp.peek_waitall_threshold = Some(
+                tcp.peek_waitall_threshold
                     .map_or(peek_length, |threshold| threshold.min(peek_length)),
             );
             return Err(BrokerError::WouldBlock);
@@ -3294,7 +3359,7 @@ fn receive_socket_once(
     flags: LinuxRecvFlags,
 ) -> BrokerResult<ReactorReceiveOutcome> {
     loop {
-        match recv(socket.tcp_socket()?, data.as_mut_slice(), flags) {
+        match recv(&socket.tcp_state()?.socket, data.as_mut_slice(), flags) {
             Ok((_buffer, 0)) => {
                 confirm_tcp_connected(socket)?;
                 let readiness = if socket.read_shutdown {
@@ -3317,7 +3382,9 @@ fn receive_socket_once(
                         .contains(ReadinessFlags::HANGUP);
                 if !flags.contains(LinuxRecvFlags::PEEK)
                     && !terminal_readable
-                    && ioctl_fionread(socket.tcp_socket()?).map_err(broker_error_from_errno)? == 0
+                    && ioctl_fionread(&socket.tcp_state()?.socket)
+                        .map_err(broker_error_from_errno)?
+                        == 0
                 {
                     clear_readiness(socket, ReadinessFlags::READ)?;
                 }
@@ -3339,19 +3406,19 @@ fn receive_socket_once(
 }
 
 fn set_tcp_option(socket: &mut SocketEntry, value: TcpOptionValue) -> BrokerResult<()> {
-    if socket.kind != SocketKind::Tcp {
+    if socket.kind() != SocketKind::Tcp {
         return Err(BrokerError::UnsupportedOperation);
     }
     match value {
         TcpOptionValue::NoDelay(value) => {
-            sockopt::set_tcp_nodelay(socket.tcp_socket()?, value)
+            sockopt::set_tcp_nodelay(&socket.tcp_state()?.socket, value)
                 .map_err(broker_error_from_errno)?;
-            socket.tcp_no_delay = value;
+            socket.tcp_state_mut()?.no_delay = value;
         }
         TcpOptionValue::KeepAlive(value) => {
-            sockopt::set_socket_keepalive(socket.tcp_socket()?, value)
+            sockopt::set_socket_keepalive(&socket.tcp_state()?.socket, value)
                 .map_err(broker_error_from_errno)?;
-            socket.tcp_keep_alive = value;
+            socket.tcp_state_mut()?.keep_alive = value;
         }
         _ => return Err(BrokerError::UnsupportedOperation),
     }
@@ -3364,14 +3431,14 @@ fn apply_tcp_options(socket: &OwnedFd, no_delay: bool, keep_alive: bool) -> Brok
 }
 
 fn get_tcp_option(socket: &SocketEntry, name: TcpOptionName) -> BrokerResult<TcpOptionValue> {
-    if socket.kind != SocketKind::Tcp {
+    if socket.kind() != SocketKind::Tcp {
         return Err(BrokerError::UnsupportedOperation);
     }
     match name {
-        TcpOptionName::NoDelay => sockopt::tcp_nodelay(socket.tcp_socket()?)
+        TcpOptionName::NoDelay => sockopt::tcp_nodelay(&socket.tcp_state()?.socket)
             .map(TcpOptionValue::NoDelay)
             .map_err(broker_error_from_errno),
-        TcpOptionName::KeepAlive => sockopt::socket_keepalive(socket.tcp_socket()?)
+        TcpOptionName::KeepAlive => sockopt::socket_keepalive(&socket.tcp_state()?.socket)
             .map(TcpOptionValue::KeepAlive)
             .map_err(broker_error_from_errno),
         _ => Err(BrokerError::UnsupportedOperation),
@@ -3382,21 +3449,22 @@ fn shutdown_tcp_socket(
     socket: &mut SocketEntry,
     mode: ShutdownMode,
 ) -> BrokerResult<SocketOutcome<()>> {
-    if socket.kind != SocketKind::Tcp {
+    if socket.kind() != SocketKind::Tcp {
         return Err(BrokerError::Internal);
     }
     if mode == ShutdownMode::Abort {
-        sockopt::set_socket_linger(socket.tcp_socket()?, Some(Duration::ZERO))
+        sockopt::set_socket_linger(&socket.tcp_state()?.socket, Some(Duration::ZERO))
             .map_err(broker_error_from_errno)?;
-        socket.abortive_close = true;
+        socket.tcp_state_mut()?.abortive_close = true;
         return Ok(SocketOutcome::Completed(()));
     }
     let stop_listening = mode == ShutdownMode::StopListening;
+    let listening = socket.tcp_state()?.listening;
     if stop_listening {
-        if !socket.listening {
+        if !listening {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
-    } else if socket.listening {
+    } else if listening {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     let (mode, add, clear, shuts_down_read, shuts_down_write) = match mode {
@@ -3431,7 +3499,7 @@ fn shutdown_tcp_socket(
         _ => return Err(BrokerError::UnsupportedOperation),
     };
     loop {
-        match shutdown(socket.tcp_socket()?, mode) {
+        match shutdown(&socket.tcp_state()?.socket, mode) {
             Ok(()) => {}
             Err(Errno::INTR) => continue,
             Err(Errno::NOTCONN) => {
@@ -3445,9 +3513,10 @@ fn shutdown_tcp_socket(
             }
         }
         if stop_listening {
-            socket.listening = false;
+            let tcp = socket.tcp_state_mut()?;
+            tcp.listening = false;
+            tcp.peek_waitall_threshold = None;
             socket.read_shutdown = true;
-            socket.peek_waitall_threshold = None;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::NotConnected);
             // The native transition is complete and the cached terminal
             // snapshot is authoritative even if its notification cannot be
@@ -3462,7 +3531,12 @@ fn shutdown_tcp_socket(
         }
         socket.read_shutdown |= shuts_down_read;
         socket.write_shutdown |= shuts_down_write;
-        let republish_readiness = shuts_down_read && socket.peek_waitall_threshold.take().is_some();
+        let republish_readiness = shuts_down_read
+            && socket
+                .tcp_state_mut()?
+                .peek_waitall_threshold
+                .take()
+                .is_some();
         if clear.0 != 0 {
             clear_readiness(socket, clear)?;
         }
@@ -3482,25 +3556,28 @@ fn shutdown_tcp_socket(
 }
 
 fn handle_socket_event(socket: &mut SocketEntry, events: epoll::EventFlags) -> BrokerResult<bool> {
-    if socket.listening {
+    if socket.tcp_state().is_ok_and(|tcp| tcp.listening) {
         update_snapshot(socket, None, readiness_from_epoll(socket, events))?;
         return Ok(false);
     }
-    if socket.kind == SocketKind::Udp {
+    if socket.kind() == SocketKind::Udp {
         update_snapshot(socket, None, readiness_from_epoll(socket, events))?;
         return Ok(false);
     }
     let republish_readiness = if events.contains(epoll::EventFlags::IN)
-        && let Some(threshold) = socket.peek_waitall_threshold
+        && let Some(threshold) = socket
+            .tcp_state()
+            .ok()
+            .and_then(|tcp| tcp.peek_waitall_threshold)
     {
         let threshold_reached = socket
-            .tcp_socket()
-            .and_then(|socket| ioctl_fionread(socket).map_err(broker_error_from_errno))
+            .tcp_state()
+            .and_then(|tcp| ioctl_fionread(&tcp.socket).map_err(broker_error_from_errno))
             .ok()
             .and_then(|available| usize::try_from(available).ok())
             .is_none_or(|available| available >= threshold);
         if threshold_reached {
-            socket.peek_waitall_threshold = None;
+            socket.tcp_state_mut()?.peek_waitall_threshold = None;
         }
         threshold_reached
     } else {
@@ -3545,7 +3622,7 @@ fn complete_connect(
 ) -> BrokerResult<SocketConnectionStatus> {
     // Epoll re-polls the descriptor when waiting, so OUT here reflects the
     // current post-connect state rather than readiness cached before connect.
-    let status = match sockopt::socket_error(socket.tcp_socket()?) {
+    let status = match sockopt::socket_error(&socket.tcp_state()?.socket) {
         Ok(Ok(())) if events.contains(epoll::EventFlags::OUT) => SocketConnectionStatus::Connected,
         Ok(Ok(())) => SocketConnectionStatus::Connecting,
         Ok(Err(error)) | Err(error) => {
@@ -3566,8 +3643,8 @@ fn complete_connect(
 }
 
 fn take_socket_error(socket: &SocketEntry) -> BrokerResult<Option<SocketError>> {
-    let native_socket = match socket.kind {
-        SocketKind::Tcp => Some(socket.tcp_socket()?),
+    let native_socket = match socket.kind() {
+        SocketKind::Tcp => Some(&socket.tcp_state()?.socket),
         SocketKind::Udp => socket
             .udp_state()?
             .external_endpoint
@@ -3597,12 +3674,12 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse>
             .lock()
             .expect("Linux socket snapshot mutex poisoned");
         (socket.connection_status == SocketConnectionStatus::Connected
-            || socket.kind == SocketKind::Udp)
+            || socket.kind() == SocketKind::Udp)
             && snapshot.readiness.contains(ReadinessFlags::ERROR)
     };
     let socket_error = if query_socket_error {
         let error = take_socket_error(socket)?;
-        if socket.kind == SocketKind::Udp {
+        if socket.kind() == SocketKind::Udp {
             let udp = socket.udp_state_mut()?;
             udp.native_error = false;
             if let Some(endpoint) = udp.external_endpoint.as_mut() {
@@ -3644,7 +3721,7 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse>
     // UDP status synchronously returns the consumed error and updates the
     // authoritative snapshot. A notification failure must not discard that
     // only error observation.
-    if socket.kind != SocketKind::Udp {
+    if socket.kind() != SocketKind::Udp {
         publication?;
     }
     Ok(response)
@@ -3668,7 +3745,7 @@ fn readiness_from_epoll(socket: &SocketEntry, events: epoll::EventFlags) -> Read
     if events.contains(epoll::EventFlags::OUT) && !socket.write_shutdown {
         readiness = readiness | ReadinessFlags::WRITE;
     }
-    if socket.kind == SocketKind::Tcp
+    if socket.kind() == SocketKind::Tcp
         && !socket.read_shutdown
         && events.intersects(epoll::EventFlags::RDHUP | epoll::EventFlags::HUP)
     {
@@ -3736,7 +3813,7 @@ fn update_snapshot(
 }
 
 fn confirm_tcp_connected(socket: &mut SocketEntry) -> BrokerResult<()> {
-    if socket.kind != SocketKind::Tcp
+    if socket.kind() != SocketKind::Tcp
         || socket.connection_status != SocketConnectionStatus::Connecting
     {
         return Ok(());
@@ -3756,7 +3833,7 @@ fn confirm_tcp_connected(socket: &mut SocketEntry) -> BrokerResult<()> {
 /// `Reactor::discard_failed_connect_after_command` after releasing its socket
 /// table borrow.
 fn fail_connect(socket: &mut SocketEntry, error: SocketError) -> BrokerResult<()> {
-    if socket.kind != SocketKind::Tcp
+    if socket.kind() != SocketKind::Tcp
         || socket.connection_status != SocketConnectionStatus::Connecting
     {
         return Ok(());
@@ -3799,7 +3876,7 @@ fn consume_synchronous_error(socket: &SocketEntry) -> BrokerResult<()> {
             .snapshot
             .lock()
             .expect("Linux socket snapshot mutex poisoned");
-        if !can_consume_synchronous_error(socket.kind, socket.connection_status) {
+        if !can_consume_synchronous_error(socket.kind(), socket.connection_status) {
             return Ok(());
         }
         snapshot.pending_error.is_none()
