@@ -180,8 +180,9 @@ pub struct PlatformDatagramReceive {
     pub datagram_length: usize,
     /// Guest-visible source address of the datagram.
     ///
-    /// Platforms must return the stable guest namespace identity for internal
-    /// traffic rather than any private host transport endpoint.
+    /// Platforms must return the sender's stable guest-namespace endpoint for
+    /// guest-to-guest datagrams. Broker-internal native endpoints must not be
+    /// exposed.
     pub source_address: SocketAddrV4,
 }
 
