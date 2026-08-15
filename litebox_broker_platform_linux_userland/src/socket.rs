@@ -41,8 +41,8 @@ use litebox_broker_core::readiness::ReadinessRegistration;
 mod udp;
 
 use udp::{
-    ReactorUdpBinding, ReactorUdpPeer, ReactorUdpState, UDP_EVENT_TOKEN_FLAG, UdpEventTarget,
-    UdpQueueAccounting, UdpReceiveOrigin, UdpSocketState, is_local_ipv4_address,
+    ReactorUdpBinding, ReactorUdpPeer, ReactorUdpState, UDP_EVENT_TOKEN_FLAG, UdpReceiveOrigin,
+    UdpSocketState, is_local_ipv4_address,
 };
 
 /// Epoll token reserved for the eventfd that wakes the reactor for commands.
@@ -447,13 +447,6 @@ impl ReactorClient {
                     max_sockets,
                     max_sockets_per_session,
                     retained_connector_count: 0,
-                    udp_external_peer_count: 0,
-                    udp_queued_datagrams: 0,
-                    udp_queued_bytes: 0,
-                    udp_source_queued: HashMap::new(),
-                    udp_event_tokens: HashMap::new(),
-                    next_udp_event_token: 1,
-                    next_udp_endpoint_generation: 1,
                     peek_cache: None,
                     events,
                 };
@@ -898,13 +891,6 @@ struct Reactor {
     max_sockets: usize,
     max_sockets_per_session: usize,
     retained_connector_count: usize,
-    udp_external_peer_count: usize,
-    udp_queued_datagrams: usize,
-    udp_queued_bytes: usize,
-    udp_source_queued: HashMap<SessionId, UdpQueueAccounting>,
-    udp_event_tokens: HashMap<u64, UdpEventTarget>,
-    next_udp_event_token: u64,
-    next_udp_endpoint_generation: u64,
     peek_cache: Option<PeekCache>,
     events: Vec<epoll::Event>,
 }
@@ -2163,8 +2149,9 @@ impl Reactor {
                 .get(&id)
                 .and_then(|socket| socket.udp_state().ok())
                 .map_or(0, |udp| udp.external_peers.len());
-            self.udp_external_peer_count = self
-                .udp_external_peer_count
+            self.udp.external_peer_count = self
+                .udp
+                .external_peer_count
                 .checked_sub(external_peer_count)
                 .expect("reactor UDP external peer count underflow");
             let session = self
@@ -2613,7 +2600,7 @@ impl Reactor {
                 }
                 #[cfg(test)]
                 ReactorCommand::UdpQueuedDatagramCount { response } => {
-                    let _ = response.send(self.udp_queued_datagrams);
+                    let _ = response.send(self.udp.queued_datagrams);
                 }
                 #[cfg(test)]
                 ReactorCommand::UdpNativeEndpointCount { response } => {
@@ -2640,11 +2627,11 @@ impl Reactor {
                 }
                 #[cfg(test)]
                 ReactorCommand::UdpExternalPeerCount { response } => {
-                    let _ = response.send(self.udp_external_peer_count);
+                    let _ = response.send(self.udp.external_peer_count);
                 }
                 #[cfg(test)]
                 ReactorCommand::ExhaustUdpEndpointGeneration { response } => {
-                    self.next_udp_endpoint_generation = u64::MAX;
+                    self.udp.next_endpoint_generation = u64::MAX;
                     let _ = response.send(());
                 }
                 #[cfg(test)]
@@ -2675,15 +2662,9 @@ impl Reactor {
                     }
                     self.tcp.bindings.clear();
                     self.tcp.pending_guest_connections.clear();
-                    self.udp.bindings.clear();
-                    self.udp.native_endpoints.clear();
-                    self.udp_event_tokens.clear();
-                    self.udp_source_queued.clear();
+                    self.udp.clear_live_state();
                     self.sessions.clear();
                     self.retained_connector_count = 0;
-                    self.udp_external_peer_count = 0;
-                    self.udp_queued_datagrams = 0;
-                    self.udp_queued_bytes = 0;
                     let _ = response.send(());
                     return true;
                 }
@@ -2993,15 +2974,9 @@ impl Reactor {
         self.sockets.clear();
         self.tcp.bindings.clear();
         self.tcp.pending_guest_connections.clear();
-        self.udp.bindings.clear();
-        self.udp.native_endpoints.clear();
-        self.udp_event_tokens.clear();
-        self.udp_source_queued.clear();
+        self.udp.clear_live_state();
         self.sessions.clear();
         self.retained_connector_count = 0;
-        self.udp_external_peer_count = 0;
-        self.udp_queued_datagrams = 0;
-        self.udp_queued_bytes = 0;
     }
 }
 

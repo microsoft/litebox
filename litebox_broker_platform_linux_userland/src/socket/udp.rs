@@ -43,11 +43,46 @@ const UDP_NATIVE_RECEIVE_BUFFER_REQUEST: usize = 64 * 1024;
 pub(super) const MAX_UDP_NATIVE_RECEIVE_BUFFER: usize = UDP_NATIVE_RECEIVE_BUFFER_REQUEST * 2;
 pub(super) const UDP_EVENT_TOKEN_FLAG: u64 = 1 << 63;
 
-/// Reactor-owned guest UDP bindings and live external endpoint identities.
-#[derive(Default)]
+/// Reactor-wide UDP namespace, native endpoint, and queue-accounting state.
 pub(super) struct ReactorUdpState {
     pub(super) bindings: HashMap<u16, ReactorUdpBinding>,
     pub(super) native_endpoints: HashMap<u16, UdpNativeEndpointIdentity>,
+    pub(super) external_peer_count: usize,
+    pub(super) queued_datagrams: usize,
+    pub(super) queued_bytes: usize,
+    pub(super) queued_by_source: HashMap<SessionId, UdpQueueAccounting>,
+    pub(super) event_tokens: HashMap<u64, UdpEventTarget>,
+    pub(super) next_event_token: u64,
+    pub(super) next_endpoint_generation: u64,
+}
+
+impl Default for ReactorUdpState {
+    fn default() -> Self {
+        Self {
+            bindings: HashMap::new(),
+            native_endpoints: HashMap::new(),
+            external_peer_count: 0,
+            queued_datagrams: 0,
+            queued_bytes: 0,
+            queued_by_source: HashMap::new(),
+            event_tokens: HashMap::new(),
+            next_event_token: 1,
+            next_endpoint_generation: 1,
+        }
+    }
+}
+
+impl ReactorUdpState {
+    /// Clears live registrations and accounting without reusing endpoint IDs.
+    pub(super) fn clear_live_state(&mut self) {
+        self.bindings.clear();
+        self.native_endpoints.clear();
+        self.event_tokens.clear();
+        self.queued_by_source.clear();
+        self.external_peer_count = 0;
+        self.queued_datagrams = 0;
+        self.queued_bytes = 0;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -245,7 +280,7 @@ impl Reactor {
             .sessions
             .get(&session_id)
             .ok_or(BrokerError::Internal)?;
-        if self.udp_external_peer_count
+        if self.udp.external_peer_count
             >= self
                 .max_sockets
                 .saturating_mul(MAX_UDP_EXTERNAL_PEERS_PER_SOCKET)
@@ -273,8 +308,9 @@ impl Reactor {
         {
             return Err(BrokerError::Internal);
         }
-        self.udp_external_peer_count = self
-            .udp_external_peer_count
+        self.udp.external_peer_count = self
+            .udp
+            .external_peer_count
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         let session = self
@@ -298,8 +334,9 @@ impl Reactor {
         if !udp.external_peers.remove(&address) {
             return;
         }
-        self.udp_external_peer_count = self
-            .udp_external_peer_count
+        self.udp.external_peer_count = self
+            .udp
+            .external_peer_count
             .checked_sub(1)
             .expect("reactor UDP external peer count underflow");
         let session = self
@@ -324,8 +361,9 @@ impl Reactor {
             udp.external_peers.clear();
             (session_id, count)
         };
-        self.udp_external_peer_count = self
-            .udp_external_peer_count
+        self.udp.external_peer_count = self
+            .udp
+            .external_peer_count
             .checked_sub(count)
             .ok_or(BrokerError::Internal)?;
         let session = self
@@ -390,7 +428,8 @@ impl Reactor {
             .get(&receiver.session_id)
             .ok_or(BrokerError::Internal)?;
         let source = self
-            .udp_source_queued
+            .udp
+            .queued_by_source
             .get(&source_session_id)
             .copied()
             .unwrap_or_default();
@@ -407,8 +446,8 @@ impl Reactor {
                 || udp.guest_receive_bytes.saturating_add(length) > MAX_UDP_QUEUE_BYTES_PER_SOCKET
                 || receiver_source.datagrams >= MAX_UDP_QUEUE_DATAGRAMS_PER_SOURCE
                 || receiver_source.bytes.saturating_add(length) > MAX_UDP_QUEUE_BYTES_PER_SOURCE
-                || self.udp_queued_datagrams >= global_datagrams
-                || self.udp_queued_bytes.saturating_add(length) > global_bytes
+                || self.udp.queued_datagrams >= global_datagrams
+                || self.udp.queued_bytes.saturating_add(length) > global_bytes
                 || receiver_session.udp_queued_datagrams >= session_datagrams
                 || receiver_session.udp_queued_bytes.saturating_add(length) > session_bytes
                 || source.datagrams >= session_datagrams
@@ -466,8 +505,9 @@ impl Reactor {
             .try_reserve_exact(payload.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         stored_payload.extend_from_slice(payload);
-        if !self.udp_source_queued.contains_key(&source_session_id) {
-            self.udp_source_queued
+        if !self.udp.queued_by_source.contains_key(&source_session_id) {
+            self.udp
+                .queued_by_source
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
         }
@@ -514,9 +554,13 @@ impl Reactor {
             udp.guest_receive_queue.push_back(datagram);
             receiver_session_id
         };
-        self.udp_queued_datagrams += 1;
-        self.udp_queued_bytes += payload.len();
-        let source = self.udp_source_queued.entry(source_session_id).or_default();
+        self.udp.queued_datagrams += 1;
+        self.udp.queued_bytes += payload.len();
+        let source = self
+            .udp
+            .queued_by_source
+            .entry(source_session_id)
+            .or_default();
         source.datagrams += 1;
         source.bytes += payload.len();
         let receiver_session = self
@@ -583,17 +627,20 @@ impl Reactor {
             udp.queued_by_source.remove(&datagram.source_session_id);
         }
 
-        self.udp_queued_datagrams = self
-            .udp_queued_datagrams
+        self.udp.queued_datagrams = self
+            .udp
+            .queued_datagrams
             .checked_sub(1)
             .expect("global UDP datagram count underflow");
-        self.udp_queued_bytes = self
-            .udp_queued_bytes
+        self.udp.queued_bytes = self
+            .udp
+            .queued_bytes
             .checked_sub(datagram.payload.len())
             .expect("global UDP byte count underflow");
         let remove_source = {
             let source = self
-                .udp_source_queued
+                .udp
+                .queued_by_source
                 .get_mut(&datagram.source_session_id)
                 .expect("global UDP source accounting missing");
             source.datagrams = source
@@ -607,7 +654,9 @@ impl Reactor {
             source.datagrams == 0
         };
         if remove_source {
-            self.udp_source_queued.remove(&datagram.source_session_id);
+            self.udp
+                .queued_by_source
+                .remove(&datagram.source_session_id);
         }
         let receiver_session = self
             .sessions
@@ -647,12 +696,12 @@ impl Reactor {
     }
 
     fn next_udp_endpoint_ids(&mut self) -> BrokerResult<(u64, u64)> {
-        let generation = self.next_udp_endpoint_generation;
-        self.next_udp_endpoint_generation = generation
+        let generation = self.udp.next_endpoint_generation;
+        self.udp.next_endpoint_generation = generation
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
-        let token_id = self.next_udp_event_token;
-        self.next_udp_event_token = token_id
+        let token_id = self.udp.next_event_token;
+        self.udp.next_event_token = token_id
             .checked_add(1)
             .filter(|token| *token < UDP_EVENT_TOKEN_FLAG)
             .ok_or(BrokerError::ResourceExhausted)?;
@@ -699,7 +748,8 @@ impl Reactor {
             .native_endpoints
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        self.udp_event_tokens
+        self.udp
+            .event_tokens
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
 
@@ -761,7 +811,8 @@ impl Reactor {
                 return Err(BrokerError::Internal);
             }
             if self
-                .udp_event_tokens
+                .udp
+                .event_tokens
                 .insert(
                     event_token,
                     UdpEventTarget {
@@ -780,7 +831,7 @@ impl Reactor {
                 epoll::EventData::new_u64(event_token),
                 udp_epoll_events(read_enabled, false),
             ) {
-                self.udp_event_tokens.remove(&event_token);
+                self.udp.event_tokens.remove(&event_token);
                 self.udp.native_endpoints.remove(&host_address.port());
                 return Err(broker_error_from_errno(error));
             }
@@ -797,7 +848,7 @@ impl Reactor {
 
     pub(super) fn unregister_udp_endpoint(&mut self, endpoint: ExternalUdpEndpoint) {
         let _ = epoll::delete(&self.epoll, &endpoint.socket);
-        self.udp_event_tokens.remove(&endpoint.event_token);
+        self.udp.event_tokens.remove(&endpoint.event_token);
         if self
             .udp
             .native_endpoints
@@ -931,7 +982,7 @@ impl Reactor {
         event_token: u64,
         events: epoll::EventFlags,
     ) -> BrokerResult<()> {
-        let Some(target) = self.udp_event_tokens.get(&event_token).copied() else {
+        let Some(target) = self.udp.event_tokens.get(&event_token).copied() else {
             return Ok(());
         };
         let readable_event = events.contains(epoll::EventFlags::IN);
