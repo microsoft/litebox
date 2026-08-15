@@ -24,18 +24,29 @@ use crate::{BrokerError, BrokerSession, Result, SessionId};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
 const DEFAULT_TCP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+const DEFAULT_UDP_BIND_POLICY_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+const DEFAULT_UDP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
 
 #[derive(Default)]
 struct BrokerSocketPortState {
     guest_tcp_ports: HashSet<u16>,
     next_guest_tcp_ephemeral: Option<u16>,
+    guest_udp_ports: HashSet<u16>,
+    next_guest_udp_ephemeral: Option<u16>,
 }
 
-/// Broker-wide authority for the guest-visible TCP port namespace.
+#[derive(Clone, Copy)]
+enum GuestTransport {
+    Tcp,
+    Udp,
+}
+
+/// Broker-wide authority for guest-visible transport port namespaces.
 ///
 /// Sessions identify endpoint owners but do not define separate network
-/// namespaces. Guest TCP ports remain independent of backend host ports.
+/// namespaces. TCP and UDP use independent port spaces, and guest ports remain
+/// independent of backend host ports.
 #[derive(Clone, Default)]
 pub(crate) struct BrokerSocketPorts {
     state: Arc<Mutex<BrokerSocketPortState>>,
@@ -47,22 +58,27 @@ impl BrokerSocketPorts {
         request: CreateSocketRequest,
         requested_address: SocketAddrV4,
     ) -> Result<SocketOutcome<(SocketAddrV4, GuestPortReservation)>> {
-        if !is_tcp(request) {
-            return Err(BrokerError::Internal);
-        }
+        let transport = guest_transport(request).ok_or(BrokerError::Internal)?;
         let mut state = self.state.lock();
+        let BrokerSocketPortState {
+            guest_tcp_ports,
+            next_guest_tcp_ephemeral,
+            guest_udp_ports,
+            next_guest_udp_ephemeral,
+        } = &mut *state;
+        let (ports, next_ephemeral) = match transport {
+            GuestTransport::Tcp => (guest_tcp_ports, next_guest_tcp_ephemeral),
+            GuestTransport::Udp => (guest_udp_ports, next_guest_udp_ephemeral),
+        };
         let port = if requested_address.port() == 0 {
-            state.allocate_ephemeral()?
-        } else if state.guest_tcp_ports.contains(&requested_address.port()) {
+            allocate_ephemeral(ports, next_ephemeral)?
+        } else if ports.contains(&requested_address.port()) {
             return Ok(SocketOutcome::Failed(SocketError::AddressInUse));
         } else {
             requested_address.port()
         };
-        state
-            .guest_tcp_ports
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        if !state.guest_tcp_ports.insert(port) {
+        ports.try_reserve(1).map_err(|_| BrokerError::OutOfMemory)?;
+        if !ports.insert(port) {
             return Err(BrokerError::Internal);
         }
         let local_address = SocketAddrV4::new(*requested_address.ip(), port);
@@ -72,34 +88,31 @@ impl BrokerSocketPorts {
             GuestPortReservation {
                 ports: self.clone(),
                 port,
+                transport,
             },
         )))
     }
 }
 
-impl BrokerSocketPortState {
-    fn allocate_ephemeral(&mut self) -> Result<u16> {
-        let start = self
-            .next_guest_tcp_ephemeral
-            .unwrap_or(FIRST_EPHEMERAL_PORT);
-        let mut port = start;
-        loop {
-            if !self.guest_tcp_ports.contains(&port) {
-                self.next_guest_tcp_ephemeral = Some(if port == u16::MAX {
-                    FIRST_EPHEMERAL_PORT
-                } else {
-                    port + 1
-                });
-                return Ok(port);
-            }
-            port = if port == u16::MAX {
+fn allocate_ephemeral(ports: &HashSet<u16>, next_ephemeral: &mut Option<u16>) -> Result<u16> {
+    let start = next_ephemeral.unwrap_or(FIRST_EPHEMERAL_PORT);
+    let mut port = start;
+    loop {
+        if !ports.contains(&port) {
+            *next_ephemeral = Some(if port == u16::MAX {
                 FIRST_EPHEMERAL_PORT
             } else {
                 port + 1
-            };
-            if port == start {
-                return Err(BrokerError::ResourceExhausted);
-            }
+            });
+            return Ok(port);
+        }
+        port = if port == u16::MAX {
+            FIRST_EPHEMERAL_PORT
+        } else {
+            port + 1
+        };
+        if port == start {
+            return Err(BrokerError::ResourceExhausted);
         }
     }
 }
@@ -107,11 +120,16 @@ impl BrokerSocketPortState {
 struct GuestPortReservation {
     ports: BrokerSocketPorts,
     port: u16,
+    transport: GuestTransport,
 }
 
 impl Drop for GuestPortReservation {
     fn drop(&mut self) {
-        self.ports.state.lock().guest_tcp_ports.remove(&self.port);
+        let mut state = self.ports.state.lock();
+        match self.transport {
+            GuestTransport::Tcp => state.guest_tcp_ports.remove(&self.port),
+            GuestTransport::Udp => state.guest_udp_ports.remove(&self.port),
+        };
     }
 }
 
@@ -160,7 +178,9 @@ pub struct PlatformDatagramReceive {
     pub data: Vec<u8>,
     /// Original datagram length before truncation.
     pub datagram_length: usize,
-    /// Source address of the datagram.
+    /// Guest-visible source address of the datagram.
+    ///
+    /// Platforms must translate private backend endpoints before returning.
     pub source_address: SocketAddrV4,
 }
 
@@ -200,11 +220,10 @@ pub trait SocketProvider: Send + Sync {
 pub trait PlatformSocket: Send + Sync {
     /// Binds this socket to a local address and echoes the assigned address.
     ///
-    /// A stream socket receives a broker-reserved guest-local address with a
-    /// nonzero port and must echo it unchanged; the host endpoint backing the
-    /// socket is chosen privately by the platform. A datagram socket receives
-    /// the address requested by the guest and returns the host-assigned one.
-    /// Returning an error must leave the socket unbound and retryable.
+    /// A stream or datagram socket receives a broker-reserved guest-local
+    /// address with a nonzero port and must echo it unchanged; the host endpoint
+    /// backing the socket is chosen privately by the platform. Returning an
+    /// error must leave the socket unbound and retryable.
     fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Makes this socket listen for incoming connections.
@@ -357,7 +376,8 @@ pub fn create(
 ///
 /// Policy denial is returned as a per-request [`SocketOutcome::Failed`] and
 /// leaves the socket unconnected, so a later authorized destination may still
-/// be attempted.
+/// be attempted. An unbound stream or datagram socket first reserves a
+/// guest-visible local endpoint.
 pub fn connect(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -387,7 +407,7 @@ pub fn connect(
     }
 
     if is_udp(create_request) {
-        return connect_datagram(&object, address);
+        return connect_datagram(session, &object, create_request, address);
     }
 
     let (resource, needs_bind) = {
@@ -508,7 +528,7 @@ pub fn bind(
             return Err(error);
         }
     }
-    let outcome = if is_tcp(create_request) {
+    let outcome = if guest_transport(create_request).is_some() {
         match reserve_and_bind(session, create_request, &resource, address) {
             Ok(ReserveAndBindOutcome::Completed(local_address, reservation)) => {
                 finish_configuration(&object, Some(local_address), Some(reservation), false)?;
@@ -726,6 +746,9 @@ pub fn send(
 }
 
 /// Sends one complete datagram without waiting for readiness.
+///
+/// The first send on an unbound datagram socket reserves and binds a
+/// guest-visible local endpoint before invoking the platform.
 pub fn send_to(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -737,11 +760,14 @@ pub fn send_to(
         return Err(BrokerError::UnsupportedOperation);
     }
     let length = data.len();
-    let (resource, create_request, connection_status) =
-        socket_state(session, handle, ObjectRights::WRITE)?;
-    if !is_udp(create_request) {
-        return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
-    }
+    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let create_request = {
+        let object = object.read();
+        let ObjectEntry::Socket(socket) = &*object else {
+            return Err(BrokerError::InvalidRights);
+        };
+        socket.create_request
+    };
     if let Some(destination) = destination {
         match session.core.policy.authorize_socket_connect(
             session.caller_credential,
@@ -754,8 +780,65 @@ pub fn send_to(
             }
             Err(error) => return Err(error),
         }
-    } else if connection_status != SocketConnectionStatus::Connected {
-        return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+    }
+    let (resource, needs_bind) = {
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::InvalidRights);
+        };
+        if !is_udp(socket.create_request) {
+            return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        if destination.is_none() && socket.connection_status != SocketConnectionStatus::Connected {
+            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
+        }
+        let needs_bind = socket.local_address.is_none();
+        if needs_bind {
+            if socket.configuration_in_flight || socket.connect_in_flight || socket.listening {
+                return Ok(SocketOutcome::Failed(SocketError::Other));
+            }
+            socket.configuration_in_flight = true;
+        }
+        (Arc::clone(&socket.resource), needs_bind)
+    };
+    if needs_bind {
+        match session.core.policy.authorize_socket_bind(
+            session.caller_credential,
+            create_request,
+            DEFAULT_UDP_BIND_POLICY_ADDRESS,
+        ) {
+            Ok(()) => {}
+            Err(BrokerError::PolicyDenied) => {
+                finish_configuration(&object, None, None, false)?;
+                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+            }
+            Err(error) => {
+                finish_configuration(&object, None, None, false)?;
+                return Err(error);
+            }
+        }
+        match reserve_and_bind(
+            session,
+            create_request,
+            &resource,
+            DEFAULT_UDP_LOCAL_ADDRESS,
+        ) {
+            Ok(ReserveAndBindOutcome::Completed(local_address, reservation)) => {
+                finish_configuration(&object, Some(local_address), Some(reservation), false)?;
+            }
+            Ok(ReserveAndBindOutcome::Failed(error)) => {
+                finish_configuration(&object, None, None, false)?;
+                return Ok(SocketOutcome::Failed(error));
+            }
+            Ok(ReserveAndBindOutcome::Retired) => {
+                finish_retired_configuration(&object, None, None)?;
+                return Err(BrokerError::Internal);
+            }
+            Err(error) => {
+                finish_configuration(&object, None, None, false)?;
+                return Err(error);
+            }
+        }
     }
     let outcome = resource.send_to(data, flags, destination)?;
     if let SocketOutcome::Completed(sent) = outcome
@@ -1095,10 +1178,12 @@ fn reserve_and_bind(
 }
 
 fn connect_datagram(
+    session: &BrokerSession,
     object: &spin::RwLock<ObjectEntry>,
+    create_request: CreateSocketRequest,
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
-    let (resource, previous_status) = {
+    let (resource, previous_status, needs_bind) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
@@ -1107,8 +1192,58 @@ fn connect_datagram(
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         socket.configuration_in_flight = true;
-        (Arc::clone(&socket.resource), socket.connection_status)
+        (
+            Arc::clone(&socket.resource),
+            socket.connection_status,
+            socket.local_address.is_none(),
+        )
     };
+    if needs_bind {
+        match session.core.policy.authorize_socket_bind(
+            session.caller_credential,
+            create_request,
+            DEFAULT_UDP_BIND_POLICY_ADDRESS,
+        ) {
+            Ok(()) => {}
+            Err(BrokerError::PolicyDenied) => {
+                finish_datagram_connect(object, previous_status, false);
+                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+            }
+            Err(error) => {
+                finish_datagram_connect(object, previous_status, false);
+                return Err(error);
+            }
+        }
+        let binding = match reserve_and_bind(
+            session,
+            create_request,
+            &resource,
+            DEFAULT_UDP_LOCAL_ADDRESS,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                finish_datagram_connect(object, previous_status, false);
+                return Err(error);
+            }
+        };
+        match binding {
+            ReserveAndBindOutcome::Completed(local_address, reservation) => {
+                attach_datagram_binding(object, local_address, reservation)?;
+            }
+            ReserveAndBindOutcome::Failed(error) => {
+                finish_datagram_connect(object, previous_status, false);
+                return Ok(SocketOutcome::Failed(error));
+            }
+            ReserveAndBindOutcome::Retired => {
+                finish_datagram_connect(
+                    object,
+                    SocketConnectionStatus::Failed(SocketError::Other),
+                    true,
+                );
+                return Err(BrokerError::Internal);
+            }
+        }
+    }
     match resource.connect(address) {
         Ok(SocketConnectionStatus::Connected) => {
             finish_datagram_connect(object, SocketConnectionStatus::Connected, true);
@@ -1139,6 +1274,41 @@ fn connect_datagram(
             Err(error)
         }
     }
+}
+
+fn attach_datagram_binding(
+    object: &spin::RwLock<ObjectEntry>,
+    local_address: SocketAddrV4,
+    port_reservation: GuestPortReservation,
+) -> Result<()> {
+    let duplicate = {
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::Internal);
+        };
+        if socket.local_address.is_some() {
+            Some((Arc::clone(&socket.resource), port_reservation))
+        } else {
+            match socket.resource.set_port_reservation(port_reservation) {
+                Ok(()) => {
+                    socket.local_address = Some(local_address);
+                    None
+                }
+                Err(port_reservation) => Some((Arc::clone(&socket.resource), port_reservation)),
+            }
+        }
+    };
+    if let Some((resource, port_reservation)) = duplicate {
+        resource.retire();
+        drop(port_reservation);
+        finish_datagram_connect(
+            object,
+            SocketConnectionStatus::Failed(SocketError::Other),
+            true,
+        );
+        return Err(BrokerError::Internal);
+    }
+    Ok(())
 }
 
 fn finish_datagram_connect(
@@ -1416,6 +1586,16 @@ const fn is_udp(request: CreateSocketRequest) -> bool {
     )
 }
 
+const fn guest_transport(request: CreateSocketRequest) -> Option<GuestTransport> {
+    if is_tcp(request) {
+        Some(GuestTransport::Tcp)
+    } else if is_udp(request) {
+        Some(GuestTransport::Udp)
+    } else {
+        None
+    }
+}
+
 impl Drop for SocketResource {
     fn drop(&mut self) {
         if let Some(platform_socket) = self.platform_socket.get() {
@@ -1482,7 +1662,7 @@ pub(crate) mod tests {
     use std::vec;
 
     #[test]
-    fn guest_tcp_port_namespace_is_broker_wide() {
+    fn guest_transport_port_namespaces_are_broker_wide_and_independent() {
         let ports = BrokerSocketPorts::default();
         let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
 
@@ -1495,14 +1675,28 @@ pub(crate) mod tests {
             ports.reserve(create_request(), address),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
+        let SocketOutcome::Completed((_, udp_reservation)) =
+            ports.reserve(create_udp_request(), address).unwrap()
+        else {
+            panic!("UDP reservation must be independent from TCP");
+        };
         assert!(matches!(
             ports.reserve(create_udp_request(), address),
-            Err(BrokerError::Internal)
+            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
 
         drop(first_reservation);
         assert!(matches!(
             ports.reserve(create_request(), address),
+            Ok(SocketOutcome::Completed(_))
+        ));
+        assert!(matches!(
+            ports.reserve(create_udp_request(), address),
+            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
+        ));
+        drop(udp_reservation);
+        assert!(matches!(
+            ports.reserve(create_udp_request(), address),
             Ok(SocketOutcome::Completed(_))
         ));
     }
@@ -2329,7 +2523,7 @@ pub(crate) mod tests {
             status(&session, handle),
             Ok(SocketStatusResponse {
                 status: SocketConnectionStatus::Failed(SocketError::Other),
-                local_address: None,
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 49152)),
                 pending_error: Some(SocketError::ConnectionRefused),
             })
         );

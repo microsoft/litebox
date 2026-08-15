@@ -3,12 +3,12 @@
 
 //! Broker-owned Linux sockets driven by one epoll reactor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,8 @@ const WAKE_TOKEN: u64 = 0;
 const MAX_QUEUED_SOCKET_COMMANDS: usize = 64;
 const MAX_EPOLL_EVENTS: usize = 64;
 const MAX_UNMATCHED_ACCEPTS_PER_COMMAND: usize = 64;
+const MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND: usize = 64;
+const MAX_UDP_EXTERNAL_PEERS_PER_SOCKET: usize = 64;
 const PENDING_CONNECT_DISCARD_LIFETIME: Duration = Duration::from_mins(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,10 +438,13 @@ impl ReactorClient {
                     commands: receiver,
                     sockets,
                     tcp: ReactorTcpState::default(),
+                    udp: ReactorUdpState::default(),
                     sessions: HashMap::new(),
                     max_sockets,
                     max_sockets_per_session,
                     retained_connector_count: 0,
+                    retained_udp_source_count: 0,
+                    udp_external_peer_count: 0,
                     peek_cache: None,
                     events,
                 };
@@ -572,6 +577,26 @@ impl ReactorClient {
         let (response, receive) = sync_channel(1);
         self.commands
             .send(ReactorCommand::RetainedConnectorCount { response })
+            .unwrap();
+        self.signal().unwrap();
+        receive.recv().unwrap()
+    }
+
+    #[cfg(test)]
+    fn udp_translation_count(&self) -> usize {
+        let (response, receive) = sync_channel(1);
+        self.commands
+            .send(ReactorCommand::UdpTranslationCount { response })
+            .unwrap();
+        self.signal().unwrap();
+        receive.recv().unwrap()
+    }
+
+    #[cfg(test)]
+    fn retained_udp_source_count(&self) -> usize {
+        let (response, receive) = sync_channel(1);
+        self.commands
+            .send(ReactorCommand::RetainedUdpSourceCount { response })
             .unwrap();
         self.signal().unwrap();
         receive.recv().unwrap()
@@ -762,6 +787,14 @@ enum ReactorCommand {
         response: SyncSender<usize>,
     },
     #[cfg(test)]
+    UdpTranslationCount {
+        response: SyncSender<usize>,
+    },
+    #[cfg(test)]
+    RetainedUdpSourceCount {
+        response: SyncSender<usize>,
+    },
+    #[cfg(test)]
     ExpireDeadlinedState {
         now: Instant,
         response: SyncSender<()>,
@@ -803,10 +836,13 @@ struct Reactor {
     commands: Receiver<ReactorCommand>,
     sockets: HashMap<u64, SocketEntry>,
     tcp: ReactorTcpState,
+    udp: ReactorUdpState,
     sessions: HashMap<SessionId, ReactorSessionState>,
     max_sockets: usize,
     max_sockets_per_session: usize,
     retained_connector_count: usize,
+    retained_udp_source_count: usize,
+    udp_external_peer_count: usize,
     peek_cache: Option<PeekCache>,
     events: Vec<epoll::Event>,
 }
@@ -835,6 +871,9 @@ struct SocketEntry {
     abortive_close: bool,
     guest_local_address: Option<SocketAddrV4>,
     host_connection: Option<(SocketAddrV4, SocketAddrV4)>,
+    udp_peer: Option<ReactorUdpPeer>,
+    udp_external_peers: HashSet<SocketAddrV4>,
+    udp_non_loopback_ingress: bool,
     tcp_no_delay: bool,
     tcp_keep_alive: bool,
 }
@@ -846,6 +885,14 @@ struct ReactorTcpState {
     pending_guest_connections: HashMap<(SocketAddrV4, SocketAddrV4), PendingGuestTcpConnection>,
 }
 
+/// Reactor-owned guest UDP bindings and potentially queued source translations.
+#[derive(Default)]
+struct ReactorUdpState {
+    bindings: HashMap<u16, ReactorUdpBinding>,
+    translations: HashMap<(u64, SocketAddrV4), ReactorUdpTranslation>,
+    translation_sources: HashMap<u64, UdpTranslationSourceState>,
+}
+
 /// Reactor-side per-session socket, retained-descriptor, and teardown state.
 ///
 /// Sessions are ownership domains, not guest network namespaces.
@@ -854,6 +901,9 @@ struct ReactorSessionState {
     live_socket_count: usize,
     pending_guest_connection_count: usize,
     retained_connector_count: usize,
+    udp_translation_count: usize,
+    retained_udp_source_count: usize,
+    udp_external_peer_count: usize,
     closing: bool,
 }
 
@@ -880,6 +930,41 @@ struct ReactorTcpBinding {
     listening: bool,
     requires_backlog_drain: bool,
     untracked_connection_deadline: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+struct ReactorUdpBinding {
+    socket_id: u64,
+    guest_address: SocketAddrV4,
+    host_address: SocketAddrV4,
+    guest_wildcard: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ReactorUdpTranslation {
+    source_socket_id: u64,
+    source_session_id: SessionId,
+    guest_address: SocketAddrV4,
+}
+
+struct RetiredUdpSource {
+    _socket: OwnedFd,
+    session_id: SessionId,
+    host_address: SocketAddrV4,
+}
+
+enum UdpTranslationSourceState {
+    Active,
+    Retired(RetiredUdpSource),
+}
+
+#[derive(Clone, Copy)]
+enum ReactorUdpPeer {
+    Guest {
+        socket_id: u64,
+        host_address: SocketAddrV4,
+    },
+    External(SocketAddrV4),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1031,11 +1116,96 @@ impl ReactorTcpState {
     }
 }
 
+impl ReactorUdpState {
+    fn reserve_binding(&mut self, guest_port: u16) -> BrokerResult<()> {
+        if guest_port == 0 || self.bindings.contains_key(&guest_port) {
+            return Err(BrokerError::Internal);
+        }
+        self.bindings
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)
+    }
+
+    fn insert_binding(&mut self, binding: ReactorUdpBinding) -> BrokerResult<()> {
+        let guest_port = binding.guest_address.port();
+        if guest_port == 0 || self.bindings.contains_key(&guest_port) {
+            return Err(BrokerError::Internal);
+        }
+        self.bindings.insert(guest_port, binding);
+        Ok(())
+    }
+
+    fn remove_binding(&mut self, guest_port: u16, socket_id: u64) {
+        if self
+            .bindings
+            .get(&guest_port)
+            .is_some_and(|binding| binding.socket_id == socket_id)
+        {
+            self.bindings.remove(&guest_port);
+        }
+    }
+
+    fn guest_binding(&self, address: SocketAddrV4) -> Option<ReactorUdpBinding> {
+        self.bindings
+            .get(&address.port())
+            .filter(|binding| {
+                address.ip().is_loopback()
+                    || (!binding.guest_address.ip().is_unspecified()
+                        && binding.guest_address.ip() == address.ip())
+            })
+            .copied()
+    }
+
+    fn binding_for_socket(&self, socket_id: u64) -> Option<ReactorUdpBinding> {
+        self.bindings
+            .values()
+            .find(|binding| binding.socket_id == socket_id)
+            .copied()
+    }
+
+    fn update_connected_addresses(
+        &mut self,
+        socket_id: u64,
+        host_address: SocketAddrV4,
+        guest_address: SocketAddrV4,
+    ) -> BrokerResult<()> {
+        let binding = self
+            .bindings
+            .values_mut()
+            .find(|binding| binding.socket_id == socket_id)
+            .ok_or(BrokerError::Internal)?;
+        if binding.guest_address.port() != guest_address.port()
+            || binding.host_address.port() != host_address.port()
+        {
+            return Err(BrokerError::Internal);
+        }
+        binding.host_address = host_address;
+        binding.guest_address = guest_address;
+        Ok(())
+    }
+
+    fn has_private_host_port(&self, port: u16) -> bool {
+        self.bindings
+            .values()
+            .any(|binding| binding.host_address.port() == port)
+            || self.translation_sources.values().any(|source| {
+                matches!(
+                    source,
+                    UdpTranslationSourceState::Retired(source)
+                        if source.host_address.port() == port
+                )
+            })
+    }
+}
+
 fn retain_session_state(state: &ReactorSessionState) -> bool {
     !state.closing
         || state.live_socket_count != 0
         || state.pending_guest_connection_count != 0
         || state.retained_connector_count != 0
+        || state.udp_translation_count != 0
+        || state.retained_udp_source_count != 0
+        || state.udp_external_peer_count != 0
 }
 
 fn listener_backlog_is_nonempty(sockets: &HashMap<u64, SocketEntry>, listener_id: u64) -> bool {
@@ -1382,6 +1552,7 @@ impl Reactor {
             .sockets
             .len()
             .checked_add(self.retained_connector_count)
+            .and_then(|count| count.checked_add(self.retained_udp_source_count))
             .is_none_or(|count| count >= self.max_sockets);
         let listener_session = self
             .sessions
@@ -1390,6 +1561,7 @@ impl Reactor {
         let session_at_limit = listener_session
             .live_socket_count
             .checked_add(listener_session.retained_connector_count)
+            .and_then(|count| count.checked_add(listener_session.retained_udp_source_count))
             .is_none_or(|count| count >= self.max_sockets_per_session);
         if !global_at_limit && !session_at_limit {
             return Ok(true);
@@ -1415,12 +1587,16 @@ impl Reactor {
         Ok(true)
     }
 
-    fn is_private_host_endpoint(&self, address: SocketAddrV4) -> bool {
+    fn is_private_tcp_host_endpoint(&self, address: SocketAddrV4) -> bool {
         self.tcp
             .bindings
             .values()
             .filter_map(|binding| binding.host_address)
             .any(|host_address| host_address == address)
+    }
+
+    fn is_private_udp_host_endpoint(&self, address: SocketAddrV4) -> bool {
+        self.udp.has_private_host_port(address.port()) && is_local_ipv4_address(*address.ip())
     }
 
     fn resolve_guest_destination(
@@ -1449,11 +1625,276 @@ impl Reactor {
                 None => SocketOutcome::Failed(SocketError::ConnectionRefused),
             };
         }
-        if self.is_private_host_endpoint(address) {
+        if self.is_private_tcp_host_endpoint(address) {
             SocketOutcome::Failed(SocketError::ConnectionRefused)
         } else {
             SocketOutcome::Completed((address, None))
         }
+    }
+
+    fn resolve_udp_destination(&self, mut address: SocketAddrV4) -> SocketOutcome<ReactorUdpPeer> {
+        if address.ip().is_unspecified() {
+            address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port());
+        }
+        if let Some(binding) = self.udp.guest_binding(address) {
+            return SocketOutcome::Completed(ReactorUdpPeer::Guest {
+                socket_id: binding.socket_id,
+                host_address: binding.host_address,
+            });
+        }
+        if self.is_private_udp_host_endpoint(address) {
+            SocketOutcome::Failed(SocketError::ConnectionRefused)
+        } else {
+            SocketOutcome::Completed(ReactorUdpPeer::External(address))
+        }
+    }
+
+    fn reserve_udp_external_peer(
+        &mut self,
+        socket_id: u64,
+        address: SocketAddrV4,
+    ) -> BrokerResult<bool> {
+        let session_id = {
+            let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
+            if socket.udp_external_peers.contains(&address) {
+                return Ok(false);
+            }
+            if socket.udp_external_peers.len() >= MAX_UDP_EXTERNAL_PEERS_PER_SOCKET {
+                return Err(BrokerError::ResourceExhausted);
+            }
+            socket.session_id
+        };
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(BrokerError::Internal)?;
+        if self.udp_external_peer_count
+            >= self
+                .max_sockets
+                .saturating_mul(MAX_UDP_EXTERNAL_PEERS_PER_SOCKET)
+            || session.udp_external_peer_count
+                >= self
+                    .max_sockets_per_session
+                    .saturating_mul(MAX_UDP_EXTERNAL_PEERS_PER_SOCKET)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        self.sockets
+            .get_mut(&socket_id)
+            .ok_or(BrokerError::Internal)?
+            .udp_external_peers
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        if !self
+            .sockets
+            .get_mut(&socket_id)
+            .ok_or(BrokerError::Internal)?
+            .udp_external_peers
+            .insert(address)
+        {
+            return Err(BrokerError::Internal);
+        }
+        self.udp_external_peer_count = self
+            .udp_external_peer_count
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(BrokerError::Internal)?;
+        session.udp_external_peer_count = session
+            .udp_external_peer_count
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        Ok(true)
+    }
+
+    fn remove_udp_external_peer(&mut self, socket_id: u64, address: SocketAddrV4) {
+        let Some(socket) = self.sockets.get_mut(&socket_id) else {
+            return;
+        };
+        if !socket.udp_external_peers.remove(&address) {
+            return;
+        }
+        self.udp_external_peer_count = self
+            .udp_external_peer_count
+            .checked_sub(1)
+            .expect("reactor UDP external peer count underflow");
+        let session = self
+            .sessions
+            .get_mut(&socket.session_id)
+            .expect("UDP external peer session state missing");
+        session.udp_external_peer_count = session
+            .udp_external_peer_count
+            .checked_sub(1)
+            .expect("session UDP external peer count underflow");
+    }
+
+    fn reserve_udp_translation(
+        &mut self,
+        source_socket_id: u64,
+        destination_socket_id: u64,
+    ) -> BrokerResult<(SocketAddrV4, bool)> {
+        let source = self
+            .udp
+            .binding_for_socket(source_socket_id)
+            .ok_or(BrokerError::Internal)?;
+        let source_guest_address = if source.guest_address.ip().is_unspecified() {
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, source.guest_address.port())
+        } else {
+            source.guest_address
+        };
+        if self.udp.binding_for_socket(destination_socket_id).is_none() {
+            return Err(BrokerError::UnknownObject);
+        }
+        let key = (destination_socket_id, source.host_address);
+        if let Some(translation) = self.udp.translations.get(&key) {
+            if translation.source_socket_id == source_socket_id
+                && translation.guest_address == source_guest_address
+            {
+                return Ok((source.host_address, false));
+            }
+            return Err(BrokerError::Internal);
+        }
+        let source_session_id = self
+            .sockets
+            .get(&source_socket_id)
+            .ok_or(BrokerError::Internal)?
+            .session_id;
+        let session = self
+            .sessions
+            .get(&source_session_id)
+            .ok_or(BrokerError::Internal)?;
+        if self.udp.translations.len() >= self.max_sockets
+            || session.udp_translation_count >= self.max_sockets_per_session
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        self.udp
+            .translations
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        if !self
+            .udp
+            .translations
+            .values()
+            .any(|translation| translation.source_socket_id == source_socket_id)
+        {
+            self.udp
+                .translation_sources
+                .try_reserve(1)
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            if self
+                .udp
+                .translation_sources
+                .insert(source_socket_id, UdpTranslationSourceState::Active)
+                .is_some()
+            {
+                return Err(BrokerError::Internal);
+            }
+        }
+        self.udp.translations.insert(
+            key,
+            ReactorUdpTranslation {
+                source_socket_id,
+                source_session_id,
+                guest_address: source_guest_address,
+            },
+        );
+        let session = self
+            .sessions
+            .get_mut(&source_session_id)
+            .ok_or(BrokerError::Internal)?;
+        session.udp_translation_count = session
+            .udp_translation_count
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        Ok((source.host_address, true))
+    }
+
+    fn remove_udp_translation(
+        &mut self,
+        destination_socket_id: u64,
+        source_host_address: SocketAddrV4,
+        source_socket_id: u64,
+    ) {
+        let key = (destination_socket_id, source_host_address);
+        if self
+            .udp
+            .translations
+            .get(&key)
+            .is_none_or(|translation| translation.source_socket_id != source_socket_id)
+        {
+            return;
+        }
+        let translation = self
+            .udp
+            .translations
+            .remove(&key)
+            .expect("checked UDP translation missing");
+        let session = self
+            .sessions
+            .get_mut(&translation.source_session_id)
+            .expect("UDP translation session state missing");
+        session.udp_translation_count = session
+            .udp_translation_count
+            .checked_sub(1)
+            .expect("session UDP translation count underflow");
+        self.release_unused_retired_udp_sources();
+    }
+
+    fn remove_udp_translations_for_receiver(&mut self, destination_socket_id: u64) {
+        let Reactor { udp, sessions, .. } = self;
+        udp.translations.retain(|(receiver_id, _), translation| {
+            if *receiver_id != destination_socket_id {
+                return true;
+            }
+            let session = sessions
+                .get_mut(&translation.source_session_id)
+                .expect("UDP translation session state missing");
+            session.udp_translation_count = session
+                .udp_translation_count
+                .checked_sub(1)
+                .expect("session UDP translation count underflow");
+            false
+        });
+        self.release_unused_retired_udp_sources();
+    }
+
+    fn release_unused_retired_udp_sources(&mut self) {
+        let Reactor {
+            udp,
+            sessions,
+            retained_udp_source_count,
+            ..
+        } = self;
+        let ReactorUdpState {
+            translations,
+            translation_sources,
+            ..
+        } = udp;
+        translation_sources.retain(|socket_id, source| {
+            if translations
+                .values()
+                .any(|translation| translation.source_socket_id == *socket_id)
+            {
+                return true;
+            }
+            if let UdpTranslationSourceState::Retired(source) = source {
+                *retained_udp_source_count = retained_udp_source_count
+                    .checked_sub(1)
+                    .expect("reactor retained UDP source count underflow");
+                let session = sessions
+                    .get_mut(&source.session_id)
+                    .expect("retained UDP source session state missing");
+                session.retained_udp_source_count = session
+                    .retained_udp_source_count
+                    .checked_sub(1)
+                    .expect("session retained UDP source count underflow");
+            }
+            false
+        });
+        sessions.retain(|_, session| retain_session_state(session));
     }
 
     fn bind_socket(
@@ -1466,19 +1907,34 @@ impl Reactor {
             .get(&id)
             .map(|socket| (socket.kind, socket.guest_local_address.is_some()))
             .ok_or(BrokerError::Internal)?;
-        if kind != SocketKind::Tcp {
+        if kind == SocketKind::Udp {
+            if already_bound {
+                return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+            }
+            self.udp.reserve_binding(requested_address.port())?;
             let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-            return match bind_host_socket(socket, requested_address)? {
-                SocketOutcome::Completed(local_address) => {
-                    socket
-                        .snapshot
-                        .lock()
-                        .expect("Linux socket snapshot mutex poisoned")
-                        .local_address = Some(local_address);
-                    Ok(SocketOutcome::Completed(local_address))
-                }
-                SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
-            };
+            restrict_udp_ingress_to_loopback(socket)?;
+            let host_address =
+                match bind_host_socket(socket, SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))? {
+                    SocketOutcome::Completed(address) => {
+                        SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port())
+                    }
+                    SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
+                };
+            self.udp.insert_binding(ReactorUdpBinding {
+                socket_id: id,
+                guest_address: requested_address,
+                host_address,
+                guest_wildcard: requested_address.ip().is_unspecified(),
+            })?;
+            let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
+            socket.guest_local_address = Some(requested_address);
+            socket
+                .snapshot
+                .lock()
+                .expect("Linux socket snapshot mutex poisoned")
+                .local_address = Some(requested_address);
+            return Ok(SocketOutcome::Completed(requested_address));
         }
         if already_bound {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
@@ -1552,15 +2008,98 @@ impl Reactor {
         let kind = self.sockets.get(&id).map(|socket| socket.kind).ok_or(
             PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
         )?;
-        if kind != SocketKind::Tcp {
-            return connect_datagram_socket(
+        if kind == SocketKind::Udp {
+            let peer = match self.resolve_udp_destination(guest_address) {
+                SocketOutcome::Completed(peer) => peer,
+                SocketOutcome::Failed(error) => {
+                    return Ok(SocketConnectionStatus::Failed(error));
+                }
+            };
+            let network_address = match peer {
+                ReactorUdpPeer::Guest { host_address, .. } => host_address,
+                ReactorUdpPeer::External(address) => address,
+            };
+            let external_peer_added = match peer {
+                ReactorUdpPeer::External(address) => {
+                    if !address.ip().is_loopback() {
+                        enable_udp_non_loopback_ingress(self.sockets.get_mut(&id).ok_or(
+                            PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
+                        )?)
+                        .map_err(PlatformConnectError::PeerUnchanged)?;
+                    }
+                    self.reserve_udp_external_peer(id, address)
+                        .map_err(PlatformConnectError::PeerUnchanged)?
+                }
+                ReactorUdpPeer::Guest { .. } => false,
+            };
+            let outcome = connect_datagram_socket(
                 self.sockets
                     .get_mut(&id)
                     .ok_or(PlatformConnectError::PeerIndeterminate(
                         BrokerError::Internal,
                     ))?,
-                guest_address,
+                network_address,
             );
+            match outcome {
+                Ok(SocketConnectionStatus::Connected) => {
+                    let (host_local_address, guest_local_address) = {
+                        let socket = self.sockets.get(&id).ok_or(
+                            PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
+                        )?;
+                        let host_local_address = local_socket_address(&socket.socket)
+                            .map_err(PlatformConnectError::PeerIndeterminate)?;
+                        let guest_local_address = socket.guest_local_address.ok_or(
+                            PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
+                        )?;
+                        let binding = self.udp.binding_for_socket(id).ok_or(
+                            PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
+                        )?;
+                        let guest_local_address = if binding.guest_wildcard {
+                            SocketAddrV4::new(*host_local_address.ip(), guest_local_address.port())
+                        } else {
+                            guest_local_address
+                        };
+                        (host_local_address, guest_local_address)
+                    };
+                    self.udp
+                        .update_connected_addresses(id, host_local_address, guest_local_address)
+                        .map_err(PlatformConnectError::PeerIndeterminate)?;
+                    let socket = self.sockets.get_mut(&id).ok_or(
+                        PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
+                    )?;
+                    socket.guest_local_address = Some(guest_local_address);
+                    socket.udp_peer = Some(peer);
+                    socket
+                        .snapshot
+                        .lock()
+                        .expect("Linux socket snapshot mutex poisoned")
+                        .local_address = Some(guest_local_address);
+                    return Ok(SocketConnectionStatus::Connected);
+                }
+                Ok(SocketConnectionStatus::Failed(error)) => {
+                    if external_peer_added {
+                        self.remove_udp_external_peer(id, network_address);
+                    }
+                    return Ok(SocketConnectionStatus::Failed(error));
+                }
+                Err(PlatformConnectError::PeerUnchanged(error)) => {
+                    if external_peer_added {
+                        self.remove_udp_external_peer(id, network_address);
+                    }
+                    return Err(PlatformConnectError::PeerUnchanged(error));
+                }
+                Err(PlatformConnectError::PeerIndeterminate(error)) => {
+                    return Err(PlatformConnectError::PeerIndeterminate(error));
+                }
+                Ok(_) => {
+                    if external_peer_added {
+                        self.remove_udp_external_peer(id, network_address);
+                    }
+                    return Err(PlatformConnectError::PeerIndeterminate(
+                        BrokerError::Internal,
+                    ));
+                }
+            }
         }
         let (session_id, local_guest_address) = self
             .sockets
@@ -1672,6 +2211,179 @@ impl Reactor {
         Ok(status)
     }
 
+    fn send_to_socket(
+        &mut self,
+        id: u64,
+        data: &[u8],
+        destination: Option<SocketAddrV4>,
+    ) -> BrokerResult<SocketOutcome<usize>> {
+        let peer = {
+            let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
+            if socket.kind != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+                return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+            }
+            if socket.write_shutdown {
+                return Ok(SocketOutcome::Failed(SocketError::Other));
+            }
+            match destination {
+                Some(address) => match self.resolve_udp_destination(address) {
+                    SocketOutcome::Completed(peer) => peer,
+                    SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
+                },
+                None => match socket.udp_peer {
+                    Some(peer) => peer,
+                    None => return Ok(SocketOutcome::Failed(SocketError::NotConnected)),
+                },
+            }
+        };
+        let network_address = match peer {
+            ReactorUdpPeer::Guest {
+                socket_id,
+                host_address,
+            } => {
+                if self
+                    .udp
+                    .binding_for_socket(socket_id)
+                    .is_none_or(|binding| binding.host_address != host_address)
+                {
+                    return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
+                }
+                host_address
+            }
+            ReactorUdpPeer::External(address) => address,
+        };
+        if matches!(peer, ReactorUdpPeer::External(address) if !address.ip().is_loopback()) {
+            enable_udp_non_loopback_ingress(
+                self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?,
+            )?;
+        }
+        let (translation_source, translation_added) = match peer {
+            ReactorUdpPeer::Guest { socket_id, .. } => {
+                let (source, added) = self.reserve_udp_translation(id, socket_id)?;
+                (Some((socket_id, source)), added)
+            }
+            ReactorUdpPeer::External(_) => (None, false),
+        };
+        let external_peer_added = match peer {
+            ReactorUdpPeer::External(address) => self.reserve_udp_external_peer(id, address)?,
+            ReactorUdpPeer::Guest { .. } => false,
+        };
+        let outcome = send_datagram_socket(
+            self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?,
+            data,
+            destination.map(|_| network_address),
+        );
+        let sent = matches!(&outcome, Ok(SocketOutcome::Completed(_)));
+        if !sent {
+            if let Some((destination_socket_id, source_host_address)) = translation_source
+                && translation_added
+            {
+                self.remove_udp_translation(destination_socket_id, source_host_address, id);
+            }
+            if external_peer_added {
+                self.remove_udp_external_peer(id, network_address);
+            }
+        }
+        outcome
+    }
+
+    fn receive_from_socket(
+        &mut self,
+        id: u64,
+        length: usize,
+        flags: ReceiveFromFlags,
+    ) -> BrokerResult<ReactorReceiveFromOutcome> {
+        let mut rejected = 0;
+        loop {
+            let outcome = receive_datagram_socket(
+                self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?,
+                length,
+                flags,
+            );
+            let received = match outcome {
+                Ok(ReactorReceiveFromOutcome::Received {
+                    data,
+                    datagram_length,
+                    source_address,
+                }) => (data, datagram_length, source_address),
+                Ok(ReactorReceiveFromOutcome::Failed(error)) => {
+                    return Ok(ReactorReceiveFromOutcome::Failed(error));
+                }
+                Err(BrokerError::WouldBlock) => {
+                    self.remove_udp_translations_for_receiver(id);
+                    return Err(BrokerError::WouldBlock);
+                }
+                Err(error) => return Err(error),
+            };
+            let source_address = self.translate_udp_source(id, received.2);
+            if let Some(source_address) = source_address {
+                return Ok(ReactorReceiveFromOutcome::Received {
+                    data: received.0,
+                    datagram_length: received.1,
+                    source_address,
+                });
+            }
+            if flags.contains(ReceiveFromFlags::PEEK) {
+                match receive_datagram_socket(
+                    self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?,
+                    0,
+                    ReceiveFromFlags::NONE,
+                ) {
+                    Ok(ReactorReceiveFromOutcome::Received { .. }) => {}
+                    Ok(ReactorReceiveFromOutcome::Failed(error)) => {
+                        return Ok(ReactorReceiveFromOutcome::Failed(error));
+                    }
+                    Err(BrokerError::WouldBlock) => {
+                        self.remove_udp_translations_for_receiver(id);
+                        return Err(BrokerError::WouldBlock);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            rejected += 1;
+            if rejected >= MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
+                let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
+                let readiness = socket
+                    .snapshot
+                    .lock()
+                    .expect("Linux socket snapshot mutex poisoned")
+                    .readiness;
+                socket.readiness.republish(readiness)?;
+                return Err(BrokerError::WouldBlock);
+            }
+        }
+    }
+
+    fn translate_udp_source(
+        &self,
+        destination_socket_id: u64,
+        source_address: SocketAddrV4,
+    ) -> Option<SocketAddrV4> {
+        if let Some(translation) = self
+            .udp
+            .translations
+            .get(&(destination_socket_id, source_address))
+        {
+            let source = self.udp.binding_for_socket(translation.source_socket_id)?;
+            let source_guest_address = if source.guest_address.ip().is_unspecified() {
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, source.guest_address.port())
+            } else {
+                source.guest_address
+            };
+            return (source.host_address.port() == source_address.port()
+                && source_guest_address == translation.guest_address
+                && self.sockets.contains_key(&translation.source_socket_id))
+            .then_some(translation.guest_address);
+        }
+        if self.is_private_udp_host_endpoint(source_address) {
+            return None;
+        }
+        self.sockets
+            .get(&destination_socket_id)
+            .is_some_and(|socket| socket.udp_external_peers.contains(&source_address))
+            .then_some(source_address)
+    }
+
     fn remove_socket(&mut self, id: u64) {
         let Some(socket) = self.sockets.remove(&id) else {
             return;
@@ -1686,6 +2398,7 @@ impl Reactor {
             abortive_close,
             guest_local_address,
             host_connection,
+            udp_external_peers,
             ..
         } = socket;
         let guest_connector = untracked_guest_listener_id.is_some()
@@ -1702,6 +2415,28 @@ impl Reactor {
             && let Some(address) = guest_local_address
         {
             self.tcp.remove_binding(address.port(), id);
+        }
+        let udp_binding = (kind == SocketKind::Udp)
+            .then(|| self.udp.binding_for_socket(id))
+            .flatten();
+        if let Some(binding) = udp_binding {
+            self.udp.remove_binding(binding.guest_address.port(), id);
+        }
+        if kind == SocketKind::Udp {
+            self.remove_udp_translations_for_receiver(id);
+            let external_peer_count = udp_external_peers.len();
+            self.udp_external_peer_count = self
+                .udp_external_peer_count
+                .checked_sub(external_peer_count)
+                .expect("reactor UDP external peer count underflow");
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("UDP socket session state missing");
+            session.udp_external_peer_count = session
+                .udp_external_peer_count
+                .checked_sub(external_peer_count)
+                .expect("session UDP external peer count underflow");
         }
 
         let mut socket = Some(socket);
@@ -1760,6 +2495,42 @@ impl Reactor {
                 listener_id,
                 Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME,
             );
+        }
+        if kind == SocketKind::Udp
+            && self
+                .udp
+                .translations
+                .values()
+                .any(|translation| translation.source_socket_id == id)
+        {
+            let binding = udp_binding.expect("translated UDP source binding missing");
+            let retained = RetiredUdpSource {
+                _socket: socket.take().expect("UDP source descriptor missing"),
+                session_id,
+                host_address: binding.host_address,
+            };
+            let source = self
+                .udp
+                .translation_sources
+                .get_mut(&id)
+                .expect("translated UDP source reservation missing");
+            assert!(
+                matches!(source, UdpTranslationSourceState::Active),
+                "translated UDP source already retired"
+            );
+            *source = UdpTranslationSourceState::Retired(retained);
+            self.retained_udp_source_count = self
+                .retained_udp_source_count
+                .checked_add(1)
+                .expect("reactor retained UDP source count overflow");
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("UDP source session state missing");
+            session.retained_udp_source_count = session
+                .retained_udp_source_count
+                .checked_add(1)
+                .expect("session retained UDP source count overflow");
         }
         drop(socket);
         if let Some(session) = self.sessions.get_mut(&session_id) {
@@ -1945,11 +2716,7 @@ impl Reactor {
                     destination,
                     response,
                 } => {
-                    let outcome = self
-                        .sockets
-                        .get_mut(&id)
-                        .ok_or(BrokerError::Internal)
-                        .and_then(|socket| send_to_socket(socket, &data, destination));
+                    let outcome = self.send_to_socket(id, &data, destination);
                     let _ = response.send(outcome);
                 }
                 ReactorCommand::Receive {
@@ -1984,11 +2751,7 @@ impl Reactor {
                     flags,
                     response,
                 } => {
-                    let outcome = self
-                        .sockets
-                        .get_mut(&id)
-                        .ok_or(BrokerError::Internal)
-                        .and_then(|socket| receive_from_socket(socket, length, flags));
+                    let outcome = self.receive_from_socket(id, length, flags);
                     let _ = response.send(outcome);
                 }
                 ReactorCommand::Shutdown { id, mode, response } => {
@@ -2096,7 +2859,13 @@ impl Reactor {
                         .tcp
                         .bindings
                         .get(&guest_port)
-                        .and_then(|binding| binding.host_address);
+                        .and_then(|binding| binding.host_address)
+                        .or_else(|| {
+                            self.udp
+                                .bindings
+                                .get(&guest_port)
+                                .map(|binding| binding.host_address)
+                        });
                     let _ = response.send(host_address);
                 }
                 #[cfg(test)]
@@ -2106,6 +2875,14 @@ impl Reactor {
                 #[cfg(test)]
                 ReactorCommand::RetainedConnectorCount { response } => {
                     let _ = response.send(self.retained_connector_count);
+                }
+                #[cfg(test)]
+                ReactorCommand::UdpTranslationCount { response } => {
+                    let _ = response.send(self.udp.translations.len());
+                }
+                #[cfg(test)]
+                ReactorCommand::RetainedUdpSourceCount { response } => {
+                    let _ = response.send(self.retained_udp_source_count);
                 }
                 #[cfg(test)]
                 ReactorCommand::ExpireDeadlinedState { now, response } => {
@@ -2133,8 +2910,13 @@ impl Reactor {
                     self.sockets.clear();
                     self.tcp.bindings.clear();
                     self.tcp.pending_guest_connections.clear();
+                    self.udp.bindings.clear();
+                    self.udp.translations.clear();
+                    self.udp.translation_sources.clear();
                     self.sessions.clear();
                     self.retained_connector_count = 0;
+                    self.retained_udp_source_count = 0;
+                    self.udp_external_peer_count = 0;
                     let _ = response.send(());
                     return true;
                 }
@@ -2156,6 +2938,7 @@ impl Reactor {
             .sockets
             .len()
             .checked_add(self.retained_connector_count)
+            .and_then(|count| count.checked_add(self.retained_udp_source_count))
             .is_none_or(|count| count >= self.max_sockets)
         {
             return Err(BrokerError::ResourceExhausted);
@@ -2176,6 +2959,7 @@ impl Reactor {
         if session
             .live_socket_count
             .checked_add(session.retained_connector_count)
+            .and_then(|count| count.checked_add(session.retained_udp_source_count))
             .is_none_or(|count| count >= self.max_sockets_per_session)
         {
             return Err(BrokerError::ResourceExhausted);
@@ -2236,6 +3020,9 @@ impl Reactor {
                 abortive_close: false,
                 guest_local_address: None,
                 host_connection: None,
+                udp_peer: None,
+                udp_external_peers: HashSet::new(),
+                udp_non_loopback_ingress: false,
                 tcp_no_delay: false,
                 tcp_keep_alive: false,
             },
@@ -2336,22 +3123,20 @@ impl Reactor {
                 return Err(BrokerError::WouldBlock);
             }
         };
+        let listener_session = self
+            .sessions
+            .get(&listener_session_id)
+            .ok_or(BrokerError::Internal)?;
         if self
             .sockets
             .len()
             .checked_add(self.retained_connector_count)
+            .and_then(|count| count.checked_add(self.retained_udp_source_count))
             .is_none_or(|count| count >= self.max_sockets)
-            || self
-                .sessions
-                .get(&listener_session_id)
-                .ok_or(BrokerError::Internal)?
+            || listener_session
                 .live_socket_count
-                .checked_add(
-                    self.sessions
-                        .get(&listener_session_id)
-                        .ok_or(BrokerError::Internal)?
-                        .retained_connector_count,
-                )
+                .checked_add(listener_session.retained_connector_count)
+                .and_then(|count| count.checked_add(listener_session.retained_udp_source_count))
                 .is_none_or(|count| count >= self.max_sockets_per_session)
         {
             return Err(BrokerError::ResourceExhausted);
@@ -2419,6 +3204,9 @@ impl Reactor {
                 abortive_close: false,
                 guest_local_address: Some(listener_guest_address),
                 host_connection: None,
+                udp_peer: None,
+                udp_external_peers: HashSet::new(),
+                udp_non_loopback_ingress: false,
                 tcp_no_delay: listener_tcp_no_delay,
                 tcp_keep_alive: listener_tcp_keep_alive,
             },
@@ -2454,8 +3242,13 @@ impl Reactor {
         self.sockets.clear();
         self.tcp.bindings.clear();
         self.tcp.pending_guest_connections.clear();
+        self.udp.bindings.clear();
+        self.udp.translations.clear();
+        self.udp.translation_sources.clear();
         self.sessions.clear();
         self.retained_connector_count = 0;
+        self.retained_udp_source_count = 0;
+        self.udp_external_peer_count = 0;
     }
 }
 
@@ -2545,13 +3338,11 @@ fn connect_datagram_socket(
     loop {
         match connect(&socket.socket, &address) {
             Ok(()) | Err(Errno::ISCONN) => {
-                let local_address = local_socket_address(&socket.socket)
-                    .map_err(PlatformConnectError::PeerIndeterminate)?;
-                socket
-                    .snapshot
-                    .lock()
-                    .expect("Linux socket snapshot mutex poisoned")
-                    .local_address = Some(local_address);
+                if socket.guest_local_address.is_none() {
+                    return Err(PlatformConnectError::PeerIndeterminate(
+                        BrokerError::Internal,
+                    ));
+                }
                 let readiness = socket
                     .snapshot
                     .lock()
@@ -2569,7 +3360,6 @@ fn connect_datagram_socket(
             }
             Err(Errno::INTR) => {}
             Err(error) => {
-                update_local_address(socket).map_err(PlatformConnectError::PeerIndeterminate)?;
                 let error = socket_operation_error_from_errno(error)
                     .map_err(PlatformConnectError::PeerIndeterminate)?;
                 return Ok(SocketConnectionStatus::Failed(error));
@@ -2596,6 +3386,125 @@ fn bind_host_socket(
             }
         }
     }
+}
+
+fn is_local_ipv4_address(address: Ipv4Addr) -> bool {
+    let Ok(socket) = socket_with(
+        LinuxAddressFamily::INET,
+        LinuxSocketType::DGRAM,
+        LinuxSocketFlags::CLOEXEC | LinuxSocketFlags::NONBLOCK,
+        Some(ipproto::UDP),
+    ) else {
+        // Conservatively reject a destination that may name a private
+        // wildcard-bound backend when locality cannot be determined.
+        return true;
+    };
+    loop {
+        match bind(&socket, &SocketAddrV4::new(address, 0)) {
+            Err(Errno::INTR) => {}
+            Err(Errno::ADDRNOTAVAIL) => return false,
+            Ok(()) | Err(_) => return true,
+        }
+    }
+}
+
+fn restrict_udp_ingress_to_loopback(socket: &mut SocketEntry) -> BrokerResult<()> {
+    if socket.kind != SocketKind::Udp || socket.udp_non_loopback_ingress {
+        return Err(BrokerError::Internal);
+    }
+    let loopback_index = {
+        // SAFETY: the C string remains valid for the duration of the call.
+        let index = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+        if index == 0 {
+            return Err(last_socket_filter_error());
+        }
+        index
+    };
+    let load_ifindex = u16::try_from(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS)
+        .expect("BPF load instruction exceeds u16");
+    let jump_if_equal = u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K)
+        .expect("BPF jump instruction exceeds u16");
+    let return_constant =
+        u16::try_from(libc::BPF_RET | libc::BPF_K).expect("BPF return instruction exceeds u16");
+    let mut filters = [
+        libc::sock_filter {
+            code: load_ifindex,
+            jt: 0,
+            jf: 0,
+            k: (libc::SKF_AD_OFF + libc::SKF_AD_IFINDEX).cast_unsigned(),
+        },
+        libc::sock_filter {
+            code: jump_if_equal,
+            jt: 0,
+            jf: 1,
+            k: loopback_index,
+        },
+        libc::sock_filter {
+            code: return_constant,
+            jt: 0,
+            jf: 0,
+            k: u32::MAX,
+        },
+        libc::sock_filter {
+            code: return_constant,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: u16::try_from(filters.len()).expect("UDP ingress filter length exceeds u16"),
+        filter: filters.as_mut_ptr(),
+    };
+    // SAFETY: `socket` is live, and the kernel copies the complete filter
+    // program during this call without retaining either stack pointer.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            (&raw const program).cast(),
+            libc::socklen_t::try_from(size_of::<libc::sock_fprog>())
+                .expect("sock_fprog size exceeds socklen_t"),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(last_socket_filter_error())
+    }
+}
+
+fn enable_udp_non_loopback_ingress(socket: &mut SocketEntry) -> BrokerResult<()> {
+    if socket.kind != SocketKind::Udp {
+        return Err(BrokerError::Internal);
+    }
+    if socket.udp_non_loopback_ingress {
+        return Ok(());
+    }
+    let ignored = 0_i32;
+    // SAFETY: `socket` is live, and the integer pointer is valid for the
+    // duration of `setsockopt`; Linux ignores its value for filter removal.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_DETACH_FILTER,
+            (&raw const ignored).cast(),
+            libc::socklen_t::try_from(size_of::<i32>())
+                .expect("filter-detach value size exceeds socklen_t"),
+        )
+    };
+    if result != 0 {
+        return Err(last_socket_filter_error());
+    }
+    socket.udp_non_loopback_ingress = true;
+    Ok(())
+}
+
+fn last_socket_filter_error() -> BrokerError {
+    let error = Error::last_os_error();
+    Errno::from_io_error(&error).map_or(BrokerError::Internal, broker_error_from_errno)
 }
 
 fn listen_tcp_socket(
@@ -2680,7 +3589,7 @@ fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutc
     }
 }
 
-fn send_to_socket(
+fn send_datagram_socket(
     socket: &mut SocketEntry,
     data: &[u8],
     destination: Option<SocketAddrV4>,
@@ -2697,22 +3606,14 @@ fn send_to_socket(
             None => send(&socket.socket, data, LinuxSendFlags::NOSIGNAL),
         };
         match result {
-            Ok(sent) if sent == data.len() => {
-                update_local_address(socket)?;
-                return Ok(SocketOutcome::Completed(sent));
-            }
-            Ok(_) => {
-                update_local_address(socket)?;
-                return Err(BrokerError::Internal);
-            }
+            Ok(sent) if sent == data.len() => return Ok(SocketOutcome::Completed(sent)),
+            Ok(_) => return Err(BrokerError::Internal),
             Err(Errno::INTR) => {}
             Err(Errno::AGAIN) => {
-                update_local_address(socket)?;
                 clear_readiness(socket, ReadinessFlags::WRITE)?;
                 return Err(BrokerError::WouldBlock);
             }
             Err(error) => {
-                update_local_address(socket)?;
                 let error = socket_operation_error_from_errno(error)?;
                 consume_synchronous_error(socket)?;
                 return Ok(SocketOutcome::Failed(error));
@@ -2833,7 +3734,7 @@ fn receive_socket(
     Ok(ReactorReceiveOutcome::Received(data))
 }
 
-fn receive_from_socket(
+fn receive_datagram_socket(
     socket: &mut SocketEntry,
     length: usize,
     flags: ReceiveFromFlags,
@@ -2860,7 +3761,6 @@ fn receive_from_socket(
                 let source_address = SocketAddrV4::try_from(address.ok_or(BrokerError::Internal)?)
                     .map_err(|_| BrokerError::Internal)?;
                 data.truncate(received);
-                update_local_address(socket)?;
                 return Ok(ReactorReceiveFromOutcome::Received {
                     data,
                     datagram_length,
@@ -3180,26 +4080,6 @@ fn local_socket_address(socket: &OwnedFd) -> BrokerResult<SocketAddrV4> {
         Ok(address) => SocketAddrV4::try_from(address).map_err(|_| BrokerError::Internal),
         Err(_) => Err(BrokerError::Internal),
     }
-}
-
-fn update_local_address(socket: &SocketEntry) -> BrokerResult<()> {
-    let needs_address = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .local_address
-        .is_none();
-    if needs_address {
-        let address = local_socket_address(&socket.socket)?;
-        if address.port() != 0 {
-            socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned")
-                .local_address = Some(address);
-        }
-    }
-    Ok(())
 }
 
 fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse> {
@@ -4680,13 +5560,13 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_guest_tcp_ports_are_rejected_by_core_before_platform_bind() {
-        let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
+    fn guest_transport_port_collisions_are_broker_wide_and_protocol_separate() {
+        let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::Ipv4Loopback),
-            BrokerCoreLimits::new_with_all_limits(4, 0, 2, 1),
-            provider,
+            BrokerCoreLimits::new_with_all_limits(4, 0, 4, 2),
+            provider.clone(),
         )
         .unwrap();
         let first_session = broker
@@ -4699,7 +5579,9 @@ mod tests {
         let (retired, retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
         let first = create_socket(&first_session, readiness.clone());
-        let second = create_socket(&second_session, readiness);
+        let second = create_socket(&second_session, readiness.clone());
+        let first_udp = create_udp_socket(&first_session, readiness.clone());
+        let second_udp = create_udp_socket(&second_session, readiness);
         let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8081);
         assert_eq!(
             litebox_broker_core::socket::bind(&first_session, first, address),
@@ -4713,6 +5595,20 @@ mod tests {
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), first);
         assert_eq!(
             litebox_broker_core::socket::bind(&second_session, second, address),
+            Ok(SocketOutcome::Completed(address))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::bind(&first_session, first_udp, address),
+            Ok(SocketOutcome::Completed(address))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::bind(&second_session, second_udp, address),
+            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
+        );
+        first_session.close_object_reference(first_udp).unwrap();
+        assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), first_udp);
+        assert_eq!(
+            litebox_broker_core::socket::bind(&second_session, second_udp, address),
             Ok(SocketOutcome::Completed(address))
         );
     }
@@ -5650,7 +6546,8 @@ mod tests {
         assert_eq!(status.status, SocketConnectionStatus::Unconnected);
         let local_address = status.local_address.unwrap();
         assert!(local_address.ip().is_unspecified());
-        assert_eq!(local_address.port(), source.port());
+        assert_eq!(local_address, implicitly_bound);
+        assert!(source.ip().is_loopback());
 
         server.send_to(&[], source).unwrap();
         wait_until_ready(&session, &publications, handle, ReadinessFlags::READ);
@@ -5701,7 +6598,10 @@ mod tests {
         );
         let connected_status = litebox_broker_core::socket::status(&session, handle).unwrap();
         assert_eq!(connected_status.status, SocketConnectionStatus::Connected);
-        assert_eq!(connected_status.local_address, Some(source));
+        assert_eq!(
+            connected_status.local_address,
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_address.port()))
+        );
         let maximum = vec![0x5a; MAX_UDP_DATAGRAM_SIZE as usize];
         assert_eq!(
             send_datagram(&session, handle, &maximum, SendFlags::NONE, None,),
@@ -5797,11 +6697,800 @@ mod tests {
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
     }
 
+    #[test]
+    fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
+        let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(8, 0, 6, 3),
+            provider.clone(),
+        )
+        .unwrap();
+        let receiver_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let sender_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+
+        let shadowed_host_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        shadowed_host_socket
+            .set_nonblocking(true)
+            .expect("failed to make shadow socket nonblocking");
+        let guest_port = shadowed_host_socket.local_addr().unwrap().port();
+        let receiver_guest_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), guest_port);
+        let receiver = create_udp_socket(&receiver_session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(&receiver_session, receiver, receiver_guest_address,),
+            Ok(SocketOutcome::Completed(receiver_guest_address))
+        );
+        let receiver_private_address = provider
+            .reactor
+            .host_address(receiver_guest_address.port())
+            .expect("UDP receiver backend must be realized");
+        assert!(receiver_private_address.ip().is_loopback());
+        assert_ne!(receiver_private_address, receiver_guest_address);
+
+        let sender = create_udp_socket(&sender_session, readiness.clone());
+        assert_eq!(
+            send_datagram(
+                &sender_session,
+                sender,
+                b"request",
+                SendFlags::NONE,
+                Some(receiver_guest_address),
+            ),
+            Ok(SocketOutcome::Completed(7))
+        );
+        let sender_guest_address = litebox_broker_core::socket::status(&sender_session, sender)
+            .unwrap()
+            .local_address
+            .expect("implicit UDP bind missing");
+        let sender_source_address =
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_guest_address.port());
+        wait_until_ready(
+            &receiver_session,
+            &publications,
+            receiver,
+            ReadinessFlags::READ,
+        );
+        let mut request = [0; 7];
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut request,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 7,
+                datagram_length: 7,
+                source_address: sender_source_address,
+            }))
+        );
+        assert_eq!(&request, b"request");
+
+        assert_eq!(
+            send_datagram(
+                &receiver_session,
+                receiver,
+                b"response",
+                SendFlags::NONE,
+                Some(sender_source_address),
+            ),
+            Ok(SocketOutcome::Completed(8))
+        );
+        wait_until_ready(&sender_session, &publications, sender, ReadinessFlags::READ);
+        let mut response = [0; 8];
+        assert_eq!(
+            receive_datagram_into(
+                &sender_session,
+                sender,
+                &mut response,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 8,
+                datagram_length: 8,
+                source_address: receiver_guest_address,
+            }))
+        );
+        assert_eq!(&response, b"response");
+
+        let probe = create_udp_socket(&sender_session, readiness.clone());
+        assert_eq!(
+            send_datagram(
+                &sender_session,
+                probe,
+                b"private",
+                SendFlags::NONE,
+                Some(receiver_private_address),
+            ),
+            Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        );
+        let receiver_private_alias =
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), receiver_private_address.port());
+        assert_eq!(
+            send_datagram(
+                &sender_session,
+                probe,
+                b"private alias",
+                SendFlags::NONE,
+                Some(receiver_private_alias),
+            ),
+            Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        );
+        assert_eq!(
+            shadowed_host_socket
+                .recv_from(&mut [0; 1])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::WouldBlock
+        );
+
+        let tcp_server =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, receiver_private_address.port())).unwrap();
+        let tcp = create_socket(&sender_session, readiness.clone());
+        let tcp_guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18085);
+        assert_eq!(
+            litebox_broker_core::socket::bind(&sender_session, tcp, tcp_guest_address),
+            Ok(SocketOutcome::Completed(tcp_guest_address))
+        );
+        assert!(matches!(
+            litebox_broker_core::socket::connect(
+                &sender_session,
+                tcp,
+                socket_address_v4(tcp_server.local_addr().unwrap()),
+            ),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+        wait_until_connected(&sender_session, tcp, &publications);
+        let _accepted = tcp_server.accept().unwrap();
+        sender_session.close_object_reference(tcp).unwrap();
+
+        let external = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        external.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+        let external_address = socket_address_v4(external.local_addr().unwrap());
+        external
+            .send_to(b"unsolicited", receiver_private_address)
+            .unwrap();
+        wait_until_ready(
+            &receiver_session,
+            &publications,
+            receiver,
+            ReadinessFlags::READ,
+        );
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut request,
+                ReceiveFromFlags::NONE,
+            ),
+            Err(BrokerError::WouldBlock)
+        );
+
+        assert_eq!(
+            send_datagram(
+                &receiver_session,
+                receiver,
+                b"contact",
+                SendFlags::NONE,
+                Some(external_address),
+            ),
+            Ok(SocketOutcome::Completed(7))
+        );
+        let mut external_packet = [0; 7];
+        let (_, receiver_source) = external.recv_from(&mut external_packet).unwrap();
+        assert_eq!(&external_packet, b"contact");
+        external.send_to(b"reply", receiver_source).unwrap();
+        wait_until_ready(
+            &receiver_session,
+            &publications,
+            receiver,
+            ReadinessFlags::READ,
+        );
+        let mut reply = [0; 5];
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut reply,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 5,
+                datagram_length: 5,
+                source_address: external_address,
+            }))
+        );
+        assert_eq!(&reply, b"reply");
+    }
+
+    #[test]
+    fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
+        let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(8, 0, 5, 3),
+            provider.clone(),
+        )
+        .unwrap();
+        let receiver_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let source_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let receiver_port_guard = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let source_port_guard = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let receiver_port = receiver_port_guard.local_addr().unwrap().port();
+        let source_port = source_port_guard.local_addr().unwrap().port();
+        let receiver_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), receiver_port);
+        let source_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), source_port);
+
+        let receiver = create_udp_socket(&receiver_session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(&receiver_session, receiver, receiver_address,),
+            Ok(SocketOutcome::Completed(receiver_address))
+        );
+        let source = create_udp_socket(&source_session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(&source_session, source, source_address),
+            Ok(SocketOutcome::Completed(source_address))
+        );
+        let old_private_source = provider
+            .reactor
+            .host_address(source_address.port())
+            .expect("old UDP source backend missing");
+        assert_eq!(
+            send_datagram(
+                &source_session,
+                source,
+                b"old",
+                SendFlags::NONE,
+                Some(receiver_address),
+            ),
+            Ok(SocketOutcome::Completed(3))
+        );
+        wait_until_ready(
+            &receiver_session,
+            &publications,
+            receiver,
+            ReadinessFlags::READ,
+        );
+        assert_eq!(provider.reactor.udp_translation_count(), 1);
+
+        source_session.close_object_reference(source).unwrap();
+        assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), source);
+        assert_eq!(provider.reactor.retained_udp_source_count(), 1);
+
+        let replacement = create_udp_socket(&source_session, readiness);
+        assert_eq!(
+            litebox_broker_core::socket::bind(&source_session, replacement, source_address),
+            Ok(SocketOutcome::Completed(source_address))
+        );
+        let new_private_source = provider
+            .reactor
+            .host_address(source_address.port())
+            .expect("replacement UDP source backend missing");
+        assert_ne!(new_private_source, old_private_source);
+        assert_eq!(
+            send_datagram(
+                &source_session,
+                replacement,
+                b"fresh",
+                SendFlags::NONE,
+                Some(receiver_address),
+            ),
+            Ok(SocketOutcome::Completed(5))
+        );
+
+        let mut payload = [0; 5];
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 5,
+                datagram_length: 5,
+                source_address,
+            }))
+        );
+        assert_eq!(&payload, b"fresh");
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(provider.reactor.udp_translation_count(), 0);
+        assert_eq!(provider.reactor.retained_udp_source_count(), 0);
+    }
+
+    #[test]
+    fn udp_translation_quota_and_session_teardown_are_bounded() {
+        let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(6, 0, 3, 1),
+            provider.clone(),
+        )
+        .unwrap();
+        let source_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let first_receiver_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second_receiver_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let replacement_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let first_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18082);
+        let second_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18083);
+        let first_receiver = create_udp_socket(&first_receiver_session, readiness.clone());
+        let second_receiver = create_udp_socket(&second_receiver_session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(
+                &first_receiver_session,
+                first_receiver,
+                first_address,
+            ),
+            Ok(SocketOutcome::Completed(first_address))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::bind(
+                &second_receiver_session,
+                second_receiver,
+                second_address,
+            ),
+            Ok(SocketOutcome::Completed(second_address))
+        );
+        let source = create_udp_socket(&source_session, readiness.clone());
+
+        assert_eq!(
+            send_datagram(
+                &source_session,
+                source,
+                b"first",
+                SendFlags::NONE,
+                Some(first_address),
+            ),
+            Ok(SocketOutcome::Completed(5))
+        );
+        let source_address = litebox_broker_core::socket::status(&source_session, source)
+            .unwrap()
+            .local_address
+            .map(|address| SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port()))
+            .expect("implicit UDP source bind missing");
+        assert_eq!(provider.reactor.udp_translation_count(), 1);
+        assert_eq!(
+            send_datagram(
+                &source_session,
+                source,
+                b"second",
+                SendFlags::NONE,
+                Some(second_address),
+            ),
+            Err(BrokerError::ResourceExhausted)
+        );
+        wait_until_ready(
+            &first_receiver_session,
+            &publications,
+            first_receiver,
+            ReadinessFlags::READ,
+        );
+        let mut payload = [0; 6];
+        assert_eq!(
+            receive_datagram_into(
+                &first_receiver_session,
+                first_receiver,
+                &mut payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 5,
+                datagram_length: 5,
+                source_address,
+            }))
+        );
+        assert_eq!(&payload[..5], b"first");
+        assert_eq!(
+            receive_datagram_into(
+                &first_receiver_session,
+                first_receiver,
+                &mut payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(provider.reactor.udp_translation_count(), 0);
+
+        assert_eq!(
+            send_datagram(
+                &source_session,
+                source,
+                b"second",
+                SendFlags::NONE,
+                Some(second_address),
+            ),
+            Ok(SocketOutcome::Completed(6))
+        );
+        wait_until_ready(
+            &second_receiver_session,
+            &publications,
+            second_receiver,
+            ReadinessFlags::READ,
+        );
+        drop(source_session);
+        assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), source);
+        assert_eq!(provider.reactor.udp_translation_count(), 1);
+        assert_eq!(provider.reactor.retained_udp_source_count(), 1);
+
+        assert!(matches!(
+            litebox_broker_core::socket::create(
+                &replacement_session,
+                CreateSocketRequest {
+                    address_family: AddressFamily::Ipv4,
+                    socket_type: SocketType::Datagram,
+                    protocol: IpProtocol::Udp,
+                },
+                readiness.clone(),
+            ),
+            Err(BrokerError::ResourceExhausted)
+        ));
+        assert_eq!(
+            receive_datagram_into(
+                &second_receiver_session,
+                second_receiver,
+                &mut payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(provider.reactor.udp_translation_count(), 0);
+        assert_eq!(provider.reactor.retained_udp_source_count(), 0);
+
+        let replacement = create_udp_socket(&replacement_session, readiness);
+        replacement_session
+            .close_object_reference(replacement)
+            .unwrap();
+    }
+
+    #[test]
+    fn connected_guest_udp_routes_and_translates_in_both_directions() {
+        let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(8, 0, 4, 2),
+            provider,
+        )
+        .unwrap();
+        let first_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let expected_first_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 18080);
+        let second_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18081);
+        let second = create_udp_socket(&second_session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(&second_session, second, second_address),
+            Ok(SocketOutcome::Completed(second_address))
+        );
+
+        let first = create_udp_socket(&first_session, readiness);
+        assert_eq!(
+            litebox_broker_core::socket::bind(&first_session, first, expected_first_address,),
+            Ok(SocketOutcome::Completed(expected_first_address))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::connect(&first_session, first, second_address),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+        );
+        let first_address = litebox_broker_core::socket::status(&first_session, first)
+            .unwrap()
+            .local_address
+            .expect("connected UDP socket lost its local address");
+        assert_eq!(first_address, expected_first_address);
+        assert_eq!(
+            send_datagram(&first_session, first, b"one", SendFlags::NONE, None,),
+            Ok(SocketOutcome::Completed(3))
+        );
+        wait_until_ready(&second_session, &publications, second, ReadinessFlags::READ);
+        let mut first_payload = [0; 3];
+        assert_eq!(
+            receive_datagram_into(
+                &second_session,
+                second,
+                &mut first_payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 3,
+                datagram_length: 3,
+                source_address: first_address,
+            }))
+        );
+        assert_eq!(&first_payload, b"one");
+
+        assert_eq!(
+            litebox_broker_core::socket::connect(&second_session, second, first_address),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+        );
+        assert_eq!(
+            send_datagram(&second_session, second, b"two", SendFlags::NONE, None,),
+            Ok(SocketOutcome::Completed(3))
+        );
+        wait_until_ready(&first_session, &publications, first, ReadinessFlags::READ);
+        let mut second_payload = [0; 3];
+        assert_eq!(
+            receive_datagram_into(
+                &first_session,
+                first,
+                &mut second_payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 3,
+                datagram_length: 3,
+                source_address: second_address,
+            }))
+        );
+        assert_eq!(&second_payload, b"two");
+    }
+
+    #[test]
+    fn externally_connected_udp_preserves_guest_routing_identity() {
+        let Some(local_ip) = non_loopback_local_ipv4() else {
+            return;
+        };
+        let external = UdpSocket::bind((local_ip, 0)).unwrap();
+        external.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+        let external_address = socket_address_v4(external.local_addr().unwrap());
+        let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+        let policy = SocketPolicy::from_udp_destination_rules(&[
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address(local_ip.octets()), 32).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+        ])
+        .unwrap();
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(policy),
+            BrokerCoreLimits::new_with_all_limits(6, 0, 4, 2),
+            provider.clone(),
+        )
+        .unwrap();
+        let source_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let receiver_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let receiver_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18084);
+        let receiver = create_udp_socket(&receiver_session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(&receiver_session, receiver, receiver_address,),
+            Ok(SocketOutcome::Completed(receiver_address))
+        );
+        let source = create_udp_socket(&source_session, readiness);
+        assert_eq!(
+            litebox_broker_core::socket::connect(&source_session, source, external_address),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+        );
+        let source_address = litebox_broker_core::socket::status(&source_session, source)
+            .unwrap()
+            .local_address
+            .expect("connected UDP source address missing");
+        assert_eq!(source_address.ip(), &local_ip);
+
+        assert_eq!(
+            send_datagram(&source_session, source, b"external", SendFlags::NONE, None),
+            Ok(SocketOutcome::Completed(8))
+        );
+        let mut external_payload = [0; 8];
+        let (external_received, _) = external.recv_from(&mut external_payload).unwrap();
+        assert_eq!(external_received, external_payload.len());
+        assert_eq!(&external_payload, b"external");
+
+        assert_eq!(
+            send_datagram(
+                &source_session,
+                source,
+                b"guest",
+                SendFlags::NONE,
+                Some(receiver_address),
+            ),
+            Ok(SocketOutcome::Completed(5))
+        );
+        wait_until_ready(
+            &receiver_session,
+            &publications,
+            receiver,
+            ReadinessFlags::READ,
+        );
+        let mut guest_payload = [0; 5];
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut guest_payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 5,
+                datagram_length: 5,
+                source_address,
+            }))
+        );
+        assert_eq!(&guest_payload, b"guest");
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut guest_payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(provider.reactor.udp_translation_count(), 0);
+        assert_eq!(
+            send_datagram(
+                &receiver_session,
+                receiver,
+                b"reply",
+                SendFlags::NONE,
+                Some(source_address),
+            ),
+            Ok(SocketOutcome::Completed(5))
+        );
+        assert_eq!(provider.reactor.udp_translation_count(), 1);
+        assert_eq!(
+            receive_datagram_into(
+                &source_session,
+                source,
+                &mut guest_payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(provider.reactor.udp_translation_count(), 0);
+    }
+
+    #[test]
+    fn rejected_udp_datagram_drain_is_bounded_and_republishes_readiness() {
+        let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(8, 0, 4, 2),
+            provider.clone(),
+        )
+        .unwrap();
+        let receiver_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let sender_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let guest_port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let receiver_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port);
+        let receiver = create_udp_socket(&receiver_session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(&receiver_session, receiver, receiver_address,),
+            Ok(SocketOutcome::Completed(receiver_address))
+        );
+        let receiver_private_address = provider
+            .reactor
+            .host_address(receiver_address.port())
+            .expect("UDP receiver backend missing");
+        let attacker = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        for _ in 0..=MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
+            attacker.send_to(b"x", receiver_private_address).unwrap();
+        }
+
+        let sender = create_udp_socket(&sender_session, readiness);
+        assert_eq!(
+            send_datagram(
+                &sender_session,
+                sender,
+                b"ok",
+                SendFlags::NONE,
+                Some(receiver_address),
+            ),
+            Ok(SocketOutcome::Completed(2))
+        );
+        wait_for_readiness(&publications, receiver, ReadinessFlags::READ);
+        let mut payload = [0; 2];
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Err(BrokerError::WouldBlock)
+        );
+        wait_for_readiness(&publications, receiver, ReadinessFlags::READ);
+        let source_address = litebox_broker_core::socket::status(&sender_session, sender)
+            .unwrap()
+            .local_address
+            .unwrap();
+        let source_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, source_address.port());
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut payload,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 2,
+                datagram_length: 2,
+                source_address,
+            }))
+        );
+        assert_eq!(&payload, b"ok");
+    }
+
     fn socket_address_v4(address: std::net::SocketAddr) -> SocketAddrV4 {
         let std::net::SocketAddr::V4(address) = address else {
             panic!("loopback TCP test unexpectedly used IPv6");
         };
         address
+    }
+
+    fn non_loopback_local_ipv4() -> Option<Ipv4Addr> {
+        let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+        let address = socket_address_v4(probe.local_addr().ok()?);
+        (!address.ip().is_unspecified() && !address.ip().is_loopback()).then_some(*address.ip())
     }
 
     fn create_socket(
@@ -5814,6 +7503,22 @@ mod tests {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
+            },
+            readiness,
+        )
+        .unwrap()
+    }
+
+    fn create_udp_socket(
+        session: &litebox_broker_core::BrokerSession,
+        readiness: Arc<dyn ReadinessSink>,
+    ) -> ObjectHandle {
+        litebox_broker_core::socket::create(
+            session,
+            CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Datagram,
+                protocol: IpProtocol::Udp,
             },
             readiness,
         )

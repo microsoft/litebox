@@ -27,6 +27,7 @@ const BROKER_ONLY_C_TESTS: &[&str] = &[
     "tcp_broker.c",
     "tcp_broker_server.c",
     "udp_broker.c",
+    "udp_broker_namespace.c",
 ];
 
 /// Debian multiarch library directory preserved at its guest-relative path.
@@ -340,6 +341,25 @@ fn spawn_test_broker(
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
 ) -> TestBroker {
+    spawn_test_broker_with_mode(control_socket_path, policy, connection_count, false)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn spawn_concurrent_test_broker(
+    control_socket_path: &Path,
+    policy: litebox_broker_core::PolicyEngine,
+    connection_count: usize,
+) -> TestBroker {
+    spawn_test_broker_with_mode(control_socket_path, policy, connection_count, true)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn spawn_test_broker_with_mode(
+    control_socket_path: &Path,
+    policy: litebox_broker_core::PolicyEngine,
+    connection_count: usize,
+    concurrent: bool,
+) -> TestBroker {
     let _ = std::fs::remove_file(control_socket_path);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -367,92 +387,28 @@ fn spawn_test_broker(
             .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
 
-            for _ in 0..connection_count {
-                let (control_stream, _) = control_listener
-                    .accept()
-                    .expect("failed to accept broker local control connection");
-                let shared_memory =
-                    litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create(
-                        litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
-                    )
-                    .expect("failed to create broker test shared memory");
-                let shared_buffers =
-                    litebox_broker_transport::shared_memory::SharedBufferPool::new(
-                        shared_memory,
-                        litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT,
-                    )
-                    .expect("failed to attach broker test shared-buffer layout");
-                let control_memory = litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create_control_ring()
-                    .expect("failed to create broker test control ring");
-                let control_ring =
-                    litebox_broker_transport::control_ring::ControlRing::new(control_memory)
-                        .expect("failed to attach broker test control ring");
-                let setup_deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
-                let mut channel =
-                    litebox_broker_transport_linux_userland::unix_socket::UnixStreamHostSetupChannel::from_host_guaranteed(
-                        control_stream,
-                        setup_deadline,
-                    );
-                let readiness = std::sync::Arc::new(
-                    litebox_broker_userland::readiness::ReadinessPublisherRuntime::new(),
-                );
-                let association = litebox_broker_host::setup_connection(
-                    &broker,
-                    &mut channel,
-                    &shared_buffers,
-                    readiness.clone(),
-                    |channel| {
-                        channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
-                        channel.send_memfd(control_ring.memory(), Some(setup_deadline))
-                    },
-                )
-                .expect("broker host setup failed")
-                .expect("broker setup terminated before activation");
-                let (mut request_source, response_sink, mut notifications, _shutdown) = channel
-                    .into_active(control_ring)
-                    .expect("failed to activate broker test control ring");
-                let publisher_readiness = readiness.clone();
-                let publisher =
-                    std::thread::spawn(move || publisher_readiness.run(&mut notifications));
-                let mut close_object_count = 0;
-                let termination = loop {
-                    match request_source
-                        .recv_request()
-                        .expect("failed to receive broker test request")
-                    {
-                        litebox_broker_transport::channel::HostReceive::Message(request) => {
-                            if matches!(
-                                &request.operation,
-                                litebox_broker_protocol::message::BrokerOperation::CloseObject(_)
-                            ) {
-                                close_object_count += 1;
-                            }
-                            association
-                                .execute_request(request, |response| {
-                                    response_sink.send_response(response)
-                                })
-                                .expect("failed to execute broker test request");
-                        }
-                        litebox_broker_transport::channel::HostReceive::PeerClosed => {
-                            break litebox_broker_host::ConnectionTermination::PeerClosed;
-                        }
-                        litebox_broker_transport::channel::HostReceive::ProtocolViolation => {
-                            break litebox_broker_host::ConnectionTermination::ProtocolViolation;
-                        }
+            let serve_connection = |control_stream, close_object_count_tx| {
+                run_test_broker_connection(&broker, control_stream, close_object_count_tx);
+            };
+            if concurrent {
+                std::thread::scope(|scope| {
+                    for _ in 0..connection_count {
+                        let (control_stream, _) = control_listener
+                            .accept()
+                            .expect("failed to accept broker local control connection");
+                        let close_object_count_tx = close_object_count_tx.clone();
+                        scope.spawn(move || {
+                            serve_connection(control_stream, close_object_count_tx);
+                        });
                     }
-                };
-                assert_eq!(
-                    termination,
-                    litebox_broker_host::ConnectionTermination::PeerClosed
-                );
-                readiness.close();
-                publisher
-                    .join()
-                    .expect("broker readiness publisher panicked")
-                    .expect("broker readiness publication failed");
-                close_object_count_tx
-                    .send(close_object_count)
-                    .expect("failed to report broker close-object count");
+                });
+            } else {
+                for _ in 0..connection_count {
+                    let (control_stream, _) = control_listener
+                        .accept()
+                        .expect("failed to accept broker local control connection");
+                    serve_connection(control_stream, close_object_count_tx.clone());
+                }
             }
         }));
         let _ = std::fs::remove_file(&server_control_socket_path);
@@ -471,6 +427,90 @@ fn spawn_test_broker(
         close_object_count_rx,
         control_socket_path: cleanup_control_socket_path,
     }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn run_test_broker_connection(
+    broker: &litebox_broker_core::BrokerCore,
+    control_stream: std::os::unix::net::UnixStream,
+    close_object_count_tx: std::sync::mpsc::Sender<usize>,
+) {
+    let shared_memory = litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create(
+        litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
+    )
+    .expect("failed to create broker test shared memory");
+    let shared_buffers = litebox_broker_transport::shared_memory::SharedBufferPool::new(
+        shared_memory,
+        litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT,
+    )
+    .expect("failed to attach broker test shared-buffer layout");
+    let control_memory =
+        litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create_control_ring()
+            .expect("failed to create broker test control ring");
+    let control_ring = litebox_broker_transport::control_ring::ControlRing::new(control_memory)
+        .expect("failed to attach broker test control ring");
+    let setup_deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
+    let mut channel =
+        litebox_broker_transport_linux_userland::unix_socket::UnixStreamHostSetupChannel::from_host_guaranteed(
+            control_stream,
+            setup_deadline,
+        );
+    let readiness =
+        std::sync::Arc::new(litebox_broker_userland::readiness::ReadinessPublisherRuntime::new());
+    let association = litebox_broker_host::setup_connection(
+        broker,
+        &mut channel,
+        &shared_buffers,
+        readiness.clone(),
+        |channel| {
+            channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
+            channel.send_memfd(control_ring.memory(), Some(setup_deadline))
+        },
+    )
+    .expect("broker host setup failed")
+    .expect("broker setup terminated before activation");
+    let (mut request_source, response_sink, mut notifications, _shutdown) = channel
+        .into_active(control_ring)
+        .expect("failed to activate broker test control ring");
+    let publisher_readiness = readiness.clone();
+    let publisher = std::thread::spawn(move || publisher_readiness.run(&mut notifications));
+    let mut close_object_count = 0;
+    let termination = loop {
+        match request_source
+            .recv_request()
+            .expect("failed to receive broker test request")
+        {
+            litebox_broker_transport::channel::HostReceive::Message(request) => {
+                if matches!(
+                    &request.operation,
+                    litebox_broker_protocol::message::BrokerOperation::CloseObject(_)
+                ) {
+                    close_object_count += 1;
+                }
+                association
+                    .execute_request(request, |response| response_sink.send_response(response))
+                    .expect("failed to execute broker test request");
+            }
+            litebox_broker_transport::channel::HostReceive::PeerClosed => {
+                break litebox_broker_host::ConnectionTermination::PeerClosed;
+            }
+            litebox_broker_transport::channel::HostReceive::ProtocolViolation => {
+                break litebox_broker_host::ConnectionTermination::ProtocolViolation;
+            }
+        }
+    };
+    assert_eq!(
+        termination,
+        litebox_broker_host::ConnectionTermination::PeerClosed
+    );
+    readiness.close();
+    publisher
+        .join()
+        .expect("broker readiness publisher panicked")
+        .expect("broker readiness publication failed");
+    close_object_count_tx
+        .send(close_object_count)
+        .expect("failed to report broker close-object count");
 }
 
 // TODO: un-gate when an AArch64 broker exists.
@@ -727,6 +767,81 @@ fn test_runner_broker_udp_with_rewriter() {
     assert_eq!(broker.next_close_object_count(), 3);
     broker.join();
     server.join().unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_broker_udp_namespace_routes_across_sessions() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::process::Stdio;
+
+    let target = common::compile(
+        "./tests/udp_broker_namespace.c",
+        "broker_udp_namespace_rewriter",
+        false,
+        false,
+    );
+    let control_socket_path = unique_test_socket_path("runner-broker-udp-namespace-control");
+    let broker = spawn_concurrent_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
+        2,
+    );
+    let mut server = Runner::new(&target, "broker_udp_namespace_server_rewriter")
+        .arg("server")
+        .broker_socket(&control_socket_path)
+        .spawn_with_stdio(Stdio::piped(), Stdio::piped(), Stdio::inherit());
+    let stdout = server.stdout.take().unwrap();
+    let (line_sender, line_receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line_sender.send(line.unwrap()).is_err() {
+                return;
+            }
+        }
+    });
+    let listen = line_receiver
+        .recv_timeout(BROKER_HELPER_TIMEOUT)
+        .expect("timed out waiting for broker UDP server");
+    let port = listen
+        .strip_prefix("LISTEN ")
+        .expect("unexpected broker UDP server output")
+        .parse::<u16>()
+        .unwrap();
+    assert_ne!(port, 0);
+
+    Runner::new(&target, "broker_udp_namespace_client_rewriter")
+        .arg("client")
+        .arg(port.to_string())
+        .broker_socket(&control_socket_path)
+        .run();
+    server
+        .stdin
+        .take()
+        .expect("broker UDP server stdin missing")
+        .write_all(&[1])
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
+    let status = loop {
+        if let Some(status) = server.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            server.kill().unwrap();
+            let _ = server.wait();
+            panic!("broker UDP server guest did not exit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    reader.join().unwrap();
+    assert!(status.success(), "broker UDP server guest failed: {status}");
+    assert_eq!(broker.next_close_object_count(), 1);
+    assert_eq!(broker.next_close_object_count(), 1);
+    broker.join();
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
