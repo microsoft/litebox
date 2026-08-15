@@ -9164,10 +9164,15 @@ mod tests {
         handle: ObjectHandle,
         readiness: ReadinessFlags,
     ) {
-        if session.check_readiness(handle).unwrap().contains(readiness) {
-            return;
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        loop {
+            if session.check_readiness(handle).unwrap().contains(readiness) {
+                return;
+            }
+            // Notifications are wake hints and may be stale by the time the
+            // test receives them; readiness is authoritative.
+            wait_for_readiness_until(publications, handle, readiness, deadline);
         }
-        wait_for_readiness(publications, handle, readiness);
     }
 
     fn wait_for_readiness_until(
