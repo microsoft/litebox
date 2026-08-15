@@ -190,6 +190,13 @@ pub trait SocketProvider: Send + Sync {
 /// The broker retains this resource in an `Arc`, allowing an operation already
 /// in flight to finish after its object handle closes. Before releasing its
 /// portable authority, core explicitly retires the platform socket.
+///
+/// Implementations own their authoritative native lifecycle state. A request
+/// handler must record the start of a native transition before issuing it, and
+/// the corresponding synchronous result or asynchronous completion handler
+/// must finish that transition. [`status`](PlatformSocket::status) projects
+/// that platform-owned state for the guest; core may cache the projection but
+/// does not drive native teardown from it.
 pub trait PlatformSocket: Send + Sync {
     /// Binds this socket to a local address and echoes the assigned address.
     ///
@@ -216,7 +223,10 @@ pub trait PlatformSocket: Send + Sync {
     /// permits replacing its peer and treats synchronous failures as retryable
     /// operation outcomes. A datagram `Failed` status must leave the previous
     /// peer unchanged. Platform failures must distinguish a peer known to be
-    /// unchanged from one whose state is indeterminate.
+    /// unchanged from one whose state is indeterminate. Once a native connect
+    /// may have started, implementations must retain enough platform state to
+    /// settle or conservatively retire it without reconstructing its lifecycle
+    /// during teardown.
     fn connect(
         &self,
         address: SocketAddrV4,
