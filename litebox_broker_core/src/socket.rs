@@ -323,14 +323,14 @@ pub trait PlatformSocket: Send + Sync {
     /// Reads a typed TCP socket option.
     fn get_tcp_option(&self, name: TcpOptionName) -> Result<TcpOptionValue>;
 
-    /// Returns the authoritative platform status and consumes at most one
-    /// pending error.
+    /// Returns platform-observed socket state and consumes at most one pending
+    /// error.
     ///
-    /// Stream sockets with an attempted connection return `Connecting`,
-    /// `Connected`, or `Failed`. Datagram sockets return `Unconnected` or
-    /// `Connected` and may change between those states through peer updates.
-    /// A datagram platform may specialize the local IP address after external
-    /// routing, but it must preserve the broker-reserved local port.
+    /// For stream sockets, this advances an asynchronous connection attempt
+    /// from `Connecting` to `Connected` or `Failed`. For datagram sockets, the
+    /// broker owns the peer state; the platform reports pending asynchronous
+    /// errors and may specialize the local IP address after external routing,
+    /// but it must preserve the broker-reserved local port.
     fn status(&self) -> Result<SocketStatusResponse>;
 
     /// Synchronously and idempotently ends this socket's platform authority.
@@ -1083,17 +1083,91 @@ pub fn shutdown(
     outcome
 }
 
-/// Returns broker-authoritative socket status and consumes at most one pending
+/// Returns broker-authoritative socket state and consumes at most one pending
 /// asynchronous error.
+///
+/// Stream status reconciles an asynchronous platform connection attempt.
+/// Datagram connects complete synchronously and may replace the peer, so
+/// datagram status preserves the broker-owned connection state while querying
+/// the platform only for pending errors and local-address specialization.
 pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketStatusResponse> {
     let object = session.authorized_object(handle, ObjectRights::WAIT)?;
+    let datagram = {
+        let object = object.read();
+        let ObjectEntry::Socket(socket) = &*object else {
+            return Err(BrokerError::InvalidRights);
+        };
+        is_udp(socket.create_request)
+    };
+
+    if datagram {
+        datagram_status(&object)
+    } else {
+        stream_status(&object)
+    }
+}
+
+/// Reconciles broker stream state with an asynchronous platform connection.
+fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusResponse> {
+    let (resource, status, local_address, connect_in_flight) = {
+        let object = object.read();
+        let ObjectEntry::Socket(socket) = &*object else {
+            return Err(BrokerError::InvalidRights);
+        };
+        (
+            Arc::clone(&socket.resource),
+            socket.connection_status,
+            socket.local_address,
+            socket.connect_in_flight,
+        )
+    };
+    if connect_in_flight {
+        return Ok(SocketStatusResponse {
+            status: SocketConnectionStatus::Connecting,
+            local_address: None,
+            pending_error: None,
+        });
+    }
+    if matches!(
+        status,
+        SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_)
+    ) {
+        return Ok(SocketStatusResponse {
+            status,
+            local_address,
+            pending_error: None,
+        });
+    }
+
+    let mut response = resource.status()?;
+    let mut object = object.write();
+    let ObjectEntry::Socket(socket) = &mut *object else {
+        return Err(BrokerError::InvalidRights);
+    };
+    if socket.connection_status == SocketConnectionStatus::Connecting
+        && response.status == SocketConnectionStatus::Unconnected
+    {
+        return Err(BrokerError::Internal);
+    }
+    socket.local_address = socket.local_address.or(response.local_address);
+    response.local_address = socket.local_address;
+    if socket.connection_status == SocketConnectionStatus::Connecting {
+        socket.connection_status = response.status;
+    } else {
+        // Another status call reached a terminal state while this platform query was in flight.
+        response.status = socket.connection_status;
+    }
+    Ok(response)
+}
+
+/// Queries datagram errors and address refinement without surrendering the
+/// broker-owned peer state to a potentially stale platform snapshot.
+fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusResponse> {
     let (
         resource,
-        create_request,
         status,
         local_address,
         configuration_in_flight,
-        connect_in_flight,
         datagram_connect_generation,
         platform_state,
     ) = {
@@ -1103,39 +1177,14 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
         };
         (
             Arc::clone(&socket.resource),
-            socket.create_request,
             socket.connection_status,
             socket.local_address,
             socket.configuration_in_flight,
-            socket.connect_in_flight,
             socket.datagram_connect_generation,
             socket.platform_state,
         )
     };
-    if configuration_in_flight && is_udp(create_request) {
-        return Ok(SocketStatusResponse {
-            status,
-            local_address,
-            pending_error: None,
-        });
-    }
-    if connect_in_flight {
-        return Ok(SocketStatusResponse {
-            status: SocketConnectionStatus::Connecting,
-            local_address: None,
-            pending_error: None,
-        });
-    }
-    if matches!(status, SocketConnectionStatus::Unconnected) && !is_udp(create_request) {
-        return Ok(SocketStatusResponse {
-            status,
-            local_address,
-            pending_error: None,
-        });
-    }
-    if matches!(status, SocketConnectionStatus::Failed(_))
-        && (!is_udp(create_request) || platform_state == PlatformSocketState::Retired)
-    {
+    if configuration_in_flight || platform_state == PlatformSocketState::Retired {
         return Ok(SocketStatusResponse {
             status,
             local_address,
@@ -1146,18 +1195,23 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
     let mut retried_datagram_status = false;
     let mut pending_error = None;
     loop {
-        if is_udp(create_request) {
+        let (platform_state, status, local_address) = {
             let object = object.read();
             let ObjectEntry::Socket(socket) = &*object else {
                 return Err(BrokerError::InvalidRights);
             };
-            if socket.platform_state == PlatformSocketState::Retired {
-                return Ok(SocketStatusResponse {
-                    status: socket.connection_status,
-                    local_address: socket.local_address,
-                    pending_error: None,
-                });
-            }
+            (
+                socket.platform_state,
+                socket.connection_status,
+                socket.local_address,
+            )
+        };
+        if platform_state == PlatformSocketState::Retired {
+            return Ok(SocketStatusResponse {
+                status,
+                local_address,
+                pending_error: None,
+            });
         }
         let mut response = resource.status()?;
         pending_error = pending_error.or(response.pending_error);
@@ -1165,76 +1219,58 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
-        if is_udp(socket.create_request) {
-            if socket.platform_state == PlatformSocketState::Retired {
-                response.status = socket.connection_status;
-                response.local_address = socket.local_address;
-                response.pending_error = None;
-                return Ok(response);
-            }
-            if socket.configuration_in_flight {
-                response.status = socket.connection_status;
-                response.local_address = socket.local_address;
-                response.pending_error = pending_error;
-                return Ok(response);
-            }
-            let invalid_local_address = match (socket.local_address, response.local_address) {
-                (None, Some(_)) => true,
-                (Some(reserved), Some(platform)) => reserved.port() != platform.port(),
-                _ => false,
-            };
-            if invalid_local_address {
-                socket.configuration_in_flight = false;
-                socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-                socket.datagram_connect_generation =
-                    socket.datagram_connect_generation.wrapping_add(1);
-                socket.platform_state = PlatformSocketState::Retired;
-                drop(object);
-                resource.retire();
-                return Err(BrokerError::Internal);
-            }
-            if matches!(
-                response.status,
-                SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
-            ) {
-                return Err(BrokerError::Internal);
-            }
-            if socket.datagram_connect_generation != expected_datagram_generation {
-                if !retried_datagram_status && pending_error.is_none() {
-                    expected_datagram_generation = socket.datagram_connect_generation;
-                    retried_datagram_status = true;
-                    drop(object);
-                    continue;
-                }
-                // Continuous peer replacement can race both bounded queries.
-                // Do not let an unordered platform snapshot overwrite newer
-                // broker observations.
-                response.status = socket.connection_status;
-                socket.local_address = socket.local_address.or(response.local_address);
-                response.local_address = socket.local_address;
-                response.pending_error = pending_error;
-                return Ok(response);
-            }
-        } else if socket.connection_status == SocketConnectionStatus::Connecting
-            && response.status == SocketConnectionStatus::Unconnected
-        {
+        if socket.platform_state == PlatformSocketState::Retired {
+            response.status = socket.connection_status;
+            response.local_address = socket.local_address;
+            response.pending_error = None;
+            return Ok(response);
+        }
+        if socket.configuration_in_flight {
+            response.status = socket.connection_status;
+            response.local_address = socket.local_address;
+            response.pending_error = pending_error;
+            return Ok(response);
+        }
+        let invalid_local_address = match (socket.local_address, response.local_address) {
+            (None, Some(_)) => true,
+            (Some(reserved), Some(platform)) => reserved.port() != platform.port(),
+            _ => false,
+        };
+        if invalid_local_address {
+            socket.configuration_in_flight = false;
+            socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+            socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
+            socket.platform_state = PlatformSocketState::Retired;
+            drop(object);
+            resource.retire();
             return Err(BrokerError::Internal);
         }
-        socket.local_address = if is_udp(socket.create_request) {
-            response.local_address.or(socket.local_address)
-        } else {
-            socket.local_address.or(response.local_address)
-        };
+        if matches!(
+            response.status,
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
+        ) {
+            return Err(BrokerError::Internal);
+        }
+        if socket.datagram_connect_generation != expected_datagram_generation {
+            if !retried_datagram_status && pending_error.is_none() {
+                expected_datagram_generation = socket.datagram_connect_generation;
+                retried_datagram_status = true;
+                drop(object);
+                continue;
+            }
+            // Continuous peer replacement can race both bounded queries.
+            // Do not let an unordered platform snapshot overwrite newer
+            // broker observations.
+            response.status = socket.connection_status;
+            socket.local_address = socket.local_address.or(response.local_address);
+            response.local_address = socket.local_address;
+            response.pending_error = pending_error;
+            return Ok(response);
+        }
+        socket.local_address = response.local_address.or(socket.local_address);
         response.local_address = socket.local_address;
         response.pending_error = pending_error;
-        if is_udp(socket.create_request) {
-            response.status = socket.connection_status;
-        } else if socket.connection_status == SocketConnectionStatus::Connecting {
-            socket.connection_status = response.status;
-        } else {
-            // Another status call reached a terminal state while this platform query was in flight.
-            response.status = socket.connection_status;
-        }
+        response.status = socket.connection_status;
         return Ok(response);
     }
 }
