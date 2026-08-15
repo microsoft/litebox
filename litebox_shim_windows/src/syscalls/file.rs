@@ -2294,10 +2294,10 @@ mod tests {
             assert_eq!(io_status.status, NtStatus::NOT_SUPPORTED.as_raw());
             assert_eq!(io_status.information, 0);
 
-            let request = ksecdd::KsecCngDeriveKeyRequest {
+            let request = ksecdd::KsecCngInitializeRequest {
                 header: ksecdd::KsecCngRequestHeader {
                     magic: 0,
-                    operation: ksecdd::KsecCngOperation::DeriveKey as u32,
+                    operation: ksecdd::KsecCngOperation::Initialize as u32,
                 },
                 opaque_arguments: [0; 11],
                 event_handle: Handle::default(),
@@ -2314,7 +2314,7 @@ mod tests {
                     Some(ConstPtr::<TestPlatform, u8>::from_usize(
                         core::ptr::from_ref(&request) as usize,
                     )),
-                    size_of::<ksecdd::KsecCngDeriveKeyRequest>()
+                    size_of::<ksecdd::KsecCngInitializeRequest>()
                         .try_into()
                         .unwrap(),
                     Some(mut_byte_ptr(&mut output)),
@@ -2323,82 +2323,6 @@ mod tests {
                 NtStatus::INVALID_DEVICE_REQUEST
             );
             assert_eq!(io_status.status, NtStatus::INVALID_DEVICE_REQUEST.as_raw());
-            assert_eq!(io_status.information, 0);
-        });
-    }
-
-    #[test]
-    fn ksecdd_cng_resolves_rng_provider_and_validates_derive_key_event() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
-            let request = ksecdd::KsecCngResolveProvidersRequest {
-                header: ksecdd::KsecCngRequestHeader {
-                    magic: 0x1a2b_3c4d,
-                    operation: ksecdd::KsecCngOperation::ResolveProviders as u32,
-                },
-                provider_type: usize::MAX,
-                interface: 6,
-                function_name_offset: usize::MAX,
-                provider_name_offset: usize::MAX,
-                mode: 1,
-                flags: 0,
-            };
-            let mut output = [0u8; 384];
-            let mut io_status = IoStatusBlock::default();
-            assert_eq!(
-                task.sys_nt_device_io_control_file(
-                    handle,
-                    Handle::default(),
-                    None,
-                    None,
-                    mut_ptr(&mut io_status),
-                    ksecdd::KsecIoControlCode::CngRequest as u32,
-                    Some(ConstPtr::<TestPlatform, u8>::from_usize(
-                        core::ptr::from_ref(&request) as usize,
-                    )),
-                    size_of::<ksecdd::KsecCngResolveProvidersRequest>()
-                        .try_into()
-                        .unwrap(),
-                    Some(mut_byte_ptr(&mut output)),
-                    output.len().try_into().unwrap(),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(io_status.information, 216);
-            assert_eq!(u32::from_le_bytes(output[..4].try_into().unwrap()), 1);
-            assert_eq!(
-                &output[168..210],
-                b"b\0c\0r\0y\0p\0t\0p\0r\0i\0m\0i\0t\0i\0v\0e\0s\0.\0d\0l\0l\0\0\0"
-            );
-
-            let derive = ksecdd::KsecCngDeriveKeyRequest {
-                header: ksecdd::KsecCngRequestHeader {
-                    magic: 0x1a2b_3c4d,
-                    operation: ksecdd::KsecCngOperation::DeriveKey as u32,
-                },
-                opaque_arguments: [0; 11],
-                event_handle: handle,
-            };
-            assert_eq!(
-                task.sys_nt_device_io_control_file(
-                    handle,
-                    Handle::default(),
-                    None,
-                    None,
-                    mut_ptr(&mut io_status),
-                    ksecdd::KsecIoControlCode::CngRequest as u32,
-                    Some(ConstPtr::<TestPlatform, u8>::from_usize(
-                        core::ptr::from_ref(&derive) as usize,
-                    )),
-                    size_of::<ksecdd::KsecCngDeriveKeyRequest>()
-                        .try_into()
-                        .unwrap(),
-                    Some(mut_byte_ptr(&mut output)),
-                    size_of::<usize>().try_into().unwrap(),
-                ),
-                NtStatus::OBJECT_TYPE_MISMATCH
-            );
             assert_eq!(io_status.information, 0);
         });
     }

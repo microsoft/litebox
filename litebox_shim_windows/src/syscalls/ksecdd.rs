@@ -27,7 +27,7 @@ pub(crate) enum KsecIoControlCode {
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
 pub(crate) enum KsecCngOperation {
-    DeriveKey = 0x0001_0500,
+    Initialize = 0x0001_0500,
     ResolveProviders = 0x0002_0000,
 }
 
@@ -56,7 +56,7 @@ pub(crate) struct KsecCngRequestHeader {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable)]
-pub(crate) struct KsecCngDeriveKeyRequest {
+pub(crate) struct KsecCngInitializeRequest {
     pub(crate) header: KsecCngRequestHeader,
     // TODO(ksecdd-cng): Name these operation-specific arguments.
     pub(crate) opaque_arguments: [usize; 11],
@@ -200,7 +200,7 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
             };
 
             match operation {
-                KsecCngOperation::DeriveKey => handle_cng_derive_key::<Platform>(
+                KsecCngOperation::Initialize => handle_cng_initialize::<Platform>(
                     io_status_block,
                     input_buffer,
                     input_length,
@@ -220,7 +220,7 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
     }
 }
 
-fn handle_cng_derive_key<Platform: crate::ShimPlatform>(
+fn handle_cng_initialize<Platform: crate::ShimPlatform>(
     io_status_block: MutPtr<Platform, IoStatusBlock>,
     input_buffer: ConstPtr<Platform, u8>,
     input_length: usize,
@@ -228,7 +228,7 @@ fn handle_cng_derive_key<Platform: crate::ShimPlatform>(
     output_length: usize,
     validate_event: impl FnOnce(Handle) -> Result<(), NtStatus>,
 ) -> NtStatus {
-    if input_length != size_of::<KsecCngDeriveKeyRequest>() {
+    if input_length != size_of::<KsecCngInitializeRequest>() {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::INFO_LENGTH_MISMATCH, 0);
     }
     if output_length != size_of::<usize>() {
@@ -241,15 +241,14 @@ fn handle_cng_derive_key<Platform: crate::ShimPlatform>(
         return complete_ioctl::<Platform>(io_status_block, status, 0);
     }
     let request =
-        ConstPtr::<Platform, KsecCngDeriveKeyRequest>::from_usize(input_buffer.as_usize());
+        ConstPtr::<Platform, KsecCngInitializeRequest>::from_usize(input_buffer.as_usize());
     let Some(request) = request.read_at_offset(0) else {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
     };
     if let Err(status) = validate_event(request.event_handle) {
         return complete_ioctl::<Platform>(io_status_block, status, 0);
     }
-    // TODO(ksecdd-cng): Implement key derivation when a guest exercises more than this
-    // initialization-time capability request.
+    // The observed CNG initialization request only requires validating its event handle.
     complete_ioctl::<Platform>(io_status_block, NtStatus::SUCCESS, 0)
 }
 
