@@ -149,8 +149,7 @@ pub(crate) enum FileDeviceObject {
         root_path: String,
     },
     ConsoleDriver,
-    /// The kernel security device (`\Device\KsecDD`). CNG's `bcrypt.dll` opens this
-    /// during its `DllMain` to seed its user-mode PRNG via `NtDeviceIoControlFile`.
+    /// The kernel security device (`\Device\KsecDD`).
     KsecDevice,
 }
 

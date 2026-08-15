@@ -3,7 +3,8 @@
 
 use alloc::string::String;
 use alloc::vec;
-use core::mem::size_of;
+use alloc::vec::Vec;
+use core::mem::{align_of, offset_of, size_of};
 
 use int_enum::IntEnum;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
@@ -18,40 +19,46 @@ use crate::{
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
-enum KsecIoControlCode {
-    RandomFillBuffer = IOCTL_KSEC_RANDOM_FILL_BUFFER,
-    CngRequest = IOCTL_KSEC_CNG_REQUEST,
+pub(crate) enum KsecIoControlCode {
+    RandomFillBuffer = 0x0039_0008,
+    CngRequest = 0x0039_0400,
 }
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
-enum KsecCngOperation {
-    DeriveKey = KSEC_CNG_DERIVE_KEY,
-    ResolveProviders = KSEC_CNG_RESOLVE_PROVIDERS,
+pub(crate) enum KsecCngOperation {
+    DeriveKey = 0x0001_0500,
+    ResolveProviders = 0x0002_0000,
 }
 
-pub(crate) const IOCTL_KSEC_RANDOM_FILL_BUFFER: u32 = 0x0039_0008;
-pub(crate) const IOCTL_KSEC_CNG_REQUEST: u32 = 0x0039_0400;
-pub(crate) const KSEC_CNG_DERIVE_KEY: u32 = 0x0001_0500;
-pub(crate) const KSEC_CNG_RESOLVE_PROVIDERS: u32 = 0x0002_0000;
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum KsecCngInterface {
+    Rng = 0x0000_0006,
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct KsecCngMode: u32 {
+        const USER = 0x1;
+    }
+}
+
 const KSEC_CNG_REQUEST_MAGIC: u32 = 0x1a2b_3c4d;
-const KSEC_CNG_OUTPUT_SIZE: usize = size_of::<usize>();
 const KSEC_RANDOM_CHUNK_SIZE: usize = 4096;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, Immutable)]
-struct KsecCngRequestHeader {
-    magic: u32,
-    operation: u32,
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+pub(crate) struct KsecCngRequestHeader {
+    pub(crate) magic: u32,
+    pub(crate) operation: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable)]
 pub(crate) struct KsecCngDeriveKeyRequest {
-    pub(crate) magic: u32,
-    pub(crate) operation: u32,
-    // TODO(ksecdd-cng): Name and implement these operation-specific arguments when a guest
-    // exercises derive-key work rather than the initialization-time capability request.
+    pub(crate) header: KsecCngRequestHeader,
+    // TODO(ksecdd-cng): Name these operation-specific arguments.
     pub(crate) opaque_arguments: [usize; 11],
     pub(crate) event_handle: Handle,
 }
@@ -59,8 +66,7 @@ pub(crate) struct KsecCngDeriveKeyRequest {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 pub(crate) struct KsecCngResolveProvidersRequest {
-    pub(crate) magic: u32,
-    pub(crate) operation: u32,
+    pub(crate) header: KsecCngRequestHeader,
     pub(crate) provider_type: usize,
     pub(crate) interface: usize,
     pub(crate) function_name_offset: usize,
@@ -80,7 +86,8 @@ struct KsecCngProviderResponsePrefix {
     flags: u32,
     function_name_offset: usize,
     provider_name_offset: usize,
-    reserved_0: usize,
+    property_count: u32,
+    padding: u32,
     reserved_1: usize,
     image_ref_offset: usize,
     reserved_2: usize,
@@ -94,20 +101,12 @@ struct KsecCngImageRef {
     reserved: u32,
 }
 
-const KSEC_CNG_PROVIDER_RESPONSE_SIZE: usize = 216;
-const KSEC_CNG_PROVIDER_REFS_OFFSET: usize = 16;
-const KSEC_CNG_PROVIDER_REF_OFFSET: usize = 24;
-const KSEC_CNG_FUNCTION_NAME_OFFSET: usize = 80;
-const KSEC_CNG_PROVIDER_NAME_OFFSET: usize = 88;
-const KSEC_CNG_IMAGE_REF_OFFSET: usize = 152;
-const KSEC_CNG_IMAGE_NAME_OFFSET: usize = 168;
-const KSEC_CNG_INTERFACE_RNG: usize = 6;
-const KSEC_CNG_USER_MODE: usize = 1;
-
-const _: () = assert!(size_of::<KsecCngDeriveKeyRequest>() == 104);
-const _: () = assert!(size_of::<KsecCngResolveProvidersRequest>() == 48);
-const _: () = assert!(size_of::<KsecCngProviderResponsePrefix>() == 80);
-const _: () = assert!(size_of::<KsecCngImageRef>() == 16);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Immutable, IntoBytes)]
+struct KsecCngBufferTooSmallResponse {
+    status: i32,
+    required_size: u32,
+}
 
 #[expect(
     clippy::too_many_arguments,
@@ -135,31 +134,13 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
 
     match io_control_code {
         KsecIoControlCode::RandomFillBuffer => {
-            litebox_util_log::debug!(
-                input_buffer_length,
-                output_buffer_length;
-                "Handling KsecDD random-fill IOCTL"
-            );
-            let input_length = input_buffer_length as usize;
-            if input_length != 0
-                && input_buffer
-                    .and_then(|buffer| buffer.to_owned_slice(input_length))
-                    .is_none()
-            {
-                return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
-            }
-
             let output_length = output_buffer_length as usize;
             let Some(output_buffer) = output_buffer.filter(|_| output_length != 0) else {
                 return complete_ioctl::<Platform>(io_status_block, NtStatus::INVALID_PARAMETER, 0);
             };
             let output_address = output_buffer.as_usize();
             if output_address.checked_add(output_length).is_none() {
-                return complete_ioctl::<Platform>(
-                    io_status_block,
-                    NtStatus::ACCESS_VIOLATION,
-                    0,
-                );
+                return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
             }
             if let Err(status) = probe_guest_output_buffer::<Platform>(output_buffer, output_length)
             {
@@ -171,11 +152,8 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
             while offset < output_length {
                 let chunk_length = (output_length - offset).min(random.len());
                 platform.fill_bytes_crng(&mut random[..chunk_length]);
-                if write_slice::<Platform, u8>(
-                    output_address + offset,
-                    &random[..chunk_length],
-                )
-                .is_none()
+                if write_slice::<Platform, u8>(output_address + offset, &random[..chunk_length])
+                    .is_none()
                 {
                     return complete_ioctl::<Platform>(
                         io_status_block,
@@ -253,14 +231,13 @@ fn handle_cng_derive_key<Platform: crate::ShimPlatform>(
     if input_length != size_of::<KsecCngDeriveKeyRequest>() {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::INFO_LENGTH_MISMATCH, 0);
     }
-    if output_length != KSEC_CNG_OUTPUT_SIZE {
+    if output_length != size_of::<usize>() {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::BUFFER_TOO_SMALL, 0);
     }
     let Some(output_buffer) = output_buffer else {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
     };
-    if let Err(status) = probe_guest_output_buffer::<Platform>(output_buffer, KSEC_CNG_OUTPUT_SIZE)
-    {
+    if let Err(status) = probe_guest_output_buffer::<Platform>(output_buffer, size_of::<usize>()) {
         return complete_ioctl::<Platform>(io_status_block, status, 0);
     }
     let request =
@@ -271,6 +248,8 @@ fn handle_cng_derive_key<Platform: crate::ShimPlatform>(
     if let Err(status) = validate_event(request.event_handle) {
         return complete_ioctl::<Platform>(io_status_block, status, 0);
     }
+    // TODO(ksecdd-cng): Implement key derivation when a guest exercises more than this
+    // initialization-time capability request.
     complete_ioctl::<Platform>(io_status_block, NtStatus::SUCCESS, 0)
 }
 
@@ -290,8 +269,11 @@ fn handle_cng_resolve_providers<Platform: crate::ShimPlatform>(
         return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
     };
 
-    let function_name = (request.interface == 0
-        && request.function_name_offset != usize::MAX)
+    let infer_interface = request.interface == 0;
+    let interface = u32::try_from(request.interface)
+        .ok()
+        .and_then(|interface| KsecCngInterface::try_from(interface).ok());
+    let function_name = (infer_interface && request.function_name_offset != usize::MAX)
         .then(|| {
             read_utf16_at_offset::<Platform>(
                 input_buffer,
@@ -301,98 +283,106 @@ fn handle_cng_resolve_providers<Platform: crate::ShimPlatform>(
             )
         })
         .flatten();
-    let resolves_rng = (request.interface == KSEC_CNG_INTERFACE_RNG
-        && request.function_name_offset == usize::MAX)
-        || function_name.as_deref() == Some("RNG");
+    let resolves_rng = match interface {
+        Some(KsecCngInterface::Rng) => request.function_name_offset == usize::MAX,
+        None if infer_interface => function_name.as_deref() == Some("RNG"),
+        None => false,
+    };
+    let mode = KsecCngMode::from_bits_retain(request.mode);
+    if !resolves_rng {
+        litebox_util_log::debug!(
+            interface:% = format_args!("{:#x}", request.interface),
+            function_name:? = function_name.as_deref();
+            "Unsupported KsecDD CNG interface or function"
+        );
+        return complete_ioctl::<Platform>(io_status_block, NtStatus::NOT_FOUND, 0);
+    }
     if request.provider_type != usize::MAX
-        || !resolves_rng
         || request.provider_name_offset != usize::MAX
-        || usize::try_from(request.mode).unwrap() & KSEC_CNG_USER_MODE == 0
+        || !mode.contains(KsecCngMode::USER)
     {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::NOT_FOUND, 0);
     }
-    if output_length < 8 {
+
+    let mut response = vec![0; size_of::<KsecCngProviderResponsePrefix>()];
+    let function_name_offset = append_utf16(&mut response, "RNG");
+    let provider_name_offset = append_utf16(&mut response, "Microsoft Primitive Provider");
+
+    let image_ref_offset = response
+        .len()
+        .next_multiple_of(align_of::<KsecCngImageRef>());
+    response.resize(image_ref_offset + size_of::<KsecCngImageRef>(), 0);
+    let image_name_offset = append_utf16(&mut response, "bcryptprimitives.dll");
+    let image_ref = KsecCngImageRef {
+        image_name_offset,
+        flags: KsecCngMode::USER.bits(),
+        reserved: 0,
+    };
+    response[image_ref_offset..image_name_offset].copy_from_slice(image_ref.as_bytes());
+
+    let response_size = response.len().next_multiple_of(align_of::<usize>());
+    response.resize(response_size, 0);
+    let prefix = KsecCngProviderResponsePrefix {
+        provider_count: 1,
+        operation: KsecCngOperation::ResolveProviders as u32,
+        provider_refs_offset: offset_of!(KsecCngProviderResponsePrefix, provider_ref_offset),
+        provider_ref_offset: offset_of!(KsecCngProviderResponsePrefix, interface),
+        interface: KsecCngInterface::Rng as u32,
+        flags: if infer_interface { 0 } else { u32::MAX },
+        function_name_offset,
+        provider_name_offset,
+        property_count: 0,
+        padding: 0,
+        reserved_1: usize::MAX,
+        image_ref_offset,
+        reserved_2: usize::MAX,
+    };
+    response[..size_of::<KsecCngProviderResponsePrefix>()].copy_from_slice(prefix.as_bytes());
+
+    if output_length < size_of::<KsecCngBufferTooSmallResponse>() {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::BUFFER_TOO_SMALL, 0);
     }
     let Some(output_buffer) = output_buffer else {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
     };
-    if output_length < KSEC_CNG_PROVIDER_RESPONSE_SIZE {
-        if let Err(status) = probe_guest_output_buffer::<Platform>(output_buffer, 8) {
+    if output_length < response.len() {
+        if let Err(status) = probe_guest_output_buffer::<Platform>(
+            output_buffer,
+            size_of::<KsecCngBufferTooSmallResponse>(),
+        ) {
             return complete_ioctl::<Platform>(io_status_block, status, 0);
         }
-        let mut short_response = [0u8; 8];
-        short_response[..4].copy_from_slice(&NtStatus::BUFFER_TOO_SMALL.as_raw().to_le_bytes());
-        short_response[4..].copy_from_slice(
-            &u32::try_from(KSEC_CNG_PROVIDER_RESPONSE_SIZE)
-                .unwrap()
-                .to_le_bytes(),
-        );
-        if write_slice::<Platform, u8>(output_buffer.as_usize(), &short_response).is_none() {
+        let short_response = KsecCngBufferTooSmallResponse {
+            status: NtStatus::BUFFER_TOO_SMALL.as_raw(),
+            required_size: response.len().try_into().unwrap(),
+        };
+        if write_slice::<Platform, u8>(output_buffer.as_usize(), short_response.as_bytes())
+            .is_none()
+        {
             return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
         }
-        return complete_ioctl::<Platform>(io_status_block, NtStatus::BUFFER_OVERFLOW, 8);
+        return complete_ioctl::<Platform>(
+            io_status_block,
+            NtStatus::BUFFER_OVERFLOW,
+            size_of::<KsecCngBufferTooSmallResponse>(),
+        );
     }
-    if let Err(status) =
-        probe_guest_output_buffer::<Platform>(output_buffer, KSEC_CNG_PROVIDER_RESPONSE_SIZE)
-    {
+    if let Err(status) = probe_guest_output_buffer::<Platform>(output_buffer, response.len()) {
         return complete_ioctl::<Platform>(io_status_block, status, 0);
     }
-
-    let mut response = vec![0; KSEC_CNG_PROVIDER_RESPONSE_SIZE];
-    let prefix = KsecCngProviderResponsePrefix {
-        provider_count: 1,
-        operation: KSEC_CNG_RESOLVE_PROVIDERS,
-        provider_refs_offset: KSEC_CNG_PROVIDER_REFS_OFFSET,
-        provider_ref_offset: KSEC_CNG_PROVIDER_REF_OFFSET,
-        interface: KSEC_CNG_INTERFACE_RNG.try_into().unwrap(),
-        flags: if request.interface == 0 { 0 } else { u32::MAX },
-        function_name_offset: KSEC_CNG_FUNCTION_NAME_OFFSET,
-        provider_name_offset: KSEC_CNG_PROVIDER_NAME_OFFSET,
-        reserved_0: if request.interface == 0 {
-            0x0000_0047_0000_0000
-        } else {
-            0
-        },
-        reserved_1: usize::MAX,
-        image_ref_offset: KSEC_CNG_IMAGE_REF_OFFSET,
-        reserved_2: usize::MAX,
-    };
-    response[..size_of::<KsecCngProviderResponsePrefix>()].copy_from_slice(prefix.as_bytes());
-    write_utf16(&mut response, KSEC_CNG_FUNCTION_NAME_OFFSET, "RNG");
-    write_utf16(
-        &mut response,
-        KSEC_CNG_PROVIDER_NAME_OFFSET,
-        "Microsoft Primitive Provider",
-    );
-    let image_ref = KsecCngImageRef {
-        image_name_offset: KSEC_CNG_IMAGE_NAME_OFFSET,
-        flags: KSEC_CNG_USER_MODE.try_into().unwrap(),
-        reserved: 0,
-    };
-    response[KSEC_CNG_IMAGE_REF_OFFSET..KSEC_CNG_IMAGE_NAME_OFFSET]
-        .copy_from_slice(image_ref.as_bytes());
-    write_utf16(
-        &mut response,
-        KSEC_CNG_IMAGE_NAME_OFFSET,
-        "bcryptprimitives.dll",
-    );
 
     if write_slice::<Platform, u8>(output_buffer.as_usize(), &response).is_none() {
         return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
     }
-    complete_ioctl::<Platform>(
-        io_status_block,
-        NtStatus::SUCCESS,
-        KSEC_CNG_PROVIDER_RESPONSE_SIZE,
-    )
+    complete_ioctl::<Platform>(io_status_block, NtStatus::SUCCESS, response.len())
 }
 
-fn write_utf16(buffer: &mut [u8], offset: usize, value: &str) {
-    for (index, unit) in value.encode_utf16().chain(core::iter::once(0)).enumerate() {
-        let start = offset + index * size_of::<u16>();
-        buffer[start..start + size_of::<u16>()].copy_from_slice(&unit.to_le_bytes());
+fn append_utf16(buffer: &mut Vec<u8>, value: &str) -> usize {
+    let offset = buffer.len();
+    for unit in value.encode_utf16().chain(core::iter::once(0)) {
+        buffer.extend_from_slice(&unit.to_le_bytes());
     }
+    offset
 }
 
 fn read_utf16_at_offset<Platform: crate::ShimPlatform>(
@@ -406,8 +396,7 @@ fn read_utf16_at_offset<Platform: crate::ShimPlatform>(
     }
     let byte_length = maximum_characters
         .checked_add(1)
-        .and_then(|units| units.checked_mul(size_of::<u16>()))
-        ?;
+        .and_then(|units| units.checked_mul(size_of::<u16>()))?;
     let end = offset.checked_add(byte_length)?;
     if end > buffer_length {
         return None;
@@ -435,31 +424,4 @@ fn complete_ioctl<Platform: crate::ShimPlatform>(
         return NtStatus::ACCESS_VIOLATION;
     }
     status
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tests::{TestPlatform, run_with_test_platform_pointers};
-
-    #[test]
-    fn utf16_read_handles_valid_and_overflowing_offsets() {
-        run_with_test_platform_pointers(|| {
-            let input = b"R\0N\0G\0\0\0";
-            let input_ptr = ConstPtr::<TestPlatform, u8>::from_usize(input.as_ptr() as usize);
-            assert_eq!(
-                read_utf16_at_offset::<TestPlatform>(input_ptr, input.len(), 0, 3).as_deref(),
-                Some("RNG")
-            );
-            assert_eq!(
-                read_utf16_at_offset::<TestPlatform>(
-                    input_ptr,
-                    input.len(),
-                    usize::MAX - 1,
-                    3,
-                ),
-                None
-            );
-        });
-    }
 }

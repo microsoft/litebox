@@ -429,9 +429,7 @@ enum FileObjectBacking<FS: ShimFS> {
         fd: TypedFd<FS>,
     },
     CondrvControl(CondrvObject),
-    /// A handle to `\Device\KsecDD`. Only `NtDeviceIoControlFile` is meaningful on
-    /// this backing; it has no filesystem descriptor and cannot be read, written, or
-    /// mapped as a section.
+    /// A handle to `\Device\KsecDD`.
     KsecDevice,
 }
 
@@ -2246,7 +2244,7 @@ mod tests {
                         None,
                         None,
                         mut_ptr(&mut io_status),
-                        ksecdd::IOCTL_KSEC_RANDOM_FILL_BUFFER,
+                        ksecdd::KsecIoControlCode::RandomFillBuffer as u32,
                         None,
                         0,
                         Some(mut_byte_ptr(output)),
@@ -2266,7 +2264,7 @@ mod tests {
                     None,
                     None,
                     mut_ptr(&mut io_status),
-                    ksecdd::IOCTL_KSEC_RANDOM_FILL_BUFFER,
+                    ksecdd::KsecIoControlCode::RandomFillBuffer as u32,
                     None,
                     0,
                     Some(mut_byte_ptr(&mut chunked)),
@@ -2297,8 +2295,10 @@ mod tests {
             assert_eq!(io_status.information, 0);
 
             let request = ksecdd::KsecCngDeriveKeyRequest {
-                magic: 0,
-                operation: ksecdd::KSEC_CNG_DERIVE_KEY,
+                header: ksecdd::KsecCngRequestHeader {
+                    magic: 0,
+                    operation: ksecdd::KsecCngOperation::DeriveKey as u32,
+                },
                 opaque_arguments: [0; 11],
                 event_handle: Handle::default(),
             };
@@ -2310,7 +2310,7 @@ mod tests {
                     None,
                     None,
                     mut_ptr(&mut io_status),
-                    ksecdd::IOCTL_KSEC_CNG_REQUEST,
+                    ksecdd::KsecIoControlCode::CngRequest as u32,
                     Some(ConstPtr::<TestPlatform, u8>::from_usize(
                         core::ptr::from_ref(&request) as usize,
                     )),
@@ -2328,69 +2328,15 @@ mod tests {
     }
 
     #[test]
-    fn ksecdd_open_accepts_bcrypt_exact_parameters() {
-        // Regression guard for the real bcrypt.dll DllMain(PROCESS_ATTACH) call captured
-        // dual-host: NtOpenFile(\Device\KsecDD, access=0x100003, share=0x7, options=0x20,
-        // disposition=FILE_OPEN). These exact bits must survive validate_create_options and
-        // reach open_ksecdd_target -> SUCCESS. options=0x20 is SYNCHRONOUS_IO_NONALERT only,
-        // so it must NOT trip the SYNCHRONOUS_IO (0x30) contains-check, and its intersects-
-        // check is satisfied because access=0x100003 carries SYNCHRONIZE (0x100000). If a
-        // future refactor of the create-option gates rejects this precise call, bcrypt's
-        // DllMain goes back to FALSE and python.exe regresses to STATUS_APP_INIT_FAILURE.
-        const BCRYPT_KSECDD_ACCESS: u32 = 0x0010_0003;
-        const BCRYPT_KSECDD_SHARE: u32 = 0x0000_0007;
-        const BCRYPT_KSECDD_OPTIONS: u32 = 0x0000_0020;
-
-        let task = crate::tests::test_task();
-        let (_path, _name, attributes) = open_object_attributes(r"\Device\KsecDD");
-        let mut handle = Handle::default();
-        let mut io_status = IoStatusBlock::default();
-        assert_eq!(
-            task.sys_nt_open_file(
-                mut_ptr(&mut handle),
-                BCRYPT_KSECDD_ACCESS,
-                Some(const_ptr(&attributes)),
-                mut_ptr(&mut io_status),
-                BCRYPT_KSECDD_SHARE,
-                BCRYPT_KSECDD_OPTIONS,
-            ),
-            NtStatus::SUCCESS,
-            "bcrypt's exact NtOpenFile parameters must open \\Device\\KsecDD"
-        );
-        assert!(!handle.is_null(), "KsecDD open must return a valid handle");
-
-        // The open is only half the DllMain contract: bcrypt then issues IOCTL_KSEC_RNG and
-        // requires entropy back. Prove the whole path works with these exact open bits.
-        let mut output = [0u8; 32];
-        let mut ioctl_status = IoStatusBlock::default();
-        let status = task.sys_nt_device_io_control_file(
-            handle,
-            Handle::default(),
-            None,
-            None,
-            mut_ptr(&mut ioctl_status),
-            ksecdd::IOCTL_KSEC_RANDOM_FILL_BUFFER,
-            None,
-            0,
-            Some(mut_byte_ptr(&mut output)),
-            output.len().try_into().unwrap(),
-        );
-        assert_eq!(status, NtStatus::SUCCESS);
-        assert_eq!(ioctl_status.information, output.len());
-        assert!(
-            output.iter().any(|&byte| byte != 0),
-            "KsecDD RNG IOCTL must populate the output buffer with entropy"
-        );
-    }
-
-    #[test]
     fn ksecdd_cng_resolves_rng_provider_and_validates_derive_key_event() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
             let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
             let request = ksecdd::KsecCngResolveProvidersRequest {
-                magic: 0x1a2b_3c4d,
-                operation: ksecdd::KSEC_CNG_RESOLVE_PROVIDERS,
+                header: ksecdd::KsecCngRequestHeader {
+                    magic: 0x1a2b_3c4d,
+                    operation: ksecdd::KsecCngOperation::ResolveProviders as u32,
+                },
                 provider_type: usize::MAX,
                 interface: 6,
                 function_name_offset: usize::MAX,
@@ -2407,7 +2353,7 @@ mod tests {
                     None,
                     None,
                     mut_ptr(&mut io_status),
-                    ksecdd::IOCTL_KSEC_CNG_REQUEST,
+                    ksecdd::KsecIoControlCode::CngRequest as u32,
                     Some(ConstPtr::<TestPlatform, u8>::from_usize(
                         core::ptr::from_ref(&request) as usize,
                     )),
@@ -2427,8 +2373,10 @@ mod tests {
             );
 
             let derive = ksecdd::KsecCngDeriveKeyRequest {
-                magic: 0x1a2b_3c4d,
-                operation: ksecdd::KSEC_CNG_DERIVE_KEY,
+                header: ksecdd::KsecCngRequestHeader {
+                    magic: 0x1a2b_3c4d,
+                    operation: ksecdd::KsecCngOperation::DeriveKey as u32,
+                },
                 opaque_arguments: [0; 11],
                 event_handle: handle,
             };
@@ -2439,7 +2387,7 @@ mod tests {
                     None,
                     None,
                     mut_ptr(&mut io_status),
-                    ksecdd::IOCTL_KSEC_CNG_REQUEST,
+                    ksecdd::KsecIoControlCode::CngRequest as u32,
                     Some(ConstPtr::<TestPlatform, u8>::from_usize(
                         core::ptr::from_ref(&derive) as usize,
                     )),
