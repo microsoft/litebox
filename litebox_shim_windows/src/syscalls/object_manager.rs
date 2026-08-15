@@ -145,8 +145,12 @@ pub(crate) struct ObjectManager<Platform: crate::ShimPlatform> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FileDeviceObject {
-    Filesystem { root_path: String },
+    Filesystem {
+        root_path: String,
+    },
     ConsoleDriver,
+    /// The kernel security device (`\Device\KsecDD`).
+    KsecDevice,
 }
 
 enum NamedObject<Platform: crate::ShimPlatform> {
@@ -1410,6 +1414,8 @@ pub(crate) fn seed_object_manager<Platform: crate::ShimPlatform>()
         },
     );
     object_manager.seed_file_device(r"\Device\ConDrv", FileDeviceObject::ConsoleDriver);
+    object_manager.seed_file_device(r"\Device\KsecDD", FileDeviceObject::KsecDevice);
+    object_manager.seed_file_device(r"\Device\CNG", FileDeviceObject::KsecDevice);
     object_manager.seed_port(WINDOWS_API_PORT);
     for (path, target) in SEEDED_SYMLINK_PATHS {
         object_manager.seed_symlink(path, target);

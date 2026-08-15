@@ -77,6 +77,7 @@ pub trait ShimPlatform:
     + ArchSpecificProvider
     + SystemInfoProvider
     + TimeProvider
+    + CrngProvider
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + 'static
 {
@@ -89,6 +90,7 @@ impl<T> ShimPlatform for T where
         + ArchSpecificProvider
         + SystemInfoProvider
         + TimeProvider
+        + CrngProvider
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + 'static
 {

@@ -24,7 +24,9 @@ use crate::nt_types::{
 };
 use crate::syscalls::Handle;
 use crate::syscalls::condrv::{self, CondrvObject, CondrvStreamDirection, CondrvStreamObject};
+use crate::syscalls::event::{EventAccess, EventSubsystem};
 use crate::syscalls::file_path::{FilePathResolver, FilePathRoot, FileTarget};
+use crate::syscalls::ksecdd;
 use crate::{
     ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
     raw_handle_entry, write_slice,
@@ -427,6 +429,15 @@ enum FileObjectBacking<FS: ShimFS> {
         fd: TypedFd<FS>,
     },
     CondrvControl(CondrvObject),
+    /// A handle to `\Device\KsecDD`.
+    KsecDevice,
+}
+
+/// The device a file handle routes `NtDeviceIoControlFile` to.
+enum IoctlTarget {
+    Condrv(CondrvObject),
+    KsecDevice,
+    Unsupported,
 }
 
 #[derive(Clone, Copy)]
@@ -451,14 +462,25 @@ impl<FS: ShimFS> FileObject<FS> {
         match self.backing {
             FileObjectBacking::CondrvStream { object, .. }
             | FileObjectBacking::CondrvControl(object) => Some(object),
-            FileObjectBacking::Filesystem { .. } => None,
+            FileObjectBacking::Filesystem { .. } | FileObjectBacking::KsecDevice => None,
+        }
+    }
+
+    fn ioctl_target(&self) -> IoctlTarget {
+        match self.backing {
+            FileObjectBacking::CondrvStream { object, .. }
+            | FileObjectBacking::CondrvControl(object) => IoctlTarget::Condrv(object),
+            FileObjectBacking::KsecDevice => IoctlTarget::KsecDevice,
+            FileObjectBacking::Filesystem { .. } => IoctlTarget::Unsupported,
         }
     }
 
     fn condrv_stream_object_id(&self) -> Option<u64> {
         match &self.backing {
             FileObjectBacking::CondrvStream { stream_object, .. } => Some(stream_object.id()),
-            FileObjectBacking::Filesystem { .. } | FileObjectBacking::CondrvControl(_) => None,
+            FileObjectBacking::Filesystem { .. }
+            | FileObjectBacking::CondrvControl(_)
+            | FileObjectBacking::KsecDevice => None,
         }
     }
 
@@ -729,10 +751,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => Ok(file.path.clone()),
             FileObjectBacking::Filesystem {
                 is_directory: true, ..
-            } => Err(NtStatus::INVALID_FILE_FOR_SECTION),
-            FileObjectBacking::CondrvStream { .. } | FileObjectBacking::CondrvControl(_) => {
-                Err(NtStatus::INVALID_FILE_FOR_SECTION)
             }
+            | FileObjectBacking::CondrvStream { .. }
+            | FileObjectBacking::CondrvControl(_)
+            | FileObjectBacking::KsecDevice => Err(NtStatus::INVALID_FILE_FOR_SECTION),
         })
     }
 
@@ -765,7 +787,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             FileObjectBacking::CondrvStream { fd, .. } => {
                 let _ = self.fs.close(&fd);
             }
-            FileObjectBacking::CondrvControl(_) => {}
+            FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {}
         }
     }
 
@@ -830,6 +852,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     object:? = object;
                     "NtQueryAttributesFile does not support ConDrv objects"
                 );
+                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            }
+            Ok(FileTarget::KsecDevice) => {
+                litebox_util_log::debug!("NtQueryAttributesFile does not support \\Device\\KsecDD");
                 return NtStatus::OBJECT_NAME_NOT_FOUND;
             }
             Err(status) => return status,
@@ -1028,7 +1054,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(written)
             }
             FileObjectBacking::CondrvStream { fd, .. } => self.fs.write(fd, &buffer, offset),
-            FileObjectBacking::CondrvControl(_) => Err(WriteError::NotAFile),
+            FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
+                Err(WriteError::NotAFile)
+            }
         });
         let (status, information) = match result {
             Ok(written) => (NtStatus::SUCCESS, written),
@@ -1349,8 +1377,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
-        let condrv_object = match self.file_entry(file_handle) {
-            Ok(entry) => entry.with_entry(FileObject::condrv_object),
+        let ioctl_target = match self.file_entry(file_handle) {
+            Ok(entry) => entry.with_entry(FileObject::ioctl_target),
             Err(status) => return status,
         };
         if !event.is_null()
@@ -1358,14 +1386,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return status;
         }
-        let Some(condrv_object) = condrv_object else {
-            litebox_util_log::debug!(
-                file_handle = file_handle.as_raw(),
-                io_control_code:% = format_args!("{io_control_code:#x}");
-                "Unsupported NtDeviceIoControlFile for non-ConDrv file handle"
-            );
-            return NtStatus::INVALID_DEVICE_REQUEST;
-        };
         if apc_routine.is_some() || apc_context.is_some() {
             litebox_util_log::debug!(
                 file_handle = file_handle.as_raw(),
@@ -1373,15 +1393,40 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 "Ignoring NtDeviceIoControlFile APC completion arguments for synchronous completion"
             );
         }
-        let status = condrv::handle_ioctl::<Platform>(
-            condrv_object,
-            io_status_block,
-            io_control_code,
-            input_buffer,
-            input_buffer_length,
-            output_buffer,
-            output_buffer_length,
-        );
+        let status = match ioctl_target {
+            IoctlTarget::Condrv(condrv_object) => condrv::handle_ioctl::<Platform>(
+                condrv_object,
+                io_status_block,
+                io_control_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+            ),
+            IoctlTarget::KsecDevice => ksecdd::handle_ioctl::<Platform>(
+                self.global.platform,
+                io_status_block,
+                io_control_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+                |event| {
+                    self.require_handle_access::<EventSubsystem<Platform>>(
+                        event,
+                        EventAccess::ALL_ACCESS.bits(),
+                    )
+                },
+            ),
+            IoctlTarget::Unsupported => {
+                litebox_util_log::debug!(
+                    file_handle = file_handle.as_raw(),
+                    io_control_code:% = format_args!("{io_control_code:#x}");
+                    "Unsupported NtDeviceIoControlFile for file handle"
+                );
+                return NtStatus::INVALID_DEVICE_REQUEST;
+            }
+        };
         if !event.is_null() {
             let event_status = self.set_event(event);
             if event_status != NtStatus::SUCCESS {
@@ -1487,6 +1532,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 ea_buffer,
                 ea_length,
             ),
+            FileTarget::KsecDevice => {
+                Self::open_ksecdd_target(desired_access, share_access, create_options)
+            }
         }?;
         let handle = self.insert_file_handle(file)?;
         Ok((handle, information))
@@ -1615,6 +1663,27 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 directory_query: DirectoryQueryState::default(),
             },
             information,
+        ))
+    }
+
+    fn open_ksecdd_target(
+        desired_access: FileAccess,
+        share_access: FileShareAccess,
+        create_options: FileCreateOptions,
+    ) -> Result<(FileObject<FS>, FileCreateInformation), NtStatus> {
+        if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
+            return Err(NtStatus::NOT_A_DIRECTORY);
+        }
+        Ok((
+            FileObject {
+                path: String::from(r"\Device\KsecDD"),
+                backing: FileObjectBacking::KsecDevice,
+                create_time_access: desired_access,
+                share_access,
+                create_options,
+                directory_query: DirectoryQueryState::default(),
+            },
+            FileCreateInformation::Opened,
         ))
     }
 
@@ -2137,6 +2206,125 @@ mod tests {
             NtStatus::SUCCESS
         );
         handle
+    }
+
+    fn open_ksecdd(task: &Task<TestPlatform, TestFS>, desired_access: u32) -> Handle {
+        let (_path, _name, attributes) = open_object_attributes(r"\Device\KsecDD");
+        let mut handle = Handle::default();
+        let mut io_status = IoStatusBlock::default();
+        assert_eq!(
+            task.sys_nt_open_file(
+                mut_ptr(&mut handle),
+                desired_access,
+                Some(const_ptr(&attributes)),
+                mut_ptr(&mut io_status),
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+            ),
+            NtStatus::SUCCESS
+        );
+        handle
+    }
+
+    #[test]
+    fn ksecdd_delivers_entropy_and_rejects_unknown_controls() {
+        run_with_test_platform_pointers(|| {
+            const UNKNOWN_KSEC_IOCTL: u32 = 0x0039_0000;
+            let task = crate::tests::test_task();
+            let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
+
+            let mut first = [0u8; 32];
+            let mut second = [0u8; 32];
+            let mut io_status = IoStatusBlock::default();
+            for output in [&mut first, &mut second] {
+                assert_eq!(
+                    task.sys_nt_device_io_control_file(
+                        handle,
+                        Handle::default(),
+                        None,
+                        None,
+                        mut_ptr(&mut io_status),
+                        ksecdd::KsecIoControlCode::RandomFillBuffer as u32,
+                        None,
+                        0,
+                        Some(mut_byte_ptr(output)),
+                        output.len().try_into().unwrap(),
+                    ),
+                    NtStatus::SUCCESS
+                );
+                assert_eq!(io_status.information, output.len());
+            }
+            assert_ne!(first, second, "successive random fills must differ");
+
+            let mut chunked = [0u8; 4097];
+            assert_eq!(
+                task.sys_nt_device_io_control_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    ksecdd::KsecIoControlCode::RandomFillBuffer as u32,
+                    None,
+                    0,
+                    Some(mut_byte_ptr(&mut chunked)),
+                    chunked.len().try_into().unwrap(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(io_status.information, chunked.len());
+            assert!(chunked.iter().any(|&byte| byte != 0));
+
+            let mut scratch = [0xa5; 8];
+            assert_eq!(
+                task.sys_nt_device_io_control_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    UNKNOWN_KSEC_IOCTL,
+                    None,
+                    0,
+                    Some(mut_byte_ptr(&mut scratch)),
+                    scratch.len().try_into().unwrap(),
+                ),
+                NtStatus::NOT_SUPPORTED
+            );
+            assert_eq!(io_status.status, NtStatus::NOT_SUPPORTED.as_raw());
+            assert_eq!(io_status.information, 0);
+
+            let request = ksecdd::KsecCngInitializeRequest {
+                header: ksecdd::KsecCngRequestHeader {
+                    magic: 0,
+                    operation: ksecdd::KsecCngOperation::Initialize as u32,
+                },
+                opaque_arguments: [0; 11],
+                event_handle: Handle::default(),
+            };
+            let mut output = [0xa5; size_of::<usize>()];
+            assert_eq!(
+                task.sys_nt_device_io_control_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    ksecdd::KsecIoControlCode::CngRequest as u32,
+                    Some(ConstPtr::<TestPlatform, u8>::from_usize(
+                        core::ptr::from_ref(&request) as usize,
+                    )),
+                    size_of::<ksecdd::KsecCngInitializeRequest>()
+                        .try_into()
+                        .unwrap(),
+                    Some(mut_byte_ptr(&mut output)),
+                    output.len().try_into().unwrap(),
+                ),
+                NtStatus::INVALID_DEVICE_REQUEST
+            );
+            assert_eq!(io_status.status, NtStatus::INVALID_DEVICE_REQUEST.as_raw());
+            assert_eq!(io_status.information, 0);
+        });
     }
 
     fn open_directory_with_access(
