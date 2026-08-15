@@ -447,7 +447,7 @@ pub fn connect(
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
-        if socket.platform_state == PlatformSocketState::Retired {
+        if socket.resource_retired {
             return Ok(SocketOutcome::Completed(socket.connection_status));
         }
         if socket.connect_in_flight {
@@ -546,7 +546,7 @@ pub fn bind(
         {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
-        if socket.platform_state == PlatformSocketState::Retired {
+        if socket.resource_retired {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
         socket.configuration_in_flight = true;
@@ -618,7 +618,7 @@ pub fn listen(
         if !is_tcp(socket.create_request) {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
-        if socket.platform_state == PlatformSocketState::Retired {
+        if socket.resource_retired {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
         if socket.configuration_in_flight
@@ -776,12 +776,12 @@ pub fn send(
         return Err(BrokerError::UnsupportedOperation);
     }
     let length = data.len();
-    let (resource, create_request, _, platform_state) =
+    let (resource, create_request, _, resource_retired) =
         socket_state(session, handle, ObjectRights::WRITE)?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if platform_state == PlatformSocketState::Retired {
+    if resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     let outcome = resource.send(data, flags)?;
@@ -838,7 +838,7 @@ pub fn send_to(
         if !is_udp(socket.create_request) {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
-        if socket.platform_state == PlatformSocketState::Retired {
+        if socket.resource_retired {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
         if destination.is_none() && socket.connection_status != SocketConnectionStatus::Connected {
@@ -930,12 +930,12 @@ pub fn receive(
     {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (resource, create_request, _, platform_state) =
+    let (resource, create_request, _, resource_retired) =
         socket_state(session, handle, ObjectRights::WAIT)?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if platform_state == PlatformSocketState::Retired {
+    if resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     if length == 0 {
@@ -962,12 +962,12 @@ pub fn receive_from(
     if flags.has_unsupported_bits() || length > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (resource, create_request, _, platform_state) =
+    let (resource, create_request, _, resource_retired) =
         socket_state(session, handle, ObjectRights::WAIT)?;
     if !is_udp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if platform_state == PlatformSocketState::Retired {
+    if resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     let outcome = resource.receive_from(length, flags)?;
@@ -987,12 +987,12 @@ pub fn set_tcp_option(
     handle: ObjectHandle,
     value: TcpOptionValue,
 ) -> Result<()> {
-    let (resource, create_request, _, platform_state) =
+    let (resource, create_request, _, resource_retired) =
         socket_state(session, handle, ObjectRights::WRITE)?;
     if !is_tcp(create_request) {
         return Err(BrokerError::UnsupportedOperation);
     }
-    if platform_state == PlatformSocketState::Retired {
+    if resource_retired {
         return Err(BrokerError::Internal);
     }
     resource.set_tcp_option(value)
@@ -1004,12 +1004,12 @@ pub fn get_tcp_option(
     handle: ObjectHandle,
     name: TcpOptionName,
 ) -> Result<TcpOptionValue> {
-    let (resource, create_request, _, platform_state) =
+    let (resource, create_request, _, resource_retired) =
         socket_state(session, handle, ObjectRights::WAIT)?;
     if !is_tcp(create_request) {
         return Err(BrokerError::UnsupportedOperation);
     }
-    if platform_state == PlatformSocketState::Retired {
+    if resource_retired {
         return Err(BrokerError::Internal);
     }
     let value = resource.get_tcp_option(name)?;
@@ -1043,7 +1043,7 @@ pub fn shutdown(
         {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
-        if socket.platform_state == PlatformSocketState::Retired {
+        if socket.resource_retired {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
         if socket.listening && !matches!(mode, ShutdownMode::Abort | ShutdownMode::StopListening) {
@@ -1169,7 +1169,7 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         local_address,
         configuration_in_flight,
         datagram_connect_generation,
-        platform_state,
+        resource_retired,
     ) = {
         let object = object.read();
         let ObjectEntry::Socket(socket) = &*object else {
@@ -1181,10 +1181,10 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             socket.local_address,
             socket.configuration_in_flight,
             socket.datagram_connect_generation,
-            socket.platform_state,
+            socket.resource_retired,
         )
     };
-    if configuration_in_flight || platform_state == PlatformSocketState::Retired {
+    if configuration_in_flight || resource_retired {
         return Ok(SocketStatusResponse {
             status,
             local_address,
@@ -1195,18 +1195,18 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
     let mut retried_datagram_status = false;
     let mut pending_error = None;
     loop {
-        let (platform_state, status, local_address) = {
+        let (resource_retired, status, local_address) = {
             let object = object.read();
             let ObjectEntry::Socket(socket) = &*object else {
                 return Err(BrokerError::InvalidRights);
             };
             (
-                socket.platform_state,
+                socket.resource_retired,
                 socket.connection_status,
                 socket.local_address,
             )
         };
-        if platform_state == PlatformSocketState::Retired {
+        if resource_retired {
             return Ok(SocketStatusResponse {
                 status,
                 local_address,
@@ -1219,7 +1219,7 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
-        if socket.platform_state == PlatformSocketState::Retired {
+        if socket.resource_retired {
             response.status = socket.connection_status;
             response.local_address = socket.local_address;
             response.pending_error = None;
@@ -1240,7 +1240,7 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             socket.configuration_in_flight = false;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
             socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
-            socket.platform_state = PlatformSocketState::Retired;
+            socket.resource_retired = true;
             drop(object);
             resource.retire();
             return Err(BrokerError::Internal);
@@ -1297,7 +1297,7 @@ fn socket_state(
     Arc<SocketResource>,
     CreateSocketRequest,
     SocketConnectionStatus,
-    PlatformSocketState,
+    bool,
 )> {
     let object = session.authorized_object(handle, required_rights)?;
     let object = object.read();
@@ -1308,7 +1308,7 @@ fn socket_state(
         Arc::clone(&socket.resource),
         socket.create_request,
         socket.connection_status,
-        socket.platform_state,
+        socket.resource_retired,
     ))
 }
 
@@ -1352,7 +1352,7 @@ fn connect_datagram(
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
-        if socket.platform_state == PlatformSocketState::Retired {
+        if socket.resource_retired {
             return Ok(SocketOutcome::Completed(socket.connection_status));
         }
         if socket.configuration_in_flight || socket.connect_in_flight || socket.listening {
@@ -1490,7 +1490,7 @@ fn finish_retired_datagram_connect(object: &spin::RwLock<ObjectEntry>) {
         socket.configuration_in_flight = false;
         socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
         socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
-        socket.platform_state = PlatformSocketState::Retired;
+        socket.resource_retired = true;
     }
 }
 
@@ -1507,7 +1507,7 @@ fn finish_retired_connect(object: &spin::RwLock<ObjectEntry>) {
     if let ObjectEntry::Socket(socket) = &mut *object {
         socket.connect_in_flight = false;
         socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-        socket.platform_state = PlatformSocketState::Retired;
+        socket.resource_retired = true;
     }
 }
 
@@ -1529,7 +1529,7 @@ fn attach_binding(
             Err(port_reservation) => {
                 socket.connect_in_flight = false;
                 socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-                socket.platform_state = PlatformSocketState::Retired;
+                socket.resource_retired = true;
                 Some((Arc::clone(&socket.resource), port_reservation))
             }
         }
@@ -1568,7 +1568,7 @@ fn finish_configuration(
                 socket.datagram_connect_generation =
                     socket.datagram_connect_generation.wrapping_add(1);
             }
-            socket.platform_state = PlatformSocketState::Retired;
+            socket.resource_retired = true;
         } else {
             socket.local_address = socket.local_address.or(local_address);
             socket.listening |= listening;
@@ -1607,7 +1607,7 @@ fn finish_retired_configuration(
         if is_udp(socket.create_request) {
             socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
         }
-        socket.platform_state = PlatformSocketState::Retired;
+        socket.resource_retired = true;
         duplicate
     };
     if let Some((resource, port_reservation)) = duplicate {
@@ -1618,12 +1618,10 @@ fn finish_retired_configuration(
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PlatformSocketState {
-    Active,
-    Retired,
-}
-
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "socket lifecycle latches are independent"
+)]
 pub(crate) struct SocketObject {
     resource: Arc<SocketResource>,
     create_request: CreateSocketRequest,
@@ -1633,7 +1631,7 @@ pub(crate) struct SocketObject {
     configuration_in_flight: bool,
     listening: bool,
     datagram_connect_generation: u64,
-    platform_state: PlatformSocketState,
+    resource_retired: bool,
 }
 
 impl SocketObject {
@@ -1647,7 +1645,7 @@ impl SocketObject {
             configuration_in_flight: false,
             listening: false,
             datagram_connect_generation: 0,
-            platform_state: PlatformSocketState::Active,
+            resource_retired: false,
         }
     }
 
@@ -1665,7 +1663,7 @@ impl SocketObject {
             configuration_in_flight: false,
             listening: false,
             datagram_connect_generation: 0,
-            platform_state: PlatformSocketState::Active,
+            resource_retired: false,
         }
     }
 
