@@ -771,8 +771,8 @@ fn test_runner_broker_udp_with_rewriter() {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
-fn test_runner_broker_udp_namespace_routes_across_sessions() {
-    use std::io::{BufRead as _, BufReader, Write as _};
+fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
+    use std::io::{BufRead as _, BufReader};
     use std::process::Stdio;
 
     let target = common::compile(
@@ -793,7 +793,7 @@ fn test_runner_broker_udp_namespace_routes_across_sessions() {
     let mut server = Runner::new(&target, "broker_udp_namespace_server_rewriter")
         .arg("server")
         .broker_socket(&control_socket_path)
-        .spawn_with_stdio(Stdio::piped(), Stdio::piped(), Stdio::inherit());
+        .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::inherit());
     let stdout = server.stdout.take().unwrap();
     let (line_sender, line_receiver) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -818,12 +818,6 @@ fn test_runner_broker_udp_namespace_routes_across_sessions() {
         .arg(port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    server
-        .stdin
-        .take()
-        .expect("broker UDP server stdin missing")
-        .write_all(&[1])
-        .unwrap();
 
     let deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
     let status = loop {

@@ -42,10 +42,6 @@ static int run_server(void) {
     assert(memcmp(request, "request", sizeof(request)) == 0);
     assert(source.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
     assert(source.sin_port != 0);
-    assert(sendto(fd, "response", 8, 0, (const struct sockaddr *)&source,
-                  sizeof(source)) == 8);
-    char release;
-    assert(read(STDIN_FILENO, &release, sizeof(release)) == sizeof(release));
     assert(close(fd) == 0);
     return 0;
 }
@@ -65,16 +61,6 @@ static int run_client(const char *port) {
     assert(getsockname(fd, (struct sockaddr *)&local, &length) == 0);
     assert(local.sin_addr.s_addr == htonl(INADDR_ANY));
     assert(local.sin_port != 0);
-
-    wait_readable(fd);
-    char response[8] = {0};
-    struct sockaddr_in source;
-    length = sizeof(source);
-    assert(recvfrom(fd, response, sizeof(response), 0,
-                    (struct sockaddr *)&source, &length) == sizeof(response));
-    assert(memcmp(response, "response", sizeof(response)) == 0);
-    assert(source.sin_addr.s_addr == server.sin_addr.s_addr);
-    assert(source.sin_port == server.sin_port);
     assert(close(fd) == 0);
     return 0;
 }

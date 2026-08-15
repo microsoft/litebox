@@ -180,7 +180,8 @@ pub struct PlatformDatagramReceive {
     pub datagram_length: usize,
     /// Guest-visible source address of the datagram.
     ///
-    /// Platforms must translate private backend endpoints before returning.
+    /// Platforms must return the stable guest namespace identity for internal
+    /// traffic rather than any private host transport endpoint.
     pub source_address: SocketAddrV4,
 }
 
@@ -221,9 +222,9 @@ pub trait PlatformSocket: Send + Sync {
     /// Binds this socket to a local address and echoes the assigned address.
     ///
     /// A stream or datagram socket receives a broker-reserved guest-local
-    /// address with a nonzero port and must echo it unchanged; the host endpoint
-    /// backing the socket is chosen privately by the platform. Returning an
-    /// error must leave the socket unbound and retryable.
+    /// address with a nonzero port and must echo it unchanged. A datagram bind
+    /// may be entirely logical and need not allocate a native host endpoint.
+    /// Returning an error must leave the socket unbound and retryable.
     fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Makes this socket listen for incoming connections.
@@ -305,6 +306,8 @@ pub trait PlatformSocket: Send + Sync {
     /// Stream sockets with an attempted connection return `Connecting`,
     /// `Connected`, or `Failed`. Datagram sockets return `Unconnected` or
     /// `Connected` and may change between those states through peer updates.
+    /// A datagram platform may specialize the local IP address after external
+    /// routing, but it must preserve the broker-reserved local port.
     fn status(&self) -> Result<SocketStatusResponse>;
 
     /// Synchronously and idempotently ends this socket's platform authority.
@@ -509,6 +512,9 @@ pub fn bind(
             || socket.connection_status != SocketConnectionStatus::Unconnected
         {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        if socket.platform_state == PlatformSocketState::Retired {
+            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
         socket.configuration_in_flight = true;
         (Arc::clone(&socket.resource), socket.create_request)
@@ -732,7 +738,7 @@ pub fn send(
         return Err(BrokerError::UnsupportedOperation);
     }
     let length = data.len();
-    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WRITE)?;
+    let (resource, create_request, _, _) = socket_state(session, handle, ObjectRights::WRITE)?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
@@ -788,6 +794,9 @@ pub fn send_to(
         };
         if !is_udp(socket.create_request) {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        if socket.platform_state == PlatformSocketState::Retired {
+            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
         if destination.is_none() && socket.connection_status != SocketConnectionStatus::Connected {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
@@ -877,7 +886,7 @@ pub fn receive(
     {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WAIT)?;
+    let (resource, create_request, _, _) = socket_state(session, handle, ObjectRights::WAIT)?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
@@ -905,9 +914,13 @@ pub fn receive_from(
     if flags.has_unsupported_bits() || length > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WAIT)?;
+    let (resource, create_request, _, platform_state) =
+        socket_state(session, handle, ObjectRights::WAIT)?;
     if !is_udp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    if platform_state == PlatformSocketState::Retired {
+        return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     let outcome = resource.receive_from(length, flags)?;
     if let SocketOutcome::Completed(received) = &outcome
@@ -926,7 +939,7 @@ pub fn set_tcp_option(
     handle: ObjectHandle,
     value: TcpOptionValue,
 ) -> Result<()> {
-    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WRITE)?;
+    let (resource, create_request, _, _) = socket_state(session, handle, ObjectRights::WRITE)?;
     if !is_tcp(create_request) {
         return Err(BrokerError::UnsupportedOperation);
     }
@@ -939,7 +952,7 @@ pub fn get_tcp_option(
     handle: ObjectHandle,
     name: TcpOptionName,
 ) -> Result<TcpOptionValue> {
-    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WAIT)?;
+    let (resource, create_request, _, _) = socket_state(session, handle, ObjectRights::WAIT)?;
     if !is_tcp(create_request) {
         return Err(BrokerError::UnsupportedOperation);
     }
@@ -970,6 +983,9 @@ pub fn shutdown(
             && matches!(mode, ShutdownMode::Abort | ShutdownMode::StopListening)
         {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        if socket.platform_state == PlatformSocketState::Retired {
+            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
         if socket.listening && !matches!(mode, ShutdownMode::Abort | ShutdownMode::StopListening) {
             return Ok(SocketOutcome::Failed(SocketError::NotConnected));
@@ -1016,8 +1032,10 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
         create_request,
         status,
         local_address,
+        configuration_in_flight,
         connect_in_flight,
         datagram_connect_generation,
+        platform_state,
     ) = {
         let object = object.read();
         let ObjectEntry::Socket(socket) = &*object else {
@@ -1028,10 +1046,19 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
             socket.create_request,
             socket.connection_status,
             socket.local_address,
+            socket.configuration_in_flight,
             socket.connect_in_flight,
             socket.datagram_connect_generation,
+            socket.platform_state,
         )
     };
+    if configuration_in_flight && is_udp(create_request) {
+        return Ok(SocketStatusResponse {
+            status,
+            local_address,
+            pending_error: None,
+        });
+    }
     if connect_in_flight {
         return Ok(SocketStatusResponse {
             status: SocketConnectionStatus::Connecting,
@@ -1046,7 +1073,9 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
             pending_error: None,
         });
     }
-    if matches!(status, SocketConnectionStatus::Failed(_)) && !is_udp(create_request) {
+    if matches!(status, SocketConnectionStatus::Failed(_))
+        && (!is_udp(create_request) || platform_state == PlatformSocketState::Retired)
+    {
         return Ok(SocketStatusResponse {
             status,
             local_address,
@@ -1057,6 +1086,19 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
     let mut retried_datagram_status = false;
     let mut pending_error = None;
     loop {
+        if is_udp(create_request) {
+            let object = object.read();
+            let ObjectEntry::Socket(socket) = &*object else {
+                return Err(BrokerError::InvalidRights);
+            };
+            if socket.platform_state == PlatformSocketState::Retired {
+                return Ok(SocketStatusResponse {
+                    status: socket.connection_status,
+                    local_address: socket.local_address,
+                    pending_error: None,
+                });
+            }
+        }
         let mut response = resource.status()?;
         pending_error = pending_error.or(response.pending_error);
         let mut object = object.write();
@@ -1064,6 +1106,33 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
             return Err(BrokerError::InvalidRights);
         };
         if is_udp(socket.create_request) {
+            if socket.platform_state == PlatformSocketState::Retired {
+                response.status = socket.connection_status;
+                response.local_address = socket.local_address;
+                response.pending_error = None;
+                return Ok(response);
+            }
+            if socket.configuration_in_flight {
+                response.status = socket.connection_status;
+                response.local_address = socket.local_address;
+                response.pending_error = pending_error;
+                return Ok(response);
+            }
+            let invalid_local_address = match (socket.local_address, response.local_address) {
+                (None, Some(_)) => true,
+                (Some(reserved), Some(platform)) => reserved.port() != platform.port(),
+                _ => false,
+            };
+            if invalid_local_address {
+                socket.configuration_in_flight = false;
+                socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+                socket.datagram_connect_generation =
+                    socket.datagram_connect_generation.wrapping_add(1);
+                socket.platform_state = PlatformSocketState::Retired;
+                drop(object);
+                resource.retire();
+                return Err(BrokerError::Internal);
+            }
             if matches!(
                 response.status,
                 SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
@@ -1132,6 +1201,7 @@ fn socket_state(
     Arc<SocketResource>,
     CreateSocketRequest,
     SocketConnectionStatus,
+    PlatformSocketState,
 )> {
     let object = session.authorized_object(handle, required_rights)?;
     let object = object.read();
@@ -1142,6 +1212,7 @@ fn socket_state(
         Arc::clone(&socket.resource),
         socket.create_request,
         socket.connection_status,
+        socket.platform_state,
     ))
 }
 
@@ -1188,6 +1259,9 @@ fn connect_datagram(
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
+        if socket.platform_state == PlatformSocketState::Retired {
+            return Ok(SocketOutcome::Completed(socket.connection_status));
+        }
         if socket.configuration_in_flight || socket.connect_in_flight || socket.listening {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
@@ -1235,11 +1309,7 @@ fn connect_datagram(
                 return Ok(SocketOutcome::Failed(error));
             }
             ReserveAndBindOutcome::Retired => {
-                finish_datagram_connect(
-                    object,
-                    SocketConnectionStatus::Failed(SocketError::Other),
-                    true,
-                );
+                finish_retired_datagram_connect(object);
                 return Err(BrokerError::Internal);
             }
         }
@@ -1254,11 +1324,8 @@ fn connect_datagram(
             Ok(SocketOutcome::Failed(error))
         }
         Ok(_) => {
-            finish_datagram_connect(
-                object,
-                SocketConnectionStatus::Failed(SocketError::Other),
-                true,
-            );
+            finish_retired_datagram_connect(object);
+            resource.retire();
             Err(BrokerError::Internal)
         }
         Err(PlatformConnectError::PeerUnchanged(error)) => {
@@ -1266,11 +1333,8 @@ fn connect_datagram(
             Err(error)
         }
         Err(PlatformConnectError::PeerIndeterminate(error)) => {
-            finish_datagram_connect(
-                object,
-                SocketConnectionStatus::Failed(SocketError::Other),
-                true,
-            );
+            finish_retired_datagram_connect(object);
+            resource.retire();
             Err(error)
         }
     }
@@ -1299,13 +1363,9 @@ fn attach_datagram_binding(
         }
     };
     if let Some((resource, port_reservation)) = duplicate {
+        finish_retired_datagram_connect(object);
         resource.retire();
         drop(port_reservation);
-        finish_datagram_connect(
-            object,
-            SocketConnectionStatus::Failed(SocketError::Other),
-            true,
-        );
         return Err(BrokerError::Internal);
     }
     Ok(())
@@ -1327,6 +1387,16 @@ fn finish_datagram_connect(
             // snapshot appear current.
             socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
         }
+    }
+}
+
+fn finish_retired_datagram_connect(object: &spin::RwLock<ObjectEntry>) {
+    let mut object = object.write();
+    if let ObjectEntry::Socket(socket) = &mut *object {
+        socket.configuration_in_flight = false;
+        socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+        socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
+        socket.platform_state = PlatformSocketState::Retired;
     }
 }
 
@@ -1409,14 +1479,40 @@ fn finish_retired_configuration(
     local_address: Option<SocketAddrV4>,
     port_reservation: Option<GuestPortReservation>,
 ) -> Result<()> {
-    finish_configuration(object, local_address, port_reservation, false)?;
-    let mut object = object.write();
-    let ObjectEntry::Socket(socket) = &mut *object else {
-        return Err(BrokerError::Internal);
+    let duplicate = {
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::Internal);
+        };
+        socket.configuration_in_flight = false;
+        let duplicate = port_reservation.and_then(|port_reservation| {
+            socket
+                .resource
+                .set_port_reservation(port_reservation)
+                .err()
+                .map(|port_reservation| (Arc::clone(&socket.resource), port_reservation))
+        });
+        socket.local_address = socket.local_address.or(local_address);
+        socket.listening = false;
+        socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+        if is_udp(socket.create_request) {
+            socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
+        }
+        socket.platform_state = PlatformSocketState::Retired;
+        duplicate
     };
-    socket.listening = false;
-    socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+    if let Some((resource, port_reservation)) = duplicate {
+        resource.retire();
+        drop(port_reservation);
+        return Err(BrokerError::Internal);
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlatformSocketState {
+    Active,
+    Retired,
 }
 
 pub(crate) struct SocketObject {
@@ -1428,6 +1524,7 @@ pub(crate) struct SocketObject {
     configuration_in_flight: bool,
     listening: bool,
     datagram_connect_generation: u64,
+    platform_state: PlatformSocketState,
 }
 
 impl SocketObject {
@@ -1441,6 +1538,7 @@ impl SocketObject {
             configuration_in_flight: false,
             listening: false,
             datagram_connect_generation: 0,
+            platform_state: PlatformSocketState::Active,
         }
     }
 
@@ -1458,6 +1556,7 @@ impl SocketObject {
             configuration_in_flight: false,
             listening: false,
             datagram_connect_generation: 0,
+            platform_state: PlatformSocketState::Active,
         }
     }
 
@@ -2024,6 +2123,7 @@ pub(crate) mod tests {
         check_socket_operations_and_policy(broker, provider);
         check_tcp_option_state_is_per_socket(broker);
         check_udp_socket_operations(broker, provider);
+        check_udp_status_rejects_changed_reserved_port(broker, provider);
         check_concurrent_udp_status_does_not_regress_connection(broker, provider);
         check_server_socket_operations(broker, provider);
         check_failed_listener_shutdown_preserves_state(broker, provider);
@@ -2509,22 +2609,12 @@ pub(crate) mod tests {
             connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54),),
             Err(BrokerError::Internal)
         );
-        provider
-            .state
-            .status_responses
-            .lock()
-            .unwrap()
-            .push_back(SocketStatusResponse {
-                status: SocketConnectionStatus::Connected,
-                local_address: None,
-                pending_error: Some(SocketError::ConnectionRefused),
-            });
         assert_eq!(
             status(&session, handle),
             Ok(SocketStatusResponse {
                 status: SocketConnectionStatus::Failed(SocketError::Other),
                 local_address: Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 49152)),
-                pending_error: Some(SocketError::ConnectionRefused),
+                pending_error: None,
             })
         );
         assert_eq!(
@@ -2532,13 +2622,50 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Failed(SocketError::NotConnected))
         );
         assert_eq!(
+            send_to(
+                &session,
+                handle,
+                b"peer".to_vec(),
+                SendFlags::NONE,
+                Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54)),
+            ),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+        assert_eq!(
+            receive_from(&session, handle, 1, ReceiveFromFlags::NONE),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+        let shutdown_calls = provider.state.shutdown_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            shutdown(&session, handle, ShutdownMode::Both),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+        assert_eq!(
+            provider.state.shutdown_calls.load(Ordering::Relaxed),
+            shutdown_calls
+        );
+        assert_eq!(
             connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54),),
-            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
+                SocketError::Other
+            )))
         );
         assert_eq!(
             send_to(&session, handle, b"peer".to_vec(), SendFlags::NONE, None),
-            Ok(SocketOutcome::Completed(4))
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
         );
+        session.close_object_reference(handle).unwrap();
+
+        let handle = create(
+            &session,
+            CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Datagram,
+                protocol: IpProtocol::Udp,
+            },
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
         assert_eq!(
             send(&session, handle, b"x".to_vec(), SendFlags::NONE),
             Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
@@ -2558,8 +2685,112 @@ pub(crate) mod tests {
         session.close_object_reference(handle).unwrap();
         assert_eq!(
             provider.state.connect_calls.load(Ordering::Relaxed),
-            connect_calls_before + 4
+            connect_calls_before + 3
         );
+    }
+
+    fn check_udp_status_rejects_changed_reserved_port(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let unbound = create(
+            &session,
+            CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Datagram,
+                protocol: IpProtocol::Udp,
+            },
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        provider
+            .state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
+                pending_error: None,
+            });
+        let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+        assert_eq!(status(&session, unbound), Err(BrokerError::Internal));
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        session.close_object_reference(unbound).unwrap();
+
+        let handle = create(
+            &session,
+            CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Datagram,
+                protocol: IpProtocol::Udp,
+            },
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            send_to(
+                &session,
+                handle,
+                b"x".to_vec(),
+                SendFlags::NONE,
+                Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
+            ),
+            Ok(SocketOutcome::Completed(1))
+        );
+        let reserved_address = status(&session, handle).unwrap().local_address.unwrap();
+        let changed_port = if reserved_address.port() == u16::MAX {
+            reserved_address.port() - 1
+        } else {
+            reserved_address.port() + 1
+        };
+        provider
+            .state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, changed_port)),
+                pending_error: None,
+            });
+        let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+        assert_eq!(status(&session, handle), Err(BrokerError::Internal));
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        let status_calls = provider.state.status_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            status(&session, handle),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::Other),
+                local_address: Some(reserved_address),
+                pending_error: None,
+            })
+        );
+        assert_eq!(
+            provider.state.status_calls.load(Ordering::Relaxed),
+            status_calls
+        );
+        let connect_calls = provider.state.connect_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            connect(&session, handle, loopback_address()),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
+                SocketError::Other
+            )))
+        );
+        assert_eq!(
+            provider.state.connect_calls.load(Ordering::Relaxed),
+            connect_calls
+        );
+        session.close_object_reference(handle).unwrap();
     }
 
     fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {
@@ -2689,7 +2920,6 @@ pub(crate) mod tests {
             Arc::new(TestReadinessSink::default()),
         )
         .unwrap();
-        let local_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 49152);
         *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
             SocketStatusResponse {
                 status: SocketConnectionStatus::Unconnected,
@@ -2698,7 +2928,7 @@ pub(crate) mod tests {
             },
             SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(local_address),
+                local_address: None,
                 pending_error: None,
             },
         ]);
@@ -2713,14 +2943,22 @@ pub(crate) mod tests {
             connect(&session, handle, loopback_address()),
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
         );
+        let local_address = *provider
+            .state
+            .binds
+            .lock()
+            .unwrap()
+            .last()
+            .expect("automatic UDP bind was not recorded");
         release_tx.send(()).unwrap();
         let stale = in_flight.join().unwrap();
         assert_eq!(stale.status, SocketConnectionStatus::Connected);
         assert_eq!(stale.local_address, Some(local_address));
         assert_eq!(stale.pending_error, None);
 
-        let next_local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153);
-        let stale_local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49154);
+        let next_local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_address.port());
+        let stale_local_address =
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), local_address.port());
         *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
             SocketStatusResponse {
                 status: SocketConnectionStatus::Unconnected,
@@ -3025,6 +3263,37 @@ pub(crate) mod tests {
             retired_before_poisoned + 1
         );
 
+        let poisoned_datagram = create(
+            &session,
+            create_udp_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        let retired_before_datagram = provider.state.retired_sockets.load(Ordering::Relaxed);
+        provider.fail_next_connect_indeterminate();
+        assert_eq!(
+            connect(&session, poisoned_datagram, loopback_address()),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before_datagram + 1
+        );
+        let status_calls_before = provider.state.status_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            status(&session, poisoned_datagram).unwrap().status,
+            SocketConnectionStatus::Failed(SocketError::Other)
+        );
+        assert_eq!(
+            provider.state.status_calls.load(Ordering::Relaxed),
+            status_calls_before
+        );
+        session.close_object_reference(poisoned_datagram).unwrap();
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before_datagram + 1
+        );
+
         let invalid_status = create(
             &session,
             create_request(),
@@ -3052,7 +3321,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             provider.state.connect_calls.load(Ordering::Relaxed),
-            calls_before + 4
+            calls_before + 5
         );
     }
 
