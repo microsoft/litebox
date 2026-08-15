@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-owned platform socket authority.
+//! Broker authority for socket policy, guest-visible endpoints, and platform
+//! lifecycle.
 
 use alloc::{sync::Arc, vec::Vec};
 use core::net::{Ipv4Addr, SocketAddrV4};
@@ -44,9 +45,10 @@ enum GuestTransport {
 
 /// Broker-wide authority for guest-visible transport port namespaces.
 ///
-/// Sessions identify endpoint owners but do not define separate network
-/// namespaces. TCP and UDP use independent port spaces, and guest ports remain
-/// independent of backend host ports.
+/// Socket resources own reservations. Sessions remain ownership, quota, and
+/// teardown domains rather than separate network namespaces. TCP and UDP use
+/// independent port spaces, and guest ports remain independent of native host
+/// ports.
 #[derive(Clone, Default)]
 pub(crate) struct BrokerSocketPorts {
     state: Arc<Mutex<BrokerSocketPortState>>,
@@ -135,20 +137,24 @@ impl Drop for GuestPortReservation {
 
 /// Platform socket and endpoint metadata returned by an accept operation.
 pub struct AcceptedPlatformSocket {
-    /// Accepted nonblocking platform socket.
+    /// Accepted, connected nonblocking platform socket.
     pub socket: Arc<dyn PlatformSocket>,
-    /// Guest-visible remote endpoint of the accepted connection.
+    /// Guest-visible peer endpoint of the accepted connection.
     ///
-    /// Platforms must translate private backend endpoints before returning.
+    /// For a guest-to-guest connection, this must be the connector's
+    /// guest-namespace endpoint; broker-internal native routing endpoints must
+    /// not be exposed.
     pub remote_address: SocketAddrV4,
 }
 
 /// Broker failure from a platform connect operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlatformConnectError {
-    /// The operation did not change the socket's peer.
+    /// The failed operation is known not to have changed the socket's peer.
     PeerUnchanged(BrokerError),
-    /// The operation may have changed the socket's peer.
+    /// The failure occurred after the socket's peer may have changed.
+    ///
+    /// Core retires the platform socket before permitting another operation.
     PeerIndeterminate(BrokerError),
 }
 
@@ -156,9 +162,9 @@ pub enum PlatformConnectError {
 pub struct AcceptedBrokerSocket {
     /// Broker handle naming the accepted socket.
     pub handle: ObjectHandle,
-    /// Local endpoint of the accepted connection.
+    /// Guest-visible local endpoint of the accepted connection.
     pub local_address: SocketAddrV4,
-    /// Remote endpoint of the accepted connection.
+    /// Guest-visible peer endpoint of the accepted connection.
     pub remote_address: SocketAddrV4,
 }
 
@@ -189,10 +195,11 @@ pub struct PlatformDatagramReceive {
 /// Broker-wide socket provider supplied by the host platform.
 ///
 /// The provider creates per-socket [`PlatformSocket`] resources and owns any
-/// bookkeeping shared across the sockets of a broker session. Operations on an
+/// bookkeeping shared across sockets and sessions. Sessions identify ownership
+/// and accounting domains, not separate provider namespaces. Operations on an
 /// individual socket belong to [`PlatformSocket`], not this shared provider.
 pub trait SocketProvider: Send + Sync {
-    /// Creates one nonblocking socket resource for an authenticated session.
+    /// Creates one nonblocking socket resource for a broker session.
     ///
     /// Any provider-retained clones must become inert when
     /// [`PlatformSocket::retire`] is called.
@@ -203,7 +210,11 @@ pub trait SocketProvider: Send + Sync {
         readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>>;
 
-    /// Releases provider state associated with a session after its references close.
+    /// Releases remaining provider state charged to a session after its socket
+    /// references close.
+    ///
+    /// This is a teardown and accounting boundary, not a separate network
+    /// namespace; it must not disturb endpoints owned by other sessions.
     fn close_session(&self, session_id: SessionId);
 }
 
@@ -213,25 +224,29 @@ pub trait SocketProvider: Send + Sync {
 /// in flight to finish after its object handle closes. Before releasing its
 /// portable authority, core explicitly retires the platform socket.
 ///
-/// Implementations own their authoritative native lifecycle state. A request
-/// handler must record the start of a native transition before issuing it, and
-/// the corresponding synchronous result or asynchronous completion handler
-/// must finish that transition. [`status`](PlatformSocket::status) projects
-/// that platform-owned state for the guest; core may cache the projection but
-/// does not drive native teardown from it.
+/// Implementations own their authoritative platform lifecycle state, including
+/// any native resources. A request handler must record the start of a
+/// transition before issuing it, and the corresponding synchronous result or
+/// asynchronous completion handler must finish that transition.
+/// [`status`](PlatformSocket::status) projects that platform-owned state for
+/// the guest; core may cache the projection but does not reconstruct native
+/// lifecycle state from status.
 pub trait PlatformSocket: Send + Sync {
     /// Binds this socket to a local address and echoes the assigned address.
     ///
-    /// A stream or datagram socket receives a broker-reserved guest-local
-    /// address with a nonzero port and must echo it unchanged. A datagram bind
-    /// may be entirely logical and need not allocate a native host endpoint.
-    /// Returning an error must leave the socket unbound and retryable.
+    /// A broker-managed TCP or UDP socket receives a broker-reserved,
+    /// guest-visible address with a nonzero port and must echo it unchanged. A
+    /// UDP bind may be entirely logical and need not allocate a native socket.
+    /// A failed outcome or broker error must leave the socket unbound and
+    /// retryable.
     fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>>;
 
-    /// Makes this socket listen for incoming connections.
+    /// Starts a TCP listener and returns its unchanged guest-visible address.
     fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>>;
 
-    /// Accepts one pending connection without waiting.
+    /// Accepts one pending TCP connection without waiting.
+    ///
+    /// An empty backlog returns [`BrokerError::WouldBlock`].
     fn accept(
         &self,
         readiness: ReadinessRegistration,
@@ -263,6 +278,8 @@ pub trait PlatformSocket: Send + Sync {
     ///
     /// A destination is required for an unconnected socket and omitted to use
     /// the socket's connected peer. Partial successful sends are invalid.
+    /// Resource failures are broker errors rather than ordinary socket
+    /// failures.
     fn send_to(
         &self,
         data: Vec<u8>,
@@ -286,14 +303,18 @@ pub trait PlatformSocket: Send + Sync {
     /// Receives one datagram without waiting for platform readiness.
     ///
     /// The original datagram length is returned even when the caller's buffer
-    /// is smaller, and zero-length datagrams are successful receives.
+    /// is smaller, and zero-length datagrams are successful receives. The
+    /// source address follows [`PlatformDatagramReceive::source_address`].
     fn receive_from(
         &self,
         length: usize,
         flags: ReceiveFromFlags,
     ) -> Result<SocketOutcome<PlatformDatagramReceive>>;
 
-    /// Shuts down one or both socket directions.
+    /// Applies a directional or TCP lifecycle shutdown mode.
+    ///
+    /// UDP supports read, write, and both. TCP additionally supports aborting
+    /// a connection and stopping a listener.
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>>;
 
     /// Sets a typed TCP socket option.
@@ -302,7 +323,8 @@ pub trait PlatformSocket: Send + Sync {
     /// Reads a typed TCP socket option.
     fn get_tcp_option(&self, name: TcpOptionName) -> Result<TcpOptionValue>;
 
-    /// Returns the authoritative connection status.
+    /// Returns the authoritative platform status and consumes at most one
+    /// pending error.
     ///
     /// Stream sockets with an attempted connection return `Connecting`,
     /// `Connected`, or `Failed`. Datagram sockets return `Unconnected` or
@@ -312,13 +334,18 @@ pub trait PlatformSocket: Send + Sync {
     fn status(&self) -> Result<SocketStatusResponse>;
 
     /// Synchronously and idempotently ends this socket's platform authority.
+    ///
+    /// Provider-retained clones must be inert when this method returns.
     fn retire(&self);
 
-    /// Returns the current readiness snapshot.
+    /// Returns the authoritative cached readiness snapshot.
+    ///
+    /// This must not require access to a native resource that retirement may
+    /// already have removed.
     fn readiness(&self) -> ReadinessFlags;
 }
 
-/// Placeholder provider for broker configurations that deliberately disable sockets.
+/// Provider for broker configurations that deliberately disable sockets.
 pub struct UnsupportedSocketProvider;
 
 impl SocketProvider for UnsupportedSocketProvider {
@@ -379,9 +406,10 @@ pub fn create(
 /// Starts a nonblocking connection attempt.
 ///
 /// Policy denial is returned as a per-request [`SocketOutcome::Failed`] and
-/// leaves the socket unconnected, so a later authorized destination may still
-/// be attempted. An unbound stream or datagram socket first reserves a
-/// guest-visible local endpoint.
+/// does not alter the socket's existing connection or peer state, so a later
+/// authorized destination may still be attempted. An authorized attempt on an
+/// unbound stream or datagram socket first reserves a guest-visible local
+/// endpoint.
 pub fn connect(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -572,7 +600,7 @@ pub fn bind(
     }
 }
 
-/// Makes a socket listen for incoming loopback connections.
+/// Starts a TCP listener in the broker's guest network namespace.
 pub fn listen(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -675,7 +703,7 @@ pub fn listen(
     }
 }
 
-/// Accepts one pending connection and creates a new broker socket capability.
+/// Accepts one pending TCP connection and creates a broker socket capability.
 pub fn accept(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -737,7 +765,7 @@ pub fn accept(
     }))
 }
 
-/// Sends bytes without waiting for readiness.
+/// Sends TCP stream bytes without waiting for readiness.
 pub fn send(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -767,8 +795,9 @@ pub fn send(
 
 /// Sends one complete datagram without waiting for readiness.
 ///
-/// The first send on an unbound datagram socket reserves and binds a
-/// guest-visible local endpoint before invoking the platform.
+/// The first valid send with an explicit destination on an unbound datagram
+/// socket reserves and binds a guest-visible local endpoint before invoking
+/// the platform.
 pub fn send_to(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -873,7 +902,7 @@ pub fn send_to(
     Ok(outcome)
 }
 
-/// Receives stream bytes without waiting for readiness.
+/// Receives TCP stream bytes without waiting for readiness.
 pub fn receive(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -994,7 +1023,10 @@ pub fn get_tcp_option(
     Ok(value)
 }
 
-/// Shuts down one or both socket directions.
+/// Applies a directional or TCP lifecycle shutdown mode.
+///
+/// Read, write, and both apply to TCP and UDP. Abort and stop-listening are
+/// TCP-only.
 pub fn shutdown(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -1051,7 +1083,8 @@ pub fn shutdown(
     outcome
 }
 
-/// Returns broker-authoritative socket status and consumes its pending asynchronous error.
+/// Returns broker-authoritative socket status and consumes at most one pending
+/// asynchronous error.
 pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketStatusResponse> {
     let object = session.authorized_object(handle, ObjectRights::WAIT)?;
     let (
