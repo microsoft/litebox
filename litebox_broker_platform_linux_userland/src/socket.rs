@@ -6034,6 +6034,76 @@ mod tests {
     }
 
     #[test]
+    fn guest_udp_receive_survives_readiness_publication_failure() {
+        let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(4, 0, 2, 1),
+            provider.clone(),
+        )
+        .unwrap();
+        let receiver_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let sender_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, _publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(FailingReadinessSink {
+            inner: TestReadinessSink { published, retired },
+            fail_next_publish: Mutex::new(None),
+        });
+        let receiver = create_udp_socket(&receiver_session, readiness.clone());
+        let receiver_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18101);
+        assert_eq!(
+            litebox_broker_core::socket::bind(&receiver_session, receiver, receiver_address,),
+            Ok(SocketOutcome::Completed(receiver_address))
+        );
+        let sender = create_udp_socket(&sender_session, readiness.clone());
+        assert_eq!(
+            send_datagram(
+                &sender_session,
+                sender,
+                b"queued",
+                SendFlags::NONE,
+                Some(receiver_address),
+            ),
+            Ok(SocketOutcome::Completed(6))
+        );
+        let sender_address = litebox_broker_core::socket::status(&sender_session, sender)
+            .unwrap()
+            .local_address
+            .map(|address| SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port()))
+            .unwrap();
+
+        readiness.fail_next_publish_for(receiver);
+        let mut data = [0; 6];
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut data,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 6,
+                datagram_length: 6,
+                source_address: sender_address,
+            }))
+        );
+        assert_eq!(&data, b"queued");
+        assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
+        assert!(
+            !receiver_session
+                .check_readiness(receiver)
+                .unwrap()
+                .contains(ReadinessFlags::READ)
+        );
+    }
+
+    #[test]
     fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
         let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
         let broker = BrokerCore::new_with_limits(
@@ -6046,7 +6116,7 @@ mod tests {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let (published, _publications) = channel();
+        let (published, publications) = channel();
         let (retired, _retirements) = channel();
         let readiness = Arc::new(FailingReadinessSink {
             inner: TestReadinessSink { published, retired },
@@ -6084,6 +6154,7 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
+        readiness.fail_next_publish_for(socket);
         let mut reply = [0; 5];
         assert_eq!(
             receive_datagram_into(&session, socket, &mut reply, ReceiveFromFlags::NONE,),
@@ -6094,6 +6165,51 @@ mod tests {
             }))
         );
         assert_eq!(&reply, b"reply");
+        assert!(
+            !session
+                .check_readiness(socket)
+                .unwrap()
+                .contains(ReadinessFlags::READ)
+        );
+
+        external.send_to(b"first", native_address).unwrap();
+        external.send_to(b"second", native_address).unwrap();
+        wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
+        readiness.fail_next_publish_for(socket);
+        for (index, expected) in [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let mut data = [0; 6];
+            assert_eq!(
+                receive_datagram_into(
+                    &session,
+                    socket,
+                    &mut data[..expected.len()],
+                    ReceiveFromFlags::NONE,
+                ),
+                Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                    received: expected.len(),
+                    datagram_length: expected.len(),
+                    source_address: external_address,
+                }))
+            );
+            assert_eq!(&data[..expected.len()], expected);
+            if index == 0 {
+                assert!(
+                    session
+                        .check_readiness(socket)
+                        .unwrap()
+                        .contains(ReadinessFlags::READ)
+                );
+            }
+        }
+        assert!(
+            !session
+                .check_readiness(socket)
+                .unwrap()
+                .contains(ReadinessFlags::READ)
+        );
     }
 
     #[test]
@@ -6186,7 +6302,7 @@ mod tests {
         let (retired, _retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
         let receiver = create_udp_socket(&receiver_session, readiness.clone());
-        let receiver_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18101);
+        let receiver_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18102);
         assert_eq!(
             litebox_broker_core::socket::bind(&receiver_session, receiver, receiver_address,),
             Ok(SocketOutcome::Completed(receiver_address))
@@ -6547,6 +6663,16 @@ mod tests {
         server.send_to(b"abcdef", source).unwrap();
         wait_until_ready(&session, &publications, handle, ReadinessFlags::READ);
         let mut peeked = [0; 3];
+        assert_eq!(
+            receive_datagram_into(&session, handle, &mut peeked, ReceiveFromFlags::PEEK,),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: 3,
+                datagram_length: 6,
+                source_address: server_address,
+            }))
+        );
+        assert_eq!(&peeked, b"abc");
+        peeked.fill(0);
         assert_eq!(
             receive_datagram_into(&session, handle, &mut peeked, ReceiveFromFlags::PEEK,),
             Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {

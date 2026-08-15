@@ -28,8 +28,7 @@ use rustix::net::{
 
 use super::{
     Reactor, ReactorReceiveFromOutcome, SocketKind, WAKE_TOKEN, broker_error_from_errno,
-    local_socket_address, socket_error_from_errno, socket_operation_error_from_errno,
-    update_snapshot, zeroed_vec,
+    local_socket_address, socket_operation_error_from_errno, update_snapshot, zeroed_vec,
 };
 
 pub(super) const MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND: usize = 64;
@@ -719,7 +718,9 @@ impl Reactor {
                     Ok(()) => break,
                     Err(Errno::INTR) => {}
                     Err(error) => {
-                        return Ok(SocketOutcome::Failed(socket_error_from_errno(error)));
+                        return Ok(SocketOutcome::Failed(socket_operation_error_from_errno(
+                            error,
+                        )?));
                     }
                 }
             }
@@ -733,7 +734,9 @@ impl Reactor {
                         Ok(()) => break,
                         Err(Errno::INTR) => {}
                         Err(error) => {
-                            return Ok(SocketOutcome::Failed(socket_error_from_errno(error)));
+                            return Ok(SocketOutcome::Failed(socket_operation_error_from_errno(
+                                error,
+                            )?));
                         }
                     }
                 }
@@ -832,7 +835,10 @@ impl Reactor {
                     Ok(()) => break,
                     Err(Errno::INTR) => {}
                     Err(error) => {
-                        return Ok(SocketOutcome::Failed(socket_error_from_errno(error)));
+                        return match socket_operation_error_from_errno(error) {
+                            Ok(error) => Ok(SocketOutcome::Failed(error)),
+                            Err(error) => Err(PlatformConnectError::PeerUnchanged(error)),
+                        };
                     }
                 }
             }
@@ -1143,7 +1149,9 @@ impl Reactor {
                 Ok(_) => break Err(BrokerError::Internal),
                 Err(Errno::INTR) => {}
                 Err(Errno::AGAIN) => break Err(BrokerError::WouldBlock),
-                Err(error) => break Ok(SocketOutcome::Failed(socket_error_from_errno(error))),
+                Err(error) => {
+                    break socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
+                }
             }
         };
         match result {
@@ -1226,7 +1234,9 @@ impl Reactor {
                 .udp_state_mut()?;
             udp.peeked_origin = None;
             udp.next_receive_origin = UdpReceiveOrigin::Native;
-            self.publish_udp_readiness(socket_id)?;
+            // The dequeue is committed and the cached snapshot is authoritative
+            // even if this association cannot accept the notification.
+            let _ = self.publish_udp_readiness(socket_id);
         }
         Ok(Some(ReactorReceiveFromOutcome::Received {
             data,
@@ -1261,7 +1271,7 @@ impl Reactor {
                     .external_endpoint
                     .as_ref()
                     .ok_or(BrokerError::Internal)?;
-                receive_datagram_fd(&endpoint.socket, length, flags)
+                receive_datagram_fd(&endpoint.socket, length, ReceiveFromFlags::PEEK)
             };
             let (data, datagram_length, source_address) = match outcome {
                 Ok(ReactorReceiveFromOutcome::Received {
@@ -1289,64 +1299,130 @@ impl Reactor {
             };
             let authorized = self.udp_native_source_authorized(socket_id, source_address)?;
             if authorized {
+                if flags.contains(ReceiveFromFlags::PEEK) {
+                    self.sockets
+                        .get_mut(&socket_id)
+                        .ok_or(BrokerError::Internal)?
+                        .udp_state_mut()?
+                        .peeked_origin = Some(UdpReceiveOrigin::Native);
+                    return Ok(Some(ReactorReceiveFromOutcome::Received {
+                        data,
+                        datagram_length,
+                        source_address,
+                    }));
+                }
+
+                let should_rearm = {
+                    let udp = self
+                        .sockets
+                        .get_mut(&socket_id)
+                        .ok_or(BrokerError::Internal)?
+                        .udp_state_mut()?;
+                    if udp.native_error {
+                        false
+                    } else {
+                        udp.external_endpoint
+                            .as_mut()
+                            .ok_or(BrokerError::Internal)?
+                            .readable = false;
+                        true
+                    }
+                };
+                if should_rearm && let Err(error) = self.rearm_udp_endpoint(socket_id) {
+                    self.sockets
+                        .get_mut(&socket_id)
+                        .ok_or(BrokerError::Internal)?
+                        .udp_state_mut()?
+                        .external_endpoint
+                        .as_mut()
+                        .ok_or(BrokerError::Internal)?
+                        .readable = true;
+                    return Err(error);
+                }
+                let consumed = {
+                    let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
+                    let endpoint = socket
+                        .udp_state()?
+                        .external_endpoint
+                        .as_ref()
+                        .ok_or(BrokerError::Internal)?;
+                    receive_datagram_fd(&endpoint.socket, 0, ReceiveFromFlags::NONE)
+                };
+                match consumed {
+                    Ok(ReactorReceiveFromOutcome::Received { .. }) => {}
+                    Ok(ReactorReceiveFromOutcome::Failed(error)) => {
+                        self.sockets
+                            .get_mut(&socket_id)
+                            .ok_or(BrokerError::Internal)?
+                            .udp_state_mut()?
+                            .external_endpoint
+                            .as_mut()
+                            .ok_or(BrokerError::Internal)?
+                            .readable = true;
+                        return Ok(Some(ReactorReceiveFromOutcome::Failed(error)));
+                    }
+                    Err(BrokerError::WouldBlock) => {
+                        let _ = self.publish_udp_readiness(socket_id);
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        self.sockets
+                            .get_mut(&socket_id)
+                            .ok_or(BrokerError::Internal)?
+                            .udp_state_mut()?
+                            .external_endpoint
+                            .as_mut()
+                            .ok_or(BrokerError::Internal)?
+                            .readable = true;
+                        return Err(error);
+                    }
+                }
                 let udp = self
                     .sockets
                     .get_mut(&socket_id)
                     .ok_or(BrokerError::Internal)?
                     .udp_state_mut()?;
-                if flags.contains(ReceiveFromFlags::PEEK) {
-                    udp.peeked_origin = Some(UdpReceiveOrigin::Native);
-                } else {
-                    udp.peeked_origin = None;
-                    udp.next_receive_origin = UdpReceiveOrigin::Guest;
-                }
-                if !flags.contains(ReceiveFromFlags::PEEK) {
-                    self.drain_invalid_udp_ingress(socket_id)?;
-                    if !self
-                        .sockets
-                        .get(&socket_id)
-                        .ok_or(BrokerError::Internal)?
-                        .udp_state()?
-                        .external_endpoint
-                        .as_ref()
-                        .is_some_and(|endpoint| endpoint.readable)
-                    {
-                        self.rearm_udp_endpoint(socket_id)?;
-                    }
-                }
+                udp.peeked_origin = None;
+                udp.next_receive_origin = UdpReceiveOrigin::Guest;
+                // Consumption is committed. The endpoint was rearmed before
+                // the dequeue. Refresh the cached head state so another
+                // authorized datagram keeps READ asserted without requiring
+                // an asynchronous low-to-high publication.
+                let _ = self.drain_invalid_udp_ingress(socket_id);
+                // The cached snapshot remains authoritative if notification
+                // delivery fails after irreversible consumption.
+                let _ = self.publish_udp_readiness(socket_id);
                 return Ok(Some(ReactorReceiveFromOutcome::Received {
                     data,
                     datagram_length,
                     source_address,
                 }));
             }
-            if flags.contains(ReceiveFromFlags::PEEK) {
-                let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
-                let endpoint = socket
-                    .udp_state()?
-                    .external_endpoint
-                    .as_ref()
-                    .ok_or(BrokerError::Internal)?;
-                match receive_datagram_fd(&endpoint.socket, 0, ReceiveFromFlags::NONE) {
-                    Ok(ReactorReceiveFromOutcome::Received { .. }) => {}
-                    Ok(ReactorReceiveFromOutcome::Failed(error)) => {
-                        return Ok(Some(ReactorReceiveFromOutcome::Failed(error)));
-                    }
-                    Err(BrokerError::WouldBlock) => {
-                        let endpoint = self
-                            .sockets
-                            .get_mut(&socket_id)
-                            .ok_or(BrokerError::Internal)?
-                            .udp_state_mut()?
-                            .external_endpoint
-                            .as_mut()
-                            .ok_or(BrokerError::Internal)?;
-                        endpoint.readable = false;
-                        self.rearm_udp_endpoint(socket_id)?;
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
+            let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
+            let endpoint = socket
+                .udp_state()?
+                .external_endpoint
+                .as_ref()
+                .ok_or(BrokerError::Internal)?;
+            match receive_datagram_fd(&endpoint.socket, 0, ReceiveFromFlags::NONE) {
+                Ok(ReactorReceiveFromOutcome::Received { .. }) => {}
+                Ok(ReactorReceiveFromOutcome::Failed(error)) => {
+                    return Ok(Some(ReactorReceiveFromOutcome::Failed(error)));
                 }
+                Err(BrokerError::WouldBlock) => {
+                    let endpoint = self
+                        .sockets
+                        .get_mut(&socket_id)
+                        .ok_or(BrokerError::Internal)?
+                        .udp_state_mut()?
+                        .external_endpoint
+                        .as_mut()
+                        .ok_or(BrokerError::Internal)?;
+                    endpoint.readable = false;
+                    self.rearm_udp_endpoint(socket_id)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
             }
         }
         let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
@@ -1355,9 +1431,8 @@ impl Reactor {
             .lock()
             .expect("Linux socket snapshot mutex poisoned")
             .readiness;
-        socket.readiness.republish(readiness)?;
-        self.rearm_udp_endpoint(socket_id)?;
-        Err(BrokerError::WouldBlock)
+        let _ = socket.readiness.republish(readiness);
+        Ok(None)
     }
 }
 

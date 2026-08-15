@@ -418,6 +418,9 @@ pub fn connect(
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
+        if socket.platform_state == PlatformSocketState::Retired {
+            return Ok(SocketOutcome::Completed(socket.connection_status));
+        }
         if socket.connect_in_flight {
             return Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting));
         }
@@ -467,15 +470,16 @@ pub fn connect(
                 return Ok(SocketOutcome::Failed(error));
             }
             ReserveAndBindOutcome::Retired => {
-                finish_connect(&object, SocketConnectionStatus::Failed(SocketError::Other));
+                finish_retired_connect(&object);
+                resource.retire();
                 return Err(BrokerError::Internal);
             }
         }
     }
     let status = match resource.connect(address) {
         Ok(SocketConnectionStatus::Unconnected) => {
+            finish_retired_connect(&object);
             resource.retire();
-            finish_connect(&object, SocketConnectionStatus::Failed(SocketError::Other));
             return Err(BrokerError::Internal);
         }
         Ok(status) => status,
@@ -484,8 +488,8 @@ pub fn connect(
             return Err(error);
         }
         Err(PlatformConnectError::PeerIndeterminate(error)) => {
+            finish_retired_connect(&object);
             resource.retire();
-            finish_connect(&object, SocketConnectionStatus::Failed(SocketError::Other));
             return Err(error);
         }
     };
@@ -543,6 +547,7 @@ pub fn bind(
             Ok(ReserveAndBindOutcome::Failed(error)) => Ok(SocketOutcome::Failed(error)),
             Ok(ReserveAndBindOutcome::Retired) => {
                 finish_retired_configuration(&object, None, None)?;
+                resource.retire();
                 return Err(BrokerError::Internal);
             }
             Err(error) => Err(error),
@@ -583,6 +588,9 @@ pub fn listen(
         };
         if !is_tcp(socket.create_request) {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        if socket.platform_state == PlatformSocketState::Retired {
+            return Ok(SocketOutcome::Failed(SocketError::NotConnected));
         }
         if socket.configuration_in_flight
             || socket.connect_in_flight
@@ -639,6 +647,7 @@ pub fn listen(
             }
             ReserveAndBindOutcome::Retired => {
                 finish_retired_configuration(&object, None, None)?;
+                resource.retire();
                 return Err(BrokerError::Internal);
             }
         }
@@ -647,8 +656,8 @@ pub fn listen(
     match resource.listen(backlog) {
         Ok(SocketOutcome::Completed(address)) => {
             if local_address != Some(address) {
-                resource.retire();
                 finish_retired_configuration(&object, local_address, port_reservation)?;
+                resource.retire();
                 return Err(BrokerError::Internal);
             }
             finish_configuration(&object, local_address, port_reservation, true)?;
@@ -738,9 +747,13 @@ pub fn send(
         return Err(BrokerError::UnsupportedOperation);
     }
     let length = data.len();
-    let (resource, create_request, _, _) = socket_state(session, handle, ObjectRights::WRITE)?;
+    let (resource, create_request, _, platform_state) =
+        socket_state(session, handle, ObjectRights::WRITE)?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    if platform_state == PlatformSocketState::Retired {
+        return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     let outcome = resource.send(data, flags)?;
     if let SocketOutcome::Completed(sent) = outcome
@@ -841,6 +854,7 @@ pub fn send_to(
             }
             Ok(ReserveAndBindOutcome::Retired) => {
                 finish_retired_configuration(&object, None, None)?;
+                resource.retire();
                 return Err(BrokerError::Internal);
             }
             Err(error) => {
@@ -886,9 +900,13 @@ pub fn receive(
     {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (resource, create_request, _, _) = socket_state(session, handle, ObjectRights::WAIT)?;
+    let (resource, create_request, _, platform_state) =
+        socket_state(session, handle, ObjectRights::WAIT)?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    if platform_state == PlatformSocketState::Retired {
+        return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     if length == 0 {
         return Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
@@ -939,9 +957,13 @@ pub fn set_tcp_option(
     handle: ObjectHandle,
     value: TcpOptionValue,
 ) -> Result<()> {
-    let (resource, create_request, _, _) = socket_state(session, handle, ObjectRights::WRITE)?;
+    let (resource, create_request, _, platform_state) =
+        socket_state(session, handle, ObjectRights::WRITE)?;
     if !is_tcp(create_request) {
         return Err(BrokerError::UnsupportedOperation);
+    }
+    if platform_state == PlatformSocketState::Retired {
+        return Err(BrokerError::Internal);
     }
     resource.set_tcp_option(value)
 }
@@ -952,9 +974,13 @@ pub fn get_tcp_option(
     handle: ObjectHandle,
     name: TcpOptionName,
 ) -> Result<TcpOptionValue> {
-    let (resource, create_request, _, _) = socket_state(session, handle, ObjectRights::WAIT)?;
+    let (resource, create_request, _, platform_state) =
+        socket_state(session, handle, ObjectRights::WAIT)?;
     if !is_tcp(create_request) {
         return Err(BrokerError::UnsupportedOperation);
+    }
+    if platform_state == PlatformSocketState::Retired {
+        return Err(BrokerError::Internal);
     }
     let value = resource.get_tcp_option(name)?;
     if !matches!(
@@ -1240,10 +1266,7 @@ fn reserve_and_bind(
         SocketOutcome::Completed(bound_address) if bound_address == local_address => {
             Ok(ReserveAndBindOutcome::Completed(local_address, reservation))
         }
-        SocketOutcome::Completed(_) => {
-            resource.retire();
-            Ok(ReserveAndBindOutcome::Retired)
-        }
+        SocketOutcome::Completed(_) => Ok(ReserveAndBindOutcome::Retired),
         SocketOutcome::Failed(error) => Ok(ReserveAndBindOutcome::Failed(error)),
     }
 }
@@ -1310,6 +1333,7 @@ fn connect_datagram(
             }
             ReserveAndBindOutcome::Retired => {
                 finish_retired_datagram_connect(object);
+                resource.retire();
                 return Err(BrokerError::Internal);
             }
         }
@@ -1408,6 +1432,15 @@ fn finish_connect(object: &spin::RwLock<ObjectEntry>, status: SocketConnectionSt
     }
 }
 
+fn finish_retired_connect(object: &spin::RwLock<ObjectEntry>) {
+    let mut object = object.write();
+    if let ObjectEntry::Socket(socket) = &mut *object {
+        socket.connect_in_flight = false;
+        socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+        socket.platform_state = PlatformSocketState::Retired;
+    }
+}
+
 fn attach_binding(
     object: &spin::RwLock<ObjectEntry>,
     local_address: SocketAddrV4,
@@ -1426,6 +1459,7 @@ fn attach_binding(
             Err(port_reservation) => {
                 socket.connect_in_flight = false;
                 socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+                socket.platform_state = PlatformSocketState::Retired;
                 Some((Arc::clone(&socket.resource), port_reservation))
             }
         }
@@ -1460,6 +1494,11 @@ fn finish_configuration(
         if duplicate.is_some() {
             socket.listening = false;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+            if is_udp(socket.create_request) {
+                socket.datagram_connect_generation =
+                    socket.datagram_connect_generation.wrapping_add(1);
+            }
+            socket.platform_state = PlatformSocketState::Retired;
         } else {
             socket.local_address = socket.local_address.or(local_address);
             socket.listening |= listening;
@@ -3256,6 +3295,33 @@ pub(crate) mod tests {
                 local_address: Some(poisoned_local_address),
                 pending_error: None,
             })
+        );
+        let sent_before = provider.state.sent.lock().unwrap().len();
+        assert_eq!(
+            send(&session, poisoned, vec![1], SendFlags::NONE),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+        assert_eq!(provider.state.sent.lock().unwrap().len(), sent_before);
+        assert_eq!(
+            receive(&session, poisoned, 1, ReceiveFlags::NONE, 0, 0),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+        let shutdown_calls_before = provider.state.shutdown_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            shutdown(&session, poisoned, ShutdownMode::Both),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+        assert_eq!(
+            provider.state.shutdown_calls.load(Ordering::Relaxed),
+            shutdown_calls_before
+        );
+        assert_eq!(
+            set_tcp_option(&session, poisoned, TcpOptionValue::NoDelay(true)),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            get_tcp_option(&session, poisoned, TcpOptionName::NoDelay),
+            Err(BrokerError::Internal)
         );
         session.close_object_reference(poisoned).unwrap();
         assert_eq!(
