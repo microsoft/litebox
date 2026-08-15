@@ -3894,7 +3894,12 @@ mod tests {
             ))
         ));
         wait_until_connected(&connector_session, connector, &publications);
-        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        wait_until_ready(
+            &listener_session,
+            &publications,
+            listener,
+            ReadinessFlags::READ,
+        );
         let accepted = match litebox_broker_core::socket::accept(
             &listener_session,
             listener,
@@ -4078,7 +4083,7 @@ mod tests {
             Ok(SocketOutcome::Failed(SocketError::Other))
         );
         allow_response.send(()).unwrap();
-        wait_for_readiness(&publications, handle, ReadinessFlags::READ);
+        wait_until_ready(&session, &publications, handle, ReadinessFlags::READ);
         let current_readiness = session.check_readiness(handle).unwrap();
         assert!(!current_readiness.contains(ReadinessFlags::WRITE));
         assert!(!current_readiness.contains(ReadinessFlags::ERROR));
@@ -4144,7 +4149,12 @@ mod tests {
         read_shutdown_data_received
             .recv_timeout(TEST_TIMEOUT)
             .unwrap();
-        wait_for_readiness(&publications, read_shutdown_handle, ReadinessFlags::READ);
+        wait_until_ready(
+            &session,
+            &publications,
+            read_shutdown_handle,
+            ReadinessFlags::READ,
+        );
         let mut read_shutdown_peek = [0_u8; 2];
         assert_eq!(
             receive_into(
@@ -4165,7 +4175,12 @@ mod tests {
             ),
             Ok(SocketOutcome::Completed(()))
         );
-        wait_for_readiness(&publications, read_shutdown_handle, ReadinessFlags::READ);
+        wait_until_ready(
+            &session,
+            &publications,
+            read_shutdown_handle,
+            ReadinessFlags::READ,
+        );
         assert_eq!(
             receive_into(
                 &session,
@@ -4402,7 +4417,12 @@ mod tests {
             ))
         ));
         wait_until_connected(&connector_session, connector, &publications);
-        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        wait_until_ready(
+            &listener_session,
+            &publications,
+            listener,
+            ReadinessFlags::READ,
+        );
         let accepted =
             match litebox_broker_core::socket::accept(&listener_session, listener, readiness)
                 .unwrap()
@@ -4414,11 +4434,17 @@ mod tests {
             send_bytes(&listener_session, accepted, b"unread", SendFlags::NONE,),
             Ok(SocketOutcome::Completed(6))
         );
-        wait_for_readiness(&publications, connector, ReadinessFlags::READ);
+        wait_until_ready(
+            &connector_session,
+            &publications,
+            connector,
+            ReadinessFlags::READ,
+        );
 
         connector_session.close_object_reference(connector).unwrap();
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-        wait_for_readiness(
+        wait_until_ready(
+            &listener_session,
             &publications,
             accepted,
             ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP,
@@ -4481,7 +4507,7 @@ mod tests {
             .unwrap()
             .local_address
             .unwrap();
-        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        wait_until_ready(&session, &publications, listener, ReadinessFlags::READ);
         let accepted =
             match litebox_broker_core::socket::accept(&session, listener, readiness).unwrap() {
                 SocketOutcome::Completed(accepted) => accepted,
@@ -4566,6 +4592,7 @@ mod tests {
         );
 
         let native_client = TcpStream::connect(private_address).unwrap();
+        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
         let client = create_socket(&client_session, readiness.clone());
         assert!(matches!(
             litebox_broker_core::socket::connect(&client_session, client, guest_destination),
@@ -4601,7 +4628,12 @@ mod tests {
             retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
             connector_probe
         );
-        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        wait_until_ready(
+            &listener_session,
+            &publications,
+            listener,
+            ReadinessFlags::READ,
+        );
         let accepted = match litebox_broker_core::socket::accept(
             &listener_session,
             listener,
@@ -4621,7 +4653,12 @@ mod tests {
             send_bytes(&client_session, client, b"x", SendFlags::NONE),
             Ok(SocketOutcome::Completed(1))
         );
-        wait_for_readiness(&publications, accepted.handle, ReadinessFlags::READ);
+        wait_until_ready(
+            &listener_session,
+            &publications,
+            accepted.handle,
+            ReadinessFlags::READ,
+        );
         let mut byte = [0];
         assert_eq!(
             receive_into(
@@ -4764,7 +4801,12 @@ mod tests {
             blocked_connector
         );
 
-        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        wait_until_ready(
+            &listener_session,
+            &publications,
+            listener,
+            ReadinessFlags::READ,
+        );
         assert!(matches!(
             litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone(),),
             Err(BrokerError::WouldBlock)
@@ -4839,7 +4881,12 @@ mod tests {
         connector_session.close_object_reference(connector).unwrap();
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
         assert_eq!(provider.reactor.retained_connector_count(), 1);
-        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        wait_until_ready(
+            &listener_session,
+            &publications,
+            listener,
+            ReadinessFlags::READ,
+        );
 
         let accepted =
             match litebox_broker_core::socket::accept(&listener_session, listener, readiness)
@@ -5000,7 +5047,12 @@ mod tests {
             .unwrap()
             .local_address
             .unwrap();
-        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        wait_until_ready(
+            &listener_session,
+            &publications,
+            listener,
+            ReadinessFlags::READ,
+        );
 
         assert!(matches!(
             litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone(),),
@@ -5236,7 +5288,12 @@ mod tests {
             ))
         ));
         wait_until_connected(&connector_session, connector, &publications);
-        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        wait_until_ready(
+            &listener_session,
+            &publications,
+            listener,
+            ReadinessFlags::READ,
+        );
         connector_session.close_object_reference(connector).unwrap();
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
         assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
@@ -5330,7 +5387,7 @@ mod tests {
             .unwrap()
             .local_address
             .unwrap();
-        wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        wait_until_ready(&session, &publications, listener, ReadinessFlags::READ);
         assert_eq!(
             litebox_broker_core::socket::listen(&session, listener, 4),
             Ok(SocketOutcome::Completed(local_address))
@@ -5395,7 +5452,7 @@ mod tests {
             ) {
                 Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(7))) => break,
                 Err(BrokerError::WouldBlock) => {
-                    wait_for_readiness(&publications, first.handle, ReadinessFlags::READ);
+                    wait_until_ready(&session, &publications, first.handle, ReadinessFlags::READ);
                 }
                 outcome => panic!("unexpected accepted receive outcome: {outcome:?}"),
             }
@@ -5417,7 +5474,7 @@ mod tests {
             ) {
                 Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(8))) => break,
                 Err(BrokerError::WouldBlock) => {
-                    wait_for_readiness(&publications, first_client, ReadinessFlags::READ);
+                    wait_until_ready(&session, &publications, first_client, ReadinessFlags::READ);
                 }
                 outcome => panic!("unexpected client receive outcome: {outcome:?}"),
             }
@@ -5427,7 +5484,7 @@ mod tests {
             litebox_broker_core::socket::shutdown(&session, listener, ShutdownMode::StopListening,),
             Ok(SocketOutcome::Completed(()))
         );
-        wait_for_readiness(&publications, listener, ReadinessFlags::HANGUP);
+        wait_until_ready(&session, &publications, listener, ReadinessFlags::HANGUP);
         assert!(
             session
                 .check_readiness(listener)
@@ -5494,7 +5551,7 @@ mod tests {
         )
         .unwrap();
 
-        wait_for_readiness(&publications, handle, ReadinessFlags::WRITE);
+        wait_until_ready(&session, &publications, handle, ReadinessFlags::WRITE);
         let shutdown_handle = litebox_broker_core::socket::create(
             &session,
             CreateSocketRequest {
@@ -5505,7 +5562,12 @@ mod tests {
             readiness,
         )
         .unwrap();
-        wait_for_readiness(&publications, shutdown_handle, ReadinessFlags::WRITE);
+        wait_until_ready(
+            &session,
+            &publications,
+            shutdown_handle,
+            ReadinessFlags::WRITE,
+        );
         assert_eq!(
             litebox_broker_core::socket::shutdown(&session, shutdown_handle, ShutdownMode::Both,),
             Ok(SocketOutcome::Completed(()))
@@ -5591,7 +5653,7 @@ mod tests {
         assert_eq!(local_address.port(), source.port());
 
         server.send_to(&[], source).unwrap();
-        wait_for_readiness(&publications, handle, ReadinessFlags::READ);
+        wait_until_ready(&session, &publications, handle, ReadinessFlags::READ);
         let mut zero = [];
         assert_eq!(
             receive_datagram_into(&session, handle, &mut zero, ReceiveFromFlags::NONE,),
@@ -5607,7 +5669,7 @@ mod tests {
         );
 
         server.send_to(b"abcdef", source).unwrap();
-        wait_for_readiness(&publications, handle, ReadinessFlags::READ);
+        wait_until_ready(&session, &publications, handle, ReadinessFlags::READ);
         let mut peeked = [0; 3];
         assert_eq!(
             receive_datagram_into(&session, handle, &mut peeked, ReceiveFromFlags::PEEK,),
@@ -5661,7 +5723,7 @@ mod tests {
             send_datagram(&session, handle, b"refused", SendFlags::NONE, None,),
             Ok(SocketOutcome::Completed(7))
         );
-        wait_for_readiness(&publications, handle, ReadinessFlags::ERROR);
+        wait_until_ready(&session, &publications, handle, ReadinessFlags::ERROR);
         assert_eq!(
             send_datagram(
                 &session,
@@ -5687,7 +5749,7 @@ mod tests {
             send_datagram(&session, handle, b"refused again", SendFlags::NONE, None,),
             Ok(SocketOutcome::Completed(13))
         );
-        wait_for_readiness(&publications, handle, ReadinessFlags::ERROR);
+        wait_until_ready(&session, &publications, handle, ReadinessFlags::ERROR);
         assert_eq!(
             litebox_broker_core::socket::connect(
                 &session,
@@ -5837,6 +5899,18 @@ mod tests {
             readiness,
             Instant::now() + TEST_TIMEOUT,
         );
+    }
+
+    fn wait_until_ready(
+        session: &litebox_broker_core::BrokerSession,
+        publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+        handle: ObjectHandle,
+        readiness: ReadinessFlags,
+    ) {
+        if session.check_readiness(handle).unwrap().contains(readiness) {
+            return;
+        }
+        wait_for_readiness(publications, handle, readiness);
     }
 
     fn wait_for_readiness_until(
