@@ -40,7 +40,7 @@ pub use policy::{
 };
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
-use socket::SocketProvider;
+use socket::{BrokerSocketPorts, SocketProvider};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -117,6 +117,7 @@ pub struct BrokerCore {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
+    pub(crate) socket_ports: BrokerSocketPorts,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -147,6 +148,7 @@ impl BrokerCore {
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             socket_provider,
+            socket_ports: BrokerSocketPorts::default(),
         })
     }
 

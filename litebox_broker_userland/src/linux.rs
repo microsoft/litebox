@@ -54,7 +54,10 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
             .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
         limits,
-        Arc::new(LinuxSocketProvider::new(limits.max_sockets)?),
+        Arc::new(LinuxSocketProvider::new(
+            limits.max_sockets,
+            limits.max_sockets_per_session,
+        )?),
     )?;
 
     crate::run_runner_process(
