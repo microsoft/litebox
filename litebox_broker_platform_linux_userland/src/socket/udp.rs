@@ -240,6 +240,8 @@ impl ReactorUdpState {
 }
 
 impl Reactor {
+    /// Resolves a UDP destination with guest bindings taking precedence over
+    /// private native endpoints and external routing.
     pub(super) fn resolve_udp_destination(
         &self,
         mut address: SocketAddrV4,

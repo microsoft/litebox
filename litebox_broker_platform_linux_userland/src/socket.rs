@@ -1568,6 +1568,12 @@ impl Reactor {
             .any(|host_address| host_address == address)
     }
 
+    /// Reports whether an address names a live broker-private native UDP endpoint.
+    ///
+    /// Native UDP endpoints are wildcard-bound, so a local address plus a
+    /// registered host port identifies the endpoint. Guest routing must check
+    /// its namespace first because guest and native ports may numerically
+    /// collide.
     fn is_private_udp_host_endpoint(&self, address: SocketAddrV4) -> bool {
         self.udp.is_private_host_port(address.port()) && is_local_ipv4_address(*address.ip())
     }
