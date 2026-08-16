@@ -20,6 +20,8 @@ use litebox_broker_protocol::socket::{
 };
 use rustix::event::epoll;
 use rustix::io::Errno;
+#[cfg(test)]
+use rustix::io::ioctl_fionread;
 use rustix::net::{
     AddressFamily as LinuxAddressFamily, RecvFlags as LinuxRecvFlags, SendFlags as LinuxSendFlags,
     SocketFlags as LinuxSocketFlags, SocketType as LinuxSocketType, bind, connect, ipproto,
@@ -410,6 +412,12 @@ impl Reactor {
     pub(super) fn udp_readiness(&self, socket_id: u64) -> BrokerResult<ReadinessFlags> {
         let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
         let udp = socket.udp_state()?;
+        let cached_error = socket
+            .snapshot
+            .lock()
+            .expect("Linux socket snapshot mutex poisoned")
+            .pending_error
+            .is_some();
         let mut readiness = ReadinessFlags::default();
         if socket.read_shutdown
             || !udp.guest_receive_queue.is_empty()
@@ -423,7 +431,7 @@ impl Reactor {
         if !socket.write_shutdown && !udp.native_write_blocked {
             readiness = readiness | ReadinessFlags::WRITE;
         }
-        if udp.native_error.is_pending() {
+        if udp.native_error.is_pending() || cached_error {
             readiness = readiness | ReadinessFlags::ERROR;
         }
         Ok(readiness)
@@ -1515,6 +1523,18 @@ impl Reactor {
             .readable = false;
         self.rearm_udp_endpoint(socket_id)?;
         Ok(None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn udp_native_head_datagram_bytes(&self, socket_id: u64) -> BrokerResult<usize> {
+        let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
+        let endpoint = socket
+            .udp_state()?
+            .external_endpoint
+            .as_ref()
+            .ok_or(BrokerError::Internal)?;
+        usize::try_from(ioctl_fionread(&endpoint.socket).map_err(broker_error_from_errno)?)
+            .map_err(|_| BrokerError::Internal)
     }
 }
 

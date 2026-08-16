@@ -100,6 +100,10 @@ impl SocketLifecycle {
     }
 
     fn retire(&self, close: impl FnOnce()) {
+        self.retire_with_wait_observer(close, || {});
+    }
+
+    fn retire_with_wait_observer(&self, close: impl FnOnce(), mut observe_wait: impl FnMut()) {
         let mut close = Some(close);
         loop {
             match self.load() {
@@ -135,6 +139,7 @@ impl SocketLifecycle {
                     }
                 }
                 SocketLifecycleState::Retiring => {
+                    observe_wait();
                     while self.load() != SocketLifecycleState::Retired {
                         thread::yield_now();
                     }
@@ -630,6 +635,19 @@ impl ReactorClient {
     }
 
     #[cfg(test)]
+    fn udp_native_head_datagram_bytes(&self, guest_port: u16) -> usize {
+        let (response, receive) = sync_channel(1);
+        self.commands
+            .send(ReactorCommand::UdpNativeHeadDatagramBytes {
+                guest_port,
+                response,
+            })
+            .unwrap();
+        self.signal().unwrap();
+        receive.recv().unwrap().unwrap()
+    }
+
+    #[cfg(test)]
     fn exhaust_udp_endpoint_generation(&self) {
         let (response, receive) = sync_channel(1);
         self.commands
@@ -841,11 +859,16 @@ enum ReactorCommand {
         response: SyncSender<usize>,
     },
     #[cfg(test)]
+    UdpNativeHeadDatagramBytes {
+        guest_port: u16,
+        response: SyncSender<BrokerResult<usize>>,
+    },
+    #[cfg(test)]
     ExerciseUdpReceiveRejectionCap {
         guest_port: u16,
         ready: SyncSender<()>,
         proceed: Receiver<()>,
-        response: SyncSender<BrokerResult<bool>>,
+        response: SyncSender<BrokerResult<(bool, usize)>>,
     },
     #[cfg(test)]
     ExhaustUdpEndpointGeneration {
@@ -2087,9 +2110,11 @@ impl Reactor {
             }
         }
         if shut_read {
-            self.rearm_udp_endpoint_if_needed(socket_id)?;
+            // Queue discard and shutdown state are already committed.
+            let _ = self.rearm_udp_endpoint_if_needed(socket_id);
         }
-        self.publish_udp_readiness(socket_id)?;
+        // The cached snapshot remains authoritative if notification fails.
+        let _ = self.publish_udp_readiness(socket_id);
         Ok(SocketOutcome::Completed(()))
     }
 
@@ -2127,9 +2152,40 @@ impl Reactor {
                 None,
                 readiness,
             );
-            self.rearm_udp_endpoint_if_needed(socket_id)?;
+            let rearm = self.rearm_udp_endpoint_if_needed(socket_id);
             // The synchronous response carries the consumed UDP error and the
-            // cached snapshot is already authoritative.
+            // cached snapshot is already authoritative. Do not discard that
+            // error if rearming the endpoint fails after consumption.
+            if let Err(error) = rearm {
+                if let Some(pending_error) = response.pending_error {
+                    let socket = self
+                        .sockets
+                        .get_mut(&socket_id)
+                        .expect("UDP status socket disappeared after rearm failure");
+                    let next_pending_error = {
+                        let mut snapshot = socket
+                            .snapshot
+                            .lock()
+                            .expect("Linux socket snapshot mutex poisoned");
+                        let next_pending_error = snapshot.pending_error.replace(pending_error);
+                        snapshot.readiness = snapshot.readiness | ReadinessFlags::ERROR;
+                        next_pending_error
+                    };
+                    if let Some(next_pending_error) = next_pending_error {
+                        socket
+                            .udp_state_mut()
+                            .expect("UDP status socket changed kind after rearm failure")
+                            .native_error = UdpNativeErrorState::Consumed(next_pending_error);
+                    }
+                    let readiness = socket
+                        .snapshot
+                        .lock()
+                        .expect("Linux socket snapshot mutex poisoned")
+                        .readiness;
+                    let _ = socket.readiness.publish(readiness);
+                }
+                return Err(error);
+            }
             let _ = publication;
         }
         Ok(response)
@@ -2693,6 +2749,19 @@ impl Reactor {
                     let _ = response.send(self.udp.external_peer_count);
                 }
                 #[cfg(test)]
+                ReactorCommand::UdpNativeHeadDatagramBytes {
+                    guest_port,
+                    response,
+                } => {
+                    let outcome = self
+                        .udp
+                        .bindings
+                        .get(&guest_port)
+                        .ok_or(BrokerError::Internal)
+                        .and_then(|binding| self.udp_native_head_datagram_bytes(binding.socket_id));
+                    let _ = response.send(outcome);
+                }
+                #[cfg(test)]
                 ReactorCommand::ExerciseUdpReceiveRejectionCap {
                     guest_port,
                     ready,
@@ -2724,14 +2793,17 @@ impl Reactor {
                         {
                             return Err(BrokerError::Internal);
                         }
-                        self.sockets
+                        let readable = self
+                            .sockets
                             .get(&socket_id)
                             .ok_or(BrokerError::Internal)?
                             .udp_state()?
                             .external_endpoint
                             .as_ref()
                             .map(|endpoint| endpoint.readable)
-                            .ok_or(BrokerError::Internal)
+                            .ok_or(BrokerError::Internal)?;
+                        let head_datagram_bytes = self.udp_native_head_datagram_bytes(socket_id)?;
+                        Ok((readable, head_datagram_bytes))
                     })();
                     let _ = response.send(outcome);
                 }
@@ -3270,7 +3342,7 @@ fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutc
         match send(&socket.tcp_state()?.socket, data, LinuxSendFlags::NOSIGNAL) {
             Ok(sent) => {
                 if sent != 0 {
-                    confirm_tcp_connected(socket)?;
+                    confirm_tcp_connected(socket);
                 }
                 return Ok(SocketOutcome::Completed(sent));
             }
@@ -3281,8 +3353,8 @@ fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutc
             }
             Err(error) => {
                 let error = socket_operation_error_from_errno(error)?;
-                fail_connect(socket, error)?;
-                consume_synchronous_error(socket)?;
+                fail_connect(socket, error);
+                let _ = consume_synchronous_error(socket);
                 return Ok(SocketOutcome::Failed(error));
             }
         }
@@ -3350,10 +3422,25 @@ fn receive_socket(
         }
     }
 
+    let refresh_exhausted_cache = match peek_cache.as_ref() {
+        Some(cache)
+            if cache.socket_id == socket_id
+                && cache.requested_length == peek_length
+                && cache.data.len() <= peek_offset =>
+        {
+            usize::try_from(
+                ioctl_fionread(&socket.tcp_state()?.socket).map_err(broker_error_from_errno)?,
+            )
+            .map_err(|_| BrokerError::Internal)?
+                > cache.data.len()
+        }
+        _ => false,
+    };
     let refresh = peek_offset == 0
         || !peek_cache.as_ref().is_some_and(|cache| {
             cache.socket_id == socket_id && cache.requested_length == peek_length
-        });
+        })
+        || refresh_exhausted_cache;
     if refresh {
         *peek_cache = None;
         let flags = if flags.contains(ReceiveFlags::WAITALL) {
@@ -3417,17 +3504,17 @@ fn receive_socket_once(
     loop {
         match recv(&socket.tcp_state()?.socket, data.as_mut_slice(), flags) {
             Ok((_buffer, 0)) => {
-                confirm_tcp_connected(socket)?;
+                confirm_tcp_connected(socket);
                 let readiness = if socket.read_shutdown {
                     ReadinessFlags::READ
                 } else {
                     ReadinessFlags::READ | ReadinessFlags::HANGUP
                 };
-                add_readiness(socket, readiness)?;
+                let _ = add_readiness(socket, readiness);
                 return Ok(ReactorReceiveOutcome::EndOfStream);
             }
             Ok((_buffer, received)) => {
-                confirm_tcp_connected(socket)?;
+                confirm_tcp_connected(socket);
                 data.truncate(received);
                 let terminal_readable = socket.read_shutdown
                     || socket
@@ -3436,13 +3523,12 @@ fn receive_socket_once(
                         .expect("Linux socket snapshot mutex poisoned")
                         .readiness
                         .contains(ReadinessFlags::HANGUP);
-                if !flags.contains(LinuxRecvFlags::PEEK)
-                    && !terminal_readable
-                    && ioctl_fionread(&socket.tcp_state()?.socket)
-                        .map_err(broker_error_from_errno)?
-                        == 0
-                {
-                    clear_readiness(socket, ReadinessFlags::READ)?;
+                if !flags.contains(LinuxRecvFlags::PEEK) && !terminal_readable {
+                    let no_queued_data = ioctl_fionread(&socket.tcp_state()?.socket)
+                        .is_ok_and(|available| available == 0);
+                    if no_queued_data {
+                        let _ = clear_readiness(socket, ReadinessFlags::READ);
+                    }
                 }
                 return Ok(ReactorReceiveOutcome::Received(data));
             }
@@ -3453,8 +3539,8 @@ fn receive_socket_once(
             }
             Err(error) => {
                 let error = socket_operation_error_from_errno(error)?;
-                fail_connect(socket, error)?;
-                consume_synchronous_error(socket)?;
+                fail_connect(socket, error);
+                let _ = consume_synchronous_error(socket);
                 return Ok(ReactorReceiveOutcome::Failed(error));
             }
         }
@@ -3559,12 +3645,12 @@ fn shutdown_tcp_socket(
             Ok(()) => {}
             Err(Errno::INTR) => continue,
             Err(Errno::NOTCONN) => {
-                fail_connect(socket, SocketError::NotConnected)?;
+                fail_connect(socket, SocketError::NotConnected);
                 return Ok(SocketOutcome::Failed(SocketError::NotConnected));
             }
             Err(error) => {
                 let error = socket_operation_error_from_errno(error)?;
-                fail_connect(socket, error)?;
+                fail_connect(socket, error);
                 return Ok(SocketOutcome::Failed(error));
             }
         }
@@ -3593,19 +3679,16 @@ fn shutdown_tcp_socket(
                 .peek_waitall_threshold
                 .take()
                 .is_some();
-        if clear.0 != 0 {
-            clear_readiness(socket, clear)?;
-        }
-        if add.0 != 0 {
-            add_readiness(socket, add)?;
-        }
+        let current = socket
+            .snapshot
+            .lock()
+            .expect("Linux socket snapshot mutex poisoned")
+            .readiness;
+        let readiness = ReadinessFlags((current.0 & !clear.0) | add.0);
+        // Native shutdown and the cached directional state are committed.
+        let _ = update_snapshot(socket, None, readiness);
         if republish_readiness {
-            let readiness = socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned")
-                .readiness;
-            socket.readiness.republish(readiness)?;
+            let _ = socket.readiness.republish(readiness);
         }
         return Ok(SocketOutcome::Completed(()));
     }
@@ -3784,12 +3867,10 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse>
     } else {
         Ok(())
     };
-    // UDP status synchronously returns the consumed error and updates the
-    // authoritative snapshot. A notification failure must not discard that
-    // only error observation.
-    if socket.kind() != SocketKind::Udp {
-        publication?;
-    }
+    // The synchronous response carries the consumed error and the cached
+    // snapshot is authoritative. Notification failure must not discard the
+    // caller's only observation of that error.
+    let _ = publication;
     Ok(response)
 }
 
@@ -3878,11 +3959,11 @@ fn update_snapshot(
     Ok(())
 }
 
-fn confirm_tcp_connected(socket: &mut SocketEntry) -> BrokerResult<()> {
+fn confirm_tcp_connected(socket: &mut SocketEntry) {
     if socket.kind() != SocketKind::Tcp
         || socket.connection_status != SocketConnectionStatus::Connecting
     {
-        return Ok(());
+        return;
     }
     socket.connection_status = SocketConnectionStatus::Connected;
     let readiness = socket
@@ -3890,7 +3971,7 @@ fn confirm_tcp_connected(socket: &mut SocketEntry) -> BrokerResult<()> {
         .lock()
         .expect("Linux socket snapshot mutex poisoned")
         .readiness;
-    update_snapshot(socket, Some(SocketConnectionStatus::Connected), readiness)
+    let _ = update_snapshot(socket, Some(SocketConnectionStatus::Connected), readiness);
 }
 
 /// Records a terminal native operation while a connect is pending.
@@ -3898,11 +3979,11 @@ fn confirm_tcp_connected(socket: &mut SocketEntry) -> BrokerResult<()> {
 /// A reactor command that can call this helper must subsequently invoke
 /// `Reactor::discard_failed_connect_after_command` after releasing its socket
 /// table borrow.
-fn fail_connect(socket: &mut SocketEntry, error: SocketError) -> BrokerResult<()> {
+fn fail_connect(socket: &mut SocketEntry, error: SocketError) {
     if socket.kind() != SocketKind::Tcp
         || socket.connection_status != SocketConnectionStatus::Connecting
     {
-        return Ok(());
+        return;
     }
     socket.connection_status = SocketConnectionStatus::Failed(error);
     let readiness = socket
@@ -3911,11 +3992,11 @@ fn fail_connect(socket: &mut SocketEntry, error: SocketError) -> BrokerResult<()
         .expect("Linux socket snapshot mutex poisoned")
         .readiness
         | ReadinessFlags::ERROR;
-    update_snapshot(
+    let _ = update_snapshot(
         socket,
         Some(SocketConnectionStatus::Failed(error)),
         readiness,
-    )
+    );
 }
 
 fn add_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerResult<()> {
@@ -4073,15 +4154,17 @@ mod tests {
         });
         close_started_receive.recv_timeout(TEST_TIMEOUT).unwrap();
 
-        let (second_started, second_started_receive) = sync_channel(1);
+        let (second_waiting, second_waiting_receive) = sync_channel(1);
         let (second_finished, second_finished_receive) = sync_channel(1);
         let second_lifecycle = Arc::clone(&lifecycle);
         let second = thread::spawn(move || {
-            second_started.send(()).unwrap();
-            second_lifecycle.retire(|| panic!("only the active caller may close the socket"));
+            second_lifecycle.retire_with_wait_observer(
+                || panic!("only the active caller may close the socket"),
+                || second_waiting.send(()).unwrap(),
+            );
             second_finished.send(()).unwrap();
         });
-        second_started_receive.recv_timeout(TEST_TIMEOUT).unwrap();
+        second_waiting_receive.recv_timeout(TEST_TIMEOUT).unwrap();
         assert!(
             second_finished_receive
                 .recv_timeout(Duration::from_millis(100))
@@ -4359,9 +4442,16 @@ mod tests {
         }
     }
 
+    struct PendingPublishFailure {
+        handle: ObjectHandle,
+        remaining: usize,
+        required: ReadinessFlags,
+        forbidden: ReadinessFlags,
+    }
+
     struct FailingReadinessSink {
         inner: TestReadinessSink,
-        fail_next_publish: Mutex<Option<(ObjectHandle, usize)>>,
+        fail_next_publish: Mutex<Option<PendingPublishFailure>>,
     }
 
     impl FailingReadinessSink {
@@ -4370,7 +4460,54 @@ mod tests {
         }
 
         fn fail_next_publishes_for(&self, handle: ObjectHandle, count: usize) {
-            *self.fail_next_publish.lock().unwrap() = Some((handle, count));
+            self.fail_next_publishes_matching(
+                handle,
+                count,
+                ReadinessFlags::default(),
+                ReadinessFlags::default(),
+            );
+        }
+
+        fn fail_next_publish_matching(
+            &self,
+            handle: ObjectHandle,
+            required: ReadinessFlags,
+            forbidden: ReadinessFlags,
+        ) {
+            self.fail_next_publishes_matching(handle, 1, required, forbidden);
+        }
+
+        fn fail_next_publishes_matching(
+            &self,
+            handle: ObjectHandle,
+            count: usize,
+            required: ReadinessFlags,
+            forbidden: ReadinessFlags,
+        ) {
+            *self.fail_next_publish.lock().unwrap() = Some(PendingPublishFailure {
+                handle,
+                remaining: count,
+                required,
+                forbidden,
+            });
+        }
+
+        fn assert_no_pending_publish_failure(&self) {
+            assert!(self.fail_next_publish.lock().unwrap().is_none());
+        }
+
+        fn wait_for_publish_failure_consumed(&self) {
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            loop {
+                if self.fail_next_publish.lock().unwrap().is_none() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for readiness failure injection"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 
@@ -4381,11 +4518,13 @@ mod tests {
 
         fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
             let mut fail_next_publish = self.fail_next_publish.lock().unwrap();
-            if let Some((failed_handle, remaining)) = fail_next_publish.as_mut()
-                && *failed_handle == handle
+            if let Some(failure) = fail_next_publish.as_mut()
+                && failure.handle == handle
+                && readiness.contains(failure.required)
+                && readiness.0 & failure.forbidden.0 == 0
             {
-                *remaining -= 1;
-                if *remaining == 0 {
+                failure.remaining -= 1;
+                if failure.remaining == 0 {
                     *fail_next_publish = None;
                 }
                 return Err(BrokerError::ResourceExhausted);
@@ -4894,6 +5033,273 @@ mod tests {
         );
         release_read_shutdown_server.send(()).unwrap();
         read_shutdown_server.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_receive_survives_readiness_publication_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (send_data, wait_to_send_data) = channel();
+        let (release_server, wait_to_release_server) = channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            wait_to_send_data.recv_timeout(TEST_TIMEOUT).unwrap();
+            stream.write_all(b"reply").unwrap();
+            wait_to_release_server.recv_timeout(TEST_TIMEOUT).unwrap();
+        });
+
+        let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+            provider,
+        )
+        .unwrap();
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(FailingReadinessSink {
+            inner: TestReadinessSink { published, retired },
+            fail_next_publish: Mutex::new(None),
+        });
+        let handle = create_socket(&session, readiness.clone());
+        assert!(matches!(
+            litebox_broker_core::socket::connect(&session, handle, socket_address_v4(address),),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+        wait_until_connected(&session, handle, &publications);
+
+        send_data.send(()).unwrap();
+        wait_until_ready(&session, &publications, handle, ReadinessFlags::READ);
+        readiness.fail_next_publish_matching(
+            handle,
+            ReadinessFlags::default(),
+            ReadinessFlags::READ,
+        );
+        let mut data = [0_u8; 5];
+        assert_eq!(
+            receive_into(&session, handle, &mut data, ReceiveFlags::NONE, 0, 0),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(5)))
+        );
+        assert_eq!(&data, b"reply");
+        readiness.assert_no_pending_publish_failure();
+        assert!(
+            !session
+                .check_readiness(handle)
+                .unwrap()
+                .contains(ReadinessFlags::READ)
+        );
+
+        release_server.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_status_publication_failure_preserves_consumed_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (abort_connection, wait_to_abort_connection) = channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            wait_to_abort_connection.recv_timeout(TEST_TIMEOUT).unwrap();
+            sockopt::set_socket_linger(&stream, Some(Duration::ZERO)).unwrap();
+        });
+
+        let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+            provider,
+        )
+        .unwrap();
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(FailingReadinessSink {
+            inner: TestReadinessSink { published, retired },
+            fail_next_publish: Mutex::new(None),
+        });
+        let handle = create_socket(&session, readiness.clone());
+        assert!(matches!(
+            litebox_broker_core::socket::connect(&session, handle, socket_address_v4(address),),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+        wait_until_connected(&session, handle, &publications);
+
+        abort_connection.send(()).unwrap();
+        wait_until_ready(&session, &publications, handle, ReadinessFlags::ERROR);
+        readiness.fail_next_publish_matching(
+            handle,
+            ReadinessFlags::default(),
+            ReadinessFlags::ERROR,
+        );
+        let status = litebox_broker_core::socket::status(&session, handle).unwrap();
+        assert_eq!(status.status, SocketConnectionStatus::Connected);
+        assert_eq!(status.pending_error, Some(SocketError::ConnectionReset));
+        readiness.assert_no_pending_publish_failure();
+        assert!(
+            !session
+                .check_readiness(handle)
+                .unwrap()
+                .contains(ReadinessFlags::ERROR)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn directional_shutdown_survives_readiness_publication_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_server, wait_to_release_server) = channel();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            wait_to_release_server.recv_timeout(TEST_TIMEOUT).unwrap();
+        });
+
+        let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+            provider,
+        )
+        .unwrap();
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(FailingReadinessSink {
+            inner: TestReadinessSink { published, retired },
+            fail_next_publish: Mutex::new(None),
+        });
+
+        let tcp = create_socket(&session, readiness.clone());
+        assert!(matches!(
+            litebox_broker_core::socket::connect(&session, tcp, socket_address_v4(address)),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+        wait_until_connected(&session, tcp, &publications);
+        readiness.fail_next_publish_matching(tcp, ReadinessFlags::READ, ReadinessFlags::WRITE);
+        assert_eq!(
+            litebox_broker_core::socket::shutdown(&session, tcp, ShutdownMode::Both),
+            Ok(SocketOutcome::Completed(()))
+        );
+        readiness.assert_no_pending_publish_failure();
+        let tcp_readiness = session.check_readiness(tcp).unwrap();
+        assert!(tcp_readiness.contains(ReadinessFlags::READ));
+        assert!(!tcp_readiness.contains(ReadinessFlags::WRITE));
+
+        let udp = create_udp_socket(&session, readiness.clone());
+        readiness.fail_next_publish_matching(udp, ReadinessFlags::READ, ReadinessFlags::WRITE);
+        assert_eq!(
+            litebox_broker_core::socket::shutdown(&session, udp, ShutdownMode::Both),
+            Ok(SocketOutcome::Completed(()))
+        );
+        readiness.assert_no_pending_publish_failure();
+        let udp_readiness = session.check_readiness(udp).unwrap();
+        assert!(udp_readiness.contains(ReadinessFlags::READ));
+        assert!(!udp_readiness.contains(ReadinessFlags::WRITE));
+
+        release_server.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let chunk = MAX_SOCKET_TRANSFER_SIZE as usize;
+        let (first_chunk_sent, wait_for_first_chunk) = channel();
+        let (send_second_chunk, wait_to_send_second_chunk) = channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&vec![0x41; chunk]).unwrap();
+            first_chunk_sent.send(()).unwrap();
+            wait_to_send_second_chunk
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap();
+            stream.write_all(&vec![0x42; chunk]).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+            provider,
+        )
+        .unwrap();
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let handle = create_socket(&session, readiness);
+        assert!(matches!(
+            litebox_broker_core::socket::connect(&session, handle, socket_address_v4(address),),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+        wait_until_connected(&session, handle, &publications);
+        wait_for_first_chunk.recv_timeout(TEST_TIMEOUT).unwrap();
+        wait_until_ready(&session, &publications, handle, ReadinessFlags::READ);
+
+        let peek_length = MAX_SOCKET_TRANSFER_SIZE * 2;
+        let mut first = vec![0_u8; chunk];
+        assert_eq!(
+            receive_into(
+                &session,
+                handle,
+                &mut first,
+                ReceiveFlags::PEEK,
+                0,
+                peek_length,
+            ),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
+                MAX_SOCKET_TRANSFER_SIZE
+            )))
+        );
+        assert!(first.iter().all(|byte| *byte == 0x41));
+
+        send_second_chunk.send(()).unwrap();
+        wait_until_ready(
+            &session,
+            &publications,
+            handle,
+            ReadinessFlags::READ | ReadinessFlags::HANGUP,
+        );
+        let mut second = vec![0_u8; chunk];
+        assert_eq!(
+            receive_into(
+                &session,
+                handle,
+                &mut second,
+                ReceiveFlags::PEEK,
+                MAX_SOCKET_TRANSFER_SIZE,
+                peek_length,
+            ),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
+                MAX_SOCKET_TRANSFER_SIZE
+            )))
+        );
+        assert!(second.iter().all(|byte| *byte == 0x42));
         server.join().unwrap();
     }
 
@@ -5630,6 +6036,8 @@ mod tests {
             listener,
             ReadinessFlags::READ,
         );
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
+        while publications.try_recv().is_ok() {}
 
         assert!(matches!(
             litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone(),),
@@ -5876,7 +6284,11 @@ mod tests {
         assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
         assert_eq!(provider.reactor.retained_connector_count(), 1);
 
-        readiness.fail_next_publish_for(listener);
+        readiness.fail_next_publish_matching(
+            listener,
+            ReadinessFlags::HANGUP,
+            ReadinessFlags::READ,
+        );
         assert_eq!(
             litebox_broker_core::socket::shutdown(
                 &listener_session,
@@ -5885,6 +6297,11 @@ mod tests {
             ),
             Ok(SocketOutcome::Completed(()))
         );
+        readiness.assert_no_pending_publish_failure();
+        let listener_readiness = listener_session.check_readiness(listener).unwrap();
+        assert!(listener_readiness.contains(ReadinessFlags::WRITE));
+        assert!(listener_readiness.contains(ReadinessFlags::HANGUP));
+        assert!(!listener_readiness.contains(ReadinessFlags::READ));
         assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
         assert_eq!(provider.reactor.retained_connector_count(), 0);
         assert_eq!(
@@ -6137,6 +6554,7 @@ mod tests {
             ),
             Err(BrokerError::WouldBlock)
         );
+        readiness.assert_no_pending_publish_failure();
 
         assert_eq!(
             send_datagram(
@@ -6212,6 +6630,7 @@ mod tests {
             }))
         );
         assert_eq!(&data, b"queued");
+        readiness.assert_no_pending_publish_failure();
         assert_eq!(provider.reactor.udp_queued_datagram_count(), 0);
         assert!(
             !receiver_session
@@ -6258,7 +6677,11 @@ mod tests {
         let (_, native_address) = external.recv_from(&mut contact).unwrap();
         assert_eq!(&contact, b"contact");
 
-        readiness.fail_next_publish_for(socket);
+        readiness.fail_next_publish_matching(
+            socket,
+            ReadinessFlags::READ,
+            ReadinessFlags::default(),
+        );
         external.send_to(b"reply", native_address).unwrap();
         let deadline = Instant::now() + TEST_TIMEOUT;
         while !session
@@ -6272,7 +6695,12 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
-        readiness.fail_next_publish_for(socket);
+        readiness.wait_for_publish_failure_consumed();
+        readiness.fail_next_publish_matching(
+            socket,
+            ReadinessFlags::default(),
+            ReadinessFlags::READ,
+        );
         let mut reply = [0; 5];
         assert_eq!(
             receive_datagram_into(&session, socket, &mut reply, ReceiveFromFlags::NONE,),
@@ -6283,6 +6711,7 @@ mod tests {
             }))
         );
         assert_eq!(&reply, b"reply");
+        readiness.assert_no_pending_publish_failure();
         assert!(
             !session
                 .check_readiness(socket)
@@ -6293,7 +6722,11 @@ mod tests {
         external.send_to(b"first", native_address).unwrap();
         external.send_to(b"second", native_address).unwrap();
         wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
-        readiness.fail_next_publish_for(socket);
+        readiness.fail_next_publish_matching(
+            socket,
+            ReadinessFlags::default(),
+            ReadinessFlags::READ,
+        );
         for (index, expected) in [b"first".as_slice(), b"second".as_slice()]
             .into_iter()
             .enumerate()
@@ -6328,6 +6761,7 @@ mod tests {
                 .unwrap()
                 .contains(ReadinessFlags::READ)
         );
+        readiness.assert_no_pending_publish_failure();
     }
 
     #[test]
@@ -6366,7 +6800,11 @@ mod tests {
         );
         wait_until_ready(&session, &publications, socket, ReadinessFlags::ERROR);
 
-        readiness.fail_next_publishes_for(socket, 2);
+        readiness.fail_next_publish_matching(
+            socket,
+            ReadinessFlags::default(),
+            ReadinessFlags::ERROR,
+        );
         assert_eq!(
             litebox_broker_core::socket::status(&session, socket),
             Ok(SocketStatusResponse {
@@ -6381,7 +6819,13 @@ mod tests {
                 .unwrap()
                 .contains(ReadinessFlags::ERROR)
         );
+        readiness.assert_no_pending_publish_failure();
 
+        readiness.fail_next_publish_matching(
+            socket,
+            ReadinessFlags::ERROR,
+            ReadinessFlags::default(),
+        );
         assert_eq!(
             send_datagram(&session, socket, b"second", SendFlags::NONE, None),
             Ok(SocketOutcome::Completed(6))
@@ -6398,6 +6842,7 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
+        readiness.wait_for_publish_failure_consumed();
     }
 
     #[test]
@@ -7587,7 +8032,14 @@ mod tests {
 
     #[test]
     fn externally_connected_udp_preserves_guest_routing_identity() {
-        let Some(local_ip) = non_loopback_local_ipv4() else {
+        let local_ip = non_loopback_local_ipv4();
+        if std::env::var_os("CI").is_some() {
+            assert!(
+                local_ip.is_some(),
+                "CI runner must provide a routable non-loopback IPv4 address"
+            );
+        }
+        let Some(local_ip) = local_ip else {
             return;
         };
         let external = UdpSocket::bind((local_ip, 0)).unwrap();
@@ -7813,14 +8265,24 @@ mod tests {
             .unwrap();
         provider.reactor.signal().unwrap();
         wait_until_ready.recv_timeout(TEST_TIMEOUT).unwrap();
-        for _ in 0..=MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
+        for _ in 0..MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
             attacker.send_to(b"x", receiver_native_address).unwrap();
         }
+        let sentinel = b"sentinel";
+        attacker.send_to(sentinel, receiver_native_address).unwrap();
         proceed.send(()).unwrap();
         assert_eq!(
             receive_response.recv_timeout(TEST_TIMEOUT).unwrap(),
-            Ok(false)
+            Ok((false, sentinel.len()))
         );
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        while provider.reactor.udp_native_head_datagram_bytes(guest_port) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the rearmed native UDP drain"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(
             send_datagram(
                 &sender_session,
