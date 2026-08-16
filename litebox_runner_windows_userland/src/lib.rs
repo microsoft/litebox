@@ -9,6 +9,7 @@ extern crate alloc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use litebox_broker_transport_windows_userland::broker;
 use litebox_platform_windows_userland::WindowsUserland;
 use memmap2::Mmap;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,15 @@ pub struct CliArgs {
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
+    /// Broker-supplied Windows named-pipe path for the local control channel.
+    #[arg(
+        long = "broker-control-channel",
+        value_name = "PIPE_NAME",
+        hide = true,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_control_channel: Option<std::ffi::OsString>,
     /// Tar archive containing the program and its runtime files.
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
     pub initial_files: PathBuf,
@@ -72,12 +82,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
         .init();
 
-    if cli_args.unstable {
-        litebox_util_log::warn!(
-            "Windows PE runner is currently a skeleton; shim functionality is not implemented yet"
-        );
-    }
-
     let tar_file = &cli_args.initial_files;
     if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
         anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
@@ -85,7 +89,26 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let tar_data = mmapped_file(tar_file)?;
 
     let platform = WindowsUserland::new();
-    let shim_builder = litebox_shim_windows::WindowsShimBuilder::new(platform);
+    let broker_connection = cli_args
+        .broker_control_channel
+        .as_deref()
+        .map(broker::connect)
+        .transpose()?;
+    let shim_builder = if let Some(broker_connection) = broker_connection {
+        let broker::BrokerConnection {
+            local,
+            notifications,
+        } = broker_connection;
+        let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+        broker::start_notification_receiver(
+            notifications,
+            litebox.broker_notification_dispatcher(),
+            litebox.broker_failure_dispatcher(),
+        )?;
+        litebox_shim_windows::WindowsShimBuilder::new_with_litebox(platform, litebox)
+    } else {
+        litebox_shim_windows::WindowsShimBuilder::new(platform)
+    };
     let litebox = shim_builder.litebox();
 
     let (program_path, program_args) = cli_args

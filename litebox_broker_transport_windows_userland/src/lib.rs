@@ -8,6 +8,7 @@
 
 #![cfg(all(windows, target_arch = "x86_64"))]
 
+pub mod broker;
 pub mod control_ring;
 mod host;
 mod local;
