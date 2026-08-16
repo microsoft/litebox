@@ -134,7 +134,9 @@ fn readiness_from_epoll(socket: &SocketEntry, events: epoll::EventFlags) -> Read
     if events.contains(epoll::EventFlags::OUT) && !socket.write_shutdown {
         readiness = readiness | ReadinessFlags::WRITE;
     }
-    if !socket.read_shutdown && events.intersects(epoll::EventFlags::RDHUP | epoll::EventFlags::HUP)
+    if socket.kind() == SocketKind::Tcp
+        && !socket.read_shutdown
+        && events.intersects(epoll::EventFlags::RDHUP | epoll::EventFlags::HUP)
     {
         readiness = readiness | ReadinessFlags::READ | ReadinessFlags::HANGUP;
     }
