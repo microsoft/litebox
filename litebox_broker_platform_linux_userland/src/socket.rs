@@ -41,8 +41,8 @@ use litebox_broker_core::readiness::ReadinessRegistration;
 mod udp;
 
 use udp::{
-    ReactorUdpBinding, ReactorUdpPeer, ReactorUdpState, UDP_EVENT_TOKEN_FLAG, UdpReceiveOrigin,
-    UdpSocketState, is_local_ipv4_address,
+    ReactorUdpBinding, ReactorUdpPeer, ReactorUdpState, UDP_EVENT_TOKEN_FLAG, UdpNativeErrorState,
+    UdpReceiveOrigin, UdpSocketState, is_local_ipv4_address,
 };
 
 /// Epoll token reserved for the eventfd that wakes the reactor for commands.
@@ -841,6 +841,13 @@ enum ReactorCommand {
         response: SyncSender<usize>,
     },
     #[cfg(test)]
+    ExerciseUdpReceiveRejectionCap {
+        guest_port: u16,
+        ready: SyncSender<()>,
+        proceed: Receiver<()>,
+        response: SyncSender<BrokerResult<bool>>,
+    },
+    #[cfg(test)]
     ExhaustUdpEndpointGeneration {
         response: SyncSender<()>,
     },
@@ -1570,10 +1577,10 @@ impl Reactor {
 
     /// Reports whether an address names a live broker-private native UDP endpoint.
     ///
-    /// Native UDP endpoints are wildcard-bound, so a local address plus a
-    /// registered host port identifies the endpoint. Guest routing must check
-    /// its namespace first because guest and native ports may numerically
-    /// collide.
+    /// Native UDP endpoints reserve their host port through an initial wildcard
+    /// bind, so a local address plus a registered host port identifies the
+    /// endpoint. Guest routing must check its namespace first because guest and
+    /// native ports may numerically collide.
     fn is_private_udp_host_endpoint(&self, address: SocketAddrV4) -> bool {
         self.udp.is_private_host_port(address.port()) && is_local_ipv4_address(*address.ip())
     }
@@ -2686,6 +2693,49 @@ impl Reactor {
                     let _ = response.send(self.udp.external_peer_count);
                 }
                 #[cfg(test)]
+                ReactorCommand::ExerciseUdpReceiveRejectionCap {
+                    guest_port,
+                    ready,
+                    proceed,
+                    response,
+                } => {
+                    let outcome = (|| {
+                        let socket_id = self
+                            .udp
+                            .bindings
+                            .get(&guest_port)
+                            .ok_or(BrokerError::Internal)?
+                            .socket_id;
+                        ready.send(()).map_err(|_| BrokerError::Internal)?;
+                        proceed
+                            .recv_timeout(Duration::from_secs(10))
+                            .map_err(|_| BrokerError::Internal)?;
+                        self.sockets
+                            .get_mut(&socket_id)
+                            .ok_or(BrokerError::Internal)?
+                            .udp_state_mut()?
+                            .external_endpoint
+                            .as_mut()
+                            .ok_or(BrokerError::Internal)?
+                            .readable = true;
+                        if self
+                            .receive_native_udp(socket_id, 1, ReceiveFromFlags::NONE)?
+                            .is_some()
+                        {
+                            return Err(BrokerError::Internal);
+                        }
+                        self.sockets
+                            .get(&socket_id)
+                            .ok_or(BrokerError::Internal)?
+                            .udp_state()?
+                            .external_endpoint
+                            .as_ref()
+                            .map(|endpoint| endpoint.readable)
+                            .ok_or(BrokerError::Internal)
+                    })();
+                    let _ = response.send(outcome);
+                }
+                #[cfg(test)]
                 ReactorCommand::ExhaustUdpEndpointGeneration { response } => {
                     self.udp.next_endpoint_generation = u64::MAX;
                     let _ = response.send(());
@@ -3684,10 +3734,20 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse>
             && snapshot.readiness.contains(ReadinessFlags::ERROR)
     };
     let socket_error = if query_socket_error {
-        let error = take_socket_error(socket)?;
+        let native_error = if socket.kind() == SocketKind::Udp {
+            socket.udp_state()?.native_error
+        } else {
+            UdpNativeErrorState::None
+        };
+        let error = match native_error {
+            UdpNativeErrorState::Consumed(error) => Some(error),
+            UdpNativeErrorState::None | UdpNativeErrorState::PendingKernel => {
+                take_socket_error(socket)?
+            }
+        };
         if socket.kind() == SocketKind::Udp {
             let udp = socket.udp_state_mut()?;
-            udp.native_error = false;
+            udp.native_error = UdpNativeErrorState::None;
             if let Some(endpoint) = udp.external_endpoint.as_mut() {
                 endpoint.readable = false;
             }
@@ -7738,9 +7798,29 @@ mod tests {
         let (_, receiver_native_address) = attacker.recv_from(&mut contact).unwrap();
         assert_eq!(&contact, b"contact");
         assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+        let (ready, wait_until_ready) = sync_channel(1);
+        let (proceed, wait_to_proceed) = sync_channel(1);
+        let (response, receive_response) = sync_channel(1);
+        provider
+            .reactor
+            .commands
+            .send(ReactorCommand::ExerciseUdpReceiveRejectionCap {
+                guest_port,
+                ready,
+                proceed: wait_to_proceed,
+                response,
+            })
+            .unwrap();
+        provider.reactor.signal().unwrap();
+        wait_until_ready.recv_timeout(TEST_TIMEOUT).unwrap();
         for _ in 0..=MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
             attacker.send_to(b"x", receiver_native_address).unwrap();
         }
+        proceed.send(()).unwrap();
+        assert_eq!(
+            receive_response.recv_timeout(TEST_TIMEOUT).unwrap(),
+            Ok(false)
+        );
         assert_eq!(
             send_datagram(
                 &sender_session,
