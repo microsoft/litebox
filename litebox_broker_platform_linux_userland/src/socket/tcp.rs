@@ -1093,12 +1093,21 @@ pub(super) fn handle_socket_event(
     socket: &mut SocketEntry,
     events: epoll::EventFlags,
 ) -> BrokerResult<bool> {
+    // Readiness publication is best-effort on the shared reactor path: a single
+    // association's publication failure must not fail the reactor for every
+    // other session using it (this mirrors the UDP endpoint handler).
+    // `update_snapshot` commits the cached snapshot before publishing, so a
+    // dropped notification leaves the cached readiness authoritative. In
+    // production an admitted socket's publication does not fail: the broker
+    // bounds live readiness registrations to the sink's capacity at association
+    // setup, so this only absorbs a synthetic sink fault. Genuine host-syscall
+    // or internal-consistency errors still propagate and remain fatal.
     if socket.tcp_state().is_ok_and(|tcp| tcp.listening) {
-        update_snapshot(socket, None, readiness_from_epoll(socket, events))?;
+        let _ = update_snapshot(socket, None, readiness_from_epoll(socket, events));
         return Ok(false);
     }
     if socket.kind() == SocketKind::Udp {
-        update_snapshot(socket, None, readiness_from_epoll(socket, events))?;
+        let _ = update_snapshot(socket, None, readiness_from_epoll(socket, events));
         return Ok(false);
     }
     let republish_readiness = if events.contains(epoll::EventFlags::IN)
@@ -1129,15 +1138,15 @@ pub(super) fn handle_socket_event(
             )
         }
         SocketConnectionStatus::Connected => {
-            update_snapshot(socket, None, readiness_from_epoll(socket, events))?;
+            let _ = update_snapshot(socket, None, readiness_from_epoll(socket, events));
             false
         }
         SocketConnectionStatus::Failed(SocketError::NotConnected) if socket.read_shutdown => {
-            update_snapshot(socket, None, ReadinessFlags::WRITE | ReadinessFlags::HANGUP)?;
+            let _ = update_snapshot(socket, None, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
             false
         }
         SocketConnectionStatus::Failed(_) => {
-            update_snapshot(socket, None, ReadinessFlags::ERROR)?;
+            let _ = update_snapshot(socket, None, ReadinessFlags::ERROR);
             false
         }
         _ => return Err(BrokerError::Internal),
@@ -1148,7 +1157,7 @@ pub(super) fn handle_socket_event(
             .lock()
             .expect("Linux socket snapshot mutex poisoned")
             .readiness;
-        socket.readiness.republish(readiness)?;
+        let _ = socket.readiness.republish(readiness);
     }
     Ok(failed_connector)
 }
@@ -1175,7 +1184,7 @@ fn complete_connect(
         _ => return Err(BrokerError::Internal),
     };
     socket.connection_status = status;
-    update_snapshot(socket, Some(status), readiness)?;
+    let _ = update_snapshot(socket, Some(status), readiness);
     Ok(status)
 }
 

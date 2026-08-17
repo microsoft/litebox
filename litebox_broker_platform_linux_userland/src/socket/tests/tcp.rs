@@ -702,6 +702,68 @@ fn tcp_status_publication_failure_preserves_consumed_error() {
 }
 
 #[test]
+fn native_tcp_readiness_failure_does_not_fail_shared_reactor() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (send_data, wait_to_send_data) = channel();
+    let (release_server, wait_to_release_server) = channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        wait_to_send_data.recv_timeout(TEST_TIMEOUT).unwrap();
+        stream.write_all(b"reply").unwrap();
+        wait_to_release_server.recv_timeout(TEST_TIMEOUT).unwrap();
+    });
+
+    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider,
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(FailingReadinessSink {
+        inner: TestReadinessSink { published, retired },
+        fail_next_publish: Mutex::new(None),
+    });
+    let handle = create_socket(&session, readiness.clone());
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&session, handle, socket_address_v4(address),),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&session, handle, &publications);
+
+    // Fail the reactor's asynchronous readiness publication at the moment the
+    // peer's data makes the socket readable. This exercises the shared-reactor
+    // event path (`handle_socket_event`), not a synchronous command: the reactor
+    // must absorb one association's publication failure and keep serving that
+    // socket rather than tearing down every session's sockets.
+    readiness.fail_next_publish_matching(handle, ReadinessFlags::READ, ReadinessFlags::default());
+    send_data.send(()).unwrap();
+    readiness.wait_for_publish_failure_consumed();
+
+    // The reactor survived: the buffered data is still retrievable through it and
+    // the cached snapshot still reflects the readable state.
+    let mut data = [0_u8; 5];
+    assert_eq!(
+        receive_into(&session, handle, &mut data, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(5)))
+    );
+    assert_eq!(&data, b"reply");
+    readiness.assert_no_pending_publish_failure();
+
+    release_server.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
