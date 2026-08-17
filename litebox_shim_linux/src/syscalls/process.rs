@@ -812,12 +812,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
         match resource {
             litebox_common_linux::RlimitResource::NOFILE
-            | litebox_common_linux::RlimitResource::STACK => {},
+            | litebox_common_linux::RlimitResource::STACK => {}
             _ => {
                 log_unsupported!("Unsupported resource for get_rlimit: {:?}", resource);
                 return Err(Errno::EINVAL);
             }
-        };
+        }
         if let Some(new_limit) = new_limit {
             let mut limits = self.thread.process.limits.limits.write();
             let old_rlimit = limits[resource as usize];
@@ -1689,46 +1689,43 @@ mod tests {
 
     #[test]
     fn resource_limit_reads_do_not_observe_interleaved_updates() {
-        use super::ResourceLimits;
-        use crate::syscalls::tests::TestPlatform;
-        use litebox_common_linux::{Rlimit, RlimitResource};
+        use crate::syscalls::tests::init_platform;
+        use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
         use std::sync::{Arc, Barrier};
 
         const ITERATIONS: usize = 20_000;
 
-        let limits = Arc::new(ResourceLimits::<TestPlatform>::default());
+        let task = init_platform();
         let barrier = Arc::new(Barrier::new(3));
-        let writer = |new_limit: Rlimit| {
-            let limits = limits.clone();
+        let writer = |offset: usize| {
             let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                for _ in 0..ITERATIONS {
-                    limits.limits.write()[RlimitResource::NOFILE as usize] = new_limit;
+            task.spawn_clone_for_test(move |task| {
+                for iteration in 0..ITERATIONS {
+                    let value = super::RLIMIT_NOFILE_MAX - (iteration * 2 + offset);
+                    barrier.wait();
+                    let result = task.do_prlimit(
+                        RlimitResource::NOFILE,
+                        Some(Rlimit {
+                            rlim_cur: value,
+                            rlim_max: value,
+                        }),
+                    );
+                    assert!(matches!(result, Ok(_) | Err(Errno::EPERM)));
+                    barrier.wait();
                 }
             })
         };
-        let writer_a = writer(Rlimit {
-            rlim_cur: 90,
-            rlim_max: 100,
-        });
-        let writer_b = writer(Rlimit {
-            rlim_cur: 10,
-            rlim_max: 10,
-        });
+        let writer_a = writer(1);
+        let writer_b = writer(2);
 
-        barrier.wait();
-        for _ in 0..ITERATIONS * 2 {
-            let limit = limits.limits.read()[RlimitResource::NOFILE as usize];
-            assert!(
-                (limit.rlim_cur == super::RLIMIT_NOFILE_CUR
-                    && limit.rlim_max == super::RLIMIT_NOFILE_MAX)
-                    || (limit.rlim_cur == 90 && limit.rlim_max == 100)
-                    || (limit.rlim_cur == 10 && limit.rlim_max == 10),
-                "observed interleaved resource limit ({}, {})",
-                limit.rlim_cur,
-                limit.rlim_max,
+        for _ in 0..ITERATIONS {
+            barrier.wait();
+            let limit = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+            assert_eq!(
+                limit.rlim_cur, limit.rlim_max,
+                "observed torn resource limit"
             );
+            barrier.wait();
         }
 
         writer_a.join().unwrap();
