@@ -26,6 +26,7 @@ litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.
 default = ["linux_syscall"]
 linux_syscall = []
 optee_syscall = ["dep:litebox_common_optee"]
+aarch64_virtualize_x18 = []
 
 [lints]
 workspace = true

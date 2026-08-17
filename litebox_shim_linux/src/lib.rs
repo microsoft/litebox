@@ -37,6 +37,14 @@ use litebox_common_linux::{
     user_pointers::{UserPtr, UserPtrMut},
 };
 
+#[cfg(target_arch = "aarch64")]
+const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
+    litebox_syscall_rewriter::RewriteOptions::new(
+        litebox_syscall_rewriter::TargetHost::Linux,
+        cfg!(feature = "aarch64_virtualize_x18"),
+    )
+}
+
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 // DEVNOTE: this is before the `mod` declarations so that it can be used within them.
 macro_rules! log_unsupported {

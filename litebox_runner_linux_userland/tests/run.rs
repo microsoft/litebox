@@ -1064,6 +1064,19 @@ fn python_runner(unique_name: &str) -> Runner {
         .collect::<Vec<_>>()
         .join(":");
 
+    let is_optional_package_path = |path: &Path| {
+        path.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some("site-packages" | "dist-packages")
+            )
+        })
+    };
+
+    // The x18 test covers the interpreter and standard library. Host-installed
+    // packages are environment-dependent and may add arbitrary native modules,
+    // so they are outside this deterministic fixture.
+
     let mut paths_to_stage = std::collections::BTreeSet::new();
     paths_to_stage.extend(python_lib_paths.iter().cloned());
 
@@ -1130,6 +1143,12 @@ fn python_runner(unique_name: &str) -> Runner {
                     for entry in walkdir::WalkDir::new(source_path)
                         .into_iter()
                         .filter_map(std::result::Result::ok)
+                        .filter(|entry| {
+                            !cfg!(all(
+                                target_arch = "aarch64",
+                                feature = "aarch64_virtualize_x18"
+                            )) || !is_optional_package_path(entry.path())
+                        })
                         .filter(|e| e.file_type().is_file())
                         .filter(|e| {
                             e.path()
@@ -1158,6 +1177,31 @@ fn python_runner(unique_name: &str) -> Runner {
                         );
                         let success = common::rewrite_with_cache(so_file, &so_file_dest, &[]);
                         assert!(success, "failed to rewrite {} file", so_file.display());
+                    }
+                }
+            }
+            if cfg!(all(
+                target_arch = "aarch64",
+                feature = "aarch64_virtualize_x18"
+            )) {
+                for source_path in &python_lib_paths {
+                    let Ok(relative) = source_path.strip_prefix("/") else {
+                        continue;
+                    };
+                    let staged = out_dir.join(relative);
+                    if is_optional_package_path(source_path) {
+                        if staged.is_dir() {
+                            std::fs::remove_dir_all(staged).unwrap();
+                        } else if staged.exists() {
+                            std::fs::remove_file(staged).unwrap();
+                        }
+                        continue;
+                    }
+                    for packages in ["site-packages", "dist-packages"] {
+                        let optional = staged.join(packages);
+                        if optional.exists() {
+                            std::fs::remove_dir_all(optional).unwrap();
+                        }
                     }
                 }
             }

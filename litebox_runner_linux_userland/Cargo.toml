@@ -31,6 +31,13 @@ litebox_broker_userland = { version = "0.1.0", path = "../litebox_broker_userlan
 
 [features]
 lock_tracing = ["litebox/lock_tracing"]
+# Keep gate rewriting and platform register/signal virtualization in lockstep.
+# Enabling only the shim feature would split logical x18 between its TLS slot
+# and the physical register exposed by the platform.
+aarch64_virtualize_x18 = [
+    "litebox_platform_linux_userland/aarch64_virtualize_x18",
+    "litebox_shim_linux/aarch64_virtualize_x18",
+]
 
 [lints]
 workspace = true

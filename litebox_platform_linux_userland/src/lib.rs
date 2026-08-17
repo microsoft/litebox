@@ -31,7 +31,7 @@ use zerocopy::{FromBytes, IntoBytes};
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
 use aarch64::{
-    Aarch64GateSignalResult, assert_tls_block_placement,
+    Aarch64GateSignalResult, GateInterruption, assert_tls_block_placement,
     canonicalize_runtime_aarch64_gate_signal_context, copy_signal_context,
     fatal_aarch64_gate_runtime_state, guest_thread_pointer_tp_offset, is_guest_thread,
     load_tls_block_base, run_thread_arch, set_is_guest_thread, set_signal_return,
@@ -2289,6 +2289,25 @@ fn set_signal_return(
     sigctx.gregs[libc::REG_RCX as usize] = p3 as i64;
 }
 
+#[cfg(target_arch = "aarch64")]
+fn is_synchronous_memory_fault(signum: libc::c_int, code: libc::c_int) -> bool {
+    match signum {
+        // SEGV_MTEAERR (8) is asynchronous; the other currently defined
+        // positive Linux SIGSEGV codes identify the faulting instruction.
+        libc::SIGSEGV => (1..=7).contains(&code) || code == 9,
+        // BUS_MCEERR_AO (5) is explicitly asynchronous.
+        libc::SIGBUS => (1..=libc::BUS_MCEERR_AR).contains(&code),
+        _ => false,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn signal_exception_fixup(signum: libc::c_int, code: libc::c_int, pc: usize) -> Option<usize> {
+    is_synchronous_memory_fault(signum, code)
+        .then(|| litebox::mm::exception_table::search_exception_tables(pc))
+        .flatten()
+}
+
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
 unsafe extern "C" fn exception_signal_handler(
     signum: libc::c_int,
@@ -2345,9 +2364,7 @@ unsafe extern "C" fn exception_signal_handler(
     // The staging store is inside the `in_guest` bracket and may raise SIGSEGV
     // or SIGBUS, so its fixup must run before consulting `in_guest`.
     #[cfg(target_arch = "aarch64")]
-    if matches!(signum, libc::SIGSEGV | libc::SIGBUS)
-        && let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(faulting_pc)
-    {
+    if let Some(fixup_addr) = signal_exception_fixup(signum, info.si_code, faulting_pc) {
         context.uc_mcontext.pc = fixup_addr as u64;
         return;
     }
@@ -2365,7 +2382,14 @@ unsafe extern "C" fn exception_signal_handler(
     #[cfg(target_arch = "x86_64")]
     copy_signal_context(unsafe { &mut *regs }, context);
     #[cfg(target_arch = "aarch64")]
-    match canonicalize_runtime_aarch64_gate_signal_context(context, unsafe { &*regs }) {
+    let interruption = if is_synchronous_memory_fault(signum, info.si_code) {
+        GateInterruption::Synchronous
+    } else {
+        GateInterruption::Asynchronous
+    };
+    #[cfg(target_arch = "aarch64")]
+    match canonicalize_runtime_aarch64_gate_signal_context(context, unsafe { &*regs }, interruption)
+    {
         Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
         Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
         Aarch64GateSignalResult::PreserveSavedContext => {
@@ -2432,7 +2456,13 @@ unsafe fn next_signal_handler(
                 context.uc_mcontext.pc.trunc()
             }
         };
-        if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
+        #[cfg(target_arch = "x86_64")]
+        // TODO: Restrict x86-64 fixups to synchronous faults too; otherwise an
+        // asynchronous SIGSEGV that interrupts a fixup range can be consumed.
+        let fixup_addr = litebox::mm::exception_table::search_exception_tables(ip);
+        #[cfg(target_arch = "aarch64")]
+        let fixup_addr = signal_exception_fixup(signum, info.si_code, ip);
+        if let Some(fixup_addr) = fixup_addr {
             #[cfg(target_arch = "x86_64")]
             {
                 context.uc_mcontext.gregs[libc::REG_RIP as usize] =
@@ -2649,7 +2679,11 @@ unsafe fn interrupt_signal_handler(
         #[cfg(target_arch = "x86_64")]
         copy_signal_context(unsafe { &mut *regs }, context);
         #[cfg(target_arch = "aarch64")]
-        match canonicalize_runtime_aarch64_gate_signal_context(context, unsafe { &*regs }) {
+        match canonicalize_runtime_aarch64_gate_signal_context(
+            context,
+            unsafe { &*regs },
+            GateInterruption::Asynchronous,
+        ) {
             Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
             Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
             Aarch64GateSignalResult::PreserveSavedContext => {

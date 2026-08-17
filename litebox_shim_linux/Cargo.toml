@@ -20,6 +20,7 @@ object = { version = "0.36.7", default-features = false, features = ["elf", "rea
 
 [features]
 alarm_fallback = []
+aarch64_virtualize_x18 = []
 
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
