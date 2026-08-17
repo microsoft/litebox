@@ -1628,7 +1628,7 @@ mod tests {
 
         const ITERATIONS: usize = 20_000;
 
-        let task = init_platform();
+        let task = init_platform(None);
         let barrier = Arc::new(Barrier::new(3));
         let writer = |offset: usize| {
             let barrier = barrier.clone();
