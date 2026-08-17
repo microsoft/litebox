@@ -140,6 +140,15 @@ fn test_fcntl() {
 }
 
 #[test]
+fn test_pipe2_with_one_fd_slot_left() {
+    let task = init_platform(None);
+    task.files.borrow().set_max_fd(3);
+
+    assert_eq!(task.sys_pipe2(OFlags::empty()), Err(Errno::EMFILE));
+    assert_eq!(task.sys_close(3), Err(Errno::EBADF));
+}
+
+#[test]
 fn test_dup() {
     let task = init_platform(None);
 

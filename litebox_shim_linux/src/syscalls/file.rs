@@ -103,9 +103,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         &self,
         typed_fd: TypedFd<Subsystem>,
     ) -> Result<usize, TypedFd<Subsystem>> {
+        let mut rds = self.raw_descriptor_store.write();
+        self.insert_raw_fd_locked(&mut rds, typed_fd)
+    }
+
+    fn insert_raw_fd_locked<Subsystem: FdEnabledSubsystem>(
+        &self,
+        rds: &mut litebox::fd::RawDescriptorStorage,
+        typed_fd: TypedFd<Subsystem>,
+    ) -> Result<usize, TypedFd<Subsystem>> {
         // XXX(jb): should we try to somehow enforce that it is set at the smallest
         // available/unassigned FD number?
-        let mut rds = self.raw_descriptor_store.write();
         let raw_fd = rds.fd_into_raw_integer(typed_fd);
         let max_fd = self.max_fd.load(Ordering::Relaxed);
         if raw_fd > max_fd {
@@ -1726,23 +1734,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
-        let pipe = self.global.create_linux_pipe(flags)?;
+        let super::pipe::LinuxPipeEnds { reader, writer } = self.global.create_linux_pipe(flags)?;
 
         let files = self.files.borrow();
-        let wr_raw_fd = files.insert_raw_fd(pipe.writer).map_err(|writer| {
-            self.global.close_linux_pipe(&writer).unwrap();
-            Errno::EMFILE
-        })?;
-        let rd_raw_fd = files.insert_raw_fd(pipe.reader).map_err(|reader| {
-            let writer = files
-                .raw_descriptor_store
-                .write()
-                .fd_consume_raw_integer(wr_raw_fd)
-                .unwrap();
-            self.global.close_linux_pipe(&writer).unwrap();
-            self.global.close_linux_pipe(&reader).unwrap();
-            Errno::EMFILE
-        })?;
+        let mut rds = files.raw_descriptor_store.write();
+        let wr_raw_fd = match files.insert_raw_fd_locked(&mut rds, writer) {
+            Ok(raw_fd) => raw_fd,
+            Err(writer) => {
+                drop(rds);
+                self.global.close_linux_pipe(&writer).unwrap();
+                self.global.close_linux_pipe(&reader).unwrap();
+                return Err(Errno::EMFILE);
+            }
+        };
+        let rd_raw_fd = match files.insert_raw_fd_locked(&mut rds, reader) {
+            Ok(raw_fd) => raw_fd,
+            Err(reader) => {
+                let writer = rds.fd_consume_raw_integer(wr_raw_fd).unwrap();
+                drop(rds);
+                self.global.close_linux_pipe(&writer).unwrap();
+                self.global.close_linux_pipe(&reader).unwrap();
+                return Err(Errno::EMFILE);
+            }
+        };
         Ok((rd_raw_fd.try_into().unwrap(), wr_raw_fd.try_into().unwrap()))
     }
 
