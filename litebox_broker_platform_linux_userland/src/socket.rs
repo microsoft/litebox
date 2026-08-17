@@ -9,7 +9,7 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -505,10 +505,14 @@ impl ReactorClient {
     ) -> BrokerResult<T> {
         let (response, receive) = sync_channel(1);
         let command = make_command(response);
-        match self.commands.try_send(command) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => return Err(BrokerError::ResourceExhausted),
-            Err(TrySendError::Disconnected(_)) => return Err(BrokerError::Internal),
+        // Block until the reactor has queue space rather than surfacing a
+        // transiently full command queue as a resource error. A valid operation
+        // always completes, and there is no Linux errno for "retry, the broker
+        // is momentarily busy"; the caller already waits for the reactor's
+        // acknowledgement below, so waiting for it to accept the command is the
+        // same order of blocking. A send failure means the reactor is gone.
+        if self.commands.send(command).is_err() {
+            return Err(BrokerError::Internal);
         }
         // Once queued, wait for acknowledgement even if the wake write fails:
         // another reactor event may still cause the command to execute.
@@ -527,18 +531,14 @@ impl ReactorClient {
             address,
             response,
         };
-        match self.commands.try_send(command) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                return Err(PlatformConnectError::PeerUnchanged(
-                    BrokerError::ResourceExhausted,
-                ));
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                return Err(PlatformConnectError::PeerIndeterminate(
-                    BrokerError::Internal,
-                ));
-            }
+        // Block until the reactor has queue space (see `request`): a transiently
+        // full command queue is internal backpressure, not a connect failure the
+        // guest should see. A send failure means the reactor is gone, leaving
+        // peer state indeterminate.
+        if self.commands.send(command).is_err() {
+            return Err(PlatformConnectError::PeerIndeterminate(
+                BrokerError::Internal,
+            ));
         }
         // A queued connect has indeterminate peer state until the reactor
         // acknowledges it, regardless of whether this wake write succeeds.
