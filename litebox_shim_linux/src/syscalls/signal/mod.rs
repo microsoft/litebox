@@ -577,7 +577,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         thread | shared
     }
 
-    #[cfg(all(test, target_arch = "x86_64"))]
+    #[cfg(test)]
     pub(crate) fn take_pending_siginfo(&self, signal: Signal) -> Siginfo {
         self.signals.pending.borrow_mut().remove(signal)
     }
