@@ -7,12 +7,14 @@ use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use litebox::shim::{Exception, ExceptionInfo};
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use litebox_common_linux::PtRegs;
 #[cfg(target_arch = "x86_64")]
-use litebox_common_linux::signal::{FPE_INTDIV, ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
+use litebox_common_linux::signal::FPE_INTDIV;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use litebox_common_linux::signal::{ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
 
 extern crate std;
 
@@ -89,6 +91,51 @@ fn exceptions_queue_their_corresponding_signals() {
                 exception,
                 error_code: 0,
                 cr2: 0,
+                kernel_mode: false,
+            },
+            &ctx,
+        );
+
+        let siginfo = task.take_pending_siginfo(signal);
+        assert_eq!(siginfo.code, code);
+        let actual_data = siginfo.data.pad;
+        let expected_data = SiginfoData::new_addr(addr).pad;
+        assert_eq!(actual_data, expected_data);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn exceptions_queue_their_corresponding_signals() {
+    const FAULT_PC: usize = 0x4444_0000;
+    const FAULT_ADDRESS: usize = 0x5555_0000;
+
+    let task = init_platform();
+    let ctx = PtRegs {
+        pc: FAULT_PC,
+        ..Default::default()
+    };
+
+    for (exception, signal, code, addr) in [
+        (Exception::BRK64, Signal::SIGTRAP, SI_KERNEL, 0),
+        (
+            Exception::INSTRUCTION_ABORT_LOWER_EL,
+            Signal::SIGILL,
+            ILL_ILLOPN,
+            FAULT_PC,
+        ),
+        (
+            Exception::DATA_ABORT_LOWER_EL,
+            Signal::SIGSEGV,
+            SI_KERNEL,
+            FAULT_ADDRESS,
+        ),
+    ] {
+        task.handle_exception_request(
+            &ExceptionInfo {
+                exception,
+                fault_address: FAULT_ADDRESS,
+                esr: u64::from(exception.0) << 26,
                 kernel_mode: false,
             },
             &ctx,
