@@ -775,13 +775,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn handle_exception_request(
         &self,
         info: &litebox::shim::ExceptionInfo,
-        _ctx: &PtRegs,
+        ctx: &PtRegs,
     ) {
+        #[cfg(target_arch = "aarch64")]
+        let _ = ctx;
         #[cfg(target_arch = "x86_64")]
         let (signal, fault_address) = match info.exception {
-            Exception::DIVIDE_ERROR => (Signal::SIGFPE, arch::pc(_ctx)),
+            Exception::DIVIDE_ERROR => (Signal::SIGFPE, arch::pc(ctx)),
             Exception::BREAKPOINT => (Signal::SIGTRAP, 0),
-            Exception::INVALID_OPCODE => (Signal::SIGILL, arch::pc(_ctx)),
+            Exception::INVALID_OPCODE => (Signal::SIGILL, arch::pc(ctx)),
             Exception::PAGE_FAULT => (Signal::SIGSEGV, info.cr2),
             // Page faults and unknown exceptions map to SIGSEGV. There may be
             // more appropriate signals in some other cases (e.g., SIGBUS).
