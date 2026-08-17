@@ -6,24 +6,21 @@
 use core::fmt;
 use core::net::SocketAddrV4;
 
-use super::{GuestBindingLease, guest_binding_address_is_valid};
+use super::{GuestBindingReservation, GuestTransport, guest_binding_address_is_valid};
 
 /// Broker-authorized guest binding passed to a platform provider.
 #[derive(Clone)]
 pub struct GuestSocketBinding {
     requested: SocketAddrV4,
-    lease: GuestBindingLease,
+    transport: GuestTransport,
 }
 
 impl GuestSocketBinding {
-    pub(super) fn new(requested: SocketAddrV4, lease: GuestBindingLease) -> Option<Self> {
-        if requested.port() == 0
-            || !guest_binding_address_is_valid(requested)
-            || lease.requested_address() != requested
-        {
-            return None;
+    pub(super) fn new(reservation: &GuestBindingReservation) -> Self {
+        Self {
+            requested: reservation.requested_address(),
+            transport: reservation.transport,
         }
-        Some(Self { requested, lease })
     }
 
     /// Returns the broker-reserved guest-visible binding.
@@ -38,24 +35,29 @@ impl GuestSocketBinding {
         self.requested.ip().is_unspecified()
     }
 
-    /// Checks that this value represents a live supported guest binding.
+    /// Checks that this value represents a supported guest binding.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.requested.port() != 0
-            && guest_binding_address_is_valid(self.requested)
-            && self.lease.requested_address() == self.requested
+        self.requested.port() != 0 && guest_binding_address_is_valid(self.requested)
     }
 
     /// Returns whether this binding belongs to the TCP guest namespace.
     #[must_use]
     pub fn is_tcp(&self) -> bool {
-        self.lease.inner.transport == super::GuestTransport::Tcp
+        self.transport == GuestTransport::Tcp
     }
 
     /// Returns whether this binding covers one concrete guest loopback address.
     #[must_use]
     pub fn covers(&self, address: SocketAddrV4) -> bool {
-        self.is_valid() && self.lease.covers(address)
+        self.is_valid()
+            && address.port() != 0
+            && address.ip().is_loopback()
+            && if self.is_wildcard() {
+                address.port() == self.requested.port()
+            } else {
+                address == self.requested
+            }
     }
 }
 
@@ -70,7 +72,7 @@ impl fmt::Debug for GuestSocketBinding {
 
 impl PartialEq for GuestSocketBinding {
     fn eq(&self, other: &Self) -> bool {
-        self.requested == other.requested
+        self.requested == other.requested && self.transport == other.transport
     }
 }
 
