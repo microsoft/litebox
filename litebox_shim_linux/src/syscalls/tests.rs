@@ -63,7 +63,7 @@ pub(crate) fn init_platform() -> crate::Task<TestPlatform, crate::DefaultFS<Test
 fn exceptions_queue_their_corresponding_signals() {
     const FAULT_PC: usize = 0x4444_0000;
 
-    let task = init_platform(None);
+    let task = init_platform();
     let ctx = PtRegs {
         rip: FAULT_PC,
         ..Default::default()
