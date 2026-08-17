@@ -238,7 +238,12 @@ impl PendingSignals {
         self.queue.remove(pos).unwrap()
     }
 
-    fn push(&mut self, rlimits: &super::process::ResourceLimits, signal: Signal, siginfo: Siginfo) {
+    fn push<Platform: ShimPlatform>(
+        &mut self,
+        rlimits: &super::process::ResourceLimits<Platform>,
+        signal: Signal,
+        siginfo: Siginfo,
+    ) {
         assert_eq!(signal.as_i32(), siginfo.signo);
 
         // Don't queue duplicates for standard signals.
